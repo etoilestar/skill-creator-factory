@@ -35,8 +35,8 @@ def test_get_skill_steps():
 def test_get_required_fields():
     from backend.modules.skill_kernel_loader import get_required_fields
     fields = get_required_fields()
-    assert "name" in fields
-    assert "description" in fields
+    assert "skill_name" in fields
+    assert "skill_description" in fields
 
 
 # ---- state_machine ----

@@ -67,8 +67,12 @@ def get_skill_steps() -> list[dict]:
 
 
 def get_required_fields() -> list[str]:
-    """Return required fields for a valid skill."""
-    return ["name", "description", "trigger", "input", "output"]
+    """Return required field step IDs for a valid skill.
+    
+    These match the step 'id' values in get_skill_steps() for the fields
+    that must be collected before skill generation is allowed.
+    """
+    return ["skill_name", "skill_description", "trigger_words", "input_format", "output_format"]
 
 
 def get_kernel_metadata() -> dict:

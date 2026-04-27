@@ -2,6 +2,8 @@
 import shutil
 from pathlib import Path
 
+import yaml
+
 from .config import KERNEL_PATH, SKILL_DATA_PATH
 
 
@@ -64,15 +66,14 @@ def generate_skill_folder(skill_data: dict) -> str:
 
 def _build_skill_md(name: str, description: str, trigger: str,
                     input_fmt: str, output_fmt: str, extra: dict) -> str:
-    """Compose a SKILL.md with standard YAML frontmatter."""
-    # Escape description for YAML (replace newlines, quote if needed)
-    desc_yaml = description.replace('"', '\\"').replace("\n", " ")
-    trigger_yaml = trigger.replace('"', '\\"').replace("\n", " ")
+    """Compose a SKILL.md with standard YAML frontmatter, using PyYAML for safe serialization."""
+    fm_data = {"name": name, "description": description}
+    fm_yaml = yaml.dump(fm_data, allow_unicode=True, default_flow_style=False,
+                        sort_keys=False).rstrip()
 
     lines = [
         "---",
-        f'name: {name}',
-        f'description: "{desc_yaml}"',
+        fm_yaml,
         "---",
         "",
         f"# {name}",

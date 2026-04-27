@@ -1,6 +1,6 @@
 """JSON-file based session persistence with multi-session isolation."""
+import hashlib
 import json
-import os
 import re
 import threading
 from pathlib import Path
@@ -10,7 +10,7 @@ from .config import SKILL_DATA_PATH
 
 _lock = threading.Lock()
 
-# Only allow UUIDs / alphanumeric+hyphen identifiers (max 64 chars)
+# Only allow UUIDs / alphanumeric+hyphen identifiers (1-64 chars)
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$")
 
 
@@ -20,22 +20,23 @@ def _sessions_dir() -> Path:
     return d
 
 
-def _safe_session_path(session_id: str) -> Path:
-    """Build and confine the session file path.
+def _session_filename(session_id: str) -> str:
+    """Derive a filesystem-safe filename from session_id via SHA-256.
 
-    Validates session_id format, then resolves the path and asserts it
-    stays within the sessions directory to prevent path traversal.
+    The hex digest contains only [0-9a-f] characters, so it can never
+    introduce path separators or traversal sequences regardless of what
+    the caller supplies for session_id.
     """
     if not _SESSION_ID_RE.match(session_id):
         raise ValueError(f"Invalid session_id format: {session_id!r}")
-    base = _sessions_dir().resolve()
-    # Use only the basename portion of the id to strip any embedded separators
-    safe_name = os.path.basename(session_id + ".json")
-    candidate = (base / safe_name).resolve()
-    # Path confinement: reject anything that escapes the sessions directory
-    if not str(candidate).startswith(str(base) + os.sep) and candidate != base:
-        raise ValueError(f"Path traversal detected for session_id: {session_id!r}")
-    return candidate
+    digest = hashlib.sha256(session_id.encode()).hexdigest()
+    return digest + ".json"
+
+
+def _safe_session_path(session_id: str) -> Path:
+    """Return the session file path derived from a hash of the session_id."""
+    filename = _session_filename(session_id)  # pure hex + ".json", no user chars
+    return _sessions_dir() / filename
 
 
 def save_session(session_id: str, data: dict) -> None:

@@ -1,29 +1,27 @@
 """Package a skill directory into a downloadable ZIP file."""
-import os
 import re
 import zipfile
 from pathlib import Path
 
 from .config import SKILL_DATA_PATH
 
-# Matches valid skill names: lowercase alphanum + hyphens, no leading/trailing hyphen
+# Matches valid skill names: lowercase alphanum + hyphens, no leading/trailing hyphen.
+# Must stay in sync with user_input_handler._SKILL_ID_RE.
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 
 
 def _safe_skill_dir(skill_name: str) -> Path:
-    """Build and confine the skill directory path.
+    """Validate skill_name and return a confined, resolved skill directory path.
 
-    Validates skill_name format, then resolves the path and asserts it
-    stays within SKILL_DATA_PATH to prevent path traversal.
+    After regex validation the name contains only [a-z0-9-] characters, so it
+    cannot carry path separators or traversal sequences.  Resolving the path
+    and checking is_relative_to() provides a second layer of defense.
     """
     if not _SKILL_NAME_RE.match(skill_name):
         raise ValueError(f"Invalid skill name: {skill_name!r}")
     base = Path(SKILL_DATA_PATH).resolve()
-    # Use only the basename to strip any embedded separators
-    safe_name = os.path.basename(skill_name)
-    candidate = (base / safe_name).resolve()
-    # Path confinement: reject anything that escapes SKILL_DATA_PATH
-    if not str(candidate).startswith(str(base) + os.sep) and candidate != base:
+    candidate = (base / skill_name).resolve()
+    if not candidate.is_relative_to(base):
         raise ValueError(f"Path traversal detected for skill name: {skill_name!r}")
     return candidate
 
@@ -41,15 +39,16 @@ def package_skill(skill_name: str) -> str:
     packages_dir = Path(SKILL_DATA_PATH) / ".packages"
     packages_dir.mkdir(parents=True, exist_ok=True)
 
-    zip_path = packages_dir / f"{skill_dir.name}.zip"
-    # Replace existing package
+    # Use the filesystem-resolved name (not the raw user input) for the zip filename.
+    validated_name = skill_dir.name
+    zip_path = packages_dir / f"{validated_name}.zip"
     if zip_path.exists():
         zip_path.unlink()
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for file in skill_dir.rglob("*"):
             if file.is_file():
-                arcname = Path(skill_dir.name) / file.relative_to(skill_dir)
+                arcname = Path(validated_name) / file.relative_to(skill_dir)
                 zf.write(file, arcname)
 
     return str(zip_path.resolve())

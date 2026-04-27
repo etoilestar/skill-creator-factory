@@ -94,9 +94,14 @@ def package(skill_name: str):
         zip_path = packager.package_skill(skill_name)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Derive the download filename from the resolved filesystem path,
+    # not from the raw user-supplied skill_name, to prevent header injection.
+    zip_filename = Path(zip_path).name
     return FileResponse(
         path=zip_path,
-        filename=f"{skill_name}.zip",
+        filename=zip_filename,
         media_type="application/zip",
     )
 

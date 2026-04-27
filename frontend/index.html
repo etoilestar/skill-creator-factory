@@ -112,7 +112,7 @@
 </div>
 
 <script>
-const API = '';  // same origin
+const API = '';  // empty string = relative URLs (same origin as page)
 let sessionId = null;
 let currentStep = null;
 let generatedSkillName = null;
@@ -261,7 +261,7 @@ function setStatus(msg) {
 }
 
 document.getElementById('userInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter') sendMessage();
+  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) sendMessage();
 });
 
 init();

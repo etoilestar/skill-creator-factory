@@ -10,36 +10,40 @@ from .config import SKILL_DATA_PATH
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 
 
-def _safe_skill_dir(skill_name: str) -> Path:
-    """Validate skill_name and return a confined, resolved skill directory path.
+def _find_skill_dir(skill_name: str) -> Path:
+    """Locate the skill directory via filesystem scan rather than path construction.
 
-    After regex validation the name contains only [a-z0-9-] characters, so it
-    cannot carry path separators or traversal sequences.  Resolving the path
-    and checking is_relative_to() provides a second layer of defense.
+    First validates skill_name format (regex), then finds the matching entry by
+    iterating SKILL_DATA_PATH.  The returned Path is filesystem-derived from
+    iterdir(), not constructed from user-supplied characters, which prevents
+    path traversal regardless of the input.
+
+    Raises ValueError  if skill_name is invalid.
+    Raises FileNotFoundError if no matching directory exists.
     """
     if not _SKILL_NAME_RE.match(skill_name):
         raise ValueError(f"Invalid skill name: {skill_name!r}")
     base = Path(SKILL_DATA_PATH).resolve()
-    candidate = (base / skill_name).resolve()
-    if not candidate.is_relative_to(base):
-        raise ValueError(f"Path traversal detected for skill name: {skill_name!r}")
-    return candidate
+    if base.is_dir():
+        for entry in base.iterdir():
+            if entry.is_dir() and entry.name == skill_name:
+                return entry
+    raise FileNotFoundError(f"Skill directory not found: {skill_name!r}")
 
 
 def package_skill(skill_name: str) -> str:
-    """Zip skill-data/{skill_name} and return the absolute path to the ZIP.
+    """Zip the skill directory and return the absolute path to the ZIP.
 
     Raises FileNotFoundError if skill directory doesn't exist.
     Raises ValueError if skill_name is invalid.
     """
-    skill_dir = _safe_skill_dir(skill_name)
-    if not skill_dir.exists() or not skill_dir.is_dir():
-        raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
+    # skill_dir is filesystem-derived (from iterdir), not constructed from user input.
+    skill_dir = _find_skill_dir(skill_name)
 
     packages_dir = Path(SKILL_DATA_PATH) / ".packages"
     packages_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use the filesystem-resolved name (not the raw user input) for the zip filename.
+    # validated_name comes from the filesystem entry, not from the raw user string.
     validated_name = skill_dir.name
     zip_path = packages_dir / f"{validated_name}.zip"
     if zip_path.exists():

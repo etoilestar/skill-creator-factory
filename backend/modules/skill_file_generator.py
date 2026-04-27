@@ -68,8 +68,8 @@ def _build_skill_md(name: str, description: str, trigger: str,
                     input_fmt: str, output_fmt: str, extra: dict) -> str:
     """Compose a SKILL.md with standard YAML frontmatter, using PyYAML for safe serialization."""
     fm_data = {"name": name, "description": description}
-    fm_yaml = yaml.dump(fm_data, allow_unicode=True, default_flow_style=False,
-                        sort_keys=False).rstrip()
+    fm_yaml = yaml.safe_dump(fm_data, allow_unicode=True, default_flow_style=False,
+                             sort_keys=False).rstrip()
 
     lines = [
         "---",

@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./kernel:/app/kernel:ro   # skill-creator kernel (read-only)
+      - ./skills:/app/skills       # user skill library (read-write)
+    environment:
+      # Point to the LLM running on the host machine.
+      # Ollama default : http://host.docker.internal:11434
+      # LM Studio default: http://host.docker.internal:1234
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:11434}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-llama3.2}
+    # Makes host.docker.internal resolve to the host on Linux as well
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

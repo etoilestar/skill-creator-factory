@@ -1,6 +1,8 @@
 import json
+import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -8,6 +10,8 @@ from pydantic import BaseModel
 from ..config import settings
 from ..services.kernel_loader import load_kernel_system_prompt, load_skill_system_prompt
 from ..services.llm_proxy import stream_chat
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -20,6 +24,17 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[Message]
     model: Optional[str] = None
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Convert LLM proxy exceptions to user-facing messages without leaking internals."""
+    if isinstance(exc, httpx.ConnectError):
+        return "无法连接到 LLM 服务，请确认 Ollama/LM Studio 已启动"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"LLM 服务返回错误: HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "LLM 服务响应超时，请重试"
+    return "生成时发生错误，请重试"
 
 
 def _sse(data: dict) -> str:
@@ -37,7 +52,8 @@ def _make_stream(system_prompt: str, request: ChatRequest):
                 yield _sse({"content": chunk})
             yield "data: [DONE]\n\n"
         except Exception as exc:
-            yield _sse({"error": str(exc)})
+            logger.exception("LLM stream error")
+            yield _sse({"error": _friendly_error(exc)})
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

@@ -14,6 +14,8 @@ services:
       # LM Studio default: http://host.docker.internal:1234
       - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:11434}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-llama3.2}
+      # Required when LLM_BASE_URL points to an OpenAI-compatible cloud API.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     # Makes host.docker.internal resolve to the host on Linux as well
     extra_hosts:
       - "host.docker.internal:host-gateway"

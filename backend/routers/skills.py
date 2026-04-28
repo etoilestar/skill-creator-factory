@@ -4,11 +4,13 @@ from pydantic import BaseModel
 from ..services.skill_manager import (
     delete_asset,
     delete_skill,
+    get_asset,
     get_skill,
     list_skill_assets,
     list_skills,
     save_asset,
     save_skill,
+    update_asset,
 )
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
@@ -76,6 +78,35 @@ async def upload_skill_asset(
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
     try:
         return save_asset(skill_name, folder, file.filename or "", data)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{skill_name}/assets/{folder}/{filename}")
+async def get_skill_asset_content(skill_name: str, folder: str, filename: str):
+    """Read the text content of a single asset file."""
+    try:
+        content = get_asset(skill_name, folder, filename)
+        return {"content": content}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        if "Binary" in str(exc):
+            raise HTTPException(status_code=415, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class UpdateAssetRequest(BaseModel):
+    content: str
+
+
+@router.put("/{skill_name}/assets/{folder}/{filename}")
+async def update_skill_asset_content(skill_name: str, folder: str, filename: str, request: UpdateAssetRequest):
+    """Overwrite the text content of a single asset file."""
+    try:
+        return update_asset(skill_name, folder, filename, request.content)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:

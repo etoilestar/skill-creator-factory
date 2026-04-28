@@ -135,6 +135,62 @@ def list_skill_assets(skill_name: str) -> dict:
     return result
 
 
+def get_asset(skill_name: str, folder: str, filename: str) -> str:
+    """Read a text asset file and return its content as a string.
+
+    Raises:
+        FileNotFoundError: if the skill or file does not exist.
+        ValueError: if folder or filename is invalid, or the file is binary.
+    """
+    if folder not in _ALLOWED_ASSET_FOLDERS:
+        raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
+    safe_name = Path(filename).name
+    if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or "/" in safe_name or "\\" in safe_name or len(safe_name) > 255:
+        raise ValueError("Invalid filename")
+    skill_dir = settings.skills_path / skill_name
+    if not skill_dir.exists():
+        raise FileNotFoundError(f"Skill '{skill_name}' not found")
+    target = skill_dir / folder / safe_name
+    if not target.is_file():
+        raise FileNotFoundError(f"Asset '{safe_name}' not found in '{folder}'")
+    raw = target.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Binary files cannot be edited") from exc
+
+
+def update_asset(skill_name: str, folder: str, filename: str, content: str) -> dict:
+    """Overwrite a text asset file with new content.
+
+    Raises:
+        FileNotFoundError: if the skill or file does not exist.
+        ValueError: if folder or filename is invalid, or content exceeds size limit.
+    """
+    if folder not in _ALLOWED_ASSET_FOLDERS:
+        raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
+    safe_name = Path(filename).name
+    if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or "/" in safe_name or "\\" in safe_name or len(safe_name) > 255:
+        raise ValueError("Invalid filename")
+    skill_dir = settings.skills_path / skill_name
+    if not skill_dir.exists():
+        raise FileNotFoundError(f"Skill '{skill_name}' not found")
+    target = skill_dir / folder / safe_name
+    if not target.is_file():
+        raise FileNotFoundError(f"Asset '{safe_name}' not found in '{folder}'")
+    data = content.encode("utf-8")
+    if len(data) > _MAX_ASSET_BYTES:
+        raise ValueError("File exceeds 10 MB limit")
+    target.write_bytes(data)
+    return {
+        "skill": skill_name,
+        "folder": folder,
+        "filename": safe_name,
+        "path": str(target.relative_to(settings.skills_path.parent)),
+        "size": len(data),
+    }
+
+
 def delete_asset(skill_name: str, folder: str, filename: str) -> None:
     """Delete a single asset file from a skill sub-directory.
 

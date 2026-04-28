@@ -58,6 +58,7 @@
               <div v-if="assets[folder] && assets[folder].length" class="asset-list">
                 <div v-for="fname in assets[folder]" :key="fname" class="asset-row">
                   <span class="asset-name">{{ fname }}</span>
+                  <button class="btn-icon-edit" :aria-label="`编辑 ${fname}`" :title="`编辑 ${fname}`" @click="openAssetEditor(folder, fname)">✎</button>
                   <button class="btn-icon-danger" :aria-label="`删除 ${fname}`" :title="`删除 ${fname}`" @click="removeAsset(folder, fname)">✕</button>
                 </div>
               </div>
@@ -83,7 +84,31 @@
       </div>
     </div>
 
-    <!-- Delete confirm -->
+    <!-- Asset editor modal -->
+  <div v-if="assetEditor" class="overlay" @click.self="closeAssetEditor">
+    <div class="dialog dialog-editor">
+      <div class="dialog-title">{{ assetEditor.folder }}/{{ assetEditor.filename }}</div>
+      <div v-if="assetEditor.loading" class="muted p16">加载中…</div>
+      <div v-else-if="assetEditor.binary" class="muted p16">该文件为二进制，无法编辑。</div>
+      <textarea
+        v-else
+        v-model="assetEditor.content"
+        class="skill-editor asset-edit-textarea"
+        spellcheck="false"
+      />
+      <div v-if="assetEditor.error" class="error px16">{{ assetEditor.error }}</div>
+      <div class="dialog-actions">
+        <template v-if="!assetEditor.binary">
+          <button class="btn-primary" :disabled="assetEditor.saving" @click="saveAssetEdit">
+            {{ assetEditor.saving ? '保存中…' : '保存' }}
+          </button>
+        </template>
+        <button class="btn-ghost" @click="closeAssetEditor">{{ assetEditor.binary ? '关闭' : '取消' }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete confirm -->
     <div v-if="deleteTarget" class="overlay" @click.self="deleteTarget = null">
       <div class="dialog">
         <p>确认删除 <strong>{{ deleteTarget }}</strong>？此操作不可撤销。</p>
@@ -98,7 +123,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset } from '../composables/useSkills.js'
+import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset, fetchAssetContent, saveAssetContent } from '../composables/useSkills.js'
 
 const skills = ref([])
 const selected = ref(null)
@@ -119,6 +144,9 @@ const uploading = ref(false)
 const uploadError = ref('')
 const assetError = ref('')
 const fileInputRef = ref(null)
+
+// asset editor
+const assetEditor = ref(null)
 
 async function load() {
   loading.value = true
@@ -224,6 +252,40 @@ async function removeAsset(folder, filename) {
     await loadAssets(selected.value.name)
   } catch (e) {
     assetError.value = e.message
+  }
+}
+
+async function openAssetEditor(folder, filename) {
+  assetEditor.value = { folder, filename, content: '', loading: true, binary: false, saving: false, error: '' }
+  try {
+    const text = await fetchAssetContent(selected.value.name, folder, filename)
+    assetEditor.value = { folder, filename, content: text, loading: false, binary: false, saving: false, error: '' }
+  } catch (e) {
+    if (e.status === 415) {
+      assetEditor.value = { folder, filename, content: '', loading: false, binary: true, saving: false, error: '' }
+    } else {
+      assetEditor.value = null
+      assetError.value = e.message
+    }
+  }
+}
+
+function closeAssetEditor() {
+  assetEditor.value = null
+}
+
+async function saveAssetEdit() {
+  if (!assetEditor.value || !selected.value) return
+  assetEditor.value.saving = true
+  assetEditor.value.error = ''
+  try {
+    await saveAssetContent(selected.value.name, assetEditor.value.folder, assetEditor.value.filename, assetEditor.value.content)
+    assetEditor.value = null
+    await loadAssets(selected.value.name)
+  } catch (e) {
+    assetEditor.value.error = e.message
+  } finally {
+    if (assetEditor.value) assetEditor.value.saving = false
   }
 }
 
@@ -379,5 +441,20 @@ onMounted(load)
   width: 90%;
 }
 .dialog p { margin-bottom: 20px; }
-.dialog-actions { display: flex; gap: 10px; }
+.dialog-actions { display: flex; gap: 10px; margin-top: 12px; }
+.dialog-title { font-weight: 600; font-size: 14px; margin-bottom: 12px; font-family: 'Fira Code', monospace; }
+.dialog-editor { width: 680px; max-width: 94vw; display: flex; flex-direction: column; }
+.asset-edit-textarea { flex: 1; min-height: 340px; resize: vertical; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 4px; }
+.btn-icon-edit {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--accent, #4a9);
+  padding: 0 4px;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.btn-icon-edit:hover { background: var(--surface2); }
 </style>

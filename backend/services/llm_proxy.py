@@ -31,7 +31,10 @@ async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, N
                     break
                 try:
                     data = json.loads(data_str)
-                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
                     content = delta.get("content")
                     if content:
                         yield content

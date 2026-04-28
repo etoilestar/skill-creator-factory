@@ -18,7 +18,7 @@
 </template>
 
 <script setup>
-import { computed, reactive } from 'vue'
+import { computed, reactive, watchEffect } from 'vue'
 
 const props = defineProps({
   content: { type: String, required: true },
@@ -67,15 +67,14 @@ const collapsed = reactive({})
 const autoCollapsed = reactive({})
 
 // Auto-collapse completed think blocks on first completion
-computed(() => {
+watchEffect(() => {
   segments.value.forEach((seg, idx) => {
     if (seg.type === 'think' && !seg.open && !autoCollapsed[idx]) {
       autoCollapsed[idx] = true
       collapsed[idx] = true
     }
   })
-  return null
-}).value
+})
 
 function toggleThink(idx) {
   collapsed[idx] = !collapsed[idx]

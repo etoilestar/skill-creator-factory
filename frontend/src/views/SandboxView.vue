@@ -34,12 +34,12 @@
           :class="msg.role"
         >
           <div class="bubble">
-            <pre class="content">{{ msg.content }}</pre>
+            <ChatBubble :content="msg.content" />
           </div>
         </div>
         <div v-if="streaming" class="message assistant">
           <div class="bubble">
-            <pre class="content">{{ streamBuffer }}<span class="cursor">▋</span></pre>
+            <ChatBubble :content="streamBuffer" :streaming="true" />
           </div>
         </div>
       </div>
@@ -70,6 +70,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
 import { streamChat } from '../composables/useChat.js'
+import ChatBubble from '../components/ChatBubble.vue'
 
 const skills = ref([])
 const selectedSkill = ref('')
@@ -181,17 +182,6 @@ async function send() {
   border-color: var(--accent);
   color: #fff;
 }
-
-.content {
-  font-family: var(--font);
-  font-size: 14px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin: 0;
-}
-
-.cursor { animation: blink 1s step-end infinite; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 .input-area {
   padding: 12px 24px 20px;

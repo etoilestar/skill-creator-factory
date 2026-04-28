@@ -113,6 +113,7 @@ async function send() {
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
     for await (const chunk of streamChat(url, { messages: messages.value })) {
+      if (typeof chunk !== 'string') continue
       streamBuffer.value += chunk
       await scrollBottom()
     }

@@ -1,10 +1,13 @@
 /**
  * Stream an SSE chat response from the backend.
- * Yields text chunks as they arrive.
+ *
+ * Yields either:
+ *   - a plain string  — text content chunk
+ *   - { type: 'action_result', data: {...} } — skill file-operation result
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model? }
- * @yields {string} text chunk
+ * @yields {string | {type: string, data: object}}
  */
 export async function* streamChat(url, body) {
   const response = await fetch(url, {
@@ -37,7 +40,8 @@ export async function* streamChat(url, body) {
       try {
         const parsed = JSON.parse(data)
         if (parsed.error) throw new Error(parsed.error)
-        if (parsed.content) yield parsed.content
+        if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
+        else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines
         if (e.message && !e.message.startsWith('JSON')) throw e

@@ -1,14 +1,17 @@
 """Skill Executor — runs kernel/scripts actions requested by the LLM.
 
-Supported actions: init, write, validate, package.
+Supported actions: init, write, write_file, validate, package.
 All return a uniform dict: {action, name, success, message, path}.
 """
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 
 from ..config import settings
+
+logger = logging.getLogger(__name__)
 
 # Make kernel/scripts importable so package_skill can do `from quick_validate import …`
 _SCRIPTS_DIR = str(settings.kernel_path / "scripts")
@@ -60,6 +63,14 @@ def run_action(action: dict) -> dict:
             return _run_init(name, skill_dir)
         if action_type == "write":
             return _run_write(name, action.get("content", ""), skill_dir)
+        if action_type == "write_file":
+            return _run_write_file(
+                name,
+                action.get("folder", ""),
+                action.get("filename", ""),
+                action.get("content", ""),
+                skill_dir,
+            )
         if action_type == "validate":
             return _run_validate(name, skill_dir)
         if action_type == "package":
@@ -167,4 +178,73 @@ def _run_package(name: str, skill_dir: Path) -> dict:
         "success": True,
         "message": f"已打包为 {name}.skill",
         "path": str(result),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Allowed folders for write_file
+# ---------------------------------------------------------------------------
+
+_ALLOWED_WRITE_FOLDERS = {"scripts", "references", "assets"}
+
+
+def _safe_filename(filename: str) -> str | None:
+    """Return the base filename if it is safe, otherwise None."""
+    safe = Path(filename).name
+    if (
+        not safe
+        or safe.startswith(".")
+        or "\x00" in safe
+        or "/" in safe
+        or "\\" in safe
+        or len(safe) > 255
+    ):
+        return None
+    return safe
+
+
+def _run_write_file(name: str, folder: str, filename: str, content: str, skill_dir: Path) -> dict:
+    if folder not in _ALLOWED_WRITE_FOLDERS:
+        return {
+            "action": "write_file",
+            "name": name,
+            "success": False,
+            "message": f"folder 必须是以下之一: {sorted(_ALLOWED_WRITE_FOLDERS)}",
+            "path": None,
+        }
+    safe = _safe_filename(filename)
+    if safe is None:
+        return {
+            "action": "write_file",
+            "name": name,
+            "success": False,
+            "message": "文件名非法（不允许路径分隔符或隐藏文件）",
+            "path": None,
+        }
+    if not content:
+        return {
+            "action": "write_file",
+            "name": name,
+            "success": False,
+            "message": "缺少 content 参数",
+            "path": None,
+        }
+    if not skill_dir.exists():
+        return {
+            "action": "write_file",
+            "name": name,
+            "success": False,
+            "message": f"Skill '{name}' 目录不存在，请先执行 init",
+            "path": None,
+        }
+    target_dir = skill_dir / folder
+    target_dir.mkdir(exist_ok=True)
+    dest = target_dir / safe
+    dest.write_text(content, encoding="utf-8")
+    return {
+        "action": "write_file",
+        "name": name,
+        "success": True,
+        "message": f"{folder}/{safe} 已写入",
+        "path": str(dest),
     }

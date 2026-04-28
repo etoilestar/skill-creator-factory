@@ -108,11 +108,22 @@ description: Guide for creating effective skills. Use when users want to create 
 
 用户确认蓝图后，按顺序输出动作标签：
 
+**不含 Python 脚本时**（纯提示词 Skill）：
 ```
 <skill_action>{"action":"init","name":"skill-name"}</skill_action>
 <skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
 <skill_action>{"action":"validate","name":"skill-name"}</skill_action>
 ```
+
+**含 Python 脚本时**（需要自动化逻辑的 Skill），在 write 之后追加 write_file：
+```
+<skill_action>{"action":"init","name":"skill-name"}</skill_action>
+<skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"scripts","filename":"main.py","content":"#!/usr/bin/env python3\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"}</skill_action>
+<skill_action>{"action":"validate","name":"skill-name"}</skill_action>
+```
+
+> **何时生成 write_file**：用户需求中包含文件处理、API 调用、数据转换、自动化等需要代码执行的场景时，生成对应 Python 脚本并用 `write_file` 写入 `scripts/` 目录。参考文档可写入 `references/`，模板文件写入 `assets/`。
 
 ### SKILL.md 编写规范
 
@@ -170,10 +181,11 @@ Body 原则：
 |--------|----------|------|
 | `init` | `name` | 初始化目录（scripts/、references/、assets/） |
 | `write` | `name`, `content` | 写入 SKILL.md（新建或覆盖） |
+| `write_file` | `name`, `folder`, `filename`, `content` | 写入子目录文件；`folder` 为 `scripts`/`references`/`assets` 之一 |
 | `validate` | `name` | 校验 frontmatter 格式 |
 | `package` | `name` | 打包为 .skill 文件 |
 
-JSON 中换行用 `\n` 转义。标准顺序：init → write → validate → package（可选）。
+JSON 中换行用 `\n` 转义。标准顺序：init → write → write_file（可选，可多次）→ validate → package（可选）。
 
 ---
 

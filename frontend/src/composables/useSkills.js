@@ -36,6 +36,39 @@ export async function deleteSkill(name) {
   return res.json()
 }
 
+export async function fetchSkillAssets(skillName) {
+  const res = await fetch(`/api/skills/${encodeURIComponent(skillName)}/assets`)
+  if (!res.ok) throw new Error(`Failed to fetch assets: ${res.statusText}`)
+  return res.json()
+}
+
+export async function uploadAsset(skillName, folder, file) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('folder', folder)
+  const res = await fetch(`/api/skills/${encodeURIComponent(skillName)}/assets`, {
+    method: 'POST',
+    body: form,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || 'Upload failed')
+  }
+  return res.json()
+}
+
+export async function deleteAsset(skillName, folder, filename) {
+  const res = await fetch(
+    `/api/skills/${encodeURIComponent(skillName)}/assets/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`,
+    { method: 'DELETE' },
+  )
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || 'Delete failed')
+  }
+  return res.json()
+}
+
 export async function fetchLlmHealth() {
   const res = await fetch('/api/health/llm')
   if (!res.ok) throw new Error('Health check failed')

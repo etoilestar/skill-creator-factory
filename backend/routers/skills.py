@@ -1,9 +1,19 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from ..services.skill_manager import delete_skill, get_skill, list_skills, save_skill
+from ..services.skill_manager import (
+    delete_asset,
+    delete_skill,
+    get_skill,
+    list_skill_assets,
+    list_skills,
+    save_asset,
+    save_skill,
+)
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
+
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 class SaveSkillRequest(BaseModel):
@@ -40,3 +50,45 @@ async def remove_skill(skill_name: str):
         return {"message": f"Skill '{skill_name}' deleted"}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/{skill_name}/assets")
+async def get_skill_assets(skill_name: str):
+    """List asset files grouped by sub-directory for a skill."""
+    try:
+        return list_skill_assets(skill_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/{skill_name}/assets")
+async def upload_skill_asset(
+    skill_name: str,
+    file: UploadFile = File(...),
+    folder: str = Form("assets"),
+):
+    """Upload a reference file to a skill sub-directory (max 10 MB)."""
+    # Reject oversized files before reading body when Content-Length is available
+    if file.size is not None and file.size > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
+    data = await file.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
+    try:
+        return save_asset(skill_name, folder, file.filename or "", data)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.delete("/{skill_name}/assets/{folder}/{filename}")
+async def remove_skill_asset(skill_name: str, folder: str, filename: str):
+    """Delete a single asset file from a skill sub-directory."""
+    try:
+        delete_asset(skill_name, folder, filename)
+        return {"message": f"Deleted '{filename}' from '{folder}'"}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

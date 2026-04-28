@@ -47,6 +47,38 @@
             <button class="btn-danger" @click="confirmDelete">删除</button>
           </div>
           <pre class="skill-preview">{{ selected.content }}</pre>
+
+          <!-- Asset files section -->
+          <div class="assets-section">
+            <div class="assets-header">资产文件</div>
+
+            <!-- File groups -->
+            <div v-for="folder in assetFolders" :key="folder" class="asset-group">
+              <div class="asset-group-title">{{ folder }}</div>
+              <div v-if="assets[folder] && assets[folder].length" class="asset-list">
+                <div v-for="fname in assets[folder]" :key="fname" class="asset-row">
+                  <span class="asset-name">{{ fname }}</span>
+                  <button class="btn-icon-danger" :aria-label="`删除 ${fname}`" :title="`删除 ${fname}`" @click="removeAsset(folder, fname)">✕</button>
+                </div>
+              </div>
+              <div v-else class="muted asset-empty">暂无文件</div>
+            </div>
+
+            <!-- Upload row -->
+            <div class="upload-row">
+              <select v-model="uploadFolder" class="folder-select" aria-label="上传目录">
+                <option v-for="f in assetFolders" :key="f" :value="f">{{ f }}</option>
+              </select>
+              <label class="file-input-label">
+                <input ref="fileInputRef" type="file" class="file-input" aria-label="选择要上传的文件" @change="onFileChange" />
+              </label>
+              <button class="btn-primary" :disabled="!uploadFile || uploading" @click="doUpload">
+                {{ uploading ? '上传中…' : '上传' }}
+              </button>
+            </div>
+            <div v-if="uploadError" class="error px16">{{ uploadError }}</div>
+            <div v-if="assetError" class="error px16">{{ assetError }}</div>
+          </div>
         </template>
       </div>
     </div>
@@ -66,7 +98,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { fetchSkills, fetchSkill, saveSkill, deleteSkill } from '../composables/useSkills.js'
+import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset } from '../composables/useSkills.js'
 
 const skills = ref([])
 const selected = ref(null)
@@ -78,15 +110,36 @@ const editError = ref('')
 const saving = ref(false)
 const deleteTarget = ref(null)
 
+// assets
+const assetFolders = ['assets', 'references', 'scripts']
+const assets = ref({ assets: [], references: [], scripts: [] })
+const uploadFolder = ref('assets')
+const uploadFile = ref(null)
+const uploading = ref(false)
+const uploadError = ref('')
+const assetError = ref('')
+const fileInputRef = ref(null)
+
 async function load() {
   loading.value = true
   skills.value = await fetchSkills()
   loading.value = false
 }
 
+async function loadAssets(name) {
+  try {
+    assets.value = await fetchSkillAssets(name)
+  } catch {
+    assets.value = { assets: [], references: [], scripts: [] }
+  }
+}
+
 async function select(name) {
   editing.value = false
   selected.value = await fetchSkill(name)
+  uploadError.value = ''
+  assetError.value = ''
+  await loadAssets(name)
 }
 
 function openNew() {
@@ -119,6 +172,7 @@ async function save() {
     await load()
     editing.value = false
     selected.value = await fetchSkill(name)
+    await loadAssets(name)
   } catch (e) {
     editError.value = e.message
   } finally {
@@ -135,7 +189,42 @@ async function doDelete() {
   deleteTarget.value = null
   await deleteSkill(name)
   selected.value = null
+  assets.value = { assets: [], references: [], scripts: [] }
+  uploadError.value = ''
+  assetError.value = ''
   await load()
+}
+
+function onFileChange(e) {
+  uploadFile.value = e.target.files[0] || null
+  uploadError.value = ''
+}
+
+async function doUpload() {
+  if (!uploadFile.value || !selected.value) return
+  uploading.value = true
+  uploadError.value = ''
+  try {
+    await uploadAsset(selected.value.name, uploadFolder.value, uploadFile.value)
+    uploadFile.value = null
+    if (fileInputRef.value) fileInputRef.value.value = ''
+    await loadAssets(selected.value.name)
+  } catch (e) {
+    uploadError.value = e.message
+  } finally {
+    uploading.value = false
+  }
+}
+
+async function removeAsset(folder, filename) {
+  if (!selected.value) return
+  assetError.value = ''
+  try {
+    await deleteAsset(selected.value.name, folder, filename)
+    await loadAssets(selected.value.name)
+  } catch (e) {
+    assetError.value = e.message
+  }
 }
 
 onMounted(load)
@@ -197,6 +286,7 @@ onMounted(load)
   word-break: break-word;
   background: var(--bg);
   margin: 0;
+  min-height: 0;
 }
 
 .skill-editor {
@@ -212,6 +302,67 @@ onMounted(load)
 
 .p16 { padding: 16px; }
 .px16 { padding: 4px 16px; }
+
+/* Asset files section */
+.assets-section {
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+  max-height: 300px;
+}
+.assets-header {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.asset-group { margin-bottom: 10px; }
+.asset-group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted, #888);
+  margin-bottom: 4px;
+}
+.asset-list { display: flex; flex-direction: column; gap: 2px; }
+.asset-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--surface2);
+}
+.asset-name { flex: 1; font-size: 12px; font-family: 'Fira Code', monospace; word-break: break-all; }
+.asset-empty { font-size: 12px; padding: 2px 0; }
+.btn-icon-danger {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--danger, #e55);
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.btn-icon-danger:hover { background: var(--danger-bg, rgba(220,50,50,0.12)); }
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.folder-select {
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: inherit;
+}
+.file-input { flex: 1; font-size: 12px; min-width: 0; }
 
 .overlay {
   position: fixed; inset: 0;

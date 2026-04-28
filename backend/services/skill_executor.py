@@ -195,8 +195,6 @@ def _safe_filename(filename: str) -> str | None:
         not safe
         or safe.startswith(".")
         or "\x00" in safe
-        or "/" in safe
-        or "\\" in safe
         or len(safe) > 255
     ):
         return None

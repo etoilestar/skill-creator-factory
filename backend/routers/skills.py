@@ -164,8 +164,6 @@ async def run_skill_script(skill_name: str, filename: str, request: RunScriptReq
         not safe_name
         or safe_name.startswith(".")
         or "\x00" in safe_name
-        or "/" in safe_name
-        or "\\" in safe_name
         or len(safe_name) > 255
         or not safe_name.endswith(".py")
     ):

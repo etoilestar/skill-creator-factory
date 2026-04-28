@@ -422,6 +422,59 @@ python scripts/package_skill.py ./my-skill ./dist
 
 ---
 
+## 文件操作协议 (File Action Protocol)
+
+当用户明确确认（例如回复"对，开始做吧"）后，你可以在回复中嵌入结构化的动作标签，让后端自动执行文件操作。**在用户确认之前，不要输出任何动作标签。**
+
+### 动作标签格式
+
+每个动作用一个独立的 `<skill_action>` 标签包裹，内容为 JSON：
+
+```
+<skill_action>{"action":"init","name":"skill-name"}</skill_action>
+<skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
+<skill_action>{"action":"validate","name":"skill-name"}</skill_action>
+<skill_action>{"action":"package","name":"skill-name"}</skill_action>
+```
+
+### 支持的动作
+
+| action | 必填参数 | 说明 |
+|--------|----------|------|
+| `init` | `name` | 初始化 Skill 目录结构（scripts/、references/、assets/） |
+| `write` | `name`, `content` | 写入 SKILL.md 内容（新建或覆盖） |
+| `validate` | `name` | 校验 SKILL.md frontmatter 格式 |
+| `package` | `name` | 将 Skill 打包为可分发的 .skill 文件 |
+
+### SKILL.md content 格式规范
+
+`write` 动作的 `content` 字段**必须**使用 `---` 分隔的 YAML frontmatter + Markdown body：
+
+```
+---
+name: skill-name
+description: 清晰描述 Skill 功能和触发场景。
+---
+
+# Skill Title
+
+## Overview
+...
+```
+
+在 JSON 中，换行符用 `\n` 转义，`---` 分隔符保持原样。
+
+### 标准执行顺序
+
+1. `init` — 创建目录骨架
+2. `write` — 写入 SKILL.md 内容
+3. `validate` — 校验格式
+4. `package` — 打包（可选）
+
+每个动作占独立一行，后端会按顺序执行并将结果显示给用户。
+
+---
+
 ## 参考资源
 
 - **编写最佳实践**: 见 [references/best-practices.md](references/best-practices.md) - 命名规范、简洁原则、反模式、质量检查清单

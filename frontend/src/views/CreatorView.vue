@@ -9,16 +9,27 @@
       <div v-if="messages.length === 0" class="empty">
         <p>向 AI 说明你想创建什么 Skill，它会引导你一步步完成。</p>
       </div>
-      <div
-        v-for="(msg, i) in messages"
-        :key="i"
-        class="message"
-        :class="msg.role"
-      >
-        <div class="bubble">
-          <pre class="content">{{ msg.content }}</pre>
+      <template v-for="(msg, i) in messages" :key="i">
+        <!-- action result card -->
+        <div
+          v-if="msg.role === 'system'"
+          class="action-card"
+          :class="msg.success ? 'ok' : 'fail'"
+          :aria-label="msg.success ? '操作成功' : '操作失败'"
+        >
+          <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
+          <span class="action-label">{{ actionLabel(msg.action) }}</span>
+          <span class="action-name">{{ msg.name }}</span>
+          <span class="action-msg">{{ msg.message }}</span>
+          <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
         </div>
-      </div>
+        <!-- regular chat bubble -->
+        <div v-else class="message" :class="msg.role">
+          <div class="bubble">
+            <pre class="content">{{ msg.content }}</pre>
+          </div>
+        </div>
+      </template>
       <div v-if="streaming" class="message assistant">
         <div class="bubble">
           <pre class="content">{{ streamBuffer }}<span class="cursor">▋</span></pre>
@@ -49,8 +60,19 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { streamChat } from '../composables/useChat.js'
+
+const ACTION_LABELS = {
+  init: '初始化目录',
+  write: '写入 SKILL.md',
+  validate: '校验格式',
+  package: '打包 Skill',
+}
+
+function actionLabel(action) {
+  return ACTION_LABELS[action] || action
+}
 
 const messages = ref([])
 const input = ref('')
@@ -58,6 +80,9 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
+
+// History sent to the LLM excludes system action-result messages
+const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
 async function scrollBottom() {
   await nextTick()
@@ -79,12 +104,27 @@ async function send() {
   streamBuffer.value = ''
 
   try {
-    for await (const chunk of streamChat('/api/chat/creator', { messages: messages.value })) {
-      streamBuffer.value += chunk
-      await scrollBottom()
+    for await (const chunk of streamChat('/api/chat/creator', { messages: chatHistory.value })) {
+      if (typeof chunk === 'string') {
+        streamBuffer.value += chunk
+        await scrollBottom()
+      } else if (chunk.type === 'action_result') {
+        const r = chunk.data
+        messages.value.push({
+          role: 'system',
+          action: r.action,
+          name: r.name,
+          success: r.success,
+          message: r.message,
+          path: r.path,
+        })
+        await scrollBottom()
+      }
     }
-    messages.value.push({ role: 'assistant', content: streamBuffer.value })
-    streamBuffer.value = ''
+    if (streamBuffer.value) {
+      messages.value.push({ role: 'assistant', content: streamBuffer.value })
+      streamBuffer.value = ''
+    }
   } catch (e) {
     error.value = e.message
   } finally {
@@ -160,6 +200,33 @@ function clearChat() {
 .cursor { animation: blink 1s step-end infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
+/* Action result card */
+.action-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  border: 1px solid transparent;
+}
+.action-card.ok {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #166534;
+}
+.action-card.fail {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+.action-icon { font-size: 15px; }
+.action-label { font-weight: 600; }
+.action-name { font-family: monospace; background: rgba(0,0,0,.07); padding: 1px 6px; border-radius: 4px; }
+.action-msg { flex: 1 1 100%; margin-top: 2px; opacity: .85; }
+.action-path { flex: 1 1 100%; font-family: monospace; font-size: 12px; opacity: .7; word-break: break-all; }
+
 .input-area {
   padding: 12px 24px 20px;
   border-top: 1px solid var(--border);
@@ -172,3 +239,4 @@ function clearChat() {
 .actions { display: flex; flex-direction: column; gap: 8px; }
 .hint { font-size: 12px; margin-top: 6px; }
 </style>
+

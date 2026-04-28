@@ -72,11 +72,12 @@ def run_action(action: dict) -> dict:
             "path": None,
         }
     except Exception as exc:  # pragma: no cover
+        logger.exception("skill_executor error for action %r", action_type)
         return {
             "action": action_type,
             "name": name,
             "success": False,
-            "message": f"执行出错: {exc}",
+            "message": "操作执行失败，请重试",
             "path": None,
         }
 

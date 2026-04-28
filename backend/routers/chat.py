@@ -104,11 +104,12 @@ def _make_stream(system_prompt: str, request: ChatRequest):
                             skill_executor.run_action, action_data
                         )
                     except json.JSONDecodeError as exc:
+                        logger.warning("skill_action JSON parse error: %s", exc)
                         result = {
                             "action": "unknown",
                             "name": "",
                             "success": False,
-                            "message": f"JSON 解析错误: {exc}",
+                            "message": "动作标签 JSON 格式错误，请检查格式后重试",
                             "path": None,
                         }
 

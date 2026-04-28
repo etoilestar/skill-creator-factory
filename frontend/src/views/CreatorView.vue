@@ -11,7 +11,12 @@
       </div>
       <template v-for="(msg, i) in messages" :key="i">
         <!-- action result card -->
-        <div v-if="msg.role === 'system'" class="action-card" :class="msg.success ? 'ok' : 'fail'">
+        <div
+          v-if="msg.role === 'system'"
+          class="action-card"
+          :class="msg.success ? 'ok' : 'fail'"
+          :aria-label="msg.success ? '操作成功' : '操作失败'"
+        >
           <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
           <span class="action-label">{{ actionLabel(msg.action) }}</span>
           <span class="action-name">{{ msg.name }}</span>
@@ -55,7 +60,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { streamChat } from '../composables/useChat.js'
 
 const ACTION_LABELS = {
@@ -75,6 +80,9 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
+
+// History sent to the LLM excludes system action-result messages
+const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
 async function scrollBottom() {
   await nextTick()
@@ -96,7 +104,7 @@ async function send() {
   streamBuffer.value = ''
 
   try {
-    for await (const chunk of streamChat('/api/chat/creator', { messages: messages.value.filter(m => m.role !== 'system') })) {
+    for await (const chunk of streamChat('/api/chat/creator', { messages: chatHistory.value })) {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
         await scrollBottom()

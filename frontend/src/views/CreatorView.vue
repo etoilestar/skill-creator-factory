@@ -26,13 +26,13 @@
         <!-- regular chat bubble -->
         <div v-else class="message" :class="msg.role">
           <div class="bubble">
-            <pre class="content">{{ msg.content }}</pre>
+            <ChatBubble :content="msg.content" />
           </div>
         </div>
       </template>
       <div v-if="streaming" class="message assistant">
         <div class="bubble">
-          <pre class="content">{{ streamBuffer }}<span class="cursor">▋</span></pre>
+          <ChatBubble :content="streamBuffer" :streaming="true" />
         </div>
       </div>
     </div>
@@ -62,6 +62,7 @@
 <script setup>
 import { ref, computed, nextTick } from 'vue'
 import { streamChat } from '../composables/useChat.js'
+import ChatBubble from '../components/ChatBubble.vue'
 
 const ACTION_LABELS = {
   init: '初始化目录',
@@ -188,17 +189,6 @@ function clearChat() {
   border-color: var(--accent);
   color: #fff;
 }
-
-.content {
-  font-family: var(--font);
-  font-size: 14px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin: 0;
-}
-
-.cursor { animation: blink 1s step-end infinite; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 /* Action result card */
 .action-card {

@@ -103,7 +103,7 @@
       "question": "你用的是什么工具？",
       "header": "工具",
       "options": [
-        {"label": "Claude Code", "description": "命令行工具"},
+        {"label": "AI 工具（命令行）", "description": "如 Claude Code 等命令行工具"},
         {"label": "其他", "description": "Cursor/Trae 等"}
       ],
       "multiSelect": false

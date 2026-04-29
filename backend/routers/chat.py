@@ -116,78 +116,128 @@ def _safe_flush_len(text: str) -> int:
 
 def _make_stream(system_prompt: str, request: ChatRequest):
     model = request.model or settings.default_model
-    messages = [{"role": "system", "content": system_prompt}]
-    messages += [{"role": m.role, "content": m.content} for m in request.messages]
+    base_messages = [{"role": "system", "content": system_prompt}]
+    base_messages += [{"role": m.role, "content": m.content} for m in request.messages]
 
     async def generate():
         try:
-            # Buffer that accumulates text while we scan for skill_action tags.
-            buf = ""
+            current_messages = list(base_messages)
+            # Agentic loop: after each LLM round, if the model ran scripts, inject
+            # the output back as a user message and call the LLM again so it can
+            # reason about the results.  At most _MAX_ROUNDS to prevent infinite loops.
+            _MAX_ROUNDS = 5
 
-            async for chunk in stream_chat(messages, model):
-                buf += chunk
+            for _round in range(_MAX_ROUNDS):
+                buf = ""
+                # Track text chunks yielded this round so we can reconstruct the
+                # assistant message when feeding results back.
+                text_chunks: list[str] = []
+                script_results: list[dict] = []
 
-                # Drain all complete skill_action tags from the front of buf.
-                while True:
-                    open_pos = buf.find(_OPEN_TAG)
+                async for chunk in stream_chat(current_messages, model):
+                    buf += chunk
 
-                    if open_pos == -1:
-                        # No open tag present — emit safe prefix and stop.
-                        safe = _safe_flush_len(buf)
-                        if safe > 0:
-                            yield _sse({"content": buf[:safe]})
-                            buf = buf[safe:]
-                        break
+                    # Drain all complete skill_action tags from the front of buf.
+                    while True:
+                        open_pos = buf.find(_OPEN_TAG)
 
-                    # Emit text that precedes the open tag.
-                    if open_pos > 0:
-                        yield _sse({"content": buf[:open_pos]})
-                        buf = buf[open_pos:]
+                        if open_pos == -1:
+                            # No open tag present — emit safe prefix and stop.
+                            safe = _safe_flush_len(buf)
+                            if safe > 0:
+                                piece = buf[:safe]
+                                text_chunks.append(piece)
+                                yield _sse({"content": piece})
+                                buf = buf[safe:]
+                            break
 
-                    close_pos = buf.find(_CLOSE_TAG)
-                    if close_pos == -1:
-                        # Tag not yet complete; wait for more chunks.
-                        break
+                        # Emit text that precedes the open tag.
+                        if open_pos > 0:
+                            piece = buf[:open_pos]
+                            text_chunks.append(piece)
+                            yield _sse({"content": piece})
+                            buf = buf[open_pos:]
 
-                    # Extract JSON between the tags.
-                    json_str = buf[len(_OPEN_TAG):close_pos]
-                    buf = buf[close_pos + len(_CLOSE_TAG):]
+                        close_pos = buf.find(_CLOSE_TAG)
+                        if close_pos == -1:
+                            # Tag not yet complete; wait for more chunks.
+                            break
 
-                    try:
-                        action_data = json.loads(json_str)
-                        result = await asyncio.to_thread(
-                            skill_executor.run_action, action_data
-                        )
-                    except json.JSONDecodeError as exc:
-                        # First repair attempt: strip markdown code fences, then
-                        # escape unescaped control characters inside string values.
-                        logger.warning(
-                            "skill_action JSON parse error: %s — attempting repair", exc
-                        )
-                        repaired = _repair_json(_strip_code_fences(json_str))
+                        # Extract JSON between the tags.
+                        json_str = buf[len(_OPEN_TAG):close_pos]
+                        buf = buf[close_pos + len(_CLOSE_TAG):]
+
                         try:
-                            action_data = json.loads(repaired)
+                            action_data = json.loads(json_str)
                             result = await asyncio.to_thread(
                                 skill_executor.run_action, action_data
                             )
-                        except (json.JSONDecodeError, Exception) as repair_exc:
+                        except json.JSONDecodeError as exc:
+                            # First repair attempt: strip markdown code fences, then
+                            # escape unescaped control characters inside string values.
                             logger.warning(
-                                "skill_action JSON repair failed: %s", repair_exc
+                                "skill_action JSON parse error: %s — attempting repair", exc
                             )
-                            result = {
-                                "action": "unknown",
-                                "name": "",
-                                "success": False,
-                                "message": "动作标签 JSON 格式错误，请检查格式后重试",
-                                "path": None,
-                            }
+                            repaired = _repair_json(_strip_code_fences(json_str))
+                            try:
+                                action_data = json.loads(repaired)
+                                result = await asyncio.to_thread(
+                                    skill_executor.run_action, action_data
+                                )
+                            except (json.JSONDecodeError, Exception) as repair_exc:
+                                logger.warning(
+                                    "skill_action JSON repair failed: %s", repair_exc
+                                )
+                                result = {
+                                    "action": "unknown",
+                                    "name": "",
+                                    "success": False,
+                                    "message": "动作标签 JSON 格式错误，请检查格式后重试",
+                                    "path": None,
+                                }
 
-                    yield _sse({"action_result": result})
-                    # Continue the while-loop to process any further tags.
+                        yield _sse({"action_result": result})
 
-            # Flush remaining buffer after the stream ends.
-            if buf:
-                yield _sse({"content": buf})
+                        if result.get("action") == "run_script":
+                            script_results.append(result)
+                        # Continue the while-loop to process any further tags.
+
+                # Flush remaining buffer after the stream ends.
+                if buf:
+                    text_chunks.append(buf)
+                    yield _sse({"content": buf})
+
+                # If no scripts were run this round, the conversation is complete.
+                if not script_results:
+                    break
+
+                # ---------------------------------------------------------------
+                # Feed script results back into the conversation for the next round.
+                # Add the assistant's generated text, then the script outputs as a
+                # user message so the LLM can reason about what the scripts produced.
+                # ---------------------------------------------------------------
+                accumulated_text = "".join(text_chunks)
+                next_messages = list(current_messages)
+                if accumulated_text.strip():
+                    next_messages.append({"role": "assistant", "content": accumulated_text})
+
+                output_parts: list[str] = []
+                for r in script_results:
+                    lines = [
+                        f"[脚本执行结果: scripts/{r.get('filename', '')}]",
+                        f"退出码: {r.get('exit_code', '')}",
+                    ]
+                    if r.get("stdout"):
+                        lines.append(f"stdout:\n{r['stdout']}")
+                    if r.get("stderr"):
+                        lines.append(f"stderr:\n{r['stderr']}")
+                    output_parts.append("\n".join(lines))
+
+                next_messages.append({
+                    "role": "user",
+                    "content": "\n\n".join(output_parts),
+                })
+                current_messages = next_messages
 
             yield "data: [DONE]\n\n"
         except Exception as exc:

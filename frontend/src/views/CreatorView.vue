@@ -22,6 +22,8 @@
           <span class="action-name">{{ msg.name }}</span>
           <span class="action-msg">{{ msg.message }}</span>
           <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
+          <pre v-if="msg.stdout" class="action-output">{{ msg.stdout }}</pre>
+          <pre v-if="msg.stderr" class="action-stderr">{{ msg.stderr }}</pre>
         </div>
         <!-- regular chat bubble -->
         <div v-else class="message" :class="msg.role">
@@ -67,8 +69,10 @@ import ChatBubble from '../components/ChatBubble.vue'
 const ACTION_LABELS = {
   init: '初始化目录',
   write: '写入 SKILL.md',
+  write_file: '写入文件',
   validate: '校验格式',
   package: '打包 Skill',
+  run_script: '运行脚本',
 }
 
 function actionLabel(action) {
@@ -216,6 +220,20 @@ function clearChat() {
 .action-name { font-family: monospace; background: rgba(0,0,0,.07); padding: 1px 6px; border-radius: 4px; }
 .action-msg { flex: 1 1 100%; margin-top: 2px; opacity: .85; }
 .action-path { flex: 1 1 100%; font-family: monospace; font-size: 12px; opacity: .7; word-break: break-all; }
+.action-output, .action-stderr {
+  flex: 1 1 100%;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.action-output { background: rgba(0,0,0,.06); }
+.action-stderr { background: rgba(200,0,0,.07); }
 
 .input-area {
   padding: 12px 24px 20px;

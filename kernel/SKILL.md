@@ -137,13 +137,24 @@ description: Guide for creating effective skills. Use when users want to create 
 <skill_action>{"action":"validate","name":"skill-name"}</skill_action>
 ```
 
-**含 Python 脚本时**（需要自动化逻辑的 Skill），在 write 之后追加 write_file：
+**含 Python 脚本时**（需要自动化逻辑的 Skill），在 write 之后追加 write_file，最后可用 run_script 测试脚本：
 ```
 <skill_action>{"action":"init","name":"skill-name"}</skill_action>
 <skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
 <skill_action>{"action":"write_file","name":"skill-name","folder":"scripts","filename":"main.py","content":"#!/usr/bin/env python3\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"}</skill_action>
+<skill_action>{"action":"run_script","name":"skill-name","filename":"main.py","args":[],"stdin":""}</skill_action>
 <skill_action>{"action":"validate","name":"skill-name"}</skill_action>
 ```
+
+**run_script 字段说明**：
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | string | Skill 名称（与其他动作一致） |
+| `filename` | string | `scripts/` 目录下的 `.py` 文件名 |
+| `args` | array | 命令行参数列表，可为空 `[]` |
+| `stdin` | string | 标准输入内容，可为空 `""` |
+
+后端执行后会将 `stdout`、`stderr`、`exit_code` 自动注入对话，你可以在下一轮根据结果判断是否需要修复脚本。
 
 **含知识库/模板文件时**（三目录同时使用的完整示例）：
 ```

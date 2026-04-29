@@ -232,18 +232,23 @@ def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
             if any(p in ("..", "") or p.startswith("/") for p in parts):
                 raise ValueError(f"ZIP 包含非法路径: {entry}")
 
-        # Detect structure: rooted (top-level dir) vs flat (SKILL.md at root)
-        # Determine common prefix directory (if any)
-        prefix = ""
-        if names:
-            first = names[0]
-            candidate = first.split("/")[0] if "/" in first else ""
-            if candidate and all(n.startswith(candidate + "/") for n in names):
-                prefix = candidate + "/"
+        # Ignore macOS metadata entries (__MACOSX/) for structure detection.
+        # macOS zip creates these as the first entries, which would break the
+        # prefix detection if we naively took names[0].
+        real_names = [n for n in names if not n.startswith("__MACOSX/") and n != "__MACOSX"]
 
-        skill_md_path = prefix + "SKILL.md"
-        if skill_md_path not in names:
+        # Find SKILL.md directly to determine the ZIP structure.
+        # Accepts: "SKILL.md" (flat) or "prefix/SKILL.md" (one level rooted).
+        skill_md_candidates = [
+            n for n in real_names
+            if n == "SKILL.md" or (n.endswith("/SKILL.md") and n.count("/") == 1)
+        ]
+        if not skill_md_candidates:
             raise ValueError("ZIP 中缺少 SKILL.md 文件")
+
+        skill_md_path = skill_md_candidates[0]
+        # Derive prefix: "" for flat, "dir-name/" for rooted.
+        prefix = skill_md_path[: -len("SKILL.md")]
 
         # Read SKILL.md content
         skill_md_content = zf.read(skill_md_path).decode("utf-8")
@@ -274,6 +279,9 @@ def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
         entries_to_extract: list[zipfile.ZipInfo] = []
         for info in zf.infolist():
             entry_name = info.filename
+            # Skip macOS metadata entries
+            if entry_name.startswith("__MACOSX/") or entry_name == "__MACOSX":
+                continue
             # Strip prefix to get relative path inside the skill
             rel = entry_name[len(prefix):]
             if not rel or rel.endswith("/"):

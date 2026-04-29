@@ -47,6 +47,60 @@ _OPEN_TAG = "<skill_action>"
 _CLOSE_TAG = "</skill_action>"
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove markdown code fences that LLMs sometimes wrap around JSON.
+
+    Handles both ```json ... ``` and ``` ... ```.
+    """
+    stripped = text.strip()
+    for prefix in ("```json", "```"):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    if stripped.endswith("```"):
+        stripped = stripped[:-3]
+    return stripped.strip()
+
+
+def _repair_json(text: str) -> str:
+    """Attempt to repair common LLM JSON mistakes.
+
+    Uses a lightweight state machine to escape unescaped control characters
+    (newlines, carriage returns, tabs) that appear *inside* JSON string values.
+    LLMs often emit these literally instead of as ``\\n`` / ``\\r`` / ``\\t``.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                # Already-escaped sequence — copy both characters verbatim.
+                result.append(c)
+                if i + 1 < len(text):
+                    result.append(text[i + 1])
+                    i += 2
+                    continue
+            elif c == '"':
+                in_string = False
+                result.append(c)
+            elif c == "\n":
+                result.append("\\n")
+            elif c == "\r":
+                result.append("\\r")
+            elif c == "\t":
+                result.append("\\t")
+            else:
+                result.append(c)
+        else:
+            if c == '"':
+                in_string = True
+            result.append(c)
+        i += 1
+    return "".join(result)
+
+
 def _safe_flush_len(text: str) -> int:
     """Return how many leading characters of *text* can safely be emitted.
 
@@ -104,14 +158,28 @@ def _make_stream(system_prompt: str, request: ChatRequest):
                             skill_executor.run_action, action_data
                         )
                     except json.JSONDecodeError as exc:
-                        logger.warning("skill_action JSON parse error: %s", exc)
-                        result = {
-                            "action": "unknown",
-                            "name": "",
-                            "success": False,
-                            "message": "动作标签 JSON 格式错误，请检查格式后重试",
-                            "path": None,
-                        }
+                        # First repair attempt: strip markdown code fences, then
+                        # escape unescaped control characters inside string values.
+                        logger.warning(
+                            "skill_action JSON parse error: %s — attempting repair", exc
+                        )
+                        repaired = _repair_json(_strip_code_fences(json_str))
+                        try:
+                            action_data = json.loads(repaired)
+                            result = await asyncio.to_thread(
+                                skill_executor.run_action, action_data
+                            )
+                        except (json.JSONDecodeError, Exception) as repair_exc:
+                            logger.warning(
+                                "skill_action JSON repair failed: %s", repair_exc
+                            )
+                            result = {
+                                "action": "unknown",
+                                "name": "",
+                                "success": False,
+                                "message": "动作标签 JSON 格式错误，请检查格式后重试",
+                                "path": None,
+                            }
 
                     yield _sse({"action_result": result})
                     # Continue the while-loop to process any further tags.

@@ -108,6 +108,20 @@ description: Guide for creating effective skills. Use when users want to create 
 
 用户确认蓝图后，按顺序输出动作标签：
 
+### ⚠️ JSON 转义规则（生成动作标签前必须自检）
+
+`<skill_action>` 标签内必须是**合法 JSON 字符串**。`content` 字段的值是一个 JSON 字符串，其中所有特殊字符必须转义：
+
+| 字符 | ❌ 错误写法 | ✅ 正确写法 |
+|------|-----------|-----------|
+| 换行 | 直接按回车 | `\n` |
+| 双引号 | `"` | `\"` |
+| 反斜杠 | `\` | `\\` |
+| 制表符 | 直接 Tab | `\t` |
+
+**自检要求**：在输出任何 `<skill_action>` 标签前，逐字检查 `content` 值内是否有未转义的换行或引号。  
+**禁止**在标签内使用 Markdown 代码围栏（\`\`\`json ... \`\`\`），直接输出裸 JSON。
+
 **不含 Python 脚本时**（纯提示词 Skill）：
 ```
 <skill_action>{"action":"init","name":"skill-name"}</skill_action>
@@ -185,7 +199,7 @@ Body 原则：
 | `validate` | `name` | 校验 frontmatter 格式 |
 | `package` | `name` | 打包为 .skill 文件 |
 
-JSON 中换行用 `\n` 转义。标准顺序：init → write → write_file（可选，可多次）→ validate → package（可选）。
+标准顺序：init → write → write_file（可选，可多次）→ validate → package（可选）。
 
 ---
 

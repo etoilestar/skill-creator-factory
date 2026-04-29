@@ -1,11 +1,13 @@
 """Skill Executor — runs kernel/scripts actions requested by the LLM.
 
-Supported actions: init, write, write_file, validate, package.
+Supported actions: init, write, write_file, validate, package, run_script.
 All return a uniform dict: {action, name, success, message, path}.
+run_script additionally returns: {stdout, stderr, exit_code, filename}.
 """
 
 import importlib.util
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -75,6 +77,14 @@ def run_action(action: dict) -> dict:
             return _run_validate(name, skill_dir)
         if action_type == "package":
             return _run_package(name, skill_dir)
+        if action_type == "run_script":
+            return _run_script(
+                name,
+                action.get("filename", ""),
+                action.get("args", []),
+                action.get("stdin", ""),
+                skill_dir,
+            )
         return {
             "action": action_type,
             "name": name,
@@ -246,3 +256,81 @@ def _run_write_file(name: str, folder: str, filename: str, content: str, skill_d
         "message": f"{folder}/{safe} 已写入",
         "path": str(dest),
     }
+
+
+# ---------------------------------------------------------------------------
+# run_script action
+# ---------------------------------------------------------------------------
+
+_SCRIPT_RUN_TIMEOUT = 30   # seconds
+_MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB per stream
+
+
+def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Path) -> dict:
+    """Execute a Python script from skills/{name}/scripts/ and return its output.
+
+    Called via asyncio.to_thread so blocking subprocess.run is safe here.
+    """
+    _empty = {"stdout": "", "stderr": "", "exit_code": -1, "filename": filename}
+
+    safe = _safe_filename(filename)
+    if safe is None or not safe.endswith(".py"):
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": "文件名非法或不是 .py 文件", "path": None, **_empty,
+        }
+
+    if not skill_dir.exists():
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": f"Skill '{name}' 目录不存在，请先执行 init", "path": None, **_empty,
+        }
+
+    script_path = skill_dir / "scripts" / safe
+    if not script_path.is_file():
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": f"脚本 '{safe}' 不存在，请先用 write_file 写入", "path": None, **_empty,
+        }
+
+    for arg in (args or []):
+        if "\x00" in str(arg):
+            return {
+                "action": "run_script", "name": name, "success": False,
+                "message": "参数包含非法字符", "path": None, **_empty,
+            }
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path), *(str(a) for a in (args or []))],
+            input=stdin.encode("utf-8") if stdin else b"",
+            capture_output=True,
+            timeout=_SCRIPT_RUN_TIMEOUT,
+            cwd=str(skill_dir / "scripts"),
+        )
+        stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        success = proc.returncode == 0
+        return {
+            "action": "run_script",
+            "name": name,
+            "success": success,
+            "message": f"脚本退出码: {proc.returncode}",
+            "path": str(script_path),
+            "filename": safe,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": proc.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": f"脚本执行超时（超过 {_SCRIPT_RUN_TIMEOUT} 秒）",
+            "path": None, **_empty,
+        }
+    except Exception as exc:  # pragma: no cover
+        logger.exception("run_script subprocess error")
+        return {
+            "action": "run_script", "name": name, "success": False,
+            "message": f"脚本执行失败: {exc}", "path": None, **_empty,
+        }

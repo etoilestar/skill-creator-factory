@@ -99,6 +99,26 @@ export async function deleteAsset(skillName, folder, filename) {
   return res.json()
 }
 
+export async function importSkillZip(file, overwrite = false) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('overwrite', overwrite ? 'true' : 'false')
+  const res = await fetch('/api/skills/import', {
+    method: 'POST',
+    body: form,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    const detail = err.detail
+    const message = (typeof detail === 'object' ? detail.message : detail) || 'Import failed'
+    const e = new Error(message)
+    e.status = res.status
+    e.skillName = typeof detail === 'object' ? (detail.skill_name || '') : ''
+    throw e
+  }
+  return res.json()
+}
+
 export async function fetchLlmHealth() {
   const res = await fetch('/api/health/llm')
   if (!res.ok) throw new Error('Health check failed')

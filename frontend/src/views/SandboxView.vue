@@ -27,16 +27,33 @@
           <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
           <p>向它发送消息，测试它的行为。</p>
         </div>
-        <div
-          v-for="(msg, i) in messages"
-          :key="i"
-          class="message"
-          :class="msg.role"
-        >
-          <div class="bubble">
-            <ChatBubble :content="msg.content" />
+        <template v-for="(msg, i) in messages" :key="i">
+          <!-- action result card -->
+          <div
+            v-if="msg.role === 'system'"
+            class="action-card"
+            :class="msg.success ? 'ok' : 'fail'"
+            :aria-label="msg.success ? '操作成功' : '操作失败'"
+          >
+            <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
+            <span class="action-label">{{ actionLabel(msg.action) }}</span>
+            <span class="action-name">{{ msg.name }}</span>
+            <span class="action-msg">{{ msg.message }}</span>
+            <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
+            <pre v-if="msg.stdout" class="action-output">{{ msg.stdout }}</pre>
+            <pre v-if="msg.stderr" class="action-stderr">{{ msg.stderr }}</pre>
           </div>
-        </div>
+          <!-- regular chat bubble -->
+          <div
+            v-else
+            class="message"
+            :class="msg.role"
+          >
+            <div class="bubble">
+              <ChatBubble :content="msg.content" />
+            </div>
+          </div>
+        </template>
         <div v-if="streaming" class="message assistant">
           <div class="bubble">
             <ChatBubble :content="streamBuffer" :streaming="true" />
@@ -67,10 +84,23 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
 import { streamChat } from '../composables/useChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
+
+const ACTION_LABELS = {
+  run_script: '运行脚本',
+  init: '初始化目录',
+  write: '写入 SKILL.md',
+  write_file: '写入文件',
+  validate: '校验格式',
+  package: '打包 Skill',
+}
+
+function actionLabel(action) {
+  return ACTION_LABELS[action] || action
+}
 
 const skills = ref([])
 const selectedSkill = ref('')
@@ -80,6 +110,9 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
+
+// Exclude system action-result cards from the history sent to the LLM.
+const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
 onMounted(async () => {
   skills.value = await fetchSkills()
@@ -113,13 +146,30 @@ async function send() {
 
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
-    for await (const chunk of streamChat(url, { messages: messages.value })) {
-      if (typeof chunk !== 'string') continue
-      streamBuffer.value += chunk
-      await scrollBottom()
+    for await (const chunk of streamChat(url, { messages: chatHistory.value })) {
+      if (typeof chunk === 'string') {
+        streamBuffer.value += chunk
+        await scrollBottom()
+      } else if (chunk.type === 'action_result') {
+        const r = chunk.data
+        messages.value.push({
+          role: 'system',
+          action: r.action,
+          name: r.name,
+          success: r.success,
+          message: r.message,
+          path: r.path,
+          stdout: r.stdout || '',
+          stderr: r.stderr || '',
+          exit_code: r.exit_code,
+        })
+        await scrollBottom()
+      }
     }
-    messages.value.push({ role: 'assistant', content: streamBuffer.value })
-    streamBuffer.value = ''
+    if (streamBuffer.value) {
+      messages.value.push({ role: 'assistant', content: streamBuffer.value })
+      streamBuffer.value = ''
+    }
   } catch (e) {
     error.value = e.message
   } finally {
@@ -182,6 +232,47 @@ async function send() {
   border-color: var(--accent);
   color: #fff;
 }
+
+/* Action result card */
+.action-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  border: 1px solid transparent;
+}
+.action-card.ok {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #166534;
+}
+.action-card.fail {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+.action-icon { font-size: 15px; }
+.action-label { font-weight: 600; }
+.action-name { font-family: monospace; background: rgba(0,0,0,.07); padding: 1px 6px; border-radius: 4px; }
+.action-msg { flex: 1 1 100%; margin-top: 2px; opacity: .85; }
+.action-path { flex: 1 1 100%; font-family: monospace; font-size: 12px; opacity: .7; word-break: break-all; }
+.action-output, .action-stderr {
+  flex: 1 1 100%;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.action-output { background: rgba(0,0,0,.06); }
+.action-stderr { background: rgba(200,0,0,.07); }
 
 .input-area {
   padding: 12px 24px 20px;

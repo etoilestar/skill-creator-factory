@@ -76,12 +76,13 @@ def _repair_json(text: str) -> str:
         c = text[i]
         if in_string:
             if c == "\\":
-                # Already-escaped sequence — copy both characters verbatim.
+                # Already-escaped sequence — consume both chars and move on.
                 result.append(c)
-                if i + 1 < len(text):
-                    result.append(text[i + 1])
-                    i += 2
-                    continue
+                i += 1
+                if i < len(text):
+                    result.append(text[i])
+                    i += 1
+                continue
             elif c == '"':
                 in_string = False
                 result.append(c)

@@ -106,13 +106,59 @@ description: Guide for creating effective skills. Use when users want to create 
 
 ## Phase 3：生成 Skill 文件
 
-用户确认蓝图后，按顺序输出动作标签：
+用户确认蓝图后，按顺序输出动作标签。
 
+### 目录用途（write_file 的 folder 参数选择依据）
+
+| folder | 存放内容 | 典型文件 |
+|--------|---------|---------|
+| `scripts` | 需要执行的 Python 逻辑 | `main.py`, `utils.py` |
+| `references` | 领域知识、提示词模板、FAQ、示例库 | `faq.md`, `prompt-template.txt`, `examples.md` |
+| `assets` | Jinja/文档模板、配置文件、静态种子数据 | `report.jinja2`, `config.yaml`, `seed-data.json` |
+
+### ⚠️ JSON 转义规则（生成动作标签前必须自检）
+
+`<skill_action>` 标签内必须是**合法 JSON 字符串**。`content` 字段的值是一个 JSON 字符串，其中所有特殊字符必须转义：
+
+| 字符 | ❌ 错误写法 | ✅ 正确写法 |
+|------|-----------|-----------|
+| 换行 | 直接按回车 | `\n` |
+| 双引号 | `"` | `\"` |
+| 反斜杠 | `\` | `\\` |
+| 制表符 | 直接 Tab | `\t` |
+
+**自检要求**：在输出任何 `<skill_action>` 标签前，逐字检查 `content` 值内是否有未转义的换行或引号。  
+**禁止**在标签内使用 Markdown 代码围栏（\`\`\`json ... \`\`\`），直接输出裸 JSON。
+
+**不含 Python 脚本时**（纯提示词 Skill）：
 ```
 <skill_action>{"action":"init","name":"skill-name"}</skill_action>
 <skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
 <skill_action>{"action":"validate","name":"skill-name"}</skill_action>
 ```
+
+**含 Python 脚本时**（需要自动化逻辑的 Skill），在 write 之后追加 write_file：
+```
+<skill_action>{"action":"init","name":"skill-name"}</skill_action>
+<skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n..."}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"scripts","filename":"main.py","content":"#!/usr/bin/env python3\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"}</skill_action>
+<skill_action>{"action":"validate","name":"skill-name"}</skill_action>
+```
+
+**含知识库/模板文件时**（三目录同时使用的完整示例）：
+```
+<skill_action>{"action":"init","name":"skill-name"}</skill_action>
+<skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n\n参考示例见 [references/examples.md](references/examples.md)。\n输出模板见 assets/report.jinja2。\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"references","filename":"examples.md","content":"# 示例\n\n## 示例一\n输入：...\n输出：...\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"assets","filename":"report.jinja2","content":"# {{ title }}\n\n{{ body }}\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"scripts","filename":"main.py","content":"#!/usr/bin/env python3\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"}</skill_action>
+<skill_action>{"action":"validate","name":"skill-name"}</skill_action>
+```
+
+> **何时生成 write_file**：
+> - **scripts/**：需要文件处理、API 调用、数据转换、自动化等代码执行场景
+> - **references/**：SKILL.md 中有超过 30 行的知识内容、示例集合、提示词模板时，抽出来放此处，SKILL.md body 用相对路径引用（`[参考](references/xxx.md)`）
+> - **assets/**：Skill 运行时依赖的固定模板文件（如 Jinja2 模板、YAML 配置），不适合内嵌在 SKILL.md 中时放此处
 
 ### SKILL.md 编写规范
 
@@ -170,10 +216,11 @@ Body 原则：
 |--------|----------|------|
 | `init` | `name` | 初始化目录（scripts/、references/、assets/） |
 | `write` | `name`, `content` | 写入 SKILL.md（新建或覆盖） |
+| `write_file` | `name`, `folder`, `filename`, `content` | 写入子目录文件；`folder` 为 `scripts`/`references`/`assets` 之一 |
 | `validate` | `name` | 校验 frontmatter 格式 |
 | `package` | `name` | 打包为 .skill 文件 |
 
-JSON 中换行用 `\n` 转义。标准顺序：init → write → validate → package（可选）。
+标准顺序：init → write → write_file（可选，可多次）→ validate → package（可选）。
 
 ---
 

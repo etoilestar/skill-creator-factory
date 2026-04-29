@@ -106,7 +106,15 @@ description: Guide for creating effective skills. Use when users want to create 
 
 ## Phase 3：生成 Skill 文件
 
-用户确认蓝图后，按顺序输出动作标签：
+用户确认蓝图后，按顺序输出动作标签。
+
+### 目录用途（write_file 的 folder 参数选择依据）
+
+| folder | 存放内容 | 典型文件 |
+|--------|---------|---------|
+| `scripts` | 需要执行的 Python 逻辑 | `main.py`, `utils.py` |
+| `references` | 领域知识、提示词模板、FAQ、示例库 | `faq.md`, `prompt-template.txt`, `examples.md` |
+| `assets` | Jinja/文档模板、配置文件、静态种子数据 | `report.jinja2`, `config.yaml`, `seed-data.json` |
 
 ### ⚠️ JSON 转义规则（生成动作标签前必须自检）
 
@@ -137,7 +145,20 @@ description: Guide for creating effective skills. Use when users want to create 
 <skill_action>{"action":"validate","name":"skill-name"}</skill_action>
 ```
 
-> **何时生成 write_file**：用户需求中包含文件处理、API 调用、数据转换、自动化等需要代码执行的场景时，生成对应 Python 脚本并用 `write_file` 写入 `scripts/` 目录。参考文档可写入 `references/`，模板文件写入 `assets/`。
+**含知识库/模板文件时**（三目录同时使用的完整示例）：
+```
+<skill_action>{"action":"init","name":"skill-name"}</skill_action>
+<skill_action>{"action":"write","name":"skill-name","content":"---\nname: skill-name\ndescription: ...\n---\n\n# Skill Title\n\n参考示例见 [references/examples.md](references/examples.md)。\n输出模板见 assets/report.jinja2。\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"references","filename":"examples.md","content":"# 示例\n\n## 示例一\n输入：...\n输出：...\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"assets","filename":"report.jinja2","content":"# {{ title }}\n\n{{ body }}\n"}</skill_action>
+<skill_action>{"action":"write_file","name":"skill-name","folder":"scripts","filename":"main.py","content":"#!/usr/bin/env python3\n\ndef main():\n    pass\n\nif __name__ == '__main__':\n    main()\n"}</skill_action>
+<skill_action>{"action":"validate","name":"skill-name"}</skill_action>
+```
+
+> **何时生成 write_file**：
+> - **scripts/**：需要文件处理、API 调用、数据转换、自动化等代码执行场景
+> - **references/**：SKILL.md 中有超过 30 行的知识内容、示例集合、提示词模板时，抽出来放此处，SKILL.md body 用相对路径引用（`[参考](references/xxx.md)`）
+> - **assets/**：Skill 运行时依赖的固定模板文件（如 Jinja2 模板、YAML 配置），不适合内嵌在 SKILL.md 中时放此处
 
 ### SKILL.md 编写规范
 

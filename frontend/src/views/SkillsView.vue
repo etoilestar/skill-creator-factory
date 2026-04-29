@@ -2,7 +2,13 @@
   <div class="skills-page">
     <div class="header">
       <h2>Skills 库</h2>
-      <button class="btn-primary" @click="openNew">+ 新建 Skill</button>
+      <div class="header-actions">
+        <button class="btn-primary" @click="openNew">+ 新建 Skill</button>
+        <label class="btn-secondary zip-import-label" title="导入来自 skillsmp 的 .zip 文件">
+          📦 导入 ZIP
+          <input ref="zipInputRef" type="file" accept=".zip" class="hidden-file-input" @change="onZipChange" />
+        </label>
+      </div>
     </div>
 
     <div class="body">
@@ -108,6 +114,38 @@
     </div>
   </div>
 
+  <!-- ZIP Import modal -->
+  <div v-if="zipImport" class="overlay" @click.self="cancelZipImport">
+    <div class="dialog">
+      <p style="margin-bottom:8px;font-weight:600;">📦 导入 Skill ZIP</p>
+      <p class="muted" style="font-size:13px;margin-bottom:16px;">文件：{{ zipImport.filename }}</p>
+
+      <!-- Conflict confirmation -->
+      <template v-if="zipImport.conflict">
+        <p style="margin-bottom:16px;">
+          技能 <strong>{{ zipImport.conflictName }}</strong> 已存在，是否覆盖？
+        </p>
+        <div class="dialog-actions">
+          <button class="btn-danger" :disabled="zipImport.loading" @click="doImportZip(true)">
+            {{ zipImport.loading ? '导入中…' : '覆盖导入' }}
+          </button>
+          <button class="btn-ghost" @click="cancelZipImport">取消</button>
+        </div>
+      </template>
+
+      <!-- Normal state -->
+      <template v-else>
+        <div v-if="zipImport.error" class="error" style="margin-bottom:12px;">{{ zipImport.error }}</div>
+        <div class="dialog-actions">
+          <button class="btn-primary" :disabled="zipImport.loading" @click="doImportZip(false)">
+            {{ zipImport.loading ? '导入中…' : '导入' }}
+          </button>
+          <button class="btn-ghost" @click="cancelZipImport">取消</button>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- Delete confirm -->
     <div v-if="deleteTarget" class="overlay" @click.self="deleteTarget = null">
       <div class="dialog">
@@ -123,7 +161,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset, fetchAssetContent, saveAssetContent } from '../composables/useSkills.js'
+import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset, fetchAssetContent, saveAssetContent, importSkillZip } from '../composables/useSkills.js'
 
 const skills = ref([])
 const selected = ref(null)
@@ -289,6 +327,44 @@ async function saveAssetEdit() {
   }
 }
 
+// zip import
+const zipInputRef = ref(null)
+const zipImport = ref(null)  // null | { filename, file, loading, error, conflict, conflictName }
+
+function onZipChange(e) {
+  const file = e.target.files[0]
+  if (zipInputRef.value) zipInputRef.value.value = ''
+  if (!file) return
+  zipImport.value = { filename: file.name, file, loading: false, error: '', conflict: false, conflictName: '' }
+}
+
+function cancelZipImport() {
+  zipImport.value = null
+}
+
+async function doImportZip(overwrite) {
+  if (!zipImport.value) return
+  zipImport.value.loading = true
+  zipImport.value.error = ''
+  zipImport.value.conflict = false
+  try {
+    const result = await importSkillZip(zipImport.value.file, overwrite)
+    zipImport.value = null
+    await load()
+    selected.value = await fetchSkill(result.name)
+    await loadAssets(result.name)
+  } catch (e) {
+    if (e.status === 409) {
+      zipImport.value.conflict = true
+      zipImport.value.conflictName = e.skillName || ''
+      zipImport.value.loading = false
+    } else {
+      zipImport.value.error = e.message
+      zipImport.value.loading = false
+    }
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -304,6 +380,26 @@ onMounted(load)
   flex-shrink: 0;
 }
 .header h2 { font-size: 18px; font-weight: 600; }
+.header-actions { display: flex; gap: 8px; align-items: center; }
+
+.zip-import-label {
+  cursor: pointer;
+}
+.hidden-file-input {
+  display: none;
+}
+.btn-secondary {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  padding: 8px 16px;
+  font: inherit;
+  transition: background 0.15s, border-color 0.15s;
+  cursor: pointer;
+  display: inline-block;
+}
+.btn-secondary:hover { background: var(--surface); border-color: var(--accent); }
 
 .body { display: flex; flex: 1; overflow: hidden; }
 

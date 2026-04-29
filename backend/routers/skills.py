@@ -10,6 +10,7 @@ from ..services.skill_manager import (
     delete_skill,
     get_asset,
     get_skill,
+    import_skill_zip,
     list_skill_assets,
     list_skills,
     save_asset,
@@ -21,6 +22,7 @@ from ..config import settings
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+_MAX_ZIP_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 class SaveSkillRequest(BaseModel):
@@ -32,6 +34,28 @@ class SaveSkillRequest(BaseModel):
 async def get_all_skills():
     """List all skills in the skills directory."""
     return list_skills()
+
+
+@router.post("/import")
+async def import_skill_from_zip(
+    file: UploadFile = File(...),
+    overwrite: bool = Form(False),
+):
+    """Import a skill from a .zip file (e.g. downloaded from skillsmp).
+
+    Returns 409 Conflict when the skill already exists and overwrite is False.
+    """
+    if file.size is not None and file.size > _MAX_ZIP_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ZIP 文件超过 50 MB 限制")
+    data = await file.read()
+    if len(data) > _MAX_ZIP_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ZIP 文件超过 50 MB 限制")
+    try:
+        return import_skill_zip(data, overwrite=overwrite)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail={"message": f"Skill '{exc}' 已存在", "skill_name": str(exc)})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/{skill_name}")

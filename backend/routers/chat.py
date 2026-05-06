@@ -109,6 +109,8 @@ _INTERPRETER_APT_PACKAGES: dict[str, str] = {
 
 # 已尝试自动安装的解释器集合（避免同一进程内重复安装）
 _auto_install_attempted: set[str] = set()
+_auto_install_lock = __import__("threading").Lock()
+_apt_update_performed: bool = False
 
 
 def _try_auto_install_interpreter(interpreter: str) -> bool:
@@ -118,9 +120,12 @@ def _try_auto_install_interpreter(interpreter: str) -> bool:
     同一进程内同一解释器只尝试安装一次。
     返回 True 表示安装后解释器可用，False 表示安装失败或不支持。
     """
-    if interpreter in _auto_install_attempted:
-        return shutil.which(interpreter) is not None
-    _auto_install_attempted.add(interpreter)
+    global _apt_update_performed
+
+    with _auto_install_lock:
+        if interpreter in _auto_install_attempted:
+            return shutil.which(interpreter) is not None
+        _auto_install_attempted.add(interpreter)
 
     apt_get = shutil.which("apt-get")
     if apt_get is None:
@@ -157,14 +162,14 @@ def _try_auto_install_interpreter(interpreter: str) -> bool:
     logger.info("auto-install: apt-get install -y %s (for interpreter %s) ...", pkg, interpreter)
     try:
         # 先更新索引（只在当次进程首次 apt 安装时执行）
-        if not getattr(_try_auto_install_interpreter, "_apt_updated", False):
+        if not _apt_update_performed:
             subprocess.run(
                 [apt_get, "update", "-qq"],
                 timeout=60,
                 capture_output=True,
                 check=False,
             )
-            _try_auto_install_interpreter._apt_updated = True  # type: ignore[attr-defined]
+            _apt_update_performed = True
 
         result = subprocess.run(
             [apt_get, "install", "-y", "--no-install-recommends", pkg],

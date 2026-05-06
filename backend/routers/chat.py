@@ -95,6 +95,95 @@ _SCRIPT_INTERPRETERS: dict[str, str] = {
     ".ts":   "ts-node",   # 特殊处理：通过 `npx ts-node` 执行
 }
 
+# 解释器 → apt 包名映射（运行时自动安装兜底）
+_INTERPRETER_APT_PACKAGES: dict[str, str] = {
+    "node":    "nodejs",
+    "nodejs":  "nodejs",
+    "npm":     "npm",
+    "npx":     "npm",      # npx 随 npm 一起安装
+    "ts-node": "ts-node",  # 通过 npm 全局安装，见下方特殊处理
+    "ruby":    "ruby",
+    "bash":    "bash",
+    "python3": "python3",
+}
+
+# 已尝试自动安装的解释器集合（避免同一进程内重复安装）
+_auto_install_attempted: set[str] = set()
+
+
+def _try_auto_install_interpreter(interpreter: str) -> bool:
+    """尝试通过系统包管理器（apt-get）自动安装缺失的解释器。
+
+    只在 Linux 环境且具备 apt-get 时生效；安装结果会被缓存，
+    同一进程内同一解释器只尝试安装一次。
+    返回 True 表示安装后解释器可用，False 表示安装失败或不支持。
+    """
+    if interpreter in _auto_install_attempted:
+        return shutil.which(interpreter) is not None
+    _auto_install_attempted.add(interpreter)
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        logger.info("auto-install: apt-get not available, skipping install of %s", interpreter)
+        return False
+
+    # ts-node 通过 npm 全局安装，而不是 apt-get
+    if interpreter == "ts-node":
+        npm_bin = shutil.which("npm")
+        if npm_bin is None:
+            logger.warning("auto-install: npm not found, cannot install ts-node")
+            return False
+        logger.info("auto-install: installing ts-node via npm ...")
+        try:
+            result = subprocess.run(
+                [npm_bin, "install", "-g", "ts-node", "typescript"],
+                timeout=120,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                logger.info("auto-install: ts-node installed successfully")
+            else:
+                logger.warning("auto-install: ts-node install failed: %s", result.stderr[:500])
+        except Exception as exc:
+            logger.warning("auto-install: ts-node install exception: %s", exc)
+        return shutil.which("ts-node") is not None
+
+    pkg = _INTERPRETER_APT_PACKAGES.get(interpreter)
+    if pkg is None:
+        logger.info("auto-install: no apt package known for interpreter %s", interpreter)
+        return False
+
+    logger.info("auto-install: apt-get install -y %s (for interpreter %s) ...", pkg, interpreter)
+    try:
+        # 先更新索引（只在当次进程首次 apt 安装时执行）
+        if not getattr(_try_auto_install_interpreter, "_apt_updated", False):
+            subprocess.run(
+                [apt_get, "update", "-qq"],
+                timeout=60,
+                capture_output=True,
+                check=False,
+            )
+            _try_auto_install_interpreter._apt_updated = True  # type: ignore[attr-defined]
+
+        result = subprocess.run(
+            [apt_get, "install", "-y", "--no-install-recommends", pkg],
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            logger.info("auto-install: %s installed successfully", pkg)
+        else:
+            logger.warning("auto-install: install failed (rc=%d): %s", result.returncode, result.stderr[:500])
+    except subprocess.TimeoutExpired:
+        logger.warning("auto-install: apt-get install %s timed out", pkg)
+    except Exception as exc:
+        logger.warning("auto-install: apt-get install %s exception: %s", pkg, exc)
+
+    return shutil.which(interpreter) is not None
+
+
 
 def _friendly_error(exc: Exception) -> str:
     """Convert LLM proxy exceptions to user-facing messages without leaking internals."""
@@ -1563,6 +1652,8 @@ def _prepare_command_argv(
             if interpreter is not None:
                 # .ts 特殊处理：直接检查 ts-node 或通过 npx 运行
                 if ext == ".ts":
+                    if shutil.which("ts-node") is None:
+                        _try_auto_install_interpreter("ts-node")
                     if shutil.which("ts-node") is not None:
                         argv = ["ts-node", str(exe_path)] + argv[1:]
                     elif shutil.which("npx") is not None:
@@ -1572,6 +1663,9 @@ def _prepare_command_argv(
                             f"无法执行 {executable}：需要 ts-node 或 npx，但它们均不在 PATH 中。"
                         )
                 else:
+                    if shutil.which(interpreter) is None:
+                        # 尝试自动安装后再检查一次
+                        _try_auto_install_interpreter(interpreter)
                     if shutil.which(interpreter) is None:
                         raise ValueError(
                             f"无法执行 {executable}：需要解释器 {interpreter}，但它不在 PATH 中。"
@@ -1587,6 +1681,9 @@ def _prepare_command_argv(
     # 2. argv[0] 是裸命令：python、node、bash、ffmpeg、convert 等
     # 不做白名单，只检查系统 PATH 中是否存在。
     else:
+        if shutil.which(executable) is None:
+            # 尝试自动安装后再检查一次
+            _try_auto_install_interpreter(executable)
         if shutil.which(executable) is None:
             raise ValueError(
                 f"命令不可执行：{executable} 不在 PATH 中，也不是当前 Skill 内的可执行文件。"

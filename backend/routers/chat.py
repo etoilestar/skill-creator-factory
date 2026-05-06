@@ -1,6 +1,12 @@
-import asyncio
+import hashlib
+import shutil
 import json
 import logging
+import re
+import shlex
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -9,9 +15,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..config import settings
-from ..services.kernel_loader import load_kernel_system_prompt, load_skill_system_prompt
-from ..services.llm_proxy import stream_chat
-from ..services import skill_executor
+from ..services.kernel_loader import (
+    load_kernel_metadata_prompt,
+    load_kernel_body_prompt,
+    load_skill_metadata_prompt,
+    load_skill_body_prompt,
+    load_child_skill_body_prompt,
+    read_skill_resource_text,
+)
+from ..services.llm_proxy import complete_chat_once, stream_chat
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +40,59 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
 
 
+@dataclass
+class MarkdownBlock:
+    """A fenced Markdown block from the main model output."""
+    index: int
+    lang: str
+    code: str
+    before_context: str
+    after_context: str
+
+
+_EXECUTABLE_FENCE_RE = re.compile(
+    r"```(?P<lang>bash|sh|shell)\s*\n(?P<code>.*?)\n```",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_ALL_FENCE_RE = re.compile(
+    r"(?P<fence>`{3,})(?P<info>[^\n`]*)\n(?P<code>[\s\S]*?)\n(?=\1)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_PYTHON_HEREDOC_RE = re.compile(
+    r"^\s*(?P<python>python3?|[\w./-]*python3?)\s+-\s+<<[ \t]*['\"]?(?P<tag>[A-Za-z_][A-Za-z0-9_]*)['\"]?[ \t]*\n"
+    r"(?P<script>.*?)\n(?P=tag)[ \t]*;?\s*$",
+    re.DOTALL,
+)
+
+_CONFIRM_KEYWORDS = (
+    "对，开始做吧",
+    "开始做吧",
+    "开始创建",
+    "开始生成",
+    "确认，开始",
+    "确认开始",
+    "可以开始",
+    "没问题，开始",
+)
+
+_FORBIDDEN_PATH_PARTS = {"..", ""}
+_SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
+_ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
+
+
 def _friendly_error(exc: Exception) -> str:
     """Convert LLM proxy exceptions to user-facing messages without leaking internals."""
     if isinstance(exc, httpx.ConnectError):
-        return "无法连接到 LLM 服务，请确认 Ollama/LM Studio 已启动"
+        return "无法连接到 LLM 服务，请确认 Ollama 已启动，且端口可访问"
+
     if isinstance(exc, httpx.HTTPStatusError):
         return f"LLM 服务返回错误: HTTP {exc.response.status_code}"
+
     if isinstance(exc, httpx.TimeoutException):
         return "LLM 服务响应超时，请重试"
+
     return "生成时发生错误，请重试"
 
 
@@ -43,225 +100,2178 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-_OPEN_TAG = "<skill_action>"
-_CLOSE_TAG = "</skill_action>"
+def _request_messages(request: ChatRequest) -> list[dict]:
+    return [{"role": m.role, "content": m.content} for m in request.messages]
 
 
-def _strip_code_fences(text: str) -> str:
-    """Remove markdown code fences that LLMs sometimes wrap around JSON.
+def _last_user_text(request: ChatRequest) -> str:
+    for message in reversed(request.messages):
+        if message.role == "user":
+            return message.content or ""
+    return ""
 
-    Handles both ```json ... ``` and ``` ... ```.
-    """
+
+def _has_creation_confirmation(request: ChatRequest) -> bool:
+    """Only execute generated file-operation blocks after explicit user confirmation."""
+    text = _last_user_text(request).strip()
+    return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
+
+
+def _strip_markdown_json_fence(text: str) -> str:
+    """Remove common markdown code fences around JSON."""
     stripped = text.strip()
-    for prefix in ("```json", "```"):
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix):]
-            break
+
+    if stripped.startswith("```json"):
+        stripped = stripped[len("```json"):].strip()
+    elif stripped.startswith("```"):
+        stripped = stripped[len("```"):].strip()
+
     if stripped.endswith("```"):
-        stripped = stripped[:-3]
-    return stripped.strip()
+        stripped = stripped[:-3].strip()
+
+    return stripped
 
 
-def _repair_json(text: str) -> str:
-    """Attempt to repair common LLM JSON mistakes.
+def _parse_need_body_decision(text: str) -> bool:
+    """Parse first-round metadata decision.
 
-    Uses a lightweight state machine to escape unescaped control characters
-    (newlines, carriage returns, tabs) that appear *inside* JSON string values.
-    LLMs often emit these literally instead of as ``\\n`` / ``\\r`` / ``\\t``.
+    解析失败时默认进入正文阶段，避免模型格式错误导致 Skill 无法执行。
+    """
+    stripped = _strip_markdown_json_fence(text)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("metadata decision is not valid JSON: %s", text[:500])
+        return True
+
+    need_body = data.get("need_body", True)
+
+    if isinstance(need_body, bool):
+        return need_body
+
+    if isinstance(need_body, str):
+        return need_body.strip().lower() in {"true", "1", "yes", "y"}
+
+    return bool(need_body)
+
+def _parse_child_skill_decision(
+    text: str,
+    *,
+    valid_child_refs: set[str] | None = None,
+) -> dict:
+    """Parse child-skill loading decision.
+
+    关键规则：
+    - 只有 child_ref 出现在 Child Skills Manifest 的真实 ref 中，才允许 need_child=true。
+    - 模型复制示例 ref 或猜测不存在 ref 时，一律降级为 need_child=false。
+    """
+    valid_child_refs = valid_child_refs or set()
+    stripped = _strip_markdown_json_fence(text)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("child skill decision is not valid JSON: %s", text[:500])
+        return {"need_child": False, "child_ref": "", "reason": "JSON 解析失败"}
+
+    if not isinstance(data, dict):
+        return {"need_child": False, "child_ref": "", "reason": "输出不是 JSON object"}
+
+    need_child = data.get("need_child", False)
+
+    if isinstance(need_child, str):
+        need_child = need_child.strip().lower() in {"true", "1", "yes", "y"}
+    else:
+        need_child = bool(need_child)
+
+    child_ref = str(data.get("child_ref") or "").strip()
+    reason = str(data.get("reason") or "").strip()
+
+    if not need_child:
+        return {"need_child": False, "child_ref": "", "reason": reason}
+
+    if not child_ref:
+        return {
+            "need_child": False,
+            "child_ref": "",
+            "reason": "need_child=true 但缺少 child_ref",
+        }
+
+    if child_ref not in valid_child_refs:
+        return {
+            "need_child": False,
+            "child_ref": "",
+            "reason": (
+                "模型返回的 child_ref 不在 Child Skills Manifest 中，已忽略："
+                + child_ref
+            ),
+        }
+
+    return {
+        "need_child": True,
+        "child_ref": child_ref,
+        "reason": reason,
+    }
+
+def _extract_child_refs_from_metadata_prompt(metadata_prompt: str) -> set[str]:
+    """Extract valid child skill refs from Child Skills Manifest.
+
+    只信任 metadata prompt 中真实出现的：
+    - ref: `xxx`
+    """
+    refs: set[str] = set()
+
+    marker = "## Child Skills Manifest"
+    index = metadata_prompt.find(marker)
+    if index < 0:
+        return refs
+
+    section = metadata_prompt[index:]
+
+    # 截到下一个 markdown 分隔符，避免误扫后面的 resource manifest
+    next_sep = section.find("\n---\n")
+    if next_sep >= 0:
+        section = section[:next_sep]
+
+    for match in re.finditer(r"-\s+ref:\s+`([^`]+)`", section):
+        ref = match.group(1).strip()
+        if ref and ref != "无":
+            refs.add(ref)
+
+    return refs
+
+async def _run_metadata_round(
+    *,
+    metadata_prompt: str,
+    request: ChatRequest,
+    model: str,
+) -> bool:
+    """First internal model round.
+
+    这一轮只给模型 metadata，不给 SKILL.md 正文。
+    不向前端流式输出，只用于决定是否进入正文阶段。
+    """
+    messages = [{"role": "system", "content": metadata_prompt}]
+    messages.extend(_request_messages(request))
+
+    decision_text = await complete_chat_once(messages, model)
+    return _parse_need_body_decision(decision_text)
+
+def _compose_child_skill_selection_prompt() -> str:
+    return (
+        "你是 Skill 分层加载运行时的子 Skill 选择器。\n\n"
+        "你会看到父 Skill 的 metadata prompt、valid_child_refs 和用户请求。\n"
+        "你的任务是根据用户请求判断是否需要加载某一个子 Skill 的完整 SKILL.md 正文。\n\n"
+        "重要规则：\n"
+        "1. 只能从 valid_child_refs 中选择 child_ref。\n"
+        "2. 如果 valid_child_refs 为空，必须 need_child=false。\n"
+        "3. Child Skill 必须是包含 SKILL.md 的子目录，不是普通 references/*.md 文件。\n"
+        "4. references/*.md、assets/*、scripts/* 都不是子 Skill，不能作为 child_ref 返回。\n"
+        "5. 如果用户请求只需要父 Skill 就能完成，need_child=false。\n"
+        "6. 如果用户请求明显匹配某个子 Skill 的 description，need_child=true，并返回 valid_child_refs 中的原样 ref。\n"
+        "7. 不要猜测不存在的 ref。\n"
+        "8. 不要复制示例占位符。\n"
+        "9. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "如果需要子 Skill，输出：\n"
+        "{\n"
+        "  \"need_child\": true,\n"
+        "  \"child_ref\": \"<必须是 valid_child_refs 中的一个值>\",\n"
+        "  \"reason\": \"简短原因\"\n"
+        "}\n\n"
+        "如果不需要子 Skill，输出：\n"
+        "{\n"
+        "  \"need_child\": false,\n"
+        "  \"child_ref\": \"\",\n"
+        "  \"reason\": \"简短原因\"\n"
+        "}\n"
+    )
+
+async def _run_child_skill_selection_round(
+    *,
+    parent_metadata_prompt: str,
+    request: ChatRequest,
+    model: str,
+) -> dict:
+    """Decide whether a child Skill body should be loaded.
+
+    这一轮只使用父 Skill metadata prompt 中的 Child Skills Manifest。
+    不读取子 Skill 正文。
+    """
+    valid_child_refs = _extract_child_refs_from_metadata_prompt(parent_metadata_prompt)
+
+    if not valid_child_refs:
+        return {
+            "need_child": False,
+            "child_ref": "",
+            "reason": "Child Skills Manifest 中没有可用子 Skill",
+        }
+
+    messages = [
+        {"role": "system", "content": _compose_child_skill_selection_prompt()},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "valid_child_refs": sorted(valid_child_refs),
+                    "parent_metadata_prompt": parent_metadata_prompt,
+                    "user_messages": _request_messages(request),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    decision_text = await complete_chat_once(messages, model)
+    return _parse_child_skill_decision(
+        decision_text,
+        valid_child_refs=valid_child_refs,
+    )
+
+def _allowed_skill_roots() -> list[Path]:
+    """Return directories under which the executor may create or modify files."""
+    roots: list[Path] = []
+
+    configured_skills_path = getattr(settings, "skills_path", None)
+    if configured_skills_path:
+        roots.append(Path(configured_skills_path).expanduser().resolve())
+
+    roots.append((Path.cwd() / ".agents" / "skills").resolve())
+    roots.append((Path.home() / ".agents" / "skills").resolve())
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(root)
+
+    return deduped
+
+def _skill_root_for_name(skill_name: str) -> Path:
+    """Resolve an existing sandbox skill root by skill_name."""
+    if not skill_name or "/" in skill_name or "\\" in skill_name or ".." in skill_name:
+        raise ValueError(f"非法 skill_name: {skill_name}")
+
+    for root in _allowed_skill_roots():
+        candidate = (root / skill_name).resolve()
+        skill_md = candidate / "SKILL.md"
+        if skill_md.exists():
+            return candidate
+
+    allowed_text = "、".join(str(root) for root in _allowed_skill_roots())
+    raise FileNotFoundError(f"未找到 Skill: {skill_name}；搜索目录: {allowed_text}")
+
+def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
+    """Resolve file paths and ensure they stay within allowed directories.
+
+    确保文件路径是相对于 skill 根目录的，而不是宿主目录。
+    """
+    path = Path(raw_path).expanduser()
+
+    if path.is_absolute():
+        return path
+
+    # 如果是相对路径，基于 execution_root 或者 inferred_skill_root 解析路径
+    base_dir = base_dir or Path.cwd()
+    return base_dir / path
+
+def _looks_like_skill_resource_dir(path: Path) -> bool:
+    return path.name in {"scripts", "references", "assets"}
+
+
+def _infer_skill_root_from_tasks(plan: dict, *, execution_root: Path | None = None) -> Path | None:
+    """Infer the active skill root from create_directory/write_file tasks.
+
+    用于 /creator legacy fallback：
+    如果模型先创建了 <skill-root>/scripts、references、assets，
+    后续相对写入 SKILL.md、scripts/main.py 都应以 <skill-root> 为根。
+    """
+    candidates: list[Path] = []
+
+    for task in plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+
+        action = str(task.get("action") or "").strip()
+        raw_path = str(task.get("path") or "").strip()
+        if not raw_path:
+            continue
+
+        try:
+            resolved = _resolve_safe_path(raw_path, base_dir=execution_root)
+        except Exception:
+            continue
+
+        if action == "create_directory":
+            if _looks_like_skill_resource_dir(resolved):
+                candidates.append(resolved.parent)
+            else:
+                candidates.append(resolved)
+
+        elif action == "write_file":
+            if resolved.name == "SKILL.md":
+                candidates.append(resolved.parent)
+            elif resolved.parent.name in {"scripts", "references", "assets"}:
+                candidates.append(resolved.parent.parent)
+
+    if not candidates:
+        return None
+
+    # 优先选择位于 allowed skill roots 下的最深目录
+    allowed_roots = _allowed_skill_roots()
+    valid: list[Path] = []
+
+    for candidate in candidates:
+        for allowed_root in allowed_roots:
+            try:
+                candidate.resolve().relative_to(allowed_root.resolve())
+                valid.append(candidate.resolve())
+                break
+            except ValueError:
+                continue
+
+    if not valid:
+        return None
+
+    return sorted(valid, key=lambda p: len(p.parts), reverse=True)[0]
+
+
+def _resolve_planned_file_path(
+    raw_path: str,
+    *,
+    execution_root: Path | None = None,
+    inferred_skill_root: Path | None = None,
+) -> Path:
+    """Resolve file path for planned write/create actions.
+
+    规则：
+    - 绝对路径保持绝对路径；
+    - sandbox 有 execution_root 时，相对路径基于 execution_root；
+    - creator 推断出 inferred_skill_root 时，Skill 内部相对路径基于 inferred_skill_root；
+    - 否则退回原有逻辑。
+    """
+    path = Path(raw_path).expanduser()
+
+    if path.is_absolute():
+        return _resolve_safe_path(raw_path, base_dir=execution_root)
+
+    if inferred_skill_root is not None:
+        first = path.parts[0] if path.parts else ""
+
+        # SKILL.md、scripts/main.py、references/xx、assets/xx 都属于当前 skill 根
+        if raw_path == "SKILL.md" or first in {"scripts", "references", "assets"}:
+            return _resolve_safe_path(raw_path, base_dir=inferred_skill_root)
+
+    return _resolve_safe_path(raw_path, base_dir=execution_root)
+
+def _parse_path_argument(path_expr: str) -> str:
+    try:
+        parts = shlex.split(path_expr)
+    except ValueError as exc:
+        raise ValueError(f"路径参数解析失败: {path_expr}") from exc
+
+    if len(parts) != 1:
+        raise ValueError(f"只允许一个路径参数: {path_expr}")
+
+    return parts[0]
+
+
+def _extract_executable_blocks(text: str) -> list[str]:
+    """Compatibility helper retained for older flow/tests."""
+    return [match.group("code").strip() for match in _EXECUTABLE_FENCE_RE.finditer(text)]
+
+
+def _normalize_fence_lang(info: str) -> str:
+    """Return the first token of a Markdown fence info string."""
+    info = (info or "").strip()
+    if not info:
+        return ""
+    return info.split()[0].strip().lower()
+
+
+def _extract_all_fenced_blocks(text: str, *, context_chars: int = 420) -> list[MarkdownBlock]:
+    """Extract fenced code blocks using a line-based parser.
+
+    支持外层 ````markdown 包含内部 ```bash 的情况。
+    只有遇到长度 >= opening fence 的同字符 fence，才关闭当前 block。
+    """
+    blocks: list[MarkdownBlock] = []
+    lines = text.splitlines(keepends=True)
+
+    pos = 0
+    i = 0
+    block_index = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        indent_len = len(line) - len(stripped)
+
+        match = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
+        if not match:
+            pos += len(line)
+            i += 1
+            continue
+
+        fence = match.group(1)
+        fence_char = fence[0]
+        fence_len = len(fence)
+        info = match.group(2).strip()
+        start_pos = pos
+        code_start_pos = pos + len(line)
+
+        code_lines: list[str] = []
+        pos += len(line)
+        i += 1
+
+        closed = False
+        while i < len(lines):
+            close_line = lines[i]
+            close_stripped = close_line.lstrip()
+
+            close_match = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}\s*$",
+                close_stripped.rstrip("\n"),
+            )
+
+            if close_match:
+                end_pos = pos + len(close_line)
+                before = text[max(0, start_pos - context_chars):start_pos].strip()
+                after = text[end_pos:min(len(text), end_pos + context_chars)].strip()
+
+                blocks.append(
+                    MarkdownBlock(
+                        index=block_index,
+                        lang=_normalize_fence_lang(info),
+                        code="".join(code_lines).rstrip("\n"),
+                        before_context=before,
+                        after_context=after,
+                    )
+                )
+                block_index += 1
+
+                pos += len(close_line)
+                i += 1
+                closed = True
+                break
+
+            code_lines.append(close_line)
+            pos += len(close_line)
+            i += 1
+
+        if not closed:
+            # 未闭合代码块不执行，避免写入半截文件
+            break
+
+    return blocks
+
+def _validate_skill_md(skill_md: Path) -> None:
+    if not skill_md.exists():
+        raise ValueError("缺少 SKILL.md 文件")
+
+    text = skill_md.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---\n"):
+        raise ValueError("SKILL.md 缺少 YAML frontmatter")
+
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("SKILL.md frontmatter 未正确闭合")
+
+    frontmatter = parts[1]
+    name_match = re.search(r"^name:\s*([a-z0-9-]+)\s*$", frontmatter, re.M)
+    desc_match = re.search(r"^description:\s*(.+)\s*$", frontmatter, re.M)
+
+    if not name_match:
+        raise ValueError("frontmatter 缺少合法的 name 字段，只能使用小写字母、数字和连字符")
+
+    if len(name_match.group(1)) > 64:
+        raise ValueError("name 字段超过 64 个字符")
+
+    if not desc_match or not desc_match.group(1).strip():
+        raise ValueError("frontmatter 缺少 description 字段")
+
+
+def _find_created_skill_roots(touched_paths: list[Path]) -> list[Path]:
+    roots: set[Path] = set()
+    allowed_roots = _allowed_skill_roots()
+
+    for path in touched_paths:
+        current = path if path.is_dir() else path.parent
+        while current != current.parent:
+            if (current / "SKILL.md").exists():
+                roots.add(current)
+                break
+            if any(current.parent == root for root in allowed_roots):
+                roots.add(current)
+                break
+            current = current.parent
+
+    return sorted(roots)
+
+
+def _blocks_for_planner(blocks: list[MarkdownBlock]) -> list[dict]:
+    return [
+        {
+            "index": block.index,
+            "lang": block.lang,
+            "code_preview": block.code[:4000],
+            "before_context": "\n".join(block.before_context.splitlines()[-8:]),
+            "after_context": "\n".join(block.after_context.splitlines()[:4]),
+        }
+        for block in blocks
+    ]
+
+
+def _planner_model_name(default_model: str) -> str:
+    """Select a separate planner model when configured.
+
+    建议在 config 中增加 planner_model 或 action_planner_model。
+    推荐部署方式：Ollama/OpenAI-compatible 接口，不建议在当前 FastAPI 进程内本地加载大模型。
+    """
+    return (
+        getattr(settings, "planner_model", None)
+        or getattr(settings, "action_planner_model", None)
+        or default_model
+    )
+
+def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
+    """从 Loaded Skill prompt 中提取宿主资源清单。
+
+    planner/selector 只选择 resource_handle，不直接生成 path。
+    """
+    catalog: list[dict] = []
+    seen: set[str] = set()
+
+    pattern = re.compile(
+        r"-\s+`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
+        re.M,
+    )
+
+    for match in pattern.finditer(body_prompt):
+        path = match.group("path").strip()
+        if path in seen:
+            continue
+
+        seen.add(path)
+        dirname = path.split("/", 1)[0]
+        title = (match.group("title") or "").lstrip("：").strip()
+
+        if dirname == "references":
+            kind = "reference"
+            usage_hint = "参考资料、规范、示例、方法论，适合在生成 Skill 文件前读取。"
+        elif dirname == "assets":
+            kind = "asset"
+            usage_hint = "模板、配置、静态资源，适合在需要固定格式或模板时读取。"
+        else:
+            kind = "script"
+            usage_hint = "脚本资源。creator 阶段可读取源码作为参考；sandbox 阶段通常通过 run_command 执行。"
+
+        catalog.append({
+            "resource_handle": f"resource:{len(catalog)}",
+            "kind": kind,
+            "path": path,
+            "title": title,
+            "usage_hint": usage_hint,
+        })
+
+    return catalog
+
+
+def _resource_catalog_for_model(catalog: list[dict]) -> list[dict]:
+    """给模型看的资源清单，不暴露 path 生成权。"""
+    return [
+        {
+            "resource_handle": item["resource_handle"],
+            "kind": item["kind"],
+            "title": item.get("title", ""),
+            "usage_hint": item.get("usage_hint", ""),
+        }
+        for item in catalog
+    ]
+
+
+def _resource_catalog_by_handle(catalog: list[dict]) -> dict[str, dict]:
+    return {str(item["resource_handle"]): item for item in catalog}
+
+def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
+    """Extract host-owned resource catalog from Loaded SKILL.md prompt.
+
+    关键原则：
+    - 真实 path 只归宿主管理；
+    - planner 只能看到 resource_handle；
+    - planner 不能自己生成 read_resource.path。
+    """
+    catalog: list[dict] = []
+    seen: set[str] = set()
+
+    pattern = re.compile(
+        r"-\s+`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
+        re.M,
+    )
+
+    for match in pattern.finditer(body_prompt):
+        path = match.group("path").strip()
+        if path in seen:
+            continue
+
+        seen.add(path)
+        kind = path.split("/", 1)[0]
+        title = (match.group("title") or "").lstrip("：").strip()
+
+        if kind == "references":
+            allowed_actions = ["read_resource"]
+            usage_hint = "参考资料，可在任务需要领域知识、示例、规范时读取。"
+        elif kind == "assets":
+            allowed_actions = ["read_resource"]
+            usage_hint = "模板或配置，可在任务需要固定格式、配置、模板时读取。"
+        else:
+            allowed_actions = ["run_command"]
+            usage_hint = "脚本资源，默认用于执行，不用于读取源码，除非用户明确要求查看脚本内容。"
+
+        catalog.append(
+            {
+                "resource_handle": f"resource:{len(catalog)}",
+                "kind": kind,
+                "path": path,
+                "title": title,
+                "allowed_actions": allowed_actions,
+                "usage_hint": usage_hint,
+            }
+        )
+
+    return catalog
+
+
+def _resource_catalog_for_planner(catalog: list[dict]) -> list[dict]:
+    """Expose resource tree to planner without exposing executable paths for read_resource."""
+    return [
+        {
+            "resource_handle": item["resource_handle"],
+            "kind": item["kind"],
+            "title": item.get("title", ""),
+            "allowed_actions": item.get("allowed_actions", []),
+            "usage_hint": item.get("usage_hint", ""),
+        }
+        for item in catalog
+    ]
+
+
+def _resource_catalog_by_handle(catalog: list[dict]) -> dict[str, dict]:
+    return {str(item["resource_handle"]): item for item in catalog}
+
+
+def _compose_resource_selection_prompt() -> str:
+    return (
+        "你是 Skill 资源按需加载选择器。\n\n"
+        "你会看到 Loaded SKILL.md、resource_catalog 和用户请求。"
+        "你的任务是判断当前阶段是否需要读取 references/assets/scripts 中的资源正文。\n\n"
+        "重要规则：\n"
+        "1. 只能从 resource_catalog 中选择 resource_handle。\n"
+        "2. 禁止生成、拼接、改写资源 path。\n"
+        "3. references 通常用于方法论、规范、示例，creator 生成 Skill 文件前应优先考虑。\n"
+        "4. scripts 在 creator 阶段可以读取源码作为实现参考，但不要执行。\n"
+        "5. assets 在需要模板或配置时读取。\n"
+        "6. 如果 SKILL.md body 已经足够完成任务，可以不读取资源。\n"
+        "7. 最多选择 5 个资源，避免一次加载过多。\n"
+        "8. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "输出格式：\n"
+        "{\n"
+        "  \"need_resources\": true,\n"
+        "  \"resource_handles\": [\"resource:0\", \"resource:1\"],\n"
+        "  \"reason\": \"简短原因\"\n"
+        "}\n\n"
+        "如果不需要资源：\n"
+        "{\n"
+        "  \"need_resources\": false,\n"
+        "  \"resource_handles\": [],\n"
+        "  \"reason\": \"简短原因\"\n"
+        "}\n"
+    )
+
+
+def _parse_resource_selection_decision(
+    text: str,
+    *,
+    resource_catalog: list[dict],
+) -> dict:
+    stripped = _strip_markdown_json_fence(text)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("resource selection decision is not valid JSON: %s", text[:500])
+        return {"need_resources": False, "resource_handles": [], "reason": "JSON 解析失败"}
+
+    if not isinstance(data, dict):
+        return {"need_resources": False, "resource_handles": [], "reason": "输出不是 JSON object"}
+
+    need_resources = data.get("need_resources", False)
+    if isinstance(need_resources, str):
+        need_resources = need_resources.strip().lower() in {"true", "1", "yes", "y"}
+    else:
+        need_resources = bool(need_resources)
+
+    resource_by_handle = _resource_catalog_by_handle(resource_catalog)
+    raw_handles = data.get("resource_handles", [])
+
+    if not isinstance(raw_handles, list):
+        raw_handles = []
+
+    selected: list[str] = []
+    for item in raw_handles:
+        handle = str(item or "").strip()
+        if not handle:
+            continue
+        if handle not in resource_by_handle:
+            continue
+        if handle not in selected:
+            selected.append(handle)
+        if len(selected) >= 5:
+            break
+
+    if not need_resources or not selected:
+        return {
+            "need_resources": False,
+            "resource_handles": [],
+            "reason": str(data.get("reason") or "").strip(),
+        }
+
+    return {
+        "need_resources": True,
+        "resource_handles": selected,
+        "reason": str(data.get("reason") or "").strip(),
+    }
+
+
+async def _run_resource_selection_round(
+    *,
+    body_prompt: str,
+    request: ChatRequest,
+    model: str,
+    resource_catalog: list[dict],
+) -> dict:
+    if not resource_catalog:
+        return {"need_resources": False, "resource_handles": [], "reason": "无可用资源"}
+
+    messages = [
+        {"role": "system", "content": _compose_resource_selection_prompt()},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "loaded_skill_prompt": body_prompt,
+                    "resource_catalog": _resource_catalog_for_model(resource_catalog),
+                    "user_messages": _request_messages(request),
+                    "last_user_text": _last_user_text(request),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    return _parse_resource_selection_decision(
+        decision_text,
+        resource_catalog=resource_catalog,
+    )
+
+def _compose_loaded_resources_prompt(
+    *,
+    skill_name: str,
+    resource_catalog: list[dict],
+    selected_handles: list[str],
+) -> str:
+    resource_by_handle = _resource_catalog_by_handle(resource_catalog)
+    sections: list[str] = []
+
+    for handle in selected_handles:
+        resource = resource_by_handle.get(handle)
+        if not resource:
+            continue
+
+        path = resource["path"]
+        try:
+            observation = read_skill_resource_text(
+                skill_name,
+                path,
+                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+            )
+        except Exception as exc:
+            sections.append(
+                f"### {handle}\n"
+                f"- path: `{path}`\n"
+                f"- load_error: {exc}\n"
+            )
+            continue
+
+        content = observation.get("content", "")
+        truncated = observation.get("truncated", False)
+
+        sections.append(
+            f"### {handle}\n"
+            f"- kind: {resource.get('kind')}\n"
+            f"- path: `{path}`\n"
+            f"- truncated: {truncated}\n\n"
+            "```text\n"
+            f"{content}\n"
+            "```"
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        "\n\n---\n\n"
+        "## Loaded On-Demand Resources\n\n"
+        "以下资源由宿主根据当前请求按需读取。"
+        "这些内容现在可以作为执行当前 Skill 的依据。\n\n"
+        + "\n\n".join(sections)
+    )
+
+def _strip_runtime_resource_manifest(body_prompt: str) -> str:
+    """Remove generated resource manifest section from planner text.
+
+    避免 planner 从 Markdown 资源清单中拼接路径。
+    真实资源树通过 resource_catalog 单独传入。
+    """
+    marker = "## Bundled Resources Manifest"
+    index = body_prompt.find(marker)
+    if index < 0:
+        return body_prompt
+
+    before = body_prompt[:index].rstrip()
+    return (
+        before
+        + "\n\n---\n\n"
+        + "## Bundled Resources Manifest\n\n"
+        + "资源清单已由宿主以结构化 resource_catalog 单独提供。"
+        + "规划 read_resource 时只能使用 resource_handle，不能生成 path。\n"
+    )
+
+def _compose_skill_runtime_planner_prompt() -> str:
+    return (
+        "你是 Skill Agent 运行时动作规划器。\n\n"
+        "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog 和用户请求，"
+        "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
+        "核心原则：\n"
+        "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
+        "2. resource_catalog 是宿主提供的真实资源树。\n"
+        "3. 你不能假设某个脚本存在；只能根据 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
+        "4. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
+        "5. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "通常应使用 mode=direct_answer，不要规划 run_command。\n"
+        "6. 如果当前 Skill 没有 scripts 资源，默认不得规划 run_command。\n"
+        "7. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 resource_catalog 或系统可执行环境中，"
+        "才允许规划 run_command。\n"
+        "8. read_resource 只能使用 resource_handle，禁止输出 path。\n"
+        "9. resource_handle 必须来自 resource_catalog。\n"
+        "10. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
+        "11. 不要假装读取、假装执行、假装写入。\n"
+        "12. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "允许的 action：\n"
+        "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
+        "- run_command：执行一个真实可执行的命令。命令不得是函数名或伪代码。\n"
+        "- write_file：写入文件。\n"
+        "- create_directory：创建目录。\n"
+        "- display / ignore：展示或忽略。\n\n"
+        "mode 选择规则：\n"
+        "- direct_answer：Skill 可由模型根据 SKILL.md 直接完成，例如写故事、公文、报告、总结、翻译、分析。\n"
+        "- execute：确实需要宿主执行 action，例如读取资源、运行真实脚本、写入文件。\n"
+        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全执行。\n"
+        "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
+        "run_command 约束：\n"
+        "1. 不得输出类似 generate_story、process、main、run_task 这样的函数名作为 command。\n"
+        "2. 不得凭空生成 scripts/main.py、scripts/run.py、main.py 等路径。\n"
+        "3. 如果 command 引用了 scripts/...，该路径必须能在 resource_catalog 中看到。\n"
+        "4. 如果 resource_catalog 的 scripts 为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
+        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不存在，应使用 ask_user，并在 errors 中说明脚本不存在。\n\n"
+        "输出格式：\n"
+        "{\n"
+        "  \"mode\": \"execute | direct_answer | ask_user | not_applicable\",\n"
+        "  \"actions\": [\n"
+        "    {\n"
+        "      \"action\": \"read_resource\",\n"
+        "      \"resource_handle\": \"resource:0\",\n"
+        "      \"reason\": \"需要读取参考资料\"\n"
+        "    },\n"
+        "    {\n"
+        "      \"action\": \"run_command\",\n"
+        "      \"command\": \"<只能填写 Loaded SKILL.md 明确要求且宿主可验证的真实命令>\",\n"
+        "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
+        "      \"reason\": \"需要运行真实存在的脚本或工具\"\n"
+        "    }\n"
+        "  ],\n"
+        "  \"final_instruction\": \"执行完成后优先基于 observation 回答；direct_answer 时按 Loaded SKILL.md 直接回答\",\n"
+        "  \"missing\": [],\n"
+        "  \"errors\": []\n"
+        "}\n"
+    )
+
+def _normalize_skill_runtime_plan(
+    plan: dict,
+    *,
+    resource_catalog: list[dict] | None = None,
+    execution_root: Path | None = None,
+) -> dict:
+    """Normalize planner JSON into executor-compatible plan.
+
+    关键原则：
+    - read_resource 的真实 path 不来自模型，而是由宿主根据 resource_handle 映射得到；
+    - run_command 不允许凭空执行函数名或不存在的脚本；
+    - command 只做通用可执行性校验，不硬编码 python/node/bash。
+    """
+    if not isinstance(plan, dict):
+        raise ValueError("运行时规划模型输出必须是 JSON object")
+
+    resource_by_handle = _resource_catalog_by_handle(resource_catalog or [])
+
+    mode = str(plan.get("mode") or "").strip()
+    if mode not in {"execute", "direct_answer", "ask_user", "not_applicable"}:
+        mode = "ask_user"
+
+    actions = plan.get("actions", [])
+    errors = plan.get("errors", [])
+    missing = plan.get("missing", [])
+
+    if not isinstance(actions, list):
+        actions = []
+
+    if not isinstance(errors, list):
+        errors = []
+
+    if not isinstance(missing, list):
+        missing = []
+
+    normalized_actions: list[dict] = []
+
+    for action_item in actions:
+        if not isinstance(action_item, dict):
+            continue
+
+        action = str(action_item.get("action") or "").strip()
+
+        if action not in {"run_command", "write_file", "create_directory", "read_resource", "display", "ignore"}:
+            errors.append({"error": f"不支持的 action: {action}", "action_item": action_item})
+            continue
+
+        if action == "run_command":
+            command = str(action_item.get("command") or "").strip()
+            if not command:
+                errors.append({"error": "run_command 缺少 command", "action_item": action_item})
+                continue
+
+            stdin_text = action_item.get("stdin", None)
+            if stdin_text is not None:
+                stdin_text = str(stdin_text)
+
+            # 运行前预检：不执行，只验证命令形态和 Skill 内资源路径。
+            try:
+                _prepare_command_argv(command, base_dir=execution_root)
+            except Exception as exc:
+                errors.append({
+                    "error": "run_command 预检失败",
+                    "command": command,
+                    "detail": str(exc),
+                    "hint": (
+                        "不要把函数名、伪代码或不存在的脚本当成命令。"
+                        "如果当前 Skill 可直接由模型完成，请使用 mode=direct_answer。"
+                    ),
+                })
+                continue
+
+            action_item["command"] = command
+            action_item["stdin"] = stdin_text
+
+        elif action == "read_resource":
+            resource_handle = str(action_item.get("resource_handle") or "").strip()
+            if not resource_handle:
+                errors.append({"error": "read_resource 缺少 resource_handle", "action_item": action_item})
+                continue
+
+            resource = resource_by_handle.get(resource_handle)
+            if not resource:
+                errors.append({
+                    "error": "read_resource 使用了不存在的 resource_handle",
+                    "resource_handle": resource_handle,
+                    "available_resource_handles": sorted(resource_by_handle.keys()),
+                })
+                continue
+
+            allowed_actions = set(resource.get("allowed_actions") or [])
+            if "read_resource" not in allowed_actions:
+                errors.append({
+                    "error": "该资源不允许 read_resource",
+                    "resource_handle": resource_handle,
+                    "kind": resource.get("kind"),
+                    "allowed_actions": sorted(allowed_actions),
+                })
+                continue
+
+            action_item["resource_handle"] = resource_handle
+            action_item["path"] = resource["path"]
+            action_item["resource_kind"] = resource["kind"]
+
+        elif action in {"write_file", "create_directory"}:
+            path = str(action_item.get("path") or "").strip()
+            if not path:
+                errors.append({"error": f"{action} 缺少 path", "action_item": action_item})
+                continue
+            action_item["path"] = path
+
+        if action == "write_file":
+            if "content" not in action_item:
+                errors.append({"error": "write_file 缺少 content", "action_item": action_item})
+                continue
+            action_item["content"] = str(action_item.get("content") or "")
+
+        action_item["block_index"] = int(action_item.get("block_index", -1))
+        normalized_actions.append(action_item)
+
+    # 如果 planner 要 execute，但所有 action 都被宿主校验拦掉，
+    # 不要继续进入 executor，改为 ask_user，让前端看到可解释错误。
+    if mode == "execute" and not normalized_actions and errors:
+        mode = "ask_user"
+
+    return {
+        "mode": mode,
+        "tasks": normalized_actions,
+        "actions": normalized_actions,
+        "missing": missing,
+        "errors": errors,
+        "final_instruction": str(plan.get("final_instruction") or "").strip(),
+    }
+
+async def _run_skill_runtime_planner_round(
+    *,
+    body_prompt: str,
+    request: ChatRequest,
+    model: str,
+    execution_root: Path | None = None,
+) -> dict:
+    """Generate an action plan from Loaded SKILL.md and structured host resources.
+
+    对齐反重力式宿主模型：
+    - Skill.md 提供流程；
+    - resource_catalog 提供资源树；
+    - planner 只选择 resource_handle；
+    - 真实 path 由宿主解析，不由模型生成。
+    """
+    resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+    planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
+
+    planner_payload = {
+        "loaded_skill_prompt": planner_body_prompt,
+        "resource_catalog": _resource_catalog_for_planner(resource_catalog),
+        "user_messages": _request_messages(request),
+        "last_user_text": _last_user_text(request),
+        "execution_root": str(execution_root) if execution_root else "",
+        "runtime_contract": {
+            "skill_md_is_markdown": True,
+            "skill_md_code_blocks_have_no_action_tag": True,
+            "resource_tree_is_structured": True,
+            "planner_must_not_generate_resource_paths": True,
+            "read_resource_uses_resource_handle_only": True,
+            "resource_path_resolution_is_host_owned": True,
+            "do_not_depend_on_main_model_markdown_output": True,
+            "action_observation_loop": True,
+        },
+    }
+
+    messages = [
+        {"role": "system", "content": _compose_skill_runtime_planner_prompt()},
+        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+    ]
+
+    planner_model = _planner_model_name(model)
+    planner_text = await complete_chat_once(messages, planner_model)
+
+    try:
+        stripped = _strip_markdown_json_fence(planner_text)
+        raw_plan = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        logger.error("Received invalid JSON response from skill runtime planner: %s", planner_text)
+        raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+
+    return _normalize_skill_runtime_plan(
+        raw_plan,
+        resource_catalog=resource_catalog,
+        execution_root=execution_root,
+    )
+
+
+def _compose_final_answer_prompt() -> str:
+    """Generate final answer from action observations."""
+    return (
+        "你是 Skill Agent 的最终回答生成器。\n\n"
+        "你会收到用户请求、Loaded SKILL.md、运行时 action plan 和 executor observation。\n"
+        "你必须基于 observation 回答用户，不要假装执行未发生的动作。\n"
+        "如果命令执行成功，优先返回脚本 stdout 中的有效结果。\n"
+        "如果命令执行失败，简要说明失败原因和 stderr/stdout 中的关键信息。\n"
+        "不要输出内部 JSON，不要重复完整 SKILL.md，不要编造 observation 之外的执行结果。\n"
+    )
+
+
+async def _generate_final_answer_from_observation(
+    *,
+    body_prompt: str,
+    request: ChatRequest,
+    model: str,
+    plan: dict,
+    execution_result: dict,
+) -> str:
+    messages = [
+        {"role": "system", "content": _compose_final_answer_prompt()},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "loaded_skill_prompt": body_prompt,
+                    "user_messages": _request_messages(request),
+                    "plan": plan,
+                    "execution_result": execution_result,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    return await complete_chat_once(messages, model)
+
+def _compose_block_planner_prompt() -> str:
+    return (
+        "你是 Agent 运行时的动作规划器。\n\n"
+        "你的唯一输入依据是：主模型已经生成的 assistant_text，以及从 assistant_text 中抽取出的 fenced code block。\n"
+        "你不能根据 SKILL.md 模板、系统提示或用户原始意图凭空生成动作。\n\n"
+        "核心规则：\n"
+        "1. 只能判断 assistant_text 中已经出现的代码块。\n"
+        "2. write_file 的文件内容必须来自对应 block 的 code，不能来自其他 block，不能来自解释文字。\n"
+        "3. write_file 的 path 必须出现在该代码块紧邻前文中，通常应是代码块前最后 1 到 3 行里的“写入文件：<path>”或“保存到：<path>”。\n"
+        "3a. 如果 assistant_text 中已经创建了某个 Skill 根目录，例如 `skills/ai-course-skill/scripts`、"
+        "`skills/ai-course-skill/references` 或 `skills/ai-course-skill/assets`，"
+        "那么后续写入 `SKILL.md` 必须绑定为 `skills/ai-course-skill/SKILL.md`，"
+        "写入 `scripts/main.py` 必须绑定为 `skills/ai-course-skill/scripts/main.py`。\n"
+        "3b. 禁止把新 Skill 的 `SKILL.md` 规划为宿主根目录下的 `SKILL.md`。\n"
+        "3c. 禁止把新 Skill 的脚本规划为宿主根目录下的 `scripts/main.py`。\n"
+        "4. 如果 path 出现在更早的段落、标题、列表或其他代码块附近，不允许把它绑定到当前 block。\n"
+        "5. 如果当前 block 前后同时出现多个路径，或者路径与当前 block 内容主题明显不一致，不要猜测，写入 errors。\n"
+        "6. 如果当前 block 的前文说写入 SKILL.md，但 block 内容明显是在描述其他文件、步骤、说明文字或另一个文件内容，不允许写入 SKILL.md。\n"
+        "7. 如果当前 block 的前文说写入某个文件，但 block 内容明显不是该文件的完整内容，不允许写入该文件。\n"
+        "8. 如果代码块表达的是创建目录，不要输出 run_command，必须输出 create_directory。\n"
+        "9. 如果一个代码块中创建多个目录，必须拆成多个 create_directory 任务，每个任务一个 path。\n"
+        "10. 对于修改宿主状态但宿主没有原生动作支持的操作，应优先 ignore，不要强行归类为 run_command。\n"
+        "11. run_command 只用于确实需要运行外部程序、脚本或工具的命令，不要把目录创建、文件写入这类可由宿主原生动作完成的操作归类为 run_command。\n"
+        "12. 如果代码块只是示例、说明、模板、教程、展示内容，则 action=display 或 ignore。\n"
+        "13. 如果路径、执行意图、命令来源不明确，不要猜测，把问题写入 errors。\n"
+        "14. 不允许根据用户希望、SKILL.md 用法、资源清单或常识补全缺失路径。\n"
+        "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "允许的 action：display、ignore、write_file、run_command、create_directory。\n\n"
+        "输出格式：\n"
+        "{\n"
+        "  \"tasks\": [\n"
+        "    {\"block_index\": 0, \"action\": \"create_directory\", \"path\": \"...\", \"reason\": \"...\"},\n"
+        "    {\"block_index\": 1, \"action\": \"write_file\", \"path\": \"...\", \"reason\": \"...\"},\n"
+        "    {\"block_index\": 2, \"action\": \"run_command\", \"command\": \"...\", \"reason\": \"...\"}\n"
+        "  ],\n"
+        "  \"errors\": []\n"
+        "}\n"
+    )
+
+async def _run_block_planner_round(
+        *,
+        assistant_text: str,
+        blocks: list[MarkdownBlock],
+        request: ChatRequest,
+        model: str,
+) -> dict:
+    """Run a silent planning round after the main model has produced assistant_text."""
+    if not blocks:
+        return {"tasks": [], "errors": []}
+
+    planner_payload = {
+        "user_messages": _request_messages(request),
+        "assistant_text": assistant_text,
+        "blocks": _blocks_for_planner(blocks),
+        "runtime_constraints": {
+            "block_source": "assistant_text_only",
+            "path_source": "assistant_text_near_block_context",
+            "content_source": "selected_block_code",
+            "command_source": "assistant_text_executable_block_or_near_block_context",
+            "directory_creation": {
+                "preferred_action": "create_directory",
+                "rule": "目录创建应使用 create_directory，不应使用 run_command。",
+                "multiple_paths": "如果一次创建多个目录，拆成多个 create_directory 任务。",
+            },
+            "do_not_use": [
+                "SKILL.md template",
+                "system prompt",
+                "resource manifest",
+                "implicit intent",
+                "guessed path",
+                "guessed command",
+            ],
+        },
+    }
+
+    messages = [
+        {"role": "system", "content": _compose_block_planner_prompt()},
+        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+    ]
+
+    planner_text = await complete_chat_once(messages, model)
+
+    try:
+        stripped = _strip_markdown_json_fence(planner_text)
+        plan = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        logger.error("Received invalid JSON response from planner: %s", planner_text)
+        raise ValueError(f"规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+
+    if not isinstance(plan, dict):
+        raise ValueError("规划模型输出必须是 JSON object")
+
+    tasks = plan.get("tasks", [])
+    errors = plan.get("errors", [])
+
+    if not isinstance(tasks, list):
+        raise ValueError("规划模型输出的 tasks 必须是数组")
+
+    if not isinstance(errors, list):
+        errors = []
+
+    normalized_tasks: list[dict] = []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+
+        action = str(task.get("action", "")).strip()
+
+        if action not in _ALLOWED_PLAN_ACTIONS:
+            errors.append({"error": f"不支持的 action: {action}", "task": task})
+            continue
+
+        try:
+            block_index = int(task.get("block_index", -1))
+        except (TypeError, ValueError):
+            block_index = -1
+
+        if action in {"write_file", "run_command"} and not (0 <= block_index < len(blocks)):
+            errors.append({"error": "任务缺少合法 block_index", "task": task})
+            continue
+
+        if action in {"write_file", "create_directory"} and not str(task.get("path") or "").strip():
+            errors.append({"error": f"{action} 缺少 path", "task": task})
+            continue
+
+        if action == "run_command":
+            block = blocks[block_index]
+            command = str(task.get("command") or block.code or "").strip()
+            if not command:
+                errors.append({"error": "run_command 缺少 command", "task": task})
+                continue
+            task["command"] = command
+
+        task["block_index"] = block_index
+        normalized_tasks.append(task)
+
+    return {"tasks": normalized_tasks, "errors": errors}
+
+
+def _runtime_script_dir() -> Path:
+    """Directory for executor-generated Python scripts converted from heredoc."""
+    roots = _allowed_skill_roots()
+    if not roots:
+        raise ValueError("没有可用的 Skill 写入根目录")
+
+    directory = roots[0] / ".runtime"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _materialize_python_heredoc(command: str) -> list[str] | None:
+    """Convert `python - <<'PY' ... PY` into `python <safe-script>.py`.
+
+    目的：兼容模型常输出的多行校验脚本，同时继续使用 shell=False，
+    不开放真正 shell 的管道、重定向、变量展开、命令替换等能力。
+    """
+    match = _PYTHON_HEREDOC_RE.match(command.strip())
+    if not match:
+        return None
+
+    python_bin = Path(match.group("python")).name
+    if python_bin not in {"python", "python3"}:
+        raise ValueError(f"只允许运行 python/python3 heredoc 命令: {command}")
+
+    script = match.group("script").rstrip() + "\n"
+    digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
+    script_path = _runtime_script_dir() / f"heredoc_{digest}.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    resolved = _resolve_safe_path(str(script_path))
+    return [python_bin, str(resolved)]
+
+def _extract_skill_local_paths_from_argv(argv: list[str]) -> list[str]:
+    """Extract skill-local resource paths mentioned in command argv.
+
+    只识别 scripts/、references/、assets/ 这类 Skill 内资源路径。
+    不关心具体语言，不硬编码 python/node/bash。
     """
     result: list[str] = []
-    in_string = False
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if in_string:
-            if c == "\\":
-                # Already-escaped sequence — consume both chars and move on.
-                result.append(c)
-                i += 1
-                if i < len(text):
-                    result.append(text[i])
-                    i += 1
+
+    for raw in argv:
+        if not raw:
+            continue
+
+        candidates = [raw]
+
+        # 支持 --config=assets/config.yaml 这种形式
+        if "=" in raw:
+            _key, value = raw.split("=", 1)
+            if value:
+                candidates.append(value)
+
+        for item in candidates:
+            item = item.strip()
+            if not item or item.startswith("-"):
                 continue
-            elif c == '"':
-                in_string = False
-                result.append(c)
-            elif c == "\n":
-                result.append("\\n")
-            elif c == "\r":
-                result.append("\\r")
-            elif c == "\t":
-                result.append("\\t")
-            else:
-                result.append(c)
-        else:
-            if c == '"':
-                in_string = True
-            result.append(c)
-        i += 1
-    return "".join(result)
+
+            if item.startswith("./"):
+                item = item[2:]
+
+            try:
+                path = Path(item)
+            except Exception:
+                continue
+
+            parts = path.parts
+            if not parts:
+                continue
+
+            if parts[0] in {"scripts", "references", "assets"}:
+                normalized = Path(*parts).as_posix()
+                if normalized not in result:
+                    result.append(normalized)
+
+    return result
 
 
-def _safe_flush_len(text: str) -> int:
-    """Return how many leading characters of *text* can safely be emitted.
+def _validate_skill_local_command_paths(
+    argv: list[str],
+    *,
+    base_dir: Path | None,
+) -> None:
+    """Validate skill-local paths referenced by a command.
 
-    We must not emit a prefix that could be the start of a ``<skill_action>``
-    tag that hasn't been fully received yet.
+    解决：
+    - python scripts/main.py 但 scripts/main.py 不存在；
+    - bash scripts/run.sh 但脚本不存在；
+    - node scripts/index.js 但脚本不存在。
+
+    这是资源存在性校验，不是工具类型白名单。
     """
-    for i in range(1, len(_OPEN_TAG)):
-        if text.endswith(_OPEN_TAG[:i]):
-            return len(text) - i
-    return len(text)
+    if base_dir is None:
+        return
+
+    root = base_dir.resolve()
+
+    for rel_path in _extract_skill_local_paths_from_argv(argv):
+        rel = Path(rel_path)
+
+        if rel.is_absolute():
+            raise ValueError(f"命令引用了非法绝对资源路径: {rel_path}")
+
+        if any(part in {"", ".."} for part in rel.parts):
+            raise ValueError(f"命令引用的资源路径越界: {rel_path}")
+
+        resolved = (root / rel).resolve()
+
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"命令引用的资源路径越界: {rel_path}") from exc
+
+        if not resolved.exists():
+            raise ValueError(f"命令引用的 Skill 资源不存在: {rel_path}")
+
+        if not resolved.is_file():
+            raise ValueError(f"命令引用的 Skill 资源不是文件: {rel_path}")
 
 
-def _make_stream(system_prompt: str, request: ChatRequest):
+def _prepare_command_argv(
+    command: str,
+    *,
+    base_dir: Path | None = None,
+) -> list[str]:
+    """Parse and preflight a command before subprocess.run.
+
+    不限制具体执行工具类型；
+    只做通用校验：
+    - 命令不能为空；
+    - 命令必须能被 shlex 解析；
+    - argv[0] 必须是 PATH 中的可执行程序，或一个真实存在的路径；
+    - command 中引用的 scripts/assets/references 路径必须真实存在。
+    """
+    argv = _safe_command_argv(command, base_dir=base_dir)
+
+    if not argv:
+        raise ValueError("命令为空")
+
+    executable = argv[0]
+
+    # 1. argv[0] 是路径形式：./tool、scripts/run.sh、/usr/bin/env 等
+    if "/" in executable or "\\" in executable:
+        exe_path = Path(executable).expanduser()
+
+        if not exe_path.is_absolute():
+            if base_dir is None:
+                exe_path = exe_path.resolve()
+            else:
+                exe_path = (base_dir / exe_path).resolve()
+        else:
+            exe_path = exe_path.resolve()
+
+        if not exe_path.exists():
+            raise ValueError(f"命令不可执行，文件不存在: {executable}")
+
+        if not exe_path.is_file():
+            raise ValueError(f"命令不可执行，目标不是文件: {executable}")
+
+        argv[0] = str(exe_path)
+
+    # 2. argv[0] 是裸命令：python、node、bash、ffmpeg、convert 等
+    # 不做白名单，只检查系统 PATH 中是否存在。
+    else:
+        if shutil.which(executable) is None:
+            raise ValueError(
+                f"命令不可执行：{executable} 不在 PATH 中，也不是当前 Skill 内的可执行文件。"
+                "如果这是函数名或伪代码，请不要规划 run_command。"
+            )
+
+    _validate_skill_local_command_paths(argv, base_dir=base_dir)
+    return argv
+
+def _safe_command_argv(command: str, *, base_dir: Path | None = None) -> list[str]:
+    """通用命令参数解析器。
+
+    注意：
+    - 不限制具体执行工具类型；
+    - 不做 python/node/bash 白名单；
+    - 真正的可执行性和资源存在性校验由 _prepare_command_argv 完成。
+    """
+    if not command or not command.strip():
+        raise ValueError("命令为空")
+
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"命令解析失败: {command}") from exc
+
+    if not argv:
+        raise ValueError("命令为空")
+
+    return argv
+
+def _execute_planned_actions(
+    plan: dict,
+    blocks: list[MarkdownBlock],
+    request: ChatRequest,
+    *,
+    require_confirmation: bool = True,
+    execution_root: Path | None = None,
+    skill_name: str = "",
+) -> dict:
+    """执行结构化 action plan，并返回 executor observation。"""
+    if require_confirmation and not _has_creation_confirmation(request):
+        return {
+            "executed": False,
+            "reason": "未检测到用户明确确认开始创建，因此不会执行规划任务。",
+            "plan": plan,
+            "results": [],
+            "logs": [],
+        }
+
+    inferred_skill_root = _infer_skill_root_from_tasks(
+        plan,
+        execution_root=execution_root,
+    )
+
+    touched: list[Path] = []
+    results: list[dict] = []
+    logs: list[str] = []
+
+    for task in plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+
+        action = str(task.get("action") or "").strip()
+        reason = str(task.get("reason") or "").strip()
+
+        if action in {"display", "ignore"}:
+            results.append({
+                "action": action,
+                "success": True,
+                "reason": reason,
+            })
+            continue
+
+        if action == "read_resource":
+            rel_path = str(task.get("path") or "").strip()
+            if not rel_path:
+                raise ValueError("read_resource 任务缺少 path")
+
+            if not skill_name:
+                raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+
+            observation = read_skill_resource_text(
+                skill_name,
+                rel_path,
+                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+            )
+
+            result = {
+                "action": action,
+                "path": rel_path,
+                "success": True,
+                "content": observation.get("content", ""),
+                "truncated": observation.get("truncated", False),
+                "reason": reason,
+            }
+
+            results.append(result)
+            logs.append(f"读取资源成功: {rel_path}")
+            continue
+
+        if action == "create_directory":
+            raw_path = str(task.get("path") or "").strip()
+            if not raw_path:
+                raise ValueError("create_directory 任务缺少 path")
+
+            path = _resolve_planned_file_path(
+                raw_path,
+                execution_root=execution_root,
+                inferred_skill_root=inferred_skill_root,
+            )
+            path.mkdir(parents=True, exist_ok=True)
+
+            touched.append(path)
+            results.append({
+                "action": action,
+                "path": str(path),
+                "success": True,
+                "reason": reason,
+            })
+            logs.append(f"创建目录: {path}")
+            continue
+
+        if action == "write_file":
+            raw_path = str(task.get("path") or "").strip()
+            if not raw_path:
+                raise ValueError("write_file 任务缺少 path")
+
+            content = task.get("content", None)
+
+            if content is None:
+                block_index = int(task.get("block_index", -1))
+                if 0 <= block_index < len(blocks):
+                    content = blocks[block_index].code
+                else:
+                    raise ValueError("write_file 任务缺少 content，且没有合法 block_index")
+
+            path = _resolve_planned_file_path(
+                raw_path,
+                execution_root=execution_root,
+                inferred_skill_root=inferred_skill_root,
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(content), encoding="utf-8")
+
+            touched.append(path)
+            results.append({
+                "action": action,
+                "path": str(path),
+                "success": True,
+                "bytes": len(str(content).encode("utf-8")),
+                "reason": reason,
+            })
+            logs.append(f"写入文件: {path}")
+            continue
+
+        if action == "run_command":
+            command = str(task.get("command") or "").strip()
+            if not command:
+                raise ValueError("run_command 任务缺少 command")
+
+            stdin_text = task.get("stdin", None)
+            if stdin_text is not None:
+                stdin_text = str(stdin_text)
+
+            cwd = execution_root or inferred_skill_root
+
+            materialized = _materialize_python_heredoc(command)
+            if materialized is not None:
+                argv = materialized
+                # heredoc 会生成临时脚本，但 python/python3 本身也需要可执行。
+                argv = _prepare_command_argv(" ".join(shlex.quote(part) for part in argv), base_dir=cwd)
+            else:
+                argv = _prepare_command_argv(command, base_dir=cwd)
+
+            try:
+                completed = subprocess.run(
+                    argv,
+                    shell=False,
+                    input=stdin_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=int(getattr(settings, "skill_command_timeout", 60)),
+                    cwd=str(cwd) if cwd else None,
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "命令不可执行: "
+                    + command
+                    + "\n原因: "
+                    + str(exc)
+                ) from exc
+            except PermissionError as exc:
+                raise ValueError(
+                    "命令没有执行权限: "
+                    + command
+                    + "\n原因: "
+                    + str(exc)
+                ) from exc
+
+            success = completed.returncode == 0
+
+            result = {
+                "action": action,
+                "command": command,
+                "stdin_used": stdin_text is not None,
+                "success": success,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "reason": reason,
+            }
+
+            results.append(result)
+
+            if not success:
+                logs.append(
+                    f"执行命令失败: {command}\n"
+                    f"returncode={completed.returncode}\n"
+                    f"stdin_used={stdin_text is not None}\n"
+                    f"stderr: {(completed.stderr or '').strip()}\n"
+                    f"stdout: {(completed.stdout or '').strip()}"
+                )
+                raise ValueError(
+                    "命令执行失败: "
+                    + command
+                    + "\n错误信息: "
+                    + (completed.stderr or completed.stdout or "无输出")
+                )
+
+            logs.append(
+                f"执行命令成功: {command}\n"
+                f"stdin_used={stdin_text is not None}\n"
+                f"输出: {completed.stdout.strip()}"
+            )
+            continue
+
+        raise ValueError(f"不支持的规划动作: {action}")
+
+    validation_logs: list[str] = []
+
+    for root in _find_created_skill_roots(touched):
+        skill_md = root / "SKILL.md"
+        if skill_md.exists():
+            _validate_skill_md(skill_md)
+            validation_logs.append(f"校验通过: {skill_md}")
+
+    logs.extend(validation_logs)
+
+    return {
+        "executed": bool(results or touched),
+        "reason": "已根据结构化 action plan 执行任务。" if (results or touched) else "规划中没有需要执行的任务。",
+        "plan": plan,
+        "results": results,
+        "logs": logs,
+    }
+
+# 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。
+def _execute_restricted_bash_block(code: str) -> dict:
+    """Execute a restricted subset of generated bash.
+
+    Deprecated: 新流程使用 main output -> block planner -> planned actions。
+    保留该函数是为了兼容已有测试或外部调用。
+    """
+    blocks = [MarkdownBlock(index=0, lang="bash", code=code, before_context="执行命令：", after_context="")]
+    plan = {
+        "tasks": [{"block_index": 0, "action": "run_command", "command": code.strip(), "reason": "兼容旧执行路径"}],
+        "errors": [],
+    }
+
+    class _ConfirmedRequest:
+        messages = [Message(role="user", content="对，开始做吧")]
+        model = None
+
+    result = _execute_planned_actions(
+        plan,
+        blocks,
+        _ConfirmedRequest(),
+        require_confirmation=True,
+        execution_root=None,
+    )
+
+    return {
+        "success": result.get("executed", False),
+        "touched": [],
+        "logs": result.get("logs", []),
+    }
+
+
+def _format_execution_report(result: dict) -> str:
+    if not result.get("executed"):
+        reason = result.get("reason", "未知原因")
+        errors = result.get("plan", {}).get("errors", []) if isinstance(result.get("plan"), dict) else []
+        if errors:
+            rendered_errors = "\n".join(f"- {json.dumps(item, ensure_ascii=False)}" for item in errors)
+            return f"\n\n⚠️ 后台未执行规划任务：{reason}\n规划提示：\n{rendered_errors}"
+        return f"\n\n⚠️ 后台未执行规划任务：{reason}"
+
+    logs = result.get("logs") or []
+
+    if not logs:
+        for item in result.get("results", []):
+            action = item.get("action")
+            if action == "read_resource":
+                logs.append(f"读取资源: {item.get('path')}")
+            elif action == "write_file":
+                logs.append(f"写入文件: {item.get('path')}")
+            elif action == "run_command":
+                logs.append(f"执行命令成功: {item.get('command')}")
+            elif action == "create_directory":
+                logs.append(f"创建目录: {item.get('path')}")
+
+    if not logs:
+        return "\n\n✅ 后台已执行规划任务。"
+
+    rendered = "\n".join(f"- {line}" for line in logs)
+    return f"\n\n✅ 后台已执行规划任务：\n{rendered}"
+
+
+async def _plan_and_execute_generated_output(
+    *,
+    assistant_text: str,
+    request: ChatRequest,
+    model: str,
+    require_confirmation: bool = True,
+    execution_root: Path | None = None,
+    skill_name: str = "",
+) -> dict:
+    """Legacy fallback: plan and execute actions from main model Markdown output.
+
+    新主路径不再依赖这个函数。
+    仅当 runtime planner 判断 direct_answer，或者旧 Skill 仍要求通过主模型 Markdown 输出动作时，才作为兜底。
+    """
+    blocks = _extract_all_fenced_blocks(assistant_text)
+
+    if not blocks:
+        return {
+            "executed": False,
+            "reason": "主模型回复中未检测到 fenced code block。",
+            "plan": {"tasks": [], "errors": []},
+            "results": [],
+        }
+
+    planner_model = _planner_model_name(model)
+
+    plan = await _run_block_planner_round(
+        assistant_text=assistant_text,
+        blocks=blocks,
+        request=request,
+        model=planner_model,
+    )
+
+    if plan.get("errors") and not plan.get("tasks"):
+        return {
+            "executed": False,
+            "reason": "规划模型未生成可执行任务。",
+            "plan": plan,
+            "results": [],
+        }
+
+    return _execute_planned_actions(
+        plan,
+        blocks,
+        request,
+        require_confirmation=require_confirmation,
+        execution_root=execution_root,
+        skill_name=skill_name,
+    )
+
+
+def _make_stream(skill_context: dict, request: ChatRequest):
+    """Staged Skill execution with creator-safe action planning.
+
+    关键逻辑：
+    - /creator：用户未明确确认前，只让主模型按 Creator SKILL.md 做需求收集；
+      不运行 runtime planner，不执行动作。
+    - /creator：用户确认后，允许主模型生成文件块，再由 block planner/executor 写入。
+    - /sandbox/{skill_name}：可以使用 runtime planner 执行具体 Skill。
+    """
     model = request.model or settings.default_model
-    base_messages = [{"role": "system", "content": system_prompt}]
-    base_messages += [{"role": m.role, "content": m.content} for m in request.messages]
+    force_body = bool(skill_context.get("force_body", False))
+    enable_action_execution = bool(skill_context.get("enable_action_execution", False))
+    require_action_confirmation = bool(skill_context.get("require_action_confirmation", True))
+    strict_skill_execution = bool(skill_context.get("strict_skill_execution", False))
+    strict_creator_generation = bool(skill_context.get("strict_creator_generation", False))
+    execution_root = skill_context.get("execution_root")
+    child_body_loader = skill_context.get("child_body_loader")
+    parent_skill_name = skill_context.get("skill_name", "")
+    disable_runtime_planner = bool(skill_context.get("disable_runtime_planner", False))
+    enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
+
+    skip_runtime_planner_before_confirmation = bool(
+        skill_context.get("skip_runtime_planner_before_confirmation", False)
+    )
+
+    if execution_root is not None:
+        execution_root = Path(execution_root).resolve()
 
     async def generate():
         try:
-            current_messages = list(base_messages)
-            # Agentic loop: after each LLM round, if the model ran scripts, inject
-            # the output back as a user message and call the LLM again so it can
-            # reason about the results.  At most _MAX_ROUNDS to prevent infinite loops.
-            _MAX_ROUNDS = 5
+            if force_body:
+                need_body = True
+                logger.debug("force_body=True, skip metadata decision and load SKILL.md body directly")
+            else:
+                need_body = await _run_metadata_round(
+                    metadata_prompt=skill_context["metadata_prompt"],
+                    request=request,
+                    model=model,
+                )
 
-            for _round in range(_MAX_ROUNDS):
-                buf = ""
-                # Track text chunks yielded this round so we can reconstruct the
-                # assistant message when feeding results back.
-                text_chunks: list[str] = []
-                script_results: list[dict] = []
+            if not need_body:
+                fallback_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "当前用户请求与已选 Skill 及其子 Skill 的 metadata 不匹配。"
+                            "请简短说明该 Skill 不适用，并提示用户重新描述需求。"
+                        ),
+                    }
+                ]
+                fallback_messages.extend(_request_messages(request))
 
-                async for chunk in stream_chat(current_messages, model):
-                    buf += chunk
+                async for chunk in stream_chat(fallback_messages, model):
+                    yield _sse({"content": chunk})
 
-                    # Drain all complete skill_action tags from the front of buf.
-                    while True:
-                        open_pos = buf.find(_OPEN_TAG)
+                yield "data: [DONE]\n\n"
+                return
 
-                        if open_pos == -1:
-                            # No open tag present — emit safe prefix and stop.
-                            safe = _safe_flush_len(buf)
-                            if safe > 0:
-                                piece = buf[:safe]
-                                text_chunks.append(piece)
-                                yield _sse({"content": piece})
-                                buf = buf[safe:]
-                            break
+            body_prompt = skill_context["body_loader"]()
 
-                        # Emit text that precedes the open tag.
-                        if open_pos > 0:
-                            piece = buf[:open_pos]
-                            text_chunks.append(piece)
-                            yield _sse({"content": piece})
-                            buf = buf[open_pos:]
+            if child_body_loader:
+                child_decision = await _run_child_skill_selection_round(
+                    parent_metadata_prompt=skill_context["metadata_prompt"],
+                    request=request,
+                    model=model,
+                )
 
-                        close_pos = buf.find(_CLOSE_TAG)
-                        if close_pos == -1:
-                            # Tag not yet complete; wait for more chunks.
-                            break
+                if child_decision.get("need_child"):
+                    child_ref = child_decision.get("child_ref", "")
+                    try:
+                        child_body_prompt = child_body_loader(child_ref)
+                        body_prompt = (
+                            f"{body_prompt}\n\n"
+                            "---\n\n"
+                            "## Loaded Child Skill Body\n\n"
+                            f"父 Skill 已根据用户请求按需加载子 Skill：`{child_ref}`。\n"
+                            "下面是该子 Skill 的完整执行正文。\n\n"
+                            f"{child_body_prompt}"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to load child skill body parent=%s child_ref=%s error=%s",
+                            parent_skill_name,
+                            child_ref,
+                            exc,
+                        )
+                        body_prompt = (
+                            f"{body_prompt}\n\n"
+                            "---\n\n"
+                            "## Child Skill Load Warning\n\n"
+                            f"运行时尝试加载子 Skill `{child_ref}`，但加载失败：{exc}\n"
+                            "请不要假装已经读取该子 Skill 正文。"
+                        )
 
-                        # Extract JSON between the tags.
-                        json_str = buf[len(_OPEN_TAG):close_pos]
-                        buf = buf[close_pos + len(_CLOSE_TAG):]
+            if enable_resource_preload:
+                resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                resource_decision = await _run_resource_selection_round(
+                    body_prompt=body_prompt,
+                    request=request,
+                    model=model,
+                    resource_catalog=resource_catalog,
+                )
 
-                        try:
-                            action_data = json.loads(json_str)
-                            result = await asyncio.to_thread(
-                                skill_executor.run_action, action_data
+                if resource_decision.get("need_resources"):
+                    loaded_resources_prompt = _compose_loaded_resources_prompt(
+                        skill_name=parent_skill_name,
+                        resource_catalog=resource_catalog,
+                        selected_handles=resource_decision.get("resource_handles") or [],
+                    )
+
+                    if loaded_resources_prompt:
+                        body_prompt = body_prompt + loaded_resources_prompt
+
+            should_skip_runtime_planner = (
+                skip_runtime_planner_before_confirmation
+                and require_action_confirmation
+                and not _has_creation_confirmation(request)
+            )
+
+            if enable_action_execution and not should_skip_runtime_planner and not disable_runtime_planner:
+                try:
+                    runtime_plan = await _run_skill_runtime_planner_round(
+                        body_prompt=body_prompt,
+                        request=request,
+                        model=model,
+                        execution_root=execution_root,
+                    )
+
+                    mode = runtime_plan.get("mode")
+
+                    if mode == "execute" and runtime_plan.get("tasks"):
+                        exec_result = _execute_planned_actions(
+                            runtime_plan,
+                            [],
+                            request,
+                            require_confirmation=require_action_confirmation,
+                            execution_root=execution_root,
+                            skill_name=parent_skill_name,
+                        )
+
+                        final_answer = await _generate_final_answer_from_observation(
+                            body_prompt=body_prompt,
+                            request=request,
+                            model=model,
+                            plan=runtime_plan,
+                            execution_result=exec_result,
+                        )
+
+                        yield _sse({"content": final_answer})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    if mode == "ask_user":
+                        missing = runtime_plan.get("missing") or []
+                        errors = runtime_plan.get("errors") or []
+
+                        if missing:
+                            text = "缺少必要信息，无法执行 Skill：\n" + "\n".join(
+                                f"- {item}" for item in missing
                             )
-                        except json.JSONDecodeError as exc:
-                            # First repair attempt: strip markdown code fences, then
-                            # escape unescaped control characters inside string values.
-                            logger.warning(
-                                "skill_action JSON parse error: %s — attempting repair", exc
+                        elif errors:
+                            text = "运行时规划失败：\n" + "\n".join(
+                                f"- {json.dumps(item, ensure_ascii=False)}" for item in errors
                             )
-                            repaired = _repair_json(_strip_code_fences(json_str))
-                            try:
-                                action_data = json.loads(repaired)
-                                result = await asyncio.to_thread(
-                                    skill_executor.run_action, action_data
-                                )
-                            except (json.JSONDecodeError, Exception) as repair_exc:
-                                logger.warning(
-                                    "skill_action JSON repair failed: %s", repair_exc
-                                )
-                                result = {
-                                    "action": "unknown",
-                                    "name": "",
-                                    "success": False,
-                                    "message": "动作标签 JSON 格式错误，请检查格式后重试",
-                                    "path": None,
-                                }
+                        else:
+                            text = "缺少必要信息，无法执行当前 Skill。"
 
-                        yield _sse({"action_result": result})
+                        yield _sse({"content": text})
+                        yield "data: [DONE]\n\n"
+                        return
 
-                        if result.get("action") == "run_script":
-                            script_results.append(result)
-                        # Continue the while-loop to process any further tags.
+                    if mode == "not_applicable":
+                        yield _sse({"content": "当前用户请求与该 Skill 不匹配，请重新选择 Skill 或重新描述需求。"})
+                        yield "data: [DONE]\n\n"
+                        return
 
-                # Flush remaining buffer after the stream ends.
-                if buf:
-                    text_chunks.append(buf)
-                    yield _sse({"content": buf})
+                    # mode == direct_answer 时继续走普通主模型回复。
 
-                # If no scripts were run this round, the conversation is complete.
-                if not script_results:
-                    break
+                except Exception as exc:
+                    logger.exception("runtime skill action planning/execution failed")
+                    yield _sse({"error": f"错误：运行时规划或执行失败：{exc}"})
+                    yield "data: [DONE]\n\n"
+                    return
 
-                # ---------------------------------------------------------------
-                # Feed script results back into the conversation for the next round.
-                # Add the assistant's generated text, then the script outputs as a
-                # user message so the LLM can reason about what the scripts produced.
-                # ---------------------------------------------------------------
-                accumulated_text = "".join(text_chunks)
-                next_messages = list(current_messages)
-                if accumulated_text.strip():
-                    next_messages.append({"role": "assistant", "content": accumulated_text})
+            final_messages = [
+                {
+                    "role": "system",
+                    "content": body_prompt,
+                }
+            ]
 
-                output_parts: list[str] = []
-                for r in script_results:
-                    lines = [
-                        f"[脚本执行结果: scripts/{r.get('filename', '')}]",
-                        f"退出码: {r.get('exit_code', '')}",
-                    ]
-                    if r.get("stdout"):
-                        lines.append(f"stdout:\n{r['stdout']}")
-                    if r.get("stderr"):
-                        lines.append(f"stderr:\n{r['stderr']}")
-                    output_parts.append("\n".join(lines))
+            if strict_creator_generation:
+                final_messages.append(
+                    {
+                        "role": "system",
+                        "content": _compose_creator_artifact_consistency_prompt(),
+                    }
+                )
 
-                next_messages.append({
-                    "role": "user",
-                    "content": "\n\n".join(output_parts),
-                })
-                current_messages = next_messages
+            if strict_skill_execution:
+                final_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "当前处于沙盒 Skill 严格执行模式。\n\n"
+                            "你必须严格遵循已经加载的 Loaded SKILL.md，禁止把它当作普通参考资料。\n"
+                            "你不得绕过 Loaded SKILL.md 自由回答用户请求。\n"
+                            "你不得自行编造业务结果、执行结果、计划内容、文件内容或命令输出。\n\n"
+                            "如果 Loaded SKILL.md 语义上要求通过某种动作完成任务，"
+                            "例如运行程序、调用脚本、执行命令、写入文件、读取资源、生成配置、运行测试或调用工具，"
+                            "你必须先按照 Loaded SKILL.md 的原始要求输出该动作的实际形式。\n"
+                            "动作表达形式由 Loaded SKILL.md 决定，不能固定假设某种章节、某种语言、某种命令或某种格式。\n\n"
+                            "如果动作中包含示例输入、占位输入、演示参数或模板参数，"
+                            "只要语义上对应当前用户输入，就必须替换为当前用户的真实输入。\n"
+                            "不能在应该替换时原样保留示例值或占位值。\n\n"
+                            "如果缺少必要参数，必须明确指出缺少哪些信息；"
+                            "不得猜测，不得保留占位符继续输出，不得直接编造最终结果。\n\n"
+                            "只有当 Loaded SKILL.md 明确要求直接生成文本结果，"
+                            "或者不存在任何外部动作要求时，才可以直接生成文本结果。\n"
+                        ),
+                    }
+                )
 
+            final_messages.extend(_request_messages(request))
+
+            assistant_chunks: list[str] = []
+            async for chunk in stream_chat(final_messages, model):
+                assistant_chunks.append(chunk)
+                yield _sse({"content": chunk})
+
+            assistant_text = "".join(assistant_chunks)
+
+            if enable_action_execution:
+                try:
+                    exec_result = await _plan_and_execute_generated_output(
+                        assistant_text=assistant_text,
+                        request=request,
+                        model=model,
+                        require_confirmation=require_action_confirmation,
+                        execution_root=execution_root,
+                        skill_name=parent_skill_name,
+                    )
+
+                    if exec_result.get("executed"):
+                        yield _sse({"content": _format_execution_report(exec_result)})
+
+                except Exception as exc:
+                    logger.exception("legacy markdown action fallback failed")
+                    yield _sse({"error": f"错误：后台规划或执行文件操作失败：{exc}"})
+                    yield "data: [DONE]\n\n"
+                    return
             yield "data: [DONE]\n\n"
+
         except Exception as exc:
             logger.exception("LLM stream error")
             yield _sse({"error": _friendly_error(exc)})
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
+def _compose_creator_artifact_consistency_prompt() -> str:
+    """Creator-stage consistency contract.
 
+    只用于 /creator 阶段。
+    目标：
+    - 不硬编码任何语言、章节名、命令格式或参数名；
+    - 要求模型自己保证生成的 SKILL.md、脚本、配置、说明之间的调用接口一致；
+    - 避免出现 SKILL.md 写一种调用方式，脚本实现却接收另一种输入方式。
+    """
+    return (
+        "当前处于 Skill Creator 严格生成模式。\n\n"
+        "你正在创建一个可运行的 Skill 包，而不是只写说明文档。"
+        "你生成的所有文件必须形成一个自洽的整体，包括但不限于 SKILL.md、脚本、配置、参考文件和测试命令。\n\n"
+        "一致性要求：\n"
+        "1. 如果你生成了任何可执行入口、脚本、工具调用、配置入口或其他运行资源，"
+        "同时又在说明文档中写出了调用方式、运行方式、示例命令或使用步骤，"
+        "两者的输入接口必须严格一致。\n"
+        "2. 说明文档中的调用方式必须由你生成的实际代码支持；"
+        "实际代码接收输入的方式也必须能被说明文档中的调用方式触发。\n"
+        "3. 如果代码通过命令行参数接收输入，说明文档中的调用方式必须使用对应的命令行参数。\n"
+        "4. 如果代码通过标准输入、文件、环境变量、配置、HTTP 请求体、JSON 字段或其他方式接收输入，"
+        "说明文档中的调用方式必须体现同一种输入通道。\n"
+        "5. 如果说明文档要求某个参数、字段、文件、输入通道或调用步骤，实际代码必须实现它。\n"
+        "6. 如果实际代码实现了某个输入通道，说明文档中的调用方式不得写成另一个不兼容的输入通道。\n"
+        "7. 示例值、占位值和演示输入只能用于说明；当需要给出可执行调用示例时，"
+        "必须保证该示例在当前生成的代码中真实可运行。\n\n"
+        "禁止行为：\n"
+        "1. 禁止只生成看起来合理但与代码入口不匹配的调用方式。\n"
+        "2. 禁止文档写一种输入形式、代码实现另一种输入形式。\n"
+        "3. 禁止依赖后台替你修正参数、命令或输入通道。\n"
+        "4. 禁止假设宿主会自动把命令行参数转换成标准输入，或把标准输入转换成命令行参数。\n"
+        "5. 禁止生成互相矛盾的 SKILL.md、脚本和测试命令。\n\n"
+        "生成前自检：\n"
+        "在输出写文件代码块之前，你必须在内部完成一致性检查：\n"
+        "- 文档中的每个可执行调用是否被实际代码支持；\n"
+        "- 实际代码需要的每个必要输入是否在文档调用方式中提供；\n"
+        "- 示例调用是否能在当前 Skill 目录下直接运行；\n"
+        "- 报错信息和输出要求是否与文档约束一致。\n\n"
+        "输出要求：\n"
+        "你仍然只输出普通 Markdown 和 fenced code block。"
+        "不要输出自定义动作标签。"
+        "需要写入文件时，仍应在代码块附近明确写出保存路径。"
+    )
+
+def build_kernel_skill_context() -> dict:
+    kernel_metadata_prompt = load_kernel_metadata_prompt()
+
+    return {
+        "skill_name": "skill-creator",
+        "metadata_prompt": kernel_metadata_prompt,
+        "body_loader": load_kernel_body_prompt,
+        "child_body_loader": lambda child_ref: load_child_skill_body_prompt("skill-creator", child_ref),
+        "force_body": True,
+        "enable_action_execution": True,
+        "require_action_confirmation": True,
+        "execution_root": None,
+        "strict_creator_generation": True,
+
+        "skip_runtime_planner_before_confirmation": True,
+        "disable_runtime_planner": True,
+
+        # 新增：creator 阶段按需读取 references/assets/scripts
+        "enable_resource_preload": True,
+    }
+
+
+def build_skill_context(skill_name: str) -> dict:
+    skill_root = _skill_root_for_name(skill_name)
+    skill_metadata_prompt = load_skill_metadata_prompt(skill_name)
+
+    return {
+        "skill_name": skill_name,
+        "metadata_prompt": skill_metadata_prompt,
+        "body_loader": lambda: load_skill_body_prompt(skill_name),
+        "child_body_loader": lambda child_ref: load_child_skill_body_prompt(skill_name, child_ref),
+        "force_body": False,
+        "enable_action_execution": True,
+        "require_action_confirmation": False,
+        "execution_root": skill_root,
+        "strict_skill_execution": True,
+
+        "enable_resource_preload": True,
+    }
 @router.post("/creator")
 async def chat_with_creator(request: ChatRequest):
-    """Multi-turn chat powered by kernel/SKILL.md (skill-creator mode)."""
+    """Multi-turn chat powered by the fixed kernel Skill Creator."""
     try:
-        system_prompt = load_kernel_system_prompt()
+        skill_context = build_kernel_skill_context()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return _make_stream(system_prompt, request)
+
+    return _make_stream(skill_context, request)
 
 
 @router.post("/sandbox/{skill_name}")
 async def chat_in_sandbox(skill_name: str, request: ChatRequest):
-    """Multi-turn chat with a specific skill loaded as system prompt (sandbox mode)."""
+    """Multi-turn chat with a specific skill loaded in sandbox mode."""
     try:
-        system_prompt = load_skill_system_prompt(skill_name)
+        skill_context = build_skill_context(skill_name)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    return _make_stream(system_prompt, request)
+
+    return _make_stream(skill_context, request)

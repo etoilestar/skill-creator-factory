@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import json
 import logging
@@ -80,6 +81,19 @@ _CONFIRM_KEYWORDS = (
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
 _ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
+
+# 脚本扩展名 → 自动注入的解释器（方案 A+B）
+# 注意：".ts" 是特殊情况，实际命令为 `npx ts-node <file>`，见 _prepare_command_argv。
+_SCRIPT_INTERPRETERS: dict[str, str] = {
+    ".js":   "node",
+    ".mjs":  "node",
+    ".cjs":  "node",
+    ".py":   "python3",
+    ".sh":   "bash",
+    ".bash": "bash",
+    ".rb":   "ruby",
+    ".ts":   "ts-node",   # 特殊处理：通过 `npx ts-node` 执行
+}
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -1538,7 +1552,37 @@ def _prepare_command_argv(
         if not exe_path.is_file():
             raise ValueError(f"命令不可执行，目标不是文件: {executable}")
 
-        argv[0] = str(exe_path)
+        # 方案 A+B：先检查 execute bit；若无，则按扩展名自动注入解释器；
+        # 若扩展名也无法识别，则给出明确错误提示。
+        if os.access(exe_path, os.X_OK):
+            # 文件有执行权限，直接执行
+            argv[0] = str(exe_path)
+        else:
+            ext = exe_path.suffix.lower()
+            interpreter = _SCRIPT_INTERPRETERS.get(ext)
+            if interpreter is not None:
+                # .ts 特殊处理：直接检查 ts-node 或通过 npx 运行
+                if ext == ".ts":
+                    if shutil.which("ts-node") is not None:
+                        argv = ["ts-node", str(exe_path)] + argv[1:]
+                    elif shutil.which("npx") is not None:
+                        argv = ["npx", "ts-node", str(exe_path)] + argv[1:]
+                    else:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要 ts-node 或 npx，但它们均不在 PATH 中。"
+                        )
+                else:
+                    if shutil.which(interpreter) is None:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要解释器 {interpreter}，但它不在 PATH 中。"
+                        )
+                    argv = [interpreter, str(exe_path)] + argv[1:]
+            else:
+                raise ValueError(
+                    f"命令没有执行权限: {executable}\n"
+                    f"文件不可直接执行（无 execute bit），且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
+                    f"请使用 'node/python3/bash <脚本路径>' 的形式明确指定解释器。"
+                )
 
     # 2. argv[0] 是裸命令：python、node、bash、ffmpeg、convert 等
     # 不做白名单，只检查系统 PATH 中是否存在。

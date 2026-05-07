@@ -2672,8 +2672,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 raw = abs_path.read_bytes()
                                 if len(raw) <= _MAX_INLINE_BYTES:
                                     text = raw.decode("utf-8", errors="replace")
+                                    # Escape any triple-backtick sequences in the content
+                                    # so they don't break the surrounding code fence.
+                                    safe_text = text.replace("```", "` ` `")
                                     content_block = (
-                                        f"\n\n  文件内容如下：\n\n  ```\n{text}\n  ```"
+                                        f"\n\n  文件内容如下：\n\n  ```\n{safe_text}\n  ```"
                                     )
                         except Exception:
                             pass  # fall back to path-only if read fails
@@ -2683,11 +2686,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             f"- `{rel_path}`（文件名：`{filename}`）{content_block}"
                         )
                     else:
+                        # Strip the leading "inputs/" component so the script only needs
+                        # os.path.join(INPUT_DIR, remaining) — INPUT_DIR points to inputs/.
+                        rel_to_input_dir = Path(rel_path).relative_to("inputs").as_posix() if rel_path.startswith("inputs/") else rel_path
                         file_sections.append(
                             f"- `{rel_path}`（文件名：`{filename}`，"
-                            "可通过脚本环境变量 `INPUT_DIR` 访问：`os.path.join(os.environ['INPUT_DIR'], '"
-                            + "/".join(rel_path.split("/")[1:])
-                            + "')` ）"
+                            f"可通过脚本环境变量 `INPUT_DIR` 访问：`os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` ）"
                         )
 
                 if file_sections:

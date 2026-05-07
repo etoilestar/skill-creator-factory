@@ -1510,8 +1510,10 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "  \"errors\": []\n"
         "}\n"
         "\n"
-        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径，"
-        "例如 `$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`，"
+        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径。\n"
+        "- Shell 脚本：`$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`\n"
+        "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
+        "`os.path.join(os.environ['INPUT_DIR'], '<相对路径>')`\n"
         "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
     )
 
@@ -2815,8 +2817,13 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         # Strip the leading "inputs/" component so the script only needs
                         # os.path.join(INPUT_DIR, remaining) — INPUT_DIR points to inputs/.
                         try:
-                            rel_to_input_dir = Path(rel_path).relative_to("inputs").as_posix() if rel_path.startswith("inputs/") else rel_path
-                        except ValueError:
+                            _rel_path_obj = Path(rel_path)
+                            # Use parts[0] to avoid Windows backslash ambiguity.
+                            if _rel_path_obj.parts and _rel_path_obj.parts[0] == "inputs":
+                                rel_to_input_dir = Path(*_rel_path_obj.parts[1:]).as_posix()
+                            else:
+                                rel_to_input_dir = rel_path
+                        except (ValueError, IndexError):
                             rel_to_input_dir = rel_path
                         file_sections.append(
                             f"- `{rel_path}`（文件名：`{filename}`，"

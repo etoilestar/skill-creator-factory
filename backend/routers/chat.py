@@ -2726,11 +2726,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 raw = abs_path.read_bytes()
                                 if len(raw) <= _MAX_INLINE_BYTES:
                                     text = raw.decode("utf-8", errors="replace")
-                                    # Escape any triple-backtick sequences in the content
-                                    # so they don't break the surrounding code fence.
-                                    safe_text = text.replace("```", "` ` `")
+                                    # Choose a fence that doesn't appear in the content.
+                                    # Prefer ``` but fall back to a tilde fence when the
+                                    # file itself contains triple-backtick sequences.
+                                    if "```" not in text:
+                                        fence, content_text = "```", text
+                                    else:
+                                        fence = "~~~~"
+                                        content_text = text.replace("~~~~", "~ ~ ~ ~")
                                     content_block = (
-                                        f"\n\n  文件内容如下：\n\n  ```\n{safe_text}\n  ```"
+                                        f"\n\n  文件内容如下：\n\n  {fence}\n{content_text}\n  {fence}"
                                     )
                         except Exception:
                             pass  # fall back to path-only if read fails
@@ -2742,7 +2747,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     else:
                         # Strip the leading "inputs/" component so the script only needs
                         # os.path.join(INPUT_DIR, remaining) — INPUT_DIR points to inputs/.
-                        rel_to_input_dir = Path(rel_path).relative_to("inputs").as_posix() if rel_path.startswith("inputs/") else rel_path
+                        try:
+                            rel_to_input_dir = Path(rel_path).relative_to("inputs").as_posix() if rel_path.startswith("inputs/") else rel_path
+                        except ValueError:
+                            rel_to_input_dir = rel_path
                         file_sections.append(
                             f"- `{rel_path}`（文件名：`{filename}`，"
                             f"脚本可通过 `os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` 读取；"

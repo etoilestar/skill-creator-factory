@@ -1388,7 +1388,11 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "2. 不得凭空生成 scripts/main.py、scripts/run.py、main.py 等路径。\n"
         "3. 如果 command 引用了 scripts/...，该路径必须能在 resource_catalog 中看到。\n"
         "4. 如果 resource_catalog 的 scripts 为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
-        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不存在，应使用 ask_user，并在 errors 中说明脚本不存在。\n\n"
+        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不存在，应使用 ask_user，并在 errors 中说明脚本不存在。\n"
+        "6. command 必须是完整的可执行命令行，包含脚本所需的所有参数，并用用户消息中的实际值替换 Loaded SKILL.md 里的占位符\n"
+        "（例如 `<filepath>`、`{file}`、`<input>` 等）；不得在 command 中保留任何占位符或省略必要参数。\n"
+        "7. 如果某个必要参数（例如文件路径、用户数据）在用户消息中未提供且无法从上下文推断，"
+        "必须使用 ask_user 模式，并在 missing 列表中说明缺少哪些信息；不得用不完整的命令继续 execute。\n\n"
         "输出格式：\n"
         "{\n"
         "  \"mode\": \"execute | direct_answer | ask_user | not_applicable\",\n"
@@ -1400,9 +1404,9 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "    },\n"
         "    {\n"
         "      \"action\": \"run_command\",\n"
-        "      \"command\": \"<只能填写 Loaded SKILL.md 明确要求且宿主可验证的真实命令>\",\n"
+        "      \"command\": \"scripts/process.py uploads/data.xlsx --format markdown\",\n"
         "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
-        "      \"reason\": \"需要运行真实存在的脚本或工具\"\n"
+        "      \"reason\": \"需要运行真实存在的脚本或工具，命令包含从用户消息中提取的实际参数值\"\n"
         "    }\n"
         "  ],\n"
         "  \"final_instruction\": \"执行完成后优先基于 observation 回答；direct_answer 时按 Loaded SKILL.md 直接回答\",\n"
@@ -1945,13 +1949,15 @@ def _prepare_command_argv(
         if not exe_path.is_file():
             raise ValueError(f"命令不可执行，目标不是文件: {executable}")
 
-        # 方案 A+B：先检查 execute bit；若无，则按扩展名自动注入解释器；
+        # 方案 A+B：对已知脚本扩展名（.py/.sh/.js 等）始终注入解释器，
+        # 避免 execute bit 判断不一致导致的 PermissionError；
+        # 对未知扩展名才依赖 execute bit 直接执行；
         # 若扩展名也无法识别，则给出明确错误提示。
-        if os.access(exe_path, os.X_OK):
-            # 文件有执行权限，直接执行
+        ext = exe_path.suffix.lower()
+        if ext not in _SCRIPT_INTERPRETERS and os.access(exe_path, os.X_OK):
+            # 非脚本文件且有执行权限，直接执行
             argv[0] = str(exe_path)
         else:
-            ext = exe_path.suffix.lower()
             interpreter = _SCRIPT_INTERPRETERS.get(ext)
             if interpreter is not None:
                 # .ts 特殊处理：直接检查 ts-node 或通过 npx 运行
@@ -2009,7 +2015,7 @@ def _prepare_command_argv(
             else:
                 raise ValueError(
                     f"命令没有执行权限: {executable}\n"
-                    f"文件不可直接执行（无 execute bit），且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
+                    f"文件不可直接执行，且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
                     f"请使用 'node/python3/bash <脚本路径>' 的形式明确指定解释器。"
                 )
 

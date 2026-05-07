@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-read_excel.py — 读取 Excel 文件并输出结构化摘要
+read_excel.py — 读取 Excel / CSV 文件或 stdin 数据并输出结构化摘要
 
 用法：
     python3 read_excel.py data.xlsx
+    python3 read_excel.py data.csv
+    python3 read_excel.py - --format markdown   # 从 stdin 读取 CSV 文本
+    echo "a,b\n1,2" | python3 read_excel.py -
     python3 read_excel.py data.xlsx --sheet "Sheet1"
     python3 read_excel.py data.xlsx --format csv
     python3 read_excel.py data.xlsx --summary
     python3 read_excel.py data.xlsx --head 20
 
 参数：
-    文件路径         Excel 文件（.xlsx / .xls）
-    --sheet NAME    指定工作表名称（默认读取所有）
+    文件路径         Excel 文件（.xlsx / .xls）、CSV 文件（.csv）或 - 表示从 stdin 读取 CSV
+    --sheet NAME    指定工作表名称（仅 Excel，默认读取所有）
     --format FMT    输出格式：markdown（默认）/ csv / json
     --summary       仅输出数据概览（行列数、字段类型、空值统计）
     --head N        仅输出前 N 行（默认全部）
 
 依赖：
-    pip install openpyxl pandas
+    pip install openpyxl pandas tabulate
 """
 
 import sys
+import io
 import json
 import argparse
 
@@ -35,6 +39,10 @@ def ensure_dependencies():
         import openpyxl
     except ImportError:
         missing.append('openpyxl')
+    try:
+        import tabulate  # noqa: F401 — needed for DataFrame.to_markdown()
+    except ImportError:
+        missing.append('tabulate')
     if missing:
         print(f"缺少依赖: {', '.join(missing)}", file=sys.stderr)
         print(f"请运行: pip install {' '.join(missing)}", file=sys.stderr)
@@ -45,10 +53,34 @@ ensure_dependencies()
 import pandas as pd
 
 
-def read_excel(filepath, sheet_name=None, output_format='markdown', summary_only=False, head=None):
-    """读取 Excel 并格式化输出"""
+def _load_dataframes(filepath, sheet_name=None):
+    """加载数据，返回 {sheet_name: DataFrame} 字典。
+
+    支持：
+    - '-'         从 stdin 读取 CSV 文本
+    - '*.csv'     读取 CSV 文件
+    - '*.xlsx/xls' 读取 Excel 文件（支持多工作表）
+    """
+    if filepath == '-':
+        raw = sys.stdin.read()
+        try:
+            df = pd.read_csv(io.StringIO(raw))
+        except Exception as e:
+            print(f"解析 stdin CSV 失败: {e}", file=sys.stderr)
+            sys.exit(1)
+        return {"stdin": df}
+
+    ext = filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+    if ext == 'csv':
+        try:
+            df = pd.read_csv(filepath)
+        except Exception as e:
+            print(f"读取 CSV 失败: {e}", file=sys.stderr)
+            sys.exit(1)
+        return {filepath: df}
+
+    # Excel
     try:
-        # 读取所有工作表或指定工作表
         if sheet_name:
             sheets = {sheet_name: pd.read_excel(filepath, sheet_name=sheet_name)}
         else:
@@ -56,6 +88,12 @@ def read_excel(filepath, sheet_name=None, output_format='markdown', summary_only
     except Exception as e:
         print(f"读取失败: {e}", file=sys.stderr)
         sys.exit(1)
+    return sheets
+
+
+def read_excel(filepath, sheet_name=None, output_format='markdown', summary_only=False, head=None):
+    """读取数据并格式化输出"""
+    sheets = _load_dataframes(filepath, sheet_name)
 
     for name, df in sheets.items():
         print(f"\n{'='*60}")
@@ -96,9 +134,14 @@ def read_excel(filepath, sheet_name=None, output_format='markdown', summary_only
 
 
 def main():
-    parser = argparse.ArgumentParser(description='读取 Excel 文件')
-    parser.add_argument('filepath', help='Excel 文件路径')
-    parser.add_argument('--sheet', help='指定工作表名称')
+    parser = argparse.ArgumentParser(description='读取 Excel / CSV 文件或 stdin 数据')
+    parser.add_argument(
+        'filepath',
+        nargs='?',
+        default='-',
+        help='Excel/CSV 文件路径，或 - 表示从 stdin 读取 CSV（默认：-）',
+    )
+    parser.add_argument('--sheet', help='指定工作表名称（仅 Excel）')
     parser.add_argument('--format', choices=['markdown', 'csv', 'json'], default='markdown', help='输出格式')
     parser.add_argument('--summary', action='store_true', help='仅输出数据概览')
     parser.add_argument('--head', type=int, help='仅输出前 N 行')

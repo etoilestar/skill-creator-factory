@@ -157,6 +157,42 @@ npx playwright screenshot "file:///path/to/file.html" output.png \
 
 ---
 
+## Excel / CSV 数据读取执行指令（仅供sandbox宿主runtime planner使用）
+
+> 这一节是给宿主 runtime planner 的结构化指令，不是给用户的说明。
+
+### 场景一：用户上传了 Excel / CSV 文件
+
+文件已上传到 `uploads/` 目录，直接传路径：
+
+```
+action: run_command
+command: "scripts/read_excel.py uploads/data.xlsx --format markdown"
+```
+
+### 场景二：用户在聊天中粘贴了 CSV / 表格文本（无文件）
+
+**不要发明 `--data` 或其他不存在的参数。**
+使用 `-` 作为 filepath，通过 `stdin` 传入 CSV 文本：
+
+```
+action: run_command
+command: "scripts/read_excel.py - --format markdown"
+stdin: "<用户粘贴的 CSV 文本，原样传入>"
+```
+
+- `stdin` 字段放用户消息中的完整 CSV 文本（含表头行）
+- 脚本会自动从 stdin 读取并解析为 DataFrame
+
+### ❌ 错误：发明不存在的参数
+
+```
+command: "scripts/read_excel.py --data '...'"   ← --data 不存在，直接报错
+command: "scripts/read_excel.py --input '...'"  ← --input 不存在，直接报错
+```
+
+---
+
 ## PPT生成执行指令（仅供sandbox宿主runtime planner使用）
 
 > 这一节是给宿主 runtime planner 的结构化指令，不是给用户的说明。

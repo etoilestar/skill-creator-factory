@@ -253,7 +253,7 @@ async def download_skill_file(skill_name: str, filepath: str):
         raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
 
     # Reject obviously malicious inputs before constructing the path
-    if "\x00" in filepath or ".." in filepath.split("/"):
+    if "\x00" in filepath:
         raise HTTPException(status_code=400, detail="非法文件路径")
 
     target = (skill_dir / filepath).resolve()

@@ -371,10 +371,19 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
     for name in top_level_names:
         if not name or name.startswith("_") or name in stdlib_names or name in seen:
             continue
+        # Only proceed if the name is a safe identifier (AST-sourced, but be explicit)
+        if not name.isidentifier():
+            continue
         seen.add(name)
         pkg = _IMPORT_TO_PACKAGE.get(name, name)
+        # Use importlib.util.find_spec via argv rather than f-string interpolation
         check = subprocess.run(
-            [str(venv_python), "-c", f"import {name}"],
+            [
+                str(venv_python),
+                "-c",
+                "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)",
+                name,
+            ],
             capture_output=True,
             timeout=10,
         )
@@ -401,9 +410,14 @@ def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
 
     source = script_path.read_text(encoding="utf-8", errors="replace")
     patterns = [
+        # CommonJS: require('pkg') / require("pkg")
         re.compile(r"""require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
+        # ES module: import ... from 'pkg' / import ... from "pkg"
         re.compile(r"""from\s+['"]([^'"./][^'"]*)['"]\s*"""),
+        # Side-effect import: import 'pkg' / import "pkg"
         re.compile(r"""import\s+['"]([^'"./][^'"]*)['"]\s*"""),
+        # Dynamic import: import('pkg') / import("pkg")
+        re.compile(r"""import\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
     ]
     names: list[str] = []
     for pattern in patterns:

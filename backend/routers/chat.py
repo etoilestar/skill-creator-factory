@@ -2644,22 +2644,63 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         body_prompt = body_prompt + loaded_resources_prompt
 
             # Append uploaded input-file context to the body prompt so the LLM
-            # knows which files are available and how scripts can read them.
+            # knows which files are available. For small text files the content is
+            # embedded directly so the LLM can reason about the data without running
+            # a script first. Binary or large files are described by path only.
             if getattr(request, "input_files", None):
-                file_lines = "\n".join(
-                    f"- `{f.get('path', f.get('filename', ''))}`"
-                    for f in request.input_files
-                )
-                body_prompt = (
-                    body_prompt
-                    + "\n\n---\n\n"
-                    "## 当前对话已上传文件\n\n"
-                    "用户已在本次对话中上传了以下文件，文件保存在 Skill 目录下的 `inputs/<session_id>/` 子目录中。\n"
-                    "脚本可通过环境变量 `INPUT_DIR` 指向的目录读取（`import os; input_dir = os.environ['INPUT_DIR']`），"
-                    "文件的完整路径为 `{INPUT_DIR}/<session_id>/<filename>`，"
-                    "其中 `<session_id>` 即下方路径中 `inputs/` 后的第一段目录名。\n\n"
-                    f"{file_lines}\n"
-                )
+                _TEXT_CONTENT_SUFFIXES = frozenset({
+                    ".txt", ".md", ".csv", ".tsv", ".json", ".jsonl",
+                    ".yaml", ".yml", ".xml", ".html", ".htm", ".log",
+                })
+                _MAX_INLINE_BYTES = 100 * 1024  # 100 KB
+
+                file_sections: list[str] = []
+                for f in request.input_files:
+                    rel_path = f.get("path", "")
+                    filename = f.get("filename", rel_path.split("/")[-1] if rel_path else "")
+                    suffix = Path(filename).suffix.lower() if filename else ""
+
+                    # Try to read text content for embedding
+                    content_block = ""
+                    if rel_path and parent_skill_name and suffix in _TEXT_CONTENT_SUFFIXES:
+                        try:
+                            abs_path = (settings.skills_path / parent_skill_name / rel_path).resolve()
+                            # Ensure path stays inside the skill directory
+                            skill_dir_check = (settings.skills_path / parent_skill_name).resolve()
+                            abs_path.relative_to(skill_dir_check)
+                            if abs_path.is_file():
+                                raw = abs_path.read_bytes()
+                                if len(raw) <= _MAX_INLINE_BYTES:
+                                    text = raw.decode("utf-8", errors="replace")
+                                    content_block = (
+                                        f"\n\n  文件内容如下：\n\n  ```\n{text}\n  ```"
+                                    )
+                        except Exception:
+                            pass  # fall back to path-only if read fails
+
+                    if content_block:
+                        file_sections.append(
+                            f"- `{rel_path}`（文件名：`{filename}`）{content_block}"
+                        )
+                    else:
+                        file_sections.append(
+                            f"- `{rel_path}`（文件名：`{filename}`，"
+                            "可通过脚本环境变量 `INPUT_DIR` 访问：`os.path.join(os.environ['INPUT_DIR'], '"
+                            + "/".join(rel_path.split("/")[1:])
+                            + "')` ）"
+                        )
+
+                if file_sections:
+                    sections_text = "\n".join(file_sections)
+                    body_prompt = (
+                        body_prompt
+                        + "\n\n---\n\n"
+                        "## 当前对话已上传文件\n\n"
+                        "用户已在本次对话中上传了以下文件。"
+                        "对于文本文件，内容已直接展示供你参考；"
+                        "对于二进制或大型文件，脚本可通过 `os.environ['INPUT_DIR']` 拼接路径读取。\n\n"
+                        f"{sections_text}\n"
+                    )
 
             should_skip_runtime_planner = (
                 skip_runtime_planner_before_confirmation

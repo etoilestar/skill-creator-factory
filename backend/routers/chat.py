@@ -2523,6 +2523,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     - /sandbox/{skill_name}：可以使用 runtime planner 执行具体 Skill。
     """
     model = request.model or settings.default_model
+    _MAX_CMD_DISPLAY_LENGTH = 60
     force_body = bool(skill_context.get("force_body", False))
     enable_action_execution = bool(skill_context.get("enable_action_execution", False))
     require_action_confirmation = bool(skill_context.get("require_action_confirmation", True))
@@ -2659,7 +2660,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             task_action = str(task.get("action") or "").strip()
                             if task_action == "run_command":
                                 cmd = str(task.get("command") or "")
-                                short_cmd = cmd[:60] + ("…" if len(cmd) > 60 else "")
+                                short_cmd = cmd[:_MAX_CMD_DISPLAY_LENGTH] + ("…" if len(cmd) > _MAX_CMD_DISPLAY_LENGTH else "")
                                 yield _sse({"status": {"phase": "executing", "message": f"执行命令：{short_cmd}"}})
                             elif task_action == "read_resource":
                                 path = str(task.get("path") or task.get("resource_handle") or "")

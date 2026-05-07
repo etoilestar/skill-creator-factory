@@ -64,7 +64,8 @@
             </div>
           </div>
         </template>
-        <div v-if="currentStatus" class="status-bar" :class="`phase-${currentStatus.phase}`">
+        <div v-if="currentStatus" class="status-bar" :class="`phase-${currentStatus.phase}`"
+             role="status" aria-live="polite">
           <span class="status-spinner" aria-hidden="true"></span>
           <span class="status-message">{{ currentStatus.message }}</span>
         </div>

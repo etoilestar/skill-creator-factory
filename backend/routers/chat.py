@@ -507,6 +507,47 @@ def _request_messages(request: ChatRequest) -> list[dict]:
     return [{"role": m.role, "content": m.content} for m in request.messages]
 
 
+def _request_messages_with_files(request: ChatRequest) -> list[dict]:
+    """Like _request_messages, but appends a compact file-attachment note to the
+    last user message so the LLM sees the files as part of the conversation turn
+    rather than only in the system prompt.
+    """
+    if not request.input_files:
+        return _request_messages(request)
+
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    # Find the last user message and append a file-attachment note.
+    for i in reversed(range(len(messages))):
+        if messages[i]["role"] == "user":
+            names = ", ".join(
+                f.get("filename") or Path(f.get("path", "")).name
+                for f in request.input_files
+            )
+            messages[i] = {
+                "role": "user",
+                "content": messages[i]["content"] + f"\n\n【已附上传文件：{names}】",
+            }
+            break
+    return messages
+
+
+def _extract_input_session_dir(input_files: list[dict], execution_root: "Path | None") -> "Path | None":
+    """Derive the session-specific input directory from the first uploaded file's path.
+
+    Uploaded files are stored at  inputs/<session_id>/<filename>  relative to the
+    skill root.  This helper resolves the absolute  inputs/<session_id>/  path so
+    subprocesses can receive it as INPUT_SESSION_DIR, allowing scripts to discover
+    all uploaded files without hard-coding the session ID.
+    """
+    if not input_files or execution_root is None:
+        return None
+    first_path = input_files[0].get("path", "")
+    parts = Path(first_path).parts  # ("inputs", "<session_id>", "<filename>")
+    if len(parts) >= 2 and parts[0] == "inputs":
+        return execution_root / "inputs" / parts[1]
+    return None
+
+
 def _last_user_text(request: ChatRequest) -> str:
     for message in reversed(request.messages):
         if message.role == "user":
@@ -1571,7 +1612,7 @@ async def _run_skill_runtime_planner_round(
     planner_payload = {
         "loaded_skill_prompt": planner_body_prompt,
         "resource_catalog": _resource_catalog_for_planner(resource_catalog),
-        "user_messages": _request_messages(request),
+        "user_messages": _request_messages_with_files(request),
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
         "runtime_contract": {
@@ -1637,7 +1678,7 @@ async def _generate_final_answer_from_observation(
             "content": json.dumps(
                 {
                     "loaded_skill_prompt": body_prompt,
-                    "user_messages": _request_messages(request),
+                    "user_messages": _request_messages_with_files(request),
                     "plan": plan,
                     "execution_result": execution_result,
                 },
@@ -2135,6 +2176,9 @@ def _execute_planned_actions(
         execution_root=execution_root,
     )
 
+    # Pre-compute the session-specific input directory once for all run_command tasks.
+    _session_input_dir: "Path | None" = None
+
     touched: list[Path] = []
     results: list[dict] = []
     logs: list[str] = []
@@ -2247,6 +2291,12 @@ def _execute_planned_actions(
 
             cwd = execution_root or inferred_skill_root
 
+            # Resolve session input directory once (lazy) for this run_command task.
+            if _session_input_dir is None:
+                _session_input_dir = _extract_input_session_dir(
+                    getattr(request, "input_files", []) or [], cwd
+                )
+
             # 执行前快照，用于后续检测新生成的文件
             pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
 
@@ -2257,6 +2307,13 @@ def _execute_planned_actions(
                 argv = _prepare_command_argv(" ".join(shlex.quote(part) for part in argv), base_dir=cwd)
             else:
                 argv = _prepare_command_argv(command, base_dir=cwd)
+
+            _run_cmd_extra_env: dict[str, str] = {
+                "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
+                "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+            }
+            if _session_input_dir is not None:
+                _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(_session_input_dir)
 
             # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
             completed = None
@@ -2270,10 +2327,7 @@ def _execute_planned_actions(
                         text=True,
                         timeout=int(getattr(settings, "skill_command_timeout", 60)),
                         cwd=str(cwd) if cwd else None,
-                        env={
-                            **os.environ,
-                            "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
-                        },
+                        env={**os.environ, **_run_cmd_extra_env},
                     )
                 except FileNotFoundError as exc:
                     raise ValueError(
@@ -2691,7 +2745,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         rel_to_input_dir = Path(rel_path).relative_to("inputs").as_posix() if rel_path.startswith("inputs/") else rel_path
                         file_sections.append(
                             f"- `{rel_path}`（文件名：`{filename}`，"
-                            f"可通过脚本环境变量 `INPUT_DIR` 访问：`os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` ）"
+                            f"脚本可通过 `os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` 读取；"
+                            "或直接用 `os.environ['INPUT_SESSION_DIR']` 目录（该目录下包含本次会话所有上传文件）"
+                            "）"
                         )
 
                 if file_sections:
@@ -2700,9 +2756,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         body_prompt
                         + "\n\n---\n\n"
                         "## 当前对话已上传文件\n\n"
-                        "用户已在本次对话中上传了以下文件。"
-                        "对于文本文件，内容已直接展示供你参考；"
-                        "对于二进制或大型文件，脚本可通过 `os.environ['INPUT_DIR']` 拼接路径读取。\n\n"
+                        "用户在本次对话中上传了以下文件，你必须以这些文件为输入进行分析或处理。\n"
+                        "- 对于文本/数据文件，内容已直接展示在下方，请直接阅读并回答。\n"
+                        "- 需要执行计算、统计、转换等操作时，可生成 Python 脚本并运行，"
+                        "脚本中使用 `os.environ['INPUT_SESSION_DIR']` 获取上传文件目录，"
+                        "使用 `os.environ['OUTPUT_DIR']` 输出结果文件。\n\n"
                         f"{sections_text}\n"
                     )
 
@@ -2855,7 +2913,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     }
                 )
 
-            final_messages.extend(_request_messages(request))
+            final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):

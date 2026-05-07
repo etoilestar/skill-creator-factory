@@ -28,7 +28,6 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const sharp = require('sharp');
-const { spawnSync } = require('child_process');
 
 const PT_PER_PX = 0.75;
 const PX_PER_IN = 96;
@@ -907,25 +906,7 @@ async function html2pptx(htmlFile, pres, options = {}) {
       launchOptions.channel = 'chrome';
     }
 
-    // Auto-install Playwright browser if the binary is missing, then retry once
-    let browser;
-    try {
-      browser = await chromium.launch(launchOptions);
-    } catch (launchErr) {
-      if (launchErr.message && launchErr.message.includes("Executable doesn't exist")) {
-        console.error('Playwright浏览器未安装，正在自动安装 chromium...');
-        const install = spawnSync('npx', ['playwright', 'install', 'chromium', '--with-deps'], {
-          stdio: 'inherit',
-          shell: false,
-        });
-        if (install.status !== 0) {
-          throw new Error('Playwright浏览器安装失败，请手动运行: npx playwright install chromium --with-deps');
-        }
-        browser = await chromium.launch(launchOptions);
-      } else {
-        throw launchErr;
-      }
-    }
+    const browser = await chromium.launch(launchOptions);
 
     let bodyDimensions;
     let slideData;

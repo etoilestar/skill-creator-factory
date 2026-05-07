@@ -2384,6 +2384,23 @@ def _execute_planned_actions(
             if _session_input_dir is not None:
                 _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(_session_input_dir)
 
+            # Expand shell-style env vars ($VAR / ${VAR}) in argv using the
+            # combined environment (subprocess uses shell=False so the shell
+            # never performs this expansion itself).
+            _effective_env = {**os.environ, **_run_cmd_extra_env}
+
+            def _expand_with_env(arg: str, env: dict) -> str:
+                if "$" not in arg:
+                    return arg
+                result = arg
+                # Replace ${VAR} first, then $VAR.
+                for var, val in env.items():
+                    result = result.replace(f"${{{var}}}", val)
+                    result = result.replace(f"${var}", val)
+                return result
+
+            argv = [_expand_with_env(arg, _effective_env) for arg in argv]
+
             # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
             completed = None
             for _retry in range(_MAX_DEP_RETRY + 1):

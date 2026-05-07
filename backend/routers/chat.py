@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import json
 import logging
@@ -80,6 +81,407 @@ _CONFIRM_KEYWORDS = (
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
 _ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
+
+# 脚本扩展名 → 自动注入的解释器（方案 A+B）
+# 注意：".ts" 是特殊情况，实际命令为 `npx ts-node <file>`，见 _prepare_command_argv。
+_SCRIPT_INTERPRETERS: dict[str, str] = {
+    ".js":   "node",
+    ".mjs":  "node",
+    ".cjs":  "node",
+    ".py":   "python3",
+    ".sh":   "bash",
+    ".bash": "bash",
+    ".rb":   "ruby",
+    ".ts":   "ts-node",   # 特殊处理：通过 `npx ts-node` 执行
+}
+
+# 解释器 → apt 包名映射（运行时自动安装兜底）
+_INTERPRETER_APT_PACKAGES: dict[str, str] = {
+    "node":    "nodejs",
+    "nodejs":  "nodejs",
+    "npm":     "npm",
+    "npx":     "npm",      # npx 随 npm 一起安装
+    "ts-node": "ts-node",  # 通过 npm 全局安装，见下方特殊处理
+    "ruby":    "ruby",
+    "bash":    "bash",
+    "python3": "python3",
+}
+
+# 已尝试自动安装的解释器集合（避免同一进程内重复安装）
+_auto_install_attempted: set[str] = set()
+_auto_install_lock = __import__("threading").Lock()
+_apt_update_performed: bool = False
+
+# Python import 名 → pip 包名映射表（约 70 条常用别名）
+_IMPORT_TO_PACKAGE: dict[str, str] = {
+    "cv2":           "opencv-python",
+    "PIL":           "Pillow",
+    "pptx":          "python-pptx",
+    "sklearn":       "scikit-learn",
+    "bs4":           "beautifulsoup4",
+    "yaml":          "pyyaml",
+    "dotenv":        "python-dotenv",
+    "magic":         "python-magic",
+    "usb":           "pyusb",
+    "serial":        "pyserial",
+    "dateutil":      "python-dateutil",
+    "boto3":         "boto3",
+    "botocore":      "botocore",
+    "paramiko":      "paramiko",
+    "cryptography":  "cryptography",
+    "nacl":          "pynacl",
+    "Crypto":        "pycryptodome",
+    "OpenSSL":       "pyOpenSSL",
+    "jwt":           "PyJWT",
+    "aiohttp":       "aiohttp",
+    "httpx":         "httpx",
+    "requests":      "requests",
+    "flask":         "Flask",
+    "fastapi":       "fastapi",
+    "uvicorn":       "uvicorn",
+    "django":        "Django",
+    "sqlalchemy":    "SQLAlchemy",
+    "pymysql":       "PyMySQL",
+    "psycopg2":      "psycopg2-binary",
+    "redis":         "redis",
+    "pymongo":       "pymongo",
+    "celery":        "celery",
+    "pika":          "pika",
+    "kafka":         "kafka-python",
+    "numpy":         "numpy",
+    "pandas":        "pandas",
+    "matplotlib":    "matplotlib",
+    "scipy":         "scipy",
+    "tensorflow":    "tensorflow",
+    "torch":         "torch",
+    "transformers":  "transformers",
+    "tqdm":          "tqdm",
+    "rich":          "rich",
+    "click":         "click",
+    "typer":         "typer",
+    "loguru":        "loguru",
+    "pydantic":      "pydantic",
+    "toml":          "toml",
+    "arrow":         "arrow",
+    "pendulum":      "pendulum",
+    "docx":          "python-docx",
+    "openpyxl":      "openpyxl",
+    "xlrd":          "xlrd",
+    "xlwt":          "xlwt",
+    "pypdf":         "pypdf",
+    "fitz":          "PyMuPDF",
+    "jinja2":        "Jinja2",
+    "markdown":      "Markdown",
+    "lxml":          "lxml",
+    "pytest":        "pytest",
+    "faker":         "Faker",
+    "hypothesis":    "hypothesis",
+    "parameterized": "parameterized",
+}
+
+# Node.js 内置模块集合（过滤用，不安装这些模块）
+_NODE_BUILTIN_MODULES: frozenset[str] = frozenset({
+    "assert", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel",
+    "dns", "domain", "events", "fs", "http", "http2", "https",
+    "inspector", "module", "net", "os", "path", "perf_hooks",
+    "process", "punycode", "querystring", "readline", "repl",
+    "stream", "string_decoder", "sys", "timers", "tls", "trace_events",
+    "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+    "node:assert", "node:async_hooks", "node:buffer", "node:child_process",
+    "node:cluster", "node:console", "node:crypto", "node:dgram",
+    "node:dns", "node:domain", "node:events", "node:fs", "node:http",
+    "node:http2", "node:https", "node:inspector", "node:module",
+    "node:net", "node:os", "node:path", "node:perf_hooks", "node:process",
+    "node:readline", "node:repl", "node:stream", "node:string_decoder",
+    "node:timers", "node:tls", "node:tty", "node:url", "node:util",
+    "node:v8", "node:vm", "node:worker_threads", "node:zlib",
+})
+
+# 已创建 venv 的 skill 目录缓存（进程级，避免重复创建）
+_venv_created_dirs: set[str] = set()
+_venv_created_lock = __import__("threading").Lock()
+
+# run_command 依赖缺失时最多重试次数
+_MAX_DEP_RETRY = 3
+
+# 目录快照时跳过的子目录名（虚拟环境、包缓存等）
+_SNAPSHOT_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    ".venv", "node_modules", "__pycache__", ".runtime", ".git",
+})
+
+
+def _snapshot_dir_files(path: Path) -> set[str]:
+    """Return a set of relative POSIX paths for all files under *path*.
+
+    Directories in _SNAPSHOT_EXCLUDE_DIRS are skipped to avoid scanning
+    virtual-env trees or node_modules.
+    """
+    result: set[str] = set()
+    if not path.exists():
+        return result
+    for f in path.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(path)
+        except ValueError:
+            continue
+        if any(part in _SNAPSHOT_EXCLUDE_DIRS for part in rel.parts):
+            continue
+        result.add(rel.as_posix())
+    return result
+
+
+def _try_auto_install_interpreter(interpreter: str) -> bool:
+    """尝试通过系统包管理器（apt-get）自动安装缺失的解释器。
+
+    只在 Linux 环境且具备 apt-get 时生效；安装结果会被缓存，
+    同一进程内同一解释器只尝试安装一次。
+    返回 True 表示安装后解释器可用，False 表示安装失败或不支持。
+    """
+    global _apt_update_performed
+
+    with _auto_install_lock:
+        if interpreter in _auto_install_attempted:
+            return shutil.which(interpreter) is not None
+        _auto_install_attempted.add(interpreter)
+
+    apt_get = shutil.which("apt-get")
+    if apt_get is None:
+        logger.info("auto-install: apt-get not available, skipping install of %s", interpreter)
+        return False
+
+    # ts-node 通过 npm 全局安装，而不是 apt-get
+    if interpreter == "ts-node":
+        npm_bin = shutil.which("npm")
+        if npm_bin is None:
+            logger.warning("auto-install: npm not found, cannot install ts-node")
+            return False
+        logger.info("auto-install: installing ts-node via npm ...")
+        try:
+            result = subprocess.run(
+                [npm_bin, "install", "-g", "ts-node", "typescript"],
+                timeout=120,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                logger.info("auto-install: ts-node installed successfully")
+            else:
+                logger.warning("auto-install: ts-node install failed: %s", result.stderr[:500])
+        except Exception as exc:
+            logger.warning("auto-install: ts-node install exception: %s", exc)
+        return shutil.which("ts-node") is not None
+
+    pkg = _INTERPRETER_APT_PACKAGES.get(interpreter)
+    if pkg is None:
+        logger.info("auto-install: no apt package known for interpreter %s", interpreter)
+        return False
+
+    logger.info("auto-install: apt-get install -y %s (for interpreter %s) ...", pkg, interpreter)
+    try:
+        # 先更新索引（只在当次进程首次 apt 安装时执行）
+        if not _apt_update_performed:
+            subprocess.run(
+                [apt_get, "update", "-qq"],
+                timeout=60,
+                capture_output=True,
+                check=False,
+            )
+            _apt_update_performed = True
+
+        result = subprocess.run(
+            [apt_get, "install", "-y", "--no-install-recommends", pkg],
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            logger.info("auto-install: %s installed successfully", pkg)
+        else:
+            logger.warning("auto-install: install failed (rc=%d): %s", result.returncode, result.stderr[:500])
+    except subprocess.TimeoutExpired:
+        logger.warning("auto-install: apt-get install %s timed out", pkg)
+    except Exception as exc:
+        logger.warning("auto-install: apt-get install %s exception: %s", pkg, exc)
+
+    return shutil.which(interpreter) is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-skill isolated environment helpers
+# ---------------------------------------------------------------------------
+
+def _get_skill_venv_python(skill_dir: Path) -> Path:
+    """Ensure skill_dir/.venv exists and return its python executable path.
+
+    Uses a process-level cache so the venv is created at most once per skill
+    per process lifetime.
+    """
+    venv_dir = skill_dir / ".venv"
+    venv_python = venv_dir / "bin" / "python"
+    key = str(skill_dir.resolve())
+
+    with _venv_created_lock:
+        if key not in _venv_created_dirs:
+            if not venv_dir.exists():
+                logger.info("skill-env: creating venv at %s", venv_dir)
+                result = subprocess.run(
+                    ["python3", "-m", "venv", str(venv_dir)],
+                    timeout=60,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"创建 skill venv 失败 ({venv_dir}): {result.stderr[:500]}"
+                    )
+            _venv_created_dirs.add(key)
+
+    return venv_python
+
+
+def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
+    """Static-scan a .py script and pip-install any missing third-party imports
+    into the per-skill venv before the script is executed.
+    """
+    import ast
+    import sys
+
+    try:
+        source = script_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(script_path))
+    except SyntaxError:
+        return  # 语法错误留给执行时报告
+
+    top_level_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_level_names.append(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_level_names.append(node.module.split(".")[0])
+
+    stdlib_names: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", set()))
+
+    to_install: list[str] = []
+    seen: set[str] = set()
+    for name in top_level_names:
+        if not name or name.startswith("_") or name in stdlib_names or name in seen:
+            continue
+        # Only proceed if the name is a safe identifier (AST-sourced, but be explicit)
+        if not name.isidentifier():
+            continue
+        seen.add(name)
+        pkg = _IMPORT_TO_PACKAGE.get(name, name)
+        # Use importlib.util.find_spec via argv rather than f-string interpolation
+        check = subprocess.run(
+            [
+                str(venv_python),
+                "-c",
+                "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)",
+                name,
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        if check.returncode != 0:
+            to_install.append(pkg)
+
+    if to_install:
+        logger.info("skill-env: pip installing into venv: %s", to_install)
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
+            timeout=180,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
+    """Static-scan a .js/.mjs script and npm-install any missing third-party
+    modules into the per-skill node_modules before the script is executed.
+    """
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        return
+
+    source = script_path.read_text(encoding="utf-8", errors="replace")
+    patterns = [
+        # CommonJS: require('pkg') / require("pkg")
+        re.compile(r"""require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
+        # ES module: import ... from 'pkg' / import ... from "pkg"
+        re.compile(r"""from\s+['"]([^'"./][^'"]*)['"]\s*"""),
+        # Side-effect import: import 'pkg' / import "pkg"
+        re.compile(r"""import\s+['"]([^'"./][^'"]*)['"]\s*"""),
+        # Dynamic import: import('pkg') / import("pkg")
+        re.compile(r"""import\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
+    ]
+    names: list[str] = []
+    for pattern in patterns:
+        for m in pattern.finditer(source):
+            raw = m.group(1)
+            # Handle scoped packages: @scope/pkg
+            if raw.startswith("@"):
+                parts = raw.split("/")
+                name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+            else:
+                name = raw.split("/")[0]
+            if name and name not in names:
+                names.append(name)
+
+    to_install = [
+        n for n in names
+        if n not in _NODE_BUILTIN_MODULES
+        and not (skill_dir / "node_modules" / n).exists()
+    ]
+
+    if to_install:
+        logger.info("skill-env: npm installing into %s: %s", skill_dir, to_install)
+        subprocess.run(
+            [npm_bin, "install", "--prefix", str(skill_dir), "--quiet"] + to_install,
+            timeout=180,
+            capture_output=True,
+            text=True,
+            cwd=str(skill_dir),
+        )
+
+
+def _retry_install_python_dep(module_name: str, venv_python: Path) -> bool:
+    """Error-driven: install a single missing Python module into the skill venv.
+
+    Returns True if the install command succeeded.
+    """
+    pkg = _IMPORT_TO_PACKAGE.get(module_name, module_name)
+    logger.info("skill-env: error-driven pip install %s (for import %s)", pkg, module_name)
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--quiet", pkg],
+        timeout=180,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _retry_install_node_dep(module_name: str, skill_dir: Path) -> bool:
+    """Error-driven: install a single missing Node.js module into skill node_modules.
+
+    Returns True if the install command succeeded.
+    """
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        return False
+    logger.info("skill-env: error-driven npm install %s into %s", module_name, skill_dir)
+    result = subprocess.run(
+        [npm_bin, "install", "--prefix", str(skill_dir), "--quiet", module_name],
+        timeout=180,
+        capture_output=True,
+        text=True,
+        cwd=str(skill_dir),
+    )
+    return result.returncode == 0
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -1209,6 +1611,8 @@ def _compose_final_answer_prompt() -> str:
         "你必须基于 observation 回答用户，不要假装执行未发生的动作。\n"
         "如果命令执行成功，优先返回脚本 stdout 中的有效结果。\n"
         "如果命令执行失败，简要说明失败原因和 stderr/stdout 中的关键信息。\n"
+        "如果 execution_result 中包含 output_files 列表（非空），必须在回答末尾以 Markdown 链接格式列出每个文件，"
+        "格式示例：[下载 presentation.pptx](/api/skills/xxx/files/outputs/presentation.pptx)。\n"
         "不要输出内部 JSON，不要重复完整 SKILL.md，不要编造 observation 之外的执行结果。\n"
     )
 
@@ -1512,6 +1916,9 @@ def _prepare_command_argv(
     - 命令必须能被 shlex 解析；
     - argv[0] 必须是 PATH 中的可执行程序，或一个真实存在的路径；
     - command 中引用的 scripts/assets/references 路径必须真实存在。
+
+    额外：对 Python 脚本使用每个 Skill 独立的 venv，执行前静态扫描依赖。
+    对 Node.js 脚本执行前扫描并安装缺失的 npm 包。
     """
     argv = _safe_command_argv(command, base_dir=base_dir)
 
@@ -1538,12 +1945,136 @@ def _prepare_command_argv(
         if not exe_path.is_file():
             raise ValueError(f"命令不可执行，目标不是文件: {executable}")
 
-        argv[0] = str(exe_path)
+        # 方案 A+B：先检查 execute bit；若无，则按扩展名自动注入解释器；
+        # 若扩展名也无法识别，则给出明确错误提示。
+        if os.access(exe_path, os.X_OK):
+            # 文件有执行权限，直接执行
+            argv[0] = str(exe_path)
+        else:
+            ext = exe_path.suffix.lower()
+            interpreter = _SCRIPT_INTERPRETERS.get(ext)
+            if interpreter is not None:
+                # .ts 特殊处理：直接检查 ts-node 或通过 npx 运行
+                if ext == ".ts":
+                    if shutil.which("ts-node") is None:
+                        _try_auto_install_interpreter("ts-node")
+                    if shutil.which("ts-node") is not None:
+                        argv = ["ts-node", str(exe_path)] + argv[1:]
+                    elif shutil.which("npx") is not None:
+                        argv = ["npx", "ts-node", str(exe_path)] + argv[1:]
+                    else:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要 ts-node 或 npx，但它们均不在 PATH 中。"
+                        )
+                elif ext == ".py" and base_dir is not None:
+                    # 使用 Skill 独立 venv 执行 Python 脚本，并预装静态依赖
+                    try:
+                        venv_python = _get_skill_venv_python(base_dir)
+                        _scan_and_install_python_deps(exe_path, venv_python)
+                        argv = [str(venv_python), str(exe_path)] + argv[1:]
+                    except Exception as venv_exc:
+                        logger.warning(
+                            "skill-env: venv setup failed, falling back to system python3: %s",
+                            venv_exc,
+                        )
+                        if shutil.which("python3") is None:
+                            _try_auto_install_interpreter("python3")
+                        if shutil.which("python3") is None:
+                            raise ValueError(
+                                f"无法执行 {executable}：需要解释器 python3，但它不在 PATH 中。"
+                            )
+                        argv = ["python3", str(exe_path)] + argv[1:]
+                elif ext in {".js", ".mjs", ".cjs"} and base_dir is not None:
+                    # 预装 Node.js 依赖到 Skill 独立 node_modules
+                    try:
+                        _scan_and_install_node_deps(exe_path, base_dir)
+                    except Exception as node_exc:
+                        logger.warning("skill-env: node dep scan failed: %s", node_exc)
+                    if shutil.which("node") is None:
+                        _try_auto_install_interpreter("node")
+                    if shutil.which("node") is None:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要解释器 node，但它不在 PATH 中。"
+                        )
+                    argv = ["node", str(exe_path)] + argv[1:]
+                else:
+                    if shutil.which(interpreter) is None:
+                        # 尝试自动安装后再检查一次
+                        _try_auto_install_interpreter(interpreter)
+                    if shutil.which(interpreter) is None:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要解释器 {interpreter}，但它不在 PATH 中。"
+                        )
+                    argv = [interpreter, str(exe_path)] + argv[1:]
+            else:
+                raise ValueError(
+                    f"命令没有执行权限: {executable}\n"
+                    f"文件不可直接执行（无 execute bit），且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
+                    f"请使用 'node/python3/bash <脚本路径>' 的形式明确指定解释器。"
+                )
 
     # 2. argv[0] 是裸命令：python、node、bash、ffmpeg、convert 等
     # 不做白名单，只检查系统 PATH 中是否存在。
     else:
-        if shutil.which(executable) is None:
+        exe_name = Path(executable).name
+        # 对裸 python/python3 + .py 脚本参数，替换为 Skill 独立 venv python
+        if exe_name in {"python", "python3"} and len(argv) >= 2 and base_dir is not None:
+            script_arg = argv[1]
+            script_path_candidate: Path | None = None
+            if not script_arg.startswith("-") and (
+                "/" in script_arg or script_arg.endswith(".py")
+            ):
+                candidate = Path(script_arg)
+                if not candidate.is_absolute():
+                    candidate = (base_dir / candidate).resolve()
+                # Guard: script must reside within the skill directory
+                try:
+                    candidate.relative_to(base_dir.resolve())
+                    if candidate.exists() and candidate.suffix.lower() == ".py":
+                        script_path_candidate = candidate
+                except ValueError:
+                    pass  # path escaped skill dir boundary — skip dep scan
+            if script_path_candidate is not None:
+                try:
+                    venv_python = _get_skill_venv_python(base_dir)
+                    _scan_and_install_python_deps(script_path_candidate, venv_python)
+                    argv = [str(venv_python)] + argv[1:]
+                except Exception as venv_exc:
+                    logger.warning(
+                        "skill-env: venv setup failed, using system %s: %s",
+                        executable,
+                        venv_exc,
+                    )
+                    if shutil.which(executable) is None:
+                        _try_auto_install_interpreter(executable)
+            else:
+                if shutil.which(executable) is None:
+                    _try_auto_install_interpreter(executable)
+        # 对裸 node/nodejs + .js 脚本参数，预装 Node.js 依赖
+        elif exe_name in {"node", "nodejs"} and len(argv) >= 2 and base_dir is not None:
+            script_arg = argv[1]
+            if not script_arg.startswith("-"):
+                candidate = Path(script_arg)
+                if not candidate.is_absolute():
+                    candidate = (base_dir / candidate).resolve()
+                # Guard: script must reside within the skill directory
+                try:
+                    candidate.relative_to(base_dir.resolve())
+                    if candidate.exists() and candidate.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                        try:
+                            _scan_and_install_node_deps(candidate, base_dir)
+                        except Exception as node_exc:
+                            logger.warning("skill-env: node dep scan failed: %s", node_exc)
+                except ValueError:
+                    pass  # path escaped skill dir boundary — skip dep scan
+            if shutil.which(executable) is None:
+                _try_auto_install_interpreter(executable)
+        else:
+            if shutil.which(executable) is None:
+                # 尝试自动安装后再检查一次
+                _try_auto_install_interpreter(executable)
+
+        if shutil.which(executable) is None and not Path(argv[0]).exists():
             raise ValueError(
                 f"命令不可执行：{executable} 不在 PATH 中，也不是当前 Skill 内的可执行文件。"
                 "如果这是函数名或伪代码，请不要规划 run_command。"
@@ -1709,6 +2240,9 @@ def _execute_planned_actions(
 
             cwd = execution_root or inferred_skill_root
 
+            # 执行前快照，用于后续检测新生成的文件
+            pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
+
             materialized = _materialize_python_heredoc(command)
             if materialized is not None:
                 argv = materialized
@@ -1717,31 +2251,71 @@ def _execute_planned_actions(
             else:
                 argv = _prepare_command_argv(command, base_dir=cwd)
 
-            try:
-                completed = subprocess.run(
-                    argv,
-                    shell=False,
-                    input=stdin_text,
-                    capture_output=True,
-                    text=True,
-                    timeout=int(getattr(settings, "skill_command_timeout", 60)),
-                    cwd=str(cwd) if cwd else None,
-                )
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    "命令不可执行: "
-                    + command
-                    + "\n原因: "
-                    + str(exc)
-                ) from exc
-            except PermissionError as exc:
-                raise ValueError(
-                    "命令没有执行权限: "
-                    + command
-                    + "\n原因: "
-                    + str(exc)
-                ) from exc
+            # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
+            completed = None
+            for _retry in range(_MAX_DEP_RETRY + 1):
+                try:
+                    completed = subprocess.run(
+                        argv,
+                        shell=False,
+                        input=stdin_text,
+                        capture_output=True,
+                        text=True,
+                        timeout=int(getattr(settings, "skill_command_timeout", 60)),
+                        cwd=str(cwd) if cwd else None,
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "命令不可执行: "
+                        + command
+                        + "\n原因: "
+                        + str(exc)
+                    ) from exc
+                except PermissionError as exc:
+                    raise ValueError(
+                        "命令没有执行权限: "
+                        + command
+                        + "\n原因: "
+                        + str(exc)
+                    ) from exc
 
+                if completed.returncode == 0 or _retry == _MAX_DEP_RETRY:
+                    break
+
+                # 尝试从 stderr 中识别缺失依赖并安装，然后重试
+                stderr = completed.stderr or ""
+                retried = False
+
+                # Python: ModuleNotFoundError: No module named 'xxx'
+                py_missing = re.search(
+                    r"ModuleNotFoundError: No module named '([^']+)'", stderr
+                )
+                if py_missing and cwd is not None:
+                    module_name = py_missing.group(1).split(".")[0]
+                    try:
+                        venv_python = _get_skill_venv_python(cwd)
+                        if _retry_install_python_dep(module_name, venv_python):
+                            retried = True
+                    except Exception as dep_exc:
+                        logger.warning("skill-env: error-driven py dep install failed: %s", dep_exc)
+
+                # Node.js: Cannot find module 'xxx'
+                node_missing = re.search(r"Cannot find module '([^']+)'", stderr)
+                if node_missing and cwd is not None:
+                    raw_mod = node_missing.group(1)
+                    if raw_mod.startswith("@"):
+                        parts = raw_mod.split("/")
+                        module_name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                    else:
+                        module_name = raw_mod.split("/")[0]
+                    if module_name not in _NODE_BUILTIN_MODULES:
+                        if _retry_install_node_dep(module_name, cwd):
+                            retried = True
+
+                if not retried:
+                    break  # 无法识别缺失依赖，停止重试
+
+            assert completed is not None  # noqa: S101 — loop always runs at least once
             success = completed.returncode == 0
 
             result = {
@@ -1754,6 +2328,23 @@ def _execute_planned_actions(
                 "stderr": completed.stderr,
                 "reason": reason,
             }
+
+            # 执行成功后：检测新生成的文件，附加下载链接
+            if success and cwd and skill_name:
+                post_snapshot = _snapshot_dir_files(cwd)
+                new_files = sorted(post_snapshot - pre_snapshot)
+                if new_files:
+                    result["output_files"] = [
+                        {
+                            "path": f,
+                            "url": f"/api/skills/{skill_name}/files/{f}",
+                        }
+                        for f in new_files
+                    ]
+                    logs.append(
+                        "新生成文件: "
+                        + ", ".join(new_files)
+                    )
 
             results.append(result)
 
@@ -1791,12 +2382,18 @@ def _execute_planned_actions(
 
     logs.extend(validation_logs)
 
+    # 汇总所有 run_command 任务产生的新文件
+    all_output_files: list[dict] = []
+    for r in results:
+        all_output_files.extend(r.get("output_files") or [])
+
     return {
         "executed": bool(results or touched),
         "reason": "已根据结构化 action plan 执行任务。" if (results or touched) else "规划中没有需要执行的任务。",
         "plan": plan,
         "results": results,
         "logs": logs,
+        "output_files": all_output_files,
     }
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。

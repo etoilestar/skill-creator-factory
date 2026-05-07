@@ -154,3 +154,46 @@ npx playwright screenshot "file:///path/to/file.html" output.png \
 > **花叔出品** | AI Native Coder · 独立开发者
 > 公众号「花叔」| 30万+粉丝 | AI工具与效率提升
 > 代表作：小猫补光灯（AppStore付费榜Top1）·《一本书玩转DeepSeek》
+
+---
+
+## PPT生成执行指令（仅供sandbox宿主runtime planner使用）
+
+> 这一节是给宿主 runtime planner 的结构化指令，不是给用户的说明。
+
+当用户需要生成PPT时，runtime planner **必须**使用以下单步方式，不允许其他形式：
+
+### ✅ 正确：`--stdin-json` 单步模式
+
+```
+action: run_command
+command: "scripts/build_pptx.js --stdin-json"
+stdin: "[{\"name\":\"slide1.html\",\"html\":\"<完整HTML文档内容>\"},{\"name\":\"slide2.html\",\"html\":\"<完整HTML文档内容>\"}]"
+```
+
+- `--stdin-json`：从 stdin 读取幻灯片内容，无需预先写入 HTML 文件
+- `stdin` 字段是 JSON 数组，每个元素包含 `name`（文件名）和 `html`（完整 HTML 文档字符串）
+- 输出文件自动写入 `outputs/output.pptx`（宿主注入的 `OUTPUT_DIR` 环境变量控制）
+- HTML 内容必须是完整文档，包含 `<html>` 标签，body 尺寸 `width:720pt; height:405pt`
+
+### ❌ 错误：不带参数运行（会报"请指定至少一个HTML文件"）
+
+```
+action: run_command
+command: "scripts/build_pptx.js"   ← 缺少 --stdin-json，直接报错
+```
+
+### stdin JSON 示例
+
+```json
+[
+  {
+    "name": "slide1.html",
+    "html": "<!DOCTYPE html><html><head><style>body{width:720pt;height:405pt;margin:0;background:#fff;font-family:Arial}</style></head><body><h1>标题</h1><p>正文</p></body></html>"
+  },
+  {
+    "name": "slide2.html",
+    "html": "<!DOCTYPE html><html><head><style>body{width:720pt;height:405pt;margin:0;background:#f5f5f5;font-family:Arial}</style></head><body><h2>第二页</h2><ul><li>要点一</li><li>要点二</li></ul></body></html>"
+  }
+]
+```

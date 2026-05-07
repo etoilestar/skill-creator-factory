@@ -6,11 +6,13 @@
  *   node build_pptx.js --slides slide1.html slide2.html --output report.pptx
  *   node build_pptx.js --dir ./slides/ --output report.pptx
  *   node build_pptx.js --slides slide1.html --output report.pptx --chart 0:bar:data.json
+ *   node build_pptx.js --stdin-json --output report.pptx   (从 stdin 读取 JSON 数组)
  *
  * 参数：
  *   --slides    指定 HTML 文件列表（按顺序）
  *   --dir       指定包含 HTML 文件的目录（按文件名排序）
- *   --output    输出 PPTX 文件名（默认：output.pptx）
+ *   --stdin-json  从 stdin 读取 JSON 数组：[{"name":"slide1.html","html":"..."}]
+ *   --output    输出 PPTX 文件名（默认：OUTPUT_DIR/output.pptx 或 output.pptx）
  *   --chart     在指定幻灯片的 placeholder 中插入图表
  *               格式：幻灯片序号:图表类型:数据JSON文件
  *               例：0:bar:chart_data.json
@@ -28,6 +30,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 // 检查依赖
 function checkDependencies() {
@@ -54,7 +57,11 @@ const html2pptx = require('./html2pptx.js');
 // 解析命令行参数
 function parseArgs() {
   const args = process.argv.slice(2);
-  const config = { slides: [], output: 'output.pptx', charts: [] };
+  // 当宿主注入了 OUTPUT_DIR 环境变量时，默认输出到该目录下；否则输出到当前目录
+  const defaultOutput = process.env.OUTPUT_DIR
+    ? path.join(process.env.OUTPUT_DIR, 'output.pptx')
+    : 'output.pptx';
+  const config = { slides: [], output: defaultOutput, charts: [], stdinJson: false };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -86,6 +93,9 @@ function parseArgs() {
           dataFile: parts[2]
         });
         break;
+      case '--stdin-json':
+        config.stdinJson = true;
+        break;
       case '--help':
         console.log(`
 用法：node build_pptx.js [选项]
@@ -93,7 +103,8 @@ function parseArgs() {
 选项：
   --slides file1.html file2.html   指定HTML幻灯片文件
   --dir ./slides/                  从目录加载所有HTML文件
-  --output report.pptx             输出文件名
+  --stdin-json                     从stdin读取幻灯片JSON（格式：[{"name":"slide1.html","html":"..."}]）
+  --output report.pptx             输出文件名（默认：OUTPUT_DIR/output.pptx 或 output.pptx）
   --chart 0:bar:data.json          插入图表到指定幻灯片
   --help                           显示帮助
         `);
@@ -101,7 +112,7 @@ function parseArgs() {
     }
   }
 
-  if (config.slides.length === 0) {
+  if (config.slides.length === 0 && !config.stdinJson) {
     console.error('请指定至少一个HTML文件。使用 --help 查看帮助。');
     process.exit(1);
   }
@@ -127,6 +138,58 @@ const CHART_COLORS = ['E17055', '45B7AA', '5B8C5A', 'FFD700', '9B7EDE'];
 
 async function build() {
   const config = parseArgs();
+
+  // --stdin-json：从 stdin 读取幻灯片 JSON 数组，写到临时目录
+  let tmpDir = null;
+  if (config.stdinJson) {
+    let stdinText;
+    try {
+      stdinText = fs.readFileSync(0, 'utf-8');
+    } catch (err) {
+      console.error('读取 stdin 失败:', err.message);
+      process.exit(1);
+    }
+
+    let slides;
+    try {
+      slides = JSON.parse(stdinText);
+    } catch (err) {
+      console.error('stdin JSON 解析失败:', err.message);
+      process.exit(1);
+    }
+
+    if (!Array.isArray(slides) || slides.length === 0) {
+      console.error('stdin JSON 必须是非空数组，格式：[{"name":"slide1.html","html":"..."}]');
+      process.exit(1);
+    }
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pptx-slides-'));
+    for (const slide of slides) {
+      if (!slide.name || !slide.html) {
+        console.error('每个幻灯片对象必须包含 name 和 html 字段');
+        process.exit(1);
+      }
+      const filePath = path.join(tmpDir, slide.name);
+      fs.writeFileSync(filePath, slide.html, 'utf-8');
+      config.slides.push(filePath);
+    }
+  }
+
+  try {
+    await _build(config);
+  } finally {
+    // 清理临时目录
+    if (tmpDir) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_) {
+        // 清理失败不影响结果
+      }
+    }
+  }
+}
+
+async function _build(config) {
 
   console.log(`构建 PPTX: ${config.slides.length} 页幻灯片`);
 
@@ -219,6 +282,8 @@ async function build() {
 
   // 输出文件
   const outputPath = path.isAbsolute(config.output) ? config.output : path.join(process.cwd(), config.output);
+  // 确保输出目录存在（例如 outputs/）
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   await pptx.writeFile({ fileName: outputPath });
   console.log(`\n✅ 已生成: ${outputPath}`);
 }

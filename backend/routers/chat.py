@@ -548,6 +548,60 @@ def _extract_input_session_dir(input_files: list[dict], execution_root: "Path | 
     return None
 
 
+def _rewrite_argv_input_paths(
+    argv: list[str],
+    input_files: list[dict],
+    execution_root: "Path | None",
+    session_input_dir: "Path | None",
+) -> list[str]:
+    """Rewrite argv elements that reference uploaded files to absolute paths.
+
+    The LLM may generate file arguments using conventions like:
+      - ``uploads/<filename>``
+      - a bare ``<filename>`` that matches an uploaded file
+
+    These won't resolve when the subprocess runs with cwd=skill_root or
+    cwd=scripts/.  This helper replaces such arguments with the real absolute
+    path so the script can open the file.
+    """
+    if not input_files or execution_root is None:
+        return argv
+
+    # Build a filename → absolute-path map from uploaded file records.
+    filename_to_abs: dict[str, str] = {}
+    for f in input_files:
+        rel = f.get("path", "")
+        fname = f.get("filename") or (Path(rel).name if rel else "")
+        if rel and fname:
+            abs_path = execution_root / rel
+            filename_to_abs[fname] = str(abs_path)
+
+    if not filename_to_abs:
+        return argv
+
+    result: list[str] = []
+    for arg in argv:
+        rewritten = arg
+        # Pattern 1: uploads/<filename>  or  uploads\<filename>
+        for prefix in ("uploads/", "uploads\\"):
+            if rewritten.startswith(prefix):
+                candidate = rewritten[len(prefix):]
+                if candidate in filename_to_abs:
+                    rewritten = filename_to_abs[candidate]
+                    break
+        # Pattern 2: bare filename that exactly matches an upload (only when the
+        # argument doesn't already look like an absolute or relative path).
+        if (
+            rewritten == arg  # not yet rewritten
+            and "/" not in rewritten
+            and "\\" not in rewritten
+            and rewritten in filename_to_abs
+        ):
+            rewritten = filename_to_abs[rewritten]
+        result.append(rewritten)
+    return result
+
+
 def _last_user_text(request: ChatRequest) -> str:
     for message in reversed(request.messages):
         if message.role == "user":
@@ -1446,7 +1500,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "    },\n"
         "    {\n"
         "      \"action\": \"run_command\",\n"
-        "      \"command\": \"scripts/process.py uploads/data.xlsx --format markdown\",\n"
+        "      \"command\": \"scripts/process.py $INPUT_SESSION_DIR/data.xlsx --format markdown\",\n"
         "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
         "      \"reason\": \"需要运行真实存在的脚本或工具，命令包含从用户消息中提取的实际参数值\"\n"
         "    }\n"
@@ -1455,6 +1509,10 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "  \"missing\": [],\n"
         "  \"errors\": []\n"
         "}\n"
+        "\n"
+        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径，"
+        "例如 `$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`，"
+        "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
     )
 
 def _normalize_skill_runtime_plan(
@@ -2307,6 +2365,15 @@ def _execute_planned_actions(
                 argv = _prepare_command_argv(" ".join(shlex.quote(part) for part in argv), base_dir=cwd)
             else:
                 argv = _prepare_command_argv(command, base_dir=cwd)
+
+            # Rewrite argv elements that reference uploaded files using legacy
+            # path conventions (e.g. uploads/<name>) to their real absolute paths.
+            argv = _rewrite_argv_input_paths(
+                argv,
+                getattr(request, "input_files", []) or [],
+                cwd,
+                _session_input_dir,
+            )
 
             _run_cmd_extra_env: dict[str, str] = {
                 "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",

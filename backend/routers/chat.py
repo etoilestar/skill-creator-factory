@@ -205,6 +205,33 @@ _venv_created_lock = __import__("threading").Lock()
 # run_command 依赖缺失时最多重试次数
 _MAX_DEP_RETRY = 3
 
+# 目录快照时跳过的子目录名（虚拟环境、包缓存等）
+_SNAPSHOT_EXCLUDE_DIRS: frozenset[str] = frozenset({
+    ".venv", "node_modules", "__pycache__", ".runtime", ".git",
+})
+
+
+def _snapshot_dir_files(path: Path) -> set[str]:
+    """Return a set of relative POSIX paths for all files under *path*.
+
+    Directories in _SNAPSHOT_EXCLUDE_DIRS are skipped to avoid scanning
+    virtual-env trees or node_modules.
+    """
+    result: set[str] = set()
+    if not path.exists():
+        return result
+    for f in path.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(path)
+        except ValueError:
+            continue
+        if any(part in _SNAPSHOT_EXCLUDE_DIRS for part in rel.parts):
+            continue
+        result.add(rel.as_posix())
+    return result
+
 
 def _try_auto_install_interpreter(interpreter: str) -> bool:
     """尝试通过系统包管理器（apt-get）自动安装缺失的解释器。
@@ -1570,6 +1597,8 @@ def _compose_final_answer_prompt() -> str:
         "你必须基于 observation 回答用户，不要假装执行未发生的动作。\n"
         "如果命令执行成功，优先返回脚本 stdout 中的有效结果。\n"
         "如果命令执行失败，简要说明失败原因和 stderr/stdout 中的关键信息。\n"
+        "如果 execution_result 中包含 output_files 列表（非空），必须在回答末尾以 Markdown 链接格式列出每个文件，"
+        "格式示例：[下载 presentation.pptx](/api/skills/xxx/files/outputs/presentation.pptx)。\n"
         "不要输出内部 JSON，不要重复完整 SKILL.md，不要编造 observation 之外的执行结果。\n"
     )
 
@@ -2197,6 +2226,9 @@ def _execute_planned_actions(
 
             cwd = execution_root or inferred_skill_root
 
+            # 执行前快照，用于后续检测新生成的文件
+            pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
+
             materialized = _materialize_python_heredoc(command)
             if materialized is not None:
                 argv = materialized
@@ -2283,6 +2315,23 @@ def _execute_planned_actions(
                 "reason": reason,
             }
 
+            # 执行成功后：检测新生成的文件，附加下载链接
+            if success and cwd and skill_name:
+                post_snapshot = _snapshot_dir_files(cwd)
+                new_files = sorted(post_snapshot - pre_snapshot)
+                if new_files:
+                    result["output_files"] = [
+                        {
+                            "path": f,
+                            "url": f"/api/skills/{skill_name}/files/{f}",
+                        }
+                        for f in new_files
+                    ]
+                    logs.append(
+                        "新生成文件: "
+                        + ", ".join(new_files)
+                    )
+
             results.append(result)
 
             if not success:
@@ -2319,12 +2368,18 @@ def _execute_planned_actions(
 
     logs.extend(validation_logs)
 
+    # 汇总所有 run_command 任务产生的新文件
+    all_output_files: list[dict] = []
+    for r in results:
+        all_output_files.extend(r.get("output_files") or [])
+
     return {
         "executed": bool(results or touched),
         "reason": "已根据结构化 action plan 执行任务。" if (results or touched) else "规划中没有需要执行的任务。",
         "plan": plan,
         "results": results,
         "logs": logs,
+        "output_files": all_output_files,
     }
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。

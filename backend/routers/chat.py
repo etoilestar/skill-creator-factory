@@ -112,6 +112,99 @@ _auto_install_attempted: set[str] = set()
 _auto_install_lock = __import__("threading").Lock()
 _apt_update_performed: bool = False
 
+# Python import 名 → pip 包名映射表（约 70 条常用别名）
+_IMPORT_TO_PACKAGE: dict[str, str] = {
+    "cv2":           "opencv-python",
+    "PIL":           "Pillow",
+    "pptx":          "python-pptx",
+    "sklearn":       "scikit-learn",
+    "bs4":           "beautifulsoup4",
+    "yaml":          "pyyaml",
+    "dotenv":        "python-dotenv",
+    "magic":         "python-magic",
+    "usb":           "pyusb",
+    "serial":        "pyserial",
+    "dateutil":      "python-dateutil",
+    "boto3":         "boto3",
+    "botocore":      "botocore",
+    "paramiko":      "paramiko",
+    "cryptography":  "cryptography",
+    "nacl":          "pynacl",
+    "Crypto":        "pycryptodome",
+    "OpenSSL":       "pyOpenSSL",
+    "jwt":           "PyJWT",
+    "aiohttp":       "aiohttp",
+    "httpx":         "httpx",
+    "requests":      "requests",
+    "flask":         "Flask",
+    "fastapi":       "fastapi",
+    "uvicorn":       "uvicorn",
+    "django":        "Django",
+    "sqlalchemy":    "SQLAlchemy",
+    "pymysql":       "PyMySQL",
+    "psycopg2":      "psycopg2-binary",
+    "redis":         "redis",
+    "pymongo":       "pymongo",
+    "celery":        "celery",
+    "pika":          "pika",
+    "kafka":         "kafka-python",
+    "numpy":         "numpy",
+    "pandas":        "pandas",
+    "matplotlib":    "matplotlib",
+    "scipy":         "scipy",
+    "tensorflow":    "tensorflow",
+    "torch":         "torch",
+    "transformers":  "transformers",
+    "tqdm":          "tqdm",
+    "rich":          "rich",
+    "click":         "click",
+    "typer":         "typer",
+    "loguru":        "loguru",
+    "pydantic":      "pydantic",
+    "toml":          "toml",
+    "arrow":         "arrow",
+    "pendulum":      "pendulum",
+    "docx":          "python-docx",
+    "openpyxl":      "openpyxl",
+    "xlrd":          "xlrd",
+    "xlwt":          "xlwt",
+    "pypdf":         "pypdf",
+    "fitz":          "PyMuPDF",
+    "jinja2":        "Jinja2",
+    "markdown":      "Markdown",
+    "lxml":          "lxml",
+    "pytest":        "pytest",
+    "faker":         "Faker",
+    "hypothesis":    "hypothesis",
+    "parameterized": "parameterized",
+}
+
+# Node.js 内置模块集合（过滤用，不安装这些模块）
+_NODE_BUILTIN_MODULES: frozenset[str] = frozenset({
+    "assert", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel",
+    "dns", "domain", "events", "fs", "http", "http2", "https",
+    "inspector", "module", "net", "os", "path", "perf_hooks",
+    "process", "punycode", "querystring", "readline", "repl",
+    "stream", "string_decoder", "sys", "timers", "tls", "trace_events",
+    "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+    "node:assert", "node:async_hooks", "node:buffer", "node:child_process",
+    "node:cluster", "node:console", "node:crypto", "node:dgram",
+    "node:dns", "node:domain", "node:events", "node:fs", "node:http",
+    "node:http2", "node:https", "node:inspector", "node:module",
+    "node:net", "node:os", "node:path", "node:perf_hooks", "node:process",
+    "node:readline", "node:repl", "node:stream", "node:string_decoder",
+    "node:timers", "node:tls", "node:tty", "node:url", "node:util",
+    "node:v8", "node:vm", "node:worker_threads", "node:zlib",
+})
+
+# 已创建 venv 的 skill 目录缓存（进程级，避免重复创建）
+_venv_created_dirs: set[str] = set()
+_venv_created_lock = __import__("threading").Lock()
+
+# run_command 依赖缺失时最多重试次数
+_MAX_DEP_RETRY = 3
+
 
 def _try_auto_install_interpreter(interpreter: str) -> bool:
     """尝试通过系统包管理器（apt-get）自动安装缺失的解释器。
@@ -188,6 +281,166 @@ def _try_auto_install_interpreter(interpreter: str) -> bool:
 
     return shutil.which(interpreter) is not None
 
+
+# ---------------------------------------------------------------------------
+# Per-skill isolated environment helpers
+# ---------------------------------------------------------------------------
+
+def _get_skill_venv_python(skill_dir: Path) -> Path:
+    """Ensure skill_dir/.venv exists and return its python executable path.
+
+    Uses a process-level cache so the venv is created at most once per skill
+    per process lifetime.
+    """
+    venv_dir = skill_dir / ".venv"
+    venv_python = venv_dir / "bin" / "python"
+    key = str(skill_dir.resolve())
+
+    with _venv_created_lock:
+        if key not in _venv_created_dirs:
+            if not venv_dir.exists():
+                logger.info("skill-env: creating venv at %s", venv_dir)
+                result = subprocess.run(
+                    ["python3", "-m", "venv", str(venv_dir)],
+                    timeout=60,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"创建 skill venv 失败 ({venv_dir}): {result.stderr[:500]}"
+                    )
+            _venv_created_dirs.add(key)
+
+    return venv_python
+
+
+def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
+    """Static-scan a .py script and pip-install any missing third-party imports
+    into the per-skill venv before the script is executed.
+    """
+    import ast
+    import sys
+
+    try:
+        source = script_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(script_path))
+    except SyntaxError:
+        return  # 语法错误留给执行时报告
+
+    top_level_names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_level_names.append(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_level_names.append(node.module.split(".")[0])
+
+    stdlib_names: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", set()))
+
+    to_install: list[str] = []
+    seen: set[str] = set()
+    for name in top_level_names:
+        if not name or name.startswith("_") or name in stdlib_names or name in seen:
+            continue
+        seen.add(name)
+        pkg = _IMPORT_TO_PACKAGE.get(name, name)
+        check = subprocess.run(
+            [str(venv_python), "-c", f"import {name}"],
+            capture_output=True,
+            timeout=10,
+        )
+        if check.returncode != 0:
+            to_install.append(pkg)
+
+    if to_install:
+        logger.info("skill-env: pip installing into venv: %s", to_install)
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
+            timeout=180,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
+    """Static-scan a .js/.mjs script and npm-install any missing third-party
+    modules into the per-skill node_modules before the script is executed.
+    """
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        return
+
+    source = script_path.read_text(encoding="utf-8", errors="replace")
+    patterns = [
+        re.compile(r"""require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
+        re.compile(r"""from\s+['"]([^'"./][^'"]*)['"]\s*"""),
+        re.compile(r"""import\s+['"]([^'"./][^'"]*)['"]\s*"""),
+    ]
+    names: list[str] = []
+    for pattern in patterns:
+        for m in pattern.finditer(source):
+            raw = m.group(1)
+            # Handle scoped packages: @scope/pkg
+            if raw.startswith("@"):
+                parts = raw.split("/")
+                name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+            else:
+                name = raw.split("/")[0]
+            if name and name not in names:
+                names.append(name)
+
+    to_install = [
+        n for n in names
+        if n not in _NODE_BUILTIN_MODULES
+        and not (skill_dir / "node_modules" / n).exists()
+    ]
+
+    if to_install:
+        logger.info("skill-env: npm installing into %s: %s", skill_dir, to_install)
+        subprocess.run(
+            [npm_bin, "install", "--prefix", str(skill_dir), "--quiet"] + to_install,
+            timeout=180,
+            capture_output=True,
+            text=True,
+            cwd=str(skill_dir),
+        )
+
+
+def _retry_install_python_dep(module_name: str, venv_python: Path) -> bool:
+    """Error-driven: install a single missing Python module into the skill venv.
+
+    Returns True if the install command succeeded.
+    """
+    pkg = _IMPORT_TO_PACKAGE.get(module_name, module_name)
+    logger.info("skill-env: error-driven pip install %s (for import %s)", pkg, module_name)
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--quiet", pkg],
+        timeout=180,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _retry_install_node_dep(module_name: str, skill_dir: Path) -> bool:
+    """Error-driven: install a single missing Node.js module into skill node_modules.
+
+    Returns True if the install command succeeded.
+    """
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        return False
+    logger.info("skill-env: error-driven npm install %s into %s", module_name, skill_dir)
+    result = subprocess.run(
+        [npm_bin, "install", "--prefix", str(skill_dir), "--quiet", module_name],
+        timeout=180,
+        capture_output=True,
+        text=True,
+        cwd=str(skill_dir),
+    )
+    return result.returncode == 0
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -1620,6 +1873,9 @@ def _prepare_command_argv(
     - 命令必须能被 shlex 解析；
     - argv[0] 必须是 PATH 中的可执行程序，或一个真实存在的路径；
     - command 中引用的 scripts/assets/references 路径必须真实存在。
+
+    额外：对 Python 脚本使用每个 Skill 独立的 venv，执行前静态扫描依赖。
+    对 Node.js 脚本执行前扫描并安装缺失的 npm 包。
     """
     argv = _safe_command_argv(command, base_dir=base_dir)
 
@@ -1667,6 +1923,37 @@ def _prepare_command_argv(
                         raise ValueError(
                             f"无法执行 {executable}：需要 ts-node 或 npx，但它们均不在 PATH 中。"
                         )
+                elif ext == ".py" and base_dir is not None:
+                    # 使用 Skill 独立 venv 执行 Python 脚本，并预装静态依赖
+                    try:
+                        venv_python = _get_skill_venv_python(base_dir)
+                        _scan_and_install_python_deps(exe_path, venv_python)
+                        argv = [str(venv_python), str(exe_path)] + argv[1:]
+                    except Exception as venv_exc:
+                        logger.warning(
+                            "skill-env: venv setup failed, falling back to system python3: %s",
+                            venv_exc,
+                        )
+                        if shutil.which("python3") is None:
+                            _try_auto_install_interpreter("python3")
+                        if shutil.which("python3") is None:
+                            raise ValueError(
+                                f"无法执行 {executable}：需要解释器 python3，但它不在 PATH 中。"
+                            )
+                        argv = ["python3", str(exe_path)] + argv[1:]
+                elif ext in {".js", ".mjs", ".cjs"} and base_dir is not None:
+                    # 预装 Node.js 依赖到 Skill 独立 node_modules
+                    try:
+                        _scan_and_install_node_deps(exe_path, base_dir)
+                    except Exception as node_exc:
+                        logger.warning("skill-env: node dep scan failed: %s", node_exc)
+                    if shutil.which("node") is None:
+                        _try_auto_install_interpreter("node")
+                    if shutil.which("node") is None:
+                        raise ValueError(
+                            f"无法执行 {executable}：需要解释器 node，但它不在 PATH 中。"
+                        )
+                    argv = ["node", str(exe_path)] + argv[1:]
                 else:
                     if shutil.which(interpreter) is None:
                         # 尝试自动安装后再检查一次
@@ -1686,10 +1973,55 @@ def _prepare_command_argv(
     # 2. argv[0] 是裸命令：python、node、bash、ffmpeg、convert 等
     # 不做白名单，只检查系统 PATH 中是否存在。
     else:
-        if shutil.which(executable) is None:
-            # 尝试自动安装后再检查一次
-            _try_auto_install_interpreter(executable)
-        if shutil.which(executable) is None:
+        exe_name = Path(executable).name
+        # 对裸 python/python3 + .py 脚本参数，替换为 Skill 独立 venv python
+        if exe_name in {"python", "python3"} and len(argv) >= 2 and base_dir is not None:
+            script_arg = argv[1]
+            script_path_candidate: Path | None = None
+            if not script_arg.startswith("-") and (
+                "/" in script_arg or script_arg.endswith(".py")
+            ):
+                candidate = Path(script_arg)
+                if not candidate.is_absolute():
+                    candidate = (base_dir / candidate).resolve()
+                if candidate.exists() and candidate.suffix.lower() == ".py":
+                    script_path_candidate = candidate
+            if script_path_candidate is not None:
+                try:
+                    venv_python = _get_skill_venv_python(base_dir)
+                    _scan_and_install_python_deps(script_path_candidate, venv_python)
+                    argv = [str(venv_python)] + argv[1:]
+                except Exception as venv_exc:
+                    logger.warning(
+                        "skill-env: venv setup failed, using system %s: %s",
+                        executable,
+                        venv_exc,
+                    )
+                    if shutil.which(executable) is None:
+                        _try_auto_install_interpreter(executable)
+            else:
+                if shutil.which(executable) is None:
+                    _try_auto_install_interpreter(executable)
+        # 对裸 node/nodejs + .js 脚本参数，预装 Node.js 依赖
+        elif exe_name in {"node", "nodejs"} and len(argv) >= 2 and base_dir is not None:
+            script_arg = argv[1]
+            if not script_arg.startswith("-"):
+                candidate = Path(script_arg)
+                if not candidate.is_absolute():
+                    candidate = (base_dir / candidate).resolve()
+                if candidate.exists() and candidate.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                    try:
+                        _scan_and_install_node_deps(candidate, base_dir)
+                    except Exception as node_exc:
+                        logger.warning("skill-env: node dep scan failed: %s", node_exc)
+            if shutil.which(executable) is None:
+                _try_auto_install_interpreter(executable)
+        else:
+            if shutil.which(executable) is None:
+                # 尝试自动安装后再检查一次
+                _try_auto_install_interpreter(executable)
+
+        if shutil.which(executable) is None and not Path(argv[0]).exists():
             raise ValueError(
                 f"命令不可执行：{executable} 不在 PATH 中，也不是当前 Skill 内的可执行文件。"
                 "如果这是函数名或伪代码，请不要规划 run_command。"
@@ -1863,31 +2195,71 @@ def _execute_planned_actions(
             else:
                 argv = _prepare_command_argv(command, base_dir=cwd)
 
-            try:
-                completed = subprocess.run(
-                    argv,
-                    shell=False,
-                    input=stdin_text,
-                    capture_output=True,
-                    text=True,
-                    timeout=int(getattr(settings, "skill_command_timeout", 60)),
-                    cwd=str(cwd) if cwd else None,
-                )
-            except FileNotFoundError as exc:
-                raise ValueError(
-                    "命令不可执行: "
-                    + command
-                    + "\n原因: "
-                    + str(exc)
-                ) from exc
-            except PermissionError as exc:
-                raise ValueError(
-                    "命令没有执行权限: "
-                    + command
-                    + "\n原因: "
-                    + str(exc)
-                ) from exc
+            # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
+            completed = None
+            for _retry in range(_MAX_DEP_RETRY + 1):
+                try:
+                    completed = subprocess.run(
+                        argv,
+                        shell=False,
+                        input=stdin_text,
+                        capture_output=True,
+                        text=True,
+                        timeout=int(getattr(settings, "skill_command_timeout", 60)),
+                        cwd=str(cwd) if cwd else None,
+                    )
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "命令不可执行: "
+                        + command
+                        + "\n原因: "
+                        + str(exc)
+                    ) from exc
+                except PermissionError as exc:
+                    raise ValueError(
+                        "命令没有执行权限: "
+                        + command
+                        + "\n原因: "
+                        + str(exc)
+                    ) from exc
 
+                if completed.returncode == 0 or _retry == _MAX_DEP_RETRY:
+                    break
+
+                # 尝试从 stderr 中识别缺失依赖并安装，然后重试
+                stderr = completed.stderr or ""
+                retried = False
+
+                # Python: ModuleNotFoundError: No module named 'xxx'
+                py_missing = re.search(
+                    r"ModuleNotFoundError: No module named '([^']+)'", stderr
+                )
+                if py_missing and cwd is not None:
+                    module_name = py_missing.group(1).split(".")[0]
+                    try:
+                        venv_python = _get_skill_venv_python(cwd)
+                        if _retry_install_python_dep(module_name, venv_python):
+                            retried = True
+                    except Exception as dep_exc:
+                        logger.warning("skill-env: error-driven py dep install failed: %s", dep_exc)
+
+                # Node.js: Cannot find module 'xxx'
+                node_missing = re.search(r"Cannot find module '([^']+)'", stderr)
+                if node_missing and cwd is not None:
+                    raw_mod = node_missing.group(1)
+                    if raw_mod.startswith("@"):
+                        parts = raw_mod.split("/")
+                        module_name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                    else:
+                        module_name = raw_mod.split("/")[0]
+                    if module_name not in _NODE_BUILTIN_MODULES:
+                        if _retry_install_node_dep(module_name, cwd):
+                            retried = True
+
+                if not retried:
+                    break  # 无法识别缺失依赖，停止重试
+
+            assert completed is not None
             success = completed.returncode == 0
 
             result = {

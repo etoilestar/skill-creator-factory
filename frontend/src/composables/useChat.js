@@ -4,6 +4,7 @@
  * Yields either:
  *   - a plain string  — text content chunk
  *   - { type: 'action_result', data: {...} } — skill file-operation result
+ *   - { type: 'status', data: {phase, message} | null } — execution phase update
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model? }
@@ -41,6 +42,7 @@ export async function* streamChat(url, body) {
         const parsed = JSON.parse(data)
         if (parsed.error) throw new Error(parsed.error)
         if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
+        else if ('status' in parsed) yield { type: 'status', data: parsed.status }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines

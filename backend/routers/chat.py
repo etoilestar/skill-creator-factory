@@ -2547,6 +2547,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 need_body = True
                 logger.debug("force_body=True, skip metadata decision and load SKILL.md body directly")
             else:
+                yield _sse({"status": {"phase": "analyzing", "message": "分析请求匹配度…"}})
                 need_body = await _run_metadata_round(
                     metadata_prompt=skill_context["metadata_prompt"],
                     request=request,
@@ -2554,6 +2555,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
             if not need_body:
+                yield _sse({"status": None})
                 fallback_messages = [
                     {
                         "role": "system",
@@ -2571,9 +2573,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 yield "data: [DONE]\n\n"
                 return
 
+            yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
 
             if child_body_loader:
+                yield _sse({"status": {"phase": "loading_child", "message": "检查子 Skill…"}})
                 child_decision = await _run_child_skill_selection_round(
                     parent_metadata_prompt=skill_context["metadata_prompt"],
                     request=request,
@@ -2582,6 +2586,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                 if child_decision.get("need_child"):
                     child_ref = child_decision.get("child_ref", "")
+                    yield _sse({"status": {"phase": "loading_child", "message": f"加载子 Skill：{child_ref}…"}})
                     try:
                         child_body_prompt = child_body_loader(child_ref)
                         body_prompt = (
@@ -2609,6 +2614,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             if enable_resource_preload:
                 resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                if resource_catalog:
+                    yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
                 resource_decision = await _run_resource_selection_round(
                     body_prompt=body_prompt,
                     request=request,
@@ -2617,10 +2624,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
                 if resource_decision.get("need_resources"):
+                    selected = resource_decision.get("resource_handles") or []
+                    yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
                     loaded_resources_prompt = _compose_loaded_resources_prompt(
                         skill_name=parent_skill_name,
                         resource_catalog=resource_catalog,
-                        selected_handles=resource_decision.get("resource_handles") or [],
+                        selected_handles=selected,
                     )
 
                     if loaded_resources_prompt:
@@ -2634,6 +2643,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             if enable_action_execution and not should_skip_runtime_planner and not disable_runtime_planner:
                 try:
+                    yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
                     runtime_plan = await _run_skill_runtime_planner_round(
                         body_prompt=body_prompt,
                         request=request,
@@ -2644,6 +2654,23 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     mode = runtime_plan.get("mode")
 
                     if mode == "execute" and runtime_plan.get("tasks"):
+                        # Announce each planned task so the user sees what will run.
+                        for task in runtime_plan.get("tasks", []):
+                            task_action = str(task.get("action") or "").strip()
+                            if task_action == "run_command":
+                                cmd = str(task.get("command") or "")
+                                short_cmd = cmd[:60] + ("…" if len(cmd) > 60 else "")
+                                yield _sse({"status": {"phase": "executing", "message": f"执行命令：{short_cmd}"}})
+                            elif task_action == "read_resource":
+                                path = str(task.get("path") or task.get("resource_handle") or "")
+                                yield _sse({"status": {"phase": "reading", "message": f"读取资源：{path}"}})
+                            elif task_action == "write_file":
+                                path = str(task.get("path") or "")
+                                yield _sse({"status": {"phase": "writing", "message": f"写入文件：{path}"}})
+                            elif task_action == "create_directory":
+                                path = str(task.get("path") or "")
+                                yield _sse({"status": {"phase": "creating", "message": f"创建目录：{path}"}})
+
                         exec_result = _execute_planned_actions(
                             runtime_plan,
                             [],
@@ -2653,6 +2680,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             skill_name=parent_skill_name,
                         )
 
+                        yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
                         final_answer = await _generate_final_answer_from_observation(
                             body_prompt=body_prompt,
                             request=request,
@@ -2660,6 +2688,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             plan=runtime_plan,
                             execution_result=exec_result,
                         )
+
+                        yield _sse({"status": None})
 
                         # Emit structured output_files event so the frontend can
                         # render download links without relying on LLM text parsing.
@@ -2680,6 +2710,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         return
 
                     if mode == "ask_user":
+                        yield _sse({"status": None})
                         missing = runtime_plan.get("missing") or []
                         errors = runtime_plan.get("errors") or []
 
@@ -2699,14 +2730,17 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         return
 
                     if mode == "not_applicable":
+                        yield _sse({"status": None})
                         yield _sse({"content": "当前用户请求与该 Skill 不匹配，请重新选择 Skill 或重新描述需求。"})
                         yield "data: [DONE]\n\n"
                         return
 
                     # mode == direct_answer 时继续走普通主模型回复。
+                    yield _sse({"status": None})
 
                 except Exception as exc:
                     logger.exception("runtime skill action planning/execution failed")
+                    yield _sse({"status": None})
                     yield _sse({"error": f"错误：运行时规划或执行失败：{exc}"})
                     yield "data: [DONE]\n\n"
                     return
@@ -2788,13 +2822,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                 except Exception as exc:
                     logger.exception("legacy markdown action fallback failed")
+                    yield _sse({"status": None})
                     yield _sse({"error": f"错误：后台规划或执行文件操作失败：{exc}"})
                     yield "data: [DONE]\n\n"
                     return
+            yield _sse({"status": None})
             yield "data: [DONE]\n\n"
 
         except Exception as exc:
             logger.exception("LLM stream error")
+            yield _sse({"status": None})
             yield _sse({"error": _friendly_error(exc)})
             yield "data: [DONE]\n\n"
 

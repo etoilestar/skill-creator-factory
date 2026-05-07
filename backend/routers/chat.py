@@ -2654,8 +2654,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     body_prompt
                     + "\n\n---\n\n"
                     "## 当前对话已上传文件\n\n"
-                    "用户已在本次对话中上传了以下文件，文件保存在 Skill 目录下，"
-                    "脚本可通过环境变量 `INPUT_DIR` 指向的目录读取（`os.environ['INPUT_DIR']`）。\n\n"
+                    "用户已在本次对话中上传了以下文件，文件保存在 Skill 目录下的 `inputs/<session_id>/` 子目录中。\n"
+                    "脚本可通过环境变量 `INPUT_DIR` 指向的目录读取（`import os; input_dir = os.environ['INPUT_DIR']`），"
+                    "文件的完整路径为 `{INPUT_DIR}/<session_id>/<filename>`，"
+                    "其中 `<session_id>` 即下方路径中 `inputs/` 后的第一段目录名。\n\n"
                     f"{file_lines}\n"
                 )
 

@@ -1,4 +1,5 @@
 import asyncio
+import re as _re
 import subprocess
 import sys as _sys
 from pathlib import Path as _Path
@@ -262,7 +263,6 @@ async def upload_sandbox_input(
     Only common data/document file types are accepted (max 10 MB).
     """
     # Validate session_id (alphanumeric, hyphens, underscores only)
-    import re as _re
     if not session_id or not _re.fullmatch(r"[a-zA-Z0-9_\-]{1,64}", session_id):
         raise HTTPException(status_code=400, detail="session_id 格式非法")
 
@@ -284,8 +284,7 @@ async def upload_sandbox_input(
             detail=f"不支持的文件类型 '{suffix}'，允许类型：{', '.join(sorted(_SANDBOX_INPUT_ALLOWED_SUFFIXES))}",
         )
 
-    from ..config import settings as _settings
-    skill_dir = (_settings.skills_path / skill_name).resolve()
+    skill_dir = (settings.skills_path / skill_name).resolve()
     if not skill_dir.exists():
         raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
 

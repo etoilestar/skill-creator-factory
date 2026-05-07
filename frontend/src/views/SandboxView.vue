@@ -157,8 +157,12 @@ function fileBasename(f) {
   return f.name || f.path.split('/').pop()
 }
 
-/** Generate a simple session ID (UUID v4-like) */
+/** Generate a cryptographically random session ID */
 function newSessionId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  // Fallback for environments without crypto.randomUUID
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = (Math.random() * 16) | 0
     return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
@@ -222,8 +226,8 @@ async function onFileSelected(event) {
         { method: 'POST', body: fd }
       )
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }))
-        uploadError.value = err.detail || '上传失败'
+        const err = await res.json().catch(() => ({ detail: `文件上传失败（${res.status}），请重试` }))
+        uploadError.value = err.detail || '文件上传失败，请重试'
       } else {
         const data = await res.json()
         uploadedFiles.value.push(data)

@@ -7,6 +7,7 @@ run_script additionally returns: {stdout, stderr, exit_code, filename}.
 
 import importlib.util
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -333,7 +334,7 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             capture_output=True,
             timeout=_SCRIPT_RUN_TIMEOUT,
             cwd=str(skill_dir / "scripts"),
-            env={**__import__("os").environ, "OUTPUT_DIR": str(skill_dir / "outputs")},
+            env={**os.environ, "OUTPUT_DIR": str(skill_dir / "outputs")},
         )
         stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")

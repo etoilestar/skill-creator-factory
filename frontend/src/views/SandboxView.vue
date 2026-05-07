@@ -48,9 +48,9 @@
                 v-for="f in msg.output_files"
                 :key="f.url"
                 :href="f.url"
-                :download="f.name || f.path.split('/').pop()"
+                :download="fileBasename(f)"
                 class="action-file-link"
-              >📄 {{ f.name || f.path.split('/').pop() }}</a>
+              >📄 {{ fileBasename(f) }}</a>
             </div>
           </div>
           <!-- regular chat bubble -->
@@ -111,6 +111,10 @@ const ACTION_LABELS = {
 
 function actionLabel(action) {
   return ACTION_LABELS[action] || action
+}
+
+function fileBasename(f) {
+  return f.name || f.path.split('/').pop()
 }
 
 const skills = ref([])

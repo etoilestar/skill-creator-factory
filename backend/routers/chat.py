@@ -2264,7 +2264,7 @@ def _execute_planned_actions(
                         timeout=int(getattr(settings, "skill_command_timeout", 60)),
                         cwd=str(cwd) if cwd else None,
                         env={
-                            **__import__("os").environ,
+                            **os.environ,
                             "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
                         },
                     )

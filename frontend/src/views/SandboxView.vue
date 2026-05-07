@@ -64,6 +64,11 @@
             </div>
           </div>
         </template>
+        <div v-if="currentStatus" class="status-bar" :class="`phase-${currentStatus.phase}`"
+             role="status" aria-live="polite">
+          <span class="status-spinner" aria-hidden="true"></span>
+          <span class="status-message">{{ currentStatus.message }}</span>
+        </div>
         <div v-if="streaming" class="message assistant">
           <div class="bubble">
             <ChatBubble :content="streamBuffer" :streaming="true" />
@@ -125,6 +130,7 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
+const currentStatus = ref(null)  // { phase, message } | null
 
 // Exclude system action-result cards from the history sent to the LLM.
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
@@ -138,6 +144,7 @@ function resetChat() {
   streamBuffer.value = ''
   error.value = ''
   input.value = ''
+  currentStatus.value = null
 }
 
 async function scrollBottom() {
@@ -158,6 +165,7 @@ async function send() {
 
   streaming.value = true
   streamBuffer.value = ''
+  currentStatus.value = null
 
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
@@ -165,6 +173,8 @@ async function send() {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
         await scrollBottom()
+      } else if (chunk.type === 'status') {
+        currentStatus.value = chunk.data  // null clears the status bar
       } else if (chunk.type === 'action_result') {
         const r = chunk.data
         messages.value.push({
@@ -190,6 +200,7 @@ async function send() {
     error.value = e.message
   } finally {
     streaming.value = false
+    currentStatus.value = null
     await scrollBottom()
   }
 }
@@ -334,4 +345,49 @@ async function send() {
 .row textarea { flex: 1; min-height: 72px; }
 .actions { display: flex; flex-direction: column; gap: 8px; }
 .hint { font-size: 12px; margin-top: 6px; }
+
+/* Execution status bar */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  animation: status-fade-in 0.2s ease;
+}
+.status-bar.phase-analyzing    { border-color: #bfdbfe; background: #eff6ff; color: #1e40af; }
+.status-bar.phase-loading,
+.status-bar.phase-loading_child,
+.status-bar.phase-loading_resources { border-color: #e9d5ff; background: #faf5ff; color: #6b21a8; }
+.status-bar.phase-planning     { border-color: #fde68a; background: #fffbeb; color: #92400e; }
+.status-bar.phase-executing    { border-color: #bbf7d0; background: #f0fdf4; color: #166534; }
+.status-bar.phase-reading      { border-color: #bae6fd; background: #f0f9ff; color: #075985; }
+.status-bar.phase-writing      { border-color: #fed7aa; background: #fff7ed; color: #9a3412; }
+.status-bar.phase-creating     { border-color: #fecdd3; background: #fff1f2; color: #9f1239; }
+.status-bar.phase-generating   { border-color: #d9f99d; background: #f7fee7; color: #365314; }
+
+.status-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.status-message { flex: 1; }
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes status-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
 </style>

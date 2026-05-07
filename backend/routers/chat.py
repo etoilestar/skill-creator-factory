@@ -1945,13 +1945,15 @@ def _prepare_command_argv(
         if not exe_path.is_file():
             raise ValueError(f"命令不可执行，目标不是文件: {executable}")
 
-        # 方案 A+B：先检查 execute bit；若无，则按扩展名自动注入解释器；
+        # 方案 A+B：对已知脚本扩展名（.py/.sh/.js 等）始终注入解释器，
+        # 避免 execute bit 判断不一致导致的 PermissionError；
+        # 对未知扩展名才依赖 execute bit 直接执行；
         # 若扩展名也无法识别，则给出明确错误提示。
-        if os.access(exe_path, os.X_OK):
-            # 文件有执行权限，直接执行
+        ext = exe_path.suffix.lower()
+        if ext not in _SCRIPT_INTERPRETERS and os.access(exe_path, os.X_OK):
+            # 非脚本文件且有执行权限，直接执行
             argv[0] = str(exe_path)
         else:
-            ext = exe_path.suffix.lower()
             interpreter = _SCRIPT_INTERPRETERS.get(ext)
             if interpreter is not None:
                 # .ts 特殊处理：直接检查 ts-node 或通过 npx 运行
@@ -2009,7 +2011,7 @@ def _prepare_command_argv(
             else:
                 raise ValueError(
                     f"命令没有执行权限: {executable}\n"
-                    f"文件不可直接执行（无 execute bit），且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
+                    f"文件不可直接执行，且扩展名 '{ext or '(无)'}' 无法自动推断解释器。\n"
                     f"请使用 'node/python3/bash <脚本路径>' 的形式明确指定解释器。"
                 )
 

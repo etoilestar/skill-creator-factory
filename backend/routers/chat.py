@@ -2263,6 +2263,10 @@ def _execute_planned_actions(
                         text=True,
                         timeout=int(getattr(settings, "skill_command_timeout", 60)),
                         cwd=str(cwd) if cwd else None,
+                        env={
+                            **__import__("os").environ,
+                            "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
+                        },
                     )
                 except FileNotFoundError as exc:
                     raise ValueError(
@@ -2657,6 +2661,20 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             execution_result=exec_result,
                         )
 
+                        # Emit structured output_files event so the frontend can
+                        # render download links without relying on LLM text parsing.
+                        output_files = exec_result.get("output_files") or []
+                        if output_files:
+                            yield _sse({
+                                "action_result": {
+                                    "action": "output_files",
+                                    "name": parent_skill_name,
+                                    "success": True,
+                                    "message": f"生成了 {len(output_files)} 个文件",
+                                    "output_files": output_files,
+                                }
+                            })
+
                         yield _sse({"content": final_answer})
                         yield "data: [DONE]\n\n"
                         return
@@ -2754,6 +2772,19 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                     if exec_result.get("executed"):
                         yield _sse({"content": _format_execution_report(exec_result)})
+
+                        # Emit structured output_files event for the fallback path too.
+                        output_files = exec_result.get("output_files") or []
+                        if output_files:
+                            yield _sse({
+                                "action_result": {
+                                    "action": "output_files",
+                                    "name": parent_skill_name,
+                                    "success": True,
+                                    "message": f"生成了 {len(output_files)} 个文件",
+                                    "output_files": output_files,
+                                }
+                            })
 
                 except Exception as exc:
                     logger.exception("legacy markdown action fallback failed")

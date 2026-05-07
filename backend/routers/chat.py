@@ -1984,8 +1984,13 @@ def _prepare_command_argv(
                 candidate = Path(script_arg)
                 if not candidate.is_absolute():
                     candidate = (base_dir / candidate).resolve()
-                if candidate.exists() and candidate.suffix.lower() == ".py":
-                    script_path_candidate = candidate
+                # Guard: script must reside within the skill directory
+                try:
+                    candidate.relative_to(base_dir.resolve())
+                    if candidate.exists() and candidate.suffix.lower() == ".py":
+                        script_path_candidate = candidate
+                except ValueError:
+                    pass  # path escaped skill dir boundary — skip dep scan
             if script_path_candidate is not None:
                 try:
                     venv_python = _get_skill_venv_python(base_dir)
@@ -2009,11 +2014,16 @@ def _prepare_command_argv(
                 candidate = Path(script_arg)
                 if not candidate.is_absolute():
                     candidate = (base_dir / candidate).resolve()
-                if candidate.exists() and candidate.suffix.lower() in {".js", ".mjs", ".cjs"}:
-                    try:
-                        _scan_and_install_node_deps(candidate, base_dir)
-                    except Exception as node_exc:
-                        logger.warning("skill-env: node dep scan failed: %s", node_exc)
+                # Guard: script must reside within the skill directory
+                try:
+                    candidate.relative_to(base_dir.resolve())
+                    if candidate.exists() and candidate.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                        try:
+                            _scan_and_install_node_deps(candidate, base_dir)
+                        except Exception as node_exc:
+                            logger.warning("skill-env: node dep scan failed: %s", node_exc)
+                except ValueError:
+                    pass  # path escaped skill dir boundary — skip dep scan
             if shutil.which(executable) is None:
                 _try_auto_install_interpreter(executable)
         else:
@@ -2259,7 +2269,7 @@ def _execute_planned_actions(
                 if not retried:
                     break  # 无法识别缺失依赖，停止重试
 
-            assert completed is not None
+            assert completed is not None  # noqa: S101 — loop always runs at least once
             success = completed.returncode == 0
 
             result = {

@@ -78,6 +78,24 @@
 
       <div class="input-area">
         <div v-if="error" class="error">{{ error }}</div>
+        <div v-if="uploadError" class="error">{{ uploadError }}</div>
+        <!-- Uploaded files chips -->
+        <div v-if="uploadedFiles.length" class="upload-chips">
+          <span
+            v-for="(f, idx) in uploadedFiles"
+            :key="f.path"
+            class="upload-chip"
+          >
+            <span class="chip-icon">📄</span>
+            <span class="chip-name">{{ f.filename }}</span>
+            <button
+              class="chip-remove"
+              :disabled="streaming"
+              @click="removeUploadedFile(idx)"
+              :title="`移除 ${f.filename}`"
+            >✕</button>
+          </span>
+        </div>
         <div class="row">
           <textarea
             v-model="input"
@@ -87,6 +105,23 @@
             :disabled="streaming"
           />
           <div class="actions">
+            <!-- Hidden file input -->
+            <input
+              type="file"
+              ref="fileInputEl"
+              multiple
+              style="display:none"
+              @change="onFileSelected"
+            />
+            <button
+              class="btn-ghost btn-upload"
+              :disabled="streaming || uploading"
+              @click="fileInputEl.click()"
+              title="上传文件供 Skill 脚本读取"
+            >
+              <span v-if="uploading">⏳</span>
+              <span v-else>📎</span>
+            </button>
             <button class="btn-primary" @click="send" :disabled="streaming || !input.trim()">
               {{ streaming ? '生成中…' : '发送' }}
             </button>
@@ -122,6 +157,14 @@ function fileBasename(f) {
   return f.name || f.path.split('/').pop()
 }
 
+/** Generate a simple session ID (UUID v4-like) */
+function newSessionId() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
+}
+
 const skills = ref([])
 const selectedSkill = ref('')
 const messages = ref([])
@@ -131,6 +174,13 @@ const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
+
+// File upload state
+const sessionId = ref(newSessionId())
+const uploadedFiles = ref([])  // [{ path, url, filename, size }]
+const uploading = ref(false)
+const uploadError = ref('')
+const fileInputEl = ref(null)
 
 // Exclude system action-result cards from the history sent to the LLM.
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
@@ -145,6 +195,45 @@ function resetChat() {
   error.value = ''
   input.value = ''
   currentStatus.value = null
+  uploadedFiles.value = []
+  uploadError.value = ''
+  sessionId.value = newSessionId()
+}
+
+function removeUploadedFile(idx) {
+  uploadedFiles.value.splice(idx, 1)
+}
+
+async function onFileSelected(event) {
+  const files = Array.from(event.target.files || [])
+  event.target.value = ''  // reset so same file can be re-selected
+  if (!files.length || !selectedSkill.value) return
+
+  uploading.value = true
+  uploadError.value = ''
+
+  for (const file of files) {
+    const fd = new FormData()
+    fd.append('file', file)
+    fd.append('session_id', sessionId.value)
+    try {
+      const res = await fetch(
+        `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs`,
+        { method: 'POST', body: fd }
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        uploadError.value = err.detail || '上传失败'
+      } else {
+        const data = await res.json()
+        uploadedFiles.value.push(data)
+      }
+    } catch (e) {
+      uploadError.value = e.message || '上传失败'
+    }
+  }
+
+  uploading.value = false
 }
 
 async function scrollBottom() {
@@ -167,9 +256,14 @@ async function send() {
   streamBuffer.value = ''
   currentStatus.value = null
 
+  // Snapshot the uploaded files for this message, then keep them until reset
+  const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
+
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
-    for await (const chunk of streamChat(url, { messages: chatHistory.value })) {
+    const body = { messages: chatHistory.value }
+    if (inputFilesSnapshot.length) body.input_files = inputFilesSnapshot
+    for await (const chunk of streamChat(url, body)) {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
         await scrollBottom()
@@ -345,6 +439,52 @@ async function send() {
 .row textarea { flex: 1; min-height: 72px; }
 .actions { display: flex; flex-direction: column; gap: 8px; }
 .hint { font-size: 12px; margin-top: 6px; }
+
+/* Upload chips */
+.upload-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.upload-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 6px;
+  border-radius: 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-family: monospace;
+  max-width: 240px;
+}
+.chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.chip-remove {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text);
+  opacity: 0.5;
+  transition: opacity 0.15s;
+}
+.chip-remove:hover:not(:disabled) { opacity: 1; }
+.chip-remove:disabled { cursor: not-allowed; }
+
+/* Upload button */
+.btn-upload {
+  padding: 6px 10px;
+  font-size: 16px;
+  line-height: 1;
+}
 
 /* Execution status bar */
 .status-bar {

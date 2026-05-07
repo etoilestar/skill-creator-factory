@@ -39,6 +39,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[Message]
     model: Optional[str] = None
+    input_files: list[dict] = []  # [{"path": "inputs/session/file.csv", "filename": "file.csv"}, ...]
 
 
 @dataclass
@@ -2641,6 +2642,22 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                     if loaded_resources_prompt:
                         body_prompt = body_prompt + loaded_resources_prompt
+
+            # Append uploaded input-file context to the body prompt so the LLM
+            # knows which files are available and how scripts can read them.
+            if getattr(request, "input_files", None):
+                file_lines = "\n".join(
+                    f"- `{f.get('path', f.get('filename', ''))}`"
+                    for f in request.input_files
+                )
+                body_prompt = (
+                    body_prompt
+                    + "\n\n---\n\n"
+                    "## 当前对话已上传文件\n\n"
+                    "用户已在本次对话中上传了以下文件，文件保存在 Skill 目录下，"
+                    "脚本可通过环境变量 `INPUT_DIR` 指向的目录读取（`os.environ['INPUT_DIR']`）。\n\n"
+                    f"{file_lines}\n"
+                )
 
             should_skip_runtime_planner = (
                 skip_runtime_planner_before_confirmation

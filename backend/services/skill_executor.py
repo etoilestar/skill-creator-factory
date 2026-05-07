@@ -7,6 +7,7 @@ run_script additionally returns: {stdout, stderr, exit_code, filename}.
 
 import importlib.util
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -265,6 +266,29 @@ def _run_write_file(name: str, folder: str, filename: str, content: str, skill_d
 _SCRIPT_RUN_TIMEOUT = 30   # seconds
 _MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB per stream
 
+_SNAPSHOT_EXCLUDE_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", "dist"}
+
+
+def _snapshot_skill_files(skill_dir: Path) -> set[str]:
+    """Return a set of relative POSIX paths for all files under *skill_dir*.
+
+    Excludes common non-output directories to keep the snapshot lightweight.
+    """
+    result: set[str] = set()
+    if not skill_dir.exists():
+        return result
+    for f in skill_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(skill_dir)
+        except ValueError:
+            continue
+        if any(part in _SNAPSHOT_EXCLUDE_DIRS for part in rel.parts):
+            continue
+        result.add(rel.as_posix())
+    return result
+
 
 def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Path) -> dict:
     """Execute a Python script from skills/{name}/scripts/ and return its output.
@@ -300,6 +324,9 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
                 "message": "参数包含非法字符", "path": None, **_empty,
             }
 
+    # Snapshot the skill directory before execution to detect new output files.
+    pre_snapshot = _snapshot_skill_files(skill_dir)
+
     try:
         proc = subprocess.run(
             [sys.executable, str(script_path), *(str(a) for a in (args or []))],
@@ -307,11 +334,13 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             capture_output=True,
             timeout=_SCRIPT_RUN_TIMEOUT,
             cwd=str(skill_dir / "scripts"),
+            env={**os.environ, "OUTPUT_DIR": str(skill_dir / "outputs")},
         )
         stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         success = proc.returncode == 0
-        return {
+
+        result: dict = {
             "action": "run_script",
             "name": name,
             "success": success,
@@ -322,6 +351,18 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             "stderr": stderr,
             "exit_code": proc.returncode,
         }
+
+        # Detect newly created files and attach download metadata.
+        if success:
+            post_snapshot = _snapshot_skill_files(skill_dir)
+            new_files = sorted(post_snapshot - pre_snapshot)
+            if new_files:
+                result["output_files"] = [
+                    {"path": f, "url": f"/api/skills/{name}/files/{f}"}
+                    for f in new_files
+                ]
+
+        return result
     except subprocess.TimeoutExpired:
         return {
             "action": "run_script", "name": name, "success": False,

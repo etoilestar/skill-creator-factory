@@ -813,6 +813,20 @@ node scripts/render.js --input input.json --output output.html
 
 但不要把这些 Python 规则推广成所有脚本语言的硬规则。
 
+### 脚本输出文件规则
+
+如果脚本会生成文件（如 .pptx、.docx、.txt、.pdf、.xlsx 等），必须将文件写入 `../outputs/` 目录（即 Skill 根目录下的 `outputs/` 子目录）。
+
+运行时会自动通过环境变量 `OUTPUT_DIR` 注入该路径，脚本应优先读取：
+
+```python
+import os, pathlib
+output_dir = pathlib.Path(os.environ.get("OUTPUT_DIR", "../outputs"))
+output_dir.mkdir(parents=True, exist_ok=True)
+```
+
+这样用户可以在 Sandbox 界面直接下载生成的文件，无需手动查找路径。
+
 ---
 
 ## 脚本路径一致性规则

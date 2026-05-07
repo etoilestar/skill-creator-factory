@@ -42,6 +42,16 @@
             <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
             <pre v-if="msg.stdout" class="action-output">{{ msg.stdout }}</pre>
             <pre v-if="msg.stderr" class="action-stderr">{{ msg.stderr }}</pre>
+            <div v-if="msg.output_files && msg.output_files.length" class="action-files">
+              <span class="action-files-label">📥 生成文件：</span>
+              <a
+                v-for="f in msg.output_files"
+                :key="f.url"
+                :href="f.url"
+                :download="fileBasename(f)"
+                class="action-file-link"
+              >📄 {{ fileBasename(f) }}</a>
+            </div>
           </div>
           <!-- regular chat bubble -->
           <div
@@ -96,10 +106,15 @@ const ACTION_LABELS = {
   write_file: '写入文件',
   validate: '校验格式',
   package: '打包 Skill',
+  output_files: '生成文件',
 }
 
 function actionLabel(action) {
   return ACTION_LABELS[action] || action
+}
+
+function fileBasename(f) {
+  return f.name || f.path.split('/').pop()
 }
 
 const skills = ref([])
@@ -162,6 +177,7 @@ async function send() {
           stdout: r.stdout || '',
           stderr: r.stderr || '',
           exit_code: r.exit_code,
+          output_files: r.output_files || [],
         })
         await scrollBottom()
       }
@@ -273,6 +289,41 @@ async function send() {
 }
 .action-output { background: rgba(0,0,0,.06); }
 .action-stderr { background: rgba(200,0,0,.07); }
+
+/* Output file download links */
+.action-files {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(0,0,0,.08);
+}
+.action-files-label {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.action-file-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  background: rgba(0,0,0,.07);
+  font-size: 12px;
+  font-family: monospace;
+  color: inherit;
+  text-decoration: none;
+  border: 1px solid rgba(0,0,0,.12);
+  transition: background 0.15s;
+}
+.action-file-link:hover {
+  background: rgba(0,0,0,.14);
+  text-decoration: underline;
+}
 
 .input-area {
   padding: 12px 24px 20px;

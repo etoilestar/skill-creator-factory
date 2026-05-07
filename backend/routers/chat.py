@@ -2400,10 +2400,14 @@ def _execute_planned_actions(
                 if "$" not in arg:
                     return arg
                 result = arg
-                # Replace ${VAR} first, then $VAR.
+                # Replace ${VAR} first — unambiguous because of the braces.
                 for var, val in env.items():
                     result = result.replace(f"${{{var}}}", val)
-                    result = result.replace(f"${var}", val)
+                # Replace bare $VAR in decreasing name-length order so that a
+                # shorter name that is a prefix of a longer one (e.g. INPUT_DIR
+                # vs INPUT_SESSION_DIR) never clobbers the longer match.
+                for var in sorted(env, key=len, reverse=True):
+                    result = result.replace(f"${var}", env[var])
                 return result
 
             argv = [_expand_with_env(arg, _effective_env) for arg in argv]

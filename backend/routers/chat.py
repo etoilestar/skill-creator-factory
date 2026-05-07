@@ -1459,6 +1459,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "3. 你不能假设某个脚本存在；只能根据 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
         "4. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
         "5. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
         "通常应使用 mode=direct_answer，不要规划 run_command。\n"
         "6. 如果当前 Skill 没有 scripts 资源，默认不得规划 run_command。\n"
         "7. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 resource_catalog 或系统可执行环境中，"
@@ -1474,9 +1475,15 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- write_file：写入文件。\n"
         "- create_directory：创建目录。\n"
         "- display / ignore：展示或忽略。\n\n"
+        "文件生成任务强制规则（高优先级，覆盖规则 5）：\n"
+        "当用户明确请求生成 PPT/PPTX/幻灯片、Excel/XLSX、Word/DOCX、CSV、图表图片、PDF 等可下载格式文件时：\n"
+        "  a. 如果 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
+        "必须使用 mode=execute 并规划 run_command；不得使用 direct_answer。\n"
+        "  b. 文本模型无法直接生成二进制文件（.pptx/.xlsx/.docx），必须通过执行脚本生成。\n"
+        "  c. SKILL.md 中为文件生成任务指定了专用脚本时，stdin 字段应包含完整的输入内容（如幻灯片 JSON 数组）。\n\n"
         "mode 选择规则：\n"
-        "- direct_answer：Skill 可由模型根据 SKILL.md 直接完成，例如写故事、公文、报告、总结、翻译、分析。\n"
-        "- execute：确实需要宿主执行 action，例如读取资源、运行真实脚本、写入文件。\n"
+        "- direct_answer：Skill 可由模型直接完成，且产物是纯文本/Markdown（不是格式化文件），例如写故事、公文、总结、翻译、分析。\n"
+        "- execute：需要宿主执行 action，例如读取资源、运行脚本、写入文件，或生成 PPT/Excel 等格式文件。\n"
         "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全执行。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "run_command 约束：\n"
@@ -2507,12 +2514,11 @@ def _execute_planned_actions(
                     f"stderr: {(completed.stderr or '').strip()}\n"
                     f"stdout: {(completed.stdout or '').strip()}"
                 )
-                raise ValueError(
-                    "命令执行失败: "
-                    + command
-                    + "\n错误信息: "
-                    + (completed.stderr or completed.stdout or "无输出")
-                )
+                # Don't raise — accumulate the failure in results so that
+                # _generate_final_answer_from_observation can explain it to the user.
+                # Raising here would bypass the final-answer round and expose a raw
+                # error traceback instead of a helpful message.
+                continue
 
             logs.append(
                 f"执行命令成功: {command}\n"

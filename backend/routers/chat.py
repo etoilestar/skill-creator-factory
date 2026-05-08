@@ -616,16 +616,55 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
 
 
 def _strip_markdown_json_fence(text: str) -> str:
-    """Remove common markdown code fences around JSON."""
+    """Remove common markdown code fences around JSON.
+
+    Handles three cases in order:
+    1. The whole response is a ```json ... ``` fence (most common for well-behaved models).
+    2. The whole response is a bare ``` ... ``` fence.
+    3. The JSON fence is embedded inside a longer natural-language response — the model
+       added prose before/after the JSON block.  In this case we search for the first
+       ```json ... ``` or ``` ... ``` block whose content starts with ``{`` or ``[``.
+    4. Last resort: find the first ``{`` or ``[`` that could start a JSON object/array.
+    """
     stripped = text.strip()
 
+    # Case 1 & 2: fence at the start of the response.
     if stripped.startswith("```json"):
         stripped = stripped[len("```json"):].strip()
-    elif stripped.startswith("```"):
-        stripped = stripped[len("```"):].strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+        return stripped
 
-    if stripped.endswith("```"):
-        stripped = stripped[:-3].strip()
+    if stripped.startswith("```"):
+        stripped = stripped[len("```"):].strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+        # Only return early if the result looks like JSON.
+        if stripped.startswith("{") or stripped.startswith("["):
+            return stripped
+
+    # If the text already looks like JSON, return it directly.
+    if stripped.startswith("{") or stripped.startswith("["):
+        return stripped
+
+    # Case 3: embedded ```json ... ``` block anywhere in the text.
+    m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
+
+    # Embedded ``` ... ``` block whose content looks like JSON.
+    m = re.search(r"```\s*([\s\S]*?)\s*```", text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
+
+    # Case 4: bare JSON object/array anywhere in the text.
+    m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if m:
+        return m.group(1).strip()
 
     return stripped
 
@@ -1451,6 +1490,8 @@ def _strip_runtime_resource_manifest(body_prompt: str) -> str:
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
         "你是 Skill Agent 运行时动作规划器。\n\n"
+        "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
+        "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
         "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog 和用户请求，"
         "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
         "核心原则：\n"
@@ -1705,9 +1746,35 @@ async def _run_skill_runtime_planner_round(
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         raw_plan = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        logger.error("Received invalid JSON response from skill runtime planner: %s", planner_text)
-        raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+    except json.JSONDecodeError:
+        # First attempt failed.  Give the model one more chance with an explicit
+        # correction prompt that reinforces the JSON-only requirement.
+        logger.warning(
+            "Planner returned non-JSON on first attempt, retrying with correction prompt: %s",
+            planner_text[:300],
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": planner_text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一次回复包含了自然语言或 Markdown，不是合法的 JSON。\n"
+                    "请重新输出，只输出一个符合格式要求的 JSON 对象，"
+                    "不要任何解释、不要 Markdown、不要代码块标记。\n"
+                    "直接输出 { ... }，不要其他内容。"
+                ),
+            },
+        ]
+        planner_text = await complete_chat_once(retry_messages, planner_model)
+        try:
+            stripped = _strip_markdown_json_fence(planner_text)
+            raw_plan = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "Received invalid JSON response from skill runtime planner after retry: %s",
+                planner_text,
+            )
+            raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     return _normalize_skill_runtime_plan(
         raw_plan,

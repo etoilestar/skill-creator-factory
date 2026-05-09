@@ -668,6 +668,14 @@ def _rewrite_argv_input_paths(
     These won't resolve when the subprocess runs with cwd=skill_root or
     cwd=scripts/.  This helper replaces such arguments with the real absolute
     path so the script can open the file.
+
+    When ``uploads/<name>`` is used but ``<name>`` does not match any uploaded
+    file exactly (e.g. the LLM copied a placeholder filename like ``data.xlsx``
+    from a SKILL.md example), the function falls back to:
+      1. The single uploaded file whose extension matches ``<name>``'s extension.
+      2. ``session_input_dir/<name>`` so the subprocess CWD issue is at least
+         resolved (the script itself will then report a meaningful error if the
+         file is truly absent).
     """
     if not input_files or execution_root is None:
         return argv
@@ -684,6 +692,14 @@ def _rewrite_argv_input_paths(
     if not filename_to_abs:
         return argv
 
+    # Build an extension → list-of-absolute-paths index for fuzzy fallback.
+    # Used when the LLM copies a placeholder filename from SKILL.md (e.g.
+    # "uploads/data.xlsx") but the user actually uploaded "report.xlsx".
+    ext_to_abs: dict[str, list[str]] = {}
+    for fname, abs_p in filename_to_abs.items():
+        ext = Path(fname).suffix.lower()
+        ext_to_abs.setdefault(ext, []).append(abs_p)
+
     result: list[str] = []
     for arg in argv:
         rewritten = arg
@@ -692,8 +708,23 @@ def _rewrite_argv_input_paths(
             if rewritten.startswith(prefix):
                 candidate = rewritten[len(prefix):]
                 if candidate in filename_to_abs:
+                    # Exact filename match — use the known absolute path.
                     rewritten = filename_to_abs[candidate]
-                    break
+                else:
+                    # Exact match failed: the LLM may have copied a placeholder
+                    # filename from the SKILL.md example.  Fall back to the
+                    # only uploaded file whose extension matches the placeholder.
+                    placeholder_ext = Path(candidate).suffix.lower()
+                    matches = ext_to_abs.get(placeholder_ext, [])
+                    if len(matches) == 1:
+                        rewritten = matches[0]
+                    elif session_input_dir is not None:
+                        # Multiple (or zero) extension matches: redirect the
+                        # directory portion to the session input dir and keep
+                        # the original filename so the script can report a
+                        # meaningful "file not found" error if needed.
+                        rewritten = str(session_input_dir / candidate)
+                break
         # Pattern 2: bare filename that exactly matches an upload (only when the
         # argument doesn't already look like an absolute or relative path).
         if (
@@ -1643,6 +1674,10 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
         "`os.path.join(os.environ['INPUT_DIR'], '<相对路径>')`\n"
         "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
+        "特别注意：Loaded SKILL.md 中的示例命令（例如 `uploads/data.xlsx`）只是占位符格式说明，"
+        "其中的文件名（如 `data.xlsx`）并非真实文件名。\n"
+        "必须从用户消息（user_messages 中的【已附上传文件：...】）中提取真实文件名，"
+        "并以 `$INPUT_SESSION_DIR/<真实文件名>` 形式写入 command，不得保留 SKILL.md 中的示例文件名。\n"
     )
 
 def _normalize_skill_runtime_plan(

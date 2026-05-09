@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import Optional
+
+import yaml
 
 from ..config import settings
 
@@ -63,8 +64,13 @@ _ALLOWED_READ_SUFFIXES = {
 }
 
 
-def _parse_simple_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Parse simple YAML-like SKILL.md frontmatter."""
+def _parse_simple_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from a SKILL.md string.
+
+    Uses PyYAML for correct multi-line and nested value handling.  Falls back
+    to an empty metadata dict on any parse error so that a malformed frontmatter
+    never prevents loading the body.
+    """
     match = _FRONTMATTER_RE.match(text)
     if not match:
         return {}, text
@@ -72,23 +78,12 @@ def _parse_simple_frontmatter(text: str) -> tuple[dict[str, str], str]:
     meta_text = match.group(1)
     body = match.group(2)
 
-    meta: dict[str, str] = {}
-    current_key: Optional[str] = None
-
-    for raw_line in meta_text.splitlines():
-        line = raw_line.rstrip()
-
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-
-        if re.match(r"^[A-Za-z0-9_-]+\s*:", line):
-            key, value = line.split(":", 1)
-            current_key = key.strip()
-            meta[current_key] = value.strip().strip('"').strip("'")
-            continue
-
-        if current_key and (raw_line.startswith(" ") or raw_line.startswith("\t")):
-            meta[current_key] = (meta[current_key] + " " + line.strip()).strip()
+    try:
+        meta = yaml.safe_load(meta_text)
+        if not isinstance(meta, dict):
+            meta = {}
+    except yaml.YAMLError:
+        meta = {}
 
     return meta, body
 

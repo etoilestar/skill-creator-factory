@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import hashlib
 import os
 import shutil
@@ -1230,11 +1232,7 @@ def _planner_model_name(default_model: str) -> str:
     建议在 config 中增加 planner_model 或 action_planner_model。
     推荐部署方式：Ollama/OpenAI-compatible 接口，不建议在当前 FastAPI 进程内本地加载大模型。
     """
-    return (
-        getattr(settings, "planner_model", None)
-        or getattr(settings, "action_planner_model", None)
-        or default_model
-    )
+    return settings.planner_model or default_model
 
 def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path | None" = None) -> list[dict]:
     """Extract host-owned resource catalog from Loaded SKILL.md prompt.
@@ -1454,7 +1452,7 @@ def _compose_loaded_resources_prompt(
             observation = read_skill_resource_text(
                 skill_name,
                 path,
-                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+                max_chars=settings.skill_resource_max_chars,
             )
         except Exception as exc:
             sections.append(
@@ -1811,10 +1809,13 @@ async def _run_skill_runtime_planner_round(
             )
             raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
-    return _normalize_skill_runtime_plan(
-        raw_plan,
-        resource_catalog=resource_catalog,
-        execution_root=execution_root,
+    return await asyncio.to_thread(
+        functools.partial(
+            _normalize_skill_runtime_plan,
+            raw_plan,
+            resource_catalog=resource_catalog,
+            execution_root=execution_root,
+        )
     )
 
 
@@ -2378,7 +2379,7 @@ def _execute_planned_actions(
             observation = read_skill_resource_text(
                 skill_name,
                 rel_path,
-                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+                max_chars=settings.skill_resource_max_chars,
             )
 
             result = {
@@ -2524,7 +2525,7 @@ def _execute_planned_actions(
                         input=stdin_text,
                         capture_output=True,
                         text=True,
-                        timeout=int(getattr(settings, "skill_command_timeout", 60)),
+                        timeout=settings.skill_command_timeout,
                         cwd=str(cwd) if cwd else None,
                         env={**os.environ, **_run_cmd_extra_env},
                     )
@@ -2786,13 +2787,16 @@ async def _plan_and_execute_generated_output(
             "results": [],
         }
 
-    return _execute_planned_actions(
-        plan,
-        blocks,
-        request,
-        require_confirmation=require_confirmation,
-        execution_root=execution_root,
-        skill_name=skill_name,
+    return await asyncio.to_thread(
+        functools.partial(
+            _execute_planned_actions,
+            plan,
+            blocks,
+            request,
+            require_confirmation=require_confirmation,
+            execution_root=execution_root,
+            skill_name=skill_name,
+        )
     )
 
 
@@ -3035,13 +3039,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 path = str(task.get("path") or "")
                                 yield _sse({"status": {"phase": "creating", "message": f"创建目录：{path}"}})
 
-                        exec_result = _execute_planned_actions(
-                            runtime_plan,
-                            [],
-                            request,
-                            require_confirmation=require_action_confirmation,
-                            execution_root=execution_root,
-                            skill_name=parent_skill_name,
+                        exec_result = await asyncio.to_thread(
+                            functools.partial(
+                                _execute_planned_actions,
+                                runtime_plan,
+                                [],
+                                request,
+                                require_confirmation=require_action_confirmation,
+                                execution_root=execution_root,
+                                skill_name=parent_skill_name,
+                            )
                         )
 
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})

@@ -1254,8 +1254,9 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
 
     # 宽松正则：匹配所有被 backtick 包裹的 references/assets/scripts 路径
     # 覆盖列表（- `scripts/xxx`）、表格单元格、行内引用等写法
+    # 可选地捕获紧随其后的「：标题」（兼容旧的列表格式）
     pattern = re.compile(
-        r"`(?P<path>(references|assets|scripts)/[^`\s]+)`",
+        r"`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
         re.M,
     )
 
@@ -1285,7 +1286,8 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
         )
 
     for match in pattern.finditer(body_prompt):
-        _add_entry(match.group("path").strip())
+        title = (match.group("title") or "").lstrip("：").strip()
+        _add_entry(match.group("path").strip(), title)
 
     # 文件系统兜底：扫描磁盘上真实存在的文件，补充正则未捕获的条目
     if execution_root is not None:
@@ -2581,7 +2583,7 @@ def _execute_planned_actions(
                     )
                     if chinese_missing:
                         raw_deps = chinese_missing.group(1)
-                        pkg_list = [p.strip() for p in re.split(r"[,，、\s]+", raw_deps) if p.strip()]
+                        pkg_list = [p.strip() for p in re.split(r"[,，、;；]\s*", raw_deps) if p.strip()]
                         for dep in pkg_list:
                             if dep in _NODE_BUILTIN_MODULES:
                                 continue

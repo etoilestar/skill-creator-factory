@@ -10,18 +10,21 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
-def _auth_headers() -> dict:
-    """Return Authorization header when an OpenAI API key is configured."""
-    api_key = (
+def _resolve_api_key() -> str | None:
+    """Resolve the LLM API key from config or environment, returning None if absent."""
+    return (
         settings.llm_api_key
         or settings.openai_api_key
         or os.environ.get("LLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
     )
 
+
+def _auth_headers() -> dict:
+    """Return Authorization header when an OpenAI API key is configured."""
+    api_key = _resolve_api_key()
     if api_key:
         return {"Authorization": f"Bearer {api_key}"}
-
     return {}
 
 
@@ -46,13 +49,7 @@ def _build_chat_completions_url(base_url: str) -> str:
 
 def _get_api_key() -> str:
     """Ollama ignores the key, but OpenAI-compatible services usually expect one."""
-    return (
-        settings.llm_api_key
-        or settings.openai_api_key
-        or os.environ.get("LLM_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or "ollama"
-    )
+    return _resolve_api_key() or "ollama"
 
 
 def _build_payload(

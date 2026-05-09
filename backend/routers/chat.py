@@ -1303,18 +1303,18 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
     # 文件系统兜底：扫描磁盘上真实存在的文件，补充正则未捕获的条目
     if execution_root is not None:
         execution_root_resolved = execution_root.resolve()
-        for subdir in ("scripts", "references", "assets"):
-            scan_dir = execution_root / subdir
-            if not scan_dir.is_dir():
-                continue
-            for entry in sorted(scan_dir.iterdir()):
-                # Reject symlinks that escape the skill sandbox
-                try:
-                    entry.resolve().relative_to(execution_root_resolved)
-                except ValueError:
+        # Guard: only scan if execution_root itself is within an allowed root.
+        if any(_is_within_sandbox(execution_root_resolved, r.resolve()) for r in _allowed_skill_roots()):
+            for subdir in ("scripts", "references", "assets"):
+                scan_dir = execution_root_resolved / subdir
+                if not scan_dir.is_dir():
                     continue
-                if entry.is_file():
-                    _add_entry(f"{subdir}/{entry.name}")
+                for entry in sorted(scan_dir.iterdir()):
+                    # Reject symlinks that escape the skill sandbox
+                    if not _is_within_sandbox(entry, execution_root_resolved):
+                        continue
+                    if entry.is_file():
+                        _add_entry(f"{subdir}/{entry.name}")
 
     return catalog
 
@@ -1760,9 +1760,9 @@ async def _run_skill_runtime_planner_round(
     # 扫描磁盘上真实存在的脚本文件，注入给 planner 以便直接规划 run_command
     available_scripts: list[str] = []
     if execution_root is not None:
-        scripts_dir = execution_root / "scripts"
-        if scripts_dir.is_dir():
-            execution_root_resolved = execution_root.resolve()
+        execution_root_resolved = execution_root.resolve()
+        scripts_dir = execution_root_resolved / "scripts"
+        if scripts_dir.is_dir() and _is_within_sandbox(scripts_dir, execution_root_resolved):
             available_scripts = sorted(
                 "scripts/" + entry.name
                 for entry in scripts_dir.iterdir()
@@ -2850,6 +2850,13 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
     if execution_root is not None:
         execution_root = Path(execution_root).resolve()
+        # Verify the resolved path is within an allowed skill root so that
+        # a crafted skill_context cannot steer execution outside the sandbox.
+        allowed_roots = _allowed_skill_roots()
+        if not any(_is_within_sandbox(execution_root, r.resolve()) for r in allowed_roots):
+            raise ValueError(
+                f"execution_root '{execution_root}' is outside all allowed skill roots."
+            )
 
     async def generate():
         try:

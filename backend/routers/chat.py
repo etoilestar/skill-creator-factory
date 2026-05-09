@@ -1420,7 +1420,7 @@ async def _run_resource_selection_round(
             "content": json.dumps(
                 {
                     "loaded_skill_prompt": body_prompt,
-                    "resource_catalog": _resource_catalog_for_model(resource_catalog),
+                    "resource_catalog": _resource_catalog_for_planner(resource_catalog),
                     "user_messages": _request_messages(request),
                     "last_user_text": _last_user_text(request),
                 },

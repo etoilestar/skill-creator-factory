@@ -1,6 +1,8 @@
 """Tests for pure helper/parser functions in backend/routers/chat.py.
 
 These functions do not require a running LLM or file system access.
+Also includes tests for _is_within_sandbox, a security-critical guard that
+rejects symlinks escaping the skill execution sandbox.
 """
 
 import json

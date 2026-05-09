@@ -361,7 +361,20 @@ async function send() {
 </script>
 
 <style scoped>
-.sandbox { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+/*
+ * CSS custom properties for the thinking sidebar so magic numbers
+ * are defined in one place and reused across layout + transitions.
+ */
+.sandbox {
+  --thinking-sidebar-width: 320px;
+  --thinking-sidebar-mobile-height: 280px;
+  --thinking-breakpoint: 900px;
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
 
 .header {
   padding: 20px 24px 12px;
@@ -420,7 +433,7 @@ async function send() {
 
 /* Thinking panel sidebar */
 .thinking-sidebar {
-  width: 320px;
+  width: var(--thinking-sidebar-width);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -460,7 +473,7 @@ async function send() {
 }
 .panel-slide-enter-to,
 .panel-slide-leave-from {
-  width: 320px;
+  width: var(--thinking-sidebar-width);
   opacity: 1;
 }
 
@@ -472,7 +485,7 @@ async function send() {
     width: 100%;
     border-left: none;
     border-top: 1px solid var(--border);
-    max-height: 280px;
+    max-height: var(--thinking-sidebar-mobile-height);
   }
 
   .panel-slide-enter-from,
@@ -485,7 +498,7 @@ async function send() {
   .panel-slide-enter-to,
   .panel-slide-leave-from {
     width: 100%;
-    max-height: 280px;
+    max-height: var(--thinking-sidebar-mobile-height);
     opacity: 1;
   }
 }

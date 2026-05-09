@@ -2603,7 +2603,7 @@ def _execute_single_task(
             if not retried:
                 break
 
-        assert completed is not None  # noqa: S101 — loop always runs at least once
+        assert completed is not None  # noqa: S101 — loop always runs at least once (range >= 1)
         success = completed.returncode == 0
 
         result: dict = {
@@ -3147,7 +3147,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     "action": t.get("action"),
                                     "command": (str(t.get("command") or ""))[:120] or None,
                                     "path": t.get("path") or t.get("resource_handle") or None,
-                                    "reason": (str(t.get("reason") or ""))[:200],
+                                    "reason": str(t.get("reason") or "")[:200],
                                 }
                                 for t in tasks
                             ],

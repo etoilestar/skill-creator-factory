@@ -71,8 +71,7 @@ const STEP_ICONS = {
 
 function stepIcon(step, data) {
   if (step === 'action_result') {
-    const success = data?.success ?? data?.success !== false
-    return success ? '✅' : '❌'
+    return data?.success !== false ? '✅' : '❌'
   }
   return STEP_ICONS[step] ?? '•'
 }

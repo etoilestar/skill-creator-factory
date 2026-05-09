@@ -77,6 +77,17 @@
       </div>
 
       <div class="input-area">
+        <!-- 本轮生成文件固定展示栏 -->
+        <div v-if="roundOutputFiles.length" class="round-files-bar">
+          <span class="round-files-label">📥 本次生成的文件</span>
+          <a
+            v-for="f in roundOutputFiles"
+            :key="f.url"
+            :href="f.url"
+            :download="fileBasename(f)"
+            class="round-file-link"
+          >📄 {{ fileBasename(f) }}</a>
+        </div>
         <div v-if="error" class="error">{{ error }}</div>
         <div v-if="uploadError" class="error">{{ uploadError }}</div>
         <!-- Uploaded files chips -->
@@ -186,6 +197,9 @@ const uploading = ref(false)
 const uploadError = ref('')
 const fileInputEl = ref(null)
 
+// Persistent file download bar — collects output_files from the current round
+const roundOutputFiles = ref([])  // [{ path, url, name? }]
+
 // Exclude system action-result cards from the history sent to the LLM.
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
@@ -202,6 +216,7 @@ function resetChat() {
   uploadedFiles.value = []
   uploadError.value = ''
   sessionId.value = newSessionId()
+  roundOutputFiles.value = []
 }
 
 function removeUploadedFile(idx) {
@@ -259,6 +274,7 @@ async function send() {
   streaming.value = true
   streamBuffer.value = ''
   currentStatus.value = null
+  roundOutputFiles.value = []
 
   // Snapshot the uploaded files for this message, then keep them until reset
   const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
@@ -287,6 +303,10 @@ async function send() {
           exit_code: r.exit_code,
           output_files: r.output_files || [],
         })
+        // Accumulate generated files for the persistent download bar
+        if (r.output_files && r.output_files.length) {
+          roundOutputFiles.value.push(...r.output_files)
+        }
         await scrollBottom()
       }
     }
@@ -431,6 +451,44 @@ async function send() {
 }
 .action-file-link:hover {
   background: rgba(0,0,0,.14);
+  text-decoration: underline;
+}
+
+/* Persistent generated-files bar above the input area */
+.round-files-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+}
+.round-files-label {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.round-file-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  background: rgba(30,64,175,.1);
+  font-size: 12px;
+  font-family: monospace;
+  color: #1e40af;
+  text-decoration: none;
+  border: 1px solid rgba(30,64,175,.25);
+  transition: background 0.15s;
+}
+.round-file-link:hover {
+  background: rgba(30,64,175,.2);
   text-decoration: underline;
 }
 

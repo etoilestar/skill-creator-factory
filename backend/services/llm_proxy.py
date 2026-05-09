@@ -10,18 +10,21 @@ from ..config import settings
 logger = logging.getLogger(__name__)
 
 
-def _auth_headers() -> dict:
-    """Return Authorization header when an OpenAI API key is configured."""
-    api_key = (
-        getattr(settings, "llm_api_key", None)
-        or getattr(settings, "openai_api_key", None)
+def _resolve_api_key() -> str | None:
+    """Resolve the LLM API key from config or environment, returning None if absent."""
+    return (
+        settings.llm_api_key
+        or settings.openai_api_key
         or os.environ.get("LLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
     )
 
+
+def _auth_headers() -> dict:
+    """Return Authorization header when an OpenAI API key is configured."""
+    api_key = _resolve_api_key()
     if api_key:
         return {"Authorization": f"Bearer {api_key}"}
-
     return {}
 
 
@@ -46,13 +49,7 @@ def _build_chat_completions_url(base_url: str) -> str:
 
 def _get_api_key() -> str:
     """Ollama ignores the key, but OpenAI-compatible services usually expect one."""
-    return (
-        getattr(settings, "llm_api_key", None)
-        or getattr(settings, "openai_api_key", None)
-        or os.environ.get("LLM_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or "ollama"
-    )
+    return _resolve_api_key() or "ollama"
 
 
 def _build_payload(
@@ -67,13 +64,11 @@ def _build_payload(
         "stream": stream,
     }
 
-    temperature = getattr(settings, "temperature", None)
-    if temperature is not None:
-        payload["temperature"] = temperature
+    if settings.temperature is not None:
+        payload["temperature"] = settings.temperature
 
-    max_tokens = getattr(settings, "max_tokens", None)
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
+    if settings.max_tokens is not None:
+        payload["max_tokens"] = settings.max_tokens
 
     return payload
 
@@ -93,7 +88,7 @@ async def complete_chat_once(messages: list[dict], model: str) -> str:
     url = _build_chat_completions_url(settings.llm_base_url)
     payload = _build_payload(messages=messages, model=model, stream=False)
     headers = _build_headers()
-    timeout = float(os.environ.get("LM_TIMEOUT_SECONDS", "6000"))
+    timeout = float(settings.llm_timeout_seconds)
 
     logger.info("[LLM][once] request model=%s url=%s messages=%d", model, url, len(messages))
 
@@ -129,7 +124,7 @@ async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, N
     url = _build_chat_completions_url(settings.llm_base_url)
     payload = _build_payload(messages=messages, model=model, stream=True)
     headers = _build_headers()
-    timeout = float(os.environ.get("LM_TIMEOUT_SECONDS", "6000"))
+    timeout = float(settings.llm_timeout_seconds)
 
     logger.info("[LLM][stream] request model=%s url=%s messages=%d", model, url, len(messages))
 

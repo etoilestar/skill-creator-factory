@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import hashlib
 import os
 import shutil
@@ -404,34 +406,97 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
 def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
     """Static-scan a .js/.mjs script and npm-install any missing third-party
     modules into the per-skill node_modules before the script is executed.
+
+    策略（按优先级）：
+    1. 解析 skill_dir/package.json 的 dependencies / devDependencies。
+    2. 递归跟踪本地 require('./xxx.js') / import './xxx.js' 引用（最多 2 层深）。
+    3. 正则扫描主脚本及所有被递归发现的子脚本中的第三方 import/require。
     """
     npm_bin = shutil.which("npm")
     if not npm_bin:
         return
 
-    source = script_path.read_text(encoding="utf-8", errors="replace")
-    patterns = [
+    import_patterns = [
         # CommonJS: require('pkg') / require("pkg")
         re.compile(r"""require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
-        # ES module: import ... from 'pkg' / import ... from "pkg"
+        # ES module: import ... from 'pkg'
         re.compile(r"""from\s+['"]([^'"./][^'"]*)['"]\s*"""),
-        # Side-effect import: import 'pkg' / import "pkg"
+        # Side-effect import: import 'pkg'
         re.compile(r"""import\s+['"]([^'"./][^'"]*)['"]\s*"""),
-        # Dynamic import: import('pkg') / import("pkg")
+        # Dynamic import: import('pkg')
         re.compile(r"""import\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)"""),
     ]
+    local_require_pattern = re.compile(
+        r"""require\s*\(\s*['"](\.{1,2}/[^'"]+)['"]\s*\)|"""
+        r"""from\s+['"](\.{1,2}/[^'"]+)['"]\s*""",
+    )
+
+    def _collect_third_party(source: str) -> list[str]:
+        found: list[str] = []
+        for pat in import_patterns:
+            for m in pat.finditer(source):
+                raw = m.group(1)
+                if raw.startswith("@"):
+                    parts = raw.split("/")
+                    name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                else:
+                    name = raw.split("/")[0]
+                if name and name not in found:
+                    found.append(name)
+        return found
+
+    def _collect_local_refs(source: str, base: Path, skill_root: Path) -> list[Path]:
+        refs: list[Path] = []
+        for m in local_require_pattern.finditer(source):
+            rel = m.group(1) or m.group(2)
+            if not rel:
+                continue
+            candidate = (base / rel).resolve()
+            if not candidate.suffix:
+                candidate = candidate.with_suffix(".js")
+            # Security: only follow references that stay inside the skill directory
+            try:
+                candidate.relative_to(skill_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                refs.append(candidate)
+        return refs
+
     names: list[str] = []
-    for pattern in patterns:
-        for m in pattern.finditer(source):
-            raw = m.group(1)
-            # Handle scoped packages: @scope/pkg
-            if raw.startswith("@"):
-                parts = raw.split("/")
-                name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
-            else:
-                name = raw.split("/")[0]
-            if name and name not in names:
-                names.append(name)
+    skill_root = skill_dir.resolve()
+
+    # 1. Parse package.json if present
+    pkg_json = skill_root / "package.json"
+    if pkg_json.is_file():
+        try:
+            pkg_data = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+            for section in ("dependencies", "devDependencies"):
+                for pkg_name in (pkg_data.get(section) or {}).keys():
+                    if pkg_name and pkg_name not in names:
+                        names.append(pkg_name)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2 + 3. Recursively scan entry script and local requires (up to 2 levels deep)
+    visited: set[Path] = set()
+    queue: list[tuple[Path, int]] = [(script_path.resolve(), 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        try:
+            source = current.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for pkg_name in _collect_third_party(source):
+            if pkg_name not in names:
+                names.append(pkg_name)
+        if depth < 2:
+            for child in _collect_local_refs(source, current.parent, skill_root):
+                if child not in visited:
+                    queue.append((child, depth + 1))
 
     to_install = [
         n for n in names
@@ -914,6 +979,19 @@ def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
     base_dir = base_dir or Path.cwd()
     return base_dir / path
 
+
+def _is_within_sandbox(entry: Path, sandbox_root: Path) -> bool:
+    """Return True only when *entry* resolves to a path inside *sandbox_root*.
+
+    Rejects symlinks that point outside the skill sandbox, preventing a
+    malicious skill from exposing files such as /etc/passwd via read_resource.
+    """
+    try:
+        entry.resolve().relative_to(sandbox_root)
+        return True
+    except ValueError:
+        return False
+
 def _looks_like_skill_resource_dir(path: Path) -> bool:
     return path.name in {"scripts", "references", "assets"}
 
@@ -1167,96 +1245,37 @@ def _planner_model_name(default_model: str) -> str:
     建议在 config 中增加 planner_model 或 action_planner_model。
     推荐部署方式：Ollama/OpenAI-compatible 接口，不建议在当前 FastAPI 进程内本地加载大模型。
     """
-    return (
-        getattr(settings, "planner_model", None)
-        or getattr(settings, "action_planner_model", None)
-        or default_model
-    )
+    return settings.planner_model or default_model
 
-def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
-    """从 Loaded Skill prompt 中提取宿主资源清单。
-
-    planner/selector 只选择 resource_handle，不直接生成 path。
-    """
-    catalog: list[dict] = []
-    seen: set[str] = set()
-
-    pattern = re.compile(
-        r"-\s+`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
-        re.M,
-    )
-
-    for match in pattern.finditer(body_prompt):
-        path = match.group("path").strip()
-        if path in seen:
-            continue
-
-        seen.add(path)
-        dirname = path.split("/", 1)[0]
-        title = (match.group("title") or "").lstrip("：").strip()
-
-        if dirname == "references":
-            kind = "reference"
-            usage_hint = "参考资料、规范、示例、方法论，适合在生成 Skill 文件前读取。"
-        elif dirname == "assets":
-            kind = "asset"
-            usage_hint = "模板、配置、静态资源，适合在需要固定格式或模板时读取。"
-        else:
-            kind = "script"
-            usage_hint = "脚本资源。creator 阶段可读取源码作为参考；sandbox 阶段通常通过 run_command 执行。"
-
-        catalog.append({
-            "resource_handle": f"resource:{len(catalog)}",
-            "kind": kind,
-            "path": path,
-            "title": title,
-            "usage_hint": usage_hint,
-        })
-
-    return catalog
-
-
-def _resource_catalog_for_model(catalog: list[dict]) -> list[dict]:
-    """给模型看的资源清单，不暴露 path 生成权。"""
-    return [
-        {
-            "resource_handle": item["resource_handle"],
-            "kind": item["kind"],
-            "title": item.get("title", ""),
-            "usage_hint": item.get("usage_hint", ""),
-        }
-        for item in catalog
-    ]
-
-
-def _resource_catalog_by_handle(catalog: list[dict]) -> dict[str, dict]:
-    return {str(item["resource_handle"]): item for item in catalog}
-
-def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
+def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path | None" = None) -> list[dict]:
     """Extract host-owned resource catalog from Loaded SKILL.md prompt.
 
     关键原则：
     - 真实 path 只归宿主管理；
     - planner 只能看到 resource_handle；
     - planner 不能自己生成 read_resource.path。
+
+    策略：
+    1. 用宽松正则匹配所有 backtick 引用（列表、表格、行内等写法均可识别）。
+    2. 若传入 execution_root，从磁盘直接扫 scripts/、references/、assets/ 三个子目录，
+       将未被正则发现的文件追加进 catalog（彻底兜底）。
     """
     catalog: list[dict] = []
     seen: set[str] = set()
 
+    # 宽松正则：匹配所有被 backtick 包裹的 references/assets/scripts 路径
+    # 覆盖列表（- `scripts/xxx`）、表格单元格、行内引用等写法
+    # 可选地捕获紧随其后的「：标题」（兼容旧的列表格式）
     pattern = re.compile(
-        r"-\s+`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
+        r"`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
         re.M,
     )
 
-    for match in pattern.finditer(body_prompt):
-        path = match.group("path").strip()
+    def _add_entry(path: str, title: str = "") -> None:
         if path in seen:
-            continue
-
+            return
         seen.add(path)
         kind = path.split("/", 1)[0]
-        title = (match.group("title") or "").lstrip("：").strip()
-
         if kind == "references":
             allowed_actions = ["read_resource"]
             usage_hint = "参考资料，可在任务需要领域知识、示例、规范时读取。"
@@ -1266,7 +1285,6 @@ def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
         else:
             allowed_actions = ["run_command"]
             usage_hint = "脚本资源，默认用于执行，不用于读取源码，除非用户明确要求查看脚本内容。"
-
         catalog.append(
             {
                 "resource_handle": f"resource:{len(catalog)}",
@@ -1277,6 +1295,26 @@ def _extract_runtime_resource_catalog(body_prompt: str) -> list[dict]:
                 "usage_hint": usage_hint,
             }
         )
+
+    for match in pattern.finditer(body_prompt):
+        title = (match.group("title") or "").lstrip("：").strip()
+        _add_entry(match.group("path").strip(), title)
+
+    # 文件系统兜底：扫描磁盘上真实存在的文件，补充正则未捕获的条目
+    if execution_root is not None:
+        execution_root_resolved = execution_root.resolve()
+        # Guard: only scan if execution_root itself is within an allowed root.
+        if any(_is_within_sandbox(execution_root_resolved, r.resolve()) for r in _allowed_skill_roots()):
+            for subdir in ("scripts", "references", "assets"):
+                scan_dir = execution_root_resolved / subdir
+                if not scan_dir.is_dir():
+                    continue
+                for entry in sorted(scan_dir.iterdir()):
+                    # Reject symlinks that escape the skill sandbox
+                    if not _is_within_sandbox(entry, execution_root_resolved):
+                        continue
+                    if entry.is_file():
+                        _add_entry(f"{subdir}/{entry.name}")
 
     return catalog
 
@@ -1399,7 +1437,7 @@ async def _run_resource_selection_round(
             "content": json.dumps(
                 {
                     "loaded_skill_prompt": body_prompt,
-                    "resource_catalog": _resource_catalog_for_model(resource_catalog),
+                    "resource_catalog": _resource_catalog_for_planner(resource_catalog),
                     "user_messages": _request_messages(request),
                     "last_user_text": _last_user_text(request),
                 },
@@ -1433,7 +1471,7 @@ def _compose_loaded_resources_prompt(
             observation = read_skill_resource_text(
                 skill_name,
                 path,
-                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+                max_chars=settings.skill_resource_max_chars,
             )
         except Exception as exc:
             sections.append(
@@ -1492,33 +1530,35 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "你是 Skill Agent 运行时动作规划器。\n\n"
         "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
         "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
-        "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog 和用户请求，"
+        "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog、available_scripts 和用户请求，"
         "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
         "2. resource_catalog 是宿主提供的真实资源树。\n"
-        "3. 你不能假设某个脚本存在；只能根据 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
-        "4. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
-        "5. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "3. available_scripts 是宿主从磁盘实时扫描到的真实脚本文件列表（权威来源）。"
+        "available_scripts 中出现的脚本无需查 resource_catalog 即可直接规划 run_command。\n"
+        "4. 你不能假设某个脚本存在；只能根据 available_scripts 或 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
+        "5. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
+        "6. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
         "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
         "通常应使用 mode=direct_answer，不要规划 run_command。\n"
-        "6. 如果当前 Skill 没有 scripts 资源，默认不得规划 run_command。\n"
-        "7. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 resource_catalog 或系统可执行环境中，"
-        "才允许规划 run_command。\n"
-        "8. read_resource 只能使用 resource_handle，禁止输出 path。\n"
-        "9. resource_handle 必须来自 resource_catalog。\n"
-        "10. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
-        "11. 不要假装读取、假装执行、假装写入。\n"
-        "12. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "7. 如果 available_scripts 和 resource_catalog 均没有 scripts 资源，默认不得规划 run_command。\n"
+        "8. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 available_scripts、"
+        "resource_catalog 或系统可执行环境中，才允许规划 run_command。\n"
+        "9. read_resource 只能使用 resource_handle，禁止输出 path。\n"
+        "10. resource_handle 必须来自 resource_catalog。\n"
+        "11. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
+        "12. 不要假装读取、假装执行、假装写入。\n"
+        "13. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
         "允许的 action：\n"
         "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
         "- run_command：执行一个真实可执行的命令。命令不得是函数名或伪代码。\n"
         "- write_file：写入文件。\n"
         "- create_directory：创建目录。\n"
         "- display / ignore：展示或忽略。\n\n"
-        "文件生成任务强制规则（高优先级，覆盖规则 5）：\n"
+        "文件生成任务强制规则（高优先级，覆盖规则 6）：\n"
         "当用户明确请求生成 PPT/PPTX/幻灯片、Excel/XLSX、Word/DOCX、CSV、图表图片、PDF 等可下载格式文件时：\n"
-        "  a. 如果 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
+        "  a. 如果 available_scripts 或 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
         "必须使用 mode=execute 并规划 run_command；不得使用 direct_answer。\n"
         "  b. 文本模型无法直接生成二进制文件（.pptx/.xlsx/.docx），必须通过执行脚本生成。\n"
         "  c. SKILL.md 中为文件生成任务指定了专用脚本时，stdin 字段应包含完整的输入内容（如幻灯片 JSON 数组）。\n\n"
@@ -1529,10 +1569,10 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "run_command 约束：\n"
         "1. 不得输出类似 generate_story、process、main、run_task 这样的函数名作为 command。\n"
-        "2. 不得凭空生成 scripts/main.py、scripts/run.py、main.py 等路径。\n"
-        "3. 如果 command 引用了 scripts/...，该路径必须能在 resource_catalog 中看到。\n"
-        "4. 如果 resource_catalog 的 scripts 为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
-        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不存在，应使用 ask_user，并在 errors 中说明脚本不存在。\n"
+        "2. 不得凭空生成不在 available_scripts 中的 scripts/main.py、scripts/run.py 等路径。\n"
+        "3. 如果 command 引用了 scripts/...，该路径必须能在 available_scripts 或 resource_catalog 中看到。\n"
+        "4. 如果 available_scripts 和 resource_catalog 的 scripts 均为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
+        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不在 available_scripts 中，应使用 ask_user，并在 errors 中说明脚本不存在。\n"
         "6. command 必须是完整的可执行命令行，包含脚本所需的所有参数，并用用户消息中的实际值替换 Loaded SKILL.md 里的占位符\n"
         "（例如 `<filepath>`、`{file}`、`<input>` 等）；不得在 command 中保留任何占位符或省略必要参数。\n"
         "7. 如果某个必要参数（例如文件路径、用户数据）在用户消息中未提供且无法从上下文推断，"
@@ -1714,12 +1754,27 @@ async def _run_skill_runtime_planner_round(
     - planner 只选择 resource_handle；
     - 真实 path 由宿主解析，不由模型生成。
     """
-    resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+    resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
     planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
+
+    # 扫描磁盘上真实存在的脚本文件，注入给 planner 以便直接规划 run_command
+    available_scripts: list[str] = []
+    if execution_root is not None:
+        execution_root_resolved = execution_root.resolve()
+        scripts_dir = execution_root_resolved / "scripts"
+        if scripts_dir.is_dir() and _is_within_sandbox(scripts_dir, execution_root_resolved):
+            available_scripts = sorted(
+                "scripts/" + entry.name
+                for entry in scripts_dir.iterdir()
+                if entry.is_file()
+                # Reject symlinks that escape the skill sandbox
+                and _is_within_sandbox(entry, execution_root_resolved)
+            )
 
     planner_payload = {
         "loaded_skill_prompt": planner_body_prompt,
         "resource_catalog": _resource_catalog_for_planner(resource_catalog),
+        "available_scripts": available_scripts,
         "user_messages": _request_messages_with_files(request),
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
@@ -1776,10 +1831,13 @@ async def _run_skill_runtime_planner_round(
             )
             raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
-    return _normalize_skill_runtime_plan(
-        raw_plan,
-        resource_catalog=resource_catalog,
-        execution_root=execution_root,
+    return await asyncio.to_thread(
+        functools.partial(
+            _normalize_skill_runtime_plan,
+            raw_plan,
+            resource_catalog=resource_catalog,
+            execution_root=execution_root,
+        )
     )
 
 
@@ -2343,7 +2401,7 @@ def _execute_planned_actions(
             observation = read_skill_resource_text(
                 skill_name,
                 rel_path,
-                max_chars=int(getattr(settings, "skill_resource_max_chars", 20000)),
+                max_chars=settings.skill_resource_max_chars,
             )
 
             result = {
@@ -2489,7 +2547,7 @@ def _execute_planned_actions(
                         input=stdin_text,
                         capture_output=True,
                         text=True,
-                        timeout=int(getattr(settings, "skill_command_timeout", 60)),
+                        timeout=settings.skill_command_timeout,
                         cwd=str(cwd) if cwd else None,
                         env={**os.environ, **_run_cmd_extra_env},
                     )
@@ -2541,6 +2599,29 @@ def _execute_planned_actions(
                         if _retry_install_node_dep(module_name, cwd):
                             retried = True
 
+                # Skill 自定义中文错误格式：缺少依赖: pkg1, pkg2
+                if not retried and cwd is not None:
+                    chinese_missing = re.search(
+                        r"缺少依赖[:：]\s*([^\n]+)", (completed.stdout or "") + "\n" + stderr
+                    )
+                    if chinese_missing:
+                        raw_deps = chinese_missing.group(1)
+                        pkg_list = [p.strip() for p in re.split(r"[,，、;；]\s*", raw_deps) if p.strip()]
+                        for dep in pkg_list:
+                            if dep in _NODE_BUILTIN_MODULES:
+                                continue
+                            # Decide whether it looks like a Node or Python package and install accordingly
+                            if dep.endswith(".js") or (cwd / "node_modules").is_dir() or shutil.which("node"):
+                                if _retry_install_node_dep(dep, cwd):
+                                    retried = True
+                            else:
+                                try:
+                                    venv_python = _get_skill_venv_python(cwd)
+                                    if _retry_install_python_dep(dep, venv_python):
+                                        retried = True
+                                except Exception as dep_exc:
+                                    logger.warning("skill-env: chinese dep install failed: %s", dep_exc)
+
                 if not retried:
                     break  # 无法识别缺失依赖，停止重试
 
@@ -2559,14 +2640,15 @@ def _execute_planned_actions(
             }
 
             # 执行成功后：检测新生成的文件，附加下载链接
-            if success and cwd and skill_name:
+            effective_skill_name = skill_name or (cwd.name if cwd else "")
+            if success and cwd and effective_skill_name:
                 post_snapshot = _snapshot_dir_files(cwd)
                 new_files = sorted(post_snapshot - pre_snapshot)
                 if new_files:
                     result["output_files"] = [
                         {
                             "path": f,
-                            "url": f"/api/skills/{skill_name}/files/{f}",
+                            "url": f"/api/skills/{effective_skill_name}/files/{f}",
                         }
                         for f in new_files
                     ]
@@ -2727,13 +2809,16 @@ async def _plan_and_execute_generated_output(
             "results": [],
         }
 
-    return _execute_planned_actions(
-        plan,
-        blocks,
-        request,
-        require_confirmation=require_confirmation,
-        execution_root=execution_root,
-        skill_name=skill_name,
+    return await asyncio.to_thread(
+        functools.partial(
+            _execute_planned_actions,
+            plan,
+            blocks,
+            request,
+            require_confirmation=require_confirmation,
+            execution_root=execution_root,
+            skill_name=skill_name,
+        )
     )
 
 
@@ -2765,6 +2850,13 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
     if execution_root is not None:
         execution_root = Path(execution_root).resolve()
+        # Verify the resolved path is within an allowed skill root so that
+        # a crafted skill_context cannot steer execution outside the sandbox.
+        allowed_roots = _allowed_skill_roots()
+        if not any(_is_within_sandbox(execution_root, r.resolve()) for r in allowed_roots):
+            raise ValueError(
+                f"execution_root '{execution_root}' is outside all allowed skill roots."
+            )
 
     async def generate():
         try:
@@ -2976,13 +3068,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 path = str(task.get("path") or "")
                                 yield _sse({"status": {"phase": "creating", "message": f"创建目录：{path}"}})
 
-                        exec_result = _execute_planned_actions(
-                            runtime_plan,
-                            [],
-                            request,
-                            require_confirmation=require_action_confirmation,
-                            execution_root=execution_root,
-                            skill_name=parent_skill_name,
+                        exec_result = await asyncio.to_thread(
+                            functools.partial(
+                                _execute_planned_actions,
+                                runtime_plan,
+                                [],
+                                request,
+                                require_confirmation=require_action_confirmation,
+                                execution_root=execution_root,
+                                skill_name=parent_skill_name,
+                            )
                         )
 
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})

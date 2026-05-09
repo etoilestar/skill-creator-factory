@@ -443,7 +443,7 @@ def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
                     found.append(name)
         return found
 
-    def _collect_local_refs(source: str, base: Path) -> list[Path]:
+    def _collect_local_refs(source: str, base: Path, skill_root: Path) -> list[Path]:
         refs: list[Path] = []
         for m in local_require_pattern.finditer(source):
             rel = m.group(1) or m.group(2)
@@ -452,14 +452,20 @@ def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
             candidate = (base / rel).resolve()
             if not candidate.suffix:
                 candidate = candidate.with_suffix(".js")
+            # Security: only follow references that stay inside the skill directory
+            try:
+                candidate.relative_to(skill_root)
+            except ValueError:
+                continue
             if candidate.is_file():
                 refs.append(candidate)
         return refs
 
     names: list[str] = []
+    skill_root = skill_dir.resolve()
 
     # 1. Parse package.json if present
-    pkg_json = skill_dir / "package.json"
+    pkg_json = skill_root / "package.json"
     if pkg_json.is_file():
         try:
             pkg_data = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
@@ -486,7 +492,7 @@ def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
             if pkg_name not in names:
                 names.append(pkg_name)
         if depth < 2:
-            for child in _collect_local_refs(source, current.parent):
+            for child in _collect_local_refs(source, current.parent, skill_root):
                 if child not in visited:
                     queue.append((child, depth + 1))
 

@@ -334,7 +334,11 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             capture_output=True,
             timeout=_SCRIPT_RUN_TIMEOUT,
             cwd=str(skill_dir / "scripts"),
-            env={**os.environ, "OUTPUT_DIR": str(skill_dir / "outputs")},
+            env={
+                **os.environ,
+                "OUTPUT_DIR": str(skill_dir / "outputs"),
+                "INPUT_DIR": str(skill_dir / "inputs"),
+            },
         )
         stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")

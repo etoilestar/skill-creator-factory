@@ -134,6 +134,19 @@ function addElements(slideData, targetSlide, pres) {
   for (const el of slideData.elements) {
     if (el.type === 'image') {
       let imagePath = el.src.startsWith('file://') ? el.src.replace('file://', '') : el.src;
+      // Validate data: URIs — reject placeholder strings that are not real base64.
+      // The LLM sometimes emits <img src="data:image/png;base64,<description>"> as a
+      // template; the base64 portion would then contain non-base64 characters (angle
+      // brackets, spaces, CJK characters, etc.) and cause PptxGenJS to crash.
+      if (imagePath.startsWith('data:')) {
+        const b64Match = imagePath.match(/^data:[^;]+;base64,(.*)$/s);
+        const b64Content = b64Match ? b64Match[1].trim() : '';
+        const isValidBase64 = b64Content.length > 0 && /^[A-Za-z0-9+/]+=*$/.test(b64Content);
+        if (!isValidBase64) {
+          console.warn(`  ⚠️  跳过无效的 data: URI 图片（占位符或损坏的 base64）: ${imagePath.substring(0, 80)}…`);
+          continue;
+        }
+      }
       targetSlide.addImage({
         path: imagePath,
         x: el.position.x,

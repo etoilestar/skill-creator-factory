@@ -39,6 +39,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[Message]
     model: Optional[str] = None
+    input_files: list[dict] = []  # [{"path": "inputs/session/file.csv", "filename": "file.csv"}, ...]
 
 
 @dataclass
@@ -506,6 +507,101 @@ def _request_messages(request: ChatRequest) -> list[dict]:
     return [{"role": m.role, "content": m.content} for m in request.messages]
 
 
+def _request_messages_with_files(request: ChatRequest) -> list[dict]:
+    """Like _request_messages, but appends a compact file-attachment note to the
+    last user message so the LLM sees the files as part of the conversation turn
+    rather than only in the system prompt.
+    """
+    if not request.input_files:
+        return _request_messages(request)
+
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    # Find the last user message and append a file-attachment note.
+    for i in reversed(range(len(messages))):
+        if messages[i]["role"] == "user":
+            names = ", ".join(
+                f.get("filename") or Path(f.get("path", "")).name
+                for f in request.input_files
+            )
+            messages[i] = {
+                "role": "user",
+                "content": messages[i]["content"] + f"\n\n【已附上传文件：{names}】",
+            }
+            break
+    return messages
+
+
+def _extract_input_session_dir(input_files: list[dict], execution_root: "Path | None") -> "Path | None":
+    """Derive the session-specific input directory from the first uploaded file's path.
+
+    Uploaded files are stored at  inputs/<session_id>/<filename>  relative to the
+    skill root.  This helper resolves the absolute  inputs/<session_id>/  path so
+    subprocesses can receive it as INPUT_SESSION_DIR, allowing scripts to discover
+    all uploaded files without hard-coding the session ID.
+    """
+    if not input_files or execution_root is None:
+        return None
+    first_path = input_files[0].get("path", "")
+    parts = Path(first_path).parts  # ("inputs", "<session_id>", "<filename>")
+    if len(parts) >= 2 and parts[0] == "inputs":
+        return execution_root / "inputs" / parts[1]
+    return None
+
+
+def _rewrite_argv_input_paths(
+    argv: list[str],
+    input_files: list[dict],
+    execution_root: "Path | None",
+    session_input_dir: "Path | None",
+) -> list[str]:
+    """Rewrite argv elements that reference uploaded files to absolute paths.
+
+    The LLM may generate file arguments using conventions like:
+      - ``uploads/<filename>``
+      - a bare ``<filename>`` that matches an uploaded file
+
+    These won't resolve when the subprocess runs with cwd=skill_root or
+    cwd=scripts/.  This helper replaces such arguments with the real absolute
+    path so the script can open the file.
+    """
+    if not input_files or execution_root is None:
+        return argv
+
+    # Build a filename → absolute-path map from uploaded file records.
+    filename_to_abs: dict[str, str] = {}
+    for f in input_files:
+        rel = f.get("path", "")
+        fname = f.get("filename") or (Path(rel).name if rel else "")
+        if rel and fname:
+            abs_path = execution_root / rel
+            filename_to_abs[fname] = str(abs_path)
+
+    if not filename_to_abs:
+        return argv
+
+    result: list[str] = []
+    for arg in argv:
+        rewritten = arg
+        # Pattern 1: uploads/<filename>  or  uploads\<filename>
+        for prefix in ("uploads/", "uploads\\"):
+            if rewritten.startswith(prefix):
+                candidate = rewritten[len(prefix):]
+                if candidate in filename_to_abs:
+                    rewritten = filename_to_abs[candidate]
+                    break
+        # Pattern 2: bare filename that exactly matches an upload (only when the
+        # argument doesn't already look like an absolute or relative path).
+        if (
+            rewritten == arg  # not yet rewritten
+            and "/" not in rewritten
+            and "\\" not in rewritten
+            and rewritten in filename_to_abs
+        ):
+            rewritten = filename_to_abs[rewritten]
+        result.append(rewritten)
+    return result
+
+
 def _last_user_text(request: ChatRequest) -> str:
     for message in reversed(request.messages):
         if message.role == "user":
@@ -520,16 +616,55 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
 
 
 def _strip_markdown_json_fence(text: str) -> str:
-    """Remove common markdown code fences around JSON."""
+    """Remove common markdown code fences around JSON.
+
+    Handles three cases in order:
+    1. The whole response is a ```json ... ``` fence (most common for well-behaved models).
+    2. The whole response is a bare ``` ... ``` fence.
+    3. The JSON fence is embedded inside a longer natural-language response — the model
+       added prose before/after the JSON block.  In this case we search for the first
+       ```json ... ``` or ``` ... ``` block whose content starts with ``{`` or ``[``.
+    4. Last resort: find the first ``{`` or ``[`` that could start a JSON object/array.
+    """
     stripped = text.strip()
 
+    # Case 1 & 2: fence at the start of the response.
     if stripped.startswith("```json"):
         stripped = stripped[len("```json"):].strip()
-    elif stripped.startswith("```"):
-        stripped = stripped[len("```"):].strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+        return stripped
 
-    if stripped.endswith("```"):
-        stripped = stripped[:-3].strip()
+    if stripped.startswith("```"):
+        stripped = stripped[len("```"):].strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+        # Only return early if the result looks like JSON.
+        if stripped.startswith("{") or stripped.startswith("["):
+            return stripped
+
+    # If the text already looks like JSON, return it directly.
+    if stripped.startswith("{") or stripped.startswith("["):
+        return stripped
+
+    # Case 3: embedded ```json ... ``` block anywhere in the text.
+    m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
+
+    # Embedded ``` ... ``` block whose content looks like JSON.
+    m = re.search(r"```\s*([\s\S]*?)\s*```", text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
+
+    # Case 4: bare JSON object/array anywhere in the text.
+    m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if m:
+        return m.group(1).strip()
 
     return stripped
 
@@ -1355,6 +1490,8 @@ def _strip_runtime_resource_manifest(body_prompt: str) -> str:
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
         "你是 Skill Agent 运行时动作规划器。\n\n"
+        "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
+        "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
         "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog 和用户请求，"
         "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
         "核心原则：\n"
@@ -1363,6 +1500,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "3. 你不能假设某个脚本存在；只能根据 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
         "4. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
         "5. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
         "通常应使用 mode=direct_answer，不要规划 run_command。\n"
         "6. 如果当前 Skill 没有 scripts 资源，默认不得规划 run_command。\n"
         "7. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 resource_catalog 或系统可执行环境中，"
@@ -1378,9 +1516,15 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- write_file：写入文件。\n"
         "- create_directory：创建目录。\n"
         "- display / ignore：展示或忽略。\n\n"
+        "文件生成任务强制规则（高优先级，覆盖规则 5）：\n"
+        "当用户明确请求生成 PPT/PPTX/幻灯片、Excel/XLSX、Word/DOCX、CSV、图表图片、PDF 等可下载格式文件时：\n"
+        "  a. 如果 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
+        "必须使用 mode=execute 并规划 run_command；不得使用 direct_answer。\n"
+        "  b. 文本模型无法直接生成二进制文件（.pptx/.xlsx/.docx），必须通过执行脚本生成。\n"
+        "  c. SKILL.md 中为文件生成任务指定了专用脚本时，stdin 字段应包含完整的输入内容（如幻灯片 JSON 数组）。\n\n"
         "mode 选择规则：\n"
-        "- direct_answer：Skill 可由模型根据 SKILL.md 直接完成，例如写故事、公文、报告、总结、翻译、分析。\n"
-        "- execute：确实需要宿主执行 action，例如读取资源、运行真实脚本、写入文件。\n"
+        "- direct_answer：Skill 可由模型直接完成，且产物是纯文本/Markdown（不是格式化文件），例如写故事、公文、总结、翻译、分析。\n"
+        "- execute：需要宿主执行 action，例如读取资源、运行脚本、写入文件，或生成 PPT/Excel 等格式文件。\n"
         "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全执行。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "run_command 约束：\n"
@@ -1404,7 +1548,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "    },\n"
         "    {\n"
         "      \"action\": \"run_command\",\n"
-        "      \"command\": \"scripts/process.py uploads/data.xlsx --format markdown\",\n"
+        "      \"command\": \"scripts/process.py $INPUT_SESSION_DIR/data.xlsx --format markdown\",\n"
         "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
         "      \"reason\": \"需要运行真实存在的脚本或工具，命令包含从用户消息中提取的实际参数值\"\n"
         "    }\n"
@@ -1413,6 +1557,12 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "  \"missing\": [],\n"
         "  \"errors\": []\n"
         "}\n"
+        "\n"
+        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径。\n"
+        "- Shell 脚本：`$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`\n"
+        "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
+        "`os.path.join(os.environ['INPUT_DIR'], '<相对路径>')`\n"
+        "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
     )
 
 def _normalize_skill_runtime_plan(
@@ -1570,7 +1720,7 @@ async def _run_skill_runtime_planner_round(
     planner_payload = {
         "loaded_skill_prompt": planner_body_prompt,
         "resource_catalog": _resource_catalog_for_planner(resource_catalog),
-        "user_messages": _request_messages(request),
+        "user_messages": _request_messages_with_files(request),
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
         "runtime_contract": {
@@ -1596,9 +1746,35 @@ async def _run_skill_runtime_planner_round(
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         raw_plan = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        logger.error("Received invalid JSON response from skill runtime planner: %s", planner_text)
-        raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+    except json.JSONDecodeError:
+        # First attempt failed.  Give the model one more chance with an explicit
+        # correction prompt that reinforces the JSON-only requirement.
+        logger.warning(
+            "Planner returned non-JSON on first attempt, retrying with correction prompt: %s",
+            planner_text[:300],
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": planner_text},
+            {
+                "role": "user",
+                "content": (
+                    "你的上一次回复包含了自然语言或 Markdown，不是合法的 JSON。\n"
+                    "请重新输出，只输出一个符合格式要求的 JSON 对象，"
+                    "不要任何解释、不要 Markdown、不要代码块标记。\n"
+                    "直接输出 { ... }，不要其他内容。"
+                ),
+            },
+        ]
+        planner_text = await complete_chat_once(retry_messages, planner_model)
+        try:
+            stripped = _strip_markdown_json_fence(planner_text)
+            raw_plan = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "Received invalid JSON response from skill runtime planner after retry: %s",
+                planner_text,
+            )
+            raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     return _normalize_skill_runtime_plan(
         raw_plan,
@@ -1636,7 +1812,7 @@ async def _generate_final_answer_from_observation(
             "content": json.dumps(
                 {
                     "loaded_skill_prompt": body_prompt,
-                    "user_messages": _request_messages(request),
+                    "user_messages": _request_messages_with_files(request),
                     "plan": plan,
                     "execution_result": execution_result,
                 },
@@ -2134,6 +2310,9 @@ def _execute_planned_actions(
         execution_root=execution_root,
     )
 
+    # Pre-compute the session-specific input directory once for all run_command tasks.
+    _session_input_dir: "Path | None" = None
+
     touched: list[Path] = []
     results: list[dict] = []
     logs: list[str] = []
@@ -2246,6 +2425,12 @@ def _execute_planned_actions(
 
             cwd = execution_root or inferred_skill_root
 
+            # Resolve session input directory once (lazy) for this run_command task.
+            if _session_input_dir is None:
+                _session_input_dir = _extract_input_session_dir(
+                    getattr(request, "input_files", []) or [], cwd
+                )
+
             # 执行前快照，用于后续检测新生成的文件
             pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
 
@@ -2256,6 +2441,43 @@ def _execute_planned_actions(
                 argv = _prepare_command_argv(" ".join(shlex.quote(part) for part in argv), base_dir=cwd)
             else:
                 argv = _prepare_command_argv(command, base_dir=cwd)
+
+            # Rewrite argv elements that reference uploaded files using legacy
+            # path conventions (e.g. uploads/<name>) to their real absolute paths.
+            argv = _rewrite_argv_input_paths(
+                argv,
+                getattr(request, "input_files", []) or [],
+                cwd,
+                _session_input_dir,
+            )
+
+            _run_cmd_extra_env: dict[str, str] = {
+                "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
+                "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+            }
+            if _session_input_dir is not None:
+                _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(_session_input_dir)
+
+            # Expand shell-style env vars ($VAR / ${VAR}) in argv using the
+            # combined environment (subprocess uses shell=False so the shell
+            # never performs this expansion itself).
+            _effective_env = {**os.environ, **_run_cmd_extra_env}
+
+            def _expand_with_env(arg: str, env: dict) -> str:
+                if "$" not in arg:
+                    return arg
+                result = arg
+                # Replace ${VAR} first — unambiguous because of the braces.
+                for var, val in env.items():
+                    result = result.replace(f"${{{var}}}", val)
+                # Replace bare $VAR in decreasing name-length order so that a
+                # shorter name that is a prefix of a longer one (e.g. INPUT_DIR
+                # vs INPUT_SESSION_DIR) never clobbers the longer match.
+                for var in sorted(env, key=len, reverse=True):
+                    result = result.replace(f"${var}", env[var])
+                return result
+
+            argv = [_expand_with_env(arg, _effective_env) for arg in argv]
 
             # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
             completed = None
@@ -2269,10 +2491,7 @@ def _execute_planned_actions(
                         text=True,
                         timeout=int(getattr(settings, "skill_command_timeout", 60)),
                         cwd=str(cwd) if cwd else None,
-                        env={
-                            **os.environ,
-                            "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
-                        },
+                        env={**os.environ, **_run_cmd_extra_env},
                     )
                 except FileNotFoundError as exc:
                     raise ValueError(
@@ -2366,12 +2585,11 @@ def _execute_planned_actions(
                     f"stderr: {(completed.stderr or '').strip()}\n"
                     f"stdout: {(completed.stdout or '').strip()}"
                 )
-                raise ValueError(
-                    "命令执行失败: "
-                    + command
-                    + "\n错误信息: "
-                    + (completed.stderr or completed.stdout or "无输出")
-                )
+                # Don't raise — accumulate the failure in results so that
+                # _generate_final_answer_from_observation can explain it to the user.
+                # Raising here would bypass the final-answer round and expose a raw
+                # error traceback instead of a helpful message.
+                continue
 
             logs.append(
                 f"执行命令成功: {command}\n"
@@ -2642,6 +2860,86 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     if loaded_resources_prompt:
                         body_prompt = body_prompt + loaded_resources_prompt
 
+            # Append uploaded input-file context to the body prompt so the LLM
+            # knows which files are available. For small text files the content is
+            # embedded directly so the LLM can reason about the data without running
+            # a script first. Binary or large files are described by path only.
+            if getattr(request, "input_files", None):
+                _TEXT_CONTENT_SUFFIXES = frozenset({
+                    ".txt", ".md", ".csv", ".tsv", ".json", ".jsonl",
+                    ".yaml", ".yml", ".xml", ".html", ".htm", ".log",
+                })
+                _MAX_INLINE_BYTES = 100 * 1024  # 100 KB
+
+                file_sections: list[str] = []
+                for f in request.input_files:
+                    rel_path = f.get("path", "")
+                    filename = f.get("filename", rel_path.split("/")[-1] if rel_path else "")
+                    suffix = Path(filename).suffix.lower() if filename else ""
+
+                    # Try to read text content for embedding
+                    content_block = ""
+                    if rel_path and parent_skill_name and suffix in _TEXT_CONTENT_SUFFIXES:
+                        try:
+                            abs_path = (settings.skills_path / parent_skill_name / rel_path).resolve()
+                            # Ensure path stays inside the skill directory
+                            skill_dir_check = (settings.skills_path / parent_skill_name).resolve()
+                            abs_path.relative_to(skill_dir_check)
+                            if abs_path.is_file():
+                                raw = abs_path.read_bytes()
+                                if len(raw) <= _MAX_INLINE_BYTES:
+                                    text = raw.decode("utf-8", errors="replace")
+                                    # Choose a fence that doesn't appear in the content.
+                                    # Prefer ``` but fall back to a tilde fence when the
+                                    # file itself contains triple-backtick sequences.
+                                    if "```" not in text:
+                                        fence, content_text = "```", text
+                                    else:
+                                        fence = "~~~~"
+                                        content_text = text.replace("~~~~", "~ ~ ~ ~")
+                                    content_block = (
+                                        f"\n\n  文件内容如下：\n\n  {fence}\n{content_text}\n  {fence}"
+                                    )
+                        except Exception:
+                            pass  # fall back to path-only if read fails
+
+                    if content_block:
+                        file_sections.append(
+                            f"- `{rel_path}`（文件名：`{filename}`）{content_block}"
+                        )
+                    else:
+                        # Strip the leading "inputs/" component so the script only needs
+                        # os.path.join(INPUT_DIR, remaining) — INPUT_DIR points to inputs/.
+                        try:
+                            _rel_path_obj = Path(rel_path)
+                            # Use parts[0] to avoid Windows backslash ambiguity.
+                            if _rel_path_obj.parts and _rel_path_obj.parts[0] == "inputs":
+                                rel_to_input_dir = Path(*_rel_path_obj.parts[1:]).as_posix()
+                            else:
+                                rel_to_input_dir = rel_path
+                        except (ValueError, IndexError):
+                            rel_to_input_dir = rel_path
+                        file_sections.append(
+                            f"- `{rel_path}`（文件名：`{filename}`，"
+                            f"脚本可通过 `os.path.join(os.environ['INPUT_DIR'], '{rel_to_input_dir}')` 读取；"
+                            "或直接用 `os.environ['INPUT_SESSION_DIR']` 目录（该目录下包含本次会话所有上传文件）"
+                            "）"
+                        )
+
+                if file_sections:
+                    sections_text = "\n".join(file_sections)
+                    body_prompt = (
+                        body_prompt
+                        + "\n\n---\n\n"
+                        "## 当前对话已上传文件\n\n"
+                        "用户在本次对话中上传了以下文件，你必须以这些文件为输入进行分析或处理。\n"
+                        "- 对于文本/数据文件，内容已直接展示在下方，请直接阅读并回答。\n"
+                        "- 需要执行计算、统计、转换等操作时，可生成 Python 脚本并运行，"
+                        "脚本中使用 `os.environ['INPUT_SESSION_DIR']` 获取上传文件目录，"
+                        "使用 `os.environ['OUTPUT_DIR']` 输出结果文件。\n\n"
+                        f"{sections_text}\n"
+                    )
+
             should_skip_runtime_planner = (
                 skip_runtime_planner_before_confirmation
                 and require_action_confirmation
@@ -2791,7 +3089,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     }
                 )
 
-            final_messages.extend(_request_messages(request))
+            final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):

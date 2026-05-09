@@ -1,4 +1,5 @@
 import asyncio
+import re as _re
 import subprocess
 import sys as _sys
 from pathlib import Path as _Path
@@ -239,6 +240,66 @@ async def run_skill_script(skill_name: str, filename: str, request: RunScriptReq
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"脚本执行失败: {exc}") from exc
+
+
+_SANDBOX_INPUT_ALLOWED_SUFFIXES: frozenset[str] = frozenset({
+    ".txt", ".md", ".csv", ".tsv", ".json", ".jsonl",
+    ".yaml", ".yml", ".xml", ".html", ".htm",
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
+    ".zip", ".tar", ".gz", ".log",
+})
+
+
+@router.post("/{skill_name}/sandbox-inputs")
+async def upload_sandbox_input(
+    skill_name: str,
+    file: UploadFile = File(...),
+    session_id: str = Form("default"),
+):
+    """Upload an input file for a sandbox chat session.
+
+    Files are stored under skills/{skill_name}/inputs/{session_id}/.
+    Only common data/document file types are accepted (max 10 MB).
+    """
+    # Validate session_id (alphanumeric, hyphens, underscores only)
+    if not session_id or not _re.fullmatch(r"[a-zA-Z0-9_\-]{1,64}", session_id):
+        raise HTTPException(status_code=400, detail="session_id 格式非法")
+
+    if file.size is not None and file.size > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
+
+    data = await file.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
+
+    safe_name = _Path(file.filename or "upload").name
+    if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or len(safe_name) > 255:
+        raise HTTPException(status_code=400, detail="文件名非法")
+
+    suffix = _Path(safe_name).suffix.lower()
+    if suffix not in _SANDBOX_INPUT_ALLOWED_SUFFIXES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"不支持的文件类型 '{suffix}'，允许类型：{', '.join(sorted(_SANDBOX_INPUT_ALLOWED_SUFFIXES))}",
+        )
+
+    skill_dir = (settings.skills_path / skill_name).resolve()
+    if not skill_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+
+    target_dir = skill_dir / "inputs" / session_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / safe_name
+    dest.write_bytes(data)
+
+    rel = dest.relative_to(skill_dir)
+    return {
+        "path": rel.as_posix(),
+        "url": f"/api/skills/{skill_name}/files/{rel.as_posix()}",
+        "filename": safe_name,
+        "size": len(data),
+    }
 
 
 @router.get("/{skill_name}/outputs")

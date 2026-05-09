@@ -360,3 +360,42 @@ def test_extract_blocks_no_blocks():
 
     blocks = _extract_all_fenced_blocks("Just plain text.")
     assert blocks == []
+
+
+# ---------------------------------------------------------------------------
+# _is_within_sandbox — symlink escape guard
+# ---------------------------------------------------------------------------
+
+def test_is_within_sandbox_regular_file(tmp_path):
+    from backend.routers.chat import _is_within_sandbox
+
+    file = tmp_path / "scripts" / "run.py"
+    file.parent.mkdir()
+    file.write_text("pass")
+
+    assert _is_within_sandbox(file, tmp_path.resolve()) is True
+
+
+def test_is_within_sandbox_escape_rejected(tmp_path):
+    from backend.routers.chat import _is_within_sandbox
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    scripts = tmp_path / "skill" / "scripts"
+    scripts.mkdir(parents=True)
+    link = scripts / "evil.py"
+    link.symlink_to(outside)
+
+    sandbox = (tmp_path / "skill").resolve()
+    assert _is_within_sandbox(link, sandbox) is False
+
+
+def test_is_within_sandbox_nested_path_ok(tmp_path):
+    from backend.routers.chat import _is_within_sandbox
+
+    nested = tmp_path / "skill" / "scripts" / "sub" / "run.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("pass")
+
+    sandbox = (tmp_path / "skill").resolve()
+    assert _is_within_sandbox(nested, sandbox) is True

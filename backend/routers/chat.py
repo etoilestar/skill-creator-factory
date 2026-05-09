@@ -979,6 +979,19 @@ def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
     base_dir = base_dir or Path.cwd()
     return base_dir / path
 
+
+def _is_within_sandbox(entry: Path, sandbox_root: Path) -> bool:
+    """Return True only when *entry* resolves to a path inside *sandbox_root*.
+
+    Rejects symlinks that point outside the skill sandbox, preventing a
+    malicious skill from exposing files such as /etc/passwd via read_resource.
+    """
+    try:
+        entry.resolve().relative_to(sandbox_root)
+        return True
+    except ValueError:
+        return False
+
 def _looks_like_skill_resource_dir(path: Path) -> bool:
     return path.name in {"scripts", "references", "assets"}
 
@@ -1289,11 +1302,17 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
 
     # 文件系统兜底：扫描磁盘上真实存在的文件，补充正则未捕获的条目
     if execution_root is not None:
+        execution_root_resolved = execution_root.resolve()
         for subdir in ("scripts", "references", "assets"):
             scan_dir = execution_root / subdir
             if not scan_dir.is_dir():
                 continue
             for entry in sorted(scan_dir.iterdir()):
+                # Reject symlinks that escape the skill sandbox
+                try:
+                    entry.resolve().relative_to(execution_root_resolved)
+                except ValueError:
+                    continue
                 if entry.is_file():
                     _add_entry(f"{subdir}/{entry.name}")
 
@@ -1743,10 +1762,13 @@ async def _run_skill_runtime_planner_round(
     if execution_root is not None:
         scripts_dir = execution_root / "scripts"
         if scripts_dir.is_dir():
+            execution_root_resolved = execution_root.resolve()
             available_scripts = sorted(
                 "scripts/" + entry.name
                 for entry in scripts_dir.iterdir()
                 if entry.is_file()
+                # Reject symlinks that escape the skill sandbox
+                and _is_within_sandbox(entry, execution_root_resolved)
             )
 
     planner_payload = {

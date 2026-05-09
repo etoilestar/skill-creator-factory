@@ -8,6 +8,7 @@ import logging
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -566,6 +567,45 @@ def _friendly_error(exc: Exception) -> str:
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _thought(step: str, label: str, detail: str, data: dict | None = None) -> str:
+    """Build a 'thought' SSE event that carries internal decision/execution data.
+
+    step values:
+      metadata_decision | body_loaded | child_decision | resource_selection |
+      planner_output | action_start | action_result | final_answer
+    """
+    return _sse({
+        "thought": {
+            "step": step,
+            "label": label,
+            "detail": detail,
+            "data": data or {},
+            "ts": time.time(),
+        }
+    })
+
+
+def _expand_arg_env_vars(arg: str, env: dict) -> str:
+    """Expand shell-style $VAR / ${VAR} references in a single command argument.
+
+    Uses the supplied *env* dict rather than the live process environment so
+    that values injected by the skill runtime (OUTPUT_DIR, INPUT_DIR, …) are
+    always honoured even when subprocess uses shell=False.
+    """
+    if "$" not in arg:
+        return arg
+    result = arg
+    # Replace ${VAR} first — unambiguous because of the braces.
+    for var, val in env.items():
+        result = result.replace(f"${{{var}}}", val)
+    # Replace bare $VAR in decreasing name-length order so that a
+    # shorter name that is a prefix of a longer one (e.g. INPUT_DIR
+    # vs INPUT_SESSION_DIR) never clobbers the longer match.
+    for var in sorted(env, key=len, reverse=True):
+        result = result.replace(f"${var}", env[var])
+    return result
 
 
 def _request_messages(request: ChatRequest) -> list[dict]:
@@ -2344,6 +2384,258 @@ def _safe_command_argv(command: str, *, base_dir: Path | None = None) -> list[st
 
     return argv
 
+def _execute_single_task(
+    task: dict,
+    blocks: "list[MarkdownBlock]",
+    request: "ChatRequest",
+    *,
+    execution_root: "Path | None" = None,
+    inferred_skill_root: "Path | None" = None,
+    skill_name: str = "",
+    session_input_dir: "Path | None" = None,
+) -> "tuple[dict, list[Path]]":
+    """Execute a single planned action task and return (result_dict, touched_paths).
+
+    This is the per-task workhorse extracted from _execute_planned_actions so
+    that callers (including the streaming execute loop in generate()) can run
+    tasks one-at-a-time and observe results in real time.
+
+    Returns:
+        (result, touched) where *result* is the action result dict and
+        *touched* is a (possibly empty) list of Path objects that were
+        created or written during this task (used for post-loop validation).
+    """
+    if not isinstance(task, dict):
+        return {}, []
+
+    action = str(task.get("action") or "").strip()
+    reason = str(task.get("reason") or "").strip()
+    touched: list[Path] = []
+
+    if action in {"display", "ignore"}:
+        return {"action": action, "success": True, "reason": reason}, touched
+
+    if action == "read_resource":
+        rel_path = str(task.get("path") or "").strip()
+        if not rel_path:
+            raise ValueError("read_resource 任务缺少 path")
+        if not skill_name:
+            raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+        observation = read_skill_resource_text(
+            skill_name, rel_path, max_chars=settings.skill_resource_max_chars
+        )
+        return {
+            "action": action,
+            "path": rel_path,
+            "success": True,
+            "content": observation.get("content", ""),
+            "truncated": observation.get("truncated", False),
+            "reason": reason,
+        }, touched
+
+    if action == "create_directory":
+        raw_path = str(task.get("path") or "").strip()
+        if not raw_path:
+            raise ValueError("create_directory 任务缺少 path")
+        path = _resolve_planned_file_path(
+            raw_path,
+            execution_root=execution_root,
+            inferred_skill_root=inferred_skill_root,
+        )
+        path.mkdir(parents=True, exist_ok=True)
+        touched.append(path)
+        return {"action": action, "path": str(path), "success": True, "reason": reason}, touched
+
+    if action == "write_file":
+        raw_path = str(task.get("path") or "").strip()
+        if not raw_path:
+            raise ValueError("write_file 任务缺少 path")
+        content = task.get("content", None)
+        if content is None:
+            block_index = int(task.get("block_index", -1))
+            if 0 <= block_index < len(blocks):
+                content = blocks[block_index].code
+            else:
+                raise ValueError("write_file 任务缺少 content，且没有合法 block_index")
+        path = _resolve_planned_file_path(
+            raw_path,
+            execution_root=execution_root,
+            inferred_skill_root=inferred_skill_root,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content), encoding="utf-8")
+        touched.append(path)
+        return {
+            "action": action,
+            "path": str(path),
+            "success": True,
+            "bytes": len(str(content).encode("utf-8")),
+            "reason": reason,
+        }, touched
+
+    if action == "run_command":
+        command = str(task.get("command") or "").strip()
+        if not command:
+            raise ValueError("run_command 任务缺少 command")
+
+        stdin_text = task.get("stdin", None)
+        if stdin_text is not None:
+            stdin_text = str(stdin_text)
+
+        cwd = execution_root or inferred_skill_root
+
+        # Per-task snapshot taken *before* execution to detect new output files.
+        pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
+
+        materialized = _materialize_python_heredoc(command)
+        if materialized is not None:
+            argv = materialized
+            argv = _prepare_command_argv(
+                " ".join(shlex.quote(part) for part in argv), base_dir=cwd
+            )
+        else:
+            argv = _prepare_command_argv(command, base_dir=cwd)
+
+        argv = _rewrite_argv_input_paths(
+            argv,
+            getattr(request, "input_files", []) or [],
+            cwd,
+            session_input_dir,
+        )
+
+        _run_cmd_extra_env: dict[str, str] = {
+            "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
+            "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+        }
+        if session_input_dir is not None:
+            _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(session_input_dir)
+
+        _effective_env = {**os.environ, **_run_cmd_extra_env}
+        argv = [_expand_arg_env_vars(arg, _effective_env) for arg in argv]
+
+        # Error-driven retry: up to _MAX_DEP_RETRY times for missing deps.
+        completed = None
+        for _retry in range(_MAX_DEP_RETRY + 1):
+            try:
+                completed = subprocess.run(
+                    argv,
+                    shell=False,
+                    input=stdin_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=settings.skill_command_timeout,
+                    cwd=str(cwd) if cwd else None,
+                    env={**os.environ, **_run_cmd_extra_env},
+                )
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    "命令不可执行: " + command + "\n原因: " + str(exc)
+                ) from exc
+            except PermissionError as exc:
+                raise ValueError(
+                    "命令没有执行权限: " + command + "\n原因: " + str(exc)
+                ) from exc
+
+            if completed.returncode == 0 or _retry == _MAX_DEP_RETRY:
+                break
+
+            stderr = completed.stderr or ""
+            retried = False
+
+            py_missing = re.search(
+                r"ModuleNotFoundError: No module named '([^']+)'", stderr
+            )
+            if py_missing and cwd is not None:
+                module_name = py_missing.group(1).split(".")[0]
+                try:
+                    venv_python = _get_skill_venv_python(cwd)
+                    if _retry_install_python_dep(module_name, venv_python):
+                        retried = True
+                except Exception as dep_exc:
+                    logger.warning(
+                        "skill-env: error-driven py dep install failed: %s", dep_exc
+                    )
+
+            node_missing = re.search(r"Cannot find module '([^']+)'", stderr)
+            if node_missing and cwd is not None:
+                raw_mod = node_missing.group(1)
+                if raw_mod.startswith("@"):
+                    parts = raw_mod.split("/")
+                    module_name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                else:
+                    module_name = raw_mod.split("/")[0]
+                if module_name not in _NODE_BUILTIN_MODULES:
+                    if _retry_install_node_dep(module_name, cwd):
+                        retried = True
+
+            if not retried and cwd is not None:
+                chinese_missing = re.search(
+                    r"缺少依赖[:：]\s*([^\n]+)",
+                    (completed.stdout or "") + "\n" + stderr,
+                )
+                if chinese_missing:
+                    raw_deps = chinese_missing.group(1)
+                    pkg_list = [
+                        p.strip()
+                        for p in re.split(r"[,，、;；]\s*", raw_deps)
+                        if p.strip()
+                    ]
+                    for dep in pkg_list:
+                        if dep in _NODE_BUILTIN_MODULES:
+                            continue
+                        if (
+                            dep.endswith(".js")
+                            or (cwd / "node_modules").is_dir()
+                            or shutil.which("node")
+                        ):
+                            if _retry_install_node_dep(dep, cwd):
+                                retried = True
+                        else:
+                            try:
+                                venv_python = _get_skill_venv_python(cwd)
+                                if _retry_install_python_dep(dep, venv_python):
+                                    retried = True
+                            except Exception as dep_exc:
+                                logger.warning(
+                                    "skill-env: chinese dep install failed: %s", dep_exc
+                                )
+
+            if not retried:
+                break
+
+        assert completed is not None  # noqa: S101 — loop always runs at least once
+        success = completed.returncode == 0
+
+        result: dict = {
+            "action": action,
+            "command": command,
+            "stdin_used": stdin_text is not None,
+            "success": success,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "reason": reason,
+        }
+
+        # Detect newly created files and attach download metadata.
+        effective_skill_name = skill_name or (cwd.name if cwd else "")
+        if success and cwd and effective_skill_name:
+            post_snapshot = _snapshot_dir_files(cwd)
+            new_files = sorted(post_snapshot - pre_snapshot)
+            if new_files:
+                result["output_files"] = [
+                    {
+                        "path": f,
+                        "url": f"/api/skills/{effective_skill_name}/files/{f}",
+                    }
+                    for f in new_files
+                ]
+
+        return result, touched
+
+    raise ValueError(f"不支持的规划动作: {action}")
+
+
 def _execute_planned_actions(
     plan: dict,
     blocks: list[MarkdownBlock],
@@ -2368,8 +2660,11 @@ def _execute_planned_actions(
         execution_root=execution_root,
     )
 
-    # Pre-compute the session-specific input directory once for all run_command tasks.
-    _session_input_dir: "Path | None" = None
+    # Pre-compute session input dir once (used for all run_command tasks).
+    cwd_for_session = execution_root or inferred_skill_root
+    session_input_dir = _extract_input_session_dir(
+        getattr(request, "input_files", []) or [], cwd_for_session
+    )
 
     touched: list[Path] = []
     results: list[dict] = []
@@ -2380,307 +2675,48 @@ def _execute_planned_actions(
             continue
 
         action = str(task.get("action") or "").strip()
-        reason = str(task.get("reason") or "").strip()
 
-        if action in {"display", "ignore"}:
-            results.append({
-                "action": action,
-                "success": True,
-                "reason": reason,
-            })
-            continue
+        result, task_touched = _execute_single_task(
+            task,
+            blocks,
+            request,
+            execution_root=execution_root,
+            inferred_skill_root=inferred_skill_root,
+            skill_name=skill_name,
+            session_input_dir=session_input_dir,
+        )
 
+        touched.extend(task_touched)
+        results.append(result)
+
+        # Build logs from the result dict.
         if action == "read_resource":
-            rel_path = str(task.get("path") or "").strip()
-            if not rel_path:
-                raise ValueError("read_resource 任务缺少 path")
-
-            if not skill_name:
-                raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
-
-            observation = read_skill_resource_text(
-                skill_name,
-                rel_path,
-                max_chars=settings.skill_resource_max_chars,
-            )
-
-            result = {
-                "action": action,
-                "path": rel_path,
-                "success": True,
-                "content": observation.get("content", ""),
-                "truncated": observation.get("truncated", False),
-                "reason": reason,
-            }
-
-            results.append(result)
-            logs.append(f"读取资源成功: {rel_path}")
-            continue
-
-        if action == "create_directory":
-            raw_path = str(task.get("path") or "").strip()
-            if not raw_path:
-                raise ValueError("create_directory 任务缺少 path")
-
-            path = _resolve_planned_file_path(
-                raw_path,
-                execution_root=execution_root,
-                inferred_skill_root=inferred_skill_root,
-            )
-            path.mkdir(parents=True, exist_ok=True)
-
-            touched.append(path)
-            results.append({
-                "action": action,
-                "path": str(path),
-                "success": True,
-                "reason": reason,
-            })
-            logs.append(f"创建目录: {path}")
-            continue
-
-        if action == "write_file":
-            raw_path = str(task.get("path") or "").strip()
-            if not raw_path:
-                raise ValueError("write_file 任务缺少 path")
-
-            content = task.get("content", None)
-
-            if content is None:
-                block_index = int(task.get("block_index", -1))
-                if 0 <= block_index < len(blocks):
-                    content = blocks[block_index].code
-                else:
-                    raise ValueError("write_file 任务缺少 content，且没有合法 block_index")
-
-            path = _resolve_planned_file_path(
-                raw_path,
-                execution_root=execution_root,
-                inferred_skill_root=inferred_skill_root,
-            )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(content), encoding="utf-8")
-
-            touched.append(path)
-            results.append({
-                "action": action,
-                "path": str(path),
-                "success": True,
-                "bytes": len(str(content).encode("utf-8")),
-                "reason": reason,
-            })
-            logs.append(f"写入文件: {path}")
-            continue
-
-        if action == "run_command":
+            logs.append(f"读取资源成功: {result.get('path')}")
+        elif action == "create_directory":
+            logs.append(f"创建目录: {result.get('path')}")
+        elif action == "write_file":
+            logs.append(f"写入文件: {result.get('path')}")
+        elif action == "run_command":
             command = str(task.get("command") or "").strip()
-            if not command:
-                raise ValueError("run_command 任务缺少 command")
-
-            stdin_text = task.get("stdin", None)
-            if stdin_text is not None:
-                stdin_text = str(stdin_text)
-
-            cwd = execution_root or inferred_skill_root
-
-            # Resolve session input directory once (lazy) for this run_command task.
-            if _session_input_dir is None:
-                _session_input_dir = _extract_input_session_dir(
-                    getattr(request, "input_files", []) or [], cwd
+            stdin_used = result.get("stdin_used", False)
+            if result.get("output_files"):
+                logs.append(
+                    "新生成文件: " + ", ".join(f["path"] for f in result["output_files"])
                 )
-
-            # 执行前快照，用于后续检测新生成的文件
-            pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
-
-            materialized = _materialize_python_heredoc(command)
-            if materialized is not None:
-                argv = materialized
-                # heredoc 会生成临时脚本，但 python/python3 本身也需要可执行。
-                argv = _prepare_command_argv(" ".join(shlex.quote(part) for part in argv), base_dir=cwd)
-            else:
-                argv = _prepare_command_argv(command, base_dir=cwd)
-
-            # Rewrite argv elements that reference uploaded files using legacy
-            # path conventions (e.g. uploads/<name>) to their real absolute paths.
-            argv = _rewrite_argv_input_paths(
-                argv,
-                getattr(request, "input_files", []) or [],
-                cwd,
-                _session_input_dir,
-            )
-
-            _run_cmd_extra_env: dict[str, str] = {
-                "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
-                "INPUT_DIR": str(cwd / "inputs") if cwd else "",
-            }
-            if _session_input_dir is not None:
-                _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(_session_input_dir)
-
-            # Expand shell-style env vars ($VAR / ${VAR}) in argv using the
-            # combined environment (subprocess uses shell=False so the shell
-            # never performs this expansion itself).
-            _effective_env = {**os.environ, **_run_cmd_extra_env}
-
-            def _expand_with_env(arg: str, env: dict) -> str:
-                if "$" not in arg:
-                    return arg
-                result = arg
-                # Replace ${VAR} first — unambiguous because of the braces.
-                for var, val in env.items():
-                    result = result.replace(f"${{{var}}}", val)
-                # Replace bare $VAR in decreasing name-length order so that a
-                # shorter name that is a prefix of a longer one (e.g. INPUT_DIR
-                # vs INPUT_SESSION_DIR) never clobbers the longer match.
-                for var in sorted(env, key=len, reverse=True):
-                    result = result.replace(f"${var}", env[var])
-                return result
-
-            argv = [_expand_with_env(arg, _effective_env) for arg in argv]
-
-            # 错误驱动重试：最多重试 _MAX_DEP_RETRY 次（仅针对缺少依赖的错误）
-            completed = None
-            for _retry in range(_MAX_DEP_RETRY + 1):
-                try:
-                    completed = subprocess.run(
-                        argv,
-                        shell=False,
-                        input=stdin_text,
-                        capture_output=True,
-                        text=True,
-                        timeout=settings.skill_command_timeout,
-                        cwd=str(cwd) if cwd else None,
-                        env={**os.environ, **_run_cmd_extra_env},
-                    )
-                except FileNotFoundError as exc:
-                    raise ValueError(
-                        "命令不可执行: "
-                        + command
-                        + "\n原因: "
-                        + str(exc)
-                    ) from exc
-                except PermissionError as exc:
-                    raise ValueError(
-                        "命令没有执行权限: "
-                        + command
-                        + "\n原因: "
-                        + str(exc)
-                    ) from exc
-
-                if completed.returncode == 0 or _retry == _MAX_DEP_RETRY:
-                    break
-
-                # 尝试从 stderr 中识别缺失依赖并安装，然后重试
-                stderr = completed.stderr or ""
-                retried = False
-
-                # Python: ModuleNotFoundError: No module named 'xxx'
-                py_missing = re.search(
-                    r"ModuleNotFoundError: No module named '([^']+)'", stderr
-                )
-                if py_missing and cwd is not None:
-                    module_name = py_missing.group(1).split(".")[0]
-                    try:
-                        venv_python = _get_skill_venv_python(cwd)
-                        if _retry_install_python_dep(module_name, venv_python):
-                            retried = True
-                    except Exception as dep_exc:
-                        logger.warning("skill-env: error-driven py dep install failed: %s", dep_exc)
-
-                # Node.js: Cannot find module 'xxx'
-                node_missing = re.search(r"Cannot find module '([^']+)'", stderr)
-                if node_missing and cwd is not None:
-                    raw_mod = node_missing.group(1)
-                    if raw_mod.startswith("@"):
-                        parts = raw_mod.split("/")
-                        module_name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
-                    else:
-                        module_name = raw_mod.split("/")[0]
-                    if module_name not in _NODE_BUILTIN_MODULES:
-                        if _retry_install_node_dep(module_name, cwd):
-                            retried = True
-
-                # Skill 自定义中文错误格式：缺少依赖: pkg1, pkg2
-                if not retried and cwd is not None:
-                    chinese_missing = re.search(
-                        r"缺少依赖[:：]\s*([^\n]+)", (completed.stdout or "") + "\n" + stderr
-                    )
-                    if chinese_missing:
-                        raw_deps = chinese_missing.group(1)
-                        pkg_list = [p.strip() for p in re.split(r"[,，、;；]\s*", raw_deps) if p.strip()]
-                        for dep in pkg_list:
-                            if dep in _NODE_BUILTIN_MODULES:
-                                continue
-                            # Decide whether it looks like a Node or Python package and install accordingly
-                            if dep.endswith(".js") or (cwd / "node_modules").is_dir() or shutil.which("node"):
-                                if _retry_install_node_dep(dep, cwd):
-                                    retried = True
-                            else:
-                                try:
-                                    venv_python = _get_skill_venv_python(cwd)
-                                    if _retry_install_python_dep(dep, venv_python):
-                                        retried = True
-                                except Exception as dep_exc:
-                                    logger.warning("skill-env: chinese dep install failed: %s", dep_exc)
-
-                if not retried:
-                    break  # 无法识别缺失依赖，停止重试
-
-            assert completed is not None  # noqa: S101 — loop always runs at least once
-            success = completed.returncode == 0
-
-            result = {
-                "action": action,
-                "command": command,
-                "stdin_used": stdin_text is not None,
-                "success": success,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout,
-                "stderr": completed.stderr,
-                "reason": reason,
-            }
-
-            # 执行成功后：检测新生成的文件，附加下载链接
-            effective_skill_name = skill_name or (cwd.name if cwd else "")
-            if success and cwd and effective_skill_name:
-                post_snapshot = _snapshot_dir_files(cwd)
-                new_files = sorted(post_snapshot - pre_snapshot)
-                if new_files:
-                    result["output_files"] = [
-                        {
-                            "path": f,
-                            "url": f"/api/skills/{effective_skill_name}/files/{f}",
-                        }
-                        for f in new_files
-                    ]
-                    logs.append(
-                        "新生成文件: "
-                        + ", ".join(new_files)
-                    )
-
-            results.append(result)
-
-            if not success:
+            if not result.get("success", True):
                 logs.append(
                     f"执行命令失败: {command}\n"
-                    f"returncode={completed.returncode}\n"
-                    f"stdin_used={stdin_text is not None}\n"
-                    f"stderr: {(completed.stderr or '').strip()}\n"
-                    f"stdout: {(completed.stdout or '').strip()}"
+                    f"returncode={result.get('returncode')}\n"
+                    f"stdin_used={stdin_used}\n"
+                    f"stderr: {(result.get('stderr') or '').strip()}\n"
+                    f"stdout: {(result.get('stdout') or '').strip()}"
                 )
-                # Don't raise — accumulate the failure in results so that
-                # _generate_final_answer_from_observation can explain it to the user.
-                # Raising here would bypass the final-answer round and expose a raw
-                # error traceback instead of a helpful message.
-                continue
-
-            logs.append(
-                f"执行命令成功: {command}\n"
-                f"stdin_used={stdin_text is not None}\n"
-                f"输出: {completed.stdout.strip()}"
-            )
-            continue
-
-        raise ValueError(f"不支持的规划动作: {action}")
+            else:
+                logs.append(
+                    f"执行命令成功: {command}\n"
+                    f"stdin_used={stdin_used}\n"
+                    f"输出: {(result.get('stdout') or '').strip()}"
+                )
 
     validation_logs: list[str] = []
 
@@ -2870,6 +2906,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     request=request,
                     model=model,
                 )
+                yield _thought(
+                    "metadata_decision",
+                    "分析匹配度",
+                    f"{'需要加载正文' if need_body else '请求与 Skill 不匹配，跳过正文'}",
+                    {
+                        "need_body": need_body,
+                        "metadata_chars": len(skill_context.get("metadata_prompt", "")),
+                    },
+                )
 
             if not need_body:
                 yield _sse({"status": None})
@@ -2892,6 +2937,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
+            yield _thought(
+                "body_loaded",
+                "加载 SKILL.md",
+                f"正文已加载，共 {len(body_prompt)} 字符",
+                {
+                    "body_chars": len(body_prompt),
+                    "skill_name": parent_skill_name,
+                },
+            )
 
             if child_body_loader:
                 yield _sse({"status": {"phase": "loading_child", "message": "检查子 Skill…"}})
@@ -2899,6 +2953,20 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     parent_metadata_prompt=skill_context["metadata_prompt"],
                     request=request,
                     model=model,
+                )
+                yield _thought(
+                    "child_decision",
+                    "子 Skill 检查",
+                    (
+                        f"加载子 Skill：{child_decision.get('child_ref')}"
+                        if child_decision.get("need_child")
+                        else f"无需子 Skill：{child_decision.get('reason', '')}"
+                    ),
+                    {
+                        "need_child": child_decision.get("need_child"),
+                        "child_ref": child_decision.get("child_ref", ""),
+                        "reason": child_decision.get("reason", ""),
+                    },
                 )
 
                 if child_decision.get("need_child"):
@@ -2938,6 +3006,21 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     request=request,
                     model=model,
                     resource_catalog=resource_catalog,
+                )
+                yield _thought(
+                    "resource_selection",
+                    "资源选择",
+                    (
+                        f"加载 {len(resource_decision.get('resource_handles', []))} 个资源：{', '.join(resource_decision.get('resource_handles', []))}"
+                        if resource_decision.get("need_resources")
+                        else f"无需加载额外资源：{resource_decision.get('reason', '')}"
+                    ),
+                    {
+                        "need_resources": resource_decision.get("need_resources"),
+                        "resource_handles": resource_decision.get("resource_handles", []),
+                        "catalog_size": len(resource_catalog),
+                        "reason": resource_decision.get("reason", ""),
+                    },
                 )
 
                 if resource_decision.get("need_resources"):
@@ -3049,36 +3132,163 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
                     mode = runtime_plan.get("mode")
+                    tasks = runtime_plan.get("tasks") or []
 
-                    if mode == "execute" and runtime_plan.get("tasks"):
-                        # Announce each planned task so the user sees what will run.
-                        for task in runtime_plan.get("tasks", []):
+                    # Emit planner_output thought with safe task summaries (no SKILL.md content).
+                    yield _thought(
+                        "planner_output",
+                        "规划结果",
+                        f"模式：{mode}，共 {len(tasks)} 个动作",
+                        {
+                            "mode": mode,
+                            "task_count": len(tasks),
+                            "tasks": [
+                                {
+                                    "action": t.get("action"),
+                                    "command": (str(t.get("command") or ""))[:120] or None,
+                                    "path": t.get("path") or t.get("resource_handle") or None,
+                                    "reason": (str(t.get("reason") or ""))[:200],
+                                }
+                                for t in tasks
+                            ],
+                            "errors": runtime_plan.get("errors") or [],
+                            "missing": runtime_plan.get("missing") or [],
+                        },
+                    )
+
+                    if mode == "execute" and tasks:
+                        # Set up shared execution context for the per-task loop.
+                        _exec_inferred_root = _infer_skill_root_from_tasks(
+                            runtime_plan, execution_root=execution_root
+                        )
+                        _exec_cwd = execution_root or _exec_inferred_root
+                        _exec_session_dir = _extract_input_session_dir(
+                            getattr(request, "input_files", []) or [], _exec_cwd
+                        )
+
+                        _exec_all_results: list[dict] = []
+                        _exec_all_touched: list[Path] = []
+
+                        # Execute tasks one at a time so the frontend receives
+                        # real-time thought events after each task completes.
+                        for task in tasks:
                             task_action = str(task.get("action") or "").strip()
+
+                            # Announce what is about to happen.
                             if task_action == "run_command":
                                 cmd = str(task.get("command") or "")
-                                short_cmd = cmd[:_MAX_CMD_DISPLAY_LENGTH] + ("…" if len(cmd) > _MAX_CMD_DISPLAY_LENGTH else "")
+                                short_cmd = cmd[:_MAX_CMD_DISPLAY_LENGTH] + (
+                                    "…" if len(cmd) > _MAX_CMD_DISPLAY_LENGTH else ""
+                                )
                                 yield _sse({"status": {"phase": "executing", "message": f"执行命令：{short_cmd}"}})
+                                yield _thought(
+                                    "action_start",
+                                    "执行命令",
+                                    short_cmd,
+                                    {"action": "run_command", "command": cmd[:200]},
+                                )
                             elif task_action == "read_resource":
-                                path = str(task.get("path") or task.get("resource_handle") or "")
-                                yield _sse({"status": {"phase": "reading", "message": f"读取资源：{path}"}})
+                                res_path = str(task.get("path") or task.get("resource_handle") or "")
+                                yield _sse({"status": {"phase": "reading", "message": f"读取资源：{res_path}"}})
+                                yield _thought(
+                                    "action_start",
+                                    "读取资源",
+                                    res_path,
+                                    {"action": "read_resource", "path": res_path},
+                                )
                             elif task_action == "write_file":
-                                path = str(task.get("path") or "")
-                                yield _sse({"status": {"phase": "writing", "message": f"写入文件：{path}"}})
+                                wf_path = str(task.get("path") or "")
+                                yield _sse({"status": {"phase": "writing", "message": f"写入文件：{wf_path}"}})
+                                yield _thought(
+                                    "action_start",
+                                    "写入文件",
+                                    wf_path,
+                                    {"action": "write_file", "path": wf_path},
+                                )
                             elif task_action == "create_directory":
-                                path = str(task.get("path") or "")
-                                yield _sse({"status": {"phase": "creating", "message": f"创建目录：{path}"}})
+                                cd_path = str(task.get("path") or "")
+                                yield _sse({"status": {"phase": "creating", "message": f"创建目录：{cd_path}"}})
+                                yield _thought(
+                                    "action_start",
+                                    "创建目录",
+                                    cd_path,
+                                    {"action": "create_directory", "path": cd_path},
+                                )
+                            else:
+                                yield _thought(
+                                    "action_start",
+                                    "执行动作",
+                                    task_action,
+                                    {"action": task_action},
+                                )
 
-                        exec_result = await asyncio.to_thread(
-                            functools.partial(
-                                _execute_planned_actions,
-                                runtime_plan,
-                                [],
-                                request,
-                                require_confirmation=require_action_confirmation,
-                                execution_root=execution_root,
-                                skill_name=parent_skill_name,
+                            # Run the task in a thread and capture the result.
+                            task_result, task_touched = await asyncio.to_thread(
+                                functools.partial(
+                                    _execute_single_task,
+                                    task,
+                                    [],
+                                    request,
+                                    execution_root=execution_root,
+                                    inferred_skill_root=_exec_inferred_root,
+                                    skill_name=parent_skill_name,
+                                    session_input_dir=_exec_session_dir,
+                                )
                             )
-                        )
+                            _exec_all_results.append(task_result)
+                            _exec_all_touched.extend(task_touched)
+
+                            # Build safe result data for the thought (truncate stdout/stderr).
+                            _safe_result = {
+                                k: (v[:1000] if isinstance(v, str) else v)
+                                for k, v in task_result.items()
+                                if k not in {"content"}  # omit large resource content
+                            }
+
+                            success_flag = task_result.get("success", True)
+                            if task_action == "run_command":
+                                rc = task_result.get("returncode", 0)
+                                yield _thought(
+                                    "action_result",
+                                    "执行结果",
+                                    f"{'成功' if success_flag else '失败'} exit={rc}",
+                                    _safe_result,
+                                )
+                            elif task_action == "read_resource":
+                                yield _thought(
+                                    "action_result",
+                                    "读取结果",
+                                    f"{'成功' if success_flag else '失败'}，"
+                                    f"{len(task_result.get('content', ''))} 字符",
+                                    _safe_result,
+                                )
+                            else:
+                                yield _thought(
+                                    "action_result",
+                                    "操作结果",
+                                    f"{'成功' if success_flag else '失败'}",
+                                    _safe_result,
+                                )
+
+                        # Post-loop: validate any newly created Skill roots.
+                        for root in _find_created_skill_roots(_exec_all_touched):
+                            skill_md = root / "SKILL.md"
+                            if skill_md.exists():
+                                _validate_skill_md(skill_md)
+
+                        # Assemble exec_result compatible with _generate_final_answer_from_observation.
+                        _exec_all_output_files: list[dict] = []
+                        for r in _exec_all_results:
+                            _exec_all_output_files.extend(r.get("output_files") or [])
+
+                        exec_result = {
+                            "executed": True,
+                            "reason": "已根据结构化 action plan 逐任务执行。",
+                            "plan": runtime_plan,
+                            "results": _exec_all_results,
+                            "logs": [],
+                            "output_files": _exec_all_output_files,
+                        }
 
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
                         final_answer = await _generate_final_answer_from_observation(
@@ -3088,20 +3298,29 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             plan=runtime_plan,
                             execution_result=exec_result,
                         )
+                        yield _thought(
+                            "final_answer",
+                            "生成回答",
+                            f"共 {len(final_answer)} 字符，包含 {len(_exec_all_output_files)} 个输出文件",
+                            {
+                                "answer_chars": len(final_answer),
+                                "has_output_files": bool(_exec_all_output_files),
+                                "output_file_count": len(_exec_all_output_files),
+                            },
+                        )
 
                         yield _sse({"status": None})
 
                         # Emit structured output_files event so the frontend can
                         # render download links without relying on LLM text parsing.
-                        output_files = exec_result.get("output_files") or []
-                        if output_files:
+                        if _exec_all_output_files:
                             yield _sse({
                                 "action_result": {
                                     "action": "output_files",
                                     "name": parent_skill_name,
                                     "success": True,
-                                    "message": f"生成了 {len(output_files)} 个文件",
-                                    "output_files": output_files,
+                                    "message": f"生成了 {len(_exec_all_output_files)} 个文件",
+                                    "output_files": _exec_all_output_files,
                                 }
                             })
 

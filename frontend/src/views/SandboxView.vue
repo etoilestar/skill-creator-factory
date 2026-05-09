@@ -15,6 +15,15 @@
       <button class="btn-ghost" @click="resetChat" :disabled="streaming || !selectedSkill">
         重置对话
       </button>
+      <button
+        v-if="selectedSkill"
+        class="btn-ghost btn-thoughts"
+        :class="{ active: showThoughts }"
+        @click="showThoughts = !showThoughts"
+        title="显示/隐藏执行过程面板"
+      >
+        🔍 执行过程{{ thoughts.length ? ` (${thoughts.length})` : '' }}
+      </button>
     </div>
 
     <div v-if="!selectedSkill" class="empty muted">
@@ -22,123 +31,139 @@
     </div>
 
     <template v-else>
-      <div class="messages" ref="messagesEl">
-        <div v-if="messages.length === 0" class="empty muted">
-          <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
-          <p>向它发送消息，测试它的行为。</p>
-        </div>
-        <template v-for="(msg, i) in messages" :key="i">
-          <!-- action result card -->
-          <div
-            v-if="msg.role === 'system'"
-            class="action-card"
-            :class="msg.success ? 'ok' : 'fail'"
-            :aria-label="msg.success ? '操作成功' : '操作失败'"
-          >
-            <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
-            <span class="action-label">{{ actionLabel(msg.action) }}</span>
-            <span class="action-name">{{ msg.name }}</span>
-            <span class="action-msg">{{ msg.message }}</span>
-            <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
-            <pre v-if="msg.stdout" class="action-output">{{ msg.stdout }}</pre>
-            <pre v-if="msg.stderr" class="action-stderr">{{ msg.stderr }}</pre>
-            <div v-if="msg.output_files && msg.output_files.length" class="action-files">
-              <span class="action-files-label">📥 生成文件：</span>
+      <div class="content-area">
+        <!-- Main chat column -->
+        <div class="messages-column">
+          <div class="messages" ref="messagesEl">
+            <div v-if="messages.length === 0" class="empty muted">
+              <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
+              <p>向它发送消息，测试它的行为。</p>
+            </div>
+            <template v-for="(msg, i) in messages" :key="i">
+              <!-- action result card -->
+              <div
+                v-if="msg.role === 'system'"
+                class="action-card"
+                :class="msg.success ? 'ok' : 'fail'"
+                :aria-label="msg.success ? '操作成功' : '操作失败'"
+              >
+                <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
+                <span class="action-label">{{ actionLabel(msg.action) }}</span>
+                <span class="action-name">{{ msg.name }}</span>
+                <span class="action-msg">{{ msg.message }}</span>
+                <span v-if="msg.path" class="action-path">{{ msg.path }}</span>
+                <pre v-if="msg.stdout" class="action-output">{{ msg.stdout }}</pre>
+                <pre v-if="msg.stderr" class="action-stderr">{{ msg.stderr }}</pre>
+                <div v-if="msg.output_files && msg.output_files.length" class="action-files">
+                  <span class="action-files-label">📥 生成文件：</span>
+                  <a
+                    v-for="f in msg.output_files"
+                    :key="f.url"
+                    :href="f.url"
+                    :download="fileBasename(f)"
+                    class="action-file-link"
+                  >📄 {{ fileBasename(f) }}</a>
+                </div>
+              </div>
+              <!-- regular chat bubble -->
+              <div
+                v-else
+                class="message"
+                :class="msg.role"
+              >
+                <div class="bubble">
+                  <ChatBubble :content="msg.content" />
+                </div>
+              </div>
+            </template>
+            <div v-if="currentStatus" class="status-bar" :class="`phase-${currentStatus.phase}`"
+                 role="status" aria-live="polite">
+              <span class="status-spinner" aria-hidden="true"></span>
+              <span class="status-message">{{ currentStatus.message }}</span>
+            </div>
+            <div v-if="streaming" class="message assistant">
+              <div class="bubble">
+                <ChatBubble :content="streamBuffer" :streaming="true" />
+              </div>
+            </div>
+          </div>
+
+          <div class="input-area">
+            <!-- 本轮生成文件固定展示栏 -->
+            <div v-if="roundOutputFiles.length" class="round-files-bar">
+              <span class="round-files-label">📥 本次生成的文件</span>
               <a
-                v-for="f in msg.output_files"
+                v-for="f in roundOutputFiles"
                 :key="f.url"
                 :href="f.url"
                 :download="fileBasename(f)"
-                class="action-file-link"
+                class="round-file-link"
               >📄 {{ fileBasename(f) }}</a>
             </div>
-          </div>
-          <!-- regular chat bubble -->
-          <div
-            v-else
-            class="message"
-            :class="msg.role"
-          >
-            <div class="bubble">
-              <ChatBubble :content="msg.content" />
+            <div v-if="error" class="error">{{ error }}</div>
+            <div v-if="uploadError" class="error">{{ uploadError }}</div>
+            <!-- Uploaded files chips -->
+            <div v-if="uploadedFiles.length" class="upload-chips">
+              <span
+                v-for="(f, idx) in uploadedFiles"
+                :key="f.path"
+                class="upload-chip"
+              >
+                <span class="chip-icon">📄</span>
+                <span class="chip-name">{{ f.filename }}</span>
+                <button
+                  class="chip-remove"
+                  :disabled="streaming"
+                  @click="removeUploadedFile(idx)"
+                  :title="`移除 ${f.filename}`"
+                >✕</button>
+              </span>
             </div>
+            <div class="row">
+              <textarea
+                v-model="input"
+                rows="3"
+                placeholder="向已加载的 Skill 发送测试消息…"
+                @keydown.enter.exact.prevent="send"
+                :disabled="streaming"
+              />
+              <div class="actions">
+                <!-- Hidden file input -->
+                <input
+                  type="file"
+                  ref="fileInputEl"
+                  multiple
+                  style="display:none"
+                  @change="onFileSelected"
+                />
+                <button
+                  class="btn-ghost btn-upload"
+                  :disabled="streaming || uploading"
+                  @click="fileInputEl.click()"
+                  title="上传文件供 Skill 脚本读取"
+                >
+                  <span v-if="uploading">⏳</span>
+                  <span v-else>📎</span>
+                </button>
+                <button class="btn-primary" @click="send" :disabled="streaming || !input.trim()">
+                  {{ streaming ? '生成中…' : '发送' }}
+                </button>
+              </div>
+            </div>
+            <p class="hint muted">Enter 发送 · Shift+Enter 换行</p>
           </div>
-        </template>
-        <div v-if="currentStatus" class="status-bar" :class="`phase-${currentStatus.phase}`"
-             role="status" aria-live="polite">
-          <span class="status-spinner" aria-hidden="true"></span>
-          <span class="status-message">{{ currentStatus.message }}</span>
         </div>
-        <div v-if="streaming" class="message assistant">
-          <div class="bubble">
-            <ChatBubble :content="streamBuffer" :streaming="true" />
-          </div>
-        </div>
-      </div>
 
-      <div class="input-area">
-        <!-- 本轮生成文件固定展示栏 -->
-        <div v-if="roundOutputFiles.length" class="round-files-bar">
-          <span class="round-files-label">📥 本次生成的文件</span>
-          <a
-            v-for="f in roundOutputFiles"
-            :key="f.url"
-            :href="f.url"
-            :download="fileBasename(f)"
-            class="round-file-link"
-          >📄 {{ fileBasename(f) }}</a>
-        </div>
-        <div v-if="error" class="error">{{ error }}</div>
-        <div v-if="uploadError" class="error">{{ uploadError }}</div>
-        <!-- Uploaded files chips -->
-        <div v-if="uploadedFiles.length" class="upload-chips">
-          <span
-            v-for="(f, idx) in uploadedFiles"
-            :key="f.path"
-            class="upload-chip"
-          >
-            <span class="chip-icon">📄</span>
-            <span class="chip-name">{{ f.filename }}</span>
-            <button
-              class="chip-remove"
-              :disabled="streaming"
-              @click="removeUploadedFile(idx)"
-              :title="`移除 ${f.filename}`"
-            >✕</button>
-          </span>
-        </div>
-        <div class="row">
-          <textarea
-            v-model="input"
-            rows="3"
-            placeholder="向已加载的 Skill 发送测试消息…"
-            @keydown.enter.exact.prevent="send"
-            :disabled="streaming"
-          />
-          <div class="actions">
-            <!-- Hidden file input -->
-            <input
-              type="file"
-              ref="fileInputEl"
-              multiple
-              style="display:none"
-              @change="onFileSelected"
-            />
-            <button
-              class="btn-ghost btn-upload"
-              :disabled="streaming || uploading"
-              @click="fileInputEl.click()"
-              title="上传文件供 Skill 脚本读取"
-            >
-              <span v-if="uploading">⏳</span>
-              <span v-else>📎</span>
-            </button>
-            <button class="btn-primary" @click="send" :disabled="streaming || !input.trim()">
-              {{ streaming ? '生成中…' : '发送' }}
-            </button>
+        <!-- Thinking panel sidebar -->
+        <transition name="panel-slide">
+          <div v-if="showThoughts" class="thinking-sidebar">
+            <div class="thinking-sidebar-header">
+              <span>执行过程</span>
+              <button class="btn-ghost btn-close-panel" @click="showThoughts = false">✕</button>
+            </div>
+            <ThinkingPanel :thoughts="thoughts" />
           </div>
-        </div>
-        <p class="hint muted">Enter 发送 · Shift+Enter 换行</p>
+        </transition>
       </div>
     </template>
   </div>
@@ -149,6 +174,7 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
 import { streamChat } from '../composables/useChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
+import ThinkingPanel from '../components/ThinkingPanel.vue'
 
 const ACTION_LABELS = {
   run_script: '运行脚本',
@@ -190,6 +216,10 @@ const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
 
+// Thinking panel state
+const thoughts = ref([])          // accumulated thought events for the current round
+const showThoughts = ref(false)   // sidebar visibility
+
 // File upload state
 const sessionId = ref(newSessionId())
 const uploadedFiles = ref([])  // [{ path, url, filename, size }]
@@ -217,6 +247,7 @@ function resetChat() {
   uploadError.value = ''
   sessionId.value = newSessionId()
   roundOutputFiles.value = []
+  thoughts.value = []
 }
 
 function removeUploadedFile(idx) {
@@ -275,6 +306,7 @@ async function send() {
   streamBuffer.value = ''
   currentStatus.value = null
   roundOutputFiles.value = []
+  thoughts.value = []           // clear previous round's thoughts
 
   // Snapshot the uploaded files for this message, then keep them until reset
   const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
@@ -289,6 +321,10 @@ async function send() {
         await scrollBottom()
       } else if (chunk.type === 'status') {
         currentStatus.value = chunk.data  // null clears the status bar
+      } else if (chunk.type === 'thought') {
+        thoughts.value.push(chunk.data)
+        // Auto-show the panel when thoughts start arriving
+        if (!showThoughts.value) showThoughts.value = true
       } else if (chunk.type === 'action_result') {
         const r = chunk.data
         messages.value.push({
@@ -344,12 +380,114 @@ async function send() {
 }
 .toolbar select { max-width: 280px; }
 
+.btn-thoughts {
+  margin-left: auto;
+  font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  color: var(--text);
+  transition: background 0.15s, color 0.15s;
+}
+.btn-thoughts.active {
+  background: #eff6ff;
+  color: #1e40af;
+  border-color: #bfdbfe;
+}
+
 .empty {
   margin: auto;
   text-align: center;
   max-width: 400px;
   padding: 40px 0;
   line-height: 2;
+}
+
+/* Main two-column layout */
+.content-area {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.messages-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* Thinking panel sidebar */
+.thinking-sidebar {
+  width: 320px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.thinking-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  color: var(--text);
+}
+
+.btn-close-panel {
+  font-size: 12px;
+  padding: 2px 6px;
+  line-height: 1;
+}
+
+/* Slide-in transition for the sidebar */
+.panel-slide-enter-active,
+.panel-slide-leave-active {
+  transition: width 0.25s ease, opacity 0.2s ease;
+  overflow: hidden;
+}
+.panel-slide-enter-from,
+.panel-slide-leave-to {
+  width: 0;
+  opacity: 0;
+}
+.panel-slide-enter-to,
+.panel-slide-leave-from {
+  width: 320px;
+  opacity: 1;
+}
+
+/* On narrow viewports, sidebar stacks below the chat */
+@media (max-width: 900px) {
+  .content-area { flex-direction: column; }
+
+  .thinking-sidebar {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    max-height: 280px;
+  }
+
+  .panel-slide-enter-from,
+  .panel-slide-leave-to {
+    width: 100%;
+    max-height: 0;
+    opacity: 0;
+  }
+
+  .panel-slide-enter-to,
+  .panel-slide-leave-from {
+    width: 100%;
+    max-height: 280px;
+    opacity: 1;
+  }
 }
 
 .messages {

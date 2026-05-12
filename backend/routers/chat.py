@@ -926,7 +926,7 @@ async def _run_metadata_round(
     不向前端流式输出，只用于决定是否进入正文阶段。
     """
     messages = [{"role": "system", "content": metadata_prompt}]
-    messages.extend(_request_messages(request))
+    messages.extend(_request_messages_with_files(request))
 
     decision_text = await complete_chat_once(messages, model)
     return _parse_need_body_decision(decision_text)
@@ -988,7 +988,7 @@ async def _run_child_skill_selection_round(
                 {
                     "valid_child_refs": sorted(valid_child_refs),
                     "parent_metadata_prompt": parent_metadata_prompt,
-                    "user_messages": _request_messages(request),
+                    "user_messages": _request_messages_with_files(request),
                 },
                 ensure_ascii=False,
             ),
@@ -1509,7 +1509,7 @@ async def _run_resource_selection_round(
                 {
                     "loaded_skill_prompt": body_prompt,
                     "resource_catalog": _resource_catalog_for_planner(resource_catalog),
-                    "user_messages": _request_messages(request),
+                    "user_messages": _request_messages_with_files(request),
                     "last_user_text": _last_user_text(request),
                 },
                 ensure_ascii=False,
@@ -2007,7 +2007,7 @@ async def _run_block_planner_round(
         return {"tasks": [], "errors": []}
 
     planner_payload = {
-        "user_messages": _request_messages(request),
+        "user_messages": _request_messages_with_files(request),
         "assistant_text": assistant_text,
         "blocks": _blocks_for_planner(blocks),
         "runtime_constraints": {
@@ -2962,7 +2962,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         ),
                     }
                 ]
-                fallback_messages.extend(_request_messages(request))
+                fallback_messages.extend(_request_messages_with_files(request))
 
                 async for chunk in stream_chat(fallback_messages, model):
                     yield _sse({"content": chunk})

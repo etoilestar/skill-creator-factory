@@ -80,6 +80,15 @@ _CONFIRM_KEYWORDS = (
     "确认开始",
     "可以开始",
     "没问题，开始",
+    "照这个做",
+    "按这个开始",
+)
+
+# Markers in assistant messages that indicate a blueprint has been presented (state B).
+_BLUEPRINT_MARKERS = (
+    "📋 Skill 蓝图",
+    "Skill 蓝图",
+    "skill 蓝图",
 )
 
 _FORBIDDEN_PATH_PARTS = {"..", ""}
@@ -749,6 +758,83 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
     """Only execute generated file-operation blocks after explicit user confirmation."""
     text = _last_user_text(request).strip()
     return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
+
+
+def _infer_creator_phase(request: ChatRequest) -> str:
+    """Infer the current creator state-machine phase from conversation history.
+
+    Returns one of:
+      "A" – requirement collection (no blueprint presented yet)
+      "B" – blueprint confirmation (blueprint shown, awaiting user confirmation)
+      "C" – creation (user has given explicit confirmation)
+
+    The heuristic is:
+    - "C" when the last user message contains a confirmation keyword.
+    - "B" when any previous assistant message contains a blueprint marker, AND
+      the current last user message is NOT a re-start phrase ("不对，我重新说" etc.).
+    - "A" otherwise.
+    """
+    if _has_creation_confirmation(request):
+        return "C"
+
+    # Check whether the user explicitly asked to restart (go back to state A).
+    last_user = _last_user_text(request).strip()
+    _RESTART_KEYWORDS = ("不对，我重新说", "重新说", "重新来", "重来", "我重新描述")
+    if any(kw in last_user for kw in _RESTART_KEYWORDS):
+        return "A"
+
+    # If any assistant message contains a blueprint, we are in state B.
+    for msg in request.messages:
+        if msg.role == "assistant":
+            if any(marker in msg.content for marker in _BLUEPRINT_MARKERS):
+                return "B"
+
+    return "A"
+
+
+def _compose_creator_phase_enforcement_prompt(phase: str) -> str:
+    """Return a focused system message that enforces the given creator phase.
+
+    Injected as an additional system message immediately before the user
+    messages so that the model cannot miss the current-state constraints.
+    Returns an empty string for phase "C" (creation is unrestricted once
+    confirmed; other guards handle execution safety).
+    """
+    if phase == "A":
+        return (
+            "【后端状态检测：当前处于状态 A（需求收集）】\n\n"
+            "系统检测到：你尚未向用户展示蓝图，用户也尚未确认。\n\n"
+            "本轮你只能做一件事：**向用户提出一个问题**，不多不少。\n\n"
+            "强制约束（违反任何一条均视为状态机错误）：\n"
+            "- 只输出一个问题\n"
+            "- 禁止输出 SKILL.md 文件内容\n"
+            "- 禁止输出任何 fenced code block（```…```）\n"
+            "- 禁止输出蓝图\n"
+            "- 禁止输出文件结构、目录结构\n"
+            "- 禁止宣布【开始创建】或【以下是完整实现】\n\n"
+            "回复格式必须是：\n"
+            "好的，我先确认一个关键信息：<只问一个问题>"
+        )
+    if phase == "B":
+        return (
+            "【后端状态检测：当前处于状态 B（蓝图确认）】\n\n"
+            "系统检测到：你已经向用户展示了蓝图，正在等待用户确认。\n\n"
+            "强制约束（违反任何一条均视为状态机错误）：\n"
+            "- 禁止创建任何文件（不得输出 write_file 代码块或文件内容）\n"
+            "- 禁止输出完整 SKILL.md 内容\n"
+            "- 禁止输出任何可执行脚本代码块\n"
+            "- 禁止输出测试命令\n"
+            "- 禁止宣布【开始创建】或【以下是完整实现】\n\n"
+            "允许的操作：\n"
+            "- 回答用户对蓝图的疑问\n"
+            "- 根据用户反馈【有些地方要改】修改蓝图并重新输出\n"
+            "- 如果用户说【不对，我重新说】，回到需求收集，提出一个问题\n\n"
+            "用户尚未说出确认语（如：对，开始做吧 / 开始做吧 / 确认开始 / 可以开始 / "
+            "没问题，开始 / 照这个做 / 按这个开始）。\n"
+            "在收到明确确认语之前，绝对禁止进入创建状态。"
+        )
+    # Phase "C": no additional enforcement needed; execution guards handle safety.
+    return ""
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -3436,6 +3522,28 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "或者不存在任何外部动作要求时，才可以直接生成文本结果。\n"
                         ),
                     }
+                )
+
+            # Inject a per-phase enforcement prompt for the creator workflow.
+            # This gives smaller models an explicit, concise constraint that
+            # matches the current state-machine phase inferred from history,
+            # preventing them from skipping requirement collection or jumping
+            # directly to file creation before the user has confirmed.
+            if skip_runtime_planner_before_confirmation:
+                creator_phase = _infer_creator_phase(request)
+                phase_enforcement = _compose_creator_phase_enforcement_prompt(creator_phase)
+                if phase_enforcement:
+                    final_messages.append(
+                        {
+                            "role": "system",
+                            "content": phase_enforcement,
+                        }
+                    )
+                yield _thought(
+                    "creator_phase",
+                    "创建者阶段",
+                    f"当前状态：{creator_phase}",
+                    {"phase": creator_phase, "enforcement_injected": bool(phase_enforcement)},
                 )
 
             final_messages.extend(_request_messages_with_files(request))

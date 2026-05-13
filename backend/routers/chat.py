@@ -831,9 +831,8 @@ def _compose_creator_phase_enforcement_prompt(phase: str) -> str:
             "- 回答用户对蓝图的疑问\n"
             "- 根据用户反馈【有些地方要改】修改蓝图并重新输出\n"
             "- 如果用户说【不对，我重新说】，回到需求收集，提出一个问题\n\n"
-            "用户尚未说出确认语（如：对，开始做吧 / 开始做吧 / 确认开始 / 可以开始 / "
-            "没问题，开始 / 照这个做 / 按这个开始）。\n"
-            "在收到明确确认语之前，绝对禁止进入创建状态。"
+            f"用户尚未说出确认语（如：{' / '.join(_CONFIRM_KEYWORDS)}）。\n"
+            "在收到明确确认语之前，绝对禁止进入创建状态."
         )
     # Phase "C": no additional enforcement needed; execution guards handle safety.
     return ""
@@ -3531,6 +3530,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # matches the current state-machine phase inferred from history,
             # preventing them from skipping requirement collection or jumping
             # directly to file creation before the user has confirmed.
+            creator_phase: str | None = None
             if skip_runtime_planner_before_confirmation:
                 creator_phase = _infer_creator_phase(request)
                 phase_enforcement = _compose_creator_phase_enforcement_prompt(creator_phase)
@@ -3541,14 +3541,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "content": phase_enforcement,
                         }
                     )
+
+            final_messages.extend(_request_messages_with_files(request))
+
+            if creator_phase is not None:
                 yield _thought(
                     "creator_phase",
                     "创建者阶段",
                     f"当前状态：{creator_phase}",
                     {"phase": creator_phase, "enforcement_injected": bool(phase_enforcement)},
                 )
-
-            final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):

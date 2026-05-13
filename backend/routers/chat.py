@@ -758,22 +758,25 @@ def _detect_creator_state(request: ChatRequest) -> str:
     """Detect the current creator state-machine position from conversation history.
 
     Returns:
-        "C"  – user's last message contains an explicit confirmation keyword
-               (state C: file creation allowed)
-        "B"  – a blueprint has been shown in a previous assistant turn but
-               no confirmation has been received yet (state B: waiting for user)
         "A"  – neither blueprint shown nor confirmation received yet
                (state A: requirement collection)
+        "B"  – a blueprint has been shown in a previous assistant turn but
+               no confirmation has been received yet (state B: waiting for user)
+        "C"  – user's last message contains an explicit confirmation keyword
+               AND a blueprint was already shown (state C: file creation allowed)
     """
+    blueprint_shown = any(
+        msg.role == "assistant"
+        and any(marker in (msg.content or "") for marker in _BLUEPRINT_MARKERS)
+        for msg in request.messages
+    )
+
     last_user = _last_user_text(request).strip()
-    if any(kw in last_user for kw in _CONFIRM_KEYWORDS):
+    if blueprint_shown and any(kw in last_user for kw in _CONFIRM_KEYWORDS):
         return "C"
 
-    for msg in request.messages:
-        if msg.role == "assistant" and any(
-            marker in (msg.content or "") for marker in _BLUEPRINT_MARKERS
-        ):
-            return "B"
+    if blueprint_shown:
+        return "B"
 
     return "A"
 
@@ -784,13 +787,14 @@ def _compose_creator_state_injection(state: str) -> str:
     Injected as a second system message so it acts as a hard constraint that
     overrides any ambiguity in the model's self-assessment of conversation state.
     """
+    blueprint_marker = _BLUEPRINT_MARKERS[0]
     if state == "A":
         return (
             "【后端状态注入】当前状态：A（需求收集）\n\n"
             "对话历史中尚未出现蓝图，用户也尚未发出确认语。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
             "1. 只允许输出一个问题，询问当前最缺失的需求信息。\n"
-            "2. 禁止输出蓝图（📋 Skill 蓝图）。\n"
+            f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
             "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。\n"

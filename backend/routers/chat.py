@@ -3508,7 +3508,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             if skip_runtime_planner_before_confirmation:
                 # Reuse the state computed earlier for the planner-skip check to
                 # avoid evaluating the conversation history a second time.
-                creator_state = _early_creator_state or _detect_creator_state(request)
+                creator_state = _early_creator_state if _early_creator_state is not None else _detect_creator_state(request)
                 final_messages.append(
                     {
                         "role": "system",

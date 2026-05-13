@@ -80,10 +80,21 @@ _CONFIRM_KEYWORDS = (
     "确认开始",
     "可以开始",
     "没问题，开始",
+    # Listed in kernel/SKILL.md but previously missing from backend detection:
+    "照这个做",
+    "按这个开始",
 )
 
-# Marker written by the model when it outputs a blueprint (state B).
-_BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
+# Markers written by the model when it outputs a blueprint (state B).
+# Listed from most specific to most general so that weak models that omit the
+# leading emoji or vary the wording are still detected.  All markers must be
+# unique enough that they cannot appear in normal conversation.
+_BLUEPRINT_MARKERS = (
+    "📋 Skill 蓝图",          # canonical form required by SKILL.md
+    "Skill 蓝图",             # emoji may be dropped by some models
+    "- Skill 名称：",          # characteristic blueprint field
+    "这是我理解的需求，对吗",   # mandatory blueprint sign-off phrase
+)
 
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
@@ -3218,11 +3229,23 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         f"{sections_text}\n"
                     )
 
-            should_skip_runtime_planner = (
-                skip_runtime_planner_before_confirmation
-                and require_action_confirmation
-                and not _has_creation_confirmation(request)
-            )
+            # Determine whether the runtime planner should be skipped for this
+            # turn.  When the creator state-machine is active we rely on
+            # _detect_creator_state() so that both the planner-skip decision
+            # and the later state-injection system message use a single,
+            # consistent evaluation of the conversation history.  This avoids
+            # the previous dual-logic problem where _has_creation_confirmation
+            # (last message only) could disagree with _detect_creator_state
+            # (full history + blueprint detection).
+            if skip_runtime_planner_before_confirmation:
+                _early_creator_state = _detect_creator_state(request)
+                should_skip_runtime_planner = (
+                    require_action_confirmation
+                    and _early_creator_state != "C"
+                )
+            else:
+                _early_creator_state = None
+                should_skip_runtime_planner = False
 
             if enable_action_execution and not should_skip_runtime_planner and not disable_runtime_planner:
                 try:
@@ -3483,7 +3506,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
             if skip_runtime_planner_before_confirmation:
-                creator_state = _detect_creator_state(request)
+                # Reuse the state computed earlier for the planner-skip check to
+                # avoid evaluating the conversation history a second time.
+                creator_state = _early_creator_state or _detect_creator_state(request)
                 final_messages.append(
                     {
                         "role": "system",

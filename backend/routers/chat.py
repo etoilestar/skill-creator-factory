@@ -91,6 +91,9 @@ _BLUEPRINT_MARKERS = (
     "skill 蓝图",
 )
 
+# Keywords that indicate the user wants to restart requirement collection (back to state A).
+_RESTART_KEYWORDS = ("不对，我重新说", "重新说", "重新来", "重来", "我重新描述")
+
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
 _ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
@@ -779,13 +782,12 @@ def _infer_creator_phase(request: ChatRequest) -> str:
 
     # Check whether the user explicitly asked to restart (go back to state A).
     last_user = _last_user_text(request).strip()
-    _RESTART_KEYWORDS = ("不对，我重新说", "重新说", "重新来", "重来", "我重新描述")
     if any(kw in last_user for kw in _RESTART_KEYWORDS):
         return "A"
 
     # If any assistant message contains a blueprint, we are in state B.
     for msg in request.messages:
-        if msg.role == "assistant":
+        if msg.role == "assistant" and msg.content:
             if any(marker in msg.content for marker in _BLUEPRINT_MARKERS):
                 return "B"
 

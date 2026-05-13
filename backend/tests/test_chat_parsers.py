@@ -401,3 +401,116 @@ def test_is_within_sandbox_nested_path_ok(tmp_path):
 
     sandbox = (tmp_path / "skill").resolve()
     assert _is_within_sandbox(nested, sandbox) is True
+
+
+# ---------------------------------------------------------------------------
+# _infer_creator_phase and _compose_creator_phase_enforcement_prompt
+# ---------------------------------------------------------------------------
+
+def _make_request(messages):
+    """Build a minimal ChatRequest-like object from a list of (role, content) pairs."""
+    from backend.routers.chat import ChatRequest, Message
+    return ChatRequest(messages=[Message(role=r, content=c) for r, c in messages])
+
+
+def test_infer_phase_a_empty_history():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([("user", "帮我做个写故事的 Skill")])
+    assert _infer_creator_phase(req) == "A"
+
+
+def test_infer_phase_a_no_blueprint_in_history():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个写故事的 Skill"),
+        ("assistant", "好的，我先确认一个关键信息：你希望这个 Skill 输出什么格式？"),
+        ("user", "输出 Markdown"),
+    ])
+    assert _infer_creator_phase(req) == "A"
+
+
+def test_infer_phase_b_blueprint_in_assistant_message():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", "📋 Skill 蓝图\n\n- Skill 名称：story-writer\n..."),
+        ("user", "有些地方要改"),
+    ])
+    assert _infer_creator_phase(req) == "B"
+
+
+def test_infer_phase_b_blueprint_marker_variant():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", "下面是 Skill 蓝图供你确认：\n- Skill 名称：foo"),
+        ("user", "好"),
+    ])
+    assert _infer_creator_phase(req) == "B"
+
+
+def test_infer_phase_c_confirmation_keyword():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", "📋 Skill 蓝图\n..."),
+        ("user", "对，开始做吧"),
+    ])
+    assert _infer_creator_phase(req) == "C"
+
+
+def test_infer_phase_c_confirmation_keyword_zhaozhegezuo():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", "📋 Skill 蓝图\n..."),
+        ("user", "照这个做"),
+    ])
+    assert _infer_creator_phase(req) == "C"
+
+
+def test_infer_phase_restart_overrides_blueprint():
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", "📋 Skill 蓝图\n..."),
+        ("user", "不对，我重新说"),
+    ])
+    assert _infer_creator_phase(req) == "A"
+
+
+def test_infer_phase_a_assistant_content_empty():
+    """Should not raise and should return A when an assistant message has empty content."""
+    from backend.routers.chat import _infer_creator_phase
+    req = _make_request([
+        ("user", "帮我做个 Skill"),
+        ("assistant", ""),
+        ("user", "好的"),
+    ])
+    assert _infer_creator_phase(req) == "A"
+
+
+def test_enforcement_prompt_phase_a_not_empty():
+    from backend.routers.chat import _compose_creator_phase_enforcement_prompt
+    prompt = _compose_creator_phase_enforcement_prompt("A")
+    assert prompt
+    assert "状态 A" in prompt
+    assert "一个问题" in prompt
+
+
+def test_enforcement_prompt_phase_b_not_empty():
+    from backend.routers.chat import _compose_creator_phase_enforcement_prompt
+    prompt = _compose_creator_phase_enforcement_prompt("B")
+    assert prompt
+    assert "状态 B" in prompt
+    assert "确认语" in prompt
+
+
+def test_enforcement_prompt_phase_c_empty():
+    from backend.routers.chat import _compose_creator_phase_enforcement_prompt
+    assert _compose_creator_phase_enforcement_prompt("C") == ""
+
+
+def test_enforcement_prompt_unknown_phase_empty():
+    from backend.routers.chat import _compose_creator_phase_enforcement_prompt
+    assert _compose_creator_phase_enforcement_prompt("X") == ""

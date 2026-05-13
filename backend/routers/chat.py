@@ -94,6 +94,9 @@ _BLUEPRINT_MARKERS = (
 # Keywords that indicate the user wants to restart requirement collection (back to state A).
 _RESTART_KEYWORDS = ("不对，我重新说", "重新说", "重新来", "重来", "我重新描述")
 
+# Pre-joined confirmation keyword list for use in phase-enforcement prompts.
+_CONFIRM_KEYWORDS_DISPLAY = " / ".join(_CONFIRM_KEYWORDS)
+
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
 _ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
@@ -831,7 +834,7 @@ def _compose_creator_phase_enforcement_prompt(phase: str) -> str:
             "- 回答用户对蓝图的疑问\n"
             "- 根据用户反馈【有些地方要改】修改蓝图并重新输出\n"
             "- 如果用户说【不对，我重新说】，回到需求收集，提出一个问题\n\n"
-            f"用户尚未说出确认语（如：{' / '.join(_CONFIRM_KEYWORDS)}）。\n"
+            f"用户尚未说出确认语（如：{_CONFIRM_KEYWORDS_DISPLAY}）。\n"
             "在收到明确确认语之前，绝对禁止进入创建状态."
         )
     # Phase "C": no additional enforcement needed; execution guards handle safety.
@@ -3530,7 +3533,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # matches the current state-machine phase inferred from history,
             # preventing them from skipping requirement collection or jumping
             # directly to file creation before the user has confirmed.
-            creator_phase: str | None = None
             if skip_runtime_planner_before_confirmation:
                 creator_phase = _infer_creator_phase(request)
                 phase_enforcement = _compose_creator_phase_enforcement_prompt(creator_phase)
@@ -3544,7 +3546,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             final_messages.extend(_request_messages_with_files(request))
 
-            if creator_phase is not None:
+            if skip_runtime_planner_before_confirmation:
                 yield _thought(
                     "creator_phase",
                     "创建者阶段",

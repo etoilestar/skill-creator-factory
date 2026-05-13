@@ -82,6 +82,9 @@ _CONFIRM_KEYWORDS = (
     "没问题，开始",
 )
 
+# Marker written by the model when it outputs a blueprint (state B).
+_BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
+
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
 _ALLOWED_PLAN_ACTIONS = {"display", "ignore", "write_file", "run_command", "create_directory"}
@@ -749,6 +752,67 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
     """Only execute generated file-operation blocks after explicit user confirmation."""
     text = _last_user_text(request).strip()
     return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
+
+
+def _detect_creator_state(request: ChatRequest) -> str:
+    """Detect the current creator state-machine position from conversation history.
+
+    Returns:
+        "C"  – user's last message contains an explicit confirmation keyword
+               (state C: file creation allowed)
+        "B"  – a blueprint has been shown in a previous assistant turn but
+               no confirmation has been received yet (state B: waiting for user)
+        "A"  – neither blueprint shown nor confirmation received yet
+               (state A: requirement collection)
+    """
+    last_user = _last_user_text(request).strip()
+    if any(kw in last_user for kw in _CONFIRM_KEYWORDS):
+        return "C"
+
+    for msg in request.messages:
+        if msg.role == "assistant" and any(
+            marker in (msg.content or "") for marker in _BLUEPRINT_MARKERS
+        ):
+            return "B"
+
+    return "A"
+
+
+def _compose_creator_state_injection(state: str) -> str:
+    """Return a system-message string that tells the model its current state.
+
+    Injected as a second system message so it acts as a hard constraint that
+    overrides any ambiguity in the model's self-assessment of conversation state.
+    """
+    if state == "A":
+        return (
+            "【后端状态注入】当前状态：A（需求收集）\n\n"
+            "对话历史中尚未出现蓝图，用户也尚未发出确认语。\n"
+            "本轮必须处于状态 A，严格执行以下规则：\n"
+            "1. 只允许输出一个问题，询问当前最缺失的需求信息。\n"
+            "2. 禁止输出蓝图（📋 Skill 蓝图）。\n"
+            "3. 禁止输出任何 fenced code block（```）。\n"
+            "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
+            "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。\n"
+            "回复格式：好的，我先确认一个关键信息：<只问一个问题>"
+        )
+    if state == "B":
+        return (
+            "【后端状态注入】当前状态：B（蓝图已展示，等待用户确认）\n\n"
+            "对话历史中已包含蓝图，但用户尚未发出确认语。\n"
+            "本轮必须处于状态 B，严格执行以下规则：\n"
+            "1. 禁止创建任何文件或目录。\n"
+            "2. 禁止输出任何 SKILL.md 正文或脚本代码块。\n"
+            "3. 如果用户要求修改蓝图，根据意见调整后重新展示完整蓝图，仍然以'这是我理解的需求，对吗？'结尾。\n"
+            "4. 等待用户发出确认语后，后端才会解锁文件创建权限。"
+        )
+    # state == "C"
+    return (
+        "【后端状态注入】当前状态：C（创建阶段）\n\n"
+        "用户已明确发出确认语，系统已进入创建阶段。\n"
+        "本轮可以：创建目录、写入文件、输出 SKILL.md 和脚本代码块、执行校验、报告结果。\n"
+        "按照蓝图逐步完成所有文件的创建，完成后给出简短报告。"
+    )
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -3412,6 +3476,21 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         "role": "system",
                         "content": _compose_creator_artifact_consistency_prompt(),
                     }
+                )
+
+            if skip_runtime_planner_before_confirmation:
+                creator_state = _detect_creator_state(request)
+                final_messages.append(
+                    {
+                        "role": "system",
+                        "content": _compose_creator_state_injection(creator_state),
+                    }
+                )
+                yield _thought(
+                    "creator_state",
+                    "创建者状态",
+                    f"当前状态：{creator_state}",
+                    {"state": creator_state},
                 )
 
             if strict_skill_execution:

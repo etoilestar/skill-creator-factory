@@ -104,12 +104,12 @@ _CONFIRM_KEYWORDS = (
 
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
-_CREATOR_REGEX_CONTEXT_WINDOW = 40
+_CREATOR_PATTERN_CONTEXT_CHARS = 40
 
 _CREATOR_INPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(输入|用户会提供|用户输入|接收|读取|上传|原始数据|原文|素材|文本|文件|参数)"),
     re.compile(
-        rf"(根据|基于|把|将).{{0,{_CREATOR_REGEX_CONTEXT_WINDOW}}}(整理|转换|提取|生成|改写|总结|分类|分析)",
+        rf"(根据|基于|把|将).{{0,{_CREATOR_PATTERN_CONTEXT_CHARS}}}(整理|转换|提取|生成|改写|总结|分类|分析)",
         re.DOTALL,
     ),
 )
@@ -965,7 +965,8 @@ def _compose_creator_state_injection(
         if requirement_analysis is None:
             raise RuntimeError(
                 "Internal error: requirement_analysis is required when composing state A injection. "
-                "This indicates the caller has not provided requirement analysis context."
+                "This indicates the caller has not provided requirement analysis context. "
+                "Ensure _detect_creator_state() runs before _compose_creator_state_injection()."
             )
         missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (
@@ -3710,7 +3711,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # "ask one question only" constraint, causing the model to skip requirement
             # collection and jump straight to blueprint generation.
             if skip_runtime_planner_before_confirmation:
-                assert creator_state_ctx is not None
+                if creator_state_ctx is None:
+                    raise RuntimeError(
+                        "creator_state_ctx must be set when skip_runtime_planner_before_confirmation is enabled."
+                    )
                 final_messages.append(
                         {
                             "role": "system",

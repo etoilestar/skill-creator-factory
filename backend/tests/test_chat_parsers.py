@@ -10,6 +10,110 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# creator requirement gating
+# ---------------------------------------------------------------------------
+
+def test_analyze_creator_requirements_detects_missing_slots():
+    from backend.routers.chat import ChatRequest, Message, _analyze_creator_requirements
+
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="帮我做一个写故事的 Skill"),
+        ]
+    )
+
+    result = _analyze_creator_requirements(request)
+
+    assert result.user_turns == 1
+    assert "purpose" in result.collected_slots
+    assert "input" in result.missing_slots
+    assert "scenario" in result.missing_slots
+    assert result.ready_for_blueprint is False
+    assert "关键信息" in result.next_question
+
+
+def test_detect_creator_state_first_turn_full_request_stays_a():
+    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+
+    request = ChatRequest(
+        messages=[
+            Message(
+                role="user",
+                content=(
+                    "帮我做一个会议纪要整理 Skill。"
+                    "输入是会议记录文本，输出是行动项清单。"
+                    "典型场景是项目经理会后整理待办。"
+                    "不需要脚本或外部服务。"
+                ),
+            ),
+        ]
+    )
+
+    result = _detect_creator_state(request)
+
+    assert result.state == "A"
+    assert result.requirements.ready_for_blueprint is False
+
+
+def test_detect_creator_state_ready_for_blueprint_after_second_turn():
+    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="帮我做一个写故事的 Skill"),
+            Message(
+                role="assistant",
+                content="好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。",
+            ),
+            Message(
+                role="user",
+                content=(
+                    "用户输入故事主题和风格，输出一个短篇故事。"
+                    "典型场景是用户会说：请写一个关于太空猫的温馨故事。"
+                    "不需要脚本、参考资料或外部依赖。"
+                ),
+            ),
+        ]
+    )
+
+    result = _detect_creator_state(request)
+
+    assert result.state == "B"
+    assert result.requirements.ready_for_blueprint is True
+
+
+@pytest.mark.asyncio
+async def test_make_stream_short_circuits_state_a_before_llm():
+    from backend.routers.chat import ChatRequest, Message, _make_stream
+
+    request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])
+    skill_context = {
+        "skill_name": "skill-creator",
+        "metadata_prompt": "",
+        "body_loader": lambda: "body",
+        "child_body_loader": None,
+        "force_body": True,
+        "enable_action_execution": True,
+        "require_action_confirmation": True,
+        "execution_root": None,
+        "strict_creator_generation": True,
+        "skip_runtime_planner_before_confirmation": True,
+        "disable_runtime_planner": True,
+        "enable_resource_preload": True,
+        "use_frontend_driven_creation": True,
+    }
+
+    response = _make_stream(skill_context, request)
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+
+    text = "".join(chunks)
+    assert "好的，我先确认一个关键信息" in text
+    assert "Skill 蓝图" not in text
+
+
+# ---------------------------------------------------------------------------
 # _strip_markdown_json_fence
 # ---------------------------------------------------------------------------
 

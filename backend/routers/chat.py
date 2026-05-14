@@ -55,6 +55,26 @@ class MarkdownBlock:
     after_context: str
 
 
+@dataclass
+class CreatorRequirementAnalysis:
+    """Best-effort slot analysis for the creator requirement-collection phase."""
+
+    user_turns: int
+    collected_slots: list[str]
+    missing_slots: list[str]
+    ready_for_blueprint: bool
+    next_question: str
+
+
+@dataclass
+class CreatorStateContext:
+    """Resolved creator state together with requirement-analysis context."""
+
+    state: str
+    blueprint_shown: bool
+    requirements: CreatorRequirementAnalysis
+
+
 _EXECUTABLE_FENCE_RE = re.compile(
     r"```(?P<lang>bash|sh|shell)\s*\n(?P<code>.*?)\n```",
     re.IGNORECASE | re.DOTALL,
@@ -84,6 +104,22 @@ _CONFIRM_KEYWORDS = (
 
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
+
+_CREATOR_INPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(输入|用户会提供|用户输入|接收|读取|上传|原始数据|原文|素材|文本|文件|参数)"),
+    re.compile(r"(根据|基于|把|将).{0,40}(整理|转换|提取|生成|改写|总结|分类|分析)", re.DOTALL),
+)
+_CREATOR_OUTPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(输出|返回|生成|产出|给出|得到|结果|报告|摘要|内容|结论)"),
+    re.compile(r"(整理成|转换成|提取出|生成出)"),
+)
+_CREATOR_SCENARIO_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(例如|比如|场景|触发|真实例子|用户会说|示例)"),
+)
+_CREATOR_RESOURCE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(脚本|script|references/|assets/|api|接口|数据库|环境变量|依赖|模型|文件处理|外部服务)", re.IGNORECASE),
+    re.compile(r"(不需要|无需|只靠模型|纯提示词).{0,20}(脚本|api|接口|数据库|依赖|外部服务)", re.IGNORECASE),
+)
 
 _FORBIDDEN_PATH_PARTS = {"..", ""}
 _SHELL_META_CHARS = ("|", "&", ";", ">", "<", "$", "`", "\n")
@@ -754,14 +790,81 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
     return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
 
 
-def _detect_creator_state(request: ChatRequest) -> str:
+def _creator_user_texts(request: ChatRequest) -> list[str]:
+    """Return non-empty user utterances in order."""
+    return [
+        (message.content or "").strip()
+        for message in request.messages
+        if message.role == "user" and (message.content or "").strip()
+    ]
+
+
+def _creator_has_slot(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
+    """Return True when any pattern indicates the slot is present."""
+    return any(pattern.search(text) for pattern in patterns)
+
+
+def _build_creator_clarifying_question(missing_slot: str) -> str:
+    """Return a deterministic single-question follow-up for state A."""
+    prompts = {
+        "purpose": "好的，我先确认一个关键信息：这个 Skill 最核心要解决什么问题？请用一句话说清它最主要的用途。",
+        "input": "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。",
+        "output": "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。",
+        "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
+        "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
+        "follow_up": "好的，我再确认一个关键细节：如果只能优先保证一项，你更希望这个 Skill 优先追求结果质量、响应速度，还是尽量简单易复用？",
+    }
+    return prompts.get(missing_slot, prompts["input"])
+
+
+def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAnalysis:
+    """Best-effort requirement-slot analysis for creator mode.
+
+    当前实现是规则启发式，不依赖额外 LLM 调用。目标不是完美理解需求，
+    而是为“先澄清、再出蓝图”提供稳定且可预测的后端闸门。
+    """
+    user_texts = _creator_user_texts(request)
+    combined = "\n".join(user_texts)
+
+    has_purpose = bool(combined)
+    has_input = _creator_has_slot(_CREATOR_INPUT_PATTERNS, combined)
+    has_output = _creator_has_slot(_CREATOR_OUTPUT_PATTERNS, combined)
+    has_scenario = _creator_has_slot(_CREATOR_SCENARIO_PATTERNS, combined)
+    has_resources = _creator_has_slot(_CREATOR_RESOURCE_PATTERNS, combined)
+
+    collected_slots: list[str] = []
+    missing_slots: list[str] = []
+
+    for slot_name, present in (
+        ("purpose", has_purpose),
+        ("input", has_input),
+        ("output", has_output),
+        ("scenario", has_scenario),
+        ("resources", has_resources),
+    ):
+        if present:
+            collected_slots.append(slot_name)
+        else:
+            missing_slots.append(slot_name)
+
+    ready_for_blueprint = not missing_slots and len(user_texts) >= 2
+    blocking_slot = missing_slots[0] if missing_slots else ("follow_up" if len(user_texts) < 2 else "")
+
+    return CreatorRequirementAnalysis(
+        user_turns=len(user_texts),
+        collected_slots=collected_slots,
+        missing_slots=missing_slots,
+        ready_for_blueprint=ready_for_blueprint,
+        next_question=_build_creator_clarifying_question(blocking_slot),
+    )
+
+
+def _detect_creator_state(request: ChatRequest) -> CreatorStateContext:
     """Detect the current creator state-machine position from conversation history.
 
     Returns:
-        "A"  – neither blueprint shown nor confirmation received yet
-               (state A: requirement collection)
-        "B"  – a blueprint has been shown in a previous assistant turn but
-               no confirmation has been received yet (state B: waiting for user)
+        "A"  – requirement collection is not complete yet
+        "B"  – requirement slots are complete and the model may output/revise blueprint
         "C"  – user's last message contains an explicit confirmation keyword
                AND a blueprint was already shown (state C: file creation allowed)
     """
@@ -770,28 +873,47 @@ def _detect_creator_state(request: ChatRequest) -> str:
         and any(marker in (msg.content or "") for marker in _BLUEPRINT_MARKERS)
         for msg in request.messages
     )
+    requirement_analysis = _analyze_creator_requirements(request)
 
     last_user = _last_user_text(request).strip()
     if blueprint_shown and any(kw in last_user for kw in _CONFIRM_KEYWORDS):
-        return "C"
+        return CreatorStateContext(
+            state="C",
+            blueprint_shown=True,
+            requirements=requirement_analysis,
+        )
 
-    if blueprint_shown:
-        return "B"
+    if blueprint_shown or requirement_analysis.ready_for_blueprint:
+        return CreatorStateContext(
+            state="B",
+            blueprint_shown=blueprint_shown,
+            requirements=requirement_analysis,
+        )
 
-    return "A"
+    return CreatorStateContext(
+        state="A",
+        blueprint_shown=blueprint_shown,
+        requirements=requirement_analysis,
+    )
 
 
-def _compose_creator_state_injection(state: str) -> str:
+def _compose_creator_state_injection(
+    state: str,
+    *,
+    blueprint_shown: bool = False,
+    requirement_analysis: CreatorRequirementAnalysis | None = None,
+) -> str:
     """Return a system-message string that tells the model its current state.
 
     Injected as a second system message so it acts as a hard constraint that
     overrides any ambiguity in the model's self-assessment of conversation state.
     """
     blueprint_marker = _BLUEPRINT_MARKERS[0]
+    missing_desc = "、".join((requirement_analysis or CreatorRequirementAnalysis(0, [], [], False, "")).missing_slots) or "无"
     if state == "A":
         return (
             "【后端状态注入】当前状态：A（需求收集）\n\n"
-            "对话历史中尚未出现蓝图，用户也尚未发出确认语。\n"
+            f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
             "1. 只允许输出一个问题，询问当前最缺失的需求信息。\n"
             f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
@@ -801,6 +923,13 @@ def _compose_creator_state_injection(state: str) -> str:
             "回复格式：好的，我先确认一个关键信息：<只问一个问题>"
         )
     if state == "B":
+        if not blueprint_shown:
+            return (
+                "【后端状态注入】当前状态：B（蓝图输出阶段）\n\n"
+                "关键信息已收集完成，且用户至少完成了一轮补充说明。\n"
+                "本轮必须只输出完整蓝图，不得输出任何文件内容、代码块、测试命令或创建报告。\n"
+                "蓝图结尾必须使用“这是我理解的需求，对吗？”以及 A/B/C 三个确认选项。"
+            )
         return (
             "【后端状态注入】当前状态：B（蓝图已展示，等待用户确认）\n\n"
             "对话历史中已包含蓝图，但用户尚未发出确认语。\n"
@@ -3041,6 +3170,36 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 yield "data: [DONE]\n\n"
                 return
 
+            # Detect creator state before loading the creator body so requirement collection
+            # can be enforced as a backend gate instead of relying on prompt following.
+            creator_state: str = "A"
+            creator_state_ctx = CreatorStateContext(
+                state="A",
+                blueprint_shown=False,
+                requirements=CreatorRequirementAnalysis(0, [], [], False, ""),
+            )
+            if skip_runtime_planner_before_confirmation:
+                creator_state_ctx = _detect_creator_state(request)
+                creator_state = creator_state_ctx.state
+                yield _thought(
+                    "creator_state",
+                    "创建者状态",
+                    f"当前状态：{creator_state}",
+                    {
+                        "state": creator_state,
+                        "blueprint_shown": creator_state_ctx.blueprint_shown,
+                        "user_turns": creator_state_ctx.requirements.user_turns,
+                        "collected_slots": creator_state_ctx.requirements.collected_slots,
+                        "missing_slots": creator_state_ctx.requirements.missing_slots,
+                    },
+                )
+
+                if creator_state == "A":
+                    yield _sse({"status": None})
+                    yield _sse({"content": creator_state_ctx.requirements.next_question})
+                    yield "data: [DONE]\n\n"
+                    return
+
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
             yield _thought(
@@ -3102,20 +3261,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             f"运行时尝试加载子 Skill `{child_ref}`，但加载失败：{exc}\n"
                             "请不要假装已经读取该子 Skill 正文。"
                         )
-
-            # Detect creator state early so we can skip unnecessary LLM calls in state A.
-            # _detect_creator_state is a pure function (reads request.messages only) so it is
-            # safe to call before the resource-preload block.  The variable is also referenced
-            # further down when building final_messages.
-            creator_state: str = "A"
-            if skip_runtime_planner_before_confirmation:
-                creator_state = _detect_creator_state(request)
-                yield _thought(
-                    "creator_state",
-                    "创建者状态",
-                    f"当前状态：{creator_state}",
-                    {"state": creator_state},
-                )
 
             # Skip resource preload entirely in state A (requirement-collection phase).
             # In state A the model only needs to ask one clarifying question — loading
@@ -3503,11 +3648,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # collection and jump straight to blueprint generation.
             if skip_runtime_planner_before_confirmation:
                 final_messages.append(
-                    {
-                        "role": "system",
-                        "content": _compose_creator_state_injection(creator_state),
-                    }
-                )
+                        {
+                            "role": "system",
+                            "content": _compose_creator_state_injection(
+                                creator_state,
+                                blueprint_shown=creator_state_ctx.blueprint_shown,
+                                requirement_analysis=creator_state_ctx.requirements,
+                            ),
+                        }
+                    )
 
                 # When the frontend drives file creation (plan C), state-C just needs a
                 # brief acknowledgement — suppress code/file generation from the LLM.

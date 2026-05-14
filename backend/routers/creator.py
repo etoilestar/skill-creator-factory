@@ -160,7 +160,7 @@ def _validate_skill_name(skill_name: str) -> str:
     name = skill_name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="skill_name 不能为空。")
-    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
         raise HTTPException(
             status_code=400,
             detail="skill_name 只能包含小写字母、数字和连字符，且必须以字母或数字开头。",

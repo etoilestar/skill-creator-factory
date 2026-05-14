@@ -316,7 +316,7 @@ function commitName() {
     nameError.value = '名称不能为空'
     return
   }
-  if (!/^[a-z0-9][a-z0-9\-]*$/.test(raw)) {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(raw)) {
     nameError.value = '只能包含小写字母、数字和连字符'
     return
   }

@@ -151,7 +151,7 @@ def parse_skill_name(blueprint_text: str) -> str | None:
 
     # Normalise: lowercase, replace spaces/underscores with hyphens, keep alnum+hyphen
     normalised = re.sub(
-        r"[^a-z0-9\-]",
+        r"[^a-z0-9-]",
         "",
         raw.lower().replace(" ", "-").replace("_", "-"),
     )

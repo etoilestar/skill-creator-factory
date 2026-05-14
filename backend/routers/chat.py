@@ -823,7 +823,7 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
                 saw_assistant_follow_up = True
             continue
 
-        if message.role != "user" or not (message.content or "").strip():
+        if message.role != "user":
             continue
 
         if not seen_first_user:
@@ -892,18 +892,18 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
         missing_slots, has_follow_up_round
     )
     if missing_slots:
-        blocking_slot = missing_slots[0]
+        next_prompt_key = missing_slots[0]
     elif not has_follow_up_round:
-        blocking_slot = "follow_up"
+        next_prompt_key = "follow_up"
     else:
-        blocking_slot = ""
+        next_prompt_key = ""
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),
         collected_slots=collected_slots,
         missing_slots=missing_slots,
         ready_for_blueprint=ready_for_blueprint,
-        next_question=_build_creator_clarifying_question(blocking_slot),
+        next_question=_build_creator_clarifying_question(next_prompt_key),
     )
 
 
@@ -961,7 +961,7 @@ def _compose_creator_state_injection(
         if requirement_analysis is None:
             raise RuntimeError(
                 "Internal error: requirement_analysis is required when composing state A injection. "
-                "This indicates the caller did not provide requirement analysis context."
+                "This indicates the caller has not provided requirement analysis context."
             )
         missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (

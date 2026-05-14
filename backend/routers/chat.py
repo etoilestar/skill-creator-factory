@@ -845,7 +845,7 @@ def _build_creator_clarifying_question(missing_slot: str) -> str:
         "output": shared_input_output_question,
         "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
         "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
-        "follow_up": "好的，我再确认一个关键细节：如果只能优先保证一项，你更希望这个 Skill 优先追求结果质量、响应速度，还是尽量简单易复用？",
+        "mandatory_follow_up": "好的，我再确认一个关键细节：如果只能优先保证一项，你更希望这个 Skill 优先追求结果质量、响应速度，还是尽量简单易复用？",
     }
     return prompts.get(missing_slot, prompts["input"])
 
@@ -853,7 +853,11 @@ def _build_creator_clarifying_question(missing_slot: str) -> str:
 def _is_creator_requirement_collection_complete(
     missing_slots: list[str], has_follow_up_round: bool
 ) -> bool:
-    """Blueprint output is allowed only after all slots are covered and a real follow-up is answered."""
+    """Blueprint output is allowed only after all slots are covered and a real follow-up is answered.
+
+    The mandatory follow-up question does not itself complete the gate; the user must answer it so
+    creator mode has at least one full clarification round before entering blueprint generation.
+    """
     return not missing_slots and has_follow_up_round
 
 
@@ -894,7 +898,7 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
     if missing_slots:
         next_prompt_key = missing_slots[0]
     elif not has_follow_up_round:
-        next_prompt_key = "follow_up"
+        next_prompt_key = "mandatory_follow_up"
     else:
         next_prompt_key = ""
 
@@ -3706,6 +3710,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # "ask one question only" constraint, causing the model to skip requirement
             # collection and jump straight to blueprint generation.
             if skip_runtime_planner_before_confirmation:
+                assert creator_state_ctx is not None
                 final_messages.append(
                         {
                             "role": "system",

@@ -848,7 +848,12 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
             missing_slots.append(slot_name)
 
     ready_for_blueprint = not missing_slots and len(user_texts) >= 2
-    blocking_slot = missing_slots[0] if missing_slots else ("follow_up" if len(user_texts) < 2 else "")
+    if missing_slots:
+        blocking_slot = missing_slots[0]
+    elif len(user_texts) < 2:
+        blocking_slot = "follow_up"
+    else:
+        blocking_slot = ""
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),
@@ -909,8 +914,10 @@ def _compose_creator_state_injection(
     overrides any ambiguity in the model's self-assessment of conversation state.
     """
     blueprint_marker = _BLUEPRINT_MARKERS[0]
-    missing_desc = "、".join((requirement_analysis or CreatorRequirementAnalysis(0, [], [], False, "")).missing_slots) or "无"
     if state == "A":
+        if requirement_analysis is None:
+            raise ValueError("requirement_analysis is required for creator state A")
+        missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (
             "【后端状态注入】当前状态：A（需求收集）\n\n"
             f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"

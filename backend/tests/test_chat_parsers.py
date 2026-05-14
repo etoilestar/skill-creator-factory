@@ -85,6 +85,33 @@ def test_detect_creator_state_ready_for_blueprint_after_second_turn():
     assert result.requirements.ready_for_blueprint is True
 
 
+def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
+    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+
+    request = ChatRequest(
+        messages=[
+            Message(role="user", content="帮我做一个写故事的 Skill"),
+            Message(
+                role="user",
+                content=(
+                    "用户输入故事主题和风格，输出一个短篇故事。"
+                    "典型场景是用户会说：请写一个关于太空猫的温馨故事。"
+                    "不需要脚本、参考资料或外部依赖。"
+                ),
+            ),
+            Message(
+                role="assistant",
+                content="好的，我再确认一个关键细节：如果只能优先保证一项，你更希望优先质量还是速度？",
+            ),
+        ]
+    )
+
+    result = _detect_creator_state(request)
+
+    assert result.state == "A"
+    assert result.requirements.ready_for_blueprint is False
+
+
 @pytest.mark.asyncio
 async def test_make_stream_short_circuits_state_a_before_llm():
     from backend.routers.chat import ChatRequest, Message, _make_stream

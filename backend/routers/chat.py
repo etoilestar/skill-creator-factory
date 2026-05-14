@@ -810,19 +810,26 @@ def _creator_has_slot(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
 
 def _creator_has_follow_up_round(request: ChatRequest) -> bool:
     """Return True when the user has already answered at least one assistant follow-up."""
-    saw_assistant_follow_up = False
-    user_turns = 0
+    first_user_index: int | None = None
+    second_user_index: int | None = None
 
-    for message in request.messages:
+    for index, message in enumerate(request.messages):
+        if message.role != "user" or not (message.content or "").strip():
+            continue
+        if first_user_index is None:
+            first_user_index = index
+            continue
+        second_user_index = index
+        break
+
+    if first_user_index is None or second_user_index is None:
+        return False
+
+    for message in request.messages[first_user_index + 1:second_user_index]:
         if message.role == "assistant" and not any(
             marker in (message.content or "") for marker in _BLUEPRINT_MARKERS
         ):
-            saw_assistant_follow_up = True
-            continue
-        if message.role == "user" and (message.content or "").strip():
-            user_turns += 1
-            if user_turns >= 2 and saw_assistant_follow_up:
-                return True
+            return True
 
     return False
 
@@ -931,7 +938,7 @@ def _compose_creator_state_injection(
     *,
     blueprint_shown: bool = False,
     requirement_analysis: CreatorRequirementAnalysis | None = None,
-    ) -> str:
+) -> str:
     """Return a system-message string that tells the model its current state.
 
     Injected as a second system message so it acts as a hard constraint that

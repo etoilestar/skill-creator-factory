@@ -838,16 +838,23 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
 
 def _build_creator_clarifying_question(missing_slot: str) -> str:
     """Return a deterministic single-question follow-up for state A."""
-    input_output_prompt = "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。"
+    shared_input_output_question = "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。"
     prompts = {
         "purpose": "好的，我先确认一个关键信息：这个 Skill 最核心要解决什么问题？请用一句话说清它最主要的用途。",
-        "input": input_output_prompt,
-        "output": input_output_prompt,
+        "input": shared_input_output_question,
+        "output": shared_input_output_question,
         "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
         "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
         "follow_up": "好的，我再确认一个关键细节：如果只能优先保证一项，你更希望这个 Skill 优先追求结果质量、响应速度，还是尽量简单易复用？",
     }
     return prompts.get(missing_slot, prompts["input"])
+
+
+def _is_creator_requirement_collection_complete(
+    missing_slots: list[str], has_follow_up_round: bool
+) -> bool:
+    """Blueprint output is allowed only after all slots are covered and a real follow-up is answered."""
+    return not missing_slots and has_follow_up_round
 
 
 def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAnalysis:
@@ -881,7 +888,9 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
         else:
             missing_slots.append(slot_name)
 
-    ready_for_blueprint = not missing_slots and has_follow_up_round
+    ready_for_blueprint = _is_creator_requirement_collection_complete(
+        missing_slots, has_follow_up_round
+    )
     if missing_slots:
         blocking_slot = missing_slots[0]
     elif not has_follow_up_round:
@@ -951,8 +960,8 @@ def _compose_creator_state_injection(
     if state == "A":
         if requirement_analysis is None:
             raise RuntimeError(
-                "Internal error: requirement_analysis must be provided when state is A. "
-                "This indicates a bug in the creator state detection logic."
+                "Internal error: requirement_analysis is required when composing state A injection. "
+                "This indicates the caller did not provide requirement analysis context."
             )
         missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (

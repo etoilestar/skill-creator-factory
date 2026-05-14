@@ -850,7 +850,7 @@ def _build_creator_clarifying_question(missing_slot: str) -> str:
     return prompts.get(missing_slot, prompts["input"])
 
 
-def _is_creator_requirement_collection_complete(
+def _are_creator_requirements_complete(
     missing_slots: list[str], has_follow_up_round: bool
 ) -> bool:
     """Blueprint output is allowed only after all slots are covered and a real follow-up is answered.
@@ -892,7 +892,7 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
         else:
             missing_slots.append(slot_name)
 
-    ready_for_blueprint = _is_creator_requirement_collection_complete(
+    ready_for_blueprint = _are_creator_requirements_complete(
         missing_slots, has_follow_up_round
     )
     if missing_slots:
@@ -965,7 +965,6 @@ def _compose_creator_state_injection(
         if requirement_analysis is None:
             raise RuntimeError(
                 "Internal error: requirement_analysis is required when composing state A injection. "
-                "This indicates the caller has not provided requirement analysis context. "
                 "Ensure _detect_creator_state() runs before _compose_creator_state_injection()."
             )
         missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
@@ -3715,7 +3714,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     raise RuntimeError(
                         "Internal error: creator_state_ctx must be initialized when "
                         "skip_runtime_planner_before_confirmation is enabled. "
-                        "This indicates _detect_creator_state() was not called or its result was not stored."
+                        "Ensure creator_state_ctx is assigned from _detect_creator_state() before this point."
                     )
                 final_messages.append(
                         {

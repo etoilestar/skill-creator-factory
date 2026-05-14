@@ -104,10 +104,14 @@ _CONFIRM_KEYWORDS = (
 
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
+_CREATOR_SLOT_SPAN_CHARS = 40
 
 _CREATOR_INPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(输入|用户会提供|用户输入|接收|读取|上传|原始数据|原文|素材|文本|文件|参数)"),
-    re.compile(r"(根据|基于|把|将).{0,40}(整理|转换|提取|生成|改写|总结|分类|分析)", re.DOTALL),
+    re.compile(
+        rf"(根据|基于|把|将).{{0,{_CREATOR_SLOT_SPAN_CHARS}}}(整理|转换|提取|生成|改写|总结|分类|分析)",
+        re.DOTALL,
+    ),
 )
 _CREATOR_OUTPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(输出|返回|生成|产出|给出|得到|结果|报告|摘要|内容|结论)"),

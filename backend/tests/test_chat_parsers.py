@@ -8,6 +8,9 @@ rejects symlinks escaping the skill execution sandbox.
 import json
 import pytest
 
+STATE_A_PROMPT_PREFIX = "好的，我先确认一个关键信息"
+BLUEPRINT_MARKER = "Skill 蓝图"
+
 
 # ---------------------------------------------------------------------------
 # creator requirement gating
@@ -109,8 +112,9 @@ async def test_make_stream_short_circuits_state_a_before_llm():
         chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
 
     text = "".join(chunks)
-    assert "好的，我先确认一个关键信息" in text
-    assert "Skill 蓝图" not in text
+    # State A must return a deterministic clarifying question instead of a blueprint.
+    assert STATE_A_PROMPT_PREFIX in text
+    assert BLUEPRINT_MARKER not in text
 
 
 # ---------------------------------------------------------------------------

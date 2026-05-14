@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import chat, health, skills
+from .routers import chat, creator, health, skills
 
 app = FastAPI(title="Skill Creator Factory", version="0.1.0")
 
@@ -16,3 +16,4 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(skills.router)
+app.include_router(creator.router)

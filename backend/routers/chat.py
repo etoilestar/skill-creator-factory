@@ -104,12 +104,12 @@ _CONFIRM_KEYWORDS = (
 
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
-_CREATOR_SLOT_SPAN_CHARS = 40
+_CREATOR_REGEX_CONTEXT_WINDOW = 40
 
 _CREATOR_INPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(输入|用户会提供|用户输入|接收|读取|上传|原始数据|原文|素材|文本|文件|参数)"),
     re.compile(
-        rf"(根据|基于|把|将).{{0,{_CREATOR_SLOT_SPAN_CHARS}}}(整理|转换|提取|生成|改写|总结|分类|分析)",
+        rf"(根据|基于|把|将).{{0,{_CREATOR_REGEX_CONTEXT_WINDOW}}}(整理|转换|提取|生成|改写|总结|分类|分析)",
         re.DOTALL,
     ),
 )
@@ -825,7 +825,8 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
     if first_user_index is None or second_user_index is None:
         return False
 
-    for message in request.messages[first_user_index + 1:second_user_index]:
+    for index in range(first_user_index + 1, second_user_index):
+        message = request.messages[index]
         if message.role == "assistant" and not any(
             marker in (message.content or "") for marker in _BLUEPRINT_MARKERS
         ):
@@ -879,12 +880,7 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
             missing_slots.append(slot_name)
 
     ready_for_blueprint = not missing_slots and has_follow_up_round
-    if missing_slots:
-        blocking_slot = missing_slots[0]
-    elif not has_follow_up_round:
-        blocking_slot = "follow_up"
-    else:
-        blocking_slot = ""
+    blocking_slot = missing_slots[0] if missing_slots else ("follow_up" if not has_follow_up_round else "")
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),
@@ -947,7 +943,7 @@ def _compose_creator_state_injection(
     blueprint_marker = _BLUEPRINT_MARKERS[0]
     if state == "A":
         if requirement_analysis is None:
-            raise ValueError(
+            raise RuntimeError(
                 "Internal error: requirement_analysis must be provided when state is A. "
                 "This indicates a bug in the creator state detection logic."
             )

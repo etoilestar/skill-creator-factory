@@ -113,7 +113,7 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
 
 
 @pytest.mark.asyncio
-async def test_make_stream_short_circuits_state_a_before_llm():
+async def test_state_a_returns_clarifying_question_without_llm():
     from backend.routers.chat import ChatRequest, Message, _make_stream
 
     request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])

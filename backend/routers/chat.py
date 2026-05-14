@@ -837,10 +837,11 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
 
 def _build_creator_clarifying_question(missing_slot: str) -> str:
     """Return a deterministic single-question follow-up for state A."""
+    io_prompt = "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。"
     prompts = {
         "purpose": "好的，我先确认一个关键信息：这个 Skill 最核心要解决什么问题？请用一句话说清它最主要的用途。",
-        "input": "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。",
-        "output": "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。",
+        "input": io_prompt,
+        "output": io_prompt,
         "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
         "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
         "follow_up": "好的，我再确认一个关键细节：如果只能优先保证一项，你更希望这个 Skill 优先追求结果质量、响应速度，还是尽量简单易复用？",
@@ -880,7 +881,12 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
             missing_slots.append(slot_name)
 
     ready_for_blueprint = not missing_slots and has_follow_up_round
-    blocking_slot = missing_slots[0] if missing_slots else ("follow_up" if not has_follow_up_round else "")
+    if missing_slots:
+        blocking_slot = missing_slots[0]
+    elif not has_follow_up_round:
+        blocking_slot = "follow_up"
+    else:
+        blocking_slot = ""
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),

@@ -3103,7 +3103,25 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "请不要假装已经读取该子 Skill 正文。"
                         )
 
-            if enable_resource_preload:
+            # Detect creator state early so we can skip unnecessary LLM calls in state A.
+            # _detect_creator_state is a pure function (reads request.messages only) so it is
+            # safe to call before the resource-preload block.  The variable is also referenced
+            # further down when building final_messages.
+            creator_state: str = "A"
+            if skip_runtime_planner_before_confirmation:
+                creator_state = _detect_creator_state(request)
+                yield _thought(
+                    "creator_state",
+                    "创建者状态",
+                    f"当前状态：{creator_state}",
+                    {"state": creator_state},
+                )
+
+            # Skip resource preload entirely in state A (requirement-collection phase).
+            # In state A the model only needs to ask one clarifying question — loading
+            # references via an extra LLM call is wasteful and can produce spurious
+            # "not valid JSON" warnings when the model ignores the JSON-only prompt.
+            if enable_resource_preload and creator_state != "A":
                 resource_catalog = _extract_runtime_resource_catalog(body_prompt)
                 if resource_catalog:
                     yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
@@ -3477,31 +3495,18 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 }
             ]
 
-            if strict_creator_generation:
-                final_messages.append(
-                    {
-                        "role": "system",
-                        "content": _compose_creator_artifact_consistency_prompt(),
-                    }
-                )
-
-            # creator_state is resolved below; default to "A" so the variable is
-            # always bound even when skip_runtime_planner_before_confirmation is False.
-            creator_state: str = "A"
-
+            # Inject the per-state constraint immediately after the body prompt so that
+            # small models see it before any other system instructions.  This is
+            # important for state A: without this ordering, the artifact-consistency
+            # prompt ("你正在创建一个可运行的 Skill 包") comes first and overrides the
+            # "ask one question only" constraint, causing the model to skip requirement
+            # collection and jump straight to blueprint generation.
             if skip_runtime_planner_before_confirmation:
-                creator_state = _detect_creator_state(request)
                 final_messages.append(
                     {
                         "role": "system",
                         "content": _compose_creator_state_injection(creator_state),
                     }
-                )
-                yield _thought(
-                    "creator_state",
-                    "创建者状态",
-                    f"当前状态：{creator_state}",
-                    {"state": creator_state},
                 )
 
                 # When the frontend drives file creation (plan C), state-C just needs a
@@ -3519,6 +3524,19 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             ),
                         }
                     )
+
+            # Artifact-consistency prompt is only relevant during blueprint-revision
+            # (state B) and file-generation (state C).  In state A the model is still
+            # gathering requirements; injecting "you are in strict creation mode" here
+            # contradicts the state-A constraint and causes weaker models to skip
+            # requirement collection entirely.
+            if strict_creator_generation and creator_state != "A":
+                final_messages.append(
+                    {
+                        "role": "system",
+                        "content": _compose_creator_artifact_consistency_prompt(),
+                    }
+                )
 
             if strict_skill_execution:
                 final_messages.append(

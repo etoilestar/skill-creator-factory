@@ -3247,7 +3247,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 _early_creator_state = None
                 should_skip_runtime_planner = False
 
+            # Track whether the runtime planner handled this turn.  The fallback
+            # executor (_plan_and_execute_generated_output) must NOT run when the
+            # planner already ran: the planner is the authoritative decision maker
+            # for sandbox skills and its verdict (execute / direct_answer / ask_user
+            # / not_applicable) should not be silently overridden by the legacy
+            # fallback path.
+            _runtime_planner_ran = False
+
             if enable_action_execution and not should_skip_runtime_planner and not disable_runtime_planner:
+                _runtime_planner_ran = True
                 try:
                     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
                     runtime_plan = await _run_skill_runtime_planner_round(
@@ -3480,7 +3489,25 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         yield "data: [DONE]\n\n"
                         return
 
-                    # mode == direct_answer 时继续走普通主模型回复。
+                    # mode == "execute" but planner returned no tasks: the planner
+                    # decided execution was needed but could not generate concrete
+                    # tasks (degenerate plan).  Return early with a clear message
+                    # instead of silently falling through to the main model path
+                    # and the fallback executor, which would produce a second,
+                    # unrelated execution attempt.
+                    if mode == "execute" and not tasks:
+                        yield _sse({"status": None})
+                        errors = runtime_plan.get("errors") or []
+                        if errors:
+                            detail = "\n".join(f"- {json.dumps(e, ensure_ascii=False)}" for e in errors)
+                            text = f"运行时规划选择了执行模式，但未生成具体任务：\n{detail}"
+                        else:
+                            text = "运行时规划选择了执行模式，但未生成具体任务，请重新描述需求。"
+                        yield _sse({"content": text})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    # mode == "direct_answer": continue to the main model reply below.
                     yield _sse({"status": None})
 
                 except Exception as exc:
@@ -3555,7 +3582,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             assistant_text = "".join(assistant_chunks)
 
-            if enable_action_execution:
+            if enable_action_execution and not _runtime_planner_ran:
                 try:
                     exec_result = await _plan_and_execute_generated_output(
                         assistant_text=assistant_text,

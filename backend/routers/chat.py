@@ -804,6 +804,25 @@ def _creator_has_slot(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
     return any(pattern.search(text) for pattern in patterns)
 
 
+def _creator_has_follow_up_round(request: ChatRequest) -> bool:
+    """Return True when the user has already answered at least one assistant follow-up."""
+    saw_assistant_follow_up = False
+    user_turns = 0
+
+    for message in request.messages:
+        if message.role == "assistant" and not any(
+            marker in (message.content or "") for marker in _BLUEPRINT_MARKERS
+        ):
+            saw_assistant_follow_up = True
+            continue
+        if message.role == "user" and (message.content or "").strip():
+            user_turns += 1
+            if user_turns >= 2 and saw_assistant_follow_up:
+                return True
+
+    return False
+
+
 def _build_creator_clarifying_question(missing_slot: str) -> str:
     """Return a deterministic single-question follow-up for state A."""
     prompts = {
@@ -831,6 +850,7 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
     has_output = _creator_has_slot(_CREATOR_OUTPUT_PATTERNS, combined)
     has_scenario = _creator_has_slot(_CREATOR_SCENARIO_PATTERNS, combined)
     has_resources = _creator_has_slot(_CREATOR_RESOURCE_PATTERNS, combined)
+    has_follow_up_round = _creator_has_follow_up_round(request)
 
     collected_slots: list[str] = []
     missing_slots: list[str] = []
@@ -847,10 +867,10 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
         else:
             missing_slots.append(slot_name)
 
-    ready_for_blueprint = not missing_slots and len(user_texts) >= 2
+    ready_for_blueprint = not missing_slots and has_follow_up_round
     if missing_slots:
         blocking_slot = missing_slots[0]
-    elif len(user_texts) < 2:
+    elif not has_follow_up_round:
         blocking_slot = "follow_up"
     else:
         blocking_slot = ""
@@ -907,7 +927,7 @@ def _compose_creator_state_injection(
     *,
     blueprint_shown: bool = False,
     requirement_analysis: CreatorRequirementAnalysis | None = None,
-) -> str:
+    ) -> str:
     """Return a system-message string that tells the model its current state.
 
     Injected as a second system message so it acts as a hard constraint that
@@ -916,7 +936,10 @@ def _compose_creator_state_injection(
     blueprint_marker = _BLUEPRINT_MARKERS[0]
     if state == "A":
         if requirement_analysis is None:
-            raise ValueError("requirement_analysis is required for creator state A")
+            raise ValueError(
+                "Internal error: requirement_analysis must be provided when state is A. "
+                "This indicates a bug in the creator state detection logic."
+            )
         missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (
             "【后端状态注入】当前状态：A（需求收集）\n\n"
@@ -953,6 +976,15 @@ def _compose_creator_state_injection(
         "本轮可以：创建目录、写入文件、输出 SKILL.md 和脚本代码块、执行校验、报告结果。\n"
         "按照蓝图逐步完成所有文件的创建，完成后给出简短报告。"
     )
+
+
+def _simple_sse_content_response(content: str) -> list[str]:
+    """Return a minimal SSE response payload containing one assistant message."""
+    return [
+        _sse({"status": None}),
+        _sse({"content": content}),
+        "data: [DONE]\n\n",
+    ]
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -3180,11 +3212,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # Detect creator state before loading the creator body so requirement collection
             # can be enforced as a backend gate instead of relying on prompt following.
             creator_state: str = "A"
-            creator_state_ctx = CreatorStateContext(
-                state="A",
-                blueprint_shown=False,
-                requirements=CreatorRequirementAnalysis(0, [], [], False, ""),
-            )
+            creator_state_ctx: CreatorStateContext | None = None
             if skip_runtime_planner_before_confirmation:
                 creator_state_ctx = _detect_creator_state(request)
                 creator_state = creator_state_ctx.state
@@ -3202,9 +3230,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
                 if creator_state == "A":
-                    yield _sse({"status": None})
-                    yield _sse({"content": creator_state_ctx.requirements.next_question})
-                    yield "data: [DONE]\n\n"
+                    for event in _simple_sse_content_response(
+                        creator_state_ctx.requirements.next_question
+                    ):
+                        yield event
                     return
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})

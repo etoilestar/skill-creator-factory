@@ -343,7 +343,8 @@ async def generate_file(request: GenerateFileRequest):
                 skill_name,
                 request.file_path,
             )
-            yield _sse({"error": str(exc)})
+            # Return a safe user-facing message; full stack trace is in server logs.
+            yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

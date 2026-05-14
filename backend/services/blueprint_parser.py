@@ -85,8 +85,10 @@ _SKIP_PHRASES: tuple[str, ...] = (
     "暂无",
     "none",
     "n/a",
-    "无\n",
 )
+
+# Maximum allowed length (chars) for a normalised Skill name.
+_MAX_SKILL_NAME_LENGTH = 64
 
 # Valid extensions per directory
 _SCRIPT_EXTENSIONS: frozenset[str] = frozenset(
@@ -155,7 +157,7 @@ def parse_skill_name(blueprint_text: str) -> str | None:
     )
     normalised = re.sub(r"-{2,}", "-", normalised).strip("-")
 
-    if not normalised or len(normalised) > 64:
+    if not normalised or len(normalised) > _MAX_SKILL_NAME_LENGTH:
         return None
 
     return normalised

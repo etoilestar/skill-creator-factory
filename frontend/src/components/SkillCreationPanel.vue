@@ -443,9 +443,9 @@ async function startCreation() {
       phase.value = 'paused'
       // Wait until resumed
       await new Promise(resolve => {
-        const unwatch = setInterval(() => {
+        const pauseCheckInterval = setInterval(() => {
           if (!paused.value) {
-            clearInterval(unwatch)
+            clearInterval(pauseCheckInterval)
             resolve()
           }
         }, 200)

@@ -952,7 +952,7 @@ def _compose_creator_state_injection(
             "【后端状态注入】当前状态：A（需求收集）\n\n"
             f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
-            "1. 只允许输出一个问题，向用户询问当前最缺失的需求信息；问题的措辞和方式由你自主决定。\n"
+            "1. 只允许输出一个问题，向用户询问当前最缺失的需求信息，问题的措辞和方式由你自主决定。\n"
             f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"

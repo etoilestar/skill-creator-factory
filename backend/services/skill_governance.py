@@ -9,8 +9,13 @@ from tempfile import NamedTemporaryFile
 from ..config import settings
 from .skill_metadata import parse_skill_frontmatter
 
+# Scope resolution follows OpenClaw-style precedence: workspace overrides shared,
+# shared overrides managed, and bundled provides the lowest-priority fallback.
 SCOPE_PRIORITY = ["workspace", "shared", "managed", "bundled"]
+# Only approved skills are executable in governed runtime paths.
 EXECUTABLE_STATUSES = {"approved"}
+# Managed skills are editable in this app; all other scopes are treated as
+# imported or externally managed sources and are therefore read-only.
 NON_EDITABLE_SCOPES = {"workspace", "shared", "bundled"}
 DEFAULT_VERSION = "0.1.0"
 

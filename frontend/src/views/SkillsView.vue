@@ -94,7 +94,7 @@
               <div class="governance-card">
                 <div class="governance-title">版本历史</div>
                 <div v-if="versions.length" class="governance-list">
-                  <div v-for="versionEntry in recentVersions" :key="`${versionEntry.version}-${versionEntry.timestamp}`">
+                  <div v-for="versionEntry in latestVersions" :key="`${versionEntry.version}-${versionEntry.timestamp}`">
                     v{{ versionEntry.version }} · {{ versionEntry.source_type || 'unknown' }}
                   </div>
                 </div>
@@ -277,7 +277,7 @@ const rollbackVersion = ref('')
 const allowlistEditor = ref(false)
 const allowlistText = ref('')
 const allowlistError = ref('')
-const recentVersions = computed(() => versions.value.slice(-5).reverse())
+const latestVersions = computed(() => versions.value.slice(-5).reverse())
 
 // asset editor
 const assetEditor = ref(null)

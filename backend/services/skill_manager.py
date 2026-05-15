@@ -157,7 +157,10 @@ def list_skill_assets(skill_name: str) -> dict:
     result: dict[str, list[str]] = {}
     for folder in sorted(_ALLOWED_ASSET_FOLDERS):
         folder_dir = skill_dir / folder
-        result[folder] = sorted(p.name for p in folder_dir.iterdir() if p.is_file()) if folder_dir.is_dir() else []
+        if folder_dir.is_dir():
+            result[folder] = sorted(path.name for path in folder_dir.iterdir() if path.is_file())
+        else:
+            result[folder] = []
     return result
 
 

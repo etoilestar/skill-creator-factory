@@ -221,7 +221,7 @@ def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, byt
         names = zf.namelist()
         for entry in names:
             parts = Path(entry).parts
-            if any(part in ("..", "") or part.startswith("/") for part in parts):
+            if any(path_component in ("..", "") or path_component.startswith("/") for path_component in parts):
                 raise ValueError(f"ZIP 包含非法路径: {entry}")
 
         real_names = [name for name in names if not name.startswith("__MACOSX/") and name != "__MACOSX"]

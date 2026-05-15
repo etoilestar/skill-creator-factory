@@ -11,7 +11,7 @@ from .skill_metadata import parse_skill_frontmatter
 
 SCOPE_PRIORITY = ["workspace", "shared", "managed", "bundled"]
 EXECUTABLE_STATUSES = {"approved"}
-READ_ONLY_SCOPES = {"workspace", "shared", "bundled"}
+NON_EDITABLE_SCOPES = {"workspace", "shared", "bundled"}
 DEFAULT_VERSION = "0.1.0"
 
 
@@ -37,6 +37,10 @@ def _skill_scope_roots() -> list[tuple[str, Path]]:
         ("managed", managed_root),
         ("bundled", settings.bundled_skills_path),
     ]
+
+
+def allowed_skill_roots() -> list[Path]:
+    return [root for _scope, root in _skill_scope_roots()]
 
 
 def _scope_rank(scope: str) -> int:
@@ -200,7 +204,7 @@ def _decorate_entry(entry: dict, shadowed: list[dict], *, mode: str) -> dict:
     item["can_view"] = _record_visible(mode, entry, action="visible")
     item["allowlisted_for_execute"] = _record_visible(mode, entry, action="execute")
     item["can_execute"] = item["allowlisted_for_execute"] and item["status"] in EXECUTABLE_STATUSES
-    item["editable"] = entry["scope"] not in READ_ONLY_SCOPES
+    item["editable"] = entry["scope"] not in NON_EDITABLE_SCOPES
     item["executable_status"] = entry["status"] in EXECUTABLE_STATUSES
     item["governance"] = {
         "status": item["status"],
@@ -269,7 +273,7 @@ def managed_skill_root(skill_name: str) -> Path:
 def _snapshot_skill(skill_name: str, version: str, root: Path) -> str | None:
     if not root.exists():
         return None
-    stamp = _now().replace(":", "-")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     dest = _snapshots_root() / skill_name / f"{version}-{stamp}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():

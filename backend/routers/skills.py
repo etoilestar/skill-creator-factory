@@ -49,7 +49,7 @@ class RollbackSkillRequest(BaseModel):
 
 @router.get("")
 async def get_all_skills(
-    mode: str = Query("manage"),
+    mode: str = Query("manage", description="治理模式：manage / sandbox / creator"),
     include_hidden: bool = Query(False),
 ):
     """List all skills in the skills directory."""
@@ -104,7 +104,7 @@ async def write_allowlist(payload: dict):
 
 
 @router.get("/{skill_name}")
-async def get_one_skill(skill_name: str, mode: str = Query("manage")):
+async def get_one_skill(skill_name: str, mode: str = Query("manage", description="治理模式：manage / sandbox / creator")):
     """Get a single skill's metadata and SKILL.md content."""
     try:
         return get_skill(skill_name, mode=mode)

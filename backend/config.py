@@ -47,8 +47,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _ensure_paths(self) -> "Settings":
         """Create skills_path if it does not exist; kernel_path must already exist."""
-        if self.skills_path != self.managed_skills_path:
-            self.managed_skills_path = self.skills_path
+        self.managed_skills_path = self.skills_path
         self.managed_skills_path.mkdir(parents=True, exist_ok=True)
         self.workspace_skills_path.mkdir(parents=True, exist_ok=True)
         self.shared_skills_path.mkdir(parents=True, exist_ok=True)

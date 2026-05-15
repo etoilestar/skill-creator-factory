@@ -28,6 +28,7 @@ from ..services.kernel_loader import (
     read_skill_resource_text,
 )
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.skill_governance import allowed_skill_roots
 from ..services.skill_manager import get_execution_skill_dir
 
 logger = logging.getLogger(__name__)
@@ -1267,12 +1268,7 @@ async def _run_child_skill_selection_round(
 
 def _allowed_skill_roots() -> list[Path]:
     """Return directories under which the executor may create or modify files."""
-    roots: list[Path] = [
-        settings.workspace_skills_path.expanduser().resolve(),
-        settings.shared_skills_path.expanduser().resolve(),
-        Path(settings.skills_path).expanduser().resolve(),
-        settings.bundled_skills_path.expanduser().resolve(),
-    ]
+    roots = [root.expanduser().resolve() for root in allowed_skill_roots()]
 
     deduped: list[Path] = []
     seen: set[str] = set()

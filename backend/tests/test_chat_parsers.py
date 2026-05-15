@@ -113,7 +113,8 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
 
 
 @pytest.mark.asyncio
-async def test_state_a_returns_clarifying_question_without_llm():
+async def test_state_a_returns_clarifying_question_from_llm():
+    from unittest.mock import AsyncMock, patch
     from backend.routers.chat import ChatRequest, Message, _make_stream
 
     request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])
@@ -133,13 +134,21 @@ async def test_state_a_returns_clarifying_question_without_llm():
         "use_frontend_driven_creation": True,
     }
 
-    response = _make_stream(skill_context, request)
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    mocked_llm_response = (
+        '{"action": "ask_user", "question": "好的，我先确认一个关键信息：'
+        '请描述这个技能的输入和输出。"}'
+    )
+    with patch(
+        "backend.routers.chat.complete_chat_once", new_callable=AsyncMock
+    ) as mock_llm:
+        mock_llm.return_value = mocked_llm_response
+        response = _make_stream(skill_context, request)
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
 
     text = "".join(chunks)
-    # State A must return a deterministic clarifying question instead of a blueprint.
+    # State A must return a clarifying question (from LLM) instead of a blueprint.
     assert STATE_A_PROMPT_PREFIX in text
     assert BLUEPRINT_MARKER not in text
 
@@ -536,3 +545,72 @@ def test_is_within_sandbox_nested_path_ok(tmp_path):
 
     sandbox = (tmp_path / "skill").resolve()
     assert _is_within_sandbox(nested, sandbox) is True
+
+
+# ---------------------------------------------------------------------------
+# _parse_creator_initial_decision
+# ---------------------------------------------------------------------------
+
+def test_parse_creator_initial_decision_ask_user():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    text = '{"action": "ask_user", "question": "请描述输入和输出"}'
+    result = _parse_creator_initial_decision(text)
+    assert result["action"] == "ask_user"
+    assert result["question"] == "请描述输入和输出"
+
+
+def test_parse_creator_initial_decision_proceed():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    text = '{"action": "proceed", "reason": "信息充分"}'
+    result = _parse_creator_initial_decision(text)
+    assert result["action"] == "proceed"
+    assert result["reason"] == "信息充分"
+
+
+def test_parse_creator_initial_decision_need_body():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    text = '{"action": "need_body", "reason": "需要更多背景信息"}'
+    result = _parse_creator_initial_decision(text)
+    assert result["action"] == "need_body"
+
+
+def test_parse_creator_initial_decision_invalid_json_defaults_ask_user():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    result = _parse_creator_initial_decision("not json at all")
+    assert result["action"] == "ask_user"
+    assert result["question"]  # non-empty fallback question
+
+
+def test_parse_creator_initial_decision_unknown_action_defaults_ask_user():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    result = _parse_creator_initial_decision('{"action": "unknown_action"}')
+    assert result["action"] == "ask_user"
+
+
+def test_parse_creator_initial_decision_ask_user_empty_question_defaults():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    result = _parse_creator_initial_decision('{"action": "ask_user", "question": ""}')
+    assert result["action"] == "ask_user"
+    assert result["question"]  # non-empty fallback
+
+
+def test_parse_creator_initial_decision_non_dict_defaults_ask_user():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    result = _parse_creator_initial_decision('["not", "an", "object"]')
+    assert result["action"] == "ask_user"
+
+
+def test_parse_creator_initial_decision_json_in_markdown_fence():
+    from backend.routers.chat import _parse_creator_initial_decision
+
+    text = '```json\n{"action": "proceed", "reason": "clear request"}\n```'
+    result = _parse_creator_initial_decision(text)
+    assert result["action"] == "proceed"
+    assert result.get("reason") == "clear request"

@@ -3,8 +3,9 @@ import re as _re
 import subprocess
 import sys as _sys
 from pathlib import Path as _Path
+from typing import Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -12,20 +13,26 @@ from ..services.skill_manager import (
     delete_asset,
     delete_skill,
     get_asset,
+    get_execution_skill_dir,
     get_skill,
+    get_skill_versions,
+    get_visible_skill_dir,
     import_skill_zip,
     list_skill_assets,
     list_skills,
+    rollback_skill,
     save_asset,
     save_skill,
+    upgrade_skill_zip,
     update_asset,
 )
-from ..config import settings
+from ..services.skill_governance import get_allowlist, get_events, transition_skill_status, update_allowlist
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 _MAX_ZIP_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+SkillMode = Literal["manage", "sandbox", "creator"]
 
 
 class SaveSkillRequest(BaseModel):
@@ -33,10 +40,22 @@ class SaveSkillRequest(BaseModel):
     content: str
 
 
+class SkillStatusRequest(BaseModel):
+    action: str
+    reason: str = ""
+
+
+class RollbackSkillRequest(BaseModel):
+    version: str
+
+
 @router.get("")
-async def get_all_skills():
+async def get_all_skills(
+    mode: SkillMode = Query("manage", description="治理模式：manage / sandbox / creator"),
+    include_hidden: bool = Query(False),
+):
     """List all skills in the skills directory."""
-    return list_skills()
+    return list_skills(mode=mode, include_hidden=include_hidden)
 
 
 @router.post("/import")
@@ -61,13 +80,40 @@ async def import_skill_from_zip(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.get("/{skill_name}")
-async def get_one_skill(skill_name: str):
-    """Get a single skill's metadata and SKILL.md content."""
+@router.post("/{skill_name}/upgrade")
+async def upgrade_skill_from_zip(skill_name: str, file: UploadFile = File(...)):
+    if file.size is not None and file.size > _MAX_ZIP_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ZIP 文件超过 50 MB 限制")
+    data = await file.read()
+    if len(data) > _MAX_ZIP_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ZIP 文件超过 50 MB 限制")
     try:
-        return get_skill(skill_name)
+        return upgrade_skill_zip(skill_name, data)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/governance/allowlist")
+async def read_allowlist():
+    return get_allowlist()
+
+
+@router.put("/governance/allowlist")
+async def write_allowlist(payload: dict):
+    return update_allowlist(payload)
+
+
+@router.get("/{skill_name}")
+async def get_one_skill(skill_name: str, mode: SkillMode = Query("manage", description="治理模式：manage / sandbox / creator")):
+    """Get a single skill's metadata and SKILL.md content."""
+    try:
+        return get_skill(skill_name, mode=mode)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.post("")
@@ -86,6 +132,37 @@ async def remove_skill(skill_name: str):
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@router.post("/{skill_name}/status")
+async def change_skill_status(skill_name: str, request: SkillStatusRequest):
+    try:
+        return transition_skill_status(skill_name, request.action, reason=request.reason)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{skill_name}/events")
+async def list_skill_events(skill_name: str):
+    return {"events": get_events(skill_name)}
+
+
+@router.get("/{skill_name}/versions")
+async def list_skill_versions(skill_name: str):
+    try:
+        return get_skill_versions(skill_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/{skill_name}/rollback")
+async def rollback_skill_version(skill_name: str, request: RollbackSkillRequest):
+    try:
+        return rollback_skill(skill_name, request.version)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @router.get("/{skill_name}/assets")
 async def get_skill_assets(skill_name: str):
     """List asset files grouped by sub-directory for a skill."""
@@ -93,6 +170,8 @@ async def get_skill_assets(skill_name: str):
         return list_skill_assets(skill_name)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.post("/{skill_name}/assets")
@@ -114,6 +193,8 @@ async def upload_skill_asset(
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.get("/{skill_name}/assets/{folder}/{filename}")
@@ -124,6 +205,8 @@ async def get_skill_asset_content(skill_name: str, folder: str, filename: str):
         return {"content": content}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         if "Binary" in str(exc):
             raise HTTPException(status_code=415, detail=str(exc))
@@ -143,6 +226,8 @@ async def update_skill_asset_content(skill_name: str, folder: str, filename: str
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 @router.delete("/{skill_name}/assets/{folder}/{filename}")
@@ -155,6 +240,8 @@ async def remove_skill_asset(skill_name: str, folder: str, filename: str):
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +283,12 @@ async def run_skill_script(skill_name: str, filename: str, request: RunScriptReq
     ):
         raise HTTPException(status_code=400, detail="文件名非法或不是 .py 文件")
 
-    skill_dir = settings.skills_path / skill_name
-    if not skill_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+    try:
+        skill_dir = get_execution_skill_dir(skill_name, mode="sandbox")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     script_path = skill_dir / "scripts" / safe_name
     if not script_path.is_file():
@@ -284,9 +374,12 @@ async def upload_sandbox_input(
             detail=f"不支持的文件类型 '{suffix}'，允许类型：{', '.join(sorted(_SANDBOX_INPUT_ALLOWED_SUFFIXES))}",
         )
 
-    skill_dir = (settings.skills_path / skill_name).resolve()
-    if not skill_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+    try:
+        skill_dir = get_execution_skill_dir(skill_name, mode="sandbox").resolve()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     target_dir = skill_dir / "inputs" / session_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -309,9 +402,12 @@ async def list_skill_outputs(skill_name: str):
     Returns name, relative path, download URL, size (bytes), and last-modified
     timestamp (Unix epoch seconds) for each file.
     """
-    skill_dir = (settings.skills_path / skill_name).resolve()
-    if not skill_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+    try:
+        skill_dir = get_execution_skill_dir(skill_name, mode="sandbox").resolve()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     outputs_dir = skill_dir / "outputs"
     if not outputs_dir.exists():
@@ -340,9 +436,12 @@ async def download_skill_file(skill_name: str, filepath: str):
     Serves any file that lives under skills/{skill_name}/, with path-traversal
     protection.  Typical use: output files written to skills/{name}/outputs/.
     """
-    skill_dir = (settings.skills_path / skill_name).resolve()
-    if not skill_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+    try:
+        skill_dir = get_visible_skill_dir(skill_name, mode="manage").resolve()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     # Reject obviously malicious inputs before constructing the path
     if "\x00" in filepath:

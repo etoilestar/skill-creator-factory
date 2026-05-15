@@ -10,5 +10,6 @@ frontend/.env*.local
 
 skills/*/
 !skills/.gitkeep
+.skill-governance/
 
 .DS_Store

@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # Filesystem paths
     kernel_path: Path = PROJECT_ROOT / "kernel"
     skills_path: Path = PROJECT_ROOT / "skills"
+    managed_skills_path: Path = PROJECT_ROOT / "skills"
+    workspace_skills_path: Path = PROJECT_ROOT / ".agents" / "skills"
+    shared_skills_path: Path = Path.home() / ".agents" / "skills"
+    bundled_skills_path: Path = PROJECT_ROOT / "bundled-skills"
+    governance_path: Path = PROJECT_ROOT / ".skill-governance"
 
     # Resource reading limit per file (characters) used by read_skill_resource_text.
     skill_resource_max_chars: int = 20000
@@ -42,7 +47,13 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _ensure_paths(self) -> "Settings":
         """Create skills_path if it does not exist; kernel_path must already exist."""
-        self.skills_path.mkdir(parents=True, exist_ok=True)
+        self.managed_skills_path = self.skills_path
+        self.managed_skills_path.mkdir(parents=True, exist_ok=True)
+        self.workspace_skills_path.mkdir(parents=True, exist_ok=True)
+        self.shared_skills_path.mkdir(parents=True, exist_ok=True)
+        self.bundled_skills_path.mkdir(parents=True, exist_ok=True)
+        self.governance_path.mkdir(parents=True, exist_ok=True)
+        self.skills_path = self.managed_skills_path
         if not self.kernel_path.exists():
             raise ValueError(
                 f"kernel_path does not exist: {self.kernel_path}. "

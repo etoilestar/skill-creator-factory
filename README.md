@@ -28,12 +28,13 @@ skill-creator-factory/
 │   ├── config.py             # 环境变量 & 路径配置（pydantic-settings）
 │   ├── routers/
 │   │   ├── chat.py           # POST /api/chat/creator & /api/chat/sandbox/{name}
-│   │   ├── skills.py         # CRUD /api/skills
+│   │   ├── skills.py         # /api/skills + governance / approval / upgrade / rollback
 │   │   └── health.py         # GET /api/health
 │   └── services/
-│       ├── kernel_loader.py  # 加载 kernel/SKILL.md 或 skills/{name}/SKILL.md
+│       ├── kernel_loader.py  # 按治理后的 skill resolver 加载 kernel / user skill
 │       ├── llm_proxy.py      # 流式代理至 Ollama/LM Studio（OpenAI 兼容）
-│       └── skill_manager.py  # Skill 目录 CRUD + YAML frontmatter 解析
+│       ├── skill_governance.py # registry / allowlist / 审批 / 版本 / 审计
+│       └── skill_manager.py  # Skill 安装 / CRUD / ZIP 导入升级 / 资源读写
 │
 ├── frontend/                 # Vue 3 + Vite 前端
 │   └── src/
@@ -217,8 +218,23 @@ python kernel/scripts/package_skill.py skills/<skill-name> [output-dir]
 | `POST` | `/api/chat/sandbox/{skill_name}` | Sandbox 模式流式对话（SSE） |
 | `GET` | `/api/skills` | 获取所有 Skill 列表 |
 | `POST` | `/api/skills` | 创建/覆盖一个 Skill |
+| `POST` | `/api/skills/import` | 导入 Skill ZIP，并记录安装治理信息 |
 | `GET` | `/api/skills/{skill_name}` | 获取单个 Skill 详情 |
 | `DELETE` | `/api/skills/{skill_name}` | 删除一个 Skill |
+| `POST` | `/api/skills/{skill_name}/status` | 提交审批 / 批准 / 驳回 / 隔离 / 启用 / 禁用 |
+| `POST` | `/api/skills/{skill_name}/upgrade` | 用 ZIP 升级一个 Skill |
+| `POST` | `/api/skills/{skill_name}/rollback` | 回滚到指定历史版本 |
+| `GET` | `/api/skills/{skill_name}/versions` | 查看当前版本与版本历史 |
+| `GET` | `/api/skills/{skill_name}/events` | 查看治理事件与审计记录 |
+| `GET/PUT` | `/api/skills/governance/allowlist` | 查看/更新 allowlist 配置 |
+
+当前 Skill 运行治理支持：
+
+- `workspace / shared / managed / bundled` 多作用域解析
+- allowlist 控制可见性与可执行性
+- `draft / pending_review / approved / rejected / quarantined / disabled` 生命周期状态
+- ZIP 安装、升级、版本快照与回滚
+- 治理事件审计与前端最小治理视图
 
 **流式响应格式**（SSE）
 

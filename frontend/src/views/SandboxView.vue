@@ -9,7 +9,7 @@
       <select v-model="selectedSkill" @change="resetChat" :disabled="streaming">
         <option value="">-- 选择 Skill --</option>
         <option v-for="sk in skills" :key="sk.name" :value="sk.name">
-          {{ sk.display_name || sk.name }}
+          {{ sk.display_name || sk.name }} · {{ sk.scope }} · {{ sk.status }}
         </option>
       </select>
       <button class="btn-ghost" @click="resetChat" :disabled="streaming || !selectedSkill">
@@ -234,7 +234,7 @@ const roundOutputFiles = ref([])  // [{ path, url, name? }]
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
 onMounted(async () => {
-  skills.value = await fetchSkills()
+  skills.value = await fetchSkills('sandbox')
 })
 
 function resetChat() {

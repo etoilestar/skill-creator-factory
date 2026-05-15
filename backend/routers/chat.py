@@ -1196,6 +1196,130 @@ async def _run_metadata_round(
     decision_text = await complete_chat_once(messages, model)
     return _parse_need_body_decision(decision_text)
 
+
+def _compose_creator_initial_decision_prompt(metadata_prompt: str) -> str:
+    """Build the system prompt for the creator initial decision round.
+
+    指示大模型根据用户输入和 SKILL.md frontmatter 判断下一步行动。
+    输出严格 JSON，共三种 action：
+    - need_body: 需要阅读 SKILL.md 正文才能判断
+    - ask_user:  需要用户补充具体信息
+    - proceed:   信息已足够，可进入蓝图生成阶段
+    """
+    return (
+        "你是技能创建向导的决策路由器。\n\n"
+        "下面是 skill-creator 技能的元数据（SKILL.md frontmatter）和用户的输入。\n"
+        "你的任务是判断下一步应该做什么。\n\n"
+        "=== Skill 元数据 ===\n"
+        f"{metadata_prompt}\n"
+        "===================\n\n"
+        "判断规则：\n"
+        "1. 如果用户的描述已经足够清晰（包含技能用途、目标场景或具体示例），"
+        "输出 proceed，进入蓝图生成阶段。不要过度追问。\n"
+        "2. 如果用户描述模糊、缺少关键信息（例如不清楚输入是什么、输出是什么、适用场景是什么），"
+        "输出 ask_user，附上一个具体的追问。问题要简洁，只问最重要的一个缺失信息。\n"
+        "3. 如果仅凭元数据无法判断，但阅读 SKILL.md 正文可能有帮助，输出 need_body。\n\n"
+        "优先选 proceed，其次 ask_user，最后 need_body。\n\n"
+        "只输出严格 JSON，禁止任何 Markdown 或说明文字。格式如下：\n"
+        '{"action": "proceed", "reason": "简短原因"}\n'
+        '{"action": "ask_user", "question": "面向用户的追问（中文，简洁）"}\n'
+        '{"action": "need_body", "reason": "需要正文的简短原因"}\n'
+    )
+
+
+def _parse_creator_initial_decision(text: str) -> dict:
+    """Parse the creator initial decision from LLM JSON output.
+
+    容错：若解析失败或 action 不合法，默认返回 ask_user 并附带通用引导语。
+    """
+    _VALID_ACTIONS = {"need_body", "ask_user", "proceed"}
+    _DEFAULT: dict = {
+        "action": "ask_user",
+        "question": "请描述您想创建的技能的具体功能和使用场景。",
+    }
+
+    stripped = _strip_markdown_json_fence(text)
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("creator initial decision is not valid JSON: %s", text[:500])
+        return _DEFAULT
+
+    if not isinstance(data, dict):
+        logger.warning("creator initial decision is not a JSON object: %s", text[:500])
+        return _DEFAULT
+
+    action = str(data.get("action") or "").strip()
+    if action not in _VALID_ACTIONS:
+        logger.warning("creator initial decision has unknown action=%r: %s", action, text[:500])
+        return _DEFAULT
+
+    if action == "ask_user":
+        question = str(data.get("question") or "").strip()
+        if not question:
+            return _DEFAULT
+        return {"action": "ask_user", "question": question}
+
+    reason = str(data.get("reason") or "").strip()
+    return {"action": action, "reason": reason}
+
+
+async def _run_creator_initial_decision_round(
+    *,
+    metadata_prompt: str,
+    body_loader,
+    request: ChatRequest,
+    model: str,
+) -> dict:
+    """Multi-round LLM decision for creator mode requirement collection.
+
+    最多调用大模型两轮：
+    - Round 0：仅使用 metadata + 用户消息 → 判断 need_body / ask_user / proceed
+    - Round 1（仅当 Round 0 返回 need_body 时）：
+        加载 SKILL.md 正文 + metadata + 用户消息 → 再次判断
+        若 Round 1 仍返回 need_body，强制升级为 proceed（防止循环）
+
+    返回最终 action dict（ask_user 或 proceed）。
+    """
+    # Round 0: metadata only
+    round0_system = _compose_creator_initial_decision_prompt(metadata_prompt)
+    messages0: list[dict] = [{"role": "system", "content": round0_system}]
+    messages0.extend(_request_messages_with_files(request))
+
+    raw0 = await complete_chat_once(messages0, model)
+    decision0 = _parse_creator_initial_decision(raw0)
+    logger.info("[creator_decision][round0] action=%s", decision0.get("action"))
+
+    if decision0["action"] != "need_body":
+        return decision0
+
+    # Round 1: metadata + SKILL.md body
+    try:
+        body_text = body_loader()
+    except Exception as exc:
+        logger.warning("[creator_decision][round1] body_loader failed: %s", exc)
+        return {"action": "proceed", "reason": f"正文加载失败，直接进入蓝图阶段：{exc}"}
+
+    round1_system = (
+        _compose_creator_initial_decision_prompt(metadata_prompt)
+        + "\n\n=== SKILL.md 正文 ===\n"
+        + body_text
+        + "\n=====================\n"
+    )
+    messages1: list[dict] = [{"role": "system", "content": round1_system}]
+    messages1.extend(_request_messages_with_files(request))
+
+    raw1 = await complete_chat_once(messages1, model)
+    decision1 = _parse_creator_initial_decision(raw1)
+    logger.info("[creator_decision][round1] action=%s", decision1.get("action"))
+
+    # Prevent infinite loops: if still need_body after Round 1, treat as proceed
+    if decision1["action"] == "need_body":
+        return {"action": "proceed", "reason": "Round 1 仍返回 need_body，强制进入蓝图阶段"}
+
+    return decision1
+
+
 def _compose_child_skill_selection_prompt() -> str:
     return (
         "你是 Skill 分层加载运行时的子 Skill 选择器。\n\n"
@@ -3244,11 +3368,30 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
                 if creator_state == "A":
-                    for event in _simple_sse_content_response(
-                        creator_state_ctx.requirements.next_question
-                    ):
-                        yield event
-                    return
+                    # Use LLM-driven decision instead of hardcoded regex-based question.
+                    yield _sse({"status": {"phase": "analyzing", "message": "分析需求信息…"}})
+                    initial_decision = await _run_creator_initial_decision_round(
+                        metadata_prompt=skill_context["metadata_prompt"],
+                        body_loader=skill_context["body_loader"],
+                        request=request,
+                        model=model,
+                    )
+                    yield _thought(
+                        "creator_initial_decision",
+                        "需求分析决策",
+                        f"决策：{initial_decision['action']}",
+                        initial_decision,
+                    )
+                    yield _sse({"status": None})
+                    if initial_decision["action"] == "ask_user":
+                        for event in _simple_sse_content_response(initial_decision["question"]):
+                            yield event
+                        return
+                    # action == "proceed": LLM determined the user has provided enough
+                    # information to generate a blueprint.  Override creator_state to B
+                    # so that the state-injection prompt instructs the model to produce
+                    # a blueprint rather than ask another clarifying question.
+                    creator_state = "B"
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
@@ -3880,7 +4023,7 @@ def build_kernel_skill_context() -> dict:
         "metadata_prompt": kernel_metadata_prompt,
         "body_loader": load_kernel_body_prompt,
         "child_body_loader": lambda child_ref: load_child_skill_body_prompt("skill-creator", child_ref),
-        "force_body": True,
+        "force_body": False,
         "enable_action_execution": True,
         "require_action_confirmation": True,
         "execution_root": None,

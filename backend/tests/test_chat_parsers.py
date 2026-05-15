@@ -1,6 +1,7 @@
 """Tests for pure helper/parser functions in backend/routers/chat.py.
 
-These functions do not require a running LLM or file system access.
+Most tests do not require a running LLM or file system access; those that call
+_make_stream with creator-mode settings mock stream_chat instead.
 Also includes tests for _is_within_sandbox, a security-critical guard that
 rejects symlinks escaping the skill execution sandbox.
 """
@@ -8,7 +9,6 @@ rejects symlinks escaping the skill execution sandbox.
 import json
 import pytest
 
-STATE_A_PROMPT_PREFIX = "好的，我先确认一个关键信息"
 BLUEPRINT_MARKER = "Skill 蓝图"
 
 
@@ -32,7 +32,6 @@ def test_analyze_creator_requirements_detects_missing_slots():
     assert "input" in result.missing_slots
     assert "scenario" in result.missing_slots
     assert result.ready_for_blueprint is False
-    assert "关键信息" in result.next_question
 
 
 def test_detect_creator_state_first_turn_full_request_stays_a():
@@ -113,7 +112,12 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
 
 
 @pytest.mark.asyncio
-async def test_state_a_returns_clarifying_question_without_llm():
+async def test_state_a_calls_llm_with_state_injection():
+    """State A must call the LLM (no early-return) and inject a system message that
+    lists missing slots and prohibits blueprint output.  The LLM is mocked so the
+    test does not require a running model."""
+    from unittest.mock import patch
+
     from backend.routers.chat import ChatRequest, Message, _make_stream
 
     request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])
@@ -123,7 +127,7 @@ async def test_state_a_returns_clarifying_question_without_llm():
         "body_loader": lambda: "body",
         "child_body_loader": None,
         "force_body": True,
-        "enable_action_execution": True,
+        "enable_action_execution": False,
         "require_action_confirmation": True,
         "execution_root": None,
         "strict_creator_generation": True,
@@ -133,14 +137,28 @@ async def test_state_a_returns_clarifying_question_without_llm():
         "use_frontend_driven_creation": True,
     }
 
-    response = _make_stream(skill_context, request)
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    captured_messages: list = []
+
+    async def mock_stream_chat(messages, model):
+        captured_messages.extend(messages)
+        yield "这个 Skill 的用途是什么？"
+
+    with patch("backend.routers.chat.stream_chat", side_effect=mock_stream_chat):
+        response = _make_stream(skill_context, request)
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
 
     text = "".join(chunks)
-    # State A must return a deterministic clarifying question instead of a blueprint.
-    assert STATE_A_PROMPT_PREFIX in text
+
+    # The LLM must have been called (state A no longer short-circuits).
+    assert captured_messages, "stream_chat should have been called for state A"
+
+    # The injected system messages must name the missing slots and prohibit blueprint.
+    system_contents = " ".join(
+        m["content"] for m in captured_messages if m.get("role") == "system"
+    )
+    assert "input" in system_contents or "scenario" in system_contents
     assert BLUEPRINT_MARKER not in text
 
 
@@ -183,6 +201,96 @@ def test_strip_fallback_finds_json_in_prose():
     text = 'Sure! Here is the JSON: {"result": 42} — done.'
     result = _strip_markdown_json_fence(text)
     assert '{"result": 42}' in result
+
+
+def test_strip_multiple_json_objects_picks_first():
+    """Bracket-depth scan must stop at the first complete object, not greedily
+    match from the first ``{`` to the last ``}``."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Result: {"key": "a"} and also {"key": "b"} done.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"key": "a"}'
+
+
+def test_strip_nested_json_in_prose():
+    """Bracket-depth scan must correctly track depth for nested objects."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Response: {"outer": {"inner": 1}} done.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"outer": {"inner": 1}}'
+
+
+def test_strip_json_with_string_containing_braces():
+    """Brace characters inside string values must not confuse the depth counter."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Hmm: {"template": "use {name} here"} rest.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"template": "use {name} here"}'
+
+
+# ---------------------------------------------------------------------------
+# complete_chat_once_with_json_retry
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_json_retry_returns_immediately_on_valid_json():
+    """No retry should happen when the first response is already valid JSON."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    mock = AsyncMock(return_value='{"ok": true}')
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+        )
+
+    assert mock.call_count == 1
+    assert '"ok"' in result
+
+
+@pytest.mark.asyncio
+async def test_json_retry_retries_on_non_json_first_response():
+    """Should retry once when the first response is not valid JSON."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    responses = [
+        "Sure! I can help with that.",  # non-JSON
+        '{"result": "ok"}',             # valid JSON
+    ]
+    mock = AsyncMock(side_effect=responses)
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+            max_retries=1,
+        )
+
+    assert mock.call_count == 2
+    assert '"result"' in result
+
+
+@pytest.mark.asyncio
+async def test_json_retry_returns_last_response_after_all_retries_exhausted():
+    """After all retries are exhausted the raw last response is returned."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    mock = AsyncMock(return_value="Still not JSON.")
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+            max_retries=2,
+        )
+
+    # 1 initial call + 2 retries = 3 total
+    assert mock.call_count == 3
+    assert result == "Still not JSON."
 
 
 # ---------------------------------------------------------------------------

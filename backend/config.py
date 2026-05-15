@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 
+    # Temperature override for silent JSON-decision rounds (metadata / child-skill /
+    # resource-selection / runtime-planner / block-planner).  Low values (0.0–0.1)
+    # reduce the chance the model adds prose or Markdown to a pure-JSON response.
+    # Falls back to 0.0 when unset, giving deterministic planner behaviour.
+    planner_temperature: Optional[float] = None
+
     # Timeout for LLM HTTP requests in seconds.
     llm_timeout_seconds: int = 6000
 

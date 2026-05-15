@@ -27,7 +27,7 @@ from ..services.kernel_loader import (
     load_child_skill_body_prompt,
     read_skill_resource_text,
 )
-from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.llm_proxy import complete_chat_once, complete_chat_once_with_json_retry, stream_chat
 from ..services.skill_governance import allowed_skill_roots
 from ..services.skill_manager import get_execution_skill_dir
 
@@ -65,7 +65,6 @@ class CreatorRequirementAnalysis:
     collected_slots: list[str]
     missing_slots: list[str]
     ready_for_blueprint: bool
-    next_question: str
 
 
 @dataclass
@@ -838,20 +837,6 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
     return False
 
 
-def _build_creator_clarifying_question(missing_slot: str) -> str:
-    """Return a deterministic single-question follow-up for state A."""
-    shared_input_output_question = "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。"
-    prompts = {
-        "purpose": "好的，我先确认一个关键信息：这个 Skill 最核心要解决什么问题？请用一句话说清它最主要的用途。",
-        "input": shared_input_output_question,
-        "output": shared_input_output_question,
-        "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
-        "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
-        "mandatory_follow_up": "好的，我再确认一个关键细节：这个 Skill 还有没有必须遵守的限制、偏好或交付要求？如果没有，也请直接说“没有”。",
-    }
-    return prompts.get(missing_slot, prompts["input"])
-
-
 def _are_creator_requirements_complete(
     missing_slots: list[str], has_follow_up_round: bool
 ) -> bool:
@@ -897,19 +882,12 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
     ready_for_blueprint = _are_creator_requirements_complete(
         missing_slots, has_follow_up_round
     )
-    if missing_slots:
-        next_prompt_key = missing_slots[0]
-    elif not has_follow_up_round:
-        next_prompt_key = "mandatory_follow_up"
-    else:
-        next_prompt_key = ""
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),
         collected_slots=collected_slots,
         missing_slots=missing_slots,
         ready_for_blueprint=ready_for_blueprint,
-        next_question=_build_creator_clarifying_question(next_prompt_key),
     )
 
 
@@ -974,12 +952,11 @@ def _compose_creator_state_injection(
             "【后端状态注入】当前状态：A（需求收集）\n\n"
             f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
-            "1. 只允许输出一个问题，询问当前最缺失的需求信息。\n"
+            "1. 只允许输出一个问题，向用户询问当前最缺失的需求信息，问题的措辞和方式由你自主决定。\n"
             f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
-            "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。\n"
-            "回复格式：好的，我先确认一个关键信息：<只问一个问题>"
+            "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。"
         )
     if state == "B":
         if not blueprint_shown:
@@ -1014,6 +991,60 @@ def _simple_sse_content_response(content: str) -> list[str]:
         _sse({"content": content}),
         "data: [DONE]\n\n",
     ]
+
+
+def _extract_json_by_bracket_scan(text: str) -> str | None:
+    """Extract the first well-formed JSON object or array from *text*.
+
+    Uses a bracket-depth scan (handling quoted strings and escape sequences)
+    instead of a greedy regex.  The greedy regex ``{[\\s\\S]*}`` matches from
+    the first ``{`` to the *last* ``}`` in the string, which incorrectly grabs
+    all content between two separate JSON objects.  This function stops at the
+    actual closing bracket of the first complete JSON value and validates it with
+    ``json.loads`` before returning.
+
+    Returns ``None`` if no complete, parseable JSON object or array is found.
+    """
+    for start_char, end_char in (('{', '}'), ('[', ']')):
+        search_start = 0
+        while True:
+            pos = text.find(start_char, search_start)
+            if pos < 0:
+                break
+            depth = 0
+            in_string = False
+            escape_next = False
+            end_pos = -1
+            for i in range(pos, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if in_string:
+                    if ch == '\\':
+                        escape_next = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == start_char:
+                    depth += 1
+                elif ch == end_char:
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i
+                        break
+            if end_pos >= 0:
+                candidate = text[pos:end_pos + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except json.JSONDecodeError:
+                    pass
+            search_start = pos + 1
+    return None
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -1062,10 +1093,12 @@ def _strip_markdown_json_fence(text: str) -> str:
         if candidate.startswith("{") or candidate.startswith("["):
             return candidate
 
-    # Case 4: bare JSON object/array anywhere in the text.
-    m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-    if m:
-        return m.group(1).strip()
+    # Case 4: bare JSON object/array anywhere in the text.  Use the bracket-depth
+    # scanner instead of a greedy regex to avoid matching from the first ``{`` to
+    # the *last* ``}`` when the model emits multiple JSON objects or trailing prose.
+    candidate = _extract_json_by_bracket_scan(text)
+    if candidate is not None:
+        return candidate
 
     return stripped
 
@@ -1193,7 +1226,12 @@ async def _run_metadata_round(
     messages = [{"role": "system", "content": metadata_prompt}]
     messages.extend(_request_messages_with_files(request))
 
-    decision_text = await complete_chat_once(messages, model)
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_need_body_decision(decision_text)
 
 def _compose_child_skill_selection_prompt() -> str:
@@ -1260,7 +1298,12 @@ async def _run_child_skill_selection_round(
         },
     ]
 
-    decision_text = await complete_chat_once(messages, model)
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_child_skill_decision(
         decision_text,
         valid_child_refs=valid_child_refs,
@@ -1767,7 +1810,12 @@ async def _run_resource_selection_round(
         },
     ]
 
-    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        _planner_model_name(model),
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_resource_selection_decision(
         decision_text,
         resource_catalog=resource_catalog,
@@ -2121,40 +2169,22 @@ async def _run_skill_runtime_planner_round(
     ]
 
     planner_model = _planner_model_name(model)
-    planner_text = await complete_chat_once(messages, planner_model)
+    planner_text = await complete_chat_once_with_json_retry(
+        messages,
+        planner_model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
 
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         raw_plan = json.loads(stripped)
-    except json.JSONDecodeError:
-        # First attempt failed.  Give the model one more chance with an explicit
-        # correction prompt that reinforces the JSON-only requirement.
-        logger.warning(
-            "Planner returned non-JSON on first attempt, retrying with correction prompt: %s",
-            planner_text[:300],
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "Received invalid JSON response from skill runtime planner after retry: %s",
+            planner_text,
         )
-        retry_messages = messages + [
-            {"role": "assistant", "content": planner_text},
-            {
-                "role": "user",
-                "content": (
-                    "你的上一次回复包含了自然语言或 Markdown，不是合法的 JSON。\n"
-                    "请重新输出，只输出一个符合格式要求的 JSON 对象，"
-                    "不要任何解释、不要 Markdown、不要代码块标记。\n"
-                    "直接输出 { ... }，不要其他内容。"
-                ),
-            },
-        ]
-        planner_text = await complete_chat_once(retry_messages, planner_model)
-        try:
-            stripped = _strip_markdown_json_fence(planner_text)
-            raw_plan = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            logger.error(
-                "Received invalid JSON response from skill runtime planner after retry: %s",
-                planner_text,
-            )
-            raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+        raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     return await asyncio.to_thread(
         functools.partial(
@@ -2286,7 +2316,12 @@ async def _run_block_planner_round(
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
     ]
 
-    planner_text = await complete_chat_once(messages, model)
+    planner_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
 
     try:
         stripped = _strip_markdown_json_fence(planner_text)
@@ -3242,13 +3277,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         "missing_slots": creator_state_ctx.requirements.missing_slots,
                     },
                 )
-
-                if creator_state == "A":
-                    for event in _simple_sse_content_response(
-                        creator_state_ctx.requirements.next_question
-                    ):
-                        yield event
-                    return
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()

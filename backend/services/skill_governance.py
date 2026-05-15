@@ -6,9 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-import yaml
-
 from ..config import settings
+from .skill_metadata import parse_skill_frontmatter
 
 SCOPE_PRIORITY = ["workspace", "shared", "managed", "bundled"]
 EXECUTABLE_STATUSES = {"approved"}
@@ -28,22 +27,6 @@ def _snapshots_root() -> Path:
     root = settings.governance_path / "snapshots"
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def _parse_frontmatter(content: str) -> dict:
-    text = content or ""
-    if not text.startswith("---\n"):
-        return {}
-    try:
-        _sep, rest = text.split("---\n", 1)
-        meta_text, _body = rest.split("\n---\n", 1)
-    except ValueError:
-        return {}
-    try:
-        data = yaml.safe_load(meta_text) or {}
-    except yaml.YAMLError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def _skill_scope_roots() -> list[tuple[str, Path]]:
@@ -162,7 +145,7 @@ def refresh_registry() -> dict:
             if not skill_md.exists():
                 continue
             content = skill_md.read_text(encoding="utf-8", errors="replace")
-            meta = _parse_frontmatter(content)
+            meta = parse_skill_frontmatter(content)
             key = _key(scope, skill_dir.name)
             old = deepcopy(state["skills"].get(key, {}))
             record = _normalize_record(state["skills"].get(key, {}), root_path=skill_dir, scope=scope, meta=meta)
@@ -318,7 +301,7 @@ def record_installation(
     })
     skill_md = root_path / "SKILL.md"
     content = skill_md.read_text(encoding="utf-8", errors="replace") if skill_md.exists() else ""
-    meta = _parse_frontmatter(content)
+    meta = parse_skill_frontmatter(content)
     record = _normalize_record(record, root_path=root_path, scope=scope, meta=meta)
     record["source"] = source
     record["install_type"] = install_type
@@ -388,6 +371,13 @@ def transition_skill_status(skill_name: str, action: str, *, reason: str = "") -
     return _decorate_entry(record, [], mode="manage")
 
 
+def _find_version_entry(history: list[dict], version: str) -> dict | None:
+    for item in reversed(history):
+        if item["version"] == version and item.get("snapshot"):
+            return item
+    return None
+
+
 def rollback_skill(skill_name: str, version: str) -> dict:
     state = refresh_registry()
     try:
@@ -395,7 +385,7 @@ def rollback_skill(skill_name: str, version: str) -> dict:
     except KeyError as exc:
         raise FileNotFoundError(f"Managed skill '{skill_name}' not found") from exc
 
-    target = next((item for item in reversed(record.get("version_history", [])) if item["version"] == version and item.get("snapshot")), None)
+    target = _find_version_entry(record.get("version_history", []), version)
     if not target:
         raise FileNotFoundError(f"Version '{version}' not found for skill '{skill_name}'")
 

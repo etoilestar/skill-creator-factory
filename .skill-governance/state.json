@@ -1,0 +1,619 @@
+{
+  "schema_version": 1,
+  "skills": {
+    "managed:my-skill": {
+      "skill_id": "3cea6fef-1b37-43a1-91cb-39eab4630c54",
+      "name": "my-skill",
+      "display_name": "my-skill",
+      "description": "test skill",
+      "version": "0.1.0",
+      "source": {
+        "type": "directory",
+        "scope": "managed",
+        "origin": "/tmp/pytest-of-runner/pytest-5/test_load_user_skill_package_f0/skills/my-skill"
+      },
+      "install_type": "local",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_list_skills_returns_metad0/skills/my-skill",
+      "status": "approved",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": null,
+      "install_history": [
+        {
+          "id": "160b13cb-4731-4644-9af8-3ff77b87b629",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_load_user_skill_package_f0/skills/my-skill"
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        }
+      ],
+      "present": false
+    },
+    "managed:test-skill": {
+      "skill_id": "35150023-c87f-4f9f-862f-2fed68ff3215",
+      "name": "test-skill",
+      "display_name": "test-skill",
+      "description": "test skill",
+      "version": "0.1.0",
+      "source": {
+        "type": "directory",
+        "scope": "managed",
+        "origin": "/tmp/pytest-of-runner/pytest-5/test_get_skill_returns_content0/skills/test-skill"
+      },
+      "install_type": "local",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_get_skill_returns_content0/skills/test-skill",
+      "status": "approved",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": null,
+      "install_history": [
+        {
+          "id": "3bb31a45-178a-41e6-a5bc-c8976c1fc57e",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_get_skill_returns_content0/skills/test-skill"
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        }
+      ],
+      "present": false
+    },
+    "managed:new-skill": {
+      "skill_id": "b0fad0d8-fb60-4f0d-b7d0-63a2439966aa",
+      "name": "new-skill",
+      "display_name": "new-skill",
+      "description": "hello",
+      "version": "0.1.0",
+      "source": {
+        "type": "local",
+        "origin": "/tmp/pytest-of-runner/pytest-5/test_save_and_delete_skill0/skills/new-skill/SKILL.md"
+      },
+      "install_type": "manual_save",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_save_and_delete_skill0/skills/new-skill",
+      "status": "draft",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": null,
+      "install_history": [
+        {
+          "id": "ac29bfc5-e46c-439d-ada2-dfd8c8367a5a",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_save_and_delete_skill0/skills/new-skill"
+          }
+        },
+        {
+          "id": "643def3c-a3f5-4acf-8aef-65e74e2dbbda",
+          "event": "create",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "draft",
+          "source": {
+            "type": "local",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_save_and_delete_skill0/skills/new-skill/SKILL.md"
+          },
+          "install_type": "manual_save",
+          "snapshot": "snapshots/new-skill/0.1.0-2026-05-15T02-45-01+00-00",
+          "details": {
+            "created": true
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        },
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "local",
+          "snapshot": "snapshots/new-skill/0.1.0-2026-05-15T02-45-01+00-00"
+        }
+      ],
+      "present": false
+    },
+    "managed:s1": {
+      "skill_id": "5f204f70-7374-42d5-8915-bbf072c93b75",
+      "name": "s1",
+      "display_name": "s1",
+      "description": "test skill",
+      "version": "0.1.0",
+      "source": {
+        "type": "directory",
+        "scope": "managed",
+        "origin": "/tmp/pytest-of-runner/pytest-5/test_save_and_get_asset0/skills/s1"
+      },
+      "install_type": "local",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_delete_asset0/skills/s1",
+      "status": "approved",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": null,
+      "install_history": [
+        {
+          "id": "5a1a88b8-e3fa-4663-b2e7-f4f09a9dfc64",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_save_and_get_asset0/skills/s1"
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        }
+      ],
+      "present": false
+    },
+    "managed:zip-flat": {
+      "skill_id": "4a9840ee-1aec-4f24-b7f3-c52f750a1c01",
+      "name": "zip-flat",
+      "display_name": "zip-flat",
+      "description": "from zip",
+      "version": "0.1.0",
+      "source": {
+        "type": "zip",
+        "origin": "upload"
+      },
+      "install_type": "zip_import",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_import_zip_flat0/skills/zip-flat",
+      "status": "pending_review",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": "2026-05-15T02:45:01+00:00",
+      "install_history": [
+        {
+          "id": "d64f5d9e-78e1-4b74-a38c-f42e4cb25c40",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_import_zip_flat0/skills/zip-flat"
+          }
+        },
+        {
+          "id": "952c22eb-2134-4579-9b6f-d17eaeca7709",
+          "event": "install",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "pending_review",
+          "source": {
+            "type": "zip",
+            "origin": "upload"
+          },
+          "install_type": "zip_import",
+          "snapshot": "snapshots/zip-flat/0.1.0-2026-05-15T02-45-01+00-00",
+          "details": {
+            "overwrite": false,
+            "archive_entries": 1,
+            "zip_size": 170
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        },
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "zip",
+          "snapshot": "snapshots/zip-flat/0.1.0-2026-05-15T02-45-01+00-00"
+        }
+      ],
+      "present": false
+    },
+    "managed:zip-rooted": {
+      "skill_id": "41726b72-645b-4aa4-9992-afa7de60ba33",
+      "name": "zip-rooted",
+      "display_name": "zip-rooted",
+      "description": "from zip rooted",
+      "version": "0.1.0",
+      "source": {
+        "type": "zip",
+        "origin": "upload"
+      },
+      "install_type": "zip_import",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_import_zip_rooted0/skills/zip-rooted",
+      "status": "pending_review",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": "2026-05-15T02:45:01+00:00",
+      "install_history": [
+        {
+          "id": "1e32d158-5ebd-4146-a7fd-2f381de51ede",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_import_zip_rooted0/skills/zip-rooted"
+          }
+        },
+        {
+          "id": "de1ffc5d-8055-41ea-81b5-42ca22370739",
+          "event": "install",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "pending_review",
+          "source": {
+            "type": "zip",
+            "origin": "upload"
+          },
+          "install_type": "zip_import",
+          "snapshot": "snapshots/zip-rooted/0.1.0-2026-05-15T02-45-01+00-00",
+          "details": {
+            "overwrite": false,
+            "archive_entries": 1,
+            "zip_size": 203
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        },
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "zip",
+          "snapshot": "snapshots/zip-rooted/0.1.0-2026-05-15T02-45-01+00-00"
+        }
+      ],
+      "present": false
+    },
+    "managed:existing": {
+      "skill_id": "9c9943d9-f1b0-458d-ba05-b3c43535d7c6",
+      "name": "existing",
+      "display_name": "existing",
+      "description": "new",
+      "version": "0.1.0",
+      "source": {
+        "type": "zip",
+        "origin": "upload"
+      },
+      "install_type": "zip_upgrade",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_import_zip_overwrite0/skills/existing",
+      "status": "pending_review",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": "2026-05-15T02:45:01+00:00",
+      "install_history": [
+        {
+          "id": "c184414a-86dd-40da-9db6-183f30216cb8",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_import_zip_overwrite0/skills/existing"
+          }
+        },
+        {
+          "id": "5769f0b2-0528-4be4-8cda-f1c0b8e5a059",
+          "event": "upgrade",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "pending_review",
+          "source": {
+            "type": "zip",
+            "origin": "upload"
+          },
+          "install_type": "zip_upgrade",
+          "snapshot": "snapshots/existing/0.1.0-2026-05-15T02-45-01+00-00",
+          "details": {
+            "overwrite": true,
+            "archive_entries": 1,
+            "zip_size": 173
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        },
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "zip",
+          "snapshot": "snapshots/existing/0.1.0-2026-05-15T02-45-01+00-00"
+        }
+      ],
+      "present": false
+    },
+    "managed:clean": {
+      "skill_id": "5eda45ae-505f-4c15-8137-1cde27f182d6",
+      "name": "clean",
+      "display_name": "clean",
+      "description": "safe",
+      "version": "0.1.0",
+      "source": {
+        "type": "zip",
+        "origin": "upload"
+      },
+      "install_type": "zip_import",
+      "scope": "managed",
+      "root_path": "/tmp/pytest-of-runner/pytest-5/test_import_zip_only_allowed_s0/skills/clean",
+      "status": "pending_review",
+      "created_at": "2026-05-15T02:45:01+00:00",
+      "updated_at": "2026-05-15T02:45:01+00:00",
+      "approval_requested_at": "2026-05-15T02:45:01+00:00",
+      "install_history": [
+        {
+          "id": "c4ea8970-1208-4727-8619-85907725b235",
+          "event": "discovered",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "approved",
+          "source": {
+            "type": "directory",
+            "scope": "managed",
+            "origin": "/tmp/pytest-of-runner/pytest-5/test_import_zip_only_allowed_s0/skills/clean"
+          }
+        },
+        {
+          "id": "4594213d-ba34-41b3-be6e-ebeab8a403c2",
+          "event": "install",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "version": "0.1.0",
+          "scope": "managed",
+          "status_after": "pending_review",
+          "source": {
+            "type": "zip",
+            "origin": "upload"
+          },
+          "install_type": "zip_import",
+          "snapshot": "snapshots/clean/0.1.0-2026-05-15T02-45-01+00-00",
+          "details": {
+            "overwrite": false,
+            "archive_entries": 2,
+            "zip_size": 394
+          }
+        }
+      ],
+      "version_history": [
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "directory",
+          "snapshot": null
+        },
+        {
+          "version": "0.1.0",
+          "timestamp": "2026-05-15T02:45:01+00:00",
+          "source_type": "zip",
+          "snapshot": "snapshots/clean/0.1.0-2026-05-15T02-45-01+00-00"
+        }
+      ],
+      "present": true
+    }
+  },
+  "events": [
+    {
+      "id": "0a33b72a-99be-4250-8885-e938dea65da1",
+      "skill_name": "my-skill",
+      "scope": "managed",
+      "type": "access",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "mode": "sandbox",
+        "action": "read",
+        "allowed": true,
+        "reason": ""
+      }
+    },
+    {
+      "id": "e6ee68cc-4e8f-4b62-803d-65b36d2186a5",
+      "skill_name": "new-skill",
+      "scope": "managed",
+      "type": "create",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "version": "0.1.0",
+        "status": "draft",
+        "install_type": "manual_save",
+        "created": true
+      }
+    },
+    {
+      "id": "1a3890f0-5a27-4adc-b40e-4b085a985b7f",
+      "skill_name": "zip-flat",
+      "scope": "managed",
+      "type": "install",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "version": "0.1.0",
+        "status": "pending_review",
+        "install_type": "zip_import",
+        "overwrite": false,
+        "archive_entries": 1,
+        "zip_size": 170
+      }
+    },
+    {
+      "id": "3d4d8414-fac0-47b0-acea-e35b50571952",
+      "skill_name": "zip-rooted",
+      "scope": "managed",
+      "type": "install",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "version": "0.1.0",
+        "status": "pending_review",
+        "install_type": "zip_import",
+        "overwrite": false,
+        "archive_entries": 1,
+        "zip_size": 203
+      }
+    },
+    {
+      "id": "4407dbe3-3435-404b-bb4a-a8a6f439a2a6",
+      "skill_name": "existing",
+      "scope": "managed",
+      "type": "upgrade",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "version": "0.1.0",
+        "status": "pending_review",
+        "install_type": "zip_upgrade",
+        "overwrite": true,
+        "archive_entries": 1,
+        "zip_size": 173
+      }
+    },
+    {
+      "id": "d13f62fa-7bad-46b3-891c-33cb0373dbff",
+      "skill_name": "clean",
+      "scope": "managed",
+      "type": "install",
+      "timestamp": "2026-05-15T02:45:01+00:00",
+      "details": {
+        "version": "0.1.0",
+        "status": "pending_review",
+        "install_type": "zip_import",
+        "overwrite": false,
+        "archive_entries": 2,
+        "zip_size": 394
+      }
+    }
+  ],
+  "allowlist": {
+    "modes": {
+      "manage": {
+        "visible_names": [
+          "*"
+        ],
+        "execute_names": [
+          "*"
+        ],
+        "visible_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ],
+        "execute_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ]
+      },
+      "sandbox": {
+        "visible_names": [
+          "*"
+        ],
+        "execute_names": [
+          "*"
+        ],
+        "visible_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ],
+        "execute_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ]
+      },
+      "creator": {
+        "visible_names": [
+          "*"
+        ],
+        "execute_names": [
+          "*"
+        ],
+        "visible_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ],
+        "execute_scopes": [
+          "workspace",
+          "shared",
+          "managed",
+          "bundled"
+        ]
+      }
+    }
+  }
+}

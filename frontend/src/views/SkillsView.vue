@@ -94,8 +94,8 @@
               <div class="governance-card">
                 <div class="governance-title">版本历史</div>
                 <div v-if="versions.length" class="governance-list">
-                  <div v-for="ver in versions.slice().reverse().slice(0, 5)" :key="`${ver.version}-${ver.timestamp}`">
-                    v{{ ver.version }} · {{ ver.source_type || 'unknown' }}
+                  <div v-for="versionEntry in recentVersions" :key="`${versionEntry.version}-${versionEntry.timestamp}`">
+                    v{{ versionEntry.version }} · {{ versionEntry.source_type || 'unknown' }}
                   </div>
                 </div>
                 <div v-else class="muted">暂无版本历史</div>
@@ -231,7 +231,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import {
   deleteAsset,
   deleteSkill,
@@ -277,6 +277,7 @@ const rollbackVersion = ref('')
 const allowlistEditor = ref(false)
 const allowlistText = ref('')
 const allowlistError = ref('')
+const recentVersions = computed(() => versions.value.slice(-5).reverse())
 
 // asset editor
 const assetEditor = ref(null)

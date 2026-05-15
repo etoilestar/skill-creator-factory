@@ -1,12 +1,10 @@
 import io
-import re
 import shutil
 import zipfile
 from pathlib import Path
 
-import yaml
-
 from ..config import settings
+from .skill_metadata import parse_skill_frontmatter
 from .skill_governance import (
     get_scope_skill_record,
     list_skills_for_mode,
@@ -17,16 +15,6 @@ from .skill_governance import (
     rollback_skill as governance_rollback_skill,
     skill_versions,
 )
-
-
-def _parse_frontmatter(content: str) -> dict:
-    match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
-    if match:
-        try:
-            return yaml.safe_load(match.group(1)) or {}
-        except yaml.YAMLError:
-            return {}
-    return {}
 
 
 def _resolved_skill_dir(skill_name: str, *, mode: str = "manage", require_executable: bool = False) -> Path:
@@ -45,6 +33,10 @@ def _managed_skill_dir(skill_name: str) -> Path:
 
 def _managed_root_parent() -> Path:
     return Path(getattr(settings, "skills_path", settings.managed_skills_path)).parent
+
+
+def _resolve_version(meta: dict, *, existing_version: str | None = None) -> str:
+    return str(meta.get("version") or existing_version or "0.1.0")
 
 
 def _skill_info(record: dict) -> dict:
@@ -100,8 +92,8 @@ def save_skill(skill_name: str, content: str) -> dict:
             previous_version = None
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
-    meta = _parse_frontmatter(content)
-    version = str(meta.get("version") or previous_version or "0.1.0")
+    meta = parse_skill_frontmatter(content)
+    version = _resolve_version(meta, existing_version=previous_version)
     status = "pending_review" if existed else "draft"
     result = record_installation(
         skill_name=skill_name,
@@ -242,7 +234,7 @@ def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, byt
         skill_md_path = skill_md_candidates[0]
         prefix = skill_md_path[: -len("SKILL.md")]
         skill_md_content = zf.read(skill_md_path).decode("utf-8")
-        meta = _parse_frontmatter(skill_md_content)
+        meta = parse_skill_frontmatter(skill_md_content)
 
         skill_name = meta.get("name", "").strip() or prefix.rstrip("/")
         if not skill_name:
@@ -296,7 +288,8 @@ def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
 
-    version = str(meta.get("version") or (get_scope_skill_record(skill_name, "managed").get("version") if exists else "0.1.0"))
+    existing_version = get_scope_skill_record(skill_name, "managed").get("version") if exists else None
+    version = _resolve_version(meta, existing_version=existing_version)
     result = record_installation(
         skill_name=skill_name,
         scope="managed",

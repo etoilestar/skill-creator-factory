@@ -1268,10 +1268,10 @@ async def _run_child_skill_selection_round(
 def _allowed_skill_roots() -> list[Path]:
     """Return directories under which the executor may create or modify files."""
     roots: list[Path] = [
-        Path(getattr(settings, "workspace_skills_path", Path.cwd() / ".agents" / "skills")).expanduser().resolve(),
-        Path(getattr(settings, "shared_skills_path", Path.home() / ".agents" / "skills")).expanduser().resolve(),
-        Path(getattr(settings, "skills_path", settings.managed_skills_path)).expanduser().resolve(),
-        Path(getattr(settings, "bundled_skills_path", settings.bundled_skills_path)).expanduser().resolve(),
+        settings.workspace_skills_path.expanduser().resolve(),
+        settings.shared_skills_path.expanduser().resolve(),
+        Path(settings.skills_path).expanduser().resolve(),
+        settings.bundled_skills_path.expanduser().resolve(),
     ]
 
     deduped: list[Path] = []

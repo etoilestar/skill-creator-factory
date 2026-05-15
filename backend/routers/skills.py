@@ -3,6 +3,7 @@ import re as _re
 import subprocess
 import sys as _sys
 from pathlib import Path as _Path
+from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -31,6 +32,7 @@ router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 _MAX_ZIP_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+SkillMode = Literal["manage", "sandbox", "creator"]
 
 
 class SaveSkillRequest(BaseModel):
@@ -49,7 +51,7 @@ class RollbackSkillRequest(BaseModel):
 
 @router.get("")
 async def get_all_skills(
-    mode: str = Query("manage", description="治理模式：manage / sandbox / creator"),
+    mode: SkillMode = Query("manage", description="治理模式：manage / sandbox / creator"),
     include_hidden: bool = Query(False),
 ):
     """List all skills in the skills directory."""
@@ -104,7 +106,7 @@ async def write_allowlist(payload: dict):
 
 
 @router.get("/{skill_name}")
-async def get_one_skill(skill_name: str, mode: str = Query("manage", description="治理模式：manage / sandbox / creator")):
+async def get_one_skill(skill_name: str, mode: SkillMode = Query("manage", description="治理模式：manage / sandbox / creator")):
     """Get a single skill's metadata and SKILL.md content."""
     try:
         return get_skill(skill_name, mode=mode)

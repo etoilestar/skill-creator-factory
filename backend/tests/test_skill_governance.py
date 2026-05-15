@@ -49,6 +49,14 @@ def test_list_skills_resolves_scope_priority(tmp_path):
     assert "managed" in result[0]["shadowed_scopes"]
 
 
+def test_parse_skill_frontmatter_invalid_yaml_returns_empty():
+    from backend.services.skill_metadata import parse_skill_frontmatter
+
+    result = parse_skill_frontmatter("---\nname: ok\nbad: :\n---\n")
+
+    assert result == {}
+
+
 def test_save_skill_creates_governance_metadata(tmp_path):
     from backend.services.skill_manager import save_skill
 

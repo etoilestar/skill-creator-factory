@@ -18,6 +18,8 @@ EXECUTABLE_STATUSES = {"approved"}
 # imported or externally managed sources and are therefore read-only.
 NON_EDITABLE_SCOPES = {"workspace", "shared", "bundled"}
 DEFAULT_VERSION = "0.1.0"
+MAX_EVENT_HISTORY = 1000
+MAX_RECENT_EVENTS = 100
 
 
 def _now() -> str:
@@ -112,8 +114,8 @@ def _append_event(state: dict, *, skill_name: str, scope: str, event_type: str, 
         "timestamp": _now(),
         "details": details or {},
     })
-    if len(state["events"]) > 1000:
-        state["events"] = state["events"][-1000:]
+    if len(state["events"]) > MAX_EVENT_HISTORY:
+        state["events"] = state["events"][-MAX_EVENT_HISTORY:]
 
 
 def _normalize_record(record: dict, *, root_path: Path, scope: str, meta: dict) -> dict:
@@ -435,8 +437,9 @@ def skill_versions(skill_name: str) -> dict:
 def get_events(skill_name: str | None = None) -> list[dict]:
     events = refresh_registry().get("events", [])
     if skill_name is None:
-        return list(reversed(events[-100:]))
-    return [event for event in reversed(events) if event["skill_name"] == skill_name][:100]
+        return list(reversed(events[-MAX_RECENT_EVENTS:]))
+    filtered = [event for event in events if event["skill_name"] == skill_name]
+    return list(reversed(filtered[-MAX_RECENT_EVENTS:]))
 
 
 def get_allowlist() -> dict:

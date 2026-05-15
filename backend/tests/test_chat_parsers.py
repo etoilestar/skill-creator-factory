@@ -613,3 +613,4 @@ def test_parse_creator_initial_decision_json_in_markdown_fence():
     text = '```json\n{"action": "proceed", "reason": "clear request"}\n```'
     result = _parse_creator_initial_decision(text)
     assert result["action"] == "proceed"
+    assert result.get("reason") == "clear request"

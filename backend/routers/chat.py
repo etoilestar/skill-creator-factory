@@ -1295,15 +1295,15 @@ async def _run_creator_initial_decision_round(
 
     # Round 1: metadata + SKILL.md body
     try:
-        body_text = body_loader()
+        body_prompt_text = body_loader()
     except Exception as exc:
         logger.warning("[creator_decision][round1] body_loader failed: %s", exc)
-        return {"action": "proceed", "reason": f"正文加载失败，直接进入蓝图阶段：{exc}"}
+        return {"action": "proceed", "reason": "正文加载失败，直接进入蓝图阶段"}
 
     round1_system = (
         _compose_creator_initial_decision_prompt(metadata_prompt)
         + "\n\n=== SKILL.md 正文 ===\n"
-        + body_text
+        + body_prompt_text
         + "\n=====================\n"
     )
     messages1: list[dict] = [{"role": "system", "content": round1_system}]
@@ -1313,9 +1313,11 @@ async def _run_creator_initial_decision_round(
     decision1 = _parse_creator_initial_decision(raw1)
     logger.info("[creator_decision][round1] action=%s", decision1.get("action"))
 
-    # Prevent infinite loops: if still need_body after Round 1, treat as proceed
+    # Prevent infinite loops: if still need_body after Round 1, treat as proceed.
+    # This is an automatic safety fallback; the body has already been loaded so
+    # there is no further context to add.
     if decision1["action"] == "need_body":
-        return {"action": "proceed", "reason": "Round 1 仍返回 need_body，强制进入蓝图阶段"}
+        return {"action": "proceed", "reason": "safety fallback: need_body after Round 1, promoting to proceed"}
 
     return decision1
 

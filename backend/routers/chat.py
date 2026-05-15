@@ -27,7 +27,7 @@ from ..services.kernel_loader import (
     load_child_skill_body_prompt,
     read_skill_resource_text,
 )
-from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.llm_proxy import complete_chat_once, complete_chat_once_with_json_retry, stream_chat
 from ..services.skill_governance import allowed_skill_roots
 from ..services.skill_manager import get_execution_skill_dir
 
@@ -1016,6 +1016,60 @@ def _simple_sse_content_response(content: str) -> list[str]:
     ]
 
 
+def _extract_json_by_bracket_scan(text: str) -> str | None:
+    """Extract the first well-formed JSON object or array from *text*.
+
+    Uses a bracket-depth scan (handling quoted strings and escape sequences)
+    instead of a greedy regex.  The greedy regex ``{[\\s\\S]*}`` matches from
+    the first ``{`` to the *last* ``}`` in the string, which incorrectly grabs
+    all content between two separate JSON objects.  This function stops at the
+    actual closing bracket of the first complete JSON value and validates it with
+    ``json.loads`` before returning.
+
+    Returns ``None`` if no complete, parseable JSON object or array is found.
+    """
+    for start_char, end_char in (('{', '}'), ('[', ']')):
+        search_start = 0
+        while True:
+            pos = text.find(start_char, search_start)
+            if pos < 0:
+                break
+            depth = 0
+            in_string = False
+            escape_next = False
+            end_pos = -1
+            for i in range(pos, len(text)):
+                ch = text[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if in_string:
+                    if ch == '\\':
+                        escape_next = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == start_char:
+                    depth += 1
+                elif ch == end_char:
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i
+                        break
+            if end_pos >= 0:
+                candidate = text[pos:end_pos + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except json.JSONDecodeError:
+                    pass
+            search_start = pos + 1
+    return None
+
+
 def _strip_markdown_json_fence(text: str) -> str:
     """Remove common markdown code fences around JSON.
 
@@ -1062,10 +1116,12 @@ def _strip_markdown_json_fence(text: str) -> str:
         if candidate.startswith("{") or candidate.startswith("["):
             return candidate
 
-    # Case 4: bare JSON object/array anywhere in the text.
-    m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-    if m:
-        return m.group(1).strip()
+    # Case 4: bare JSON object/array anywhere in the text.  Use the bracket-depth
+    # scanner instead of a greedy regex to avoid matching from the first ``{`` to
+    # the *last* ``}`` when the model emits multiple JSON objects or trailing prose.
+    candidate = _extract_json_by_bracket_scan(text)
+    if candidate is not None:
+        return candidate
 
     return stripped
 
@@ -1193,7 +1249,12 @@ async def _run_metadata_round(
     messages = [{"role": "system", "content": metadata_prompt}]
     messages.extend(_request_messages_with_files(request))
 
-    decision_text = await complete_chat_once(messages, model)
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_need_body_decision(decision_text)
 
 def _compose_child_skill_selection_prompt() -> str:
@@ -1260,7 +1321,12 @@ async def _run_child_skill_selection_round(
         },
     ]
 
-    decision_text = await complete_chat_once(messages, model)
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_child_skill_decision(
         decision_text,
         valid_child_refs=valid_child_refs,
@@ -1767,7 +1833,12 @@ async def _run_resource_selection_round(
         },
     ]
 
-    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    decision_text = await complete_chat_once_with_json_retry(
+        messages,
+        _planner_model_name(model),
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
     return _parse_resource_selection_decision(
         decision_text,
         resource_catalog=resource_catalog,
@@ -2121,40 +2192,22 @@ async def _run_skill_runtime_planner_round(
     ]
 
     planner_model = _planner_model_name(model)
-    planner_text = await complete_chat_once(messages, planner_model)
+    planner_text = await complete_chat_once_with_json_retry(
+        messages,
+        planner_model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
 
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         raw_plan = json.loads(stripped)
-    except json.JSONDecodeError:
-        # First attempt failed.  Give the model one more chance with an explicit
-        # correction prompt that reinforces the JSON-only requirement.
-        logger.warning(
-            "Planner returned non-JSON on first attempt, retrying with correction prompt: %s",
-            planner_text[:300],
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "Received invalid JSON response from skill runtime planner after retry: %s",
+            planner_text,
         )
-        retry_messages = messages + [
-            {"role": "assistant", "content": planner_text},
-            {
-                "role": "user",
-                "content": (
-                    "你的上一次回复包含了自然语言或 Markdown，不是合法的 JSON。\n"
-                    "请重新输出，只输出一个符合格式要求的 JSON 对象，"
-                    "不要任何解释、不要 Markdown、不要代码块标记。\n"
-                    "直接输出 { ... }，不要其他内容。"
-                ),
-            },
-        ]
-        planner_text = await complete_chat_once(retry_messages, planner_model)
-        try:
-            stripped = _strip_markdown_json_fence(planner_text)
-            raw_plan = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            logger.error(
-                "Received invalid JSON response from skill runtime planner after retry: %s",
-                planner_text,
-            )
-            raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+        raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
 
     return await asyncio.to_thread(
         functools.partial(
@@ -2286,7 +2339,12 @@ async def _run_block_planner_round(
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
     ]
 
-    planner_text = await complete_chat_once(messages, model)
+    planner_text = await complete_chat_once_with_json_retry(
+        messages,
+        model,
+        temperature=settings.planner_temperature or 0.0,
+        response_format={"type": "json_object"},
+    )
 
     try:
         stripped = _strip_markdown_json_fence(planner_text)

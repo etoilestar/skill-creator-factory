@@ -185,6 +185,96 @@ def test_strip_fallback_finds_json_in_prose():
     assert '{"result": 42}' in result
 
 
+def test_strip_multiple_json_objects_picks_first():
+    """Bracket-depth scan must stop at the first complete object, not greedily
+    match from the first ``{`` to the last ``}``."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Result: {"key": "a"} and also {"key": "b"} done.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"key": "a"}'
+
+
+def test_strip_nested_json_in_prose():
+    """Bracket-depth scan must correctly track depth for nested objects."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Response: {"outer": {"inner": 1}} done.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"outer": {"inner": 1}}'
+
+
+def test_strip_json_with_string_containing_braces():
+    """Brace characters inside string values must not confuse the depth counter."""
+    from backend.routers.chat import _strip_markdown_json_fence
+
+    text = 'Hmm: {"template": "use {name} here"} rest.'
+    result = _strip_markdown_json_fence(text)
+    assert result == '{"template": "use {name} here"}'
+
+
+# ---------------------------------------------------------------------------
+# complete_chat_once_with_json_retry
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_json_retry_returns_immediately_on_valid_json():
+    """No retry should happen when the first response is already valid JSON."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    mock = AsyncMock(return_value='{"ok": true}')
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+        )
+
+    assert mock.call_count == 1
+    assert '"ok"' in result
+
+
+@pytest.mark.asyncio
+async def test_json_retry_retries_on_non_json_first_response():
+    """Should retry once when the first response is not valid JSON."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    responses = [
+        "Sure! I can help with that.",  # non-JSON
+        '{"result": "ok"}',             # valid JSON
+    ]
+    mock = AsyncMock(side_effect=responses)
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+            max_retries=1,
+        )
+
+    assert mock.call_count == 2
+    assert '"result"' in result
+
+
+@pytest.mark.asyncio
+async def test_json_retry_returns_last_response_after_all_retries_exhausted():
+    """After all retries are exhausted the raw last response is returned."""
+    from backend.services.llm_proxy import complete_chat_once_with_json_retry
+    from unittest.mock import AsyncMock, patch
+
+    mock = AsyncMock(return_value="Still not JSON.")
+    with patch("backend.services.llm_proxy.complete_chat_once", mock):
+        result = await complete_chat_once_with_json_retry(
+            [{"role": "user", "content": "go"}],
+            "test-model",
+            max_retries=2,
+        )
+
+    # 1 initial call + 2 retries = 3 total
+    assert mock.call_count == 3
+    assert result == "Still not JSON."
+
+
 # ---------------------------------------------------------------------------
 # _parse_need_body_decision
 # ---------------------------------------------------------------------------

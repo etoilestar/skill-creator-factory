@@ -178,7 +178,7 @@ def _looks_like_valid_json(text: str) -> bool:
     stripped = text.strip()
     for prefix in ("```json", "```"):
         if stripped.startswith(prefix):
-            stripped = stripped[len(prefix):].strip()
+            stripped = stripped.removeprefix(prefix).strip()
             if stripped.endswith("```"):
                 stripped = stripped[:-3].strip()
             break
@@ -249,10 +249,10 @@ async def complete_chat_once_with_json_retry(
             max_retries,
             text[:300],
         )
-        current_messages = current_messages + [
+        current_messages.extend([
             {"role": "assistant", "content": text},
             {"role": "user", "content": _JSON_CORRECTION_PROMPT},
-        ]
+        ])
         text = await complete_chat_once(
             current_messages,
             model,

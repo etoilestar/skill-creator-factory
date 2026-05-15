@@ -7,10 +7,19 @@ from pathlib import Path
 import yaml
 
 from ..config import settings
+from .skill_governance import (
+    get_scope_skill_record,
+    list_skills_for_mode,
+    log_access_decision,
+    managed_skill_root,
+    record_installation,
+    resolve_skill_record,
+    rollback_skill as governance_rollback_skill,
+    skill_versions,
+)
 
 
 def _parse_frontmatter(content: str) -> dict:
-    """Extract YAML frontmatter from a SKILL.md file."""
     match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
     if match:
         try:
@@ -20,74 +29,107 @@ def _parse_frontmatter(content: str) -> dict:
     return {}
 
 
-def _skill_info(skill_dir: Path) -> dict:
-    skill_md = skill_dir / "SKILL.md"
-    content = skill_md.read_text(encoding="utf-8")
-    meta = _parse_frontmatter(content)
+def _resolved_skill_dir(skill_name: str, *, mode: str = "manage", require_executable: bool = False) -> Path:
+    record = resolve_skill_record(
+        skill_name,
+        mode=mode,
+        require_visible=True,
+        require_executable=require_executable,
+    )
+    return Path(record["root_path"])
+
+
+def _managed_skill_dir(skill_name: str) -> Path:
+    return managed_skill_root(skill_name)
+
+
+def _managed_root_parent() -> Path:
+    return Path(getattr(settings, "skills_path", settings.managed_skills_path)).parent
+
+
+def _skill_info(record: dict) -> dict:
     return {
-        "name": skill_dir.name,
-        "display_name": meta.get("name", skill_dir.name),
-        "description": meta.get("description", ""),
+        "skill_id": record["skill_id"],
+        "name": record["name"],
+        "display_name": record.get("display_name", record["name"]),
+        "description": record.get("description", ""),
+        "version": record.get("version"),
+        "source": record.get("source"),
+        "install_type": record.get("install_type"),
+        "scope": record.get("scope"),
+        "resolved_scope": record.get("resolved_scope", record.get("scope")),
+        "status": record.get("status"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "approval_requested_at": record.get("approval_requested_at"),
+        "available_scopes": record.get("available_scopes", [record.get("scope")]),
+        "shadowed_scopes": record.get("shadowed_scopes", []),
+        "editable": record.get("editable", False),
+        "can_view": record.get("can_view", True),
+        "can_execute": record.get("can_execute", False),
+        "governance": record.get("governance", {}),
+        "version_history": record.get("version_history", []),
+        "install_history": record.get("install_history", []),
     }
 
 
-def list_skills() -> list[dict]:
-    if not settings.skills_path.exists():
-        return []
-    return [
-        _skill_info(d)
-        for d in sorted(settings.skills_path.iterdir())
-        if d.is_dir() and (d / "SKILL.md").exists()
-    ]
+def list_skills(mode: str = "manage", *, include_hidden: bool = False) -> list[dict]:
+    return [_skill_info(record) for record in list_skills_for_mode(mode, include_hidden=include_hidden)]
 
 
-def get_skill(skill_name: str) -> dict:
-    skill_dir = settings.skills_path / skill_name
+def get_skill(skill_name: str, mode: str = "manage") -> dict:
+    record = resolve_skill_record(skill_name, mode=mode, require_visible=True)
+    skill_dir = Path(record["root_path"])
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.exists():
         raise FileNotFoundError(f"Skill '{skill_name}' not found")
     content = skill_md.read_text(encoding="utf-8")
-    meta = _parse_frontmatter(content)
-    return {
-        "name": skill_dir.name,
-        "display_name": meta.get("name", skill_dir.name),
-        "description": meta.get("description", ""),
-        "content": content,
-    }
+    result = _skill_info(record)
+    result["content"] = content
+    return result
 
 
 def save_skill(skill_name: str, content: str) -> dict:
-    """Create or overwrite a skill's SKILL.md."""
-    skill_dir = settings.skills_path / skill_name
+    skill_dir = _managed_skill_dir(skill_name)
+    existed = skill_dir.exists()
+    previous_version = None
+    if existed:
+        try:
+            previous_version = get_scope_skill_record(skill_name, "managed").get("version")
+        except FileNotFoundError:
+            previous_version = None
     skill_dir.mkdir(parents=True, exist_ok=True)
-    skill_md = skill_dir / "SKILL.md"
-    skill_md.write_text(content, encoding="utf-8")
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
     meta = _parse_frontmatter(content)
-    return {
-        "name": skill_dir.name,
-        "display_name": meta.get("name", skill_dir.name),
-        "description": meta.get("description", ""),
-    }
+    version = str(meta.get("version") or previous_version or "0.1.0")
+    status = "pending_review" if existed else "draft"
+    result = record_installation(
+        skill_name=skill_name,
+        scope="managed",
+        root_path=skill_dir,
+        source={"type": "local", "origin": str(skill_dir / "SKILL.md")},
+        install_type="manual_save",
+        status=status,
+        version=version,
+        event="save" if existed else "create",
+        approval_requested=existed,
+        extra={"created": not existed},
+    )
+    return _skill_info(result)
 
 
 def delete_skill(skill_name: str) -> None:
-    skill_dir = settings.skills_path / skill_name
+    skill_dir = _managed_skill_dir(skill_name)
     if not skill_dir.exists():
         raise FileNotFoundError(f"Skill '{skill_name}' not found")
     shutil.rmtree(skill_dir)
 
 
 _ALLOWED_ASSET_FOLDERS = {"scripts", "references", "assets"}
-_MAX_ASSET_BYTES = 10 * 1024 * 1024  # 10 MB
+_MAX_ASSET_BYTES = 10 * 1024 * 1024
 
 
 def save_asset(skill_name: str, folder: str, filename: str, data: bytes) -> dict:
-    """Save an uploaded file to a skill sub-directory.
-
-    Raises:
-        FileNotFoundError: if the skill does not exist.
-        ValueError: if folder or filename is invalid, or data exceeds size limit.
-    """
     if folder not in _ALLOWED_ASSET_FOLDERS:
         raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
     safe_name = Path(filename).name
@@ -102,7 +144,7 @@ def save_asset(skill_name: str, folder: str, filename: str, data: bytes) -> dict
         raise ValueError("Invalid filename")
     if len(data) > _MAX_ASSET_BYTES:
         raise ValueError("File exceeds 10 MB limit")
-    skill_dir = settings.skills_path / skill_name
+    skill_dir = _managed_skill_dir(skill_name)
     if not skill_dir.exists():
         raise FileNotFoundError(f"Skill '{skill_name}' not found")
     target_dir = skill_dir / folder
@@ -113,45 +155,27 @@ def save_asset(skill_name: str, folder: str, filename: str, data: bytes) -> dict
         "skill": skill_name,
         "folder": folder,
         "filename": safe_name,
-        "path": str(dest.relative_to(settings.skills_path.parent)),
+        "path": str(dest.relative_to(_managed_root_parent())),
         "size": len(data),
     }
 
 
 def list_skill_assets(skill_name: str) -> dict:
-    """Return filenames grouped by sub-directory for a skill.
-
-    Raises:
-        FileNotFoundError: if the skill does not exist.
-    """
-    skill_dir = settings.skills_path / skill_name
-    if not skill_dir.exists():
-        raise FileNotFoundError(f"Skill '{skill_name}' not found")
+    skill_dir = _resolved_skill_dir(skill_name, mode="manage")
     result: dict[str, list[str]] = {}
     for folder in sorted(_ALLOWED_ASSET_FOLDERS):
         folder_dir = skill_dir / folder
-        if folder_dir.is_dir():
-            result[folder] = sorted(p.name for p in folder_dir.iterdir() if p.is_file())
-        else:
-            result[folder] = []
+        result[folder] = sorted(p.name for p in folder_dir.iterdir() if p.is_file()) if folder_dir.is_dir() else []
     return result
 
 
 def get_asset(skill_name: str, folder: str, filename: str) -> str:
-    """Read a text asset file and return its content as a string.
-
-    Raises:
-        FileNotFoundError: if the skill or file does not exist.
-        ValueError: if folder or filename is invalid, or the file is binary.
-    """
     if folder not in _ALLOWED_ASSET_FOLDERS:
         raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
     safe_name = Path(filename).name
     if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or "/" in safe_name or "\\" in safe_name or len(safe_name) > 255:
         raise ValueError("Invalid filename")
-    skill_dir = settings.skills_path / skill_name
-    if not skill_dir.exists():
-        raise FileNotFoundError(f"Skill '{skill_name}' not found")
+    skill_dir = _resolved_skill_dir(skill_name, mode="manage")
     target = skill_dir / folder / safe_name
     if not target.is_file():
         raise FileNotFoundError(f"Asset '{safe_name}' not found in '{folder}'")
@@ -163,18 +187,12 @@ def get_asset(skill_name: str, folder: str, filename: str) -> str:
 
 
 def update_asset(skill_name: str, folder: str, filename: str, content: str) -> dict:
-    """Overwrite a text asset file with new content.
-
-    Raises:
-        FileNotFoundError: if the skill or file does not exist.
-        ValueError: if folder or filename is invalid, or content exceeds size limit.
-    """
     if folder not in _ALLOWED_ASSET_FOLDERS:
         raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
     safe_name = Path(filename).name
     if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or "/" in safe_name or "\\" in safe_name or len(safe_name) > 255:
         raise ValueError("Invalid filename")
-    skill_dir = settings.skills_path / skill_name
+    skill_dir = _managed_skill_dir(skill_name)
     if not skill_dir.exists():
         raise FileNotFoundError(f"Skill '{skill_name}' not found")
     target = skill_dir / folder / safe_name
@@ -188,33 +206,17 @@ def update_asset(skill_name: str, folder: str, filename: str, content: str) -> d
         "skill": skill_name,
         "folder": folder,
         "filename": safe_name,
-        "path": str(target.relative_to(settings.skills_path.parent)),
+        "path": str(target.relative_to(_managed_root_parent())),
         "size": len(data),
     }
 
 
-_MAX_ZIP_BYTES = 50 * 1024 * 1024       # 50 MB raw zip
-_MAX_UNZIP_BYTES = 50 * 1024 * 1024    # 50 MB total extracted
-
-# Allowed top-level sub-directories inside a skill zip
+_MAX_ZIP_BYTES = 50 * 1024 * 1024
+_MAX_UNZIP_BYTES = 50 * 1024 * 1024
 _ALLOWED_ZIP_SUBDIRS = {"scripts", "references", "assets"}
 
 
-def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
-    """Import a skill from a .zip file downloaded from skillsmp.
-
-    The zip may contain either:
-    - a top-level directory with SKILL.md inside  (my-skill/SKILL.md)
-    - or SKILL.md at the zip root                 (SKILL.md)
-
-    The skill directory name is derived (in order of priority) from:
-    1. The ``name`` field in SKILL.md frontmatter
-    2. The top-level directory name inside the zip
-
-    Raises:
-        ValueError: malformed zip, missing SKILL.md, unsafe paths, or oversized.
-        FileExistsError: skill already exists and overwrite is False.
-    """
+def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, bytes]], dict]:
     if len(data) > _MAX_ZIP_BYTES:
         raise ValueError("ZIP 文件超过 50 MB 限制")
 
@@ -225,122 +227,149 @@ def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
 
     with zf:
         names = zf.namelist()
-
-        # Security: reject path traversal in any entry
         for entry in names:
             parts = Path(entry).parts
-            if any(p in ("..", "") or p.startswith("/") for p in parts):
+            if any(part in ("..", "") or part.startswith("/") for part in parts):
                 raise ValueError(f"ZIP 包含非法路径: {entry}")
 
-        # Ignore macOS metadata entries (__MACOSX/) for structure detection.
-        # macOS zip creates these as the first entries, which would break the
-        # prefix detection if we naively took names[0].
-        real_names = [n for n in names if not n.startswith("__MACOSX/") and n != "__MACOSX"]
-
-        # Find SKILL.md directly to determine the ZIP structure.
-        # Accepts: "SKILL.md" (flat) or "prefix/SKILL.md" (one level rooted).
+        real_names = [name for name in names if not name.startswith("__MACOSX/") and name != "__MACOSX"]
         skill_md_candidates = [
-            n for n in real_names
-            if n == "SKILL.md" or (n.endswith("/SKILL.md") and n.count("/") == 1)
+            name for name in real_names if name == "SKILL.md" or (name.endswith("/SKILL.md") and name.count("/") == 1)
         ]
         if not skill_md_candidates:
             raise ValueError("ZIP 中缺少 SKILL.md 文件")
 
         skill_md_path = skill_md_candidates[0]
-        # Derive prefix: "" for flat, "dir-name/" for rooted.
         prefix = skill_md_path[: -len("SKILL.md")]
-
-        # Read SKILL.md content
         skill_md_content = zf.read(skill_md_path).decode("utf-8")
-
-        # Determine skill name from frontmatter, fallback to prefix dir name
         meta = _parse_frontmatter(skill_md_content)
-        skill_name = meta.get("name", "").strip()
-        if not skill_name and prefix:
-            skill_name = prefix.rstrip("/")
+
+        skill_name = meta.get("name", "").strip() or prefix.rstrip("/")
         if not skill_name:
             raise ValueError("无法确定 Skill 名称：请在 SKILL.md 的 frontmatter 中设置 name 字段")
 
-        # Validate skill name: must be a plain filename with no path components
         safe_skill_name = Path(skill_name).name
         if not safe_skill_name or safe_skill_name != skill_name or "\x00" in safe_skill_name:
             raise ValueError(f"SKILL.md 中的 name 字段包含非法字符: {skill_name!r}")
 
-        skill_dir = settings.skills_path / safe_skill_name
-        if skill_dir.exists() and not overwrite:
-            raise FileExistsError(safe_skill_name)
-
-        # Validate total uncompressed size (zip bomb protection)
         total_size = sum(info.file_size for info in zf.infolist())
         if total_size > _MAX_UNZIP_BYTES:
             raise ValueError("ZIP 解压后内容超过 50 MB 限制")
 
-        # Collect entries to extract: SKILL.md and allowed sub-directories only
-        entries_to_extract: list[zipfile.ZipInfo] = []
+        entries_to_extract: list[tuple[str, bytes]] = []
         for info in zf.infolist():
             entry_name = info.filename
-            # Skip macOS metadata entries
             if entry_name.startswith("__MACOSX/") or entry_name == "__MACOSX":
                 continue
-            # Strip prefix to get relative path inside the skill
             rel = entry_name[len(prefix):]
             if not rel or rel.endswith("/"):
-                continue  # skip directories
-
-            # Validate relative path parts
+                continue
             rel_parts = Path(rel).parts
             if len(rel_parts) == 1:
-                # Top-level file: only SKILL.md is allowed
                 if rel_parts[0] != "SKILL.md":
                     continue
-            elif len(rel_parts) >= 2:
-                # Sub-directory file: only allowed sub-dirs
-                if rel_parts[0] not in _ALLOWED_ZIP_SUBDIRS:
-                    continue
-            else:
+            elif rel_parts[0] not in _ALLOWED_ZIP_SUBDIRS:
                 continue
-
-            # Filename safety check
             fname = rel_parts[-1]
             if fname.startswith(".") or "\x00" in fname or len(fname) > 255:
                 continue
+            entries_to_extract.append((rel, zf.read(info.filename)))
 
-            entries_to_extract.append(info)
+        return safe_skill_name, meta, skill_md_content, entries_to_extract, {
+            "archive_entries": len(entries_to_extract),
+            "zip_size": len(data),
+        }
 
-        # Write files
-        if skill_dir.exists() and overwrite:
-            shutil.rmtree(skill_dir)
-        skill_dir.mkdir(parents=True, exist_ok=True)
 
-        for info in entries_to_extract:
-            rel = info.filename[len(prefix):]
-            dest = skill_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(zf.read(info.filename))
+def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:
+    skill_name, meta, _content, entries_to_extract, install_details = _parse_zip_payload(data)
+    skill_dir = _managed_skill_dir(skill_name)
+    exists = skill_dir.exists()
+    if exists and not overwrite:
+        raise FileExistsError(skill_name)
 
-    return {
-        "name": safe_skill_name,
-        "display_name": meta.get("name", safe_skill_name),
-        "description": meta.get("description", ""),
-    }
+    if exists:
+        shutil.rmtree(skill_dir)
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    for rel, content in entries_to_extract:
+        dest = skill_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+
+    version = str(meta.get("version") or (get_scope_skill_record(skill_name, "managed").get("version") if exists else "0.1.0"))
+    result = record_installation(
+        skill_name=skill_name,
+        scope="managed",
+        root_path=skill_dir,
+        source={"type": "zip", "origin": "upload"},
+        install_type="zip_import" if not exists else "zip_upgrade",
+        status="pending_review",
+        version=version,
+        event="install" if not exists else "upgrade",
+        approval_requested=True,
+        extra={
+            "overwrite": overwrite,
+            **install_details,
+        },
+    )
+    response = _skill_info(result)
+    response["installation"] = result["install_history"][-1]
+    return response
+
+
+def upgrade_skill_zip(skill_name: str, data: bytes) -> dict:
+    parsed_skill_name, _meta, _content, _entries, _details = _parse_zip_payload(data)
+    if parsed_skill_name != skill_name:
+        raise ValueError(f"ZIP 中的 skill 名称为 '{parsed_skill_name}'，与目标 '{skill_name}' 不一致")
+    return import_skill_zip(data, overwrite=True)
 
 
 def delete_asset(skill_name: str, folder: str, filename: str) -> None:
-    """Delete a single asset file from a skill sub-directory.
-
-    Raises:
-        FileNotFoundError: if the skill or file does not exist.
-        ValueError: if folder or filename is invalid.
-    """
     if folder not in _ALLOWED_ASSET_FOLDERS:
         raise ValueError(f"folder must be one of {sorted(_ALLOWED_ASSET_FOLDERS)}")
     safe_name = Path(filename).name
     if not safe_name or safe_name.startswith(".") or "\x00" in safe_name or "/" in safe_name or "\\" in safe_name or len(safe_name) > 255:
         raise ValueError("Invalid filename")
-    skill_dir = settings.skills_path / skill_name
+    skill_dir = _managed_skill_dir(skill_name)
     if not skill_dir.exists():
         raise FileNotFoundError(f"Skill '{skill_name}' not found")
     target = skill_dir / folder / safe_name
     if not target.is_file():
         raise FileNotFoundError(f"Asset '{safe_name}' not found in '{folder}'")
     target.unlink()
+
+
+def get_execution_skill_dir(skill_name: str, *, mode: str = "sandbox") -> Path:
+    try:
+        record = resolve_skill_record(skill_name, mode=mode, require_visible=True, require_executable=True)
+        log_access_decision(skill_name, record["scope"], mode=mode, action="execute", allowed=True)
+        return Path(record["root_path"])
+    except PermissionError as exc:
+        try:
+            record = resolve_skill_record(skill_name, mode=mode, require_visible=False, require_executable=False)
+            log_access_decision(skill_name, record["scope"], mode=mode, action="execute", allowed=False, reason=str(exc))
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def get_visible_skill_dir(skill_name: str, *, mode: str = "manage") -> Path:
+    try:
+        record = resolve_skill_record(skill_name, mode=mode, require_visible=True, require_executable=False)
+        log_access_decision(skill_name, record["scope"], mode=mode, action="read", allowed=True)
+        return Path(record["root_path"])
+    except PermissionError as exc:
+        try:
+            record = resolve_skill_record(skill_name, mode=mode, require_visible=False, require_executable=False)
+            log_access_decision(skill_name, record["scope"], mode=mode, action="read", allowed=False, reason=str(exc))
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def rollback_skill(skill_name: str, version: str) -> dict:
+    return _skill_info(governance_rollback_skill(skill_name, version))
+
+
+def get_skill_versions(skill_name: str) -> dict:
+    return skill_versions(skill_name)

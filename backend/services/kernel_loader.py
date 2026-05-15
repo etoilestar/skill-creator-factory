@@ -5,6 +5,7 @@ import re
 import yaml
 
 from ..config import settings
+from .skill_manager import get_visible_skill_dir
 
 
 @dataclass
@@ -414,11 +415,7 @@ def load_kernel_package(*, include_body: bool = False) -> SkillPackage:
 
 def load_user_skill_package(skill_name: str, *, include_body: bool = False) -> SkillPackage:
     """Load a user-created Skill package by directory name."""
-    root = settings.skills_path / skill_name
-
-    if not root.exists():
-        raise FileNotFoundError(f"Skill '{skill_name}' not found")
-
+    root = get_visible_skill_dir(skill_name, mode="sandbox")
     return _load_skill_from_root(root, include_body=include_body)
 
 

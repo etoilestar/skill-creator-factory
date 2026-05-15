@@ -28,6 +28,7 @@ from ..services.kernel_loader import (
     read_skill_resource_text,
 )
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.skill_manager import get_execution_skill_dir
 
 logger = logging.getLogger(__name__)
 
@@ -1266,14 +1267,12 @@ async def _run_child_skill_selection_round(
 
 def _allowed_skill_roots() -> list[Path]:
     """Return directories under which the executor may create or modify files."""
-    roots: list[Path] = []
-
-    configured_skills_path = getattr(settings, "skills_path", None)
-    if configured_skills_path:
-        roots.append(Path(configured_skills_path).expanduser().resolve())
-
-    roots.append((Path.cwd() / ".agents" / "skills").resolve())
-    roots.append((Path.home() / ".agents" / "skills").resolve())
+    roots: list[Path] = [
+        Path(getattr(settings, "workspace_skills_path", Path.cwd() / ".agents" / "skills")).expanduser().resolve(),
+        Path(getattr(settings, "shared_skills_path", Path.home() / ".agents" / "skills")).expanduser().resolve(),
+        Path(getattr(settings, "skills_path", settings.managed_skills_path)).expanduser().resolve(),
+        Path(getattr(settings, "bundled_skills_path", settings.bundled_skills_path)).expanduser().resolve(),
+    ]
 
     deduped: list[Path] = []
     seen: set[str] = set()
@@ -1289,15 +1288,7 @@ def _skill_root_for_name(skill_name: str) -> Path:
     """Resolve an existing sandbox skill root by skill_name."""
     if not skill_name or "/" in skill_name or "\\" in skill_name or ".." in skill_name:
         raise ValueError(f"非法 skill_name: {skill_name}")
-
-    for root in _allowed_skill_roots():
-        candidate = (root / skill_name).resolve()
-        skill_md = candidate / "SKILL.md"
-        if skill_md.exists():
-            return candidate
-
-    allowed_text = "、".join(str(root) for root in _allowed_skill_roots())
-    raise FileNotFoundError(f"未找到 Skill: {skill_name}；搜索目录: {allowed_text}")
+    return get_execution_skill_dir(skill_name, mode="sandbox").resolve()
 
 def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
     """Resolve file paths and ensure they stay within allowed directories.

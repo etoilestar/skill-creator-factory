@@ -3,6 +3,7 @@
     <div class="header">
       <h2>Skills 库</h2>
       <div class="header-actions">
+        <button class="btn-ghost" @click="openAllowlist">治理配置</button>
         <button class="btn-primary" @click="openNew">+ 新建 Skill</button>
         <label class="btn-secondary zip-import-label" title="导入来自 skillsmp 的 .zip 文件">
           📦 导入 ZIP
@@ -26,6 +27,7 @@
           @click="select(sk.name)"
         >
           <div class="sk-name">{{ sk.display_name || sk.name }}</div>
+          <div class="sk-meta muted">v{{ sk.version || '0.1.0' }} · {{ sk.scope }} · {{ sk.status }}</div>
           <div class="sk-desc muted">{{ sk.description || '暂无描述' }}</div>
         </div>
       </div>
@@ -49,8 +51,65 @@
         <template v-else-if="selected">
           <div class="detail-header">
             <span class="detail-title">{{ selected.display_name || selected.name }}</span>
-            <button class="btn-ghost" @click="startEdit">编辑</button>
-            <button class="btn-danger" @click="confirmDelete">删除</button>
+            <button class="btn-ghost" @click="startEdit" :disabled="!selected.editable">编辑</button>
+            <button class="btn-danger" @click="confirmDelete" :disabled="!selected.editable">删除</button>
+          </div>
+          <div class="governance-strip">
+            <span class="gov-badge">{{ selected.scope }}</span>
+            <span class="gov-badge">v{{ selected.version || '0.1.0' }}</span>
+            <span class="gov-badge" :class="`status-${selected.status}`">{{ selected.status }}</span>
+            <span class="gov-badge" :class="{ blocked: !selected.can_execute }">
+              {{ selected.can_execute ? '可执行' : '不可执行' }}
+            </span>
+          </div>
+          <div class="governance-panel">
+            <div class="governance-actions">
+              <button class="btn-ghost" @click="applyStatus('request_review')" :disabled="!selected.editable">提交审批</button>
+              <button class="btn-ghost" @click="applyStatus('approve')" :disabled="!selected.editable">批准</button>
+              <button class="btn-ghost" @click="applyStatus('reject')" :disabled="!selected.editable">驳回</button>
+              <button class="btn-ghost" @click="applyStatus('quarantine')" :disabled="!selected.editable">隔离</button>
+              <button class="btn-ghost" @click="applyStatus(selected.status === 'disabled' ? 'enable' : 'disable')" :disabled="!selected.editable">
+                {{ selected.status === 'disabled' ? '启用' : '禁用' }}
+              </button>
+              <label class="btn-secondary zip-import-label" :class="{ disabled: !selected.editable }">
+                ⬆ 升级 ZIP
+                <input type="file" accept=".zip" class="hidden-file-input" :disabled="!selected.editable" @change="onUpgradeZipChange" />
+              </label>
+              <select v-model="rollbackVersion" class="folder-select" :disabled="!selected.editable || !versions.length">
+                <option value="">回滚版本</option>
+                <option v-for="ver in versions" :key="`${ver.version}-${ver.timestamp}`" :value="ver.version">
+                  {{ ver.version }}
+                </option>
+              </select>
+              <button class="btn-ghost" @click="doRollback" :disabled="!selected.editable || !rollbackVersion">回滚</button>
+            </div>
+            <div class="governance-grid">
+              <div class="governance-card">
+                <div class="governance-title">治理摘要</div>
+                <div class="muted">来源：{{ selected.source?.type || 'directory' }}</div>
+                <div class="muted">安装方式：{{ selected.install_type || 'local' }}</div>
+                <div class="muted">生效作用域：{{ selected.resolved_scope || selected.scope }}</div>
+                <div class="muted">可见作用域：{{ (selected.available_scopes || []).join(', ') || '-' }}</div>
+              </div>
+              <div class="governance-card">
+                <div class="governance-title">版本历史</div>
+                <div v-if="versions.length" class="governance-list">
+                  <div v-for="ver in versions.slice().reverse().slice(0, 5)" :key="`${ver.version}-${ver.timestamp}`">
+                    v{{ ver.version }} · {{ ver.source_type || 'unknown' }}
+                  </div>
+                </div>
+                <div v-else class="muted">暂无版本历史</div>
+              </div>
+              <div class="governance-card">
+                <div class="governance-title">最近事件</div>
+                <div v-if="events.length" class="governance-list">
+                  <div v-for="event in events.slice(0, 5)" :key="event.id">
+                    {{ event.type }} · {{ new Date(event.timestamp).toLocaleString() }}
+                  </div>
+                </div>
+                <div v-else class="muted">暂无事件</div>
+              </div>
+            </div>
           </div>
           <pre class="skill-preview">{{ selected.content }}</pre>
 
@@ -64,8 +123,8 @@
               <div v-if="assets[folder] && assets[folder].length" class="asset-list">
                 <div v-for="fname in assets[folder]" :key="fname" class="asset-row">
                   <span class="asset-name">{{ fname }}</span>
-                  <button class="btn-icon-edit" :aria-label="`编辑 ${fname}`" :title="`编辑 ${fname}`" @click="openAssetEditor(folder, fname)">✎</button>
-                  <button class="btn-icon-danger" :aria-label="`删除 ${fname}`" :title="`删除 ${fname}`" @click="removeAsset(folder, fname)">✕</button>
+                  <button class="btn-icon-edit" :aria-label="`编辑 ${fname}`" :title="`编辑 ${fname}`" :disabled="!selected?.editable" @click="openAssetEditor(folder, fname)">✎</button>
+                  <button class="btn-icon-danger" :aria-label="`删除 ${fname}`" :title="`删除 ${fname}`" :disabled="!selected?.editable" @click="removeAsset(folder, fname)">✕</button>
                 </div>
               </div>
               <div v-else class="muted asset-empty">暂无文件</div>
@@ -79,7 +138,7 @@
               <label class="file-input-label">
                 <input ref="fileInputRef" type="file" class="file-input" aria-label="选择要上传的文件" @change="onFileChange" />
               </label>
-              <button class="btn-primary" :disabled="!uploadFile || uploading" @click="doUpload">
+              <button class="btn-primary" :disabled="!uploadFile || uploading || !selected?.editable" @click="doUpload">
                 {{ uploading ? '上传中…' : '上传' }}
               </button>
             </div>
@@ -156,12 +215,42 @@
         </div>
       </div>
     </div>
+
+    <div v-if="allowlistEditor" class="overlay" @click.self="closeAllowlist">
+      <div class="dialog dialog-editor">
+        <div class="dialog-title">Allowlist / 治理配置</div>
+        <textarea v-model="allowlistText" class="skill-editor asset-edit-textarea" spellcheck="false" />
+        <div v-if="allowlistError" class="error px16">{{ allowlistError }}</div>
+        <div class="dialog-actions">
+          <button class="btn-primary" @click="saveAllowlistEditor">保存</button>
+          <button class="btn-ghost" @click="closeAllowlist">取消</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { fetchSkills, fetchSkill, saveSkill, deleteSkill, fetchSkillAssets, uploadAsset, deleteAsset, fetchAssetContent, saveAssetContent, importSkillZip } from '../composables/useSkills.js'
+import {
+  deleteAsset,
+  deleteSkill,
+  fetchAllowlist,
+  fetchAssetContent,
+  fetchSkill,
+  fetchSkillAssets,
+  fetchSkillEvents,
+  fetchSkillVersions,
+  fetchSkills,
+  importSkillZip,
+  rollbackSkillVersion,
+  saveAllowlist,
+  saveAssetContent,
+  saveSkill,
+  updateSkillStatus,
+  upgradeSkillZip,
+  uploadAsset,
+} from '../composables/useSkills.js'
 
 const skills = ref([])
 const selected = ref(null)
@@ -182,13 +271,19 @@ const uploading = ref(false)
 const uploadError = ref('')
 const assetError = ref('')
 const fileInputRef = ref(null)
+const events = ref([])
+const versions = ref([])
+const rollbackVersion = ref('')
+const allowlistEditor = ref(false)
+const allowlistText = ref('')
+const allowlistError = ref('')
 
 // asset editor
 const assetEditor = ref(null)
 
 async function load() {
   loading.value = true
-  skills.value = await fetchSkills()
+  skills.value = await fetchSkills('manage', { includeHidden: true })
   loading.value = false
 }
 
@@ -202,10 +297,21 @@ async function loadAssets(name) {
 
 async function select(name) {
   editing.value = false
-  selected.value = await fetchSkill(name)
+  selected.value = await fetchSkill(name, 'manage')
   uploadError.value = ''
   assetError.value = ''
   await loadAssets(name)
+  await loadGovernance(name)
+}
+
+async function loadGovernance(name) {
+  const [{ events: nextEvents }, versionInfo] = await Promise.all([
+    fetchSkillEvents(name),
+    fetchSkillVersions(name),
+  ])
+  events.value = nextEvents
+  versions.value = versionInfo.versions || []
+  rollbackVersion.value = ''
 }
 
 function openNew() {
@@ -217,6 +323,7 @@ function openNew() {
 }
 
 function startEdit() {
+  if (!selected.value?.editable) return
   editName.value = selected.value.name
   editContent.value = selected.value.content
   editError.value = ''
@@ -237,8 +344,9 @@ async function save() {
     await saveSkill(name, editContent.value)
     await load()
     editing.value = false
-    selected.value = await fetchSkill(name)
+    selected.value = await fetchSkill(name, 'manage')
     await loadAssets(name)
+    await loadGovernance(name)
   } catch (e) {
     editError.value = e.message
   } finally {
@@ -247,6 +355,7 @@ async function save() {
 }
 
 function confirmDelete() {
+  if (!selected.value?.editable) return
   deleteTarget.value = selected.value.name
 }
 
@@ -327,6 +436,50 @@ async function saveAssetEdit() {
   }
 }
 
+async function applyStatus(action) {
+  if (!selected.value?.editable) return
+  await updateSkillStatus(selected.value.name, action)
+  await load()
+  await select(selected.value.name)
+}
+
+async function onUpgradeZipChange(event) {
+  const file = event.target.files[0]
+  event.target.value = ''
+  if (!file || !selected.value?.editable) return
+  await upgradeSkillZip(selected.value.name, file)
+  await load()
+  await select(selected.value.name)
+}
+
+async function doRollback() {
+  if (!selected.value?.editable || !rollbackVersion.value) return
+  await rollbackSkillVersion(selected.value.name, rollbackVersion.value)
+  await load()
+  await select(selected.value.name)
+}
+
+async function openAllowlist() {
+  const payload = await fetchAllowlist()
+  allowlistText.value = JSON.stringify(payload, null, 2)
+  allowlistError.value = ''
+  allowlistEditor.value = true
+}
+
+function closeAllowlist() {
+  allowlistEditor.value = false
+}
+
+async function saveAllowlistEditor() {
+  try {
+    await saveAllowlist(JSON.parse(allowlistText.value))
+    allowlistEditor.value = false
+    await load()
+  } catch (e) {
+    allowlistError.value = e.message
+  }
+}
+
 // zip import
 const zipInputRef = ref(null)
 const zipImport = ref(null)  // null | { filename, file, loading, error, conflict, conflictName }
@@ -351,8 +504,9 @@ async function doImportZip(overwrite) {
     const result = await importSkillZip(zipImport.value.file, overwrite)
     zipImport.value = null
     await load()
-    selected.value = await fetchSkill(result.name)
+    selected.value = await fetchSkill(result.name, 'manage')
     await loadAssets(result.name)
+    await loadGovernance(result.name)
   } catch (e) {
     if (e.status === 409) {
       zipImport.value.conflict = true
@@ -384,6 +538,10 @@ onMounted(load)
 
 .zip-import-label {
   cursor: pointer;
+}
+.zip-import-label.disabled {
+  opacity: 0.5;
+  pointer-events: none;
 }
 .hidden-file-input {
   display: none;
@@ -420,6 +578,7 @@ onMounted(load)
 .skill-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
 
 .sk-name { font-weight: 500; margin-bottom: 4px; }
+.sk-meta { font-size: 11px; margin-bottom: 4px; }
 .sk-desc { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .detail-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -433,6 +592,65 @@ onMounted(load)
   flex-shrink: 0;
 }
 .detail-title { font-weight: 600; flex: 1; }
+
+.governance-strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 16px 0;
+}
+
+.gov-badge {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--surface2);
+  font-size: 12px;
+}
+
+.gov-badge.blocked { color: var(--danger, #e55); }
+.status-approved { color: var(--accent, #4c8); }
+.status-disabled,
+.status-rejected,
+.status-quarantined { color: var(--danger, #e55); }
+
+.governance-panel {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.governance-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.governance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.governance-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.governance-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.governance-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
 
 .skill-preview {
   flex: 1;

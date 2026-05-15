@@ -158,14 +158,22 @@ _JSON_CORRECTION_PROMPT = (
     "直接输出 { ... }，不要其他内容。"
 )
 
+# HTTP status codes returned by backends that do not support `response_format`.
+_RESPONSE_FORMAT_UNSUPPORTED_CODES = (400, 422)
+
 
 def _looks_like_valid_json(text: str) -> bool:
     """Return True if *text* (after stripping common markdown fences) is valid JSON.
 
+    Handled fence patterns (checked in order):
+    - ``\\`\\`\\`json ... \\`\\`\\``` — the most common structured-output wrapper.
+    - ``\\`\\`\\` ... \\`\\`\\``` — bare code fence whose content is JSON.
+    - Raw JSON (no fence) — verified with ``json.loads``.
+
     This is a lightweight check used by :func:`complete_chat_once_with_json_retry`
-    to decide whether a retry is needed.  It intentionally handles only the most
-    common fence patterns; the full ``_strip_markdown_json_fence`` in ``chat.py``
-    covers additional edge-cases for the final parse.
+    to decide whether a retry is needed.  The full ``_strip_markdown_json_fence``
+    in ``chat.py`` handles additional edge-cases (embedded fences, bracket-depth
+    scan) for the final parse.
     """
     stripped = text.strip()
     for prefix in ("```json", "```"):
@@ -218,7 +226,7 @@ async def complete_chat_once_with_json_retry(
             response_format=effective_response_format,
         )
     except httpx.HTTPStatusError as exc:
-        if effective_response_format is not None and exc.response.status_code in (400, 422):
+        if effective_response_format is not None and exc.response.status_code in _RESPONSE_FORMAT_UNSUPPORTED_CODES:
             logger.warning(
                 "[LLM][json-retry] response_format rejected by backend (HTTP %d),"
                 " retrying without it",

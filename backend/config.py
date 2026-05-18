@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 
+    # Temperature override for silent JSON-decision rounds (metadata / child-skill /
+    # resource-selection / runtime-planner / block-planner).  Low values (0.0–0.1)
+    # reduce the chance the model adds prose or Markdown to a pure-JSON response.
+    # Falls back to 0.0 when unset, giving deterministic planner behaviour.
+    planner_temperature: Optional[float] = None
+
     # Timeout for LLM HTTP requests in seconds.
     llm_timeout_seconds: int = 6000
 
@@ -38,6 +44,11 @@ class Settings(BaseSettings):
 
     # Resource reading limit per file (characters) used by read_skill_resource_text.
     skill_resource_max_chars: int = 20000
+
+    # Maximum total character budget for conversation history in creator mode.
+    # When the accumulated user/assistant turns exceed this budget, the oldest
+    # exchange pairs are dropped to avoid silently truncating the context window.
+    creator_max_history_chars: int = 6000
 
     # Maximum wall-clock seconds allowed for a single run_command subprocess.
     skill_command_timeout: int = 60

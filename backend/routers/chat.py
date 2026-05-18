@@ -120,10 +120,16 @@ _CREATOR_OUTPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 _CREATOR_SCENARIO_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(例如|比如|场景|触发|真实例子|用户会说|示例)"),
+    # Natural-language answers produced when users respond to SKILL.md guided questions
+    re.compile(r"(用于|用来|主要功能是|经常用|偶尔用|自己用|给别人用|会用到|使用场景|应用场景|每天|每周|平时)"),
 )
 _CREATOR_RESOURCE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(脚本|script|references/|assets/|api|接口|数据库|环境变量|依赖|模型|文件处理|外部服务)", re.IGNORECASE),
     re.compile(r"(不需要|无需|只靠模型|纯提示词).{0,20}(脚本|api|接口|数据库|依赖|外部服务)", re.IGNORECASE),
+    # Explicit "no external resources" answers
+    re.compile(r"没有.{0,10}(外部|依赖|脚本|资源)|只需要.{0,10}(提示词|SKILL\.md)|纯文本|只用模型|不需要额外", re.IGNORECASE),
+    # Positive resource mentions in natural language
+    re.compile(r"需要.{0,15}(调用|连接|读取|访问|爬取|请求|下载)", re.DOTALL),
 )
 
 _FORBIDDEN_PATH_PARTS = {"..", ""}
@@ -680,7 +686,54 @@ def _request_messages_with_files(request: ChatRequest) -> list[dict]:
     return messages
 
 
-def _extract_input_session_dir(input_files: list[dict], execution_root: "Path | None") -> "Path | None":
+def _truncate_messages_to_char_budget(messages: list[dict], max_chars: int) -> list[dict]:
+    """Return a trimmed copy of *messages* whose total content length ≤ *max_chars*.
+
+    The first user message is always preserved (it contains the original task
+    description).  Oldest user/assistant exchange pairs are dropped from the
+    front of the conversation until the budget is met.  When trimming occurs a
+    one-line summary note is inserted at the truncation point so the model knows
+    part of the history was omitted.
+    """
+    total = sum(len(m.get("content") or "") for m in messages)
+    if total <= max_chars:
+        return list(messages)
+
+    # Locate the first user message — always preserved.
+    first_user_idx = next(
+        (i for i, m in enumerate(messages) if m.get("role") == "user"),
+        None,
+    )
+    if first_user_idx is None:
+        return list(messages)
+
+    head = list(messages[: first_user_idx + 1])
+    tail = list(messages[first_user_idx + 1:])
+
+    head_chars = sum(len(m.get("content") or "") for m in head)
+    tail_chars = sum(len(m.get("content") or "") for m in tail)
+    budget = max_chars - head_chars
+
+    original_tail_len = len(tail)
+
+    # Drop pairs (user + following assistant) from the front of tail.
+    while tail_chars > budget and len(tail) >= 2:
+        if tail[0].get("role") == "user":
+            dropped = tail.pop(0)
+            tail_chars -= len(dropped.get("content") or "")
+        if tail and tail[0].get("role") == "assistant":
+            dropped = tail.pop(0)
+            tail_chars -= len(dropped.get("content") or "")
+
+    if len(tail) < original_tail_len:
+        tail.insert(0, {
+            "role": "user",
+            "content": "【早期部分对话已省略以节省上下文空间，核心需求已在首条消息中保留】",
+        })
+
+    return head + tail
+
+
     """Derive the session-specific input directory from the first uploaded file's path.
 
     Uploaded files are stored at  inputs/<session_id>/<filename>  relative to the
@@ -840,12 +893,25 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
 def _are_creator_requirements_complete(
     missing_slots: list[str], has_follow_up_round: bool
 ) -> bool:
-    """Blueprint output is allowed only after all slots are covered and a real follow-up is answered.
+    """Blueprint output is allowed when sufficient requirement slots are covered.
 
-    The mandatory follow-up question does not itself complete the gate; the user must answer it so
-    creator mode has at least one full clarification round before entering blueprint generation.
+    Rules:
+    - All five slots filled → ready immediately (no mandatory extra exchange needed).
+    - Only the optional slots (scenario, resources) are missing → ready after one
+      clarification round.  This prevents an infinite state-A loop when the user has
+      already described purpose, input, and output in detail.
+    - Core slots (purpose, input, output) are still missing → not ready.
     """
-    return not missing_slots and has_follow_up_round
+    if not missing_slots:
+        # Everything collected — allow blueprint without forcing an extra round.
+        return True
+
+    _NON_CORE_SLOTS = {"scenario", "resources"}
+    if set(missing_slots) <= _NON_CORE_SLOTS:
+        # Only optional slots missing; one clarification exchange is enough.
+        return has_follow_up_round
+
+    return False
 
 
 def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAnalysis:
@@ -947,12 +1013,11 @@ def _compose_creator_state_injection(
                 "Internal error: requirement_analysis is required when composing state A injection. "
                 "Ensure _detect_creator_state() runs before _compose_creator_state_injection()."
             )
-        missing_desc = "、".join(requirement_analysis.missing_slots) or "无"
         return (
             "【后端状态注入】当前状态：A（需求收集）\n\n"
-            f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"
+            "需求信息尚不完整，无法生成蓝图，继续收集用户需求。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
-            "1. 只允许输出一个问题，向用户询问当前最缺失的需求信息，问题的措辞和方式由你自主决定。\n"
+            "1. 只允许输出一个问题。根据对话历史判断当前最需要了解的信息，问题的措辞和方式由你自主决定。\n"
             f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
@@ -3795,7 +3860,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     }
                 )
 
-            final_messages.extend(_request_messages_with_files(request))
+            conv_messages = _request_messages_with_files(request)
+            # In creator mode, guard against context-window saturation by trimming
+            # oldest exchange pairs when the accumulated history grows too large.
+            if skip_runtime_planner_before_confirmation:
+                conv_messages = _truncate_messages_to_char_budget(
+                    conv_messages,
+                    settings.creator_max_history_chars,
+                )
+            final_messages.extend(conv_messages)
 
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):

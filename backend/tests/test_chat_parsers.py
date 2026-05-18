@@ -34,7 +34,11 @@ def test_analyze_creator_requirements_detects_missing_slots():
     assert result.ready_for_blueprint is False
 
 
-def test_detect_creator_state_first_turn_full_request_stays_a():
+def test_detect_creator_state_first_turn_full_request_transitions_to_b():
+    """When the first user message already contains all five requirement slots,
+    the state machine should allow blueprint generation immediately (state B)
+    without requiring an extra clarification exchange.
+    """
     from backend.routers.chat import ChatRequest, Message, _detect_creator_state
 
     request = ChatRequest(
@@ -53,8 +57,8 @@ def test_detect_creator_state_first_turn_full_request_stays_a():
 
     result = _detect_creator_state(request)
 
-    assert result.state == "A"
-    assert result.requirements.ready_for_blueprint is False
+    assert result.state == "B"
+    assert result.requirements.ready_for_blueprint is True
 
 
 def test_detect_creator_state_ready_for_blueprint_after_second_turn():
@@ -84,7 +88,13 @@ def test_detect_creator_state_ready_for_blueprint_after_second_turn():
     assert result.requirements.ready_for_blueprint is True
 
 
-def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
+def test_detect_creator_state_all_slots_filled_no_assistant_unlocks_b():
+    """When all five requirement slots are present across user messages and a
+    subsequent assistant response exists, the state machine should enter state B
+    even though no proper assistant-question → user-answer exchange occurred.
+    The old rule (mandatory assistant follow-up) no longer applies when every
+    slot is already satisfied.
+    """
     from backend.routers.chat import ChatRequest, Message, _detect_creator_state
 
     request = ChatRequest(
@@ -107,8 +117,8 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
 
     result = _detect_creator_state(request)
 
-    assert result.state == "A"
-    assert result.requirements.ready_for_blueprint is False
+    assert result.state == "B"
+    assert result.requirements.ready_for_blueprint is True
 
 
 @pytest.mark.asyncio
@@ -154,11 +164,11 @@ async def test_state_a_calls_llm_with_state_injection():
     # The LLM must have been called (state A no longer short-circuits).
     assert captured_messages, "stream_chat should have been called for state A"
 
-    # The injected system messages must name the missing slots and prohibit blueprint.
+    # The injected system messages must prohibit blueprint output and guide further collection.
     system_contents = " ".join(
         m["content"] for m in captured_messages if m.get("role") == "system"
     )
-    assert "input" in system_contents or "scenario" in system_contents
+    assert "状态 A" in system_contents
     assert BLUEPRINT_MARKER not in text
 
 

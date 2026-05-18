@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Resource reading limit per file (characters) used by read_skill_resource_text.
     skill_resource_max_chars: int = 20000
 
+    # Maximum total character budget for conversation history in creator mode.
+    # When the accumulated user/assistant turns exceed this budget, the oldest
+    # exchange pairs are dropped to avoid silently truncating the context window.
+    creator_max_history_chars: int = 6000
+
     # Maximum wall-clock seconds allowed for a single run_command subprocess.
     skill_command_timeout: int = 60
 

@@ -3,9 +3,13 @@
 Supported actions: init, write, write_file, validate, package, run_script.
 All return a uniform dict: {action, name, success, message, path}.
 run_script additionally returns: {stdout, stderr, exit_code, filename}.
+
+The kernel is treated as an independent, opaque skill package.  All kernel
+scripts are invoked via subprocess using only their documented CLI interfaces
+(as described in kernel/SKILL.md) so that internal implementation details are
+never hardcoded here.
 """
 
-import importlib.util
 import logging
 import os
 import subprocess
@@ -16,26 +20,37 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-# Make kernel/scripts importable so package_skill can do `from quick_validate import …`
-_SCRIPTS_DIR = str(settings.kernel_path / "scripts")
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
 
+def _run_kernel_script(
+    script_filename: str,
+    args: list[str],
+    *,
+    timeout: int = 30,
+) -> tuple[int, str, str]:
+    """Run *script_filename* from kernel/scripts/ as a subprocess.
 
-def _import_script(script_filename: str):
-    """Dynamically import a script from kernel/scripts/.
-
-    Uses sys.modules cache to avoid duplicate exec on repeated calls.
+    Returns ``(returncode, stdout, stderr)``.  The kernel directory is placed
+    first on PYTHONPATH so that inter-script imports (e.g. package_skill.py
+    importing quick_validate) resolve correctly without modifying the host
+    process's sys.path.
     """
-    module_name = Path(script_filename).stem
-    if module_name in sys.modules:
-        return sys.modules[module_name]
     script_path = settings.kernel_path / "scripts" / script_filename
-    spec = importlib.util.spec_from_file_location(module_name, script_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    scripts_dir = str(settings.kernel_path / "scripts")
+    env = {**os.environ, "PYTHONPATH": scripts_dir}
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", f"执行超时（超过 {timeout} 秒）"
+    except Exception as exc:
+        logger.exception("kernel script subprocess failed: %s %s", script_filename, args)
+        return -1, "", f"执行失败: {exc}"
 
 
 def run_action(action: dict) -> dict:
@@ -63,7 +78,7 @@ def run_action(action: dict) -> dict:
 
     try:
         if action_type == "init":
-            return _run_init(name, skill_dir)
+            return _run_init(name, skill_dir, action.get("resources") or [])
         if action_type == "write":
             return _run_write(name, action.get("content", ""), skill_dir)
         if action_type == "write_file":
@@ -108,7 +123,13 @@ def run_action(action: dict) -> dict:
 # Action implementations
 # ---------------------------------------------------------------------------
 
-def _run_init(name: str, skill_dir: Path) -> dict:
+def _run_init(name: str, skill_dir: Path, resources: list[str]) -> dict:
+    """Initialise a new skill directory via kernel/scripts/init_skill.py.
+
+    *resources* is forwarded as ``--resources <csv>`` so that the kernel
+    script creates the requested subdirectories (scripts/, references/, assets/)
+    in one atomic step.  When *skill_dir* already exists the call is a no-op.
+    """
     if skill_dir.exists():
         return {
             "action": "init",
@@ -117,22 +138,25 @@ def _run_init(name: str, skill_dir: Path) -> dict:
             "message": f"目录已存在，跳过初始化: {skill_dir.name}",
             "path": str(skill_dir),
         }
-    mod = _import_script("init_skill.py")
-    result = mod.init_skill(name, str(settings.skills_path))
-    if result is None:
+    args = [name, "--path", str(settings.skills_path)]
+    if resources:
+        args += ["--resources", ",".join(resources)]
+    returncode, stdout, stderr = _run_kernel_script("init_skill.py", args)
+    if returncode == 0:
         return {
             "action": "init",
             "name": name,
-            "success": False,
-            "message": "初始化失败，请检查 skill 名称是否合法",
-            "path": None,
+            "success": True,
+            "message": f"已创建 {name} 目录结构",
+            "path": str(skill_dir),
         }
+    msg = stdout or stderr or "初始化失败，请检查 skill 名称是否合法"
     return {
         "action": "init",
         "name": name,
-        "success": True,
-        "message": f"已创建 {name} 目录结构",
-        "path": str(result),
+        "success": False,
+        "message": msg,
+        "path": None,
     }
 
 
@@ -159,8 +183,12 @@ def _run_write(name: str, content: str, skill_dir: Path) -> dict:
 
 
 def _run_validate(name: str, skill_dir: Path) -> dict:
-    mod = _import_script("quick_validate.py")
-    valid, message = mod.validate_skill(skill_dir)
+    """Validate a skill via kernel/scripts/quick_validate.py."""
+    returncode, stdout, stderr = _run_kernel_script(
+        "quick_validate.py", [str(skill_dir)]
+    )
+    valid = returncode == 0
+    message = stdout or stderr or ("校验通过" if valid else "校验失败")
     return {
         "action": "validate",
         "name": name,
@@ -171,24 +199,28 @@ def _run_validate(name: str, skill_dir: Path) -> dict:
 
 
 def _run_package(name: str, skill_dir: Path) -> dict:
+    """Package a skill via kernel/scripts/package_skill.py."""
     output_dir = skill_dir / "dist"
     output_dir.mkdir(parents=True, exist_ok=True)
-    mod = _import_script("package_skill.py")
-    result = mod.package_skill(skill_dir, str(output_dir))
-    if result is None:
+    returncode, stdout, stderr = _run_kernel_script(
+        "package_skill.py", [str(skill_dir), str(output_dir)]
+    )
+    pkg_path = output_dir / f"{name}.skill"
+    if returncode == 0:
         return {
             "action": "package",
             "name": name,
-            "success": False,
-            "message": "打包失败，请先执行 validate 确认 SKILL.md 格式正确",
-            "path": None,
+            "success": True,
+            "message": f"已打包为 {name}.skill",
+            "path": str(pkg_path),
         }
+    msg = stdout or stderr or "打包失败，请先执行 validate 确认 SKILL.md 格式正确"
     return {
         "action": "package",
         "name": name,
-        "success": True,
-        "message": f"已打包为 {name}.skill",
-        "path": str(result),
+        "success": False,
+        "message": msg,
+        "path": None,
     }
 
 

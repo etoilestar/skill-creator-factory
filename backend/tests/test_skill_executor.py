@@ -246,3 +246,107 @@ def test_snapshot_excludes_pycache(tmp_path):
     snapshot = _snapshot_skill_files(tmp_path)
     assert "main.py" in snapshot
     assert not any("__pycache__" in p for p in snapshot)
+
+
+# ---------------------------------------------------------------------------
+# _run_init (subprocess-based kernel call)
+# ---------------------------------------------------------------------------
+
+def test_run_init_creates_directory(tmp_path):
+    from backend.services import skill_executor
+
+    skills_path = tmp_path / "skills"
+    skills_path.mkdir()
+    skill_dir = skills_path / "new-skill"
+
+    with patch.object(skill_executor.settings, "skills_path", skills_path):
+        result = skill_executor._run_init("new-skill", skill_dir, [])
+
+    assert result["success"] is True
+    assert skill_dir.exists()
+    assert (skill_dir / "SKILL.md").exists()
+
+
+def test_run_init_creates_resource_subdirs(tmp_path):
+    from backend.services import skill_executor
+
+    skills_path = tmp_path / "skills"
+    skills_path.mkdir()
+    skill_dir = skills_path / "res-skill"
+
+    with patch.object(skill_executor.settings, "skills_path", skills_path):
+        result = skill_executor._run_init("res-skill", skill_dir, ["scripts", "references"])
+
+    assert result["success"] is True
+    assert (skill_dir / "scripts").is_dir()
+    assert (skill_dir / "references").is_dir()
+
+
+def test_run_init_existing_directory(tmp_path):
+    from backend.services import skill_executor
+
+    skills_path = tmp_path / "skills"
+    skill_dir = _prepare_skill(skills_path, "existing")
+
+    with patch.object(skill_executor.settings, "skills_path", skills_path):
+        result = skill_executor._run_init("existing", skill_dir, [])
+
+    # Should report success without re-running the kernel script
+    assert result["success"] is True
+    assert "已存在" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# _run_validate (subprocess-based kernel call)
+# ---------------------------------------------------------------------------
+
+def test_run_validate_valid_skill(tmp_path):
+    from backend.services import skill_executor
+
+    skill_dir = _prepare_skill(tmp_path, "valid-sk")
+
+    result = skill_executor._run_validate("valid-sk", skill_dir)
+
+    assert result["success"] is True
+    assert result["path"] is not None
+
+
+def test_run_validate_missing_skill_md(tmp_path):
+    from backend.services import skill_executor
+
+    skill_dir = tmp_path / "bad-sk"
+    skill_dir.mkdir()
+
+    result = skill_executor._run_validate("bad-sk", skill_dir)
+
+    assert result["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# _run_package (subprocess-based kernel call)
+# ---------------------------------------------------------------------------
+
+def test_run_package_valid_skill(tmp_path):
+    from backend.services import skill_executor
+
+    skill_dir = _prepare_skill(tmp_path, "pkg-skill")
+
+    result = skill_executor._run_package("pkg-skill", skill_dir)
+
+    assert result["success"] is True
+    assert result["path"] is not None
+    assert result["path"].endswith(".skill")
+
+
+def test_run_package_invalid_skill(tmp_path):
+    from backend.services import skill_executor
+
+    # Create skill dir with invalid SKILL.md (missing description)
+    skill_dir = tmp_path / "bad-pkg"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: bad-pkg\n---\n# Body\n")
+
+    result = skill_executor._run_package("bad-pkg", skill_dir)
+
+    assert result["success"] is False
+

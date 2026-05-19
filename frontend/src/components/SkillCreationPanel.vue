@@ -489,9 +489,20 @@ async function startCreation() {
   phase.value = 'running'
   paused.value = false
 
+  // Derive the set of resource subdirectories referenced by the file plan so the
+  // kernel init script can pre-create them (scripts/, references/, assets/).
+  // SKILL.md lives at the root and has no parent subdirectory, so it is excluded.
+  const resources = [
+    ...new Set(
+      localFiles.value
+        .map(f => f.path.split('/')[0])
+        .filter(d => d !== 'SKILL.md')
+    ),
+  ]
+
   // 1. Init skill directory
   try {
-    const r = await initSkill(localSkillName.value)
+    const r = await initSkill(localSkillName.value, resources)
     if (!r.success) throw new Error(r.message)
   } catch (err) {
     emit('creation-error', err.message)

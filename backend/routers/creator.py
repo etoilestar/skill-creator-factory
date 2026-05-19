@@ -89,6 +89,7 @@ class AnalyzeBlueprintResponse(BaseModel):
 
 class InitSkillRequest(BaseModel):
     skill_name: str
+    resources: list[str] = []
 
 
 class InitSkillResponse(BaseModel):
@@ -389,7 +390,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 async def init_skill(request: InitSkillRequest):
     """Initialise a new Skill directory structure."""
     skill_name = _validate_skill_name(request.skill_name)
-    result = run_action({"action": "init", "name": skill_name})
+    result = run_action({"action": "init", "name": skill_name, "resources": request.resources})
     return InitSkillResponse(
         success=result["success"],
         path=result.get("path"),

@@ -30,13 +30,14 @@ export async function analyzeBlueprintPlan(messages, model = null) {
  * Initialise a new Skill directory structure on the backend.
  *
  * @param {string} skillName
+ * @param {string[]} [resources] - resource subdirectories to pre-create, e.g. ['scripts', 'references']
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function initSkill(skillName) {
+export async function initSkill(skillName, resources = []) {
   const resp = await fetch('/api/creator/init-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({ skill_name: skillName, resources }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))

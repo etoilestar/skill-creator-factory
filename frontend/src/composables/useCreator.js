@@ -49,7 +49,9 @@ export async function initSkill(skillName) {
  * Stream the generated content for a single Skill file.
  *
  * Yields:
- *   - string chunks while the model is generating
+ *   - string chunks while the model is generating  (backward-compat: content event)
+ *   - { thought: object } for internal step visibility (F4)
+ *   - { tool_result: object } when the model returned a JSON tool call (F3)
  *   - { done: true } when generation is complete
  *   - { error: string } on failure
  *
@@ -61,7 +63,7 @@ export async function initSkill(skillName) {
  *   conversationHistory: Array,
  *   model?: string|null
  * }} params
- * @yields {string | {done:true} | {error:string}}
+ * @yields {string | {thought:object} | {tool_result:object} | {done:true} | {error:string}}
  */
 export async function* generateFileStream({
   skillName,
@@ -114,6 +116,14 @@ export async function* generateFileStream({
         if (parsed.done) {
           yield { done: true }
           return
+        }
+        if (parsed.thought) {
+          yield { thought: parsed.thought }
+          continue
+        }
+        if (parsed.tool_result) {
+          yield { tool_result: parsed.tool_result }
+          continue
         }
         if (typeof parsed.content === 'string') {
           yield parsed.content

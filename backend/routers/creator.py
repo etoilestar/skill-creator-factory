@@ -14,6 +14,7 @@ These endpoints decouple the file-creation phase from the main
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +24,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.llm_proxy import stream_chat
+from ..services.output_validator import retry_with_validation
 from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,61 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _thought_event(step: str, label: str, detail: str, data: dict | None = None) -> str:
+    """Build a 'thought' SSE event for creator-flow observability."""
+    return _sse({
+        "thought": {
+            "step": step,
+            "label": label,
+            "detail": detail,
+            "data": data or {},
+            "ts": time.time(),
+        }
+    })
+
+
+# ---------------------------------------------------------------------------
+# JSON tool call gate (F3)
+# ---------------------------------------------------------------------------
+
+# Actions the model is permitted to invoke via a JSON tool call during file
+# generation.  write / write_file are intentionally excluded — those are
+# handled by the explicit /write-file endpoint so the frontend always has
+# a chance to preview content before committing it to disk.
+_ALLOWED_TOOL_ACTIONS: frozenset[str] = frozenset(
+    {"init", "validate", "package", "run_script"}
+)
+
+
+def _parse_tool_call(text: str) -> dict | None:
+    """Try to parse *text* as a JSON tool call.
+
+    Expected format::
+
+        {"tool_call": {"action": "<action>", "name": "<skill>", ...}}
+
+    Returns the inner ``tool_call`` dict when *text* is valid JSON containing
+    a ``tool_call`` key whose ``action`` is in ``_ALLOWED_TOOL_ACTIONS``.
+    Returns ``None`` for any other input, including plain file content.
+    """
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tool_call = data.get("tool_call")
+    if not isinstance(tool_call, dict):
+        return None
+    action = str(tool_call.get("action", "")).strip()
+    if action not in _ALLOWED_TOOL_ACTIONS:
+        return None
+    return tool_call
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -313,12 +369,15 @@ async def init_skill(request: InitSkillRequest):
 
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
-    """Stream the generated content for a single Skill file.
+    """Generate content for a single Skill file with validation and retry (F2/F3/F4).
 
     SSE event shapes:
-      ``{ "content": "<chunk>" }``  — content chunk
-      ``{ "done": true }``           — generation complete
-      ``{ "error": "<message>" }``   — generation failed
+
+    ``{ "thought": {...} }``          — internal step visibility (F4)
+    ``{ "content": "<text>" }``       — final file content (emitted once, after validation)
+    ``{ "tool_result": {...} }``       — script execution result when model returns a tool call (F3)
+    ``{ "done": true }``              — generation complete
+    ``{ "error": "<message>" }``      — fatal error (includes "要求过于复杂模型无法实现" after 3 failed retries)
     """
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
@@ -334,17 +393,84 @@ async def generate_file(request: GenerateFileRequest):
 
     async def event_stream():
         try:
-            async for chunk in stream_chat(prompt_messages, model):
-                yield _sse({"content": chunk})
+            # ----------------------------------------------------------------
+            # F2 + F4: validate-and-retry with thought events
+            # ----------------------------------------------------------------
+            yield _thought_event(
+                "creator_attempt",
+                "开始生成",
+                f"文件：{request.file_path}",
+                {"file": request.file_path, "model": model},
+            )
+
+            output, succeeded, attempt_log = await retry_with_validation(
+                prompt_messages, model, max_retries=3
+            )
+
+            # Emit one thought per attempt so the frontend can show the log.
+            for rec in attempt_log:
+                yield _thought_event(
+                    "creator_validate",
+                    f"第 {rec.attempt} 次校验{'通过' if rec.is_valid else '未通过'}",
+                    rec.reason if not rec.is_valid else f"内容长度：{rec.output_chars} 字符",
+                    {
+                        "attempt": rec.attempt,
+                        "valid": rec.is_valid,
+                        "output_chars": rec.output_chars,
+                        "reason": rec.reason,
+                    },
+                )
+
+            if not succeeded:
+                yield _sse({"error": "要求过于复杂模型无法实现"})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ----------------------------------------------------------------
+            # F3: check whether output is a JSON tool call
+            # ----------------------------------------------------------------
+            tool_call = _parse_tool_call(output)
+            if tool_call is not None:
+                action = tool_call.get("action", "")
+                yield _thought_event(
+                    "creator_tool_call",
+                    "工具调用",
+                    f"action={action}",
+                    {"tool_call": tool_call},
+                )
+
+                exec_result = run_action({**tool_call, "name": skill_name})
+
+                yield _thought_event(
+                    "creator_script_exec",
+                    "脚本执行结果",
+                    (
+                        "成功" if exec_result.get("success") else "失败"
+                    ) + f": {exec_result.get('message', '')}",
+                    {
+                        k: (v[:500] if isinstance(v, str) else v)
+                        for k, v in exec_result.items()
+                    },
+                )
+                yield _sse({"tool_result": exec_result})
+                yield _sse({"done": True})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ----------------------------------------------------------------
+            # Normal path: emit the validated file content as a single event
+            # ----------------------------------------------------------------
+            yield _sse({"content": output})
             yield _sse({"done": True})
+
         except Exception as exc:
             logger.exception(
-                "generate-file stream error skill=%s file=%s",
+                "generate-file error skill=%s file=%s",
                 skill_name,
                 request.file_path,
             )
-            # Return a safe user-facing message; full stack trace is in server logs.
             yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

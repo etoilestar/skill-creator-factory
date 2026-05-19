@@ -178,6 +178,30 @@
       </div>
     </div>
 
+    <!-- Internal thought log (F4): shadow panel showing model conversation steps -->
+    <div v-if="activeThoughts.length > 0" class="thought-log">
+      <div class="thought-log-header" @click="showThoughtLog = !showThoughtLog">
+        <span class="thought-log-icon">🔍</span>
+        <span class="thought-log-title">内部执行日志</span>
+        <span class="thought-log-count">{{ activeThoughts.length }} 步</span>
+        <span class="thought-log-toggle">{{ showThoughtLog ? '▲' : '▼' }}</span>
+      </div>
+      <div v-if="showThoughtLog" class="thought-log-body">
+        <div
+          v-for="(t, i) in activeThoughts"
+          :key="i"
+          class="thought-item"
+          :class="t.step"
+        >
+          <span class="thought-step-icon">{{ thoughtIcon(t.step, t.data) }}</span>
+          <div class="thought-text">
+            <span class="thought-label">{{ t.label }}</span>
+            <span class="thought-detail">{{ t.detail }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Complete actions -->
     <div v-if="phase === 'complete'" class="complete-actions">
       <button class="btn-primary" @click="openInSandbox">在沙盒中打开</button>
@@ -231,6 +255,7 @@ const localFiles = ref(
     bytesWritten: 0,
     error: '',
     showPreview: false,
+    toolResult: null,
   }))
 )
 
@@ -248,6 +273,10 @@ const packageResult = ref(null)
 const addFilePrompt = ref(false)
 const newFilePath = ref('')
 const newFilePurpose = ref('')
+
+// Thought log: accumulates internal steps from the active generate-file call (F4)
+const activeThoughts = ref([])
+const showThoughtLog = ref(false)
 
 // ---------------------------------------------------------------------------
 // Computed
@@ -284,6 +313,23 @@ function statusIcon(status) {
     error:      '❌',
   }
   return icons[status] ?? '⬜'
+}
+
+const THOUGHT_ICONS = {
+  creator_attempt:     '🚀',
+  creator_validate:    '🔎',
+  creator_tool_call:   '🔧',
+  creator_script_exec: '⚙️',
+}
+
+function thoughtIcon(step, data) {
+  if (step === 'creator_validate') {
+    return data?.valid === false ? '⚠️' : '✅'
+  }
+  if (step === 'creator_script_exec') {
+    return data?.success === false ? '❌' : '✅'
+  }
+  return THOUGHT_ICONS[step] ?? '•'
 }
 
 function formatBytes(n) {
@@ -374,6 +420,8 @@ async function generateOneFile(idx) {
   file.status = 'generating'
   file.error = ''
   file.generatedContent = ''
+  activeThoughts.value = []
+  showThoughtLog.value = true  // auto-show log while generating
 
   try {
     for await (const chunk of generateFileStream({
@@ -386,6 +434,13 @@ async function generateOneFile(idx) {
     })) {
       if (typeof chunk === 'string') {
         file.generatedContent += chunk
+      } else if (chunk?.thought) {
+        activeThoughts.value.push(chunk.thought)
+      } else if (chunk?.tool_result) {
+        // Model returned a JSON tool call; backend executed it.
+        // Store stdout/message for display; no editable content to show.
+        file.toolResult = chunk.tool_result
+        file.generatedContent = chunk.tool_result.message || ''
       } else if (chunk?.done) {
         break
       } else if (chunk?.error) {
@@ -393,11 +448,16 @@ async function generateOneFile(idx) {
       }
     }
 
-    if (!file.generatedContent.trim()) {
+    if (!file.generatedContent.trim() && !file.toolResult) {
       throw new Error('模型未返回任何内容，请重试或手动填写')
     }
 
-    file.status = 'preview'
+    // If handled by a tool call, mark as done immediately (no write needed).
+    if (file.toolResult) {
+      file.status = 'done'
+    } else {
+      file.status = 'preview'
+    }
   } catch (err) {
     file.status = 'error'
     file.error = err.message
@@ -406,6 +466,8 @@ async function generateOneFile(idx) {
 
 async function writeOneFile(idx) {
   const file = localFiles.value[idx]
+  // If the file was already handled by a tool call execution, skip the write step.
+  if (file.status === 'done') return
   file.status = 'writing'
   try {
     const result = await writeFile(localSkillName.value, file.path, file.generatedContent)
@@ -752,4 +814,66 @@ function openInSandbox() {
   font-size: 13px;
 }
 .complete-actions a:hover { background: #4a4a4a; }
+
+/* Internal thought log (F4) — shadow/dim panel showing model internal steps */
+.thought-log {
+  border: 1px solid #333;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(2px);
+  overflow: hidden;
+}
+
+.thought-log-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid transparent;
+  transition: background 0.15s;
+}
+.thought-log-header:hover { background: rgba(255, 255, 255, 0.07); }
+
+.thought-log-icon  { font-size: 13px; }
+.thought-log-title { font-size: 12px; font-weight: 600; color: #888; flex: 1; }
+.thought-log-count { font-size: 11px; color: #666; }
+.thought-log-toggle { font-size: 10px; color: #555; }
+
+.thought-log-body {
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.thought-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+  border-left: 2px solid #333;
+}
+.thought-item.creator_attempt    { border-left-color: #3a7bd5; }
+.thought-item.creator_validate   { border-left-color: #27ae60; }
+.thought-item.creator_tool_call  { border-left-color: #e67e22; }
+.thought-item.creator_script_exec { border-left-color: #9b59b6; }
+
+.thought-step-icon { font-size: 12px; flex-shrink: 0; margin-top: 1px; }
+
+.thought-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.thought-label  { font-size: 11px; font-weight: 600; color: #999; }
+.thought-detail { font-size: 11px; color: #666; word-break: break-all; white-space: pre-wrap; }
 </style>

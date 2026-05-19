@@ -2130,14 +2130,20 @@ async def _run_skill_runtime_planner_round(
     planner_model = _planner_model_name(model)
     planner_text = await complete_chat_once(messages, planner_model)
 
+    _needs_dict_retry = False
     try:
         stripped = _strip_markdown_json_fence(planner_text)
         raw_plan = json.loads(stripped)
+        if not isinstance(raw_plan, dict):
+            _needs_dict_retry = True
     except json.JSONDecodeError:
-        # First attempt failed.  Give the model one more chance with an explicit
-        # correction prompt that reinforces the JSON-only requirement.
+        _needs_dict_retry = True
+
+    if _needs_dict_retry:
+        # First attempt returned either non-JSON or valid JSON that is not an object.
+        # Give the model one more chance with an explicit correction prompt.
         logger.warning(
-            "Planner returned non-JSON on first attempt, retrying with correction prompt: %s",
+            "Planner returned non-JSON-object on first attempt, retrying with correction prompt: %s",
             planner_text[:300],
         )
         retry_messages = messages + [
@@ -2145,9 +2151,9 @@ async def _run_skill_runtime_planner_round(
             {
                 "role": "user",
                 "content": (
-                    "你的上一次回复包含了自然语言或 Markdown，不是合法的 JSON。\n"
-                    "请重新输出，只输出一个符合格式要求的 JSON 对象，"
-                    "不要任何解释、不要 Markdown、不要代码块标记。\n"
+                    "你的上一次回复不是合法的 JSON 对象（可能是数组、纯文字或 Markdown）。\n"
+                    "请重新输出，只输出一个符合格式要求的 JSON 对象（即 { ... } 形式），"
+                    "不要任何解释、不要 Markdown、不要代码块标记、不要数组。\n"
                     "直接输出 { ... }，不要其他内容。"
                 ),
             },
@@ -2162,6 +2168,12 @@ async def _run_skill_runtime_planner_round(
                 planner_text,
             )
             raise ValueError(f"运行时规划模型没有返回合法 JSON: {planner_text[:500]}") from exc
+        if not isinstance(raw_plan, dict):
+            logger.error(
+                "Skill runtime planner returned valid JSON but not an object after retry: %s",
+                planner_text,
+            )
+            raise ValueError(f"运行时规划模型输出必须是 JSON object，实际返回: {planner_text[:500]}")
 
     return await asyncio.to_thread(
         functools.partial(

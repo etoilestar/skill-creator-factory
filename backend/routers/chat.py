@@ -1919,6 +1919,13 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "  \"errors\": []\n"
         "}\n"
         "\n"
+        "可用环境变量（由运行时注入，shell=False 时不会自动展开，必须通过这些变量访问）：\n"
+        "- `$SKILL_DIR`：当前 Skill 的根目录绝对路径（如 `/app/skills/my-skill`）。\n"
+        "  Python 脚本内引用：`os.environ['SKILL_DIR']`\n"
+        "- `$OUTPUT_DIR`：输出文件存放目录（`$SKILL_DIR/outputs/`）。\n"
+        "- `$INPUT_DIR`：输入文件目录（`$SKILL_DIR/inputs/`）。\n"
+        "- `$INPUT_SESSION_DIR`：本次会话上传文件的存放目录（仅在有文件上传时存在）。\n"
+        "\n"
         "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径。\n"
         "- Shell 脚本：`$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`\n"
         "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
@@ -2789,6 +2796,7 @@ def _execute_single_task(
         )
 
         _run_cmd_extra_env: dict[str, str] = {
+            "SKILL_DIR": str(cwd) if cwd else "",
             "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
             "INPUT_DIR": str(cwd / "inputs") if cwd else "",
         }

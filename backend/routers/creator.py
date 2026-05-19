@@ -202,9 +202,34 @@ def _build_generate_file_prompt(
 
     The model is asked to output *only* raw file content — no fences, no JSON,
     no explanations.  This maximises reliability for small or unstable models.
+
+    **Exception — JSON tool call (F3):**
+    When the model needs to *execute* an existing script rather than generate
+    new file content (e.g., to run a helper or validate an intermediate result),
+    it must respond with the following pure-JSON format and nothing else::
+
+        {"tool_call": {"action": "run_script", "name": "<skill>", "filename": "<script>", "args": []}}
+
+    Allowed actions: run_script, init, validate, package.
+    The backend gate (``_parse_tool_call``) discards any tool-call output whose
+    action is not in the allowlist, treating it as plain file content instead.
     """
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
+
+    # ------------------------------------------------------------------
+    # Shared tool-call addendum injected into every prompt so the model
+    # knows the escape hatch when script execution is needed.
+    # ------------------------------------------------------------------
+    _tool_call_note = (
+        "\n\n【特殊情况】如果完成本任务需要执行一个已有脚本（而非生成新文件内容），"
+        "请改为只输出如下纯 JSON 格式，不包含任何其他内容：\n"
+        '{"tool_call": {"action": "run_script", "name": "'
+        + skill_name
+        + '", "filename": "<脚本文件名>", "args": [...]}}\n'
+        "可用 action：run_script、init、validate、package。"
+        "如无需执行脚本，请直接输出文件内容，忽略此说明。"
+    )
 
     if file_path == "SKILL.md":
         instruction = (
@@ -220,6 +245,7 @@ def _build_generate_file_prompt(
             "4. 执行说明应指导宿主 AI 如何理解用户请求、调用脚本/工具、生成回答。\n"
             "5. 不要在输出内容的外侧套 ``` 代码块。\n\n"
             f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("scripts/"):
         instruction = (
@@ -232,6 +258,7 @@ def _build_generate_file_prompt(
             "4. 所有导入的第三方库必须真实存在且常见。\n"
             "5. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("references/"):
         instruction = (
@@ -242,6 +269,7 @@ def _build_generate_file_prompt(
             "2. 不要在文档外套 ``` 代码块。\n"
             "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n\n"
             f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("assets/"):
         instruction = (
@@ -251,6 +279,7 @@ def _build_generate_file_prompt(
             f"1. 只输出 {lang} 格式的文件内容，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     else:
         instruction = (
@@ -258,6 +287,7 @@ def _build_generate_file_prompt(
             f"职责说明：{purpose}\n\n"
             "要求：直接输出文件内容，不要任何解释，不要 Markdown 代码块包裹。\n\n"
             f"蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
 
     messages: list[dict] = [{"role": "system", "content": instruction}]

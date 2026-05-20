@@ -30,13 +30,14 @@ export async function analyzeBlueprintPlan(messages, model = null) {
  * Initialise a new Skill directory structure on the backend.
  *
  * @param {string} skillName
+ * @param {string[]} [resources] - resource subdirectories to pre-create, e.g. ['scripts', 'references']
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function initSkill(skillName) {
+export async function initSkill(skillName, resources = []) {
   const resp = await fetch('/api/creator/init-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({ skill_name: skillName, resources }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
@@ -49,7 +50,9 @@ export async function initSkill(skillName) {
  * Stream the generated content for a single Skill file.
  *
  * Yields:
- *   - string chunks while the model is generating
+ *   - string chunks while the model is generating  (backward-compat: content event)
+ *   - { thought: object } for internal step visibility (F4)
+ *   - { tool_result: object } when the model returned a JSON tool call (F3)
  *   - { done: true } when generation is complete
  *   - { error: string } on failure
  *
@@ -61,7 +64,7 @@ export async function initSkill(skillName) {
  *   conversationHistory: Array,
  *   model?: string|null
  * }} params
- * @yields {string | {done:true} | {error:string}}
+ * @yields {string | {thought:object} | {tool_result:object} | {done:true} | {error:string}}
  */
 export async function* generateFileStream({
   skillName,
@@ -114,6 +117,14 @@ export async function* generateFileStream({
         if (parsed.done) {
           yield { done: true }
           return
+        }
+        if (parsed.thought) {
+          yield { thought: parsed.thought }
+          continue
+        }
+        if (parsed.tool_result) {
+          yield { tool_result: parsed.tool_result }
+          continue
         }
         if (typeof parsed.content === 'string') {
           yield parsed.content

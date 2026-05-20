@@ -14,6 +14,7 @@ These endpoints decouple the file-creation phase from the main
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +24,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.llm_proxy import stream_chat
+from ..services.output_validator import retry_with_validation
 from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class AnalyzeBlueprintResponse(BaseModel):
 
 class InitSkillRequest(BaseModel):
     skill_name: str
+    resources: list[str] = []
 
 
 class InitSkillResponse(BaseModel):
@@ -201,9 +203,34 @@ def _build_generate_file_prompt(
 
     The model is asked to output *only* raw file content — no fences, no JSON,
     no explanations.  This maximises reliability for small or unstable models.
+
+    **Exception — JSON tool call (F3):**
+    When the model needs to *execute* an existing script rather than generate
+    new file content (e.g., to run a helper or validate an intermediate result),
+    it must respond with the following pure-JSON format and nothing else::
+
+        {"tool_call": {"action": "run_script", "name": "<skill>", "filename": "<script>", "args": []}}
+
+    Allowed actions: run_script, init, validate, package.
+    The backend gate (``_parse_tool_call``) discards any tool-call output whose
+    action is not in the allowlist, treating it as plain file content instead.
     """
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
+
+    # ------------------------------------------------------------------
+    # Shared tool-call addendum injected into every prompt so the model
+    # knows the escape hatch when script execution is needed.
+    # ------------------------------------------------------------------
+    _tool_call_note = (
+        "\n\n【特殊情况】如果完成本任务需要执行一个已有脚本（而非生成新文件内容），"
+        "请改为只输出如下纯 JSON 格式，不包含任何其他内容：\n"
+        '{"tool_call": {"action": "run_script", "name": "'
+        + skill_name
+        + '", "filename": "<脚本文件名>", "args": [...]}}\n'
+        "可用 action：run_script、init、validate、package。"
+        "如无需执行脚本，请直接输出文件内容，忽略此说明。"
+    )
 
     if file_path == "SKILL.md":
         instruction = (
@@ -219,6 +246,7 @@ def _build_generate_file_prompt(
             "4. 执行说明应指导宿主 AI 如何理解用户请求、调用脚本/工具、生成回答。\n"
             "5. 不要在输出内容的外侧套 ``` 代码块。\n\n"
             f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("scripts/"):
         instruction = (
@@ -231,6 +259,7 @@ def _build_generate_file_prompt(
             "4. 所有导入的第三方库必须真实存在且常见。\n"
             "5. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("references/"):
         instruction = (
@@ -241,6 +270,7 @@ def _build_generate_file_prompt(
             "2. 不要在文档外套 ``` 代码块。\n"
             "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n\n"
             f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     elif file_path.startswith("assets/"):
         instruction = (
@@ -250,6 +280,7 @@ def _build_generate_file_prompt(
             f"1. 只输出 {lang} 格式的文件内容，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
     else:
         instruction = (
@@ -257,6 +288,7 @@ def _build_generate_file_prompt(
             f"职责说明：{purpose}\n\n"
             "要求：直接输出文件内容，不要任何解释，不要 Markdown 代码块包裹。\n\n"
             f"蓝图：\n\n{blueprint_text}"
+            + _tool_call_note
         )
 
     messages: list[dict] = [{"role": "system", "content": instruction}]
@@ -271,6 +303,61 @@ def _build_generate_file_prompt(
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _thought_event(step: str, label: str, detail: str, data: dict | None = None) -> str:
+    """Build a 'thought' SSE event for creator-flow observability."""
+    return _sse({
+        "thought": {
+            "step": step,
+            "label": label,
+            "detail": detail,
+            "data": data or {},
+            "ts": time.time(),
+        }
+    })
+
+
+# ---------------------------------------------------------------------------
+# JSON tool call gate (F3)
+# ---------------------------------------------------------------------------
+
+# Actions the model is permitted to invoke via a JSON tool call during file
+# generation.  write / write_file are intentionally excluded — those are
+# handled by the explicit /write-file endpoint so the frontend always has
+# a chance to preview content before committing it to disk.
+_ALLOWED_TOOL_ACTIONS: frozenset[str] = frozenset(
+    {"init", "validate", "package", "run_script"}
+)
+
+
+def _parse_tool_call(text: str) -> dict | None:
+    """Try to parse *text* as a JSON tool call.
+
+    Expected format::
+
+        {"tool_call": {"action": "<action>", "name": "<skill>", ...}}
+
+    Returns the inner ``tool_call`` dict when *text* is valid JSON containing
+    a ``tool_call`` key whose ``action`` is in ``_ALLOWED_TOOL_ACTIONS``.
+    Returns ``None`` for any other input, including plain file content.
+    """
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tool_call = data.get("tool_call")
+    if not isinstance(tool_call, dict):
+        return None
+    action = str(tool_call.get("action", "")).strip()
+    if action not in _ALLOWED_TOOL_ACTIONS:
+        return None
+    return tool_call
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +390,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 async def init_skill(request: InitSkillRequest):
     """Initialise a new Skill directory structure."""
     skill_name = _validate_skill_name(request.skill_name)
-    result = run_action({"action": "init", "name": skill_name})
+    result = run_action({"action": "init", "name": skill_name, "resources": request.resources})
     return InitSkillResponse(
         success=result["success"],
         path=result.get("path"),
@@ -313,12 +400,15 @@ async def init_skill(request: InitSkillRequest):
 
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
-    """Stream the generated content for a single Skill file.
+    """Generate content for a single Skill file with validation and retry (F2/F3/F4).
 
     SSE event shapes:
-      ``{ "content": "<chunk>" }``  — content chunk
-      ``{ "done": true }``           — generation complete
-      ``{ "error": "<message>" }``   — generation failed
+
+    ``{ "thought": {...} }``          — internal step visibility (F4)
+    ``{ "content": "<text>" }``       — final file content (emitted once, after validation)
+    ``{ "tool_result": {...} }``       — script execution result when model returns a tool call (F3)
+    ``{ "done": true }``              — generation complete
+    ``{ "error": "<message>" }``      — fatal error (includes "要求过于复杂模型无法实现" after 3 failed retries)
     """
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
@@ -334,17 +424,84 @@ async def generate_file(request: GenerateFileRequest):
 
     async def event_stream():
         try:
-            async for chunk in stream_chat(prompt_messages, model):
-                yield _sse({"content": chunk})
+            # ----------------------------------------------------------------
+            # F2 + F4: validate-and-retry with thought events
+            # ----------------------------------------------------------------
+            yield _thought_event(
+                "creator_attempt",
+                "开始生成",
+                f"文件：{request.file_path}",
+                {"file": request.file_path, "model": model},
+            )
+
+            output, succeeded, attempt_log = await retry_with_validation(
+                prompt_messages, model, max_retries=3
+            )
+
+            # Emit one thought per attempt so the frontend can show the log.
+            for rec in attempt_log:
+                yield _thought_event(
+                    "creator_validate",
+                    f"第 {rec.attempt} 次校验{'通过' if rec.is_valid else '未通过'}",
+                    rec.reason if not rec.is_valid else f"内容长度：{rec.output_chars} 字符",
+                    {
+                        "attempt": rec.attempt,
+                        "valid": rec.is_valid,
+                        "output_chars": rec.output_chars,
+                        "reason": rec.reason,
+                    },
+                )
+
+            if not succeeded:
+                yield _sse({"error": "要求过于复杂模型无法实现"})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ----------------------------------------------------------------
+            # F3: check whether output is a JSON tool call
+            # ----------------------------------------------------------------
+            tool_call = _parse_tool_call(output)
+            if tool_call is not None:
+                action = tool_call.get("action", "")
+                yield _thought_event(
+                    "creator_tool_call",
+                    "工具调用",
+                    f"action={action}",
+                    {"tool_call": tool_call},
+                )
+
+                exec_result = run_action({**tool_call, "name": skill_name})
+
+                yield _thought_event(
+                    "creator_script_exec",
+                    "脚本执行结果",
+                    (
+                        "成功" if exec_result.get("success") else "失败"
+                    ) + f": {exec_result.get('message', '')}",
+                    {
+                        k: (v[:500] if isinstance(v, str) else v)
+                        for k, v in exec_result.items()
+                    },
+                )
+                yield _sse({"tool_result": exec_result})
+                yield _sse({"done": True})
+                yield "data: [DONE]\n\n"
+                return
+
+            # ----------------------------------------------------------------
+            # Normal path: emit the validated file content as a single event
+            # ----------------------------------------------------------------
+            yield _sse({"content": output})
             yield _sse({"done": True})
+
         except Exception as exc:
             logger.exception(
-                "generate-file stream error skill=%s file=%s",
+                "generate-file error skill=%s file=%s",
                 skill_name,
                 request.file_path,
             )
-            # Return a safe user-facing message; full stack trace is in server logs.
             yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

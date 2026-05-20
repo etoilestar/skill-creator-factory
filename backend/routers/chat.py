@@ -65,7 +65,6 @@ class CreatorRequirementAnalysis:
     collected_slots: list[str]
     missing_slots: list[str]
     ready_for_blueprint: bool
-    next_question: str
 
 
 @dataclass
@@ -838,18 +837,6 @@ def _creator_has_follow_up_round(request: ChatRequest) -> bool:
     return False
 
 
-def _build_creator_clarifying_question(missing_slot: str) -> str:
-    """Return a deterministic single-question follow-up for state A."""
-    shared_input_output_question = "好的，我先确认一个关键信息：用户实际会提供什么输入，它最终又应该输出什么结果？最好直接给我一条真实示例。"
-    prompts = {
-        "purpose": "好的，我先确认一个关键信息：这个 Skill 最核心要解决什么问题？请用一句话说清它最主要的用途。",
-        "input": shared_input_output_question,
-        "output": shared_input_output_question,
-        "scenario": "好的，我先确认一个关键信息：请给我一个最典型的使用场景，最好是一句用户真的会说的话。",
-        "resources": "好的，我先确认一个关键信息：这个 Skill 是否需要脚本、参考资料、外部 API、数据库或其他依赖配置？如果都不需要，也请直接说明。",
-        "mandatory_follow_up": "好的，我再确认一个关键细节：这个 Skill 还有没有必须遵守的限制、偏好或交付要求？如果没有，也请直接说“没有”。",
-    }
-    return prompts.get(missing_slot, prompts["input"])
 
 
 def _are_creator_requirements_complete(
@@ -897,19 +884,12 @@ def _analyze_creator_requirements(request: ChatRequest) -> CreatorRequirementAna
     ready_for_blueprint = _are_creator_requirements_complete(
         missing_slots, has_follow_up_round
     )
-    if missing_slots:
-        next_prompt_key = missing_slots[0]
-    elif not has_follow_up_round:
-        next_prompt_key = "mandatory_follow_up"
-    else:
-        next_prompt_key = ""
 
     return CreatorRequirementAnalysis(
         user_turns=len(user_texts),
         collected_slots=collected_slots,
         missing_slots=missing_slots,
         ready_for_blueprint=ready_for_blueprint,
-        next_question=_build_creator_clarifying_question(next_prompt_key),
     )
 
 
@@ -979,7 +959,7 @@ def _compose_creator_state_injection(
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
             "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。\n"
-            "回复格式：好的，我先确认一个关键信息：<只问一个问题>"
+            "请自然地提问，语气与 SKILL.md 的内容要求一致，只提一个问题，问完即止。"
         )
     if state == "B":
         if not blueprint_shown:
@@ -1007,13 +987,6 @@ def _compose_creator_state_injection(
     )
 
 
-def _simple_sse_content_response(content: str) -> list[str]:
-    """Return a minimal SSE response payload containing one assistant message."""
-    return [
-        _sse({"status": None}),
-        _sse({"content": content}),
-        "data: [DONE]\n\n",
-    ]
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -3243,12 +3216,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     },
                 )
 
-                if creator_state == "A":
-                    for event in _simple_sse_content_response(
-                        creator_state_ctx.requirements.next_question
-                    ):
-                        yield event
-                    return
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()

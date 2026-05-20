@@ -8,7 +8,6 @@ rejects symlinks escaping the skill execution sandbox.
 import json
 import pytest
 
-STATE_A_PROMPT_PREFIX = "好的，我先确认一个关键信息"
 BLUEPRINT_MARKER = "Skill 蓝图"
 
 
@@ -32,7 +31,6 @@ def test_analyze_creator_requirements_detects_missing_slots():
     assert "input" in result.missing_slots
     assert "scenario" in result.missing_slots
     assert result.ready_for_blueprint is False
-    assert "关键信息" in result.next_question
 
 
 def test_detect_creator_state_first_turn_full_request_stays_a():
@@ -112,36 +110,6 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
     assert result.requirements.ready_for_blueprint is False
 
 
-@pytest.mark.asyncio
-async def test_state_a_returns_clarifying_question_without_llm():
-    from backend.routers.chat import ChatRequest, Message, _make_stream
-
-    request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])
-    skill_context = {
-        "skill_name": "skill-creator",
-        "metadata_prompt": "",
-        "body_loader": lambda: "body",
-        "child_body_loader": None,
-        "force_body": True,
-        "enable_action_execution": True,
-        "require_action_confirmation": True,
-        "execution_root": None,
-        "strict_creator_generation": True,
-        "skip_runtime_planner_before_confirmation": True,
-        "disable_runtime_planner": True,
-        "enable_resource_preload": True,
-        "use_frontend_driven_creation": True,
-    }
-
-    response = _make_stream(skill_context, request)
-    chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-
-    text = "".join(chunks)
-    # State A must return a deterministic clarifying question instead of a blueprint.
-    assert STATE_A_PROMPT_PREFIX in text
-    assert BLUEPRINT_MARKER not in text
 
 
 # ---------------------------------------------------------------------------

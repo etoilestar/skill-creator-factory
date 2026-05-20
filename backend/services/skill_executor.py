@@ -4,8 +4,6 @@ Supported actions: init, write, write_file, validate, package, run_script.
 All return a uniform dict: {action, name, success, message, path}.
 run_script additionally returns: {stdout, stderr, exit_code, filename}.
 """
-
-import importlib.util
 import logging
 import os
 import subprocess
@@ -16,26 +14,20 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-# Make kernel/scripts importable so package_skill can do `from quick_validate import …`
-_SCRIPTS_DIR = str(settings.kernel_path / "scripts")
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
+_KERNEL_SCRIPT_TIMEOUT = 60
 
 
-def _import_script(script_filename: str):
-    """Dynamically import a script from kernel/scripts/.
-
-    Uses sys.modules cache to avoid duplicate exec on repeated calls.
-    """
-    module_name = Path(script_filename).stem
-    if module_name in sys.modules:
-        return sys.modules[module_name]
+def _run_kernel_script(script_filename: str, args: list[str]) -> subprocess.CompletedProcess:
     script_path = settings.kernel_path / "scripts" / script_filename
-    spec = importlib.util.spec_from_file_location(module_name, script_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    if not script_path.is_file():
+        raise FileNotFoundError(f"Kernel 脚本不存在: {script_path}")
+
+    return subprocess.run(
+        [sys.executable, str(script_path), *args],
+        capture_output=True,
+        text=True,
+        timeout=_KERNEL_SCRIPT_TIMEOUT,
+    )
 
 
 def run_action(action: dict) -> dict:
@@ -117,14 +109,25 @@ def _run_init(name: str, skill_dir: Path) -> dict:
             "message": f"目录已存在，跳过初始化: {skill_dir.name}",
             "path": str(skill_dir),
         }
-    mod = _import_script("init_skill.py")
-    result = mod.init_skill(name, str(settings.skills_path))
-    if result is None:
+    try:
+        result = _run_kernel_script(
+            "init_skill.py",
+            [name, "--path", str(settings.skills_path)],
+        )
+    except Exception as exc:
         return {
             "action": "init",
             "name": name,
             "success": False,
-            "message": "初始化失败，请检查 skill 名称是否合法",
+            "message": f"初始化失败：{exc}",
+            "path": None,
+        }
+    if result.returncode != 0:
+        return {
+            "action": "init",
+            "name": name,
+            "success": False,
+            "message": (result.stderr or result.stdout or "初始化失败，请检查 skill 名称是否合法").strip(),
             "path": None,
         }
     return {
@@ -132,7 +135,7 @@ def _run_init(name: str, skill_dir: Path) -> dict:
         "name": name,
         "success": True,
         "message": f"已创建 {name} 目录结构",
-        "path": str(result),
+        "path": str(skill_dir),
     }
 
 
@@ -159,8 +162,19 @@ def _run_write(name: str, content: str, skill_dir: Path) -> dict:
 
 
 def _run_validate(name: str, skill_dir: Path) -> dict:
-    mod = _import_script("quick_validate.py")
-    valid, message = mod.validate_skill(skill_dir)
+    try:
+        result = _run_kernel_script("quick_validate.py", [str(skill_dir)])
+    except Exception as exc:
+        return {
+            "action": "validate",
+            "name": name,
+            "success": False,
+            "message": f"校验失败：{exc}",
+            "path": None,
+        }
+
+    valid = result.returncode == 0
+    message = (result.stdout or result.stderr or "").strip() or "校验失败"
     return {
         "action": "validate",
         "name": name,
@@ -173,14 +187,30 @@ def _run_validate(name: str, skill_dir: Path) -> dict:
 def _run_package(name: str, skill_dir: Path) -> dict:
     output_dir = skill_dir / "dist"
     output_dir.mkdir(parents=True, exist_ok=True)
-    mod = _import_script("package_skill.py")
-    result = mod.package_skill(skill_dir, str(output_dir))
-    if result is None:
+    try:
+        result = _run_kernel_script(
+            "package_skill.py",
+            [str(skill_dir), str(output_dir)],
+        )
+    except Exception as exc:
         return {
             "action": "package",
             "name": name,
             "success": False,
-            "message": "打包失败，请先执行 validate 确认 SKILL.md 格式正确",
+            "message": f"打包失败：{exc}",
+            "path": None,
+        }
+
+    if result.returncode != 0:
+        return {
+            "action": "package",
+            "name": name,
+            "success": False,
+            "message": (
+                result.stderr
+                or result.stdout
+                or "打包失败，请先执行 validate 确认 SKILL.md 格式正确"
+            ).strip(),
             "path": None,
         }
     return {
@@ -188,7 +218,7 @@ def _run_package(name: str, skill_dir: Path) -> dict:
         "name": name,
         "success": True,
         "message": f"已打包为 {name}.skill",
-        "path": str(result),
+        "path": str(output_dir / f"{name}.skill"),
     }
 
 

@@ -28,6 +28,7 @@ from ..services.kernel_loader import (
     read_skill_resource_text,
 )
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.output_validator import retry_with_validation
 from ..services.skill_governance import allowed_skill_roots
 from ..services.skill_manager import get_execution_skill_dir
 
@@ -98,6 +99,8 @@ _CONFIRM_KEYWORDS = (
     "开始做吧",
     "开始创建",
     "开始生成",
+    "开始制作",
+    "开始干吧",
     "确认，开始",
     "确认开始",
     "可以开始",
@@ -107,6 +110,7 @@ _CONFIRM_KEYWORDS = (
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 蓝图",)
 _CREATOR_PATTERN_CONTEXT_CHARS = 40
+_CREATOR_VALIDATION_MAX_RETRIES = 3
 
 _CREATOR_INPUT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(输入|用户会提供|用户输入|接收|读取|上传|原始数据|原文|素材|文本|文件|参数)"),
@@ -974,20 +978,23 @@ def _compose_creator_state_injection(
             "【后端状态注入】当前状态：A（需求收集）\n\n"
             f"对话历史中尚未满足蓝图输出条件；当前缺失槽位：{missing_desc}。\n"
             "本轮必须处于状态 A，严格执行以下规则：\n"
-            "1. 只允许输出一个问题，询问当前最缺失的需求信息。\n"
+            "1. 只允许输出一个简洁问题，询问当前最缺失的需求信息。\n"
             f"2. 禁止输出蓝图（{blueprint_marker}）。\n"
             "3. 禁止输出任何 fenced code block（```）。\n"
             "4. 禁止输出 SKILL.md、scripts/、references/、assets/ 的内容。\n"
             "5. 禁止说'我来帮你创建'、'以下是设计文档'、'下面是实现代码'等。\n"
-            "回复格式：好的，我先确认一个关键信息：<只问一个问题>"
+            "6. 回复必须是一个自然语言问题，不要包含多段说明或列表。\n"
+            f"建议提问方向（可改写）：{requirement_analysis.next_question}"
         )
     if state == "B":
+        confirm_keywords = " / ".join(_CONFIRM_KEYWORDS)
         if not blueprint_shown:
             return (
                 "【后端状态注入】当前状态：B（蓝图输出阶段）\n\n"
                 "关键信息已收集完成，且用户至少完成了一轮补充说明。\n"
                 "本轮必须只输出完整蓝图，不得输出任何文件内容、代码块、测试命令或创建报告。\n"
-                "蓝图结尾必须使用“这是我理解的需求，对吗？”以及 A/B/C 三个确认选项。"
+                "蓝图结尾必须使用“这是我理解的需求，对吗？”以及 A/B/C 三个确认选项。\n"
+                f"其中“开始”选项必须包含以下触发语之一：{confirm_keywords}。"
             )
         return (
             "【后端状态注入】当前状态：B（蓝图已展示，等待用户确认）\n\n"
@@ -996,7 +1003,8 @@ def _compose_creator_state_injection(
             "1. 禁止创建任何文件或目录。\n"
             "2. 禁止输出任何 SKILL.md 正文或脚本代码块。\n"
             "3. 如果用户要求修改蓝图，根据意见调整后重新展示完整蓝图，仍然以'这是我理解的需求，对吗？'结尾。\n"
-            "4. 等待用户发出确认语后，后端才会解锁文件创建权限。"
+            f"4. 提醒用户使用明确的触发语确认（例如：{confirm_keywords}）。\n"
+            "5. 等待用户发出确认语后，后端才会解锁文件创建权限。"
         )
     # state == "C"
     return (
@@ -1005,6 +1013,55 @@ def _compose_creator_state_injection(
         "本轮可以：创建目录、写入文件、输出 SKILL.md 和脚本代码块、执行校验、报告结果。\n"
         "按照蓝图逐步完成所有文件的创建，完成后给出简短报告。"
     )
+
+
+def _compose_creator_validation_messages(
+    state: str,
+    *,
+    requirement_analysis: CreatorRequirementAnalysis | None = None,
+) -> list[dict]:
+    if state == "A":
+        rules = [
+            "只能输出一个简短问题，不能出现多个问号或多段说明",
+            "禁止包含任何蓝图标题（例如 '📋 Skill 蓝图' 或 '📋 Skill 架构蓝图'）",
+            "禁止出现 fenced code block（``` 或 ~~~）",
+            "禁止输出 SKILL.md、scripts/、references/、assets/ 的文件内容",
+        ]
+        payload = {
+            "state": "A",
+            "missing_slots": (requirement_analysis.missing_slots if requirement_analysis else []),
+            "rules": rules,
+        }
+    else:
+        confirm_keywords = list(_CONFIRM_KEYWORDS)
+        rules = [
+            "必须输出完整蓝图正文，包含蓝图标题（例如 '📋 Skill 蓝图'）",
+            "蓝图结尾必须包含“这是我理解的需求，对吗？”以及三个确认选项",
+            "确认选项中必须出现至少一个明确触发语（如 '开始制作'、'开始干吧'、'对，开始做吧'）",
+            "禁止出现 fenced code block（``` 或 ~~~）",
+            "禁止输出任何文件内容、脚本或执行命令",
+        ]
+        payload = {
+            "state": "B",
+            "confirm_keywords": confirm_keywords,
+            "rules": rules,
+        }
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是输出格式校验器。\n"
+                "请根据规则判断模型输出是否合格。\n"
+                "只输出 JSON，不要解释：\n"
+                "{\n"
+                "  \"valid\": true/false,\n"
+                "  \"reason\": \"不合格原因，合格时可简短说明\"\n"
+                "}"
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
 
 
 def _simple_sse_content_response(content: str) -> list[str]:
@@ -3243,13 +3300,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     },
                 )
 
-                if creator_state == "A":
-                    for event in _simple_sse_content_response(
-                        creator_state_ctx.requirements.next_question
-                    ):
-                        yield event
-                    return
-
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
             yield _thought(
@@ -3768,6 +3818,28 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
 
             final_messages.extend(_request_messages_with_files(request))
+
+            if skip_runtime_planner_before_confirmation and creator_state in {"A", "B"}:
+                validator_messages = _compose_creator_validation_messages(
+                    creator_state,
+                    requirement_analysis=(
+                        creator_state_ctx.requirements if creator_state_ctx else None
+                    ),
+                )
+                validated_text, valid, attempts = await retry_with_validation(
+                    final_messages,
+                    model,
+                    max_retries=_CREATOR_VALIDATION_MAX_RETRIES,
+                    validator_messages=validator_messages,
+                )
+                if not valid:
+                    logger.warning(
+                        "creator output validation failed after retries: %s",
+                        [a.feedback for a in attempts],
+                    )
+                for event in _simple_sse_content_response(validated_text):
+                    yield event
+                return
 
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):

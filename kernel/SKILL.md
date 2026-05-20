@@ -197,7 +197,7 @@ description: Guide for creating effective skills. Use when users want to create 
 ```
 问题: "这是我理解的你的需求，对吗？"
 选项:
-- "对，开始做吧"
+- "对，开始做吧 / 开始制作 / 开始干吧"
 - "大体对，但有些地方要改"
 - "不对，我重新说一下"
 ```

@@ -8,6 +8,7 @@ State machine overview:
 """
 
 import json
+from dataclasses import dataclass, field
 
 from fastapi import APIRouter, HTTPException
 
@@ -26,6 +27,99 @@ _CONFIRM_KEYWORDS = ("对，开始做吧", "开始制作", "开始干吧")
 # Marker written by the model when it outputs a blueprint (state B).
 _BLUEPRINT_MARKERS = ("📋 Skill 架构蓝图",)
 _CREATOR_VALIDATION_MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Slot detection — keyword lists for each requirement dimension
+# ---------------------------------------------------------------------------
+
+_SLOT_KEYWORDS: dict[str, list[str]] = {
+    "input": ["输入", "提供", "传入", "上传", "用户输入", "用户会", "接受", "接收", "读取"],
+    "output": ["输出", "生成", "产出", "结果", "返回", "回答", "产生", "给出"],
+    "scenario": ["场景", "典型", "例如", "比如", "会说", "用于", "用来", "应用场景", "使用场景"],
+}
+
+# Minimum required slots before a blueprint can be drafted.
+_REQUIRED_SLOTS: frozenset[str] = frozenset({"input", "scenario"})
+
+
+@dataclass
+class RequirementsAnalysis:
+    """Structured analysis of what requirement slots have been collected."""
+    user_turns: int
+    collected_slots: dict = field(default_factory=dict)
+    missing_slots: list = field(default_factory=list)
+    ready_for_blueprint: bool = False
+    next_question: str = ""
+
+
+@dataclass
+class CreatorStateResult:
+    """Rich creator-state result combining state label, blueprint flag, and requirements."""
+    state: str                          # "A", "B", or "C"
+    blueprint_shown: bool
+    requirements: RequirementsAnalysis
+
+
+def _analyze_creator_requirements(request: ChatRequest) -> RequirementsAnalysis:
+    """Analyse accumulated user messages to determine which slots are collected/missing.
+
+    Rules for ready_for_blueprint:
+    - At least 2 user turns must have occurred (ensures ≥1 assistant follow-up).
+    - All _REQUIRED_SLOTS must be detected in the combined user text.
+    - The last message in the conversation must be from the user.
+    """
+    user_messages = [m for m in request.messages if m.role == "user"]
+    user_turns = len(user_messages)
+
+    all_user_text = " ".join(m.content or "" for m in user_messages)
+
+    collected: dict[str, str] = {}
+    missing: list[str] = []
+
+    # Purpose is always assumed present once the user has sent any message.
+    if user_messages:
+        collected["purpose"] = "用户已描述 Skill 功能"
+
+    for slot, keywords in _SLOT_KEYWORDS.items():
+        if any(kw in all_user_text for kw in keywords):
+            collected[slot] = f"已从用户消息中检测到 {slot} 信息"
+        else:
+            missing.append(slot)
+
+    last_role = request.messages[-1].role if request.messages else ""
+    slots_complete = _REQUIRED_SLOTS.issubset(collected)
+    ready = user_turns >= 2 and slots_complete and last_role == "user"
+
+    if "input" in missing:
+        next_q = (
+            "好的，我先确认一个关键信息："
+            "这个 Skill 的输入是什么（用户会提供什么内容），输出又是什么？"
+            "最好给我一条真实的使用示例。"
+        )
+    elif "output" in missing:
+        next_q = (
+            "好的，我先确认一个关键信息："
+            "这个 Skill 最终应该输出什么格式或内容？"
+        )
+    elif "scenario" in missing:
+        next_q = (
+            "好的，我先确认一个关键信息："
+            "你能描述一个典型使用场景吗？用户通常会怎么使用它？"
+        )
+    else:
+        next_q = (
+            "好的，我先确认一个关键信息："
+            "还有没有其他特殊要求（依赖、格式、限制等）？"
+        )
+
+    return RequirementsAnalysis(
+        user_turns=user_turns,
+        collected_slots=collected,
+        missing_slots=missing,
+        ready_for_blueprint=ready,
+        next_question=next_q,
+    )
+
 
 CREATOR_GLOBAL_CONSTRAINTS = (
     "【平台基础约束】\n"
@@ -51,8 +145,10 @@ def _has_creation_confirmation(request: ChatRequest) -> bool:
     return any(keyword in text for keyword in _CONFIRM_KEYWORDS)
 
 
-def _detect_creator_state(request: ChatRequest) -> tuple[str, bool]:
+def _detect_creator_state(request: ChatRequest) -> CreatorStateResult:
     """Detect the current creator state-machine position from conversation history."""
+    requirements = _analyze_creator_requirements(request)
+
     blueprint_shown = any(
         msg.role == "assistant"
         and any(marker in (msg.content or "") for marker in _BLUEPRINT_MARKERS)
@@ -60,12 +156,15 @@ def _detect_creator_state(request: ChatRequest) -> tuple[str, bool]:
     )
 
     if blueprint_shown and _has_creation_confirmation(request):
-        return "C", True
+        return CreatorStateResult(state="C", blueprint_shown=True, requirements=requirements)
 
     if blueprint_shown:
-        return "B", True
+        return CreatorStateResult(state="B", blueprint_shown=True, requirements=requirements)
 
-    return "A", False
+    if requirements.ready_for_blueprint:
+        return CreatorStateResult(state="B", blueprint_shown=False, requirements=requirements)
+
+    return CreatorStateResult(state="A", blueprint_shown=False, requirements=requirements)
 
 
 def _compose_creator_state_injection(
@@ -101,7 +200,6 @@ def _compose_creator_state_injection(
 
 def _compose_creator_validation_messages(
     state: str,
-    *,
 ) -> list[dict]:
     """Build a validator prompt enforcing state-A/B output constraints."""
     if state == "A":

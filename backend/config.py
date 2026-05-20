@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     # Falls back to default_model when unset.
     planner_model: Optional[str] = None
 
+    # Optional separate model used exclusively for output-format validation rounds
+    # inside retry_with_validation().  A small/fast model is sufficient here because
+    # validation only requires JSON-structured classification of a prior output.
+    # Falls back to default_model when unset.
+    validator_model: Optional[str] = None
+
     # LLM generation parameters — omitted from request payload when unset so the
     # backend can apply its own defaults.
     temperature: Optional[float] = None

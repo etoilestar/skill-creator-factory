@@ -19,6 +19,8 @@ from ..services.output_validator import retry_with_validation
 from .chat_models import ChatRequest, CreatorStateContext, MarkdownBlock
 from .creator_chat import (
     CREATOR_GLOBAL_CONSTRAINTS,
+    _CREATOR_VALIDATION_MAX_RETRIES,
+    _analyze_creator_requirements,
     _compose_creator_state_injection,
     _compose_creator_validation_messages,
     _detect_creator_state,
@@ -1097,6 +1099,15 @@ def _planner_model_name(default_model: str) -> str:
     """
     return settings.planner_model or default_model
 
+
+def _validator_model_name(default_model: str) -> str:
+    """Select a separate validator model when configured.
+
+    校验轮只需要 JSON 分类能力，小/快模型即可胜任。
+    未配置时回退到 default_model。
+    """
+    return settings.validator_model or default_model
+
 def _make_stream(skill_context: dict, request: ChatRequest):
     """Staged Skill execution with creator-safe action planning.
 
@@ -1194,8 +1205,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # can be enforced as a backend gate instead of relying on prompt following.
             creator_state: str = "A"
             creator_state_ctx: CreatorStateContext | None = None
+            _creator_state_result = None
             if skip_runtime_planner_before_confirmation:
-                creator_state, blueprint_shown = _detect_creator_state(request)
+                _creator_state_result = _detect_creator_state(request)
+                creator_state = _creator_state_result.state
+                blueprint_shown = _creator_state_result.blueprint_shown
                 creator_state_ctx = CreatorStateContext(
                     state=creator_state,
                     blueprint_shown=blueprint_shown,
@@ -1700,6 +1714,20 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             final_messages.extend(_request_messages_with_files(request))
 
             if skip_runtime_planner_before_confirmation and creator_state in {"A", "B"}:
+                # State A with incomplete requirements → return a deterministic clarifying
+                # question without calling the LLM.  This makes State A responses fast,
+                # consistent, and immune to model output format failures.
+                if (
+                    creator_state == "A"
+                    and _creator_state_result is not None
+                    and not _creator_state_result.requirements.ready_for_blueprint
+                ):
+                    for event in _simple_sse_content_response(
+                        _creator_state_result.requirements.next_question
+                    ):
+                        yield event
+                    return
+
                 validator_messages = _compose_creator_validation_messages(
                     creator_state,
                 )
@@ -1708,6 +1736,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     model,
                     max_retries=_CREATOR_VALIDATION_MAX_RETRIES,
                     validator_messages=validator_messages,
+                    validator_model=_validator_model_name(model),
                 )
                 if not valid:
                     logger.warning(

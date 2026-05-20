@@ -27,6 +27,7 @@ def test_new_fields_declared():
         "openai_api_key",
         "llm_api_key",
         "planner_model",
+        "validator_model",
         "temperature",
         "max_tokens",
         "llm_timeout_seconds",
@@ -43,6 +44,12 @@ def test_planner_model_defaults_to_none():
     from backend.config import settings
 
     assert settings.planner_model is None or isinstance(settings.planner_model, str)
+
+
+def test_validator_model_defaults_to_none():
+    from backend.config import settings
+
+    assert settings.validator_model is None or isinstance(settings.validator_model, str)
 
 
 def test_temperature_defaults_to_none():

@@ -83,17 +83,19 @@ async def retry_with_validation(
     max_retries: int = 3,
     *,
     validator_messages: list[dict] | None = None,
+    validator_model: str | None = None,
 ) -> tuple[str, bool, list[AttemptRecord]]:
     attempts: list[AttemptRecord] = []
     retries = max(1, int(max_retries))
     last_output = ""
+    _validator_model = validator_model or model
 
     for attempt in range(1, retries + 1):
         output = await complete_chat_once(messages, model)
         last_output = output
 
         if validator_messages:
-            valid, feedback = await validate_output(validator_messages, output, model)
+            valid, feedback = await validate_output(validator_messages, output, _validator_model)
         else:
             valid, feedback = True, ""
 

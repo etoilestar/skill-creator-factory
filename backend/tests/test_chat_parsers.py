@@ -17,7 +17,8 @@ BLUEPRINT_MARKER = "Skill 蓝图"
 # ---------------------------------------------------------------------------
 
 def test_analyze_creator_requirements_detects_missing_slots():
-    from backend.routers.chat import ChatRequest, Message, _analyze_creator_requirements
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.creator_chat import _analyze_creator_requirements
 
     request = ChatRequest(
         messages=[
@@ -36,7 +37,8 @@ def test_analyze_creator_requirements_detects_missing_slots():
 
 
 def test_detect_creator_state_first_turn_full_request_stays_a():
-    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.creator_chat import _detect_creator_state
 
     request = ChatRequest(
         messages=[
@@ -59,7 +61,8 @@ def test_detect_creator_state_first_turn_full_request_stays_a():
 
 
 def test_detect_creator_state_ready_for_blueprint_after_second_turn():
-    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.creator_chat import _detect_creator_state
 
     request = ChatRequest(
         messages=[
@@ -86,7 +89,8 @@ def test_detect_creator_state_ready_for_blueprint_after_second_turn():
 
 
 def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
-    from backend.routers.chat import ChatRequest, Message, _detect_creator_state
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.creator_chat import _detect_creator_state
 
     request = ChatRequest(
         messages=[
@@ -114,7 +118,8 @@ def test_detect_creator_state_requires_assistant_follow_up_between_user_turns():
 
 @pytest.mark.asyncio
 async def test_state_a_returns_clarifying_question_without_llm():
-    from backend.routers.chat import ChatRequest, Message, _make_stream
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.chat import _make_stream
 
     request = ChatRequest(messages=[Message(role="user", content="帮我做一个写故事的 Skill")])
     skill_context = {
@@ -288,7 +293,7 @@ def _make_catalog(n: int = 3) -> list[dict]:
 
 
 def test_parse_resource_selection_picks_valid_handles():
-    from backend.routers.chat import _parse_resource_selection_decision
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
 
     catalog = _make_catalog(3)
     text = '{"need_resources": true, "resource_handles": ["resource:0", "resource:2"], "reason": "need"}'
@@ -300,7 +305,7 @@ def test_parse_resource_selection_picks_valid_handles():
 
 
 def test_parse_resource_selection_ignores_invalid_handles():
-    from backend.routers.chat import _parse_resource_selection_decision
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
 
     catalog = _make_catalog(2)
     text = '{"need_resources": true, "resource_handles": ["resource:99"], "reason": "oops"}'
@@ -312,7 +317,7 @@ def test_parse_resource_selection_ignores_invalid_handles():
 
 
 def test_parse_resource_selection_caps_at_five():
-    from backend.routers.chat import _parse_resource_selection_decision
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
 
     catalog = _make_catalog(10)
     handles = [f"resource:{i}" for i in range(10)]
@@ -323,7 +328,7 @@ def test_parse_resource_selection_caps_at_five():
 
 
 def test_parse_resource_selection_invalid_json():
-    from backend.routers.chat import _parse_resource_selection_decision
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
 
     result = _parse_resource_selection_decision("bad json", resource_catalog=[])
     assert result["need_resources"] is False
@@ -356,14 +361,14 @@ def test_planner_model_name_uses_configured():
 # ---------------------------------------------------------------------------
 
 def test_normalize_plan_raises_on_non_dict():
-    from backend.routers.chat import _normalize_skill_runtime_plan
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
 
     with pytest.raises(ValueError):
         _normalize_skill_runtime_plan("not a dict")
 
 
 def test_normalize_plan_direct_answer_mode():
-    from backend.routers.chat import _normalize_skill_runtime_plan
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
 
     plan = {"mode": "direct_answer", "actions": [], "errors": [], "missing": []}
     result = _normalize_skill_runtime_plan(plan)
@@ -372,7 +377,7 @@ def test_normalize_plan_direct_answer_mode():
 
 
 def test_normalize_plan_unknown_mode_becomes_ask_user():
-    from backend.routers.chat import _normalize_skill_runtime_plan
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
 
     plan = {"mode": "invalid_mode", "actions": [], "errors": [], "missing": []}
     result = _normalize_skill_runtime_plan(plan)
@@ -380,7 +385,7 @@ def test_normalize_plan_unknown_mode_becomes_ask_user():
 
 
 def test_normalize_plan_read_resource_without_handle():
-    from backend.routers.chat import _normalize_skill_runtime_plan
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
 
     plan = {
         "mode": "execute",
@@ -395,7 +400,7 @@ def test_normalize_plan_read_resource_without_handle():
 
 
 def test_normalize_plan_execute_with_all_actions_rejected_becomes_ask_user():
-    from backend.routers.chat import _normalize_skill_runtime_plan
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
 
     plan = {
         "mode": "execute",
@@ -504,7 +509,7 @@ def test_extract_blocks_no_blocks():
 # ---------------------------------------------------------------------------
 
 def test_is_within_sandbox_regular_file(tmp_path):
-    from backend.routers.chat import _is_within_sandbox
+    from backend.routers.sandbox_chat import _is_within_sandbox
 
     file = tmp_path / "scripts" / "run.py"
     file.parent.mkdir()
@@ -514,7 +519,7 @@ def test_is_within_sandbox_regular_file(tmp_path):
 
 
 def test_is_within_sandbox_escape_rejected(tmp_path):
-    from backend.routers.chat import _is_within_sandbox
+    from backend.routers.sandbox_chat import _is_within_sandbox
 
     outside = tmp_path / "outside.txt"
     outside.write_text("secret")
@@ -528,7 +533,7 @@ def test_is_within_sandbox_escape_rejected(tmp_path):
 
 
 def test_is_within_sandbox_nested_path_ok(tmp_path):
-    from backend.routers.chat import _is_within_sandbox
+    from backend.routers.sandbox_chat import _is_within_sandbox
 
     nested = tmp_path / "skill" / "scripts" / "sub" / "run.py"
     nested.parent.mkdir(parents=True)

@@ -108,7 +108,7 @@ def _analyze_creator_requirements(request: ChatRequest) -> RequirementsAnalysis:
         )
     else:
         next_q = (
-            "好的，我先确认一个关键信息："
+            "好的，我再确认一个关键信息："
             "还有没有其他特殊要求（依赖、格式、限制等）？"
         )
 

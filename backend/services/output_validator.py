@@ -57,9 +57,15 @@ async def validate_output(
     )
 
     decision_text = await complete_chat_once(messages, model)
+    # 如果decision_text中开头包含<，则去掉到第一个</之前的内容
+    if decision_text.startswith("<"):
+        decision_text = decision_text[decision_text.find("</"):].strip()
+        # 选择{}之间的内容
+        decision_text = decision_text[decision_text.find("{") :decision_text.find("}")+1].strip()
     stripped = _strip_markdown_json_fence(decision_text)
 
     try:
+
         data = json.loads(stripped)
     except json.JSONDecodeError:
         logger.warning("output validation model returned invalid JSON: %s", decision_text[:300])

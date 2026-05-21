@@ -4,8 +4,16 @@ WORKDIR /app
 
 # Install system runtimes needed by Skill scripts (Node.js, npm, Ruby …)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs npm ruby && \
+    apt-get install -y --no-install-recommends nodejs npm ruby openssh-server && \
     rm -rf /var/lib/apt/lists/*
+
+# 配置SSH服务
+RUN mkdir -p /var/run/sshd && \
+    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
+    echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+
+# 设置root密码为: skillfactory
+RUN echo "root:123456" | chpasswd
 
 # Pre-install Playwright's Chromium browser so skill scripts don't need to
 # download it at runtime (downloading at runtime causes subprocess timeouts).
@@ -26,4 +34,5 @@ COPY backend/ ./backend/
 # skills/ and kernel/ are provided via Docker volumes at runtime
 RUN mkdir -p skills kernel
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["bash", "-c", "/usr/sbin/sshd && tail -f /dev/null"]
+#CMD ["bash", "-c", "/usr/sbin/sshd && uvicorn backend.main:app --host 0.0.0.0 --port 8000"]

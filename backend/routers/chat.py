@@ -18,7 +18,9 @@ from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.output_validator import retry_with_validation
 from .chat_models import ChatRequest, CreatorStateContext, MarkdownBlock
 from .creator_chat import (
-    _compose_creator_artifact_consistency_prompt,
+    CREATOR_GLOBAL_CONSTRAINTS,
+    _CREATOR_VALIDATION_MAX_RETRIES,
+    _analyze_creator_requirements,
     _compose_creator_state_injection,
     _compose_creator_validation_messages,
     _detect_creator_state,
@@ -1097,6 +1099,15 @@ def _planner_model_name(default_model: str) -> str:
     """
     return settings.planner_model or default_model
 
+
+def _validator_model_name(default_model: str) -> str:
+    """Select a separate validator model when configured.
+
+    校验轮只需要 JSON 分类能力，小/快模型即可胜任。
+    未配置时回退到 default_model。
+    """
+    return settings.validator_model or default_model
+
 def _make_stream(skill_context: dict, request: ChatRequest):
     """Staged Skill execution with creator-safe action planning.
 
@@ -1126,7 +1137,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     enable_action_execution = bool(skill_context.get("enable_action_execution", False))
     require_action_confirmation = bool(skill_context.get("require_action_confirmation", True))
     strict_skill_execution = bool(skill_context.get("strict_skill_execution", False))
-    strict_creator_generation = bool(skill_context.get("strict_creator_generation", False))
     execution_root = skill_context.get("execution_root")
     child_body_loader = skill_context.get("child_body_loader")
     parent_skill_name = skill_context.get("skill_name", "")
@@ -1195,9 +1205,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             # can be enforced as a backend gate instead of relying on prompt following.
             creator_state: str = "A"
             creator_state_ctx: CreatorStateContext | None = None
+            _creator_state_result = None
             if skip_runtime_planner_before_confirmation:
-                creator_state_ctx = _detect_creator_state(request)
-                creator_state = creator_state_ctx.state
+                _creator_state_result = _detect_creator_state(request)
+                creator_state = _creator_state_result.state
+                blueprint_shown = _creator_state_result.blueprint_shown
+                creator_state_ctx = CreatorStateContext(
+                    state=creator_state,
+                    blueprint_shown=blueprint_shown,
+                )
                 yield _thought(
                     "creator_state",
                     "创建者状态",
@@ -1205,9 +1221,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     {
                         "state": creator_state,
                         "blueprint_shown": creator_state_ctx.blueprint_shown,
-                        "user_turns": creator_state_ctx.requirements.user_turns,
-                        "collected_slots": creator_state_ctx.requirements.collected_slots,
-                        "missing_slots": creator_state_ctx.requirements.missing_slots,
                     },
                 )
 
@@ -1273,11 +1286,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "请不要假装已经读取该子 Skill 正文。"
                         )
 
-            # Skip resource preload entirely in state A (requirement-collection phase).
-            # In state A the model only needs to ask one clarifying question — loading
-            # references via an extra LLM call is wasteful and can produce spurious
-            # "not valid JSON" warnings when the model ignores the JSON-only prompt.
-            if enable_resource_preload and creator_state != "A":
+            if enable_resource_preload:
                 resource_catalog = _extract_runtime_resource_catalog(body_prompt)
                 if resource_catalog:
                     yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
@@ -1644,19 +1653,23 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield "data: [DONE]\n\n"
                     return
 
-            final_messages = [
+            final_messages: list[dict] = []
+            if skip_runtime_planner_before_confirmation:
+                final_messages.append(
+                    {
+                        "role": "system",
+                        "content": CREATOR_GLOBAL_CONSTRAINTS,
+                    }
+                )
+            final_messages.append(
                 {
                     "role": "system",
                     "content": body_prompt,
                 }
-            ]
+            )
 
-            # Inject the per-state constraint immediately after the body prompt so that
-            # small models see it before any other system instructions.  This is
-            # important for state A: without this ordering, the artifact-consistency
-            # prompt ("你正在创建一个可运行的 Skill 包") comes first and overrides the
-            # "ask one question only" constraint, causing the model to skip requirement
-            # collection and jump straight to blueprint generation.
+            # Inject the per-state constraint after the body prompt so creator-mode
+            # messages follow the layered system-prompt ordering.
             if skip_runtime_planner_before_confirmation:
                 if creator_state_ctx is None:
                     raise RuntimeError(
@@ -1665,42 +1678,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         "Ensure creator_state_ctx is assigned from _detect_creator_state() before this point."
                     )
                 final_messages.append(
-                        {
-                            "role": "system",
-                            "content": _compose_creator_state_injection(
-                                creator_state,
-                                blueprint_shown=creator_state_ctx.blueprint_shown,
-                                requirement_analysis=creator_state_ctx.requirements,
-                            ),
-                        }
-                    )
-
-                # When the frontend drives file creation (plan C), state-C just needs a
-                # brief acknowledgement — suppress code/file generation from the LLM.
-                if use_frontend_driven_creation and creator_state == "C":
-                    final_messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "【前端主控创建模式】用户已确认，前端创建面板将接管文件生成流程。\n"
-                                "你的任务：只输出一句简短确认，例如：\n"
-                                "  '好的，开始按蓝图创建 Skill 文件，请在下方面板中查看进度。'\n"
-                                "严禁输出：fenced code block、SKILL.md 内容、脚本代码、文件列表、目录结构。\n"
-                                "严禁说：'正在生成'、'以下是代码'、'下面是实现'、'已创建完成'。"
-                            ),
-                        }
-                    )
-
-            # Artifact-consistency prompt is only relevant during blueprint-revision
-            # (state B) and file-generation (state C).  In state A the model is still
-            # gathering requirements; injecting "you are in strict creation mode" here
-            # contradicts the state-A constraint and causes weaker models to skip
-            # requirement collection entirely.
-            if strict_creator_generation and creator_state != "A":
-                final_messages.append(
                     {
                         "role": "system",
-                        "content": _compose_creator_artifact_consistency_prompt(),
+                        "content": _compose_creator_state_injection(
+                            creator_state,
+                            blueprint_shown=creator_state_ctx.blueprint_shown,
+                        ),
                     }
                 )
 
@@ -1731,17 +1714,29 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             final_messages.extend(_request_messages_with_files(request))
 
             if skip_runtime_planner_before_confirmation and creator_state in {"A", "B"}:
+                # State A with incomplete requirements → return a deterministic clarifying
+                # question without calling the LLM.  This makes State A responses fast,
+                # consistent, and immune to model output format failures.
+                if (
+                    creator_state == "A"
+                    and _creator_state_result is not None
+                    and not _creator_state_result.requirements.ready_for_blueprint
+                ):
+                    for event in _simple_sse_content_response(
+                        _creator_state_result.requirements.next_question
+                    ):
+                        yield event
+                    return
+
                 validator_messages = _compose_creator_validation_messages(
                     creator_state,
-                    requirement_analysis=(
-                        creator_state_ctx.requirements if creator_state_ctx else None
-                    ),
                 )
                 validated_text, valid, attempts = await retry_with_validation(
                     final_messages,
                     model,
                     max_retries=_CREATOR_VALIDATION_MAX_RETRIES,
                     validator_messages=validator_messages,
+                    validator_model=_validator_model_name(model),
                 )
                 if not valid:
                     logger.warning(

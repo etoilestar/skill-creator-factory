@@ -492,17 +492,6 @@ def load_child_skill_body_prompt(parent_skill_name: str, child_ref: str) -> str:
         f"{compose_body_prompt(child)}"
     )
 
-# 兼容旧函数名：不要在新代码里优先使用这两个名字。
-def load_kernel_system_prompt() -> str:
-    """Compatibility alias: metadata-only prompt, not full SKILL.md."""
-    return load_kernel_metadata_prompt()
-
-
-def load_skill_system_prompt(skill_name: str) -> str:
-    """Compatibility alias: metadata-only prompt, not full SKILL.md."""
-    return load_skill_metadata_prompt(skill_name)
-
-
 def resolve_skill_resource(skill: SkillPackage, rel_path: str) -> Path:
     """Resolve and validate a resource path inside the Skill directory."""
     if not rel_path or "\x00" in rel_path:

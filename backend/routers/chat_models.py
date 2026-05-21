@@ -38,20 +38,8 @@ class MarkdownBlock:
 
 
 @dataclass
-class CreatorRequirementAnalysis:
-    """Result of best-effort requirement slot analysis for creator mode."""
-
-    user_turns: int
-    collected_slots: list[str]
-    missing_slots: list[str]
-    ready_for_blueprint: bool
-    next_question: str
-
-
-@dataclass
 class CreatorStateContext:
-    """Creator state plus requirement-analysis details."""
+    """Creator state tracking for creator mode."""
 
     state: str
     blueprint_shown: bool
-    requirements: CreatorRequirementAnalysis

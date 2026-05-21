@@ -2,14 +2,20 @@ from pathlib import Path
 from typing import Optional
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
+import os
 
+# 获取环境变量
 PROJECT_ROOT = Path(__file__).parent.parent
+# 获取环境变量 LLM_BASE_URL
+# 获取环境变量 DEFAULT_MODEL
+default_model = os.getenv("DEFAULT_MODEL", "qwen3:32b")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 
 
 class Settings(BaseSettings):
     # LLM backend
-    llm_base_url: str = "http://localhost:11434"
-    default_model: str = "qwen3:32b"
+    llm_base_url: str = LLM_BASE_URL
+    default_model: str = default_model
     # Leave empty to use a local backend; set to your sk-... key for OpenAI.
     openai_api_key: Optional[str] = None
     # Alternative field name accepted by some deployments

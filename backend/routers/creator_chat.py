@@ -43,11 +43,11 @@ def build_kernel_skill_context() -> dict:
 @router.post("/creator")
 async def chat_with_creator(request: ChatRequest):
     """Multi-turn chat powered by the fixed kernel Skill Creator."""
-    from .chat import _make_stream  # local import avoids circular dependency
+    from .chat import _make_stream_creator  # local import avoids circular dependency
 
     try:
         skill_context = build_kernel_skill_context()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return _make_stream(skill_context, request)
+    return _make_stream_creator(skill_context, request)

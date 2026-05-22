@@ -1925,14 +1925,23 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
                         }
 
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
-                        from .sandbox_chat import _generate_final_answer_from_observation
-                        final_answer = await _generate_final_answer_from_observation(
-                            body_prompt=body_prompt,
-                            request=request,
-                            model=model,
-                            plan=runtime_plan,
-                            execution_result=exec_result,
-                        )
+                        from .sandbox_chat import _compose_final_answer_prompt
+
+                        _final_messages = [
+                            {"role": "system", "content": _compose_final_answer_prompt()},
+                            {
+                                "role": "user",
+                                "content": json.dumps(
+                                    {
+                                        "loaded_skill_prompt": body_prompt,
+                                        "user_messages": _request_messages_with_files(request),
+                                        "plan": runtime_plan,
+                                        "execution_result": exec_result,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        ]
 
                         yield _sse({"status": None})
                         if _exec_all_output_files:
@@ -1945,7 +1954,8 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
                                     "output_files": _exec_all_output_files,
                                 }
                             })
-                        yield _sse({"content": final_answer})
+                        async for chunk in stream_chat(_final_messages, model):
+                            yield _sse({"content": chunk})
                         yield "data: [DONE]\n\n"
                         return
 

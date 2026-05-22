@@ -3,10 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from ..config import settings
-from ..services.kernel_loader import (
-    load_kernel_body_prompt,
-    load_kernel_metadata_prompt,
-)
+from ..services.kernel_loader import load_kernel_creator_body_prompt
 from .chat_models import ChatRequest
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -33,8 +30,7 @@ def build_kernel_skill_context() -> dict:
     """Build creator-mode skill context for the kernel Skill Creator."""
     return {
         "skill_name": "skill-creator",
-        "metadata_prompt": load_kernel_metadata_prompt(),
-        "body_loader": load_kernel_body_prompt,
+        "body_loader": load_kernel_creator_body_prompt,
         "force_body": True,
         "enable_action_execution": True,
         "require_action_confirmation": False,
@@ -47,11 +43,11 @@ def build_kernel_skill_context() -> dict:
 @router.post("/creator")
 async def chat_with_creator(request: ChatRequest):
     """Multi-turn chat powered by the fixed kernel Skill Creator."""
-    from .chat import _make_stream  # local import avoids circular dependency
+    from .chat import _make_stream_creator  # local import avoids circular dependency
 
     try:
         skill_context = build_kernel_skill_context()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return _make_stream(skill_context, request)
+    return _make_stream_creator(skill_context, request)

@@ -6,6 +6,10 @@
     </div>
 
     <div class="messages" ref="messagesEl">
+      <div v-if="currentStatus" class="status-bar">
+        <span class="status-icon">⏳</span>
+        <span class="status-text">{{ currentStatus.message }}</span>
+      </div>
       <div v-if="messages.length === 0" class="empty">
         <p>向 AI 说明你想创建什么 Skill，它会引导你一步步完成。</p>
       </div>
@@ -38,6 +42,18 @@
         </div>
       </div>
 
+      <!-- Skill creation panel (shown after user confirms blueprint) -->
+      <SkillCreationPanel
+        v-if="showCreationPanel && creationPlan"
+        :skill-name="creationPlan.skill_name"
+        :files="creationPlan.files"
+        :blueprint-text="blueprintText"
+        :conversation-history="chatHistory"
+        :model="null"
+        :warnings="creationPlan.warnings"
+        @creation-complete="onCreationComplete"
+        @creation-error="onCreationError"
+      />
     </div>
 
     <div class="input-area">
@@ -59,13 +75,52 @@
       </div>
       <p class="hint muted">Enter 发送 · Shift+Enter 换行</p>
     </div>
+
+    <!-- Thinking panel sidebar -->
+    <transition name="panel-slide">
+      <div v-if="showThoughts" class="thinking-sidebar">
+        <div class="thinking-sidebar-header">
+          <span>执行过程</span>
+          <button class="btn-ghost btn-close-panel" @click="showThoughts = false">✕</button>
+        </div>
+        <ThinkingPanel :thoughts="thoughts" />
+      </div>
+    </transition>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, nextTick } from 'vue'
 import { streamChat } from '../composables/useChat.js'
+import { analyzeBlueprintPlan } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
+import SkillCreationPanel from '../components/SkillCreationPanel.vue'
+import ThinkingPanel from '../components/ThinkingPanel.vue'
+
+// ---------------------------------------------------------------------------
+// Keywords kept in sync with backend/_CONFIRM_KEYWORDS and _BLUEPRINT_MARKERS
+// ---------------------------------------------------------------------------
+const CONFIRM_KEYWORDS = [
+  '对，开始做吧',
+  '开始做吧',
+  '开始创建',
+  '开始生成',
+  '确认，开始',
+  '确认开始',
+  '可以开始',
+  '没问题，开始',
+]
+const BLUEPRINT_MARKER = '📋 Skill 蓝图'
+
+function isCreationConfirmation(text) {
+  return CONFIRM_KEYWORDS.some(kw => text.includes(kw))
+}
+
+function hasBlueprintInHistory() {
+  return messages.value.some(
+    m => m.role === 'assistant' && (m.content || '').includes(BLUEPRINT_MARKER)
+  )
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -90,6 +145,26 @@ const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
+const currentStatus = ref(null)
+
+// Thinking panel state
+const thoughts = ref([])
+const showThoughts = ref(false)
+
+// Creation panel state
+const showCreationPanel = ref(false)
+const creationPlan = ref(null)
+
+// The raw blueprint text extracted from the latest blueprint assistant message
+const blueprintText = computed(() => {
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const m = messages.value[i]
+    if (m.role === 'assistant' && (m.content || '').includes(BLUEPRINT_MARKER)) {
+      return m.content
+    }
+  }
+  return ''
+})
 
 // History sent to the LLM excludes system action-result messages
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
@@ -114,6 +189,20 @@ async function send() {
   input.value = ''
   await scrollBottom()
 
+  // If the user just confirmed the blueprint, trigger blueprint analysis in parallel
+  // with the chat call (pure-rule extraction, no LLM, very fast).
+  if (isCreationConfirmation(text) && hasBlueprintInHistory()) {
+    analyzeBlueprintPlan(chatHistory.value)
+      .then(plan => {
+        creationPlan.value = plan
+        showCreationPanel.value = true
+        nextTick(scrollBottom)
+      })
+      .catch(err => {
+        error.value = `蓝图解析失败：${err.message}，请重试`
+      })
+  }
+
   streaming.value = true
   streamBuffer.value = ''
 
@@ -121,6 +210,13 @@ async function send() {
     for await (const chunk of streamChat('/api/chat/creator', { messages: chatHistory.value })) {
       if (typeof chunk === 'string') {
         streamBuffer.value += chunk
+        await scrollBottom()
+      } else if (chunk.type === 'status') {
+        currentStatus.value = chunk.data
+        await scrollBottom()
+      } else if (chunk.type === 'thought') {
+        thoughts.value.push(chunk.data)
+        if (!showThoughts.value) showThoughts.value = true
         await scrollBottom()
       } else if (chunk.type === 'action_result') {
         const r = chunk.data
@@ -148,6 +244,23 @@ async function send() {
 }
 
 // ---------------------------------------------------------------------------
+// Creation panel handlers
+// ---------------------------------------------------------------------------
+
+function onCreationComplete({ skillName }) {
+  messages.value.push({
+    role: 'assistant',
+    content: `✅ Skill **${skillName}** 已创建完成！可以在沙盒模式下测试。`,
+  })
+  showCreationPanel.value = false
+  scrollBottom()
+}
+
+function onCreationError(errMsg) {
+  error.value = `Skill 创建失败：${errMsg}`
+}
+
+// ---------------------------------------------------------------------------
 // Clear
 // ---------------------------------------------------------------------------
 
@@ -155,6 +268,11 @@ function clearChat() {
   messages.value = []
   streamBuffer.value = ''
   error.value = ''
+  currentStatus.value = null
+  thoughts.value = []
+  showThoughts.value = false
+  showCreationPanel.value = false
+  creationPlan.value = null
 }
 </script>
 
@@ -180,6 +298,25 @@ function clearChat() {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface2);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.status-icon {
+  font-size: 14px;
+}
+
+.status-text {
+  flex: 1;
 }
 
 .empty {
@@ -249,14 +386,51 @@ function clearChat() {
 .action-stderr { background: rgba(200,0,0,.07); }
 
 .input-area {
-  padding: 12px 24px 20px;
+  padding: 16px 24px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
-
-.row { display: flex; gap: 12px; align-items: flex-end; }
-.row textarea { flex: 1; min-height: 72px; }
-
-.actions { display: flex; flex-direction: column; gap: 8px; }
-.hint { font-size: 12px; margin-top: 6px; }
+.input-area .error {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: #fee2e2;
+  border-radius: 6px;
+  color: #991b1b;
+  font-size: 13px;
+}
+.input-area .row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.input-area textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+}
+.input-area textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.input-area textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.input-area .actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.input-area .hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 </style>

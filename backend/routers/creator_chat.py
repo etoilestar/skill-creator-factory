@@ -190,7 +190,10 @@ async def _run_creator_resource_selection_round(
     ]
 
     try:
+        # 调用选择器模型
+
         decision_text = await complete_chat_once(messages, _planner_model_name(model))
+        print("planner decision_text:", decision_text)
     except Exception:
         logger.exception("creator resource selection round failed")
         return {"need_resources": False, "resource_handles": [], "reason": "选择器调用失败"}
@@ -320,8 +323,13 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
         return False
 
     async def generate():
+        """
+        生成kernel Skill Creator的响应
+
+        :return:
+        """
         try:
-            # ── Step 1: Load body prompt ──────────────────────────────────
+            # ── Step 1: 加载kernel Skill Creator正文 ──────────────────────────────────
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill Creator 正文…"}})
             body_prompt = skill_context["body_loader"]()
             yield _thought(
@@ -331,7 +339,7 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
                 {"body_chars": len(body_prompt), "skill_name": parent_skill_name},
             )
 
-            # ── Step 2: Optionally preload resources ──────────────────────
+            # ── Step 2: 优化资源加载 ──────────────────────
             if enable_resource_preload:
                 resource_catalog = _extract_creator_resource_catalog(body_prompt)
                 if resource_catalog:
@@ -368,7 +376,7 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
                         if loaded_resources_prompt:
                             body_prompt = body_prompt + loaded_resources_prompt
 
-            # ── Step 3: Detect phase from conversation history ────────────
+            # ── Step 3: 检测对话阶段是否进入执行阶段 ────────────
             already_in_phase3 = _conversation_has_phase3(
                 getattr(request, "messages", [])
             )
@@ -595,6 +603,10 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
 
             yield "data: [DONE]\n\n"
 
+        except GeneratorExit:
+            # Client disconnected - exit gracefully
+            logger.info("Client disconnected during streaming")
+            raise
         except Exception as exc:
             logger.exception("creator LLM stream error")
             yield _sse({"status": None})

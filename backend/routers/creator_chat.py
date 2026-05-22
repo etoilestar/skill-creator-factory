@@ -4,34 +4,35 @@ import asyncio
 import functools
 import json
 import logging
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..config import settings
-from ..services.kernel_loader import load_kernel_creator_body_prompt
-from ..services.llm_proxy import stream_chat
+from ..services.kernel_loader import load_kernel_creator_body_prompt, read_skill_resource_text
+from ..services.llm_proxy import complete_chat_once, stream_chat
 from .chat_models import ChatRequest
 from .chat_utils import (
+    _last_user_text,
     _allowed_skill_roots,
     _extract_input_session_dir,
     _find_created_skill_roots,
     _friendly_error,
     _is_within_sandbox,
+    _planner_model_name,
     _request_messages_with_files,
     _sse,
+    _strip_markdown_json_fence,
     _thought,
     _validate_skill_md,
 )
 from .sandbox_chat import (
-    _compose_loaded_resources_prompt,
     _execute_single_task,
-    _extract_runtime_resource_catalog,
     _format_execution_report,
     _infer_skill_root_from_tasks,
     _plan_and_execute_generated_output,
-    _run_resource_selection_round,
     _run_skill_runtime_planner_round,
 )
 
@@ -40,6 +41,219 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 _CREATOR_PHASE3_MARKER = '{"creator_phase":"phase3_start"}'
+
+
+def _extract_creator_resource_catalog(body_prompt: str) -> list[dict]:
+    """Extract creator resources from prompt references without sandbox coupling."""
+    catalog: list[dict] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r"`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?",
+        re.M,
+    )
+
+    for match in pattern.finditer(body_prompt):
+        path = match.group("path").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        kind = path.split("/", 1)[0]
+        title = (match.group("title") or "").lstrip("：").strip()
+        usage_hint = {
+            "references": "设计/规范参考资料，按需阅读。",
+            "assets": "模板或配置样例，按需阅读。",
+            "scripts": "实现参考脚本，可读取其内容辅助生成。",
+        }.get(kind, "按需阅读。")
+        catalog.append(
+            {
+                "resource_handle": f"resource:{len(catalog)}",
+                "kind": kind,
+                "path": path,
+                "title": title,
+                "usage_hint": usage_hint,
+            }
+        )
+
+    return catalog
+
+
+def _creator_resource_catalog_for_selector(catalog: list[dict]) -> list[dict]:
+    return [
+        {
+            "resource_handle": item["resource_handle"],
+            "kind": item["kind"],
+            "title": item.get("title", ""),
+            "usage_hint": item.get("usage_hint", ""),
+        }
+        for item in catalog
+    ]
+
+
+def _compose_creator_resource_selection_prompt() -> str:
+    return (
+        "你是 Creator 模式的资源按需加载助手。\n\n"
+        "输入包含 Loaded SKILL.md、resource_catalog 和用户请求。\n"
+        "目标：判断是否需要先读取部分资源帮助当前回答。\n\n"
+        "规则：\n"
+        "1. 仅能从 resource_catalog 中选择 resource_handle。\n"
+        "2. 最多选择 5 个资源。\n"
+        "3. 若无需资源，直接说明不需要。\n"
+        "4. 输出格式不强制 JSON，可直接给结论和 resource handle 列表。\n"
+    )
+
+
+def _parse_creator_resource_selection_decision(
+    text: str,
+    *,
+    resource_catalog: list[dict],
+) -> dict:
+    valid_handles = {
+        str(item.get("resource_handle", "")).strip()
+        for item in resource_catalog
+        if str(item.get("resource_handle", "")).strip()
+    }
+
+    def _filter_handles(candidates: list[str]) -> list[str]:
+        selected: list[str] = []
+        for item in candidates:
+            handle = str(item or "").strip()
+            if not handle or handle not in valid_handles or handle in selected:
+                continue
+            selected.append(handle)
+            if len(selected) >= 5:
+                break
+        return selected
+
+    stripped = _strip_markdown_json_fence(text)
+    parsed = None
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        raw_need = parsed.get("need_resources")
+        raw_handles = parsed.get("resource_handles", [])
+        selected = _filter_handles(raw_handles if isinstance(raw_handles, list) else [])
+        if isinstance(raw_need, str):
+            need_resources = raw_need.strip().lower() in {"true", "1", "yes", "y"}
+        elif raw_need is None:
+            need_resources = bool(selected)
+        else:
+            need_resources = bool(raw_need)
+        if not need_resources or not selected:
+            return {
+                "need_resources": False,
+                "resource_handles": [],
+                "reason": str(parsed.get("reason") or "").strip(),
+            }
+        return {
+            "need_resources": True,
+            "resource_handles": selected,
+            "reason": str(parsed.get("reason") or "").strip(),
+        }
+
+    extracted = _filter_handles(re.findall(r"resource:\d+", text or ""))
+    if extracted:
+        return {
+            "need_resources": True,
+            "resource_handles": extracted,
+            "reason": "从自由文本解析到资源句柄",
+        }
+    return {"need_resources": False, "resource_handles": [], "reason": "未选择资源"}
+
+
+async def _run_creator_resource_selection_round(
+    *,
+    body_prompt: str,
+    request: ChatRequest,
+    model: str,
+    resource_catalog: list[dict],
+) -> dict:
+    if not resource_catalog:
+        return {"need_resources": False, "resource_handles": [], "reason": "无可用资源"}
+
+    messages = [
+        {"role": "system", "content": _compose_creator_resource_selection_prompt()},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "loaded_skill_prompt": body_prompt,
+                    "resource_catalog": _creator_resource_catalog_for_selector(resource_catalog),
+                    "user_messages": _request_messages_with_files(request),
+                    "last_user_text": _last_user_text(request),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    try:
+        decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    except Exception:
+        logger.exception("creator resource selection round failed")
+        return {"need_resources": False, "resource_handles": [], "reason": "选择器调用失败"}
+
+    return _parse_creator_resource_selection_decision(
+        decision_text,
+        resource_catalog=resource_catalog,
+    )
+
+
+def _compose_creator_loaded_resources_prompt(
+    *,
+    skill_name: str,
+    resource_catalog: list[dict],
+    selected_handles: list[str],
+) -> str:
+    resource_by_handle = {
+        str(item.get("resource_handle")): item for item in resource_catalog if item.get("resource_handle")
+    }
+    sections: list[str] = []
+
+    for handle in selected_handles:
+        resource = resource_by_handle.get(str(handle))
+        if not resource:
+            continue
+        path = str(resource.get("path") or "").strip()
+        if not path:
+            continue
+        try:
+            observation = read_skill_resource_text(
+                skill_name,
+                path,
+                max_chars=settings.skill_resource_max_chars,
+            )
+        except Exception as exc:
+            sections.append(
+                f"### {handle}\n"
+                f"- path: `{path}`\n"
+                f"- load_error: {exc}\n"
+            )
+            continue
+
+        content = observation.get("content", "")
+        truncated = observation.get("truncated", False)
+        sections.append(
+            f"### {handle}\n"
+            f"- kind: {resource.get('kind')}\n"
+            f"- path: `{path}`\n"
+            f"- truncated: {truncated}\n\n"
+            "```text\n"
+            f"{content}\n"
+            "```"
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        "\n\n---\n\n"
+        "## Loaded On-Demand Resources (Creator)\n\n"
+        "以下内容由宿主按需读取，可作为当前 Creator 回答上下文。\n\n"
+        + "\n\n".join(sections)
+    )
 
 
 def build_kernel_skill_context() -> dict:
@@ -119,10 +333,10 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
 
             # ── Step 2: Optionally preload resources ──────────────────────
             if enable_resource_preload:
-                resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                resource_catalog = _extract_creator_resource_catalog(body_prompt)
                 if resource_catalog:
                     yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
-                    resource_decision = await _run_resource_selection_round(
+                    resource_decision = await _run_creator_resource_selection_round(
                         body_prompt=body_prompt,
                         request=request,
                         model=model,
@@ -146,7 +360,7 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
                     if resource_decision.get("need_resources"):
                         selected = resource_decision.get("resource_handles") or []
                         yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
-                        loaded_resources_prompt = _compose_loaded_resources_prompt(
+                        loaded_resources_prompt = _compose_creator_loaded_resources_prompt(
                             skill_name=parent_skill_name,
                             resource_catalog=resource_catalog,
                             selected_handles=selected,

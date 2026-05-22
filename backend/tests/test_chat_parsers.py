@@ -194,6 +194,49 @@ def test_parse_resource_selection_invalid_json():
 
 
 # ---------------------------------------------------------------------------
+# creator_chat resource preload parser
+# ---------------------------------------------------------------------------
+
+def test_extract_creator_resource_catalog_from_prompt():
+    from backend.routers.creator_chat import _extract_creator_resource_catalog
+
+    text = (
+        "参考 `references/spec.md`：规范\n"
+        "模板 `assets/template.json`\n"
+        "脚本 `scripts/build.py`\n"
+    )
+    result = _extract_creator_resource_catalog(text)
+
+    assert len(result) == 3
+    assert [item["resource_handle"] for item in result] == ["resource:0", "resource:1", "resource:2"]
+    assert result[0]["path"] == "references/spec.md"
+    assert result[1]["path"] == "assets/template.json"
+    assert result[2]["path"] == "scripts/build.py"
+
+
+def test_parse_creator_resource_selection_accepts_plain_text():
+    from backend.routers.creator_chat import _parse_creator_resource_selection_decision
+
+    catalog = _make_catalog(3)
+    text = "建议先读取 resource:1 和 resource:2，再继续。"
+    result = _parse_creator_resource_selection_decision(text, resource_catalog=catalog)
+
+    assert result["need_resources"] is True
+    assert result["resource_handles"] == ["resource:1", "resource:2"]
+
+
+def test_parse_creator_resource_selection_accepts_json():
+    from backend.routers.creator_chat import _parse_creator_resource_selection_decision
+
+    catalog = _make_catalog(3)
+    text = '{"need_resources": true, "resource_handles": ["resource:0"], "reason": "需要"}'
+    result = _parse_creator_resource_selection_decision(text, resource_catalog=catalog)
+
+    assert result["need_resources"] is True
+    assert result["resource_handles"] == ["resource:0"]
+
+
+# ---------------------------------------------------------------------------
 # _planner_model_name
 # ---------------------------------------------------------------------------
 

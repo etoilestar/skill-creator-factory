@@ -382,6 +382,39 @@ def _compose_agent_runtime_contract() -> str:
     )
 
 
+def _compose_creator_workflow_contract() -> str:
+    """Creator workflow contract injected into the kernel creator body prompt."""
+    return (
+        "## Creator Workflow Contract\n\n"
+        "你正在执行 Skill Creator 的多阶段工作流。\n\n"
+        "相位自我评估：\n"
+        "1. 在每次回复前，先通读对话历史和已加载的 SKILL.md。\n"
+        "2. 判断当前最符合哪一个 Phase，并在你的思考中标注当前 Phase。\n"
+        "3. 必须以 SKILL.md 中的 Phase 定义与完成标志为准，不得自行跳跃。\n\n"
+        "阶段门控：\n"
+        "1. 在推进到下一阶段前，必须确认当前阶段的完成标志已满足。\n"
+        "2. 如果未满足，继续提问或总结确认，不得提前输出下一阶段内容。\n\n"
+        "Phase 1-2 行为约束：\n"
+        "1. 只进行需求澄清与蓝图确认，不得输出任何文件写入或命令执行格式。\n"
+        "2. 需要更好的问法时，可在资源选择阶段请求加载 `references/interaction-guide.md`。\n\n"
+        "Phase 3-5 行为约束：\n"
+        "1. 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3。\n"
+        "2. 进入 Phase 3 后，才可以按 SKILL.md 规定输出“写入文件/执行命令”的动作格式。\n"
+        "3. 如果需要命名规范或输出格式示例，可在资源选择阶段请求加载 "
+        "`references/best-practices.md` 与 `references/output-patterns.md`。\n"
+        "4. 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 "
+        "`references/workflows.md`。\n\n"
+        "蓝图确认信号：\n"
+        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
+        '{"creator_phase":"phase3_start"}\n'
+        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "运行时安全：\n"
+        "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
+        "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+        "3. 不要输出自定义 `<skill_action>` 标签。\n"
+    )
+
+
 def compose_body_prompt(skill: SkillPackage) -> str:
     """Compose body prompt for the second model round.
 
@@ -395,6 +428,33 @@ def compose_body_prompt(skill: SkillPackage) -> str:
         "不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
         "不要输出自定义 `<skill_action>` 标签。\n\n"
         f"{_compose_agent_runtime_contract()}\n\n"
+        "## Skill Metadata\n"
+        f"- name: {skill.name}\n"
+        f"- description: {skill.description}\n\n"
+        "---\n\n"
+        "## Loaded SKILL.md\n\n"
+        f"{skill.skill_md_text}\n\n"
+        "---\n\n"
+        f"{_compose_child_skill_manifest(skill)}\n\n"
+        "---\n\n"
+        f"{_compose_resource_manifest(skill)}"
+    )
+
+
+def compose_kernel_creator_body_prompt(skill: SkillPackage) -> str:
+    """Compose creator-specific body prompt for the kernel Skill Creator."""
+    return (
+        "你处于 Skill Creator 的 SKILL.md 正文执行阶段。\n\n"
+        "阶段自评估指令：\n"
+        "1. 先基于对话历史判断当前处于哪个 Phase。\n"
+        "2. 核对该 Phase 的完成标志是否满足；未满足就继续提问或总结确认。\n"
+        "3. 只有在 Phase 2 被用户确认后，才进入 Phase 3 并执行工程化输出。\n"
+        "4. 在 Phase 1-2 期间，不得输出任何文件写入或命令执行格式。\n\n"
+        "请严格遵循下面完整 SKILL.md 中定义的流程、步骤、约束和输出要求。\n"
+        "不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主运行时明确提供后才可使用。\n"
+        "不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+        "不要输出自定义 `<skill_action>` 标签。\n\n"
+        f"{_compose_creator_workflow_contract()}\n\n"
         "## Skill Metadata\n"
         f"- name: {skill.name}\n"
         f"- description: {skill.description}\n\n"
@@ -435,6 +495,12 @@ def load_kernel_body_prompt() -> str:
     """Load kernel Skill full SKILL.md body prompt."""
     skill = load_kernel_package(include_body=True)
     return compose_body_prompt(skill)
+
+
+def load_kernel_creator_body_prompt() -> str:
+    """Load kernel Skill full SKILL.md body prompt for creator mode."""
+    skill = load_kernel_package(include_body=True)
+    return compose_kernel_creator_body_prompt(skill)
 
 
 def load_skill_body_prompt(skill_name: str) -> str:

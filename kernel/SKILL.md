@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Guide for creating effective skills. Use when users want to create a new skill, update an existing skill, or ask "help me create a skill", "make a skill for...", "I want to build a skill". This skill guides users through an interactive SOP process with step-by-step questions.
+description: 高效技能创建指南。适用于用户想要新建技能、更新已有技能，或是提出 “帮我创建技能”“为…… 制作技能”“我想搭建一项技能” 这类诉求的场景。该技能以循序渐进的问答形式，引导用户完成标准化交互流程。
 ---
 
 # Skill Creator

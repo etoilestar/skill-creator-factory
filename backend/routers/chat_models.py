@@ -36,10 +36,3 @@ class MarkdownBlock:
     before_context: str
     after_context: str
 
-
-@dataclass
-class CreatorStateContext:
-    """Creator state tracking for creator mode."""
-
-    state: str
-    blueprint_shown: bool

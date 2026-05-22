@@ -15,18 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..services.llm_proxy import complete_chat_once, stream_chat
-from ..services.output_validator import retry_with_validation
-from .chat_models import ChatRequest, CreatorStateContext, MarkdownBlock
-from .creator_chat import (
-    CREATOR_GLOBAL_CONSTRAINTS,
-    _CREATOR_VALIDATION_MAX_RETRIES,
-    _analyze_creator_requirements,
-    _compose_creator_state_injection,
-    _compose_creator_validation_messages,
-    _detect_creator_state,
-    _has_creation_confirmation,
-    _simple_sse_content_response,
-)
+from .chat_models import ChatRequest, MarkdownBlock
 
 logger = logging.getLogger(__name__)
 
@@ -1109,14 +1098,7 @@ def _validator_model_name(default_model: str) -> str:
     return settings.validator_model or default_model
 
 def _make_stream(skill_context: dict, request: ChatRequest):
-    """Staged Skill execution with creator-safe action planning.
-
-    关键逻辑：
-    - /creator：用户未明确确认前，只让主模型按 Creator SKILL.md 做需求收集；
-      不运行 runtime planner，不执行动作。
-    - /creator：用户确认后，允许主模型生成文件块，再由 block planner/executor 写入。
-    - /sandbox/{skill_name}：可以使用 runtime planner 执行具体 Skill。
-    """
+    """Staged Skill execution with shared runtime planning and action execution."""
     from .sandbox_chat import (
         _allowed_skill_roots,
         _compose_loaded_resources_prompt,
@@ -1140,15 +1122,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     execution_root = skill_context.get("execution_root")
     child_body_loader = skill_context.get("child_body_loader")
     parent_skill_name = skill_context.get("skill_name", "")
-    disable_runtime_planner = bool(skill_context.get("disable_runtime_planner", False))
     enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
-
-    skip_runtime_planner_before_confirmation = bool(
-        skill_context.get("skip_runtime_planner_before_confirmation", False)
-    )
-    use_frontend_driven_creation = bool(
-        skill_context.get("use_frontend_driven_creation", False)
-    )
 
     if execution_root is not None:
         execution_root = Path(execution_root).resolve()
@@ -1200,29 +1174,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                 yield "data: [DONE]\n\n"
                 return
-
-            # Detect creator state before loading the creator body so requirement collection
-            # can be enforced as a backend gate instead of relying on prompt following.
-            creator_state: str = "A"
-            creator_state_ctx: CreatorStateContext | None = None
-            _creator_state_result = None
-            if skip_runtime_planner_before_confirmation:
-                _creator_state_result = _detect_creator_state(request)
-                creator_state = _creator_state_result.state
-                blueprint_shown = _creator_state_result.blueprint_shown
-                creator_state_ctx = CreatorStateContext(
-                    state=creator_state,
-                    blueprint_shown=blueprint_shown,
-                )
-                yield _thought(
-                    "creator_state",
-                    "创建者状态",
-                    f"当前状态：{creator_state}",
-                    {
-                        "state": creator_state,
-                        "blueprint_shown": creator_state_ctx.blueprint_shown,
-                    },
-                )
 
             yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
             body_prompt = skill_context["body_loader"]()
@@ -1404,13 +1355,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         f"{sections_text}\n"
                     )
 
-            should_skip_runtime_planner = (
-                skip_runtime_planner_before_confirmation
-                and require_action_confirmation
-                and not _has_creation_confirmation(request)
-            )
-
-            if enable_action_execution and not should_skip_runtime_planner and not disable_runtime_planner:
+            if enable_action_execution:
                 try:
                     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
                     runtime_plan = await _run_skill_runtime_planner_round(
@@ -1654,38 +1599,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     return
 
             final_messages: list[dict] = []
-            if skip_runtime_planner_before_confirmation:
-                final_messages.append(
-                    {
-                        "role": "system",
-                        "content": CREATOR_GLOBAL_CONSTRAINTS,
-                    }
-                )
             final_messages.append(
                 {
                     "role": "system",
                     "content": body_prompt,
                 }
             )
-
-            # Inject the per-state constraint after the body prompt so creator-mode
-            # messages follow the layered system-prompt ordering.
-            if skip_runtime_planner_before_confirmation:
-                if creator_state_ctx is None:
-                    raise RuntimeError(
-                        "Internal error: creator_state_ctx must be initialized when "
-                        "skip_runtime_planner_before_confirmation is enabled. "
-                        "Ensure creator_state_ctx is assigned from _detect_creator_state() before this point."
-                    )
-                final_messages.append(
-                    {
-                        "role": "system",
-                        "content": _compose_creator_state_injection(
-                            creator_state,
-                            blueprint_shown=creator_state_ctx.blueprint_shown,
-                        ),
-                    }
-                )
 
             if strict_skill_execution:
                 final_messages.append(
@@ -1713,40 +1632,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             final_messages.extend(_request_messages_with_files(request))
 
-            if skip_runtime_planner_before_confirmation and creator_state in {"A", "B"}:
-                # State A with incomplete requirements → return a deterministic clarifying
-                # question without calling the LLM.  This makes State A responses fast,
-                # consistent, and immune to model output format failures.
-                if (
-                    creator_state == "A"
-                    and _creator_state_result is not None
-                    and not _creator_state_result.requirements.ready_for_blueprint
-                ):
-                    for event in _simple_sse_content_response(
-                        _creator_state_result.requirements.next_question
-                    ):
-                        yield event
-                    return
-
-                validator_messages = _compose_creator_validation_messages(
-                    creator_state,
-                )
-                validated_text, valid, attempts = await retry_with_validation(
-                    final_messages,
-                    model,
-                    max_retries=_CREATOR_VALIDATION_MAX_RETRIES,
-                    validator_messages=validator_messages,
-                    validator_model=_validator_model_name(model),
-                )
-                if not valid:
-                    logger.warning(
-                        "creator output validation failed after retries: %s",
-                        [a.feedback for a in attempts],
-                    )
-                for event in _simple_sse_content_response(validated_text):
-                    yield event
-                return
-
             assistant_chunks: list[str] = []
             async for chunk in stream_chat(final_messages, model):
                 assistant_chunks.append(chunk)
@@ -1755,14 +1640,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             assistant_text = "".join(assistant_chunks)
 
             if enable_action_execution:
-                # In frontend-driven creation mode (plan C), state C is handled entirely
-                # by the frontend panel.  Skip the legacy block-planner path so it does
-                # not try to execute file-write actions from the brief acknowledgement text.
-                if use_frontend_driven_creation and creator_state == "C":
-                    yield _sse({"status": None})
-                    yield "data: [DONE]\n\n"
-                    return
-
                 try:
                     exec_result = await _plan_and_execute_generated_output(
                         assistant_text=assistant_text,

@@ -9,6 +9,7 @@ services:
     volumes:
       - ./kernel:/app/kernel:ro   # skill-creator kernel (read-only)
       - ./skills:/app/skills       # user skill library (read-write)
+      - ./backend:/app/backend 
     environment:
       # Point to the LLM running on the host machine.
       # Ollama default : http://host.docker.internal:11434

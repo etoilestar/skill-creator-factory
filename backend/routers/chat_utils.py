@@ -558,6 +558,22 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _quick_actions(actions: list[dict]) -> str:
+    """Build a 'quick_actions' SSE event that carries button suggestions for user to click.
+    
+    Each action should have:
+      - text: button text to display
+      - value: text to send when clicked
+      - style: optional, default "default", can be "primary", "danger", etc.
+    """
+    return _sse({
+        "quick_actions": {
+            "actions": actions,
+            "ts": time.time(),
+        }
+    })
+
+
 def _thought(step: str, label: str, detail: str, data: dict | None = None) -> str:
     """Build a 'thought' SSE event that carries internal decision/execution data.
 

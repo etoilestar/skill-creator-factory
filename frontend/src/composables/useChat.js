@@ -6,6 +6,7 @@
  *   - { type: 'action_result', data: {...} } — skill file-operation result
  *   - { type: 'status', data: {phase, message} | null } — execution phase update
  *   - { type: 'thought', data: {step, label, detail, data, ts} } — internal decision record
+ *   - { type: 'quick_actions', data: {actions: [...], ts} } — quick action buttons to display
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model? }
@@ -45,6 +46,7 @@ export async function* streamChat(url, body) {
         if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
         else if (parsed.thought) yield { type: 'thought', data: parsed.thought }
         else if ('status' in parsed) yield { type: 'status', data: parsed.status }
+        else if (parsed.quick_actions) yield { type: 'quick_actions', data: parsed.quick_actions }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines

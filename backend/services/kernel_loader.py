@@ -415,6 +415,144 @@ def _compose_creator_workflow_contract() -> str:
     )
 
 
+def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
+    """Create phase-specific creator workflow contract.
+    
+    Progressive disclosure: only show constraints relevant to current phase.
+    """
+    base_contract = (
+        "## Creator Workflow Contract\n\n"
+        "你正在执行 Skill Creator 的多阶段工作流。\n\n"
+        "相位自我评估：\n"
+        "1. 在每次回复前，先通读对话历史和已加载的 SKILL.md。\n"
+        "2. 判断当前最符合哪一个 Phase，并在你的思考中标注当前 Phase。\n"
+        "3. 必须以 SKILL.md 中的 Phase 定义与完成标志为准，不得自行跳跃。\n\n"
+        "阶段门控：\n"
+        "1. 在推进到下一阶段前，必须确认当前阶段的完成标志已满足。\n"
+        "2. 如果未满足，继续提问或总结确认，不得提前输出下一阶段内容。\n\n"
+    )
+    
+    if phase == "first_time" or phase == "phase1":
+        # Phase 1: only show Phase 1 constraints
+        return base_contract + (
+            "当前阶段：Phase 1（深度需求挖掘）\n\n"
+            "==================== Phase 1 执行要求 ====================\n"
+            "【重要！Phase 1 必须严格按顺序执行！】\n\n"
+            "执行顺序：\n"
+            "1. 必须严格按照 1.1 → 1.2 → 1.3 → 1.4 → 1.5 的顺序执行\n"
+            "2. 每个步骤只问一个问题，不要在一次回复中问多个问题\n"
+            "3. 只有当前步骤获得用户回复后，才能进入下一个步骤\n"
+            "4. 不要跳过任何步骤！\n\n"
+            "【重要！AskUserQuestion 输出格式要求！】\n\n"
+            "必须使用以下格式输出问题，用 ```text 包裹！\n"
+            "格式示例：\n"
+            "```text\n"
+            "问题: \"你希望 智能助手 帮你做什么事情？\"\n"
+            "选项:\n"
+            "- \"处理文件 (比如 PDF、Excel、图片等)\"\n"
+            "- \"帮我写东西 (比如文档、代码、报告)\"\n"
+            "- \"连接某个服务 (比如发消息、查数据)\"\n"
+            "- \"其他 (我来描述)\"\n"
+            "```\n\n"
+            "注意事项：\n"
+            "1. 必须用 ```text 和 ``` 包裹整个问题块\n"
+            "2. 必须使用 \"问题:\" 开头\n"
+            "3. 必须使用 \"选项:\" 开头列出选项\n"
+            "4. 每个选项用 - 开头\n"
+            "5. 问题和选项都要用双引号包裹\n"
+            "6. 每次只输出一个 AskUserQuestion 块\n\n"
+            "问题格式要求：\n"
+            "1. 必须使用 SKILL.md 中给出的 ``` 包裹的问题模板\n"
+            "2. 不要自己编问题，直接用 SKILL.md 里的问题\n"
+            "3. 每次只输出一个 AskUserQuestion\n\n"
+            "Phase 1 行为约束：\n"
+            "1. 只进行需求澄清，不得输出任何文件写入或命令执行格式。\n"
+            "2. 需要更好的问法时，可在资源选择阶段请求加载 `references/interaction-guide.md`。\n\n"
+            "运行时安全：\n"
+            "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
+            "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+            "3. 不要输出自定义 `<skill_action>` 标签。\n"
+        )
+    elif phase == "phase2":
+        # Phase 2: show Phase 1-2 constraints
+        return base_contract + (
+            "当前阶段：Phase 2（技能架构蓝图）\n\n"
+            "Phase 1-2 行为约束：\n"
+            "1. 只进行需求澄清与蓝图确认，不得输出任何文件写入或命令执行格式。\n"
+            "2. 需要更好的问法时，可在资源选择阶段请求加载 `references/interaction-guide.md`。\n\n"
+            "蓝图确认信号：\n"
+            "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
+            '{"creator_phase":"phase3_start"}\n'
+            "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+            "运行时安全：\n"
+            "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
+            "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+            "3. 不要输出自定义 `<skill_action>` 标签。\n"
+        )
+    elif phase in ["phase3+", "phase3", "phase4", "phase5"]:
+        # Phase 3+: show specific execution mode constraints
+        return base_contract + (
+            "当前阶段：Phase 3+（工程化实现）\n\n"
+            "⚠️ 重要：Phase 3+ 是后台执行模式\n\n"
+            "Phase 3+ 执行要求：\n"
+            "1. 不要输出自然语言给用户看 - 你的输出是给后端执行引擎解析的\n"
+            "2. 只输出执行指令，使用 fenced code blocks 格式\n"
+            "3. 首先输出 phase3_start 标记（在回复的最前面）\n"
+            "4. 严格按照 SKILL.md 中的 3.1.1 动作输出格式\n\n"
+            "动作输出格式（必须严格遵守）：\n"
+            "- 写入文件：代码块前一行写 `写入文件：<path>` 或 `保存到：<path>`，紧跟一个 code block\n"
+            "- 运行命令：代码块前一行写 `执行命令：`，code block 中写完整命令\n"
+            "- 路径必须包含完整 Skill 根目录，例如 `skills/<skill-name>/SKILL.md`\n"
+            "- 一个 code block 只对应一个文件或一条命令\n\n"
+            "Phase 3+ 行为约束：\n"
+            "- 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3\n"
+            "- 进入 Phase 3 后，才可以按 SKILL.md 规定输出\"写入文件/执行命令\"的动作格式\n"
+            "- 如果需要命名规范或输出格式示例，可在资源选择阶段请求加载 `references/best-practices.md` 与 `references/output-patterns.md`\n"
+            "- 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 `references/workflows.md`\n\n"
+            "输出示例（严格按照此格式）：\n"
+            "```\n"
+            '{ "creator_phase":"phase3_start"}\n'
+            "\n"
+            "执行命令：\n"
+            "```bash\n"
+            "python ../kernel/scripts/init_skill.py query-system-time --path .\n"
+            "```\n"
+            "\n"
+            "写入文件：skills/query-system-time/SKILL.md\n"
+            "```markdown\n"
+            "---\n"
+            "name: query-system-time\n"
+            "description: 查询当前系统时间，精确到秒。当用户提到时间、现在几点、查询时间时使用。\n"
+            "---\n"
+            "# 查询系统时间\n"
+            "\n"
+            "## Overview\n"
+            "查询当前系统的标准时间格式。\n"
+            "```\n"
+            "\n"
+            "写入文件：skills/query-system-time/scripts/get_time.py\n"
+            "```python\n"
+            "#!/usr/bin/env python3\n"
+            "import datetime\n"
+            "\n"
+            "def main():\n"
+            '    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")\n'
+            '    print(f"当前系统时间为: {now}")\n'
+            "\n"
+            'if __name__ == "__main__":\n'
+            "    main()\n"
+            "```\n"
+            "```\n\n"
+            "运行时安全：\n"
+            "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
+            "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+            "3. 不要输出自定义 `<skill_action>` 标签。\n"
+        )
+    else:
+        # Unknown phase: default to Phase 1
+        return _compose_creator_workflow_contract_for_phase("phase1")
+
+
 def compose_body_prompt(skill: SkillPackage) -> str:
     """Compose body prompt for the second model round.
 
@@ -468,6 +606,188 @@ def compose_kernel_creator_body_prompt(skill: SkillPackage) -> str:
     )
 
 
+def compose_kernel_creator_metadata_prompt(skill: SkillPackage) -> str:
+    """Compose creator-specific metadata-only prompt (no full SKILL.md body).
+    
+    精简版 creator prompt：
+    - 只包含元数据和核心流程定义
+    - 不加载完整 SKILL.md 正文
+    - 适合 Phase 3+ 阶段，或不需要完整指导的场景
+    """
+    return (
+        "你处于 Skill Creator 精简执行模式。\n\n"
+        "阶段自评估指令：\n"
+        "1. 先基于对话历史判断当前处于哪个 Phase。\n"
+        "2. 只有在 Phase 2 被用户确认后，才进入 Phase 3 并执行工程化输出。\n"
+        "3. 在 Phase 1-2 期间，不得输出任何文件写入或命令执行格式。\n\n"
+        "核心流程：\n"
+        "- Phase 1：需求收集 - 收集用户对 Skill 的真实需求\n"
+        "- Phase 2：蓝图确认 - 设计并确认 Skill 架构蓝图\n"
+        "- Phase 3+：工程化实现 - 执行文件创建和脚本编写\n\n"
+        "蓝图确认信号：\n"
+        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
+        '{"creator_phase":"phase3_start"}\n'
+        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "请确保：\n"
+        "- 严格按 Phase 流程执行\n"
+        "- Phase 1-2 只做需求澄清和蓝图确认\n"
+        "- Phase 3+ 才输出写入文件或执行命令的格式\n\n"
+        f"{_compose_creator_workflow_contract()}\n\n"
+        "## Skill Metadata\n"
+        f"- name: {skill.name}\n"
+        f"- description: {skill.description}\n\n"
+        "---\n\n"
+        f"{_compose_child_skill_manifest(skill)}\n\n"
+        "---\n\n"
+        f"{_compose_resource_manifest(skill)}"
+    )
+
+
+def compose_kernel_creator_first_part_prompt(skill: SkillPackage, first_part_content: str) -> str:
+    """Compose creator prompt with only the first part of SKILL.md.
+    
+    初始版 creator prompt：
+    - 只包含元数据和 SKILL.md 的第一部分（到第一个 --- 分隔符）
+    - 包含启动对话的指令，适合首次进入页面
+    - 比完整加载更轻量，同时保留了关键信息
+    """
+    return (
+        "你处于 Skill Creator 初始对话模式。\n\n"
+        "请严格按照下面 SKILL.md 中的启动对话要求执行。\n"
+        "不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主运行时明确提供后才可使用。\n"
+        "不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+        "不要输出自定义 `<skill_action>` 标签。\n\n"
+        f"{_compose_creator_workflow_contract()}\n\n"
+        "## Skill Metadata\n"
+        f"- name: {skill.name}\n"
+        f"- description: {skill.description}\n\n"
+        "---\n\n"
+        "## Loaded SKILL.md (First Part)\n\n"
+        f"{first_part_content}\n\n"
+        "---\n\n"
+        f"{_compose_child_skill_manifest(skill)}\n\n"
+        "---\n\n"
+        f"{_compose_resource_manifest(skill)}"
+    )
+
+
+def _split_skill_md_into_blocks(skill_root: Path) -> list[str]:
+    """Split SKILL.md into blocks separated by --- separators.
+    
+    Returns a list of blocks, where:
+    - Block 0: Frontmatter + intro (to first ---)
+    - Block 1: Phase 1
+    - Block 2: Phase 2
+    - Block 3: Phase 3
+    - Block 4: Phase 4
+    - Block 5: Phase 5
+    - Block 6: Core principles
+    """
+    skill_md_path = skill_root / "SKILL.md"
+    if not skill_md_path.exists():
+        raise FileNotFoundError(f"SKILL.md not found at {skill_md_path}")
+    
+    with open(skill_md_path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    
+    # Split by --- separators
+    parts = content.split("\n---\n")
+    
+    # The first part includes frontmatter, we need to process it
+    blocks = []
+    for i, part in enumerate(parts):
+        if i == 0:
+            # First part: frontmatter + intro
+            blocks.append(part.strip() + "\n")
+        else:
+            # Subsequent parts: add back the separator context
+            blocks.append("---\n" + part.strip() + "\n")
+    
+    return blocks
+
+
+def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int], phase: str) -> str:
+    """Compose creator prompt with specific blocks from SKILL.md.
+    
+    Args:
+        skill: SkillPackage with metadata
+        blocks: List of block indices to include (0 = intro, 1 = Phase1, etc.)
+        phase: Current phase for progressive disclosure
+    """
+    # Load the full content first to extract blocks
+    all_blocks = _split_skill_md_into_blocks(settings.kernel_path)
+    
+    # Build combined content from selected blocks
+    selected_content = []
+    for block_idx in blocks:
+        if block_idx < len(all_blocks):
+            selected_content.append(all_blocks[block_idx])
+    
+    combined_content = "\n".join(selected_content)
+    
+    # Phase 1 特殊处理：在 SKILL.md 前面增加顺序执行提示
+    if phase == "first_time" or phase == "phase1":
+        phase1_instruction = """
+==================== Phase 1 执行指南 ====================
+
+【重要！请务必阅读！】
+
+1. **严格按顺序执行**：必须按照 1.1 → 1.2 → 1.3 → 1.4 → 1.5 的顺序执行
+2. **每次只问一个问题**：不要在一次回复中问多个问题
+3. **使用指定的问题模板**：必须使用 SKILL.md 中用 ``` 包裹的问题模板
+4. **不要跳过步骤**：每个步骤都要执行，不要省略
+
+现在，让我们开始执行 Phase 1 吧！
+
+========================================================
+
+"""
+        combined_content = phase1_instruction + combined_content
+    
+    return (
+        "你处于 Skill Creator 模式。\n\n"
+        "请严格按照下面 SKILL.md 中的流程和要求执行。\n"
+        "不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主运行时明确提供后才可使用。\n"
+        "不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+        "不要输出自定义 `<skill_action>` 标签。\n\n"
+        f"{_compose_creator_workflow_contract_for_phase(phase)}\n\n"
+        "## Skill Metadata\n"
+        f"- name: {skill.name}\n"
+        f"- description: {skill.description}\n\n"
+        "---\n\n"
+        "## Loaded SKILL.md\n\n"
+        f"{combined_content}\n\n"
+        "---\n\n"
+        f"{_compose_child_skill_manifest(skill)}\n\n"
+        "---\n\n"
+        f"{_compose_resource_manifest(skill)}"
+    )
+
+
+def load_kernel_creator_for_phase(phase: str) -> str:
+    """Load kernel Skill with appropriate blocks for current phase.
+
+    Progressive disclosure strategy:
+    - first_time / phase1: blocks [0, 1] (intro + Phase1)
+    - phase2: blocks [0, 2] (intro + Phase2)
+    - phase3+: load FULL SKILL.md (need full implementation instructions)
+    """
+    skill = load_kernel_package(include_body=False)
+
+    if phase == "first_time" or phase == "phase1":
+        # First time or Phase1: only need intro + Phase1
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 1], phase)
+    elif phase == "phase2":
+        # Phase2: intro + Phase2
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 2], phase)
+    elif phase in ["phase3+", "phase3", "phase4", "phase5"]:
+        # Phase3 and beyond: NEED FULL SKILL.md for implementation instructions!
+        return compose_kernel_creator_body_prompt(skill)
+    else:
+        # Unknown phase: default to intro + Phase1
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 1], phase)
+
+
 def load_kernel_package(*, include_body: bool = False) -> SkillPackage:
     """Load the fixed kernel Skill package."""
     return _load_skill_from_root(settings.kernel_path, include_body=include_body)
@@ -501,6 +821,25 @@ def load_kernel_creator_body_prompt() -> str:
     """Load kernel Skill full SKILL.md body prompt for creator mode."""
     skill = load_kernel_package(include_body=True)
     return compose_kernel_creator_body_prompt(skill)
+
+
+def load_kernel_creator_metadata_prompt() -> str:
+    """Load kernel Skill metadata-only prompt for creator mode (no full SKILL.md body)."""
+    skill = load_kernel_package(include_body=False)
+    return compose_kernel_creator_metadata_prompt(skill)
+
+
+def load_kernel_creator_first_part_prompt() -> str:
+    """Load kernel Skill with only the first part of SKILL.md (until first --- separator).
+    
+    适合首次进入 Creator 页面的场景：
+    - 包含元数据和启动对话指令
+    - 比完整加载更轻量
+    - 只包含 SKILL.md 到第一个 --- 的部分
+    """
+    skill = load_kernel_package(include_body=False)
+    first_part_content = _load_skill_first_part(settings.kernel_path)
+    return compose_kernel_creator_first_part_prompt(skill, first_part_content)
 
 
 def load_skill_body_prompt(skill_name: str) -> str:

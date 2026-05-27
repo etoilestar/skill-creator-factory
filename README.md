@@ -27,7 +27,10 @@ skill-creator-factory/
 │   ├── main.py               # 应用入口，CORS 配置
 │   ├── config.py             # 环境变量 & 路径配置（pydantic-settings）
 │   ├── routers/
-│   │   ├── chat.py           # POST /api/chat/creator & /api/chat/sandbox/{name}
+│   │   ├── chat.py           # /api/chat 路由占位（共享前缀）
+│   │   ├── creator_chat.py   # POST /api/chat/creator
+│   │   ├── sandbox_chat.py   # POST /api/chat/sandbox/{name}
+│   │   ├── skills_chat.py    # /api/chat/skills/*（预留）
 │   │   ├── skills.py         # /api/skills + governance / approval / upgrade / rollback
 │   │   └── health.py         # GET /api/health
 │   └── services/

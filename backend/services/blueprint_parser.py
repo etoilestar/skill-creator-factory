@@ -37,17 +37,25 @@ class BlueprintPlan:
 # Constants
 # ---------------------------------------------------------------------------
 
-_BLUEPRINT_MARKER = "📋 Skill 蓝图"
+_BLUEPRINT_MARKER = "📋 Skill 架构蓝图"
 
-# "- Skill 名称：foo-bar" or "- Skill 名称: foo-bar"
+# "- **Skill 名称**: foo-bar" or "- **Skill 名称**: foo-bar"
 _SKILL_NAME_RE = re.compile(
-    r"-\s+Skill\s+名称[：:]\s*([^\n]+)",
+    r"-\s+\*\*Skill\s+名称\*\*[：:]\s*([^\n]+)",
     re.IGNORECASE,
 )
 
 # Inline backtick references: `scripts/main.py` or `references/guide.md`
 _SKILL_PATH_INLINE_RE = re.compile(
     r"`((?:scripts|references|assets)/[^`\s]+)`"
+)
+
+# Tree structure patterns: 
+# - ├── scripts/main.py 或 └── scripts/main.py (第一层级)
+# - │   ├── scripts/main.py 或 │   └── scripts/main.py (第二层级)
+# - /path/to/scripts/main.py (完整路径)
+_TREE_FILE_RE = re.compile(
+    r"(?:[│ ]{2,})?[├└]──\s*((?:/?[\w./-]+/)?(?:scripts|references|assets)/[^\s#]+)"
 )
 
 # "主入口脚本：scripts/xxx.py" or "主入口脚本: `scripts/xxx.py`"
@@ -210,6 +218,18 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     for path in _extract_inline_paths(blueprint_text, "scripts"):
         _add(path, scripts_desc or "Skill 执行脚本")
 
+    # 4b. Tree structure paths (e.g., ├── scripts/main.py 或 ├── /path/to/scripts/main.py)
+    for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
+        tree_path = m_tree.group(1).strip()
+        # 提取相对路径（移除前面的绝对路径部分）
+        for prefix in ("scripts/", "references/", "assets/"):
+            idx = tree_path.find(prefix)
+            if idx >= 0:
+                tree_path = tree_path[idx:]
+                break
+        if tree_path.startswith("scripts/"):
+            _add(tree_path, scripts_desc or "Skill 执行脚本（从目录结构提取）")
+
     # 5. Bare paths inside the scripts section description
     if scripts_desc and not _should_skip(scripts_desc):
         for m_bare in re.finditer(r"scripts/(\S+\.\w+)", scripts_desc):
@@ -249,6 +269,17 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         ref_files = _extract_inline_paths(blueprint_text, "references")
         for path in ref_files:
             _add(path, refs_desc, required=False, can_skip=True)
+        # Tree structure paths for references
+        for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
+            tree_path = m_tree.group(1).strip()
+            # 提取相对路径（移除前面的绝对路径部分）
+            for prefix in ("scripts/", "references/", "assets/"):
+                idx = tree_path.find(prefix)
+                if idx >= 0:
+                    tree_path = tree_path[idx:]
+                    break
+            if tree_path.startswith("references/"):
+                _add(tree_path, refs_desc + "（从目录结构提取）", required=False, can_skip=True)
         # Bare filenames in section description
         for m_bare in re.finditer(r"references/(\S+\.\w+)", refs_desc):
             _add("references/" + m_bare.group(1), refs_desc, required=False, can_skip=True)
@@ -268,6 +299,17 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         asset_files = _extract_inline_paths(blueprint_text, "assets")
         for path in asset_files:
             _add(path, assets_desc, required=False, can_skip=True)
+        # Tree structure paths for assets
+        for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
+            tree_path = m_tree.group(1).strip()
+            # 提取相对路径（移除前面的绝对路径部分）
+            for prefix in ("scripts/", "references/", "assets/"):
+                idx = tree_path.find(prefix)
+                if idx >= 0:
+                    tree_path = tree_path[idx:]
+                    break
+            if tree_path.startswith("assets/"):
+                _add(tree_path, assets_desc + "（从目录结构提取）", required=False, can_skip=True)
         for m_bare in re.finditer(r"assets/(\S+\.\w+)", assets_desc):
             _add("assets/" + m_bare.group(1), assets_desc, required=False, can_skip=True)
         if not any(f.path.startswith("assets/") for f in files):

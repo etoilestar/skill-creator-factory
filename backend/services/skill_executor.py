@@ -130,6 +130,16 @@ def _run_init(name: str, skill_dir: Path) -> dict:
             "message": (result.stderr or result.stdout or "初始化失败，请检查 skill 名称是否合法").strip(),
             "path": None,
         }
+    
+    # 删除示例文件，只保留空目录结构
+    for example_file in [
+        skill_dir / "scripts" / "example.py",
+        skill_dir / "references" / "api_reference.md",
+        skill_dir / "assets" / "example_asset.txt",
+    ]:
+        if example_file.exists():
+            example_file.unlink()
+    
     return {
         "action": "init",
         "name": name,

@@ -725,7 +725,7 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
     
     combined_content = "\n".join(selected_content)
     
-    # Phase 1 特殊处理：在 SKILL.md 前面增加顺序执行提示
+    # Phase 1/2 特殊处理：在 SKILL.md 前面增加执行提示
     if phase == "first_time" or phase == "phase1":
         phase1_instruction = """
 ==================== Phase 1 执行指南 ====================
@@ -743,6 +743,31 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
 
 """
         combined_content = phase1_instruction + combined_content
+    elif phase == "phase2":
+        phase2_instruction = """
+==================== Phase 2 执行指南 ====================
+
+【重要！请务必阅读！】
+
+Phase 2 的任务是：
+1. 基于 Phase 1 收集的信息，生成完整的"架构蓝图"
+2. 使用 AskUserQuestion 询问用户确认蓝图
+
+【关键要求！】
+1. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
+   - 必须包含 `## 📋 Skill 架构蓝图` 标记
+   - 必须明确列出 Skill 名称
+   - 必须包含 I/O 契约、目录结构、工作流逻辑
+2. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
+3. **AskUserQuestion 选项中必须包含"对，开始做吧"**
+4. **不要输出 phase3_start 标记**，必须等用户确认后再说
+
+现在，让我们开始执行 Phase 2 吧！
+
+========================================================
+
+"""
+        combined_content = phase2_instruction + combined_content
     
     return (
         "你处于 Skill Creator 模式。\n\n"
@@ -768,24 +793,38 @@ def load_kernel_creator_for_phase(phase: str) -> str:
     """Load kernel Skill with appropriate blocks for current phase.
 
     Progressive disclosure strategy:
-    - first_time / phase1: blocks [0, 1] (intro + Phase1)
-    - phase2: blocks [0, 2] (intro + Phase2)
+    - first_time / phase1: blocks [0, 1, 2] (intro + Phase1)
+    - phase2: blocks [0, 1, 2, 3] (intro + Phase1 + Phase2)
     - phase3+: load FULL SKILL.md (need full implementation instructions)
+    
+    Block mapping from SKILL.md split:
+    - Block 0: frontmatter
+    - Block 1: intro + SOP overview
+    - Block 2: Phase 1 (需求挖掘)
+    - Block 3: Phase 2 (蓝图设计)
+    - Block 4-...: Phase 3-5 + core principles
     """
     skill = load_kernel_package(include_body=False)
 
     if phase == "first_time" or phase == "phase1":
         # First time or Phase1: only need intro + Phase1
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 1], phase)
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 1, 2], phase)
     elif phase == "phase2":
-        # Phase2: intro + Phase2
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 2], phase)
-    elif phase in ["phase3+", "phase3", "phase4", "phase5"]:
+        # Phase2: intro + Phase1 + Phase2
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 3], phase)
+    elif phase in ["phase3+", "phase3"]:
         # Phase3 and beyond: NEED FULL SKILL.md for implementation instructions!
-        return compose_kernel_creator_body_prompt(skill)
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 4], phase)
+    elif phase in ["phase4"]:
+        # Phase4 and beyond: NEED FULL SKILL.md for implementation instructions!
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 5], phase)
+    elif phase in ["phase5"]:
+        # Phase5 and beyond: NEED FULL SKILL.md for implementation instructions!
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 6], phase)
+
     else:
         # Unknown phase: default to intro + Phase1
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 1], phase)
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 1, 2], phase)
 
 
 def load_kernel_package(*, include_body: bool = False) -> SkillPackage:

@@ -128,6 +128,34 @@ class SkillActionResponse(BaseModel):
     message: str
 
 
+class ListFilesRequest(BaseModel):
+    skill_name: str
+
+
+class FileInfo(BaseModel):
+    path: str
+    is_directory: bool
+    size: int = 0
+
+
+class ListFilesResponse(BaseModel):
+    success: bool
+    files: list[FileInfo]
+    message: str
+
+
+class InitFromBlueprintRequest(BaseModel):
+    skill_name: str
+    files: list[FileSpecOut]
+
+
+class InitFromBlueprintResponse(BaseModel):
+    success: bool
+    path: Optional[str] = None
+    files_created: int = 0
+    message: str
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -406,4 +434,97 @@ async def package_skill(request: SkillActionRequest):
         success=result["success"],
         path=result.get("path"),
         message=result["message"],
+    )
+
+
+@router.post("/init-from-blueprint", response_model=InitFromBlueprintResponse)
+async def init_from_blueprint(request: InitFromBlueprintRequest):
+    """Initialize Skill directory structure from blueprint file list.
+    
+    Creates empty files based on the blueprint analysis result.
+    This ensures the file structure matches exactly what the user confirmed.
+    
+    Workflow:
+    1. Create main skill directory
+    2. Create required subdirectories (scripts/, references/, assets/)
+    3. Create empty files based on the blueprint file list
+    """
+    skill_name = _validate_skill_name(request.skill_name)
+    skill_root = settings.skill_public_dir / skill_name
+    
+    try:
+        # Create main skill directory
+        skill_root.mkdir(parents=True, exist_ok=True)
+        
+        files_created = 0
+        
+        for file_spec in request.files:
+            file_path = skill_root / file_spec.path
+            
+            # Ensure parent directory exists
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Create empty file if it doesn't exist
+            if not file_path.exists():
+                file_path.touch()
+                files_created += 1
+        
+        return InitFromBlueprintResponse(
+            success=True,
+            path=str(skill_root),
+            files_created=files_created,
+            message=f"已创建 {files_created} 个文件",
+        )
+    
+    except Exception as exc:
+        logger.exception("init-from-blueprint error")
+        return InitFromBlueprintResponse(
+            success=False,
+            path=None,
+            files_created=0,
+            message=f"初始化失败：{exc}",
+        )
+
+
+@router.post("/list-files", response_model=ListFilesResponse)
+async def list_files(request: ListFilesRequest):
+    """List all files in a Skill directory.
+    
+    Returns the actual file structure on disk, useful for displaying
+    to the user after initializing the Skill directory structure.
+    """
+    skill_name = _validate_skill_name(request.skill_name)
+    
+    skill_root = settings.skill_public_dir / skill_name
+    if not skill_root.exists():
+        return ListFilesResponse(
+            success=False,
+            files=[],
+            message=f"Skill '{skill_name}' 不存在",
+        )
+    
+    files: list[FileInfo] = []
+    
+    def scan_dir(base: Path, rel_path: Path = Path("")):
+        for entry in sorted(base.iterdir()):
+            entry_rel = rel_path / entry.name
+            if entry.is_dir():
+                files.append(FileInfo(
+                    path=str(entry_rel),
+                    is_directory=True,
+                ))
+                scan_dir(entry, entry_rel)
+            else:
+                files.append(FileInfo(
+                    path=str(entry_rel),
+                    is_directory=False,
+                    size=entry.stat().st_size,
+                ))
+    
+    scan_dir(skill_root)
+    
+    return ListFilesResponse(
+        success=True,
+        files=files,
+        message=f"已列出 {len(files)} 个文件",
     )

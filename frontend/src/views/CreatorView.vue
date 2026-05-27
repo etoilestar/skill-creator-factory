@@ -144,7 +144,7 @@ const CONFIRM_KEYWORDS = [
   '可以开始',
   '没问题，开始',
 ]
-const BLUEPRINT_MARKER = '📋 Skill 蓝图'
+const BLUEPRINT_MARKER = '📋 Skill 架构蓝图'
 
 function isCreationConfirmation(text) {
   return CONFIRM_KEYWORDS.some(kw => text.includes(kw))

@@ -659,21 +659,22 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
         "2. resource_catalog 是宿主提供的真实资源树。\n"
-        "3. available_scripts 是宿主从磁盘实时扫描到的真实脚本文件列表（权威来源）。"
-        "available_scripts 中出现的脚本无需查 resource_catalog 即可直接规划 run_command。\n"
-        "4. 你不能假设某个脚本存在；只能根据 available_scripts 或 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
-        "5. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
-        "6. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "3. available_scripts 是宿主从磁盘实时扫描到的真实脚本文件列表（权威来源），其中出现的脚本无需查 resource_catalog 即可直接规划 run_command。\n"
+        "4. 当生成 init_skill.py 命令时，必须使用提供的 skill_name 参数，并使用 skills 作为 --path 参数的值。命令格式：python ../kernel/scripts/init_skill.py <skill_name> --path skills\n"
+        "5. 绝对不能使用 'skill-creator' 作为技能名称（这是 kernel 的名称）。\n"
+        "6. 你不能假设某个脚本存在；只能根据 available_scripts 或 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
+        "7. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
+        "8. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
         "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
         "通常应使用 mode=direct_answer，不要规划 run_command。\n"
-        "7. 如果 available_scripts 和 resource_catalog 均没有 scripts 资源，默认不得规划 run_command。\n"
-        "8. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 available_scripts、"
+        "9. 如果 available_scripts 和 resource_catalog 均没有 scripts 资源，默认不得规划 run_command。\n"
+        "10. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 available_scripts、"
         "resource_catalog 或系统可执行环境中，才允许规划 run_command。\n"
-        "9. read_resource 只能使用 resource_handle，禁止输出 path。\n"
-        "10. resource_handle 必须来自 resource_catalog。\n"
-        "11. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
-        "12. 不要假装读取、假装执行、假装写入。\n"
-        "13. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "11. read_resource 只能使用 resource_handle，禁止输出 path。\n"
+        "12. resource_handle 必须来自 resource_catalog。\n"
+        "13. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
+        "14. 不要假装读取、假装执行、假装写入。\n"
+        "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
         "允许的 action：\n"
         "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
         "- run_command：执行一个真实可执行的命令。命令不得是函数名或伪代码。\n"
@@ -873,6 +874,7 @@ async def _run_skill_runtime_planner_round(
     request: ChatRequest,
     model: str,
     execution_root: Path | None = None,
+    skill_name: str = "",
 ) -> dict:
     """Generate an action plan from Loaded SKILL.md and structured host resources.
 
@@ -906,6 +908,7 @@ async def _run_skill_runtime_planner_round(
         "user_messages": _request_messages_with_files(request),
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
+        "skill_name": skill_name,
         "runtime_contract": {
             "skill_md_is_markdown": True,
             "skill_md_code_blocks_have_no_action_tag": True,
@@ -920,7 +923,12 @@ async def _run_skill_runtime_planner_round(
 
     messages = [
         {"role": "system", "content": _compose_skill_runtime_planner_prompt()},
-        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+        {"role": "user", "content": f"## Skill 执行规范\n{planner_body_prompt}"},
+        {"role": "user", "content": f"## 可用脚本\n{json.dumps(available_scripts, ensure_ascii=False)}"},
+        {"role": "user", "content": f"## 用户请求\n{_last_user_text(request)}"},
+        {"role": "user", "content": f"## 执行根目录\n{str(execution_root) if execution_root else ''}"},
+        {"role": "user", "content": f"## 技能名称\n{skill_name}"},
+        {"role": "user", "content": "请根据以上信息，输出 JSON 格式的执行计划。只输出 JSON，不要任何其他内容。"},
     ]
 
     planner_model = _planner_model_name(model)
@@ -1389,6 +1397,13 @@ def _prepare_command_argv(
                 candidate = Path(script_arg)
                 if not candidate.is_absolute():
                     candidate = (base_dir / candidate).resolve()
+                else:
+                    # 处理硬编码的 /app/scripts/ 路径，重写为基于 base_dir 的路径
+                    for prefix in ("/app/scripts/", "/app/references/", "/app/assets/"):
+                        if str(candidate).startswith(prefix):
+                            rel_path = str(candidate)[len("/app/"):]
+                            candidate = (base_dir / rel_path).resolve()
+                            break
                 # Guard: script must reside within the skill directory
                 try:
                     candidate.relative_to(base_dir.resolve())
@@ -1586,6 +1601,7 @@ def _execute_single_task(
         )
 
         _run_cmd_extra_env: dict[str, str] = {
+            "EXECUTION_ROOT": str(execution_root) if execution_root else "",
             "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
             "INPUT_DIR": str(cwd / "inputs") if cwd else "",
         }

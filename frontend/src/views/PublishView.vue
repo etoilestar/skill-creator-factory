@@ -186,8 +186,23 @@ function showCopySuccess(id) {
   }, 2000)
 }
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  // Fallback for non-HTTPS environments
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand('copy')
+  document.body.removeChild(textarea)
+}
+
 function copyUrl(config) {
-  navigator.clipboard.writeText(`${baseUrl.value}/published/v1`)
+  copyToClipboard(`${baseUrl.value}/published/v1`)
   showCopySuccess('url-' + config.endpoint_id)
 }
 

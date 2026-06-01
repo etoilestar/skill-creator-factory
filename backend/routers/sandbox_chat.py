@@ -961,6 +961,26 @@ async def _generate_final_answer_from_observation(
 
     return await complete_chat_once(messages, model)
 
+_RUN_COMMAND_CUE_RE = re.compile(
+    r"(?im)(^|\n)\s*(?:"
+    r"执行命令|运行命令|执行脚本|运行脚本|后台执行|宿主执行|"
+    r"run command|execute command|command to execute|execute script"
+    r")\s*[：:]\s*$"
+)
+
+
+def _block_has_explicit_run_command_cue(block: MarkdownBlock) -> bool:
+    """Return True only when text near a block explicitly asks the host to run it.
+
+    A fenced `bash`/`sh` block by itself can be an example for the user.  The
+    sandbox may turn it into `run_command` only when the assistant also emits a
+    nearby execution cue such as `执行命令：`.
+    """
+    nearby_lines = block.before_context.splitlines()[-4:]
+    nearby_context = "\n".join(nearby_lines)
+    return bool(_RUN_COMMAND_CUE_RE.search(nearby_context))
+
+
 def _compose_block_planner_prompt() -> str:
     return (
         "你是 Agent 运行时的动作规划器。\n\n"
@@ -984,7 +1004,8 @@ def _compose_block_planner_prompt() -> str:
         "9. 如果一个代码块中创建多个目录，必须拆成多个 create_directory 任务，每个任务一个 path。\n"
         "10. 对于修改宿主状态但宿主没有原生动作支持的操作，应优先 ignore，不要强行归类为 run_command。\n"
         "11. run_command 只用于确实需要运行外部程序、脚本或工具的命令，不要把目录创建、文件写入这类可由宿主原生动作完成的操作归类为 run_command。\n"
-        "12. 如果代码块只是示例、说明、模板、教程、展示内容，则 action=display 或 ignore。\n"
+        "11a. run_command 还必须满足：该代码块紧邻前文存在显式执行提示，例如“执行命令：”“运行命令：”“执行脚本：”或“run command:”。只有 ```bash 语言标记不等于允许执行。\n"
+        "12. 如果代码块只是示例、说明、模板、教程、展示内容，或缺少显式执行提示，则 action=display 或 ignore。\n"
         "13. 如果路径、执行意图、命令来源不明确，不要猜测，把问题写入 errors。\n"
         "14. 不允许根据用户希望、SKILL.md 用法、资源清单或常识补全缺失路径。\n"
         "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
@@ -1019,7 +1040,13 @@ async def _run_block_planner_round(
             "block_source": "assistant_text_only",
             "path_source": "assistant_text_near_block_context",
             "content_source": "selected_block_code",
-            "command_source": "assistant_text_executable_block_or_near_block_context",
+            "command_source": "assistant_text_block_with_explicit_run_command_cue",
+            "run_command_requires_nearby_cue": [
+                "执行命令：",
+                "运行命令：",
+                "执行脚本：",
+                "run command:",
+            ],
             "directory_creation": {
                 "preferred_action": "create_directory",
                 "rule": "目录创建应使用 create_directory，不应使用 run_command。",
@@ -1089,6 +1116,13 @@ async def _run_block_planner_round(
 
         if action == "run_command":
             block = blocks[block_index]
+            if not _block_has_explicit_run_command_cue(block):
+                errors.append({
+                    "error": "run_command 缺少代码块紧邻前文中的显式执行提示",
+                    "task": task,
+                    "block_index": block_index,
+                })
+                continue
             command = str(task.get("command") or block.code or "").strip()
             if not command:
                 errors.append({"error": "run_command 缺少 command", "task": task})

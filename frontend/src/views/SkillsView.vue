@@ -218,7 +218,7 @@
 
     <div v-if="allowlistEditor" class="overlay" @click.self="closeAllowlist">
       <div class="dialog dialog-editor">
-        <div class="dialog-title">Allowlist / 治理配置</div>
+        <div class="dialog-title">白名单 / 治理配置</div>
         <textarea v-model="allowlistText" class="skill-editor asset-edit-textarea" spellcheck="false" />
         <div v-if="allowlistError" class="error px16">{{ allowlistError }}</div>
         <div class="dialog-actions">

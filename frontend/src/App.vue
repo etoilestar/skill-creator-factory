@@ -3,16 +3,16 @@
     <nav class="sidebar">
       <div class="brand">
         <span class="brand-icon">⚡</span>
-        <span class="brand-name">Skill Factory</span>
+        <span class="brand-name">技能工厂</span>
       </div>
       <RouterLink to="/creator" class="nav-item">
-        <span>🛠</span> Creator
+        <span>🛠</span> 技能创建
       </RouterLink>
       <RouterLink to="/skills" class="nav-item">
-        <span>📚</span> Skills
+        <span>📚</span> 技能库
       </RouterLink>
       <RouterLink to="/sandbox" class="nav-item">
-        <span>🧪</span> Sandbox
+        <span>🧪</span> 沙盒测试
       </RouterLink>
       <div class="sidebar-footer">
         <div class="llm-status" :class="llmStatus">
@@ -32,21 +32,21 @@ import { ref, onMounted } from 'vue'
 import { fetchLlmHealth } from './composables/useSkills.js'
 
 const llmStatus = ref('unknown')
-const llmLabel = ref('Checking LLM…')
+const llmLabel = ref('正在检查 LLM…')
 
 onMounted(async () => {
   try {
     const data = await fetchLlmHealth()
     if (data.connected) {
       llmStatus.value = 'ok'
-      llmLabel.value = `LLM connected`
+      llmLabel.value = `LLM 已连接`
     } else {
       llmStatus.value = 'err'
-      llmLabel.value = 'LLM offline'
+      llmLabel.value = 'LLM 离线'
     }
   } catch {
     llmStatus.value = 'err'
-    llmLabel.value = 'LLM offline'
+    llmLabel.value = 'LLM 离线'
   }
 })
 </script>

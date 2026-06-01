@@ -502,6 +502,10 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "- 运行命令：代码块前一行写 `执行命令：`，code block 中写完整命令\n"
             "- 路径必须包含完整 Skill 根目录，例如 `skills/<skill-name>/SKILL.md`\n"
             "- 一个 code block 只对应一个文件或一条命令\n\n"
+            "生成的 Skill.md 运行时约束：\n"
+            "- 如果 Skill 需要运行 scripts/ 下的脚本，SKILL.md 必须要求 assistant 在 Sandbox 当轮回复中输出 `执行命令：` + ```bash fenced block。\n"
+            "- 只写 `scripts/foo.py` 行内路径或‘立即调用脚本’不会触发宿主执行；必须写明显式 block 触发规则。\n"
+            "- SKILL.md 必须要求 assistant 等待宿主 observation 后再生成最终回答，不得假装执行。\n\n"
             "Phase 3+ 行为约束：\n"
             "- 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3\n"
             "- 进入 Phase 3 后，才可以按 SKILL.md 规定输出\"写入文件/执行命令\"的动作格式\n"
@@ -756,6 +760,7 @@ Phase 2 的任务是：
    - 必须包含 `## 📋 Skill 架构蓝图` 标记
    - 必须明确列出 Skill 名称
    - 必须包含 I/O 契约、目录结构、工作流逻辑
+   - 必须包含“宿主执行方式”，明确哪些任务直接回答，哪些任务需要输出显式 fenced block
 3. 完整蓝图之后，再输出一个 AskUserQuestion 确认问题。
 4. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
 5. **AskUserQuestion 选项必须使用以下三项原文**：

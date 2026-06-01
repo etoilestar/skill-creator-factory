@@ -500,3 +500,32 @@ def test_normalize_plan_rejects_direct_run_command_trigger():
     assert result["mode"] == "ask_user"
     assert result["tasks"] == []
     assert any("显式 fenced code block" in str(error) for error in result["errors"])
+
+
+def test_creator_generate_skill_md_prompt_requires_block_contract():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="demo-skill",
+        purpose="创建主 Skill 文档",
+        blueprint_text="## 📋 Skill 架构蓝图\n### 宿主执行方式\n- 需要脚本/命令",
+        conversation_history=[],
+    )
+    prompt = messages[0]["content"]
+
+    assert "宿主 Block 执行契约" in prompt
+    assert "只有 assistant 当轮回复中出现的 fenced code block" in prompt
+    assert "禁止只写‘立即调用 `scripts/...`’" in prompt
+
+
+def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
+    from backend.services.kernel_loader import load_kernel_creator_for_phase
+
+    phase2_prompt = load_kernel_creator_for_phase("phase2")
+    phase3_prompt = load_kernel_creator_for_phase("phase3+")
+
+    assert "宿主执行方式" in phase2_prompt
+    assert "显式 fenced block" in phase2_prompt
+    assert "生成的 Skill.md 运行时约束" in phase3_prompt
+    assert "不会触发宿主执行" in phase3_prompt

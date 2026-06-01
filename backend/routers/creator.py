@@ -29,6 +29,22 @@ from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
 
+_SKILL_MD_BLOCK_RUNTIME_CONTRACT = """
+
+宿主 Block 执行契约（必须写入生成的 SKILL.md 正文）：
+- SKILL.md 只描述做什么、何时使用资源，以及 assistant 应该如何表达动作；不要把资源存在本身写成执行触发器。
+- 如果本 Skill 需要运行 scripts/ 下的脚本，必须指示 assistant 在 Sandbox 当轮回复中输出显式可执行 fenced code block，格式为：
+  执行命令：
+  ```bash
+  python scripts/<script-name> <真实参数>
+  ```
+- 只有 assistant 当轮回复中出现的 fenced code block 才会被宿主解析和执行；`scripts/foo.py` 这样的行内路径引用或“立即调用脚本”的自然语言不会触发执行。
+- 如果需要写文件，必须指示 assistant 输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放入紧随其后的 fenced code block。
+- assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
+- 对纯文本即可完成的任务，不要要求运行脚本，直接按 SKILL.md 生成最终文本。
+- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”；应写成“输出以下显式命令块交由宿主执行”。
+"""
+
 router = APIRouter(prefix="/api/creator", tags=["creator"])
 
 # ---------------------------------------------------------------------------
@@ -245,8 +261,12 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. 执行说明应指导宿主 AI 如何理解用户请求、调用脚本/工具、生成回答。\n"
-            "5. 不要在输出内容的外侧套 ``` 代码块。\n\n"
+            "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须包含下面的宿主 Block 执行契约；\n"
+            "   即使蓝图没有脚本，也应说明纯文本任务可直接回答，不要假装执行。\n"
+            "6. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部允许包含示例 fenced code block。\n"
+            "7. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            f"{_SKILL_MD_BLOCK_RUNTIME_CONTRACT}\n"
             f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
         )
     elif file_path.startswith("scripts/"):

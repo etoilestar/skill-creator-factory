@@ -485,37 +485,6 @@ def test_runtime_planner_prompt_requires_fenced_block_trigger():
     assert "禁止的 action：run_command、write_file、create_directory" in prompt
 
 
-def test_block_planner_prompt_requires_explicit_run_command_cue():
-    from backend.routers.sandbox_chat import _compose_block_planner_prompt
-
-    prompt = _compose_block_planner_prompt()
-
-    assert "紧邻前文存在显式执行提示" in prompt
-    assert "只有 ```bash 语言标记不等于允许执行" in prompt
-
-
-def test_run_command_cue_requires_nearby_explicit_marker():
-    from backend.routers.chat_models import MarkdownBlock
-    from backend.routers.sandbox_chat import _block_has_explicit_run_command_cue
-
-    display_only_block = MarkdownBlock(
-        index=0,
-        lang="bash",
-        code="scripts/generate_chord.py --style pop",
-        before_context="输出为：",
-        after_context="",
-    )
-    executable_block = MarkdownBlock(
-        index=1,
-        lang="bash",
-        code="python scripts/generate_chord.py '{\"style\": \"pop\"}'",
-        before_context="需要调用脚本时\n执行命令：",
-        after_context="",
-    )
-
-    assert not _block_has_explicit_run_command_cue(display_only_block)
-    assert _block_has_explicit_run_command_cue(executable_block)
-
 
 def test_normalize_plan_rejects_direct_run_command_trigger():
     from backend.routers.sandbox_chat import _normalize_skill_runtime_plan

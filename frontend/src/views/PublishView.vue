@@ -134,7 +134,14 @@ const newName = ref('')
 const newSkills = ref([])
 const copyFeedback = ref('')
 
-const baseUrl = computed(() => window.location.origin)
+const baseUrl = computed(() => {
+  const origin = window.location.origin
+  // In dev mode (Vite default port 5173), point curl examples to backend port 8000
+  if (origin.includes(':5173')) {
+    return origin.replace(':5173', ':8000')
+  }
+  return origin
+})
 
 onMounted(async () => {
   await Promise.all([fetchConfigs(), fetchAvailableSkills()])

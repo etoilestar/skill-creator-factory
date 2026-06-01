@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     bundled_skills_path: Path = PROJECT_ROOT / "bundled-skills"
     governance_path: Path = PROJECT_ROOT / ".skill-governance"
 
+    # Publish module settings
+    publish_config_path: Path = PROJECT_ROOT / ".skill-governance" / "publish"
+    publish_rate_limit: int = 60  # Max requests per minute per endpoint
+    publish_default_model: Optional[str] = None  # Falls back to default_model
+
     # Resource reading limit per file (characters) used by read_skill_resource_text.
     skill_resource_max_chars: int = 20000
 

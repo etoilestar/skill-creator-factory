@@ -23,6 +23,11 @@ from ..services.kernel_loader import (
     read_skill_resource_text,
 )
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.model_router import (
+    TEXT_TASK,
+    infer_sandbox_response_task,
+    route_model,
+)
 from ..services.skill_manager import get_execution_skill_dir
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
@@ -1925,7 +1930,8 @@ async def _plan_and_execute_generated_output(
 
 def _make_stream(skill_context: dict, request: ChatRequest):
     """Staged Skill execution with shared runtime planning and action execution."""
-    model = request.model or settings.default_model
+    requested_model = request.model or settings.default_model
+    model = route_model(TEXT_TASK, requested_model=requested_model, reason="sandbox default response").model
     _MAX_CMD_DISPLAY_LENGTH = 60
     force_body = bool(skill_context.get("force_body", False))
     enable_action_execution = bool(skill_context.get("enable_action_execution", False))
@@ -2177,6 +2183,18 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         execution_root=execution_root,
                     )
 
+                    response_route = route_model(
+                        infer_sandbox_response_task(
+                            body_prompt=body_prompt,
+                            user_text=_last_user_text(request),
+                            plan=runtime_plan,
+                        ),
+                        requested_model=requested_model,
+                        reason="sandbox runtime plan classification",
+                    )
+                    response_model = response_route.model
+                    yield _sse({"model_ack": response_route.ack()})
+
                     mode = runtime_plan.get("mode")
                     tasks = runtime_plan.get("tasks") or []
 
@@ -2340,7 +2358,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         final_answer = await _generate_final_answer_from_observation(
                             body_prompt=body_prompt,
                             request=request,
-                            model=model,
+                            model=response_model,
                             plan=runtime_plan,
                             execution_result=exec_result,
                         )
@@ -2410,6 +2428,18 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield "data: [DONE]\n\n"
                     return
 
+            response_route = route_model(
+                infer_sandbox_response_task(
+                    body_prompt=body_prompt,
+                    user_text=_last_user_text(request),
+                    plan=locals().get("runtime_plan") if isinstance(locals().get("runtime_plan"), dict) else None,
+                ),
+                requested_model=requested_model,
+                reason="sandbox final response classification",
+            )
+            response_model = response_route.model
+            yield _sse({"model_ack": response_route.ack()})
+
             final_messages: list[dict] = []
             final_messages.append(
                 {
@@ -2445,7 +2475,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
-            async for chunk in stream_chat(final_messages, model):
+            ack_payload = {}
+
+            def _capture_final_ack(payload: dict) -> None:
+                ack_payload.update(payload)
+
+            async for chunk in stream_chat(final_messages, response_model, model_ack_callback=_capture_final_ack):
+                if ack_payload:
+                    yield _sse({"model_ack": {**response_route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
+                    ack_payload.clear()
                 assistant_chunks.append(chunk)
                 yield _sse({"content": chunk})
 

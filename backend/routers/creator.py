@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.llm_proxy import stream_chat
+from ..services.model_router import route_creator_file_model
 from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
@@ -350,7 +351,12 @@ async def generate_file(request: GenerateFileRequest):
     """
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
-    model = request.model or settings.default_model
+    route = route_creator_file_model(
+        file_path=request.file_path,
+        purpose=request.purpose,
+        requested_model=request.model,
+    )
+    model = route.model
 
     prompt_messages = _build_generate_file_prompt(
         file_path=request.file_path,
@@ -362,7 +368,16 @@ async def generate_file(request: GenerateFileRequest):
 
     async def event_stream():
         try:
-            async for chunk in stream_chat(prompt_messages, model):
+            yield _sse({"model_ack": route.ack()})
+            ack_payload = {}
+
+            def _capture_ack(payload: dict) -> None:
+                ack_payload.update(payload)
+
+            async for chunk in stream_chat(prompt_messages, model, model_ack_callback=_capture_ack):
+                if ack_payload:
+                    yield _sse({"model_ack": {**route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
+                    ack_payload.clear()
                 yield _sse({"content": chunk})
             yield _sse({"done": True})
         except Exception as exc:

@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from ..config import settings
 from ..services.kernel_loader import load_kernel_creator_body_prompt, load_kernel_creator_metadata_prompt, load_kernel_creator_for_phase, read_skill_resource_text
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.model_router import CODE_TASK, TEXT_TASK, route_model
 from .chat_models import ChatRequest
 from .chat_utils import (
     _last_user_text,
@@ -321,6 +322,7 @@ async def _execute_conversation_mode(
     assistant_chunks: list[str] = []
     
     try:
+        yield _sse({"model_ack": {"task": "text", "model": model, "reason": f"creator {current_phase} conversation"}})
         async for chunk in stream_chat(final_messages, model):
             assistant_chunks.append(chunk)
             yield _sse({"content": chunk})
@@ -356,6 +358,7 @@ async def _execute_phase3_mode(
     # 1. 收集模型完整输出（不流式展示给用户）
     assistant_chunks: list[str] = []
     try:
+        yield _sse({"model_ack": {"task": "code", "model": model, "reason": "creator phase3 implementation"}})
         async for chunk in stream_chat(final_messages, model):
             assistant_chunks.append(chunk)
     except Exception as e:
@@ -415,9 +418,74 @@ async def _execute_phase3_mode(
 
     yield "data: [DONE]\n\n"
 
+def _extract_creator_resource_catalog(body_prompt: str) -> list[dict]:
+    """Extract creator references/assets/scripts from a loaded prompt."""
+    catalog: list[dict] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?", re.M)
+
+    for match in pattern.finditer(body_prompt):
+        path = match.group("path").strip()
+        if path in seen:
+            continue
+        seen.add(path)
+        kind = path.split("/", 1)[0]
+        catalog.append({
+            "resource_handle": f"resource:{len(catalog)}",
+            "kind": kind,
+            "path": path,
+            "title": (match.group("title") or "").lstrip("：").strip(),
+            "allowed_actions": ["read_resource"],
+        })
+
+    return catalog
+
+
+def _parse_creator_resource_selection_decision(text: str, *, resource_catalog: list[dict]) -> dict:
+    """Parse creator resource selection from JSON or plain-text handles."""
+    valid_handles = {str(item.get("resource_handle")) for item in resource_catalog}
+    stripped = _strip_markdown_json_fence(text)
+    need_resources = False
+    raw_handles: list[str] = []
+    reason = ""
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        raw_handles = re.findall(r"resource:\d+", text)
+        need_resources = bool(raw_handles)
+        reason = "从普通文本中识别 resource handle" if raw_handles else "JSON 解析失败"
+    else:
+        if not isinstance(data, dict):
+            return {"need_resources": False, "resource_handles": [], "reason": "输出不是 JSON object"}
+        raw = data.get("resource_handles", [])
+        raw_handles = raw if isinstance(raw, list) else []
+        flag = data.get("need_resources", bool(raw_handles))
+        need_resources = flag.strip().lower() in {"true", "1", "yes", "y"} if isinstance(flag, str) else bool(flag)
+        reason = str(data.get("reason") or "").strip()
+
+    selected: list[str] = []
+    for item in raw_handles:
+        handle = str(item or "").strip()
+        if handle in valid_handles and handle not in selected:
+            selected.append(handle)
+        if len(selected) >= 5:
+            break
+
+    return {
+        "need_resources": bool(need_resources and selected),
+        "resource_handles": selected if need_resources else [],
+        "reason": reason,
+    }
+
+
 def _build_creator_resource_catalog():
-    """Build a catalog of available resources in current skill (if any)."""
-    return []
+    """Build a catalog of available resources in the kernel prompt."""
+    try:
+        return _extract_creator_resource_catalog(load_kernel_creator_body_prompt())
+    except Exception:
+        logger.exception("failed to build creator resource catalog")
+        return []
 
 
 async def _run_creator_resource_selection_round(
@@ -427,11 +495,26 @@ async def _run_creator_resource_selection_round(
     resource_catalog: list,
     current_phase_hint: str = "unknown"
 ):
-    """
-    Run a round of resource selection.
-    Returns structured resource decision, or None to continue conversation.
-    """
-    return {"is_structured": False}
+    """Run a planner round to choose creator resources when useful."""
+    if not resource_catalog:
+        return {"is_structured": True, "need_resources": False, "resource_handles": [], "reason": "无可用资源"}
+
+    messages = [
+        {"role": "system", "content": "只从给定 resource_catalog 选择最多 5 个 resource_handle。只输出 JSON。"},
+        {
+            "role": "user",
+            "content": json.dumps({
+                "current_phase_hint": current_phase_hint,
+                "loaded_skill_prompt": body_prompt,
+                "resource_catalog": resource_catalog,
+                "user_messages": _request_messages_with_files(request),
+            }, ensure_ascii=False),
+        },
+    ]
+    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    decision = _parse_creator_resource_selection_decision(decision_text, resource_catalog=resource_catalog)
+    decision["is_structured"] = True
+    return decision
 
 
 def _compose_creator_loaded_resources_prompt(
@@ -753,9 +836,14 @@ async def _make_stream_creator_generator(
         return False
 
     if current_phase in ["phase3+", "phase3", "phase4", "phase5"]: # or _conversation_has_phase3(request.messages):
+        phase3_route = route_model(
+            CODE_TASK,
+            requested_model=getattr(request, "model", None) or settings.default_model,
+            reason="creator phase3 implementation",
+        )
         async for sse in _execute_phase3_mode(
             final_messages=final_messages,
-            model=model,
+            model=phase3_route.model,
             request=request,
             execution_root=execution_root,
             parent_skill_name=parent_skill_name,
@@ -788,7 +876,8 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
     This avoids the overhead and potential mis-planning of running the runtime
     planner on conversational Phase 1-2 turns that are purely asking questions.
     """
-    model = request.model or settings.default_model
+    requested_model = request.model or settings.default_model
+    model = route_model(TEXT_TASK, requested_model=requested_model, reason="creator conversation").model
     _MAX_CMD_DISPLAY_LENGTH = 60
     execution_root = skill_context.get("execution_root")
     parent_skill_name = skill_context.get("skill_name", "")

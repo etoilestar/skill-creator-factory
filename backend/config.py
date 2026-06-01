@@ -31,6 +31,26 @@ class Settings(BaseSettings):
     # Falls back to default_model when unset.
     validator_model: Optional[str] = None
 
+    # Optional capability-specific models. These allow the runtime to keep
+    # action classification in code while SKILL.md only describes what to do.
+    text_model: Optional[str] = None
+    code_model: Optional[str] = None
+    image_model: Optional[str] = None
+
+    # Optional JSON routing overrides, e.g.
+    # {"tasks": {"code": "qwen-coder", "image": "sdxl"},
+    #  "creator_paths": {"scripts/*": "code", "assets/*.png": "image"}}
+    model_routing_json: Optional[str] = None
+
+    # Configurable heuristics used only for capability classification.
+    code_file_extensions: str = ".py,.js,.mjs,.cjs,.ts,.tsx,.jsx,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.cs,.php,.swift,.kt,.sql"
+    image_task_keywords: str = "image,images,picture,pictures,photo,photos,logo,icon,illustration,draw,绘图,图片,图像,照片,海报,插画,图标,logo"
+
+    # When true, raise if the provider echoes a different response model.
+    # Defaults to non-strict because many local OpenAI-compatible backends
+    # canonicalize model IDs in streamed chunks.
+    model_ack_strict: bool = False
+
     # LLM generation parameters — omitted from request payload when unset so the
     # backend can apply its own defaults.
     temperature: Optional[float] = None

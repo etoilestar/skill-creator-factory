@@ -64,7 +64,7 @@
           <!-- API 端点 -->
           <div class="section-label">🔗 API 端点</div>
           <div class="endpoint-info">
-            <code class="code-block">POST {{ baseUrl }}/published/v1/chat/completions</code>
+            <code class="code-block">{{ baseUrl }}/published/v1</code>
             <button class="btn-ghost btn-sm" @click="copyUrl(config)">
               {{ copyFeedback === 'url-' + config.endpoint_id ? '✓ 已复制' : '📋 复制' }}
             </button>
@@ -180,7 +180,7 @@ function showCopySuccess(id) {
 }
 
 function copyUrl(config) {
-  navigator.clipboard.writeText(`${baseUrl.value}/published/v1/chat/completions`)
+  navigator.clipboard.writeText(`${baseUrl.value}/published/v1`)
   showCopySuccess('url-' + config.endpoint_id)
 }
 

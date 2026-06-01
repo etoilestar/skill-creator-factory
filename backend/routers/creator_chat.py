@@ -2,55 +2,26 @@
 
 import asyncio
 import functools
-import json
 import logging
 import re
-from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..config import settings
-from ..services.kernel_loader import load_kernel_creator_body_prompt, load_kernel_creator_metadata_prompt, load_kernel_creator_for_phase, read_skill_resource_text
-from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.kernel_loader import load_kernel_creator_for_phase
+from ..services.llm_proxy import stream_chat
 from .chat_models import ChatRequest
 from .chat_utils import (
-    _last_user_text,
-    _allowed_skill_roots,
-    _extract_input_session_dir,
-    _find_created_skill_roots,
-    _friendly_error,
-    _is_within_sandbox,
-    _planner_model_name,
+    _blueprint_ready,
     _request_messages_with_files,
     _sse,
     _quick_actions,
-    _strip_markdown_json_fence,
     _thought,
-    _validate_skill_md,
-)
-from .sandbox_chat import (
-    _execute_single_task,
-    _format_execution_report,
-    _infer_skill_root_from_tasks,
-    _plan_and_execute_generated_output,
-    _run_skill_runtime_planner_round,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_skill_name_from_messages(messages: list) -> str:
-    """从对话历史中提取技能名称（从蓝图消息中）"""
-    for msg in reversed(messages):
-        # Message 是 Pydantic BaseModel，使用属性访问
-        content = getattr(msg, "content", "")
-        if "Skill 架构蓝图" in content or "Skill 名称" in content:
-            match = re.search(r"Skill\s*名称\s*[：:]\s*([a-z0-9-]+)", content)
-            if match:
-                return match.group(1)
-    return ""
 
 
 def _safe_async_generator(generator_func):
@@ -76,138 +47,16 @@ def _safe_async_generator(generator_func):
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-_CREATOR_PHASE3_MARKER = '{"creator_phase":"phase3_start"}'
+_BLUEPRINT_MARKER = "📋 Skill 架构蓝图"
 
 
 def _guess_current_phase(messages: list) -> str:
-    """
-    根据对话历史智能猜测当前所处的阶段。
-
-    关键逻辑：
-    - 如果 Skill 已创建完成 → 重置到 phase1
-    - 如果有 phase3 marker → phase3+
-    - 如果有用户确认（"对，开始做吧"等）+ 有蓝图 → phase3+
-    - 如果有蓝图但无确认 → phase2
-    - 如果 Phase 1 完成 → phase2
-    - 默认 → phase1
-    """
-
-    # 0. 检查是否有 Skill 创建完成的标记（在检测 phase3 marker 之前）
-    completion_keywords = [
-        "Skill 创建成功",
-        "技能创建成功",
-        "创建完成",
-        "创建成功"
-    ]
-    for msg in messages:
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-        if any(keyword in content for keyword in completion_keywords):
-            return "phase1"  # 技能已创建完成，后续对话重新开始
-
-    # 1. 检查是否有 phase3 marker
+    """Determine current creator phase from conversation history."""
     for msg in messages:
         role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
         content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-        if role == "assistant" and content and '{"creator_phase":"phase3_start"}' in content:
-            return "phase3+"
-
-    # 2. 检查是否有用户确认消息
-    user_confirm_keywords = [
-        "对，开始做吧",
-        "开始制作",
-        "开始干吧",
-        "确认",
-        "没问题",
-        "对，就这样"
-    ]
-    has_user_confirm = False
-
-    for msg in reversed(messages):
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-
-        if role == "user":
-            if any(keyword in content for keyword in user_confirm_keywords):
-                has_user_confirm = True
-                break
-
-    # 3. 检查是否有蓝图
-    has_blueprint = False
-    for msg in messages:
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-        if role == "assistant" and "📋 Skill 架构蓝图" in content:
-            has_blueprint = True
-            break
-
-    # 4. 如果有确认 + 有蓝图 → phase3+（但需要检查确认后是否有修改请求）
-    if has_user_confirm and has_blueprint:
-        # 检查确认之后是否有用户修改请求
-        modification_keywords = [
-            "修改",
-            "调整",
-            "变更",
-            "改一下",
-            "重新",
-            "换一个",
-            "不要",
-            "不对",
-            "重新来",
-            "我想改"
-        ]
-        
-        last_confirm_index = -1
-        for i, msg in enumerate(messages):
-            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            if role == "user":
-                if any(keyword in content for keyword in user_confirm_keywords):
-                    last_confirm_index = i
-        
-        if last_confirm_index != -1:
-            for msg in messages[last_confirm_index+1:]:
-                role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-                content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-                if role == "user":
-                    if any(keyword in content for keyword in modification_keywords):
-                        return "phase2"
-        
-        return "phase3+"
-
-    # 5. 如果只有蓝图 → phase2
-    if has_blueprint:
-        return "phase2"
-
-    # 6. 检查 Phase 1 是否完成
-    phase1_complete = False
-    phase1_final_step_keywords = [
-        "这是一个简单的单步操作",
-        "这涉及多个步骤",
-        "这需要一些参考资料",
-        "根据你的需求，我觉得这个 Skill",
-        "架构解耦评估"
-    ]
-
-    for msg in reversed(messages):
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-
-        if role == "assistant":
-            if any(keyword in content for keyword in phase1_final_step_keywords):
-                phase1_complete = True
-                break
-
-    # 7. 如果 Phase 1 完成，检查是否有 Phase 2 关键词
-    if phase1_complete:
-        for msg in reversed(messages):
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            if not content:
-                continue
-            phase2_keywords = ["蓝图", "架构", "I/O", "目录结构", "工作流", "确认"]
-            if any(keyword in content for keyword in phase2_keywords):
-                return "phase2"
-
-    # 8. 默认在 phase1
+        if role == "assistant" and _BLUEPRINT_MARKER in content:
+            return "phase2"
     return "phase1"
 
 
@@ -311,8 +160,6 @@ async def _execute_conversation_mode(
     model: str,
     current_phase: str,
     request: ChatRequest,
-    execution_root: Path,
-    parent_skill_name: str,
 ) -> AsyncGenerator[str, None]:
     """Phase 1-2 conversation mode: stream directly to user."""
     yield _sse({"status": None})
@@ -337,121 +184,18 @@ async def _execute_conversation_mode(
         _, actions = _ensure_single_question(assistant_text)
         if actions:
             yield _quick_actions(actions)
+    if _BLUEPRINT_MARKER in assistant_text:
+        yield _blueprint_ready()
     
     yield "data: [DONE]\n\n"
 
 
 @_safe_async_generator
-async def _execute_phase3_mode(
-        final_messages: list[dict],
-        model: str,
-        request: ChatRequest,
-        execution_root: Path,
-        parent_skill_name: str,
-) -> AsyncGenerator[str, None]:
-    """Phase 3+ execution mode: collect model output and execute."""
-
-    yield _sse({"type": "phase3_start", "message": "开始执行 Skill 创建流程..."})
-
-    # 1. 收集模型完整输出（不流式展示给用户）
-    assistant_chunks: list[str] = []
-    try:
-        async for chunk in stream_chat(final_messages, model):
-            assistant_chunks.append(chunk)
-    except Exception as e:
-        logger.exception("Error during Phase 3 streaming")
-        yield _sse({"error": f"模型输出错误: {str(e)}"})
-        yield "data: [DONE]\n\n"
-        return
-
-    if not assistant_chunks:
-        yield _sse({"error": "模型没有输出内容"})
-        yield "data: [DONE]\n\n"
-        return
-
-    assistant_text = "".join(assistant_chunks)
-
-    # 2. 调用执行函数
-    try:
-        exec_result = await _plan_and_execute_generated_output(
-            assistant_text=assistant_text,
-            request=request,
-            model=model,
-            require_confirmation=False,
-            execution_root=execution_root,
-            skill_name=parent_skill_name,
-        )
-
-        # 3. 返回结果
-        yield _sse({"type": "progress", "step": "执行完成", "step_num": 3, "total_steps": 3})
-
-        if exec_result.get("executed"):
-            output_files = exec_result.get("output_files", [])
-
-            # 查找 skill 名称和路径
-            skill_name = None
-            skill_path = None
-            for file_info in output_files:
-                file_path = file_info.get("path", "")
-                if "skills/" in file_path and "/SKILL.md" in file_path:
-                    parts = file_path.split("skills/", 1)[1].split("/", 1)
-                    if parts:
-                        skill_name = parts[0]
-                        skill_path = str(Path(file_path).parent)
-                    break
-
-            yield _sse({
-                "type": "completed",
-                "success": True,
-                "skill_name": skill_name,
-                "skill_path": skill_path,
-                "created_files": output_files,
-                "message": "Skill 创建成功！" if skill_name else "文件创建完成！"
-            })
-
-    except Exception as e:
-        logger.exception("Phase 3 execution failed")
-        yield _sse({"type": "error", "message": f"执行失败: {_friendly_error(e)}"})
-
-    yield "data: [DONE]\n\n"
-
-def _build_creator_resource_catalog():
-    """Build a catalog of available resources in current skill (if any)."""
-    return []
-
-
-async def _run_creator_resource_selection_round(
-    body_prompt: str,
-    request: ChatRequest,
-    model: str,
-    resource_catalog: list,
-    current_phase_hint: str = "unknown"
-):
-    """
-    Run a round of resource selection.
-    Returns structured resource decision, or None to continue conversation.
-    """
-    return {"is_structured": False}
-
-
-def _compose_creator_loaded_resources_prompt(
-    skill_name: str,
-    resource_catalog: list,
-    selected_handles: list
-):
-    """Compose loaded resources into a prompt for the LLM."""
-    return ""
-
-
-@_safe_async_generator
 async def _make_stream_creator_generator(
-    skill_context: dict, 
+    skill_context: dict,
     request: ChatRequest,
     model: str,
-    execution_root: Path | None,
     parent_skill_name: str,
-    enable_resource_preload: bool,
-    _MAX_CMD_DISPLAY_LENGTH: int
 ) -> AsyncGenerator[str, None]:
     """Core generator function that produces SSE stream."""
     
@@ -460,7 +204,6 @@ async def _make_stream_creator_generator(
     phase_description = {
         "phase1": "Phase 1（深度需求挖掘）",
         "phase2": "Phase 2（技能架构蓝图）",
-        "phase3+": "Phase 3+（工程化实现）",
         "unknown": "阶段未知"
     }.get(current_phase, "阶段未知")
 
@@ -483,9 +226,6 @@ async def _make_stream_creator_generator(
     elif current_phase == "phase2":
         loading_phase = "phase2"
         prompt_desc = "Phase2 指导（块 0+2）"
-    elif current_phase == "phase3+":
-        loading_phase = "phase3+"
-        prompt_desc = "Phase3+ 指导（块 0+3-6）"
     else:
         loading_phase = "phase1"
         prompt_desc = "Phase1 指导（块 0+1）"
@@ -501,51 +241,6 @@ async def _make_stream_creator_generator(
         {"body_chars": len(body_prompt), "skill_name": parent_skill_name, "prompt_type": prompt_type},
     )
 
-    loaded_resources_prompt = ""
-    if enable_resource_preload and current_phase in ["phase1", "phase2", "unknown"]:
-        resource_catalog = _build_creator_resource_catalog()
-        if resource_catalog:
-            yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
-            
-            resource_decision = await _run_creator_resource_selection_round(
-                body_prompt=body_prompt,
-                request=request,
-                model=model,
-                resource_catalog=resource_catalog,
-                current_phase_hint=current_phase,
-            )
-            
-            is_structured = resource_decision.get("is_structured", False)
-
-            if is_structured:
-                if resource_decision.get("need_resources"):
-                    yield _thought(
-                        "resource_selection",
-                        "资源选择",
-                        (
-                            f"加载 {len(resource_decision.get('resource_handles', []))} 个资源"
-                            if resource_decision.get("need_resources")
-                            else f"无需加载额外资源：{resource_decision.get('reason', '')}"
-                        ),
-                        {
-                            "need_resources": resource_decision.get("need_resources"),
-                            "resource_handles": resource_decision.get("resource_handles", []),
-                            "catalog_size": len(resource_catalog),
-                            "current_phase": current_phase,
-                        },
-                    )
-
-                    selected = resource_decision.get("resource_handles") or []
-                    if selected:
-                        loaded_resources_prompt = _compose_creator_loaded_resources_prompt(
-                            skill_name=parent_skill_name,
-                            resource_catalog=resource_catalog,
-                            selected_handles=selected,
-                        )
-
-    if loaded_resources_prompt:
-        body_prompt = body_prompt + loaded_resources_prompt
-
     if current_phase in ["phase1", "phase2", "unknown"]:
         single_step_instruction = """
 
@@ -555,7 +250,6 @@ async def _make_stream_creator_generator(
 请严格按照 SKILL.md 中的流程执行:
 - Phase 1: 通过多轮对话充分收集用户需求
 - Phase 2: 生成完整蓝图并让用户确认
-- Phase 3: 执行实现（需要先输出 phase3 marker）
 
 一次只问一个问题，等待用户回复。
 """
@@ -564,253 +258,26 @@ async def _make_stream_creator_generator(
     final_messages: list[dict] = [{"role": "system", "content": body_prompt}]
     final_messages.extend(_request_messages_with_files(request))
 
-    # if current_phase == "phase3+":
-    #     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
-    #     try:
-    #         # 加载 Phase 3+ 的 SKILL.md
-    #         body_prompt = load_kernel_creator_for_phase("phase3+")
-    #         # 从对话历史中提取技能名称
-    #         skill_name = _extract_skill_name_from_messages(request.messages)
-    #         runtime_plan = await _run_skill_runtime_planner_round(
-    #             body_prompt=body_prompt,
-    #             request=request,
-    #             model=model,
-    #             execution_root=execution_root,
-    #             skill_name=skill_name,
-    #         )
-    #
-    #         mode = runtime_plan.get("mode")
-    #         tasks = runtime_plan.get("tasks") or []
-    #
-    #         yield _thought(
-    #             "planner_output",
-    #             "规划结果",
-    #             f"模式：{mode}，共 {len(tasks)} 个动作",
-    #             {
-    #                 "mode": mode,
-    #                 "task_count": len(tasks),
-    #                 "tasks": [
-    #                     {
-    #                         "action": t.get("action"),
-    #                         "command": (str(t.get("command") or ""))[:120] or None,
-    #                         "path": t.get("path") or t.get("resource_handle") or None,
-    #                         "reason": str(t.get("reason") or "")[:200],
-    #                     }
-    #                     for t in tasks
-    #                 ],
-    #             },
-    #         )
-    #
-    #         if mode == "execute" and tasks:
-    #             _exec_inferred_root = _infer_skill_root_from_tasks(
-    #                 runtime_plan, execution_root=execution_root
-    #             )
-    #             _exec_cwd = execution_root or _exec_inferred_root
-    #             _exec_session_dir = _extract_input_session_dir(
-    #                 getattr(request, "input_files", []) or [], _exec_cwd
-    #             )
-    #
-    #             _exec_all_results: list[dict] = []
-    #             _exec_all_touched: list[Path] = []
-    #
-    #             for task in tasks:
-    #                 task_action = str(task.get("action") or "").strip()
-    #
-    #                 if task_action == "run_command":
-    #                     cmd = str(task.get("command") or "")
-    #                     short_cmd = cmd[:_MAX_CMD_DISPLAY_LENGTH] + (
-    #                         "…" if len(cmd) > _MAX_CMD_DISPLAY_LENGTH else ""
-    #                     )
-    #                     yield _sse({"status": {"phase": "executing", "message": f"执行命令：{short_cmd}"}})
-    #                     yield _thought("action_start", "执行命令", short_cmd,
-    #                                    {"action": "run_command", "command": cmd[:200]})
-    #                 elif task_action == "write_file":
-    #                     wf_path = str(task.get("path") or "")
-    #                     yield _sse({"status": {"phase": "writing", "message": f"写入文件：{wf_path}"}})
-    #                     yield _thought("action_start", "写入文件", wf_path,
-    #                                    {"action": "write_file", "path": wf_path})
-    #                 elif task_action == "create_directory":
-    #                     cd_path = str(task.get("path") or "")
-    #                     yield _sse({"status": {"phase": "creating", "message": f"创建目录：{cd_path}"}})
-    #                     yield _thought("action_start", "创建目录", cd_path,
-    #                                    {"action": "create_directory", "path": cd_path})
-    #                 elif task_action == "read_resource":
-    #                     res_path = str(task.get("path") or task.get("resource_handle") or "")
-    #                     yield _sse({"status": {"phase": "reading", "message": f"读取资源：{res_path}"}})
-    #                     yield _thought("action_start", "读取资源", res_path,
-    #                                    {"action": "read_resource", "path": res_path})
-    #                 else:
-    #                     yield _thought("action_start", "执行动作", task_action, {"action": task_action})
-    #
-    #                 task_result, task_touched = await asyncio.to_thread(
-    #                     functools.partial(
-    #                         _execute_single_task,
-    #                         task,
-    #                         [],
-    #                         request,
-    #                         execution_root=execution_root,
-    #                         inferred_skill_root=_exec_inferred_root,
-    #                         skill_name=parent_skill_name,
-    #                         session_input_dir=_exec_session_dir,
-    #                     )
-    #                 )
-    #                 _exec_all_results.append(task_result)
-    #                 _exec_all_touched.extend(task_touched)
-    #
-    #                 _safe_result = {
-    #                     k: (v[:1000] if isinstance(v, str) else v)
-    #                     for k, v in task_result.items()
-    #                     if k not in {"content"}
-    #                 }
-    #                 success_flag = task_result.get("success", True)
-    #                 yield _thought(
-    #                     "action_result",
-    #                     "操作结果",
-    #                     f"{'成功' if success_flag else '失败'}",
-    #                     _safe_result,
-    #                 )
-    #
-    #             for root in _find_created_skill_roots(_exec_all_touched):
-    #                 skill_md = root / "SKILL.md"
-    #                 if skill_md.exists():
-    #                     _validate_skill_md(skill_md)
-    #
-    #             _exec_all_output_files: list[dict] = []
-    #             for r in _exec_all_results:
-    #                 _exec_all_output_files.extend(r.get("output_files") or [])
-    #
-    #             exec_result = {
-    #                 "executed": True,
-    #                 "reason": "已根据结构化 action plan 逐任务执行。",
-    #                 "plan": runtime_plan,
-    #                 "results": _exec_all_results,
-    #                 "logs": [],
-    #                 "output_files": _exec_all_output_files,
-    #             }
-    #
-    #             yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
-    #             from .sandbox_chat import _compose_final_answer_prompt
-    #
-    #             _final_messages = [
-    #                 {"role": "system", "content": _compose_final_answer_prompt()},
-    #                 {
-    #                     "role": "user",
-    #                     "content": json.dumps(
-    #                         {
-    #                             "loaded_skill_prompt": body_prompt,
-    #                             "user_messages": _request_messages_with_files(request),
-    #                             "plan": runtime_plan,
-    #                             "execution_result": exec_result,
-    #                         },
-    #                         ensure_ascii=False,
-    #                     ),
-    #                 },
-    #             ]
-    #
-    #             yield _sse({"status": None})
-    #
-    #             if _exec_all_output_files:
-    #                 yield _sse({
-    #                     "action_result": {
-    #                         "action": "output_files",
-    #                         "name": parent_skill_name,
-    #                         "success": True,
-    #                         "message": f"生成了 {len(_exec_all_output_files)} 个文件",
-    #                         "output_files": _exec_all_output_files,
-    #                     }
-    #                 })
-    #
-    #             async for chunk in stream_chat(_final_messages, model):
-    #                 yield _sse({"content": chunk})
-    #
-    #             yield "data: [DONE]\n\n"
-    #             return
-    #
-    #         if mode == "ask_user":
-    #             yield _sse({"status": None})
-    #             missing = runtime_plan.get("missing") or []
-    #             text = "缺少必要信息，无法执行：\n" + "\n".join(
-    #                 f"- {item}" for item in missing) if missing else "缺少必要信息。"
-    #             yield _sse({"content": text})
-    #             yield "data: [DONE]\n\n"
-    #             return
-    #
-    #         yield _sse({"status": None})
-    #
-    #     except Exception as exc:
-    #         logger.exception("creator runtime planning/execution failed")
-    #         yield _sse({"status": None})
-    #         yield _sse({"error": "错误：运行时规划或执行失败"})
-    #         yield "data: [DONE]\n\n"
-    #         return
-
-    def _conversation_has_phase3(messages: list) -> bool:
-        for msg in messages:
-            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            if role == "assistant" and content and _CREATOR_PHASE3_MARKER in content:
-                return True
-        return False
-
-    if current_phase in ["phase3+", "phase3", "phase4", "phase5"]: # or _conversation_has_phase3(request.messages):
-        async for sse in _execute_phase3_mode(
-            final_messages=final_messages,
-            model=model,
-            request=request,
-            execution_root=execution_root,
-            parent_skill_name=parent_skill_name,
-        ):
-            yield sse
-    else:
-        async for sse in _execute_conversation_mode(
-            final_messages=final_messages,
-            model=model,
-            current_phase=current_phase,
-            request=request,
-            execution_root=execution_root,
-            parent_skill_name=parent_skill_name,
-        ):
-            yield sse
+    async for sse in _execute_conversation_mode(
+        final_messages=final_messages,
+        model=model,
+        current_phase=current_phase,
+        request=request,
+    ):
+        yield sse
 
 
 def _make_stream_creator(skill_context: dict, request: ChatRequest):
-    """Creator-specific streaming with phase-aware behaviour.
-
-    Unlike _make_stream which always runs the runtime planner, this function
-    detects whether the conversation is still in Phase 1-2 (pure conversation)
-    or has advanced to Phase 3+ (action execution).
-
-    Phase detection:
-    - If the LLM's response in the current turn contains the phase-3 marker,
-      run the planner/executor on the generated output.
-    - Otherwise, stream the LLM response directly without planning.
-
-    This avoids the overhead and potential mis-planning of running the runtime
-    planner on conversational Phase 1-2 turns that are purely asking questions.
-    """
+    """Creator-specific streaming for Phase 1-2 conversation flow."""
     model = request.model or settings.default_model
-    _MAX_CMD_DISPLAY_LENGTH = 60
-    execution_root = skill_context.get("execution_root")
     parent_skill_name = skill_context.get("skill_name", "")
-    enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
-
-    if execution_root is not None:
-        execution_root = Path(execution_root).resolve()
-        allowed_roots = _allowed_skill_roots()
-        if not any(_is_within_sandbox(execution_root, r.resolve()) for r in allowed_roots):
-            raise ValueError(
-                f"execution_root '{execution_root}' is outside all allowed skill roots."
-            )
 
     return StreamingResponse(
         _make_stream_creator_generator(
             skill_context=skill_context,
             request=request,
             model=model,
-            execution_root=execution_root,
             parent_skill_name=parent_skill_name,
-            enable_resource_preload=enable_resource_preload,
-            _MAX_CMD_DISPLAY_LENGTH=_MAX_CMD_DISPLAY_LENGTH
         ),
         media_type="text/event-stream"
     )
@@ -820,8 +287,6 @@ def build_kernel_skill_context():
     """Build the context for the kernel skill mode."""
     return {
         "skill_name": "",
-        "execution_root": None,
-        "enable_resource_preload": False
     }
 
 

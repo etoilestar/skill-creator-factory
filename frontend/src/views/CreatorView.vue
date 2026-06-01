@@ -143,8 +143,18 @@ const CONFIRM_KEYWORDS = [
   '确认开始',
   '可以开始',
   '没问题，开始',
+  '开始制作',
+  '开始干吧',
+  '确认',
+  '没问题',
+  '对，就这样',
 ]
 const BLUEPRINT_MARKER = '📋 Skill 架构蓝图'
+const BLUEPRINT_CONFIRM_ACTIONS = [
+  { text: '对，开始做吧', value: '对，开始做吧', style: 'primary' },
+  { text: '大体对，但有些地方要改', value: '大体对，但有些地方要改', style: 'default' },
+  { text: '不对，我重新说一下', value: '不对，我重新说一下', style: 'default' },
+]
 
 function isCreationConfirmation(text) {
   return CONFIRM_KEYWORDS.some(kw => text.includes(kw))
@@ -183,6 +193,7 @@ const currentStatus = ref(null)
 
 // Quick actions state
 const quickActions = ref([])
+const pendingBlueprintReady = ref(false)
 
 // Thinking panel state
 const thoughts = ref([])
@@ -238,8 +249,7 @@ async function send() {
   input.value = ''
   await scrollBottom()
 
-  // If the user just confirmed the blueprint, trigger blueprint analysis in parallel
-  // with the chat call (pure-rule extraction, no LLM, very fast).
+  // If the user just confirmed the blueprint, trigger blueprint analysis directly.
   if (isCreationConfirmation(text) && hasBlueprintInHistory()) {
     analyzeBlueprintPlan(chatHistory.value)
       .then(plan => {
@@ -250,6 +260,7 @@ async function send() {
       .catch(err => {
         error.value = `蓝图解析失败：${err.message}，请重试`
       })
+    return
   }
 
   streaming.value = true
@@ -282,11 +293,23 @@ async function send() {
         // Show quick action buttons
         quickActions.value = chunk.data.actions || []
         await scrollBottom()
+      } else if (chunk.type === 'blueprint_ready') {
+        pendingBlueprintReady.value = true
       }
     }
     if (streamBuffer.value) {
       messages.value.push({ role: 'assistant', content: streamBuffer.value })
       streamBuffer.value = ''
+      if (pendingBlueprintReady.value) {
+        if (!quickActions.value.length) {
+          quickActions.value = BLUEPRINT_CONFIRM_ACTIONS
+        }
+        messages.value.push({
+          role: 'assistant',
+          content: '📌 蓝图已生成，请确认后进入创建流程。',
+        })
+        pendingBlueprintReady.value = false
+      }
     }
   } catch (e) {
     error.value = e.message
@@ -326,6 +349,7 @@ function clearChat() {
   showThoughts.value = false
   showCreationPanel.value = false
   creationPlan.value = null
+  pendingBlueprintReady.value = false
 }
 
 // ---------------------------------------------------------------------------
@@ -366,11 +390,23 @@ async function autoStartConversation() {
       } else if (chunk.type === 'quick_actions') {
         quickActions.value = chunk.data.actions || []
         await scrollBottom()
+      } else if (chunk.type === 'blueprint_ready') {
+        pendingBlueprintReady.value = true
       }
     }
     if (streamBuffer.value) {
       messages.value.push({ role: 'assistant', content: streamBuffer.value })
       streamBuffer.value = ''
+      if (pendingBlueprintReady.value) {
+        if (!quickActions.value.length) {
+          quickActions.value = BLUEPRINT_CONFIRM_ACTIONS
+        }
+        messages.value.push({
+          role: 'assistant',
+          content: '📌 蓝图已生成，请确认后进入创建流程。',
+        })
+        pendingBlueprintReady.value = false
+      }
     }
   } catch (e) {
     error.value = e.message

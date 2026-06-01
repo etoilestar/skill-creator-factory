@@ -795,14 +795,12 @@ def load_kernel_creator_for_phase(phase: str) -> str:
     Progressive disclosure strategy:
     - first_time / phase1: blocks [0, 1, 2] (intro + Phase1)
     - phase2: blocks [0, 1, 2, 3] (intro + Phase1 + Phase2)
-    - phase3+: load FULL SKILL.md (need full implementation instructions)
     
     Block mapping from SKILL.md split:
     - Block 0: frontmatter
     - Block 1: intro + SOP overview
     - Block 2: Phase 1 (需求挖掘)
     - Block 3: Phase 2 (蓝图设计)
-    - Block 4-...: Phase 3-5 + core principles
     """
     skill = load_kernel_package(include_body=False)
 
@@ -812,15 +810,6 @@ def load_kernel_creator_for_phase(phase: str) -> str:
     elif phase == "phase2":
         # Phase2: intro + Phase1 + Phase2
         return _compose_kernel_creator_blocks_prompt(skill, [0, 3], phase)
-    elif phase in ["phase3+", "phase3"]:
-        # Phase3 and beyond: NEED FULL SKILL.md for implementation instructions!
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 4], phase)
-    elif phase in ["phase4"]:
-        # Phase4 and beyond: NEED FULL SKILL.md for implementation instructions!
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 5], phase)
-    elif phase in ["phase5"]:
-        # Phase5 and beyond: NEED FULL SKILL.md for implementation instructions!
-        return _compose_kernel_creator_blocks_prompt(skill, [0, 6], phase)
 
     else:
         # Unknown phase: default to intro + Phase1

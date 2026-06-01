@@ -558,6 +558,11 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _blueprint_ready() -> str:
+    """Notify frontend that a blueprint was generated."""
+    return _sse({"type": "blueprint_ready"})
+
+
 def _quick_actions(actions: list[dict]) -> str:
     """Build a 'quick_actions' SSE event that carries button suggestions for user to click.
     

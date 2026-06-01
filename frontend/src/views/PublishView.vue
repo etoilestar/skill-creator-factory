@@ -228,6 +228,8 @@ curl ${baseUrl.value}/published/v1/chat/completions \\
   padding: 24px 32px;
   max-width: 1200px;
   margin: 0 auto;
+  height: 100%;
+  overflow-y: auto;
 }
 
 /* 页面标题 */

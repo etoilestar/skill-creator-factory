@@ -15,7 +15,7 @@
         <span>🧪</span> 沙盒测试
       </RouterLink>
       <RouterLink to="/publish" class="nav-item">
-        <span>🚀</span> Publish
+        <span>🚀</span> 端口发布
       </RouterLink>
       <div class="sidebar-footer">
         <div class="llm-status" :class="llmStatus">

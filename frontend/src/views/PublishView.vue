@@ -1,27 +1,50 @@
 <template>
   <div class="publish-page">
+    <!-- 页面标题区 -->
     <div class="header">
-      <h2>接口发布</h2>
+      <div class="header-left">
+        <h2>📡 接口发布</h2>
+        <p class="header-desc muted">管理对外发布的 API 端点，配置技能与访问密钥</p>
+      </div>
       <button class="btn-primary" @click="showCreate = true">+ 新建发布</button>
     </div>
 
-    <div v-if="loading" class="muted p16">加载中…</div>
-    <div v-else-if="configs.length === 0" class="muted p16">
-      还没有发布配置。点击「新建发布」创建第一个对外接口。
+    <!-- 加载状态 -->
+    <div v-if="loading" class="loading-state">
+      <div class="loading-spinner"></div>
+      <span class="muted">正在加载发布配置…</span>
     </div>
 
+    <!-- 空状态 -->
+    <div v-else-if="configs.length === 0" class="empty-state">
+      <div class="empty-icon">🚀</div>
+      <p class="empty-title">还没有发布配置</p>
+      <p class="muted">点击「新建发布」创建第一个对外接口，让你的技能通过 API 对外服务</p>
+      <button class="btn-primary" @click="showCreate = true" style="margin-top: 16px;">+ 新建发布</button>
+    </div>
+
+    <!-- 配置卡片网格 -->
     <div class="configs-grid" v-else>
       <div v-for="config in configs" :key="config.endpoint_id" class="config-card">
         <div class="card-header">
-          <span class="model-name">{{ config.name }}</span>
-          <label class="switch">
-            <input type="checkbox" :checked="config.is_active" @change="onToggle(config)" />
-            <span class="slider"></span>
-          </label>
+          <div class="card-title-area">
+            <span class="model-name">{{ config.name }}</span>
+            <span :class="['status-badge', config.is_active ? 'active' : 'inactive']">
+              {{ config.is_active ? '● 已启用' : '○ 已停用' }}
+            </span>
+          </div>
+          <div class="switch-area">
+            <span class="switch-label muted">{{ config.is_active ? '启用' : '停用' }}</span>
+            <label class="switch">
+              <input type="checkbox" :checked="config.is_active" @change="onToggle(config)" />
+              <span class="slider"></span>
+            </label>
+          </div>
         </div>
 
         <div class="card-body">
-          <div class="section-label">已启用技能 ({{ config.enabled_skills?.length || 0 }})</div>
+          <!-- 技能区 -->
+          <div class="section-label">🧩 已启用技能（{{ config.enabled_skills?.length || 0 }}）</div>
           <div class="skills-list">
             <div v-for="skill in availableSkills" :key="skill.name" class="skill-toggle">
               <label class="switch small">
@@ -35,51 +58,63 @@
               <span class="skill-name">{{ skill.display_name || skill.name }}</span>
               <span class="skill-desc muted">{{ skill.description }}</span>
             </div>
-            <div v-if="availableSkills.length === 0" class="muted">暂无可用技能</div>
+            <div v-if="availableSkills.length === 0" class="muted" style="padding: 8px 0;">暂无可用技能</div>
           </div>
 
-          <div class="section-label">API 端点</div>
+          <!-- API 端点 -->
+          <div class="section-label">🔗 API 端点</div>
           <div class="endpoint-info">
-            <code class="endpoint-url">POST {{ baseUrl }}/published/v1/chat/completions</code>
-            <button class="btn-ghost btn-sm" @click="copyUrl(config)">复制</button>
+            <code class="code-block">POST {{ baseUrl }}/published/v1/chat/completions</code>
+            <button class="btn-ghost btn-sm" @click="copyUrl(config)">
+              {{ copyFeedback === 'url-' + config.endpoint_id ? '✓ 已复制' : '📋 复制' }}
+            </button>
           </div>
 
-          <div class="section-label">API Key</div>
+          <!-- API Key -->
+          <div class="section-label">🔑 API Key</div>
           <div class="key-info">
-            <code class="api-key">{{ maskKey(config.api_key) }}</code>
-            <button class="btn-ghost btn-sm" @click="copyKey(config)">复制</button>
-            <button class="btn-ghost btn-sm" @click="onRegenerateKey(config)">重新生成</button>
+            <code class="code-block">{{ maskKey(config.api_key) }}</code>
+            <button class="btn-ghost btn-sm" @click="copyKey(config)">
+              {{ copyFeedback === 'key-' + config.endpoint_id ? '✓ 已复制' : '📋 复制' }}
+            </button>
+            <button class="btn-ghost btn-sm" @click="onRegenerateKey(config)">🔄 重新生成</button>
           </div>
 
-          <div class="section-label">调用示例</div>
+          <!-- 调用示例 -->
+          <div class="section-label">📝 调用示例</div>
           <pre class="curl-example">{{ curlExample(config) }}</pre>
         </div>
 
         <div class="card-footer">
-          <button class="btn-ghost btn-danger" @click="onDelete(config)">删除</button>
+          <button class="btn-danger" @click="onDelete(config)">🗑️ 删除此配置</button>
         </div>
       </div>
     </div>
 
-    <!-- Create Dialog -->
+    <!-- 新建发布弹窗 -->
     <div v-if="showCreate" class="modal-overlay" @click.self="showCreate = false">
       <div class="modal">
-        <h3>新建发布</h3>
+        <h3>✨ 新建发布</h3>
+        <p class="modal-desc muted">创建一个新的 API 端点，选择要对外提供的技能</p>
         <div class="form-group">
           <label>模型名称</label>
-          <input v-model="newName" placeholder="my-skilled-model" />
+          <input v-model="newName" placeholder="输入模型名称，如 my-skilled-model" />
+          <span class="form-hint muted">用于调用时 model 参数的名称标识</span>
         </div>
         <div class="form-group">
-          <label>启用技能</label>
-          <div v-for="skill in availableSkills" :key="skill.name" class="skill-check">
-            <label>
-              <input type="checkbox" :value="skill.name" v-model="newSkills" />
-              {{ skill.display_name || skill.name }}
-            </label>
+          <label>选择要启用的技能</label>
+          <div class="skill-check-list">
+            <div v-for="skill in availableSkills" :key="skill.name" class="skill-check">
+              <label>
+                <input type="checkbox" :value="skill.name" v-model="newSkills" />
+                <span>{{ skill.display_name || skill.name }}</span>
+              </label>
+            </div>
+            <div v-if="availableSkills.length === 0" class="muted" style="padding: 8px 0;">暂无可用技能，请先创建技能</div>
           </div>
         </div>
         <div class="modal-actions">
-          <button class="btn-primary" @click="onCreate" :disabled="!newName">创建</button>
+          <button class="btn-primary" @click="onCreate" :disabled="!newName">确认创建</button>
           <button class="btn-ghost" @click="showCreate = false">取消</button>
         </div>
       </div>
@@ -108,6 +143,7 @@ const {
 const showCreate = ref(false)
 const newName = ref('')
 const newSkills = ref([])
+const copyFeedback = ref('')
 
 const baseUrl = computed(() => window.location.origin)
 
@@ -142,13 +178,13 @@ async function onCreate() {
 }
 
 async function onDelete(config) {
-  if (confirm(`确定删除「${config.name}」？`)) {
+  if (confirm(`确定要删除「${config.name}」吗？删除后将无法恢复。`)) {
     await deleteConfig(config.endpoint_id)
   }
 }
 
 async function onRegenerateKey(config) {
-  if (confirm('重新生成 API Key？旧 Key 将立即失效。')) {
+  if (confirm('确定要重新生成 API Key 吗？旧 Key 将立即失效，使用旧 Key 的客户端将无法访问。')) {
     await regenerateKey(config.endpoint_id)
   }
 }
@@ -158,95 +194,215 @@ function maskKey(key) {
   return key.slice(0, 10) + '...' + key.slice(-4)
 }
 
+function showCopySuccess(id) {
+  copyFeedback.value = id
+  setTimeout(() => {
+    if (copyFeedback.value === id) copyFeedback.value = ''
+  }, 2000)
+}
+
 function copyUrl(config) {
   navigator.clipboard.writeText(`${baseUrl.value}/published/v1/chat/completions`)
+  showCopySuccess('url-' + config.endpoint_id)
 }
 
 function copyKey(config) {
   navigator.clipboard.writeText(config.api_key || '')
+  showCopySuccess('key-' + config.endpoint_id)
 }
 
 function curlExample(config) {
-  return `curl ${baseUrl.value}/published/v1/chat/completions \\
+  return `# 调用示例 - 将 YOUR_API_KEY 替换为实际的 API Key
+curl ${baseUrl.value}/published/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: ****** || 'YOUR_API_KEY'}" \\
+  -H "Authorization: ******" \\
   -d '{
     "model": "${config.name}",
-    "messages": [{"role": "user", "content": "Hello"}]
+    "messages": [{"role": "user", "content": "你好"}]
   }'`
 }
 </script>
 
 <style scoped>
 .publish-page {
-  padding: 24px;
+  padding: 24px 32px;
   max-width: 1200px;
   margin: 0 auto;
 }
 
+/* 页面标题 */
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 24px;
+  align-items: flex-start;
+  margin-bottom: 28px;
 }
 
+.header-left h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.header-desc {
+  font-size: 13px;
+}
+
+/* 加载状态 */
+.loading-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 32px 16px;
+}
+
+.loading-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 空状态 */
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+.empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+/* 卡片网格 */
 .configs-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
   gap: 20px;
 }
 
 .config-card {
-  border: 1px solid #e2e8f0;
+  border: 1px solid var(--border);
   border-radius: 12px;
   padding: 20px;
-  background: #fff;
+  background: var(--surface);
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
 
+.config-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 20px rgba(108, 138, 255, 0.08);
+}
+
+/* 卡片头部 */
 .card-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.card-title-area {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .model-name {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 600;
 }
 
+.status-badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  width: fit-content;
+}
+
+.status-badge.active {
+  color: var(--success);
+  background: rgba(76, 175, 130, 0.12);
+}
+
+.status-badge.inactive {
+  color: var(--text-muted);
+  background: rgba(122, 128, 153, 0.12);
+}
+
+.switch-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.switch-label {
+  font-size: 12px;
+}
+
+/* 卡片主体 */
 .card-body {
   font-size: 14px;
 }
 
 .section-label {
   font-weight: 500;
-  margin-top: 12px;
-  margin-bottom: 6px;
-  color: #475569;
+  margin-top: 16px;
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 13px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
 }
 
+/* 技能列表 */
 .skills-list {
-  max-height: 200px;
+  max-height: 180px;
   overflow-y: auto;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
 }
 
 .skill-toggle {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  padding: 6px 0;
+}
+
+.skill-toggle + .skill-toggle {
+  border-top: 1px solid var(--border);
 }
 
 .skill-name {
   font-weight: 500;
+  font-size: 13px;
 }
 
 .skill-desc {
   font-size: 12px;
 }
 
+/* 端点/密钥信息 */
 .endpoint-info, .key-info {
   display: flex;
   align-items: center;
@@ -254,36 +410,47 @@ function curlExample(config) {
   flex-wrap: wrap;
 }
 
-.endpoint-url, .api-key {
-  background: #f1f5f9;
-  padding: 4px 8px;
-  border-radius: 4px;
+.code-block {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: var(--radius);
   font-size: 12px;
   word-break: break-all;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  color: var(--text);
 }
 
+/* curl 示例 */
 .curl-example {
-  background: #1e293b;
-  color: #e2e8f0;
-  padding: 12px;
-  border-radius: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 14px;
+  border-radius: var(--radius);
   font-size: 12px;
   overflow-x: auto;
   white-space: pre-wrap;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  line-height: 1.5;
 }
 
+/* 卡片底部 */
 .card-footer {
   margin-top: 16px;
   padding-top: 12px;
-  border-top: 1px solid #e2e8f0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
 }
 
-/* Switch styles */
+/* 开关样式 */
 .switch {
   position: relative;
   display: inline-block;
   width: 44px;
   height: 24px;
+  flex-shrink: 0;
 }
 
 .switch.small {
@@ -304,7 +471,7 @@ function curlExample(config) {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: #cbd5e1;
+  background-color: var(--border);
   transition: 0.3s;
   border-radius: 24px;
 }
@@ -316,7 +483,7 @@ function curlExample(config) {
   width: 18px;
   left: 3px;
   bottom: 3px;
-  background-color: white;
+  background-color: var(--text);
   transition: 0.3s;
   border-radius: 50%;
 }
@@ -329,7 +496,7 @@ function curlExample(config) {
 }
 
 input:checked + .slider {
-  background-color: #3b82f6;
+  background-color: var(--accent);
 }
 
 input:checked + .slider::before {
@@ -340,91 +507,123 @@ input:checked + .slider::before {
   transform: translateX(16px);
 }
 
-/* Modal */
+/* 弹窗 */
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.4);
+  background: rgba(0, 0, 0, 0.6);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  backdrop-filter: blur(4px);
 }
 
 .modal {
-  background: white;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 24px;
+  padding: 28px;
   min-width: 400px;
   max-width: 500px;
   max-height: 80vh;
   overflow-y: auto;
 }
 
+.modal h3 {
+  font-size: 18px;
+  margin-bottom: 4px;
+}
+
+.modal-desc {
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+
 .form-group {
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .form-group label {
   display: block;
   font-weight: 500;
-  margin-bottom: 4px;
+  margin-bottom: 6px;
+  font-size: 13px;
 }
 
-.form-group input[type="text"],
-.form-group input:not([type]) {
-  width: 100%;
+.form-hint {
+  display: block;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.skill-check-list {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   padding: 8px 12px;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
+  max-height: 180px;
+  overflow-y: auto;
 }
 
 .skill-check {
-  padding: 4px 0;
+  padding: 6px 0;
+}
+
+.skill-check + .skill-check {
+  border-top: 1px solid var(--border);
+}
+
+.skill-check label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 400;
+}
+
+.skill-check input[type="checkbox"] {
+  width: auto;
+  flex-shrink: 0;
 }
 
 .modal-actions {
   display: flex;
   gap: 8px;
-  margin-top: 16px;
+  margin-top: 20px;
+  justify-content: flex-end;
 }
 
-.btn-primary {
-  background: #3b82f6;
-  color: white;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.btn-primary:disabled {
-  opacity: 0.5;
-}
-
-.btn-ghost {
-  background: none;
-  border: 1px solid #e2e8f0;
-  padding: 8px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
+/* 按钮尺寸 */
 .btn-sm {
-  padding: 4px 8px;
+  padding: 4px 10px;
   font-size: 12px;
 }
 
-.btn-danger {
-  color: #ef4444;
-  border-color: #fecaca;
-}
+/* 响应式 */
+@media (max-width: 768px) {
+  .publish-page {
+    padding: 16px;
+  }
 
-.muted {
-  color: #64748b;
-}
+  .header {
+    flex-direction: column;
+    gap: 12px;
+  }
 
-.p16 {
-  padding: 16px;
+  .configs-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .modal {
+    min-width: unset;
+    width: calc(100vw - 32px);
+    margin: 16px;
+  }
+
+  .endpoint-info, .key-info {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 }
 </style>

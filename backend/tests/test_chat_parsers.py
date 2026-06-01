@@ -473,3 +473,30 @@ def test_strip_phase3_marker_from_visible_creator_text():
     text = "蓝图内容\n{\"creator_phase\":\"phase3_start\"}\n后续文字"
 
     assert _strip_phase3_marker_from_visible_text(text) == "蓝图内容\n后续文字"
+
+
+def test_runtime_planner_prompt_requires_fenced_block_trigger():
+    from backend.routers.sandbox_chat import _compose_skill_runtime_planner_prompt
+
+    prompt = _compose_skill_runtime_planner_prompt()
+
+    assert "显式可执行 fenced code block 触发" in prompt
+    assert "不要因为磁盘上存在脚本就直接规划 run_command" in prompt
+    assert "禁止的 action：run_command、write_file、create_directory" in prompt
+
+
+def test_normalize_plan_rejects_direct_run_command_trigger():
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "run_command", "command": "python scripts/build.py"}],
+        "errors": [],
+        "missing": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan)
+
+    assert result["mode"] == "ask_user"
+    assert result["tasks"] == []
+    assert any("显式 fenced code block" in str(error) for error in result["errors"])

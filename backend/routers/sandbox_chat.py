@@ -656,88 +656,61 @@ def _strip_runtime_resource_manifest(body_prompt: str) -> str:
 
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
-        "你是 Skill Agent 运行时动作规划器。\n\n"
+        "你是 Skill Agent 运行时动作意图判断器。\n\n"
         "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
         "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
-        "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog、available_scripts 和用户请求，"
-        "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
+        "你的任务不是回答用户问题，也不是凭空创建命令；你的任务是根据 Loaded SKILL.md、"
+        "resource_catalog、available_scripts 和用户请求判断本轮是否需要先让主模型输出显式可执行块。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
-        "2. resource_catalog 是宿主提供的真实资源树。\n"
-        "3. available_scripts 是宿主从磁盘实时扫描到的真实脚本文件列表（权威来源），其中出现的脚本无需查 resource_catalog 即可直接规划 run_command。\n"
-        "4. 当生成 init_skill.py 命令时，必须使用提供的 skill_name 参数，并使用 skills 作为 --path 参数的值。命令格式：python ../kernel/scripts/init_skill.py <skill_name> --path skills\n"
-        "5. 绝对不能使用 'skill-creator' 作为技能名称（这是 kernel 的名称）。\n"
-        "6. 你不能假设某个脚本存在；只能根据 available_scripts 或 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
-        "7. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
+        "2. resource_catalog 和 available_scripts 只是宿主提供的真实资源树，用于安全校验候选动作是否可能存在。\n"
+        "3. 是否执行命令，必须由后续主模型回复里的显式可执行 fenced code block 触发；"
+        "不要因为磁盘上存在脚本就直接规划 run_command。\n"
+        "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
+        "但不要在本轮规划 run_command、write_file 或 create_directory。\n"
+        "5. 如果任务需要运行 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求调用脚本，"
+        "应使用 mode=direct_answer，并在 final_instruction 中要求主模型输出真实命令的 fenced code block。\n"
+        "6. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
+        "7. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令。\n"
         "8. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
         "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
-        "通常应使用 mode=direct_answer，不要规划 run_command。\n"
-        "9. 如果 available_scripts 和 resource_catalog 均没有 scripts 资源，默认不得规划 run_command。\n"
-        "10. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 available_scripts、"
-        "resource_catalog 或系统可执行环境中，才允许规划 run_command。\n"
-        "11. read_resource 只能使用 resource_handle，禁止输出 path。\n"
-        "12. resource_handle 必须来自 resource_catalog。\n"
-        "13. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
-        "14. 不要假装读取、假装执行、假装写入。\n"
-        "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "应使用 mode=direct_answer，并让主模型按 Loaded SKILL.md 直接回答，不输出可执行块。\n"
+        "9. read_resource 只能使用 resource_handle，禁止输出 path。\n"
+        "10. resource_handle 必须来自 resource_catalog。\n"
+        "11. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
+        "12. 不要假装读取、假装执行、假装写入。\n"
+        "13. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
         "允许的 action：\n"
         "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
-        "- run_command：执行一个真实可执行的命令。命令不得是函数名或伪代码。\n"
-        "- write_file：写入文件。\n"
-        "- create_directory：创建目录。\n"
-        "- display / ignore：展示或忽略。\n\n"
-        "文件生成任务强制规则（高优先级，覆盖规则 6）：\n"
-        "当用户明确请求生成 PPT/PPTX/幻灯片、Excel/XLSX、Word/DOCX、CSV、图表图片、PDF 等可下载格式文件时：\n"
-        "  a. 如果 available_scripts 或 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
-        "必须使用 mode=execute 并规划 run_command；不得使用 direct_answer。\n"
-        "  b. 文本模型无法直接生成二进制文件（.pptx/.xlsx/.docx），必须通过执行脚本生成。\n"
-        "  c. SKILL.md 中为文件生成任务指定了专用脚本时，stdin 字段应包含完整的输入内容（如幻灯片 JSON 数组）。\n\n"
+        "- display / ignore：展示或忽略。\n"
+        "禁止的 action：run_command、write_file、create_directory；这些只能由后续主模型显式 fenced block 触发。\n\n"
+        "显式可执行块触发规则（给 final_instruction 使用）：\n"
+        "- 需要执行命令时，要求主模型输出一段可执行命令 fenced block，例如 ```bash ... ```，"
+        "并在代码块附近说明这是要执行的命令。\n"
+        "- 需要写文件时，要求主模型在代码块前写 `写入文件：<path>` 或 `保存到：<path>`，"
+        "文件内容必须放在紧随其后的 fenced code block 内。\n"
+        "- 后端只执行主模型回复中已经出现的 fenced block；资源存在性只做安全校验，不做触发条件。\n\n"
         "mode 选择规则：\n"
-        "- direct_answer：Skill 可由模型直接完成，且产物是纯文本/Markdown（不是格式化文件），例如写故事、公文、总结、翻译、分析。\n"
-        "- execute：需要宿主执行 action，例如读取资源、运行脚本、写入文件，或生成 PPT/Excel 等格式文件。\n"
-        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全执行。\n"
+        "- direct_answer：主模型继续生成最终回复；如果需要动作，也必须在该回复中输出显式 fenced block 供后端识别执行。\n"
+        "- execute：只用于 read_resource/display/ignore 这类宿主受控动作；不得包含 run_command/write_file/create_directory。\n"
+        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
-        "run_command 约束：\n"
-        "1. 不得输出类似 generate_story、process、main、run_task 这样的函数名作为 command。\n"
-        "2. 不得凭空生成不在 available_scripts 中的 scripts/main.py、scripts/run.py 等路径。\n"
-        "3. 如果 command 引用了 scripts/...，该路径必须能在 available_scripts 或 resource_catalog 中看到。\n"
-        "4. 如果 available_scripts 和 resource_catalog 的 scripts 均为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
-        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不在 available_scripts 中，应使用 ask_user，并在 errors 中说明脚本不存在。\n"
-        "6. command 必须是完整的可执行命令行，包含脚本所需的所有参数，并用用户消息中的实际值替换 Loaded SKILL.md 里的占位符\n"
-        "（例如 `<filepath>`、`{file}`、`<input>` 等）；不得在 command 中保留任何占位符或省略必要参数。\n"
-        "7. 如果某个必要参数（例如文件路径、用户数据）在用户消息中未提供且无法从上下文推断，"
-        "必须使用 ask_user 模式，并在 missing 列表中说明缺少哪些信息；不得用不完整的命令继续 execute。\n\n"
         "输出格式：\n"
         "{\n"
         "  \"mode\": \"execute | direct_answer | ask_user | not_applicable\",\n"
         "  \"actions\": [\n"
         "    {\n"
-        "      \"action\": \"read_resource\",\n"
+        "      \"action\": \"read_resource | display | ignore\",\n"
         "      \"resource_handle\": \"resource:0\",\n"
-        "      \"reason\": \"需要读取参考资料\"\n"
-        "    },\n"
-        "    {\n"
-        "      \"action\": \"run_command\",\n"
-        "      \"command\": \"scripts/process.py $INPUT_SESSION_DIR/data.xlsx --format markdown\",\n"
-        "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
-        "      \"reason\": \"需要运行真实存在的脚本或工具，命令包含从用户消息中提取的实际参数值\"\n"
+        "      \"reason\": \"为什么需要该动作\"\n"
         "    }\n"
         "  ],\n"
-        "  \"final_instruction\": \"执行完成后优先基于 observation 回答；direct_answer 时按 Loaded SKILL.md 直接回答\",\n"
         "  \"missing\": [],\n"
-        "  \"errors\": []\n"
+        "  \"errors\": [],\n"
+        "  \"final_instruction\": \"direct_answer 时给主模型的执行提示；需要动作时要求它输出显式 fenced block\"\n"
         "}\n"
-        "\n"
-        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径。\n"
-        "- Shell 脚本：`$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`\n"
-        "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
-        "`os.path.join(os.environ['INPUT_DIR'], '<相对路径>')`\n"
-        "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
-        "特别注意：Loaded SKILL.md 中的示例命令（例如 `uploads/data.xlsx`）只是占位符格式说明，"
-        "其中的文件名（如 `data.xlsx`）并非真实文件名。\n"
-        "必须从用户消息（user_messages 中的【已附上传文件：...】）中提取真实文件名，"
-        "并以 `$INPUT_SESSION_DIR/<真实文件名>` 形式写入 command，不得保留 SKILL.md 中的示例文件名。\n"
     )
+
 
 def _normalize_skill_runtime_plan(
     plan: dict,
@@ -749,8 +722,8 @@ def _normalize_skill_runtime_plan(
 
     关键原则：
     - read_resource 的真实 path 不来自模型，而是由宿主根据 resource_handle 映射得到；
-    - run_command 不允许凭空执行函数名或不存在的脚本；
-    - command 只做通用可执行性校验，不硬编码 python/node/bash。
+    - runtime planner 不直接触发 run_command/write_file/create_directory；
+    - 命令和写文件只能由后续主模型回复中的 fenced code block 触发。
     """
     if not isinstance(plan, dict):
         raise ValueError("运行时规划模型输出必须是 JSON object")
@@ -786,35 +759,15 @@ def _normalize_skill_runtime_plan(
             errors.append({"error": f"不支持的 action: {action}", "action_item": action_item})
             continue
 
-        if action == "run_command":
-            command = str(action_item.get("command") or "").strip()
-            if not command:
-                errors.append({"error": "run_command 缺少 command", "action_item": action_item})
-                continue
+        if action in {"run_command", "write_file", "create_directory"}:
+            errors.append({
+                "error": f"{action} 只能由主模型回复中的显式 fenced code block 触发",
+                "action_item": action_item,
+                "hint": "runtime planner 只做意图判断和 read_resource；不要直接规划执行命令或写文件。",
+            })
+            continue
 
-            stdin_text = action_item.get("stdin", None)
-            if stdin_text is not None:
-                stdin_text = str(stdin_text)
-
-            # 运行前预检：不执行，只验证命令形态和 Skill 内资源路径。
-            try:
-                _prepare_command_argv(command, base_dir=execution_root)
-            except Exception as exc:
-                errors.append({
-                    "error": "run_command 预检失败",
-                    "command": command,
-                    "detail": str(exc),
-                    "hint": (
-                        "不要把函数名、伪代码或不存在的脚本当成命令。"
-                        "如果当前 Skill 可直接由模型完成，请使用 mode=direct_answer。"
-                    ),
-                })
-                continue
-
-            action_item["command"] = command
-            action_item["stdin"] = stdin_text
-
-        elif action == "read_resource":
+        if action == "read_resource":
             resource_handle = str(action_item.get("resource_handle") or "").strip()
             if not resource_handle:
                 errors.append({"error": "read_resource 缺少 resource_handle", "action_item": action_item})
@@ -843,18 +796,6 @@ def _normalize_skill_runtime_plan(
             action_item["path"] = resource["path"]
             action_item["resource_kind"] = resource["kind"]
 
-        elif action in {"write_file", "create_directory"}:
-            path = str(action_item.get("path") or "").strip()
-            if not path:
-                errors.append({"error": f"{action} 缺少 path", "action_item": action_item})
-                continue
-            action_item["path"] = path
-
-        if action == "write_file":
-            if "content" not in action_item:
-                errors.append({"error": "write_file 缺少 content", "action_item": action_item})
-                continue
-            action_item["content"] = str(action_item.get("content") or "")
 
         action_item["block_index"] = int(action_item.get("block_index", -1))
         normalized_actions.append(action_item)
@@ -921,7 +862,7 @@ async def _run_skill_runtime_planner_round(
             "planner_must_not_generate_resource_paths": True,
             "read_resource_uses_resource_handle_only": True,
             "resource_path_resolution_is_host_owned": True,
-            "do_not_depend_on_main_model_markdown_output": True,
+            "execution_requires_main_model_fenced_block": True,
             "action_observation_loop": True,
         },
     }
@@ -2447,6 +2388,22 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     "content": body_prompt,
                 }
             )
+
+            _runtime_plan_for_final = locals().get("runtime_plan")
+            if isinstance(_runtime_plan_for_final, dict):
+                _final_instruction = str(_runtime_plan_for_final.get("final_instruction") or "").strip()
+                if _final_instruction:
+                    final_messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "运行时动作意图判断器给出的本轮执行提示：\n"
+                                f"{_final_instruction}\n\n"
+                                "如果该提示要求输出可执行动作，必须把真实命令或文件内容放入 fenced code block；"
+                                "后端只会执行本轮回复中已经出现的 fenced code block。"
+                            ),
+                        }
+                    )
 
             if strict_skill_execution:
                 final_messages.append(

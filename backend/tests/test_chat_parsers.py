@@ -503,6 +503,73 @@ def test_normalize_plan_rejects_direct_run_command_trigger():
     assert any("显式 fenced code block" in str(error) for error in result["errors"])
 
 
+def test_extract_skill_command_contract_requires_shell_fenced_template():
+    from backend.routers.sandbox_chat import _extract_skill_command_contract
+
+    implicit_skill = "立即调用 `scripts/generate_chord.py` 生成结果。"
+    explicit_skill = """执行命令：
+```bash
+python scripts/generate_chord.py '{"style":"{{style}}","key":"{{key}}"}'
+```
+"""
+
+    assert not _extract_skill_command_contract(implicit_skill)["has_executable_command_block"]
+
+    explicit_contract = _extract_skill_command_contract(explicit_skill)
+    assert explicit_contract["has_executable_command_block"]
+    assert "scripts/generate_chord.py" in explicit_contract["command_blocks"][0]["code"]
+
+
+def test_normalize_plan_rejects_generated_command_without_skill_template():
+    from backend.routers.sandbox_chat import (
+        _extract_skill_command_contract,
+        _normalize_skill_runtime_plan,
+    )
+
+    command_contract = _extract_skill_command_contract(
+        "当用户提供风格时，调用 `scripts/generate_chord.py` 生成结果。"
+    )
+    plan = {
+        "mode": "direct_answer",
+        "actions": [],
+        "errors": [],
+        "missing": [],
+        "final_instruction": "输出 fenced code block 调用 scripts/generate_chord.py。",
+    }
+
+    result = _normalize_skill_runtime_plan(plan, command_contract=command_contract)
+
+    assert result["mode"] == "ask_user"
+    assert any("缺少可执行命令 fenced block 模板" in str(error) for error in result["errors"])
+
+
+def test_normalize_plan_allows_generated_command_with_skill_template():
+    from backend.routers.sandbox_chat import (
+        _extract_skill_command_contract,
+        _normalize_skill_runtime_plan,
+    )
+
+    command_contract = _extract_skill_command_contract(
+        """执行命令：
+```bash
+python scripts/generate_chord.py '{"style":"{{style}}","key":"{{key}}"}'
+```
+"""
+    )
+    plan = {
+        "mode": "direct_answer",
+        "actions": [],
+        "errors": [],
+        "missing": [],
+        "final_instruction": "按 SKILL.md 中已有命令模板替换参数后输出 fenced code block。",
+    }
+
+    result = _normalize_skill_runtime_plan(plan, command_contract=command_contract)
+
+    assert result["mode"] == "direct_answer"
+    assert result["errors"] == []
+
+
 def test_creator_generate_skill_md_prompt_requires_block_contract():
     from backend.routers.creator import _build_generate_file_prompt
 
@@ -518,6 +585,7 @@ def test_creator_generate_skill_md_prompt_requires_block_contract():
     assert "宿主 Block 执行契约" in prompt
     assert "只有 assistant 当轮回复中出现的 fenced code block" in prompt
     assert "禁止只写‘立即调用 `scripts/...`’" in prompt
+    assert "具体命令模板" in prompt
 
 
 def test_kernel_creator_phase_prompts_include_block_runtime_requirements():

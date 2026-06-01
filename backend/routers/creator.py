@@ -33,16 +33,17 @@ _SKILL_MD_BLOCK_RUNTIME_CONTRACT = """
 
 宿主 Block 执行契约（必须写入生成的 SKILL.md 正文）：
 - SKILL.md 只描述做什么、何时使用资源，以及 assistant 应该如何表达动作；不要把资源存在本身写成执行触发器。
-- 如果本 Skill 需要运行 scripts/ 下的脚本，必须指示 assistant 在 Sandbox 当轮回复中输出显式可执行 fenced code block，格式为：
+- 如果本 Skill 需要运行 scripts/ 下的脚本，必须在 SKILL.md 正文里写出具体、完整、可复用的命令模板，并指示 assistant 在 Sandbox 当轮回复中按模板替换真实参数后输出显式可执行 fenced code block，格式为：
   执行命令：
   ```bash
-  python scripts/<script-name> <真实参数>
+  python scripts/<script-name> '<与脚本接口一致的 JSON 或参数模板>'
   ```
+- 命令模板必须与脚本真实接口一致：如果脚本读取 argv[1] 的 JSON，就在 block 里写 JSON 字符串模板；如果脚本读取 stdin，就明确 stdin 协议；禁止让运行时主模型根据脚本名临时猜 CLI flags。
 - 只有 assistant 当轮回复中出现的 fenced code block 才会被宿主解析和执行；`scripts/foo.py` 这样的行内路径引用或“立即调用脚本”的自然语言不会触发执行。
 - 如果需要写文件，必须指示 assistant 输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放入紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
 - 对纯文本即可完成的任务，不要要求运行脚本，直接按 SKILL.md 生成最终文本。
-- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”；应写成“输出以下显式命令块交由宿主执行”。
+- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”；应写成“输出以下显式命令块交由宿主执行”，并给出具体命令模板。
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])

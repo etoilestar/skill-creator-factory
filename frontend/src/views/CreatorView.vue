@@ -1,8 +1,8 @@
 <template>
   <div class="creator">
     <div class="header">
-      <h2>Skill Creator</h2>
-      <p class="muted">Powered by <code>kernel/SKILL.md</code> · multi-turn conversation</p>
+      <h2>技能创建器</h2>
+      <p class="muted">由 <code>kernel/SKILL.md</code> 驱动 · 支持多轮对话</p>
     </div>
 
     <div class="toolbar">

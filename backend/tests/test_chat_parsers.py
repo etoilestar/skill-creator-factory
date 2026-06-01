@@ -570,6 +570,65 @@ python scripts/generate_chord.py '{"style":"{{style}}","key":"{{key}}"}'
     assert result["errors"] == []
 
 
+def test_creator_sanitizes_script_from_multifile_bundle():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    bundle = """# fairy-tale-generator
+
+## 📜 SKILL.md
+
+```markdown
+# 童话故事生成器
+```
+
+## 📁 scripts/generate_story.py
+
+```python
+import argparse
+
+def main():
+    print("ok")
+
+if __name__ == "__main__":
+    main()
+```
+
+## 📁 references/config.md
+
+```markdown
+# config
+```
+"""
+
+    result = _sanitize_generated_file_content("scripts/generate_story.py", bundle)
+
+    assert result.startswith("import argparse")
+    assert "## 📜 SKILL.md" not in result
+    assert "```" not in result
+
+
+def test_creator_rejects_markdown_bundle_for_script_without_target_section():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    bundle = """# fairy-tale-generator
+
+## 📜 SKILL.md
+
+```markdown
+# 童话故事生成器
+```
+
+## 📁 scripts/other.py
+
+```python
+print("wrong target")
+```
+"""
+
+    with pytest.raises(ValueError, match="不是单个脚本源码"):
+        _sanitize_generated_file_content("scripts/generate_story.py", bundle)
+
+
 def test_creator_generate_skill_md_prompt_requires_block_contract():
     from backend.routers.creator import _build_generate_file_prompt
 

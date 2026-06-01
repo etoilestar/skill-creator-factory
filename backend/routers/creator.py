@@ -11,6 +11,7 @@ These endpoints decouple the file-creation phase from the main
 - POST /api/creator/package-skill       — package Skill directory into .skill archive
 """
 
+import ast
 import json
 import logging
 import re
@@ -214,6 +215,89 @@ def _validate_skill_name(skill_name: str) -> str:
     return name
 
 
+def _extract_first_fenced_block(content: str) -> str | None:
+    """Return the first fenced block body from content, or None."""
+    lines = content.splitlines(keepends=True)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        match = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
+        if not match:
+            i += 1
+            continue
+
+        fence = match.group(1)
+        fence_char = fence[0]
+        fence_len = len(fence)
+        code_lines: list[str] = []
+        i += 1
+
+        while i < len(lines):
+            close_line = lines[i]
+            close_stripped = close_line.lstrip()
+            close_match = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}\s*$",
+                close_stripped.rstrip("\n"),
+            )
+            if close_match:
+                return "".join(code_lines).strip()
+            code_lines.append(close_line)
+            i += 1
+
+        return "".join(code_lines).strip()
+
+    return None
+
+
+def _extract_target_file_from_bundle(content: str, file_path: str) -> str | None:
+    """Extract the requested file when a model returns a multi-file bundle."""
+    escaped_path = re.escape(file_path)
+    heading_re = re.compile(
+        rf"(?im)^\s*#{{1,6}}\s*(?:[^\n`]*?)`?{escaped_path}`?\s*$"
+    )
+
+    for match in heading_re.finditer(content):
+        section = content[match.end():]
+        block = _extract_first_fenced_block(section)
+        if block is not None:
+            return block
+
+    return None
+
+
+_MULTI_FILE_MARKER_RE = re.compile(
+    r"(?im)^\s*#{1,6}\s*(?:[^\n`]*)(?:SKILL\.md|scripts/|references/|assets/)"
+)
+
+
+def _validate_generated_file_content(file_path: str, content: str) -> None:
+    """Reject content that is clearly not the requested single file."""
+    if file_path.startswith("scripts/"):
+        if "```" in content or _MULTI_FILE_MARKER_RE.search(content):
+            raise ValueError(
+                f"{file_path} 生成内容包含 Markdown 代码块或多文件包，"
+                "不是单个脚本源码。请重新生成该文件。"
+            )
+
+        if Path(file_path).suffix.lower() == ".py":
+            try:
+                ast.parse(content)
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+                ) from exc
+
+
+def _sanitize_generated_file_content(file_path: str, content: str) -> str:
+    """Normalize model output into exactly the requested file content."""
+    extracted = _extract_target_file_from_bundle(content, file_path)
+    sanitized = _strip_code_fence(extracted if extracted is not None else content)
+    _validate_generated_file_content(file_path, sanitized)
+    return sanitized
+
+
 def _strip_code_fence(content: str) -> str:
     """Strip wrapping code-fence markers that a model may output despite instructions.
 
@@ -395,11 +479,18 @@ async def generate_file(request: GenerateFileRequest):
             def _capture_ack(payload: dict) -> None:
                 ack_payload.update(payload)
 
+            generated_chunks: list[str] = []
             async for chunk in stream_chat(prompt_messages, model, model_ack_callback=_capture_ack):
                 if ack_payload:
                     yield _sse({"model_ack": {**route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
                     ack_payload.clear()
-                yield _sse({"content": chunk})
+                generated_chunks.append(chunk)
+
+            content = _sanitize_generated_file_content(
+                request.file_path,
+                "".join(generated_chunks),
+            )
+            yield _sse({"content": content})
             yield _sse({"done": True})
         except Exception as exc:
             logger.exception(
@@ -423,7 +514,10 @@ async def write_file(request: WriteFileRequest):
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
 
-    content = _strip_code_fence(request.content)
+    try:
+        content = _sanitize_generated_file_content(request.file_path, request.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if request.file_path == "SKILL.md":
         result = run_action({"action": "write", "name": skill_name, "content": content})

@@ -118,6 +118,9 @@ def _guess_current_phase(messages: list) -> str:
         "开始制作",
         "开始干吧",
         "确认",
+        "确认，继续构建",
+        "继续构建",
+        "确认继续",
         "没问题",
         "对，就这样"
     ]
@@ -306,6 +309,15 @@ def _ensure_single_question(text: str) -> tuple[str, list[dict] | None]:
     return _parse_ask_user_question(text)
 
 
+def _strip_phase3_marker_from_visible_text(text: str) -> str:
+    """Remove accidental phase3 marker lines from user-visible Creator text."""
+    return re.sub(
+        r"(?m)^\s*\{\s*\"creator_phase\"\s*:\s*\"phase3_start\"\s*\}\s*\n?",
+        "",
+        text,
+    )
+
+
 @_safe_async_generator
 async def _execute_conversation_mode(
     final_messages: list[dict],
@@ -318,14 +330,14 @@ async def _execute_conversation_mode(
     """Phase 1-2 conversation mode: stream directly to user."""
     yield _sse({"status": None})
 
-    # Stream while collecting complete text
+    # Collect first, then stream sanitized user-visible text.
+    # Phase 1-2 must never show an accidental phase3 marker to the user.
     assistant_chunks: list[str] = []
     
     try:
         yield _sse({"model_ack": {"task": "text", "model": model, "reason": f"creator {current_phase} conversation"}})
         async for chunk in stream_chat(final_messages, model):
             assistant_chunks.append(chunk)
-            yield _sse({"content": chunk})
     except Exception:
         logger.exception("Error during LLM streaming")
     
@@ -333,6 +345,9 @@ async def _execute_conversation_mode(
         return
     
     assistant_text = "".join(assistant_chunks)
+    visible_text = _strip_phase3_marker_from_visible_text(assistant_text)
+    if visible_text:
+        yield _sse({"content": visible_text})
     
     # Check for quick actions after streaming completes
     if current_phase in ["phase1", "phase2", "unknown"]:

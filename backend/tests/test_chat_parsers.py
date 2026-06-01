@@ -443,3 +443,33 @@ def test_is_within_sandbox_nested_path_ok(tmp_path):
 
     sandbox = (tmp_path / "skill").resolve()
     assert _is_within_sandbox(nested, sandbox) is True
+
+
+def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
+    from backend.services.kernel_loader import load_kernel_creator_for_phase
+
+    prompt = load_kernel_creator_for_phase("phase2")
+
+    assert "必须先输出完整蓝图正文" in prompt
+    assert "不要只输出确认问题" in prompt
+    assert "Phase 2 期间禁止输出 phase3_start" in prompt
+    assert "\"对，开始做吧\"" in prompt
+
+
+def test_creator_phase_guess_accepts_continue_build_confirmation():
+    from backend.routers.creator_chat import _guess_current_phase
+
+    messages = [
+        {"role": "assistant", "content": "## 📋 Skill 架构蓝图\n### 基本信息\n- **Skill 名称**: demo"},
+        {"role": "user", "content": "确认，继续构建"},
+    ]
+
+    assert _guess_current_phase(messages) == "phase3+"
+
+
+def test_strip_phase3_marker_from_visible_creator_text():
+    from backend.routers.creator_chat import _strip_phase3_marker_from_visible_text
+
+    text = "蓝图内容\n{\"creator_phase\":\"phase3_start\"}\n后续文字"
+
+    assert _strip_phase3_marker_from_visible_text(text) == "蓝图内容\n后续文字"

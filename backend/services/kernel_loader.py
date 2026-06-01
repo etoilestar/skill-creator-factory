@@ -405,9 +405,8 @@ def _compose_creator_workflow_contract() -> str:
         "4. 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 "
         "`references/workflows.md`。\n\n"
         "蓝图确认信号：\n"
-        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-        '{"creator_phase":"phase3_start"}\n'
-        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "Phase 2 输出完整蓝图与确认问题；用户确认后由后端进入 Phase 3。\n"
+        "Phase 1-2 期间禁止输出 phase3_start JSON 标记。\n\n"
         "运行时安全：\n"
         "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
         "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
@@ -480,10 +479,9 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "Phase 1-2 行为约束：\n"
             "1. 只进行需求澄清与蓝图确认，不得输出任何文件写入或命令执行格式。\n"
             "2. 需要更好的问法时，可在资源选择阶段请求加载 `references/interaction-guide.md`。\n\n"
-            "蓝图确认信号：\n"
-            "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-            '{"creator_phase":"phase3_start"}\n'
-            "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+            "蓝图确认规则：\n"
+            "1. Phase 2 的输出必须先展示完整蓝图，再询问用户确认。\n"
+            "2. Phase 2 期间禁止输出 phase3_start JSON 标记；必须等用户在下一轮确认后由后端进入 Phase 3。\n\n"
             "运行时安全：\n"
             "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
             "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
@@ -625,9 +623,8 @@ def compose_kernel_creator_metadata_prompt(skill: SkillPackage) -> str:
         "- Phase 2：蓝图确认 - 设计并确认 Skill 架构蓝图\n"
         "- Phase 3+：工程化实现 - 执行文件创建和脚本编写\n\n"
         "蓝图确认信号：\n"
-        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-        '{"creator_phase":"phase3_start"}\n'
-        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "Phase 2 输出完整蓝图与确认问题；用户确认后由后端进入 Phase 3。\n"
+        "Phase 1-2 期间禁止输出 phase3_start JSON 标记。\n\n"
         "请确保：\n"
         "- 严格按 Phase 流程执行\n"
         "- Phase 1-2 只做需求澄清和蓝图确认\n"
@@ -754,13 +751,18 @@ Phase 2 的任务是：
 2. 使用 AskUserQuestion 询问用户确认蓝图
 
 【关键要求！】
-1. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
+1. **必须先输出完整蓝图正文**，不要只输出确认问题。
+2. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
    - 必须包含 `## 📋 Skill 架构蓝图` 标记
    - 必须明确列出 Skill 名称
    - 必须包含 I/O 契约、目录结构、工作流逻辑
-2. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
-3. **AskUserQuestion 选项中必须包含"对，开始做吧"**
-4. **不要输出 phase3_start 标记**，必须等用户确认后再说
+3. 完整蓝图之后，再输出一个 AskUserQuestion 确认问题。
+4. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
+5. **AskUserQuestion 选项必须使用以下三项原文**：
+   - "对，开始做吧"
+   - "大体对，但有些地方要改"
+   - "不对，我重新说一下"
+6. **不要输出 phase3_start 标记**，必须等用户确认后再说
 
 现在，让我们开始执行 Phase 2 吧！
 

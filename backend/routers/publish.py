@@ -12,7 +12,6 @@ from ..services.publish_config import (
     get_available_skills,
     get_publish_config,
     load_publish_configs,
-    regenerate_api_key,
     save_publish_config,
     toggle_publish_config,
     validate_skills_available,
@@ -95,15 +94,6 @@ async def remove_config(endpoint_id: str):
 async def toggle_config(endpoint_id: str):
     """Toggle active state of a publish configuration."""
     result = toggle_publish_config(endpoint_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Config not found")
-    return result
-
-
-@router.post("/configs/{endpoint_id}/regenerate-key")
-async def regenerate_key(endpoint_id: str):
-    """Regenerate the API key for a publish configuration."""
-    result = regenerate_api_key(endpoint_id)
     if not result:
         raise HTTPException(status_code=404, detail="Config not found")
     return result

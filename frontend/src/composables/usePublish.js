@@ -76,17 +76,6 @@ export function usePublish() {
     return updated
   }
 
-  async function regenerateKey(endpointId) {
-    const res = await fetch(`${API_BASE}/configs/${endpointId}/regenerate-key`, {
-      method: 'POST',
-    })
-    if (!res.ok) throw new Error('Failed to regenerate key')
-    const updated = await res.json()
-    const idx = configs.value.findIndex(c => c.endpoint_id === endpointId)
-    if (idx !== -1) configs.value[idx] = updated
-    return updated
-  }
-
   return {
     configs,
     availableSkills,
@@ -98,6 +87,5 @@ export function usePublish() {
     updateConfig,
     deleteConfig,
     toggleConfig,
-    regenerateKey,
   }
 }

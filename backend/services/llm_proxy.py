@@ -2,9 +2,10 @@ import httpx
 import json
 import os
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from ..config import settings
+from .model_router import _models_match
 
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,22 @@ def _build_payload(
     return payload
 
 
+def _ack_response_model(*, expected_model: str, actual_model: str | None, phase: str) -> None:
+    """Log and optionally enforce provider model acknowledgement."""
+    matched = _models_match(expected_model, actual_model) if actual_model else None
+    logger.info(
+        "[LLM][ack] phase=%s expected_model=%s actual_model=%s matched=%s",
+        phase,
+        expected_model,
+        actual_model or "",
+        matched,
+    )
+    if settings.model_ack_strict and actual_model and not matched:
+        raise ValueError(
+            f"LLM provider returned model {actual_model!r}, expected {expected_model!r}"
+        )
+
+
 def _build_headers() -> dict:
     return {
         "Content-Type": "application/json",
@@ -97,6 +114,8 @@ async def complete_chat_once(messages: list[dict], model: str) -> str:
         response.raise_for_status()
         data = response.json()
 
+    _ack_response_model(expected_model=model, actual_model=data.get("model"), phase="once")
+
     choices = data.get("choices") or []
     if not choices:
         logger.warning("[LLM][once] empty choices")
@@ -119,7 +138,11 @@ async def complete_chat_once(messages: list[dict], model: str) -> str:
     return content
 
 
-async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, None]:
+async def stream_chat(
+    messages: list[dict],
+    model: str,
+    model_ack_callback: Callable[[dict], None] | None = None,
+) -> AsyncGenerator[str, None]:
     """Stream chat completion from Ollama/OpenAI-compatible API."""
     url = _build_chat_completions_url(settings.llm_base_url)
     payload = _build_payload(messages=messages, model=model, stream=True)
@@ -129,6 +152,7 @@ async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, N
     logger.info("[LLM][stream] request model=%s url=%s messages=%d", model, url, len(messages))
 
     full_content: list[str] = []
+    ack_sent = False
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
@@ -157,6 +181,17 @@ async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, N
                     logger.warning("[LLM][stream] invalid json line=%s", data_str[:500])
                     continue
 
+                if not ack_sent:
+                    actual_model = data.get("model")
+                    _ack_response_model(expected_model=model, actual_model=actual_model, phase="stream")
+                    if model_ack_callback is not None:
+                        model_ack_callback({
+                            "expected_model": model,
+                            "actual_model": actual_model or "",
+                            "matched": _models_match(model, actual_model) if actual_model else None,
+                        })
+                    ack_sent = True
+
                 choices = data.get("choices") or []
                 if not choices:
                     continue
@@ -173,6 +208,9 @@ async def stream_chat(messages: list[dict], model: str) -> AsyncGenerator[str, N
                 if content:
                     full_content.append(content)
                     yield content
+
+    if not ack_sent:
+        _ack_response_model(expected_model=model, actual_model=None, phase="stream")
 
     final_text = "".join(full_content)
 

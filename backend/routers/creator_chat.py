@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from ..config import settings
 from ..services.kernel_loader import load_kernel_creator_body_prompt, load_kernel_creator_metadata_prompt, load_kernel_creator_for_phase, read_skill_resource_text
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.model_router import CODE_TASK, TEXT_TASK, VALIDATOR_TASK, route_model
 from .chat_models import ChatRequest
 from .chat_utils import (
     _last_user_text,
@@ -79,6 +80,109 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 _CREATOR_PHASE3_MARKER = '{"creator_phase":"phase3_start"}'
 
 
+def _message_role_content(msg) -> tuple[str, str]:
+    role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
+    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+    return str(role or ""), str(content or "")
+
+
+def _last_user_message_content(messages: list) -> str:
+    for msg in reversed(messages):
+        role, content = _message_role_content(msg)
+        if role == "user":
+            return content
+    return ""
+
+
+def _latest_blueprint_text(messages: list) -> str:
+    for msg in reversed(messages):
+        role, content = _message_role_content(msg)
+        if role == "assistant" and "📋 Skill 架构蓝图" in content:
+            return content[-5000:]
+    return ""
+
+
+_REVISION_INTENT_HINT_RE = re.compile(
+    r"(不需要|无需|不用|不要用|去掉|移除|删除|改成|换成|使用内置|内置.*模型|"
+    r"多模态模型|不需要\s*api|不需要.*密钥|不需要.*数据库|api\s*密钥|关键词.*数据库)",
+    re.IGNORECASE,
+)
+_PURE_CONFIRM_RE = re.compile(r"^\s*(确认|确认，继续构建|确认继续|继续构建|没问题|对，就这样|开始制作|开始做吧)[。.!！\s]*$")
+
+
+def _latest_user_sounds_like_revision(text: str) -> bool:
+    return bool(_REVISION_INTENT_HINT_RE.search(text or ""))
+
+
+def _latest_user_is_pure_confirmation(text: str) -> bool:
+    return bool(_PURE_CONFIRM_RE.match(text or ""))
+
+
+def _parse_phase_refinement(text: str) -> dict:
+    try:
+        data = json.loads(_strip_markdown_json_fence(text))
+    except json.JSONDecodeError:
+        return {"phase": "", "reason": "invalid_json"}
+    if not isinstance(data, dict):
+        return {"phase": "", "reason": "not_object"}
+    phase = str(data.get("phase") or "").strip()
+    if phase not in {"phase2", "phase3+"}:
+        phase = ""
+    return {"phase": phase, "reason": str(data.get("reason") or "")[:300]}
+
+
+async def _refine_creator_phase_with_model(messages: list, current_phase: str, model: str) -> dict:
+    """Use a lightweight classifier to avoid treating blueprint edits as build confirmation."""
+    last_user = _last_user_message_content(messages)
+    if current_phase != "phase3+" or not last_user or _latest_user_is_pure_confirmation(last_user):
+        return {"phase": current_phase, "reason": "heuristic_unambiguous", "used_model": False}
+
+    # Fast local guard for common revision wording; model handles the long tail.
+    if _latest_user_sounds_like_revision(last_user):
+        return {"phase": "phase2", "reason": "latest_user_revision_hint", "used_model": False}
+
+    classifier_model = route_model(
+        VALIDATOR_TASK,
+        requested_model=model,
+        reason="creator phase refinement",
+    ).model
+    messages_for_classifier = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator 阶段分类器，只输出 JSON。\n"
+                "如果最后一条用户消息是在修改/否定/替换已确认蓝图中的需求、依赖、资源、模型、API、数据库或执行方式，phase=phase2。\n"
+                "只有最后一条用户消息是明确确认开始构建且没有新增修改要求时，phase=phase3+。\n"
+                "输出格式：{\"phase\":\"phase2|phase3+\",\"reason\":\"...\"}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "heuristic_phase": current_phase,
+                    "last_user_message": last_user,
+                    "latest_blueprint_excerpt": _latest_blueprint_text(messages),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    try:
+        decision_text = await complete_chat_once(messages_for_classifier, classifier_model)
+        decision = _parse_phase_refinement(decision_text)
+    except Exception as exc:
+        logger.warning("creator phase refinement failed: %s", exc)
+        return {"phase": current_phase, "reason": "classifier_failed", "used_model": True}
+
+    return {
+        "phase": decision.get("phase") or current_phase,
+        "reason": decision.get("reason") or "classifier_empty",
+        "used_model": True,
+        "model": classifier_model,
+    }
+
+
 def _guess_current_phase(messages: list) -> str:
     """
     根据对话历史智能猜测当前所处的阶段。
@@ -117,6 +221,9 @@ def _guess_current_phase(messages: list) -> str:
         "开始制作",
         "开始干吧",
         "确认",
+        "确认，继续构建",
+        "继续构建",
+        "确认继续",
         "没问题",
         "对，就这样"
     ]
@@ -305,6 +412,15 @@ def _ensure_single_question(text: str) -> tuple[str, list[dict] | None]:
     return _parse_ask_user_question(text)
 
 
+def _strip_phase3_marker_from_visible_text(text: str) -> str:
+    """Remove accidental phase3 marker lines from user-visible Creator text."""
+    return re.sub(
+        r"(?m)^\s*\{\s*\"creator_phase\"\s*:\s*\"phase3_start\"\s*\}\s*\n?",
+        "",
+        text,
+    )
+
+
 @_safe_async_generator
 async def _execute_conversation_mode(
     final_messages: list[dict],
@@ -317,13 +433,14 @@ async def _execute_conversation_mode(
     """Phase 1-2 conversation mode: stream directly to user."""
     yield _sse({"status": None})
 
-    # Stream while collecting complete text
+    # Collect first, then stream sanitized user-visible text.
+    # Phase 1-2 must never show an accidental phase3 marker to the user.
     assistant_chunks: list[str] = []
     
     try:
+        yield _sse({"model_ack": {"task": "text", "model": model, "reason": f"creator {current_phase} conversation"}})
         async for chunk in stream_chat(final_messages, model):
             assistant_chunks.append(chunk)
-            yield _sse({"content": chunk})
     except Exception:
         logger.exception("Error during LLM streaming")
     
@@ -331,6 +448,9 @@ async def _execute_conversation_mode(
         return
     
     assistant_text = "".join(assistant_chunks)
+    visible_text = _strip_phase3_marker_from_visible_text(assistant_text)
+    if visible_text:
+        yield _sse({"content": visible_text})
     
     # Check for quick actions after streaming completes
     if current_phase in ["phase1", "phase2", "unknown"]:
@@ -352,10 +472,12 @@ async def _execute_phase3_mode(
     """Phase 3+ execution mode: collect model output and execute."""
 
     yield _sse({"type": "phase3_start", "message": "开始执行 Skill 创建流程..."})
+    yield _sse({"status": {"phase": "phase3", "message": "正在生成实现方案…"}})
 
     # 1. 收集模型完整输出（不流式展示给用户）
     assistant_chunks: list[str] = []
     try:
+        yield _sse({"model_ack": {"task": "code", "model": model, "reason": "creator phase3 implementation"}})
         async for chunk in stream_chat(final_messages, model):
             assistant_chunks.append(chunk)
     except Exception as e:
@@ -370,9 +492,11 @@ async def _execute_phase3_mode(
         return
 
     assistant_text = "".join(assistant_chunks)
+    yield _sse({"status": {"phase": "planning", "message": "正在解析实现输出并规划执行…"}})
 
     # 2. 调用执行函数
     try:
+        yield _sse({"status": {"phase": "executing", "message": "正在执行生成的文件操作…"}})
         exec_result = await _plan_and_execute_generated_output(
             assistant_text=assistant_text,
             request=request,
@@ -415,9 +539,74 @@ async def _execute_phase3_mode(
 
     yield "data: [DONE]\n\n"
 
+def _extract_creator_resource_catalog(body_prompt: str) -> list[dict]:
+    """Extract creator references/assets/scripts from a loaded prompt."""
+    catalog: list[dict] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"`(?P<path>(references|assets|scripts)/[^`]+)`(?P<title>：[^\n]+)?", re.M)
+
+    for match in pattern.finditer(body_prompt):
+        path = match.group("path").strip()
+        if path in seen:
+            continue
+        seen.add(path)
+        kind = path.split("/", 1)[0]
+        catalog.append({
+            "resource_handle": f"resource:{len(catalog)}",
+            "kind": kind,
+            "path": path,
+            "title": (match.group("title") or "").lstrip("：").strip(),
+            "allowed_actions": ["read_resource"],
+        })
+
+    return catalog
+
+
+def _parse_creator_resource_selection_decision(text: str, *, resource_catalog: list[dict]) -> dict:
+    """Parse creator resource selection from JSON or plain-text handles."""
+    valid_handles = {str(item.get("resource_handle")) for item in resource_catalog}
+    stripped = _strip_markdown_json_fence(text)
+    need_resources = False
+    raw_handles: list[str] = []
+    reason = ""
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        raw_handles = re.findall(r"resource:\d+", text)
+        need_resources = bool(raw_handles)
+        reason = "从普通文本中识别 resource handle" if raw_handles else "JSON 解析失败"
+    else:
+        if not isinstance(data, dict):
+            return {"need_resources": False, "resource_handles": [], "reason": "输出不是 JSON object"}
+        raw = data.get("resource_handles", [])
+        raw_handles = raw if isinstance(raw, list) else []
+        flag = data.get("need_resources", bool(raw_handles))
+        need_resources = flag.strip().lower() in {"true", "1", "yes", "y"} if isinstance(flag, str) else bool(flag)
+        reason = str(data.get("reason") or "").strip()
+
+    selected: list[str] = []
+    for item in raw_handles:
+        handle = str(item or "").strip()
+        if handle in valid_handles and handle not in selected:
+            selected.append(handle)
+        if len(selected) >= 5:
+            break
+
+    return {
+        "need_resources": bool(need_resources and selected),
+        "resource_handles": selected if need_resources else [],
+        "reason": reason,
+    }
+
+
 def _build_creator_resource_catalog():
-    """Build a catalog of available resources in current skill (if any)."""
-    return []
+    """Build a catalog of available resources in the kernel prompt."""
+    try:
+        return _extract_creator_resource_catalog(load_kernel_creator_body_prompt())
+    except Exception:
+        logger.exception("failed to build creator resource catalog")
+        return []
 
 
 async def _run_creator_resource_selection_round(
@@ -427,11 +616,26 @@ async def _run_creator_resource_selection_round(
     resource_catalog: list,
     current_phase_hint: str = "unknown"
 ):
-    """
-    Run a round of resource selection.
-    Returns structured resource decision, or None to continue conversation.
-    """
-    return {"is_structured": False}
+    """Run a planner round to choose creator resources when useful."""
+    if not resource_catalog:
+        return {"is_structured": True, "need_resources": False, "resource_handles": [], "reason": "无可用资源"}
+
+    messages = [
+        {"role": "system", "content": "只从给定 resource_catalog 选择最多 5 个 resource_handle。只输出 JSON。"},
+        {
+            "role": "user",
+            "content": json.dumps({
+                "current_phase_hint": current_phase_hint,
+                "loaded_skill_prompt": body_prompt,
+                "resource_catalog": resource_catalog,
+                "user_messages": _request_messages_with_files(request),
+            }, ensure_ascii=False),
+        },
+    ]
+    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    decision = _parse_creator_resource_selection_decision(decision_text, resource_catalog=resource_catalog)
+    decision["is_structured"] = True
+    return decision
 
 
 def _compose_creator_loaded_resources_prompt(
@@ -455,7 +659,10 @@ async def _make_stream_creator_generator(
 ) -> AsyncGenerator[str, None]:
     """Core generator function that produces SSE stream."""
     
-    current_phase = _guess_current_phase(getattr(request, "messages", []))
+    messages_list = getattr(request, "messages", [])
+    heuristic_phase = _guess_current_phase(messages_list)
+    phase_refinement = await _refine_creator_phase_with_model(messages_list, heuristic_phase, model)
+    current_phase = str(phase_refinement.get("phase") or heuristic_phase)
 
     phase_description = {
         "phase1": "Phase 1（深度需求挖掘）",
@@ -468,10 +675,13 @@ async def _make_stream_creator_generator(
         "phase_detection",
         "阶段检测",
         f"当前处于 {phase_description}",
-        {"current_phase": current_phase},
+        {
+            "current_phase": current_phase,
+            "heuristic_phase": heuristic_phase,
+            "phase_refinement": phase_refinement,
+        },
     )
 
-    messages_list = getattr(request, "messages", [])
     is_first_time = len(messages_list) == 0
     
     if is_first_time:
@@ -485,7 +695,7 @@ async def _make_stream_creator_generator(
         prompt_desc = "Phase2 指导（块 0+2）"
     elif current_phase == "phase3+":
         loading_phase = "phase3+"
-        prompt_desc = "Phase3+ 指导（块 0+3-6）"
+        prompt_desc = "Phase3+ 指导（块 0+4）"
     else:
         loading_phase = "phase1"
         prompt_desc = "Phase1 指导（块 0+1）"
@@ -753,9 +963,14 @@ async def _make_stream_creator_generator(
         return False
 
     if current_phase in ["phase3+", "phase3", "phase4", "phase5"]: # or _conversation_has_phase3(request.messages):
+        phase3_route = route_model(
+            CODE_TASK,
+            requested_model=getattr(request, "model", None) or settings.default_model,
+            reason="creator phase3 implementation",
+        )
         async for sse in _execute_phase3_mode(
             final_messages=final_messages,
-            model=model,
+            model=phase3_route.model,
             request=request,
             execution_root=execution_root,
             parent_skill_name=parent_skill_name,
@@ -788,7 +1003,8 @@ def _make_stream_creator(skill_context: dict, request: ChatRequest):
     This avoids the overhead and potential mis-planning of running the runtime
     planner on conversational Phase 1-2 turns that are purely asking questions.
     """
-    model = request.model or settings.default_model
+    requested_model = request.model or settings.default_model
+    model = route_model(TEXT_TASK, requested_model=requested_model, reason="creator conversation").model
     _MAX_CMD_DISPLAY_LENGTH = 60
     execution_root = skill_context.get("execution_root")
     parent_skill_name = skill_context.get("skill_name", "")

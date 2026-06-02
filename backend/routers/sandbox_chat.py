@@ -1,10 +1,12 @@
 """Sandbox-mode chat helpers, planners, and execution routines."""
 
 import asyncio
+import base64
 import functools
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -23,6 +25,11 @@ from ..services.kernel_loader import (
     read_skill_resource_text,
 )
 from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.model_router import (
+    TEXT_TASK,
+    infer_sandbox_response_task,
+    route_model,
+)
 from ..services.skill_manager import get_execution_skill_dir
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
@@ -629,6 +636,45 @@ async def _run_child_skill_selection_round(
         valid_child_refs=valid_child_refs,
     )
 
+_VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _request_messages_with_inline_images(request: ChatRequest, execution_root: Path | None) -> list[dict]:
+    """Build OpenAI-compatible multimodal user messages for VL models."""
+    messages = _request_messages_with_files(request)
+    if execution_root is None or not request.input_files:
+        return messages
+
+    image_parts: list[dict] = []
+    root = execution_root.resolve()
+    for item in request.input_files:
+        rel = str(item.get("path") or "")
+        path = (root / rel).resolve()
+        if path.suffix.lower() not in _VISION_IMAGE_EXTS:
+            continue
+        if not _is_within_sandbox(path, root) or not path.is_file():
+            continue
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+        })
+
+    if not image_parts:
+        return messages
+
+    for i in reversed(range(len(messages))):
+        if messages[i].get("role") == "user":
+            text = str(messages[i].get("content") or "")
+            messages[i] = {
+                "role": "user",
+                "content": [{"type": "text", "text": text}, *image_parts],
+            }
+            break
+    return messages
+
+
 def _strip_runtime_resource_manifest(body_prompt: str) -> str:
     """Remove generated resource manifest section from planner text.
 
@@ -649,103 +695,125 @@ def _strip_runtime_resource_manifest(body_prompt: str) -> str:
         + "规划 read_resource 时只能使用 resource_handle，不能生成 path。\n"
     )
 
+_COMMAND_BLOCK_LANGS = {"bash", "sh", "shell", "zsh", "console", "terminal"}
+_COMMAND_BLOCK_CODE_RE = re.compile(
+    r"(?im)(^|\n)\s*(?:python(?:3)?\s+)?scripts/[^\s`]+|"
+    r"(^|\n)\s*(?:python|python3|node|npm|npx|bash|sh)\s+[^\n]*scripts/"
+)
+_HOST_COMMAND_INSTRUCTION_RE = re.compile(
+    r"(?i)fenced\s+code\s+block|```|run_command|run command|execute command|"
+    r"执行命令|运行命令|执行脚本|运行脚本|调用脚本|scripts/|输出[^\n]{0,30}(?:命令|可执行)"
+)
+
+
+def _extract_skill_command_contract(body_prompt: str) -> dict:
+    """Extract concrete host-executable command examples declared in SKILL.md.
+
+    The sandbox must not ask the final model to invent script invocations from an
+    inline `scripts/...` mention.  A skill that wants host execution must include
+    a concrete shell fenced block that shows the invocation shape.
+    """
+    blocks = _extract_all_fenced_blocks(_strip_runtime_resource_manifest(body_prompt))
+    command_blocks: list[dict] = []
+
+    for block in blocks:
+        lang = (block.lang or "").lower()
+        code = (block.code or "").strip()
+        if lang not in _COMMAND_BLOCK_LANGS or not code:
+            continue
+        if not _COMMAND_BLOCK_CODE_RE.search(code):
+            continue
+        command_blocks.append({
+            "block_index": block.index,
+            "lang": lang,
+            "code": code[:600],
+            "before_context": block.before_context[-300:],
+        })
+
+    return {
+        "has_executable_command_block": bool(command_blocks),
+        "command_blocks": command_blocks[:5],
+    }
+
+
+def _final_instruction_requests_host_command(final_instruction: str) -> bool:
+    return bool(_HOST_COMMAND_INSTRUCTION_RE.search(final_instruction or ""))
+
+
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
-        "你是 Skill Agent 运行时动作规划器。\n\n"
+        "你是 Skill Agent 运行时动作意图判断器。\n\n"
         "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
         "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
-        "你的任务不是回答用户问题，而是根据 Loaded SKILL.md、resource_catalog、available_scripts 和用户请求，"
-        "判断当前 Skill 应该直接回答，还是需要宿主执行结构化 action。\n\n"
+        "你的任务不是回答用户问题，也不是凭空创建命令；你的任务是根据 Loaded SKILL.md、"
+        "resource_catalog、available_scripts 和用户请求判断本轮是否需要先让主模型输出显式可执行块。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
-        "2. resource_catalog 是宿主提供的真实资源树。\n"
-        "3. available_scripts 是宿主从磁盘实时扫描到的真实脚本文件列表（权威来源），其中出现的脚本无需查 resource_catalog 即可直接规划 run_command。\n"
-        "4. 当生成 init_skill.py 命令时，必须使用提供的 skill_name 参数，并使用 skills 作为 --path 参数的值。命令格式：python ../kernel/scripts/init_skill.py <skill_name> --path skills\n"
-        "5. 绝对不能使用 'skill-creator' 作为技能名称（这是 kernel 的名称）。\n"
-        "6. 你不能假设某个脚本存在；只能根据 available_scripts 或 resource_catalog 中真实出现的 scripts 资源规划 run_command。\n"
-        "7. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令执行。\n"
-        "8. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
+        "2. resource_catalog 和 available_scripts 只是宿主提供的真实资源树，用于安全校验候选动作是否可能存在；"
+        "不能用它们推导、补全或发明命令参数。\n"
+        "3. 是否执行命令，必须由后续主模型回复里的显式可执行 fenced code block 触发；"
+        "不要因为磁盘上存在脚本就直接规划 run_command，也不要让主模型临时拼接 Skill.md 中没有声明的命令。\n"
+        "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
+        "但不要在本轮规划 run_command、write_file 或 create_directory。\n"
+        "5. 如果任务需要运行 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求调用脚本，"
+        "只有在 Loaded SKILL.md 已经包含具体 shell fenced 命令示例时，才可使用 mode=direct_answer 并让主模型按该示例替换真实参数。\n"
+        "6. 如果 Skill.md 只写了 `scripts/...` 行内路径、‘调用脚本’等自然语言，但没有具体 fenced 命令示例，"
+        "必须使用 mode=ask_user，说明该 Skill 缺少可执行命令 block 示例，不能让主模型临时拼命令。\n"
+        "7. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
+        "8. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令。\n"
+        "9. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
         "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
-        "通常应使用 mode=direct_answer，不要规划 run_command。\n"
-        "9. 如果 available_scripts 和 resource_catalog 均没有 scripts 资源，默认不得规划 run_command。\n"
-        "10. 只有当 Loaded SKILL.md 明确要求运行外部命令，且该命令引用的脚本/资源确实存在于 available_scripts、"
-        "resource_catalog 或系统可执行环境中，才允许规划 run_command。\n"
-        "11. read_resource 只能使用 resource_handle，禁止输出 path。\n"
-        "12. resource_handle 必须来自 resource_catalog。\n"
-        "13. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
-        "14. 不要假装读取、假装执行、假装写入。\n"
-        "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        "应使用 mode=direct_answer，并让主模型按 Loaded SKILL.md 直接回答，不输出可执行块。\n"
+        "10. read_resource 只能使用 resource_handle，禁止输出 path。\n"
+        "11. resource_handle 必须来自 resource_catalog。\n"
+        "12. 如果任务需要 references/assets 的知识、示例、模板或配置，应优先规划 read_resource。\n"
+        "13. 不要假装读取、假装执行、假装写入。\n"
+        "14. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
         "允许的 action：\n"
         "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
-        "- run_command：执行一个真实可执行的命令。命令不得是函数名或伪代码。\n"
-        "- write_file：写入文件。\n"
-        "- create_directory：创建目录。\n"
-        "- display / ignore：展示或忽略。\n\n"
-        "文件生成任务强制规则（高优先级，覆盖规则 6）：\n"
-        "当用户明确请求生成 PPT/PPTX/幻灯片、Excel/XLSX、Word/DOCX、CSV、图表图片、PDF 等可下载格式文件时：\n"
-        "  a. 如果 available_scripts 或 resource_catalog 中存在可执行的 scripts 资源（如 build_pptx.js、read_excel.py 等），"
-        "必须使用 mode=execute 并规划 run_command；不得使用 direct_answer。\n"
-        "  b. 文本模型无法直接生成二进制文件（.pptx/.xlsx/.docx），必须通过执行脚本生成。\n"
-        "  c. SKILL.md 中为文件生成任务指定了专用脚本时，stdin 字段应包含完整的输入内容（如幻灯片 JSON 数组）。\n\n"
+        "- display / ignore：展示或忽略。\n"
+        "禁止的 action：run_command、write_file、create_directory；这些只能由后续主模型显式 fenced block 触发。\n\n"
+        "显式可执行块触发规则（给 final_instruction 使用）：\n"
+        "- 需要执行命令时，只能要求主模型复用 Loaded SKILL.md 已声明的具体 shell fenced 命令示例，"
+        "替换用户真实参数后输出；禁止从 available_scripts 或脚本文件名临时发明 CLI 参数。\n"
+        "- 需要写文件时，要求主模型在代码块前写 `写入文件：<path>` 或 `保存到：<path>`，"
+        "文件内容必须放在紧随其后的 fenced code block 内。\n"
+        "- 后端只执行主模型回复中已经出现的 fenced block；资源存在性只做安全校验，不做触发条件。\n\n"
         "mode 选择规则：\n"
-        "- direct_answer：Skill 可由模型直接完成，且产物是纯文本/Markdown（不是格式化文件），例如写故事、公文、总结、翻译、分析。\n"
-        "- execute：需要宿主执行 action，例如读取资源、运行脚本、写入文件，或生成 PPT/Excel 等格式文件。\n"
-        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全执行。\n"
+        "- direct_answer：主模型继续生成最终回复；如果需要动作，也必须在该回复中输出显式 fenced block 供后端识别执行。\n"
+        "- execute：只用于 read_resource/display/ignore 这类宿主受控动作；不得包含 run_command/write_file/create_directory。\n"
+        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
-        "run_command 约束：\n"
-        "1. 不得输出类似 generate_story、process、main、run_task 这样的函数名作为 command。\n"
-        "2. 不得凭空生成不在 available_scripts 中的 scripts/main.py、scripts/run.py 等路径。\n"
-        "3. 如果 command 引用了 scripts/...，该路径必须能在 available_scripts 或 resource_catalog 中看到。\n"
-        "4. 如果 available_scripts 和 resource_catalog 的 scripts 均为空，而任务又可由语言模型直接完成，应使用 direct_answer。\n"
-        "5. 如果 Loaded SKILL.md 中只有示例命令，但对应脚本不在 available_scripts 中，应使用 ask_user，并在 errors 中说明脚本不存在。\n"
-        "6. command 必须是完整的可执行命令行，包含脚本所需的所有参数，并用用户消息中的实际值替换 Loaded SKILL.md 里的占位符\n"
-        "（例如 `<filepath>`、`{file}`、`<input>` 等）；不得在 command 中保留任何占位符或省略必要参数。\n"
-        "7. 如果某个必要参数（例如文件路径、用户数据）在用户消息中未提供且无法从上下文推断，"
-        "必须使用 ask_user 模式，并在 missing 列表中说明缺少哪些信息；不得用不完整的命令继续 execute。\n\n"
         "输出格式：\n"
         "{\n"
         "  \"mode\": \"execute | direct_answer | ask_user | not_applicable\",\n"
         "  \"actions\": [\n"
         "    {\n"
-        "      \"action\": \"read_resource\",\n"
+        "      \"action\": \"read_resource | display | ignore\",\n"
         "      \"resource_handle\": \"resource:0\",\n"
-        "      \"reason\": \"需要读取参考资料\"\n"
-        "    },\n"
-        "    {\n"
-        "      \"action\": \"run_command\",\n"
-        "      \"command\": \"scripts/process.py $INPUT_SESSION_DIR/data.xlsx --format markdown\",\n"
-        "      \"stdin\": \"<可选：需要传给命令的标准输入>\",\n"
-        "      \"reason\": \"需要运行真实存在的脚本或工具，命令包含从用户消息中提取的实际参数值\"\n"
+        "      \"reason\": \"为什么需要该动作\"\n"
         "    }\n"
         "  ],\n"
-        "  \"final_instruction\": \"执行完成后优先基于 observation 回答；direct_answer 时按 Loaded SKILL.md 直接回答\",\n"
         "  \"missing\": [],\n"
-        "  \"errors\": []\n"
+        "  \"errors\": [],\n"
+        "  \"final_instruction\": \"direct_answer 时给主模型的执行提示；需要动作时只能引用 SKILL.md 中已有 Markdown 命令示例\"\n"
         "}\n"
-        "\n"
-        "重要：如果用户上传了文件，命令中引用该文件时应使用环境变量路径。\n"
-        "- Shell 脚本：`$INPUT_SESSION_DIR/<文件名>` 或 `$INPUT_DIR/<相对路径>`\n"
-        "- Python 脚本：`os.environ['INPUT_SESSION_DIR'] + '/<文件名>'` 或 "
-        "`os.path.join(os.environ['INPUT_DIR'], '<相对路径>')`\n"
-        "不得使用 `uploads/`、`inputs/` 等相对路径，因为执行目录并非上传文件的存储位置。\n"
-        "特别注意：Loaded SKILL.md 中的示例命令（例如 `uploads/data.xlsx`）只是占位符格式说明，"
-        "其中的文件名（如 `data.xlsx`）并非真实文件名。\n"
-        "必须从用户消息（user_messages 中的【已附上传文件：...】）中提取真实文件名，"
-        "并以 `$INPUT_SESSION_DIR/<真实文件名>` 形式写入 command，不得保留 SKILL.md 中的示例文件名。\n"
     )
+
 
 def _normalize_skill_runtime_plan(
     plan: dict,
     *,
     resource_catalog: list[dict] | None = None,
     execution_root: Path | None = None,
+    command_contract: dict | None = None,
 ) -> dict:
     """Normalize planner JSON into executor-compatible plan.
 
     关键原则：
     - read_resource 的真实 path 不来自模型，而是由宿主根据 resource_handle 映射得到；
-    - run_command 不允许凭空执行函数名或不存在的脚本；
-    - command 只做通用可执行性校验，不硬编码 python/node/bash。
+    - runtime planner 不直接触发 run_command/write_file/create_directory；
+    - 命令和写文件只能由后续主模型回复中的 fenced code block 触发。
     """
     if not isinstance(plan, dict):
         raise ValueError("运行时规划模型输出必须是 JSON object")
@@ -781,35 +849,15 @@ def _normalize_skill_runtime_plan(
             errors.append({"error": f"不支持的 action: {action}", "action_item": action_item})
             continue
 
-        if action == "run_command":
-            command = str(action_item.get("command") or "").strip()
-            if not command:
-                errors.append({"error": "run_command 缺少 command", "action_item": action_item})
-                continue
+        if action in {"run_command", "write_file", "create_directory"}:
+            errors.append({
+                "error": f"{action} 只能由主模型回复中的显式 fenced code block 触发",
+                "action_item": action_item,
+                "hint": "runtime planner 只做意图判断和 read_resource；不要直接规划执行命令或写文件。",
+            })
+            continue
 
-            stdin_text = action_item.get("stdin", None)
-            if stdin_text is not None:
-                stdin_text = str(stdin_text)
-
-            # 运行前预检：不执行，只验证命令形态和 Skill 内资源路径。
-            try:
-                _prepare_command_argv(command, base_dir=execution_root)
-            except Exception as exc:
-                errors.append({
-                    "error": "run_command 预检失败",
-                    "command": command,
-                    "detail": str(exc),
-                    "hint": (
-                        "不要把函数名、伪代码或不存在的脚本当成命令。"
-                        "如果当前 Skill 可直接由模型完成，请使用 mode=direct_answer。"
-                    ),
-                })
-                continue
-
-            action_item["command"] = command
-            action_item["stdin"] = stdin_text
-
-        elif action == "read_resource":
+        if action == "read_resource":
             resource_handle = str(action_item.get("resource_handle") or "").strip()
             if not resource_handle:
                 errors.append({"error": "read_resource 缺少 resource_handle", "action_item": action_item})
@@ -838,18 +886,6 @@ def _normalize_skill_runtime_plan(
             action_item["path"] = resource["path"]
             action_item["resource_kind"] = resource["kind"]
 
-        elif action in {"write_file", "create_directory"}:
-            path = str(action_item.get("path") or "").strip()
-            if not path:
-                errors.append({"error": f"{action} 缺少 path", "action_item": action_item})
-                continue
-            action_item["path"] = path
-
-        if action == "write_file":
-            if "content" not in action_item:
-                errors.append({"error": "write_file 缺少 content", "action_item": action_item})
-                continue
-            action_item["content"] = str(action_item.get("content") or "")
 
         action_item["block_index"] = int(action_item.get("block_index", -1))
         normalized_actions.append(action_item)
@@ -859,13 +895,25 @@ def _normalize_skill_runtime_plan(
     if mode == "execute" and not normalized_actions and errors:
         mode = "ask_user"
 
+    final_instruction = str(plan.get("final_instruction") or "").strip()
+    if (
+        mode == "direct_answer"
+        and _final_instruction_requests_host_command(final_instruction)
+        and not (command_contract or {}).get("has_executable_command_block")
+    ):
+        mode = "ask_user"
+        errors.append({
+            "error": "Skill.md 缺少可执行命令 fenced block 示例，禁止主模型临时拼接命令",
+            "hint": "请在 Creator 生成的 SKILL.md 中用普通 Markdown 写入具体 ```bash 命令示例，并让脚本接口与示例一致。",
+        })
+
     return {
         "mode": mode,
         "tasks": normalized_actions,
         "actions": normalized_actions,
         "missing": missing,
         "errors": errors,
-        "final_instruction": str(plan.get("final_instruction") or "").strip(),
+        "final_instruction": final_instruction,
     }
 
 async def _run_skill_runtime_planner_round(
@@ -886,6 +934,7 @@ async def _run_skill_runtime_planner_round(
     """
     resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
     planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
+    command_contract = _extract_skill_command_contract(planner_body_prompt)
 
     # 扫描磁盘上真实存在的脚本文件，注入给 planner 以便直接规划 run_command
     available_scripts: list[str] = []
@@ -916,8 +965,9 @@ async def _run_skill_runtime_planner_round(
             "planner_must_not_generate_resource_paths": True,
             "read_resource_uses_resource_handle_only": True,
             "resource_path_resolution_is_host_owned": True,
-            "do_not_depend_on_main_model_markdown_output": True,
+            "execution_requires_main_model_fenced_block": True,
             "action_observation_loop": True,
+            "command_generation_requires_skill_md_markdown_example": True,
         },
     }
 
@@ -925,6 +975,7 @@ async def _run_skill_runtime_planner_round(
         {"role": "system", "content": _compose_skill_runtime_planner_prompt()},
         {"role": "user", "content": f"## Skill 执行规范\n{planner_body_prompt}"},
         {"role": "user", "content": f"## 可用脚本\n{json.dumps(available_scripts, ensure_ascii=False)}"},
+        {"role": "user", "content": f"## SKILL.md Markdown 命令块示例\n{json.dumps(command_contract, ensure_ascii=False)}"},
         {"role": "user", "content": f"## 用户请求\n{_last_user_text(request)}"},
         {"role": "user", "content": f"## 执行根目录\n{str(execution_root) if execution_root else ''}"},
         {"role": "user", "content": f"## 技能名称\n{skill_name}"},
@@ -973,6 +1024,7 @@ async def _run_skill_runtime_planner_round(
             raw_plan,
             resource_catalog=resource_catalog,
             execution_root=execution_root,
+            command_contract=command_contract,
         )
     )
 
@@ -1080,7 +1132,7 @@ async def _run_block_planner_round(
                 "multiple_paths": "如果一次创建多个目录，拆成多个 create_directory 任务。",
             },
             "do_not_use": [
-                "SKILL.md template",
+                "SKILL.md code example that was not present in assistant_text",
                 "system prompt",
                 "resource manifest",
                 "implicit intent",
@@ -1604,7 +1656,22 @@ def _execute_single_task(
             "EXECUTION_ROOT": str(execution_root) if execution_root else "",
             "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
             "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+            # Expose configured model endpoints to generated skill scripts so
+            # creative/text/image tasks can use the same capability routing as
+            # the host instead of hard-coded templates or fake image stubs.
+            "LLM_BASE_URL": settings.llm_base_url,
+            "DEFAULT_MODEL": settings.default_model,
+            "TEXT_MODEL": settings.text_model or settings.default_model,
+            "CODE_MODEL": settings.code_model or settings.default_model,
+            "IMAGE_MODEL": settings.image_model or settings.default_model,
+            "VISION_MODEL": settings.vision_model or settings.default_model,
+            "PLANNER_MODEL": settings.planner_model or settings.default_model,
+            "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
         }
+        if settings.llm_api_key:
+            _run_cmd_extra_env["LLM_API_KEY"] = settings.llm_api_key
+        if settings.openai_api_key:
+            _run_cmd_extra_env["OPENAI_API_KEY"] = settings.openai_api_key
         if session_input_dir is not None:
             _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(session_input_dir)
 
@@ -1841,6 +1908,32 @@ def _execute_planned_actions(
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。
 
+def _render_success_stdout_payload(result: dict) -> str | None:
+    """Render structured JSON stdout from a successful command as final user content."""
+    for item in result.get("results") or []:
+        if not isinstance(item, dict) or not item.get("success"):
+            continue
+        stdout = str(item.get("stdout") or "").strip()
+        if not stdout:
+            continue
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("text") or payload.get("markdown") or "").strip()
+        image = str(payload.get("image") or payload.get("image_path") or "").strip()
+        parts: list[str] = []
+        if text:
+            parts.append(text)
+        if image and image not in text:
+            parts.append(f"![插图]({image})")
+        if parts:
+            return "\n\n".join(parts)
+    return None
+
+
 def _format_execution_report(result: dict) -> str:
     if not result.get("executed"):
         reason = result.get("reason", "未知原因")
@@ -1925,7 +2018,8 @@ async def _plan_and_execute_generated_output(
 
 def _make_stream(skill_context: dict, request: ChatRequest):
     """Staged Skill execution with shared runtime planning and action execution."""
-    model = request.model or settings.default_model
+    requested_model = request.model or settings.default_model
+    model = route_model(TEXT_TASK, requested_model=requested_model, reason="sandbox default response").model
     _MAX_CMD_DISPLAY_LENGTH = 60
     force_body = bool(skill_context.get("force_body", False))
     enable_action_execution = bool(skill_context.get("enable_action_execution", False))
@@ -2177,6 +2271,18 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         execution_root=execution_root,
                     )
 
+                    response_route = route_model(
+                        infer_sandbox_response_task(
+                            body_prompt=body_prompt,
+                            user_text=_last_user_text(request),
+                            plan=runtime_plan,
+                        ),
+                        requested_model=requested_model,
+                        reason="sandbox runtime plan classification",
+                    )
+                    response_model = response_route.model
+                    yield _sse({"model_ack": response_route.ack()})
+
                     mode = runtime_plan.get("mode")
                     tasks = runtime_plan.get("tasks") or []
 
@@ -2340,7 +2446,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         final_answer = await _generate_final_answer_from_observation(
                             body_prompt=body_prompt,
                             request=request,
-                            model=model,
+                            model=response_model,
                             plan=runtime_plan,
                             execution_result=exec_result,
                         )
@@ -2410,6 +2516,19 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield "data: [DONE]\n\n"
                     return
 
+            response_route = route_model(
+                infer_sandbox_response_task(
+                    body_prompt=body_prompt,
+                    user_text=_last_user_text(request),
+                    plan=locals().get("runtime_plan") if isinstance(locals().get("runtime_plan"), dict) else None,
+                    input_files=request.input_files,
+                ),
+                requested_model=requested_model,
+                reason="sandbox final response classification",
+            )
+            response_model = response_route.model
+            yield _sse({"model_ack": response_route.ack()})
+
             final_messages: list[dict] = []
             final_messages.append(
                 {
@@ -2417,6 +2536,22 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     "content": body_prompt,
                 }
             )
+
+            _runtime_plan_for_final = locals().get("runtime_plan")
+            if isinstance(_runtime_plan_for_final, dict):
+                _final_instruction = str(_runtime_plan_for_final.get("final_instruction") or "").strip()
+                if _final_instruction:
+                    final_messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "运行时动作意图判断器给出的本轮执行提示：\n"
+                                f"{_final_instruction}\n\n"
+                                "如果该提示要求输出可执行动作，必须把真实命令或文件内容放入 fenced code block；"
+                                "后端只会执行本轮回复中已经出现的 fenced code block。"
+                            ),
+                        }
+                    )
 
             if strict_skill_execution:
                 final_messages.append(
@@ -2442,12 +2577,24 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     }
                 )
 
-            final_messages.extend(_request_messages_with_files(request))
+            if response_route.task == "vision":
+                final_messages.extend(_request_messages_with_inline_images(request, execution_root))
+            else:
+                final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
-            async for chunk in stream_chat(final_messages, model):
+            ack_payload = {}
+
+            def _capture_final_ack(payload: dict) -> None:
+                ack_payload.update(payload)
+
+            async for chunk in stream_chat(final_messages, response_model, model_ack_callback=_capture_final_ack):
+                if ack_payload:
+                    yield _sse({"model_ack": {**response_route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
+                    ack_payload.clear()
                 assistant_chunks.append(chunk)
-                yield _sse({"content": chunk})
+                if not enable_action_execution:
+                    yield _sse({"content": chunk})
 
             assistant_text = "".join(assistant_chunks)
 
@@ -2463,7 +2610,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
                     if exec_result.get("executed"):
-                        yield _sse({"content": _format_execution_report(exec_result)})
+                        rendered_payload = _render_success_stdout_payload(exec_result)
+                        if rendered_payload:
+                            yield _sse({"content": rendered_payload})
+                        else:
+                            yield _sse({"content": assistant_text})
+                            yield _sse({"content": _format_execution_report(exec_result)})
 
                         # Emit structured output_files event for the fallback path too.
                         output_files = exec_result.get("output_files") or []
@@ -2484,6 +2636,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield _sse({"error": "错误：后台规划或执行文件操作失败"})
                     yield "data: [DONE]\n\n"
                     return
+            if enable_action_execution and assistant_text and not locals().get("exec_result", {}).get("executed"):
+                yield _sse({"content": assistant_text})
             yield _sse({"status": None})
             yield "data: [DONE]\n\n"
 

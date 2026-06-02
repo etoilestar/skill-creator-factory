@@ -11,6 +11,7 @@ These endpoints decouple the file-creation phase from the main
 - POST /api/creator/package-skill       — package Skill directory into .skill archive
 """
 
+import ast
 import json
 import logging
 import re
@@ -24,9 +25,29 @@ from pydantic import BaseModel
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.llm_proxy import stream_chat
+from ..services.model_router import route_creator_file_model
 from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
+
+_SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
+
+宿主 Markdown 执行说明（写入生成的 SKILL.md 正文时必须保持常见 Markdown 形态）：
+- SKILL.md 是普通 Markdown 说明书，只描述做什么、何时使用资源，以及 assistant 在运行时应如何表达动作；不要引入自定义协议章节（例如 `Runtime Contract` JSON）。
+- 对纯文本即可完成的任务，明确写“直接回答”，不要要求运行脚本。
+- 如果确实需要运行 scripts/ 下的脚本，使用市面常见的 Markdown fenced code block 给出命令示例/模板，例如：
+  执行命令：
+  ```bash
+  python scripts/<script-name> '{"topic":"{{topic}}","keywords":"{{keywords}}"}'
+  ```
+- 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 参数映射用普通 Markdown 列表说明，例如 `topic` 从用户输入提取、`keywords` 从用户输入提取、可选参数给出默认值；不要使用单独的 JSON contract。
+- 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
+- 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
+- assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
+- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
+- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时调用宿主注入的 `LLM_BASE_URL`、`TEXT_MODEL`、`IMAGE_MODEL`、`VISION_MODEL`；不能用固定模板、随机词表、ASCII 图或占位文件冒充模型能力。
+"""
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
 
@@ -196,6 +217,216 @@ def _validate_skill_name(skill_name: str) -> str:
     return name
 
 
+def _extract_first_fenced_block(content: str) -> str | None:
+    """Return the first fenced block body from content, or None."""
+    lines = content.splitlines(keepends=True)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        match = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
+        if not match:
+            i += 1
+            continue
+
+        fence = match.group(1)
+        fence_char = fence[0]
+        fence_len = len(fence)
+        code_lines: list[str] = []
+        i += 1
+
+        while i < len(lines):
+            close_line = lines[i]
+            close_stripped = close_line.lstrip()
+            close_match = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}\s*$",
+                close_stripped.rstrip("\n"),
+            )
+            if close_match:
+                return "".join(code_lines).strip()
+            code_lines.append(close_line)
+            i += 1
+
+        return "".join(code_lines).strip()
+
+    return None
+
+
+def _extract_target_file_from_bundle(content: str, file_path: str) -> str | None:
+    """Extract the requested file when a model returns a multi-file bundle."""
+    escaped_path = re.escape(file_path)
+    heading_re = re.compile(
+        rf"(?im)^\s*#{{1,6}}\s*(?:[^\n`]*?)`?{escaped_path}`?\s*$"
+    )
+
+    for match in heading_re.finditer(content):
+        section = content[match.end():]
+        block = _extract_first_fenced_block(section)
+        if block is not None:
+            return block
+
+    return None
+
+
+_MULTI_FILE_MARKER_RE = re.compile(
+    r"(?im)^\s*#{1,6}\s*(?:[^\n`]*)(?:SKILL\.md|scripts/|references/|assets/)"
+)
+
+
+_SCRIPT_FAKE_IMPLEMENTATION_RE = re.compile(
+    r"placeholder|TODO|your_api_key|api\.example\.com|example\.com|模拟|占位|假装|"
+    r"实际使用时|实际开发中|仅为演示|演示目的|空的占位图|纯色图片|ASCII插图|ascii_art|fake",
+    re.IGNORECASE,
+)
+_SKILL_CUSTOM_RUNTIME_CONTRACT_RE = re.compile(r"(?im)^\s*#{1,6}\s*Runtime\s+Contract\s*$")
+_HOST_MODEL_CAPABILITY_RE = re.compile(
+    r"宿主.{0,12}模型|内置.{0,12}模型|配置.{0,12}模型|文本模型|图像模型|视觉模型|"
+    r"多模态|大语言模型|LLM|AI生成|模型生成|调用模型|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL",
+    re.IGNORECASE,
+)
+_CONFIGURED_MODEL_CALL_RE = re.compile(
+    r"LLM_BASE_URL|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL|/v1/chat/completions|"
+    r"chat/completions|complete_chat_once|stream_chat|openai",
+    re.IGNORECASE,
+)
+
+
+def _reject_custom_skill_md_protocol(content: str) -> None:
+    """Reject non-standard runtime protocol sections in generated SKILL.md."""
+    if _SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content):
+        raise ValueError(
+            "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；"
+            "请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
+        )
+
+
+def _reject_fake_script_implementation(file_path: str, content: str) -> None:
+    """Reject placeholder/mock scripts that pretend to implement capabilities."""
+    if _SCRIPT_FAKE_IMPLEMENTATION_RE.search(content):
+        raise ValueError(
+            f"{file_path} 包含占位/模拟/假 API 实现。"
+            "Creator 生成的脚本必须具备真实可执行功能；"
+            "如需图像或多模态能力，应通过宿主配置的模型/服务完成，不能写 placeholder 文件或假装调用 API。"
+        )
+
+
+def _requires_configured_model_call(*, skill_md: str, file_path: str) -> bool:
+    """Return whether SKILL.md declares host-model-powered behavior for a script.
+
+    This intentionally keys off model-capability wording (host/built-in/
+    configured models, LLM, multimodal, image/vision models) rather than a
+    finite list of Skill domains.
+    """
+    if not skill_md:
+        return False
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return False
+    return bool(_HOST_MODEL_CAPABILITY_RE.search(skill_md))
+
+
+def _script_uses_configured_model(content: str) -> bool:
+    """Detect whether script calls the configured host LLM/VL endpoint."""
+    return bool(_CONFIGURED_MODEL_CALL_RE.search(content))
+
+
+def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Reject scripts that claim host-model behavior but do not call models."""
+    if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
+        return
+    if _script_uses_configured_model(content):
+        return
+    raise ValueError(
+        f"{file_path} 的 SKILL.md 声明需要使用宿主/内置/配置模型，但脚本没有调用这些模型。"
+        "脚本不能用固定模板、随机词表或 ASCII 图替代模型能力；"
+        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL，"
+        "或者把该 Skill 设计为无需 scripts/ 的模型直接回答。"
+    )
+
+def _validate_generated_file_content(file_path: str, content: str) -> None:
+    """Reject content that is clearly not the requested single file."""
+    if file_path == "SKILL.md":
+        _reject_custom_skill_md_protocol(content)
+        return
+
+    if file_path.startswith("scripts/"):
+        _reject_fake_script_implementation(file_path, content)
+        if "```" in content or _MULTI_FILE_MARKER_RE.search(content):
+            raise ValueError(
+                f"{file_path} 生成内容包含 Markdown 代码块或多文件包，"
+                "不是单个脚本源码。请重新生成该文件。"
+            )
+
+        if Path(file_path).suffix.lower() == ".py":
+            try:
+                ast.parse(content)
+            except SyntaxError as exc:
+                raise ValueError(
+                    f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+                ) from exc
+
+
+def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
+    """Return shell command templates in SKILL.md that invoke script_path."""
+    commands: list[str] = []
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", skill_md, flags=re.IGNORECASE):
+        command = match.group(1).strip()
+        if script_path in command:
+            commands.append(command)
+    return commands
+
+
+def _command_uses_json_argv(command: str) -> bool:
+    return "{" in command and "}" in command
+
+
+def _script_reads_json_argv(content: str) -> bool:
+    return "json.loads" in content and "sys.argv" in content
+
+
+def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Validate script source against existing SKILL.md command examples."""
+    _reject_fake_script_implementation(file_path, content)
+    _validate_configured_model_usage_static(file_path=file_path, content=content, skill_md=skill_md)
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return
+
+    json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
+    if json_argv_commands and not _script_reads_json_argv(content):
+        raise ValueError(
+            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
+            "禁止保存与命令示例不一致的脚本。"
+        )
+
+    for cmd in commands:
+        for key in re.findall(r"{{\s*([a-zA-Z_][\w-]*)\s*}}", cmd):
+            if key not in content:
+                raise ValueError(
+                    f"{file_path} 的 Markdown 命令示例包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
+                )
+
+
+def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
+    """Refuse saving scripts that do not match the current SKILL.md contract."""
+    if not file_path.startswith("scripts/"):
+        return
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    if not skill_md_path.is_file():
+        return
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+
+def _sanitize_generated_file_content(file_path: str, content: str) -> str:
+    """Normalize model output into exactly the requested file content."""
+    extracted = _extract_target_file_from_bundle(content, file_path)
+    sanitized = _strip_code_fence(extracted if extracted is not None else content)
+    _validate_generated_file_content(file_path, sanitized)
+    return sanitized
+
+
 def _strip_code_fence(content: str) -> str:
     """Strip wrapping code-fence markers that a model may output despite instructions.
 
@@ -244,8 +475,12 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. 执行说明应指导宿主 AI 如何理解用户请求、调用脚本/工具、生成回答。\n"
-            "5. 不要在输出内容的外侧套 ``` 代码块。\n\n"
+            "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须包含下面的宿主 Markdown 执行说明；\n"
+            "   即使蓝图没有脚本，也应说明纯文本任务可直接回答，不要假装执行。\n"
+            "6. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部允许包含示例 fenced code block。\n"
+            "7. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
             f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
         )
     elif file_path.startswith("scripts/"):
@@ -255,9 +490,13 @@ def _build_generate_file_prompt(
             "要求：\n"
             f"1. 只输出完整可运行的 {lang} 代码，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出内容。\n"
-            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图中描述的一致。\n"
-            "4. 所有导入的第三方库必须真实存在且常见。\n"
-            "5. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
+            "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
+            "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
+            "6. 如果脚本承担需要模型判断的开放式能力，必须调用宿主注入的 LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL（OpenAI-compatible /v1/chat/completions），不要用固定模板或随机词表冒充模型能力。\n"
+            "7. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
+            "8. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
+            "9. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):
@@ -350,7 +589,12 @@ async def generate_file(request: GenerateFileRequest):
     """
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
-    model = request.model or settings.default_model
+    route = route_creator_file_model(
+        file_path=request.file_path,
+        purpose=request.purpose,
+        requested_model=request.model,
+    )
+    model = route.model
 
     prompt_messages = _build_generate_file_prompt(
         file_path=request.file_path,
@@ -362,8 +606,24 @@ async def generate_file(request: GenerateFileRequest):
 
     async def event_stream():
         try:
-            async for chunk in stream_chat(prompt_messages, model):
-                yield _sse({"content": chunk})
+            yield _sse({"model_ack": route.ack()})
+            ack_payload = {}
+
+            def _capture_ack(payload: dict) -> None:
+                ack_payload.update(payload)
+
+            generated_chunks: list[str] = []
+            async for chunk in stream_chat(prompt_messages, model, model_ack_callback=_capture_ack):
+                if ack_payload:
+                    yield _sse({"model_ack": {**route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
+                    ack_payload.clear()
+                generated_chunks.append(chunk)
+
+            content = _sanitize_generated_file_content(
+                request.file_path,
+                "".join(generated_chunks),
+            )
+            yield _sse({"content": content})
             yield _sse({"done": True})
         except Exception as exc:
             logger.exception(
@@ -387,7 +647,11 @@ async def write_file(request: WriteFileRequest):
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
 
-    content = _strip_code_fence(request.content)
+    try:
+        content = _sanitize_generated_file_content(request.file_path, request.content)
+        _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if request.file_path == "SKILL.md":
         result = run_action({"action": "write", "name": skill_name, "content": content})

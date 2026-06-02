@@ -34,5 +34,5 @@ COPY backend/ ./backend/
 # skills/ and kernel/ are provided via Docker volumes at runtime
 RUN mkdir -p skills kernel
 
-CMD ["bash", "-c", "/usr/sbin/sshd && tail -f /dev/null"]
-#CMD ["bash", "-c", "/usr/sbin/sshd && uvicorn backend.main:app --host 0.0.0.0 --port 8000"]
+#CMD ["bash", "-c", "/usr/sbin/sshd && tail -f /dev/null"]
+CMD ["bash", "-c", "/usr/sbin/sshd && uvicorn backend.main:app --host 0.0.0.0 --port 8000"]

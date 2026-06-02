@@ -120,6 +120,7 @@ async def test_complete_chat_once_success():
     from backend.services.llm_proxy import complete_chat_once
 
     response_data = {
+        "model": "test-model",
         "choices": [{"message": {"content": "Hello from LLM"}}]
     }
 
@@ -179,6 +180,15 @@ async def test_complete_chat_once_http_error():
         with pytest.raises(httpx.HTTPStatusError):
             await complete_chat_once([{"role": "user", "content": "hi"}], "test-model")
 
+
+
+
+def test_models_match_exact_and_canonical_suffix():
+    from backend.services.model_router import _models_match
+
+    assert _models_match("qwen", "qwen")
+    assert _models_match("qwen", "ollama/qwen")
+    assert not _models_match("qwen", "llama")
 
 # ---------------------------------------------------------------------------
 # check_connection — mocked HTTP

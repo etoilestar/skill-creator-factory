@@ -13,3 +13,5 @@ skills/*/
 .skill-governance/
 
 .DS_Store
+docker-compose.yml
+backend/config.py

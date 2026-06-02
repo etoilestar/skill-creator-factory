@@ -28,8 +28,8 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - MODEL_ROUTING_JSON=${MODEL_ROUTING_JSON:-}
       - MODEL_ACK_STRICT=${MODEL_ACK_STRICT:-false}
-      - TEMPERATURE=${TEMPERATURE:-0.7}
-      - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - TEMPERATURE=${TEMPERATURE:-}
+      - MAX_TOKENS=${MAX_TOKENS:-}
 # Makes host.docker.internal resolve to the host on Linux as well
     extra_hosts:
       - "host.docker.internal:host-gateway"

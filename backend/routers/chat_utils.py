@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from ..config import settings
+from ..services.model_router import route_model, PLANNER_TASK, VALIDATOR_TASK
 from ..services.skill_governance import allowed_skill_roots
 from .chat_models import ChatRequest, MarkdownBlock
 
@@ -945,7 +946,7 @@ def _planner_model_name(default_model: str) -> str:
     建议在 config 中增加 planner_model 或 action_planner_model。
     推荐部署方式：Ollama/OpenAI-compatible 接口，不建议在当前 FastAPI 进程内本地加载大模型。
     """
-    return settings.planner_model or default_model
+    return route_model(PLANNER_TASK, requested_model=default_model, reason="silent planner round").model
 
 
 def _validator_model_name(default_model: str) -> str:
@@ -954,4 +955,4 @@ def _validator_model_name(default_model: str) -> str:
     校验轮只需要 JSON 分类能力，小/快模型即可胜任。
     未配置时回退到 default_model。
     """
-    return settings.validator_model or default_model
+    return route_model(VALIDATOR_TASK, requested_model=default_model, reason="output validator round").model

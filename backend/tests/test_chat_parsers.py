@@ -469,6 +469,31 @@ def test_run_command_injects_configured_model_environment(tmp_path, monkeypatch)
     assert "text-env-model|image-env-model|vision-env-model" in result["stdout"]
 
 
+def test_run_command_injects_default_model_api_keys(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers.sandbox_chat import _execute_single_task
+
+    monkeypatch.setattr(settings, "llm_api_key", None)
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    request = ChatRequest(messages=[])
+    result, _ = _execute_single_task(
+        {
+            "action": "run_command",
+            "command": "python -c \"import os; print(os.environ['LLM_API_KEY'] + '|' + os.environ['OPENAI_API_KEY'])\"",
+        },
+        [],
+        request,
+        execution_root=tmp_path,
+    )
+
+    assert result["success"] is True
+    assert "ollama|ollama" in result["stdout"]
+
+
 def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 
@@ -1007,6 +1032,43 @@ print(os.environ['IMAGE_MODEL'], prompt)
             skill_md=skill_md,
         )
 
+
+
+def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from backend.routers import creator
+
+    prepared = {}
+
+    def fake_get_venv_python(skill_dir):
+        prepared["skill_dir"] = skill_dir
+        return Path("/tmp/fake-skill-venv/bin/python")
+
+    def fake_scan_and_install(script_path, venv_python):
+        prepared["script_path"] = script_path
+        prepared["venv_python"] = venv_python
+
+    def fake_run(argv, **kwargs):
+        prepared["argv"] = argv
+        prepared["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
+    monkeypatch.setattr(creator, "_scan_and_install_python_deps", fake_scan_and_install)
+    monkeypatch.setattr(creator.subprocess, "run", fake_run)
+
+    creator._trial_run_generated_script(
+        "dep-skill",
+        "scripts/use_dep.py",
+        "import requests\nprint('{}')\n",
+    )
+
+    assert prepared["script_path"].name == "use_dep.py"
+    assert prepared["venv_python"] == Path("/tmp/fake-skill-venv/bin/python")
+    assert prepared["argv"][0] == "/tmp/fake-skill-venv/bin/python"
+    assert prepared["argv"][1].endswith("use_dep.py")
 
 def test_creator_trial_args_render_skill_md_template():
     from backend.routers.creator import _trial_args_for_script

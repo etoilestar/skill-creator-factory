@@ -2,6 +2,7 @@
 
 Exposes /published/v1/chat/completions and /published/v1/models
 endpoints that external systems can call using standard OpenAI SDK.
+No authentication required — routing is based on the model name in the request.
 """
 
 import json
@@ -9,16 +10,15 @@ import time
 import uuid
 import logging
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ..config import settings
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.publish_auth import (
     check_rate_limit,
     log_request,
-    verify_publish_token,
     get_active_published_models,
 )
 from ..services.publish_config import get_config_by_model_name, validate_skills_available
@@ -42,52 +42,23 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
 
 
-def _extract_bearer_token(authorization: str | None) -> str | None:
-    """Extract token from Authorization header."""
-    if not authorization:
-        return None
-    if authorization.startswith("Bearer "):
-        return authorization[7:]
-    return None
-
-
-def _authenticate(authorization: str | None) -> dict:
-    """Authenticate request and return the publish config."""
-    token = _extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    config = verify_publish_token(token)
-    if not config:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    endpoint_id = config["endpoint_id"]
-    if not check_rate_limit(endpoint_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    return config
-
-
 @router.post("/chat/completions")
-async def chat_completions(
-    request: ChatCompletionRequest,
-    authorization: str | None = Header(None),
-):
-    """OpenAI-compatible chat completions endpoint."""
-    config = _authenticate(authorization)
+async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compatible chat completions endpoint (no auth required)."""
+    # Route by model name
+    config = get_config_by_model_name(request.model)
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{request.model}' not found or not active",
+        )
+
     endpoint_id = config["endpoint_id"]
     model_name = config["name"]
 
-    # Verify requested model matches a published config
-    if request.model != model_name:
-        # Also try finding by model name in case token maps to different config
-        target_config = get_config_by_model_name(request.model)
-        if not target_config or target_config["endpoint_id"] != endpoint_id:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{request.model}' not found or not accessible with this key",
-            )
-        config = target_config
+    # Rate limit by endpoint
+    if not check_rate_limit(endpoint_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     # Validate and filter enabled skills
     enabled_skills = validate_skills_available(config.get("enabled_skills", []))
@@ -182,13 +153,8 @@ def _build_completion_response(content: str, model_name: str) -> dict:
 
 
 @router.get("/models")
-async def list_models(authorization: str | None = Header(None)):
-    """List all published models available to the authenticated user."""
-    token = _extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    # Show all active models (public listing)
+async def list_models():
+    """List all published models (no auth required)."""
     active_configs = get_active_published_models()
 
     models = []
@@ -209,12 +175,8 @@ async def list_models(authorization: str | None = Header(None)):
 
 
 @router.get("/models/{model_id}")
-async def get_model(model_id: str, authorization: str | None = Header(None)):
-    """Get details of a specific published model."""
-    token = _extract_bearer_token(authorization)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
+async def get_model(model_id: str):
+    """Get details of a specific published model (no auth required)."""
     config = get_config_by_model_name(model_id)
     if not config:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")

@@ -1,7 +1,8 @@
 """Publish authentication and rate limiting service.
 
-Provides token verification, simple in-memory rate limiting,
-and request logging for the published OpenAI-compatible endpoints.
+Provides simple in-memory rate limiting and request logging
+for the published OpenAI-compatible endpoints.
+Authentication has been removed — routing is based on model name.
 """
 
 import logging
@@ -9,30 +10,12 @@ import time
 from collections import defaultdict
 
 from ..config import settings
-from .publish_config import get_config_by_api_key, load_publish_configs
+from .publish_config import load_publish_configs
 
 logger = logging.getLogger(__name__)
 
 # In-memory rate limit tracking: {endpoint_id: [(timestamp, ...)] }
 _request_log: dict[str, list[float]] = defaultdict(list)
-
-
-def verify_publish_token(token: str) -> dict | None:
-    """Verify a ****** against publish configs.
-
-    Returns the matching PublishConfig dict if valid and active, else None.
-    """
-    if not token:
-        return None
-
-    config = get_config_by_api_key(token)
-    if not config:
-        return None
-
-    if not config.get("is_active", False):
-        return None
-
-    return config
 
 
 def check_rate_limit(endpoint_id: str) -> bool:

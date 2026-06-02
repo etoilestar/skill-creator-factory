@@ -64,20 +64,10 @@
           <!-- API 端点 -->
           <div class="section-label">🔗 API 端点</div>
           <div class="endpoint-info">
-            <code class="code-block">POST {{ baseUrl }}/published/v1/chat/completions</code>
+            <code class="code-block">{{ baseUrl }}/published/v1</code>
             <button class="btn-ghost btn-sm" @click="copyUrl(config)">
               {{ copyFeedback === 'url-' + config.endpoint_id ? '✓ 已复制' : '📋 复制' }}
             </button>
-          </div>
-
-          <!-- API Key -->
-          <div class="section-label">🔑 API Key</div>
-          <div class="key-info">
-            <code class="code-block">{{ maskKey(config.api_key) }}</code>
-            <button class="btn-ghost btn-sm" @click="copyKey(config)">
-              {{ copyFeedback === 'key-' + config.endpoint_id ? '✓ 已复制' : '📋 复制' }}
-            </button>
-            <button class="btn-ghost btn-sm" @click="onRegenerateKey(config)">🔄 重新生成</button>
           </div>
 
           <!-- 调用示例 -->
@@ -137,7 +127,6 @@ const {
   updateConfig,
   deleteConfig,
   toggleConfig,
-  regenerateKey,
 } = usePublish()
 
 const showCreate = ref(false)
@@ -145,7 +134,14 @@ const newName = ref('')
 const newSkills = ref([])
 const copyFeedback = ref('')
 
-const baseUrl = computed(() => window.location.origin)
+const baseUrl = computed(() => {
+  const origin = window.location.origin
+  // In dev mode (Vite default port 5173), point curl examples to backend port 8000
+  if (origin.includes(':5173')) {
+    return origin.replace(':5173', ':8000')
+  }
+  return origin
+})
 
 onMounted(async () => {
   await Promise.all([fetchConfigs(), fetchAvailableSkills()])
@@ -183,17 +179,6 @@ async function onDelete(config) {
   }
 }
 
-async function onRegenerateKey(config) {
-  if (confirm('确定要重新生成 API Key 吗？旧 Key 将立即失效，使用旧 Key 的客户端将无法访问。')) {
-    await regenerateKey(config.endpoint_id)
-  }
-}
-
-function maskKey(key) {
-  if (!key) return '***'
-  return key.slice(0, 10) + '...' + key.slice(-4)
-}
-
 function showCopySuccess(id) {
   copyFeedback.value = id
   setTimeout(() => {
@@ -201,21 +186,30 @@ function showCopySuccess(id) {
   }, 2000)
 }
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  // Fallback for non-HTTPS environments
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand('copy')
+  document.body.removeChild(textarea)
+}
+
 function copyUrl(config) {
-  navigator.clipboard.writeText(`${baseUrl.value}/published/v1/chat/completions`)
+  copyToClipboard(`${baseUrl.value}/published/v1`)
   showCopySuccess('url-' + config.endpoint_id)
 }
 
-function copyKey(config) {
-  navigator.clipboard.writeText(config.api_key || '')
-  showCopySuccess('key-' + config.endpoint_id)
-}
-
 function curlExample(config) {
-  return `# 调用示例 - 将 YOUR_API_KEY 替换为实际的 API Key
+  return `# 调用示例 - 无需 API Key
 curl ${baseUrl.value}/published/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: ******" \\
   -d '{
     "model": "${config.name}",
     "messages": [{"role": "user", "content": "你好"}]

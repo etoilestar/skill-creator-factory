@@ -43,7 +43,6 @@ class TestPublishConfig:
 
         assert config["name"] == "test-model"
         assert config["endpoint_id"]  # generated
-        assert config["api_key"].startswith("sk-pub-")
         assert config["enabled_skills"] == ["skill-a"]
 
         loaded = load_publish_configs()
@@ -107,24 +106,6 @@ class TestPublishConfig:
         toggled = toggle_publish_config(config["endpoint_id"])
         assert toggled["is_active"] is False
 
-    def test_regenerate_key(self):
-        from backend.services.publish_config import (
-            regenerate_api_key,
-            save_publish_config,
-        )
-
-        config = save_publish_config({
-            "endpoint_id": "",
-            "name": "regen-key",
-            "enabled_skills": [],
-            "is_active": False,
-        })
-        old_key = config["api_key"]
-
-        updated = regenerate_api_key(config["endpoint_id"])
-        assert updated["api_key"] != old_key
-        assert updated["api_key"].startswith("sk-pub-")
-
     def test_get_config_by_model_name(self):
         from backend.services.publish_config import (
             get_config_by_model_name,
@@ -145,62 +126,9 @@ class TestPublishConfig:
         not_found = get_config_by_model_name("nonexistent")
         assert not_found is None
 
-    def test_get_config_by_api_key(self):
-        from backend.services.publish_config import (
-            get_config_by_api_key,
-            save_publish_config,
-        )
-
-        config = save_publish_config({
-            "endpoint_id": "",
-            "name": "key-lookup",
-            "enabled_skills": [],
-            "is_active": True,
-        })
-
-        found = get_config_by_api_key(config["api_key"])
-        assert found is not None
-        assert found["endpoint_id"] == config["endpoint_id"]
-
 
 class TestPublishAuth:
     """Tests for publish_auth.py service."""
-
-    def test_verify_valid_token(self):
-        from backend.services.publish_auth import verify_publish_token
-        from backend.services.publish_config import save_publish_config
-
-        config = save_publish_config({
-            "endpoint_id": "",
-            "name": "auth-test",
-            "enabled_skills": [],
-            "is_active": True,
-        })
-
-        result = verify_publish_token(config["api_key"])
-        assert result is not None
-        assert result["endpoint_id"] == config["endpoint_id"]
-
-    def test_verify_invalid_token(self):
-        from backend.services.publish_auth import verify_publish_token
-
-        assert verify_publish_token("invalid-key") is None
-        assert verify_publish_token("") is None
-        assert verify_publish_token(None) is None
-
-    def test_verify_inactive_config(self):
-        from backend.services.publish_auth import verify_publish_token
-        from backend.services.publish_config import save_publish_config
-
-        config = save_publish_config({
-            "endpoint_id": "",
-            "name": "inactive-test",
-            "enabled_skills": [],
-            "is_active": False,
-        })
-
-        result = verify_publish_token(config["api_key"])
-        assert result is None
 
     def test_rate_limit(self):
         from backend.services.publish_auth import check_rate_limit, _request_log
@@ -216,3 +144,25 @@ class TestPublishAuth:
         assert check_rate_limit(endpoint_id) is False
 
         _request_log.clear()
+
+    def test_get_active_published_models(self):
+        from backend.services.publish_auth import get_active_published_models
+        from backend.services.publish_config import save_publish_config
+
+        save_publish_config({
+            "endpoint_id": "",
+            "name": "active-model",
+            "enabled_skills": [],
+            "is_active": True,
+        })
+        save_publish_config({
+            "endpoint_id": "",
+            "name": "inactive-model",
+            "enabled_skills": [],
+            "is_active": False,
+        })
+
+        active = get_active_published_models()
+        names = [c["name"] for c in active]
+        assert "active-model" in names
+        assert "inactive-model" not in names

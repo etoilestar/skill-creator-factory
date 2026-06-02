@@ -17,7 +17,6 @@ import logging
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -31,6 +30,7 @@ from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import route_creator_file_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
+from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
 logger = logging.getLogger(__name__)
 
@@ -493,7 +493,14 @@ def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stde
 
 
 def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -> None:
-    """Run a generated Python script before accepting it from Creator."""
+    """Run a generated Python script before accepting it from Creator.
+
+    Python scripts are executed in a temporary per-skill virtual environment.
+    Before each trial run, imports are statically scanned and missing common
+    third-party packages are installed into that venv, matching sandbox runtime
+    behavior and allowing generation-test-repair-test loops to focus on real
+    script defects instead of missing packages.
+    """
     if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
         return
 
@@ -505,14 +512,23 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -
         skill_dir = Path(tmp) / skill_name
         scripts_dir = skill_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(skill_md or f"---\nname: {skill_name}\ndescription: trial\n---\n", encoding="utf-8")
+        (skill_dir / "SKILL.md").write_text(
+            skill_md or f"---\nname: {skill_name}\ndescription: trial\n---\n",
+            encoding="utf-8",
+        )
         script_path = scripts_dir / Path(file_path).name
         script_path.write_text(content, encoding="utf-8")
+
+        try:
+            venv_python = _get_skill_venv_python(skill_dir)
+            _scan_and_install_python_deps(script_path, venv_python)
+        except RuntimeError as exc:
+            raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc
 
         for args in _trial_args_for_script(skill_md, file_path, content):
             try:
                 proc = subprocess.run(
-                    [sys.executable, str(script_path), *args],
+                    [str(venv_python), str(script_path), *args],
                     cwd=str(scripts_dir),
                     capture_output=True,
                     text=True,
@@ -634,7 +650,7 @@ def _build_generate_file_prompt(
             "7. 如果脚本调用 diffusion/IMAGE_MODEL 生成图片，必须先调用 TEXT_MODEL 将用户输入的图片提示词翻译/润色成英文，再把英文 prompt 传给图片生成接口；不要把中文原文直接传给 diffusion。\n"
             "8. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "9. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
-            "10. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "10. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):
@@ -809,6 +825,7 @@ async def write_file(request: WriteFileRequest):
     try:
         content = _sanitize_generated_file_content(request.file_path, request.content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
+        _trial_run_generated_script(skill_name, request.file_path, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

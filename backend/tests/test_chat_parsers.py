@@ -608,15 +608,17 @@ def test_finalize_answer_rewrites_generated_image_to_download_url():
     assert "![插图](generated-image.png)" not in rendered
 
 
-def test_finalize_answer_appends_missing_generated_image_url():
+def test_finalize_answer_does_not_append_omitted_generated_image_url():
     from backend.routers.sandbox_chat import _finalize_answer_output_file_links
 
+    answer = "# 科普故事\n\n正文"
     rendered = _finalize_answer_output_file_links(
-        "# 科普故事\n\n正文",
+        answer,
         [{"path": "generated-image.png", "url": "/api/skills/story/files/generated-image.png"}],
     )
 
-    assert rendered.endswith("![生成图片](/api/skills/story/files/generated-image.png)")
+    assert rendered == answer
+    assert "generated-image.png" not in rendered
 
 
 def test_runtime_planner_prompt_requires_fenced_block_trigger():

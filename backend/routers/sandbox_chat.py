@@ -1922,7 +1922,6 @@ def _execute_planned_actions(
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。
 
 
-_IMAGE_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".svg"}
 _MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^()\s]+)(\))")
 
 
@@ -1974,27 +1973,14 @@ def _rewrite_output_file_markdown_links(answer: str, output_files: list[dict] | 
     return _MARKDOWN_LINK_RE.sub(replace, answer)
 
 
-def _append_missing_output_images(answer: str, output_files: list[dict] | None) -> str:
-    """Append generated images when finalization omitted them entirely."""
-    parts = [answer.strip()] if answer and answer.strip() else []
-    existing = answer or ""
-    for item in output_files or []:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "").strip()
-        url = str(item.get("url") or "").strip()
-        if not path or not url or Path(path).suffix.lower() not in _IMAGE_OUTPUT_EXTENSIONS:
-            continue
-        if path in existing or Path(path).name in existing or url in existing:
-            continue
-        parts.append(f"![生成图片]({url})")
-    return "\n\n".join(parts)
-
-
 def _finalize_answer_output_file_links(answer: str, output_files: list[dict] | None) -> str:
-    """Ensure final answers reference generated files through accessible URLs."""
-    rewritten = _rewrite_output_file_markdown_links(answer, output_files)
-    return _append_missing_output_images(rewritten, output_files)
+    """Rewrite only file links the final answer already chose to show.
+
+    Do not append generated files automatically: many Skills create auxiliary
+    artifacts that should stay available through the structured output_files
+    event/download bar without being forced into the final chat answer.
+    """
+    return _rewrite_output_file_markdown_links(answer, output_files)
 
 
 def _render_success_stdout_payload(result: dict) -> str | None:

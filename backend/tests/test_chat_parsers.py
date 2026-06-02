@@ -828,17 +828,19 @@ if __name__ == '__main__':
         _sanitize_generated_file_content("scripts/generate_image.py", script)
 
 
-def test_creator_rejects_creative_script_without_model_call():
+def test_creator_rejects_model_declared_script_without_model_call():
     from backend.routers.creator import _validate_script_contract_static
 
     skill_md = """---
-name: fairy-tale
-description: 生成童话故事
+name: model-backed-generator
+description: 使用宿主内置文本模型生成结果
 ---
+
+本 Skill 需要使用宿主配置的文本模型完成开放式生成。
 
 执行命令：
 ```bash
-python scripts/generate_fairy_tale.py '{"theme":"{{theme}}","characters":["{{character}}"]}'
+python scripts/run_model_task.py '{"topic":"{{topic}}","detail":"{{detail}}"}'
 ```
 """
     script = """import json
@@ -846,34 +848,36 @@ import sys
 
 def main():
     data = json.loads(sys.argv[1])
-    theme = data.get('theme', '森林')
-    character = data.get('character', '小猪')
-    text = f'从前，在{theme}里，住着一只{character}。它非常勇敢。'
+    topic = data.get('topic', '')
+    detail = data.get('detail', '')
+    text = f'{topic}: {detail}'
     print(json.dumps({'text': text, 'image': ''}, ensure_ascii=False))
 
 if __name__ == '__main__':
     main()
 """
 
-    with pytest.raises(ValueError, match="调用宿主已配置的模型"):
+    with pytest.raises(ValueError, match="声明需要使用宿主/内置/配置模型"):
         _validate_script_contract_static(
-            file_path="scripts/generate_fairy_tale.py",
+            file_path="scripts/run_model_task.py",
             content=script,
             skill_md=skill_md,
         )
 
 
-def test_creator_accepts_creative_script_that_calls_configured_text_model():
+def test_creator_accepts_model_declared_script_that_calls_configured_text_model():
     from backend.routers.creator import _validate_script_contract_static
 
     skill_md = """---
-name: fairy-tale
-description: 生成童话故事
+name: model-backed-generator
+description: 使用宿主内置文本模型生成结果
 ---
+
+本 Skill 需要使用宿主配置的文本模型完成开放式生成。
 
 执行命令：
 ```bash
-python scripts/generate_fairy_tale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+python scripts/run_model_task.py '{"topic":"{{topic}}","detail":"{{detail}}"}'
 ```
 """
     script = """import json
@@ -883,13 +887,13 @@ import httpx
 
 def main():
     payload = json.loads(sys.argv[1])
-    theme = payload.get('theme')
-    character = payload.get('character')
+    topic = payload.get('topic')
+    detail = payload.get('detail')
     response = httpx.post(
         os.environ['LLM_BASE_URL'].rstrip('/') + '/v1/chat/completions',
         json={
             'model': os.environ.get('TEXT_MODEL'),
-            'messages': [{'role': 'user', 'content': f'写一个{character}在{theme}冒险的童话'}],
+            'messages': [{'role': 'user', 'content': f'{topic}: {detail}'}],
             'stream': False,
         },
         headers={'Authorization': 'Bearer ' + os.environ.get('LLM_API_KEY', 'ollama')},
@@ -904,11 +908,42 @@ if __name__ == '__main__':
 """
 
     _validate_script_contract_static(
-        file_path="scripts/generate_fairy_tale.py",
+        file_path="scripts/run_model_task.py",
         content=script,
         skill_md=skill_md,
     )
 
+
+def test_creator_accepts_deterministic_script_when_skill_does_not_declare_model():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: deterministic-tool
+description: 格式化输入数据
+---
+
+执行命令：
+```bash
+python scripts/format_data.py '{"value":"{{value}}"}'
+```
+"""
+    script = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    value = payload.get('value', '')
+    print(json.dumps({'text': value.strip().upper()}, ensure_ascii=False))
+
+if __name__ == '__main__':
+    main()
+"""
+
+    _validate_script_contract_static(
+        file_path="scripts/format_data.py",
+        content=script,
+        skill_md=skill_md,
+    )
 
 def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
@@ -921,4 +956,4 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     assert "生成的 Skill.md Markdown 运行说明" in phase3_prompt
     assert "不会触发宿主执行" in phase3_prompt
     assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt
-    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt
+    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt or "LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL" in phase3_prompt

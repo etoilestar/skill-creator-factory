@@ -290,7 +290,7 @@ description: 清晰描述 Skill 功能和触发场景。
 6. **标准 Markdown Block 触发执行**：如果 Skill 需要脚本、命令或写文件，SKILL.md 必须保持普通 Markdown 写法，并明确要求 assistant 在运行时输出标准 fenced code block；宿主不会因为 SKILL.md 中出现 `scripts/...` 行内路径就自动执行。
 7. **不要自定义协议**：不要在生成的 SKILL.md 中加入 `Runtime Contract` JSON、action DSL 或自定义标签；用自然 Markdown 段落、列表和 ```bash 示例说明动作。
 8. **不要假装执行**：SKILL.md 必须要求 assistant 等待宿主 observation，再基于 stdout/stderr/输出文件回答用户。
-9. **不要生成假实现**：脚本必须有真实可执行逻辑；涉及图像/多模态时，优先说明使用宿主已配置模型能力，不要写 API key、关键词数据库、placeholder 图片或“模拟 AI 绘图”脚本。童话/故事/科普/文章/歌词等创作类 Skill 优先直接由模型回答；如必须包含脚本，脚本必须调用宿主注入的 `LLM_BASE_URL` + `TEXT_MODEL`，不得用固定模板、随机词表或 ASCII 图替代模型创作。
+9. **不要生成假实现**：脚本必须有真实可执行逻辑；涉及图像/多模态时，优先说明使用宿主已配置模型能力，不要写 API key、关键词数据库、placeholder 图片或“模拟 AI 绘图”脚本。需要模型判断的开放式 Skill 优先直接由模型回答；如必须包含脚本，脚本必须调用宿主注入的 `LLM_BASE_URL` + `TEXT_MODEL`/`IMAGE_MODEL`/`VISION_MODEL`；确定性脚本必须实现真实算法，不得用固定模板、随机词表或 ASCII 图冒充模型能力。
 
 #### 标准 Markdown 执行说明模板
 

@@ -46,7 +46,7 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
 - 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
-- 如果用户要求使用平台内置图像/多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的图像/多模态模型完成视觉/图像相关步骤，脚本最多产出图像提示词或处理宿主返回的真实结果。
+- 如果用户要求使用平台内置图像/多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的图像/多模态模型完成视觉/图像相关步骤。若脚本负责创作文本/科普/童话/歌词，脚本必须调用宿主注入的 `LLM_BASE_URL` + `TEXT_MODEL`；若脚本负责图像/视觉步骤，必须使用 `IMAGE_MODEL`/`VISION_MODEL` 或只输出给宿主模型使用的提示词，不能用固定模板、随机词表、ASCII 图或占位文件冒充模型生成。
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
@@ -276,10 +276,20 @@ _MULTI_FILE_MARKER_RE = re.compile(
 
 _SCRIPT_FAKE_IMPLEMENTATION_RE = re.compile(
     r"placeholder|TODO|your_api_key|api\.example\.com|example\.com|模拟|占位|假装|"
-    r"实际使用时|实际开发中|仅为演示|演示目的|空的占位图|纯色图片|fake",
+    r"实际使用时|实际开发中|仅为演示|演示目的|空的占位图|纯色图片|ASCII插图|ascii_art|fake",
     re.IGNORECASE,
 )
 _SKILL_CUSTOM_RUNTIME_CONTRACT_RE = re.compile(r"(?im)^\s*#{1,6}\s*Runtime\s+Contract\s*$")
+_MODEL_POWERED_GENERATION_RE = re.compile(
+    r"童话|故事|小说|歌词|诗歌|文案|科普|文章|解释|创作|写作|改写|总结|"
+    r"fairy|story|article|lyrics|poem|creative|writing",
+    re.IGNORECASE,
+)
+_LLM_CALL_RE = re.compile(
+    r"LLM_BASE_URL|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL|/v1/chat/completions|"
+    r"chat/completions|complete_chat_once|stream_chat|openai",
+    re.IGNORECASE,
+)
 
 
 def _reject_custom_skill_md_protocol(content: str) -> None:
@@ -299,6 +309,36 @@ def _reject_fake_script_implementation(file_path: str, content: str) -> None:
             "Creator 生成的脚本必须具备真实可执行功能；"
             "如需图像或多模态能力，应通过宿主配置的模型/服务完成，不能写 placeholder 文件或假装调用 API。"
         )
+
+
+def _requires_model_powered_generation(*, skill_md: str, file_path: str, content: str = "") -> bool:
+    """Return whether a script is for creative/model-powered generation."""
+    haystack = f"{skill_md}\n{file_path}\n{content}"
+    if not _MODEL_POWERED_GENERATION_RE.search(haystack):
+        return False
+    commands = _extract_script_command_templates(skill_md, file_path) if skill_md else []
+    if skill_md and not commands:
+        return False
+    return True
+
+
+def _script_uses_configured_llm(content: str) -> bool:
+    """Detect whether script calls the configured host LLM/VL endpoint."""
+    return bool(_LLM_CALL_RE.search(content))
+
+
+def _validate_model_powered_script_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Reject creative-generation scripts that hard-code content instead of calling models."""
+    if not _requires_model_powered_generation(skill_md=skill_md, file_path=file_path, content=content):
+        return
+    if _script_uses_configured_llm(content):
+        return
+    raise ValueError(
+        f"{file_path} 是创作/科普/写作类生成脚本，但没有调用宿主已配置的模型。"
+        "这类脚本不能用固定模板、随机词表或 ASCII 图替代模型创作；"
+        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL，"
+        "或把该 Skill 设计为无需 scripts/ 的直接回答。"
+    )
 
 
 def _validate_generated_file_content(file_path: str, content: str) -> None:
@@ -345,6 +385,7 @@ def _script_reads_json_argv(content: str) -> bool:
 def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
     """Validate script source against existing SKILL.md command examples."""
     _reject_fake_script_implementation(file_path, content)
+    _validate_model_powered_script_static(file_path=file_path, content=content, skill_md=skill_md)
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
@@ -449,9 +490,10 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例故事、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
-            "7. 禁止生成占位实现、模拟实现、假 API、placeholder 文件或纯色/空白图片；如果缺少真实图像生成能力，应让 SKILL.md 使用宿主配置的图像/多模态模型，脚本不要假装生成图片。\n"
-            "8. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "6. 如果这是童话/故事/科普/文章/歌词等创作类脚本，不要用固定模板、随机词表或 ASCII 图生成内容；必须调用宿主注入的 LLM_BASE_URL + TEXT_MODEL（OpenAI-compatible /v1/chat/completions）进行创作。\n"
+            "7. 如果涉及图像或多模态能力，使用宿主注入的 IMAGE_MODEL/VISION_MODEL 或输出给宿主模型的提示词；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充图像生成。\n"
+            "8. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
+            "9. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):

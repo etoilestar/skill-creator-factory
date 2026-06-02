@@ -445,6 +445,30 @@ def test_is_within_sandbox_nested_path_ok(tmp_path):
     assert _is_within_sandbox(nested, sandbox) is True
 
 
+def test_run_command_injects_configured_model_environment(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers.sandbox_chat import _execute_single_task
+
+    monkeypatch.setattr(settings, "text_model", "text-env-model")
+    monkeypatch.setattr(settings, "image_model", "image-env-model")
+    monkeypatch.setattr(settings, "vision_model", "vision-env-model")
+
+    request = ChatRequest(messages=[])
+    result, _ = _execute_single_task(
+        {
+            "action": "run_command",
+            "command": "python -c \"import os; print(os.environ['TEXT_MODEL'] + '|' + os.environ['IMAGE_MODEL'] + '|' + os.environ['VISION_MODEL'])\"",
+        },
+        [],
+        request,
+        execution_root=tmp_path,
+    )
+
+    assert result["success"] is True
+    assert "text-env-model|image-env-model|vision-env-model" in result["stdout"]
+
+
 def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 
@@ -705,18 +729,18 @@ def test_creator_rejects_script_that_ignores_json_argv_contract():
 
     skill_md = """执行命令：
 ```bash
-python scripts/generate_fairytale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+python scripts/process_params.py '{"theme":"{{theme}}","character":"{{character}}"}'
 ```
 """
     script = """import json
 
 def main():
-    print(json.dumps({"text": "固定小兔子故事"}))
+    print(json.dumps({"text": "固定输出"}))
 """
 
     with pytest.raises(ValueError, match="json.loads"):
         _validate_script_contract_static(
-            file_path="scripts/generate_fairytale.py",
+            file_path="scripts/process_params.py",
             content=script,
             skill_md=skill_md,
         )
@@ -727,7 +751,7 @@ def test_creator_accepts_script_that_reads_contract_placeholders():
 
     skill_md = """执行命令：
 ```bash
-python scripts/generate_fairytale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+python scripts/process_params.py '{"theme":"{{theme}}","character":"{{character}}"}'
 ```
 """
     script = """import json
@@ -737,11 +761,11 @@ def main():
     payload = json.loads(sys.argv[1])
     theme = payload.get("theme")
     character = payload.get("character")
-    print(json.dumps({"text": f"{character}的{theme}故事"}, ensure_ascii=False))
+    print(json.dumps({"text": f"{character}:{theme}"}, ensure_ascii=False))
 """
 
     _validate_script_contract_static(
-        file_path="scripts/generate_fairytale.py",
+        file_path="scripts/process_params.py",
         content=script,
         skill_md=skill_md,
     )
@@ -764,6 +788,8 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
     assert "只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block" in prompt
     assert "禁止在 SKILL.md 中只写“立即调用 `scripts/...`”" in prompt
     assert "不要引入自定义协议章节" in prompt
+    assert "LLM_BASE_URL" in prompt
+    assert "TEXT_MODEL" in prompt
 
 
 def test_creator_rejects_custom_runtime_contract_section():
@@ -802,6 +828,88 @@ if __name__ == '__main__':
         _sanitize_generated_file_content("scripts/generate_image.py", script)
 
 
+def test_creator_rejects_creative_script_without_model_call():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: fairy-tale
+description: 生成童话故事
+---
+
+执行命令：
+```bash
+python scripts/generate_fairy_tale.py '{"theme":"{{theme}}","characters":["{{character}}"]}'
+```
+"""
+    script = """import json
+import sys
+
+def main():
+    data = json.loads(sys.argv[1])
+    theme = data.get('theme', '森林')
+    character = data.get('character', '小猪')
+    text = f'从前，在{theme}里，住着一只{character}。它非常勇敢。'
+    print(json.dumps({'text': text, 'image': ''}, ensure_ascii=False))
+
+if __name__ == '__main__':
+    main()
+"""
+
+    with pytest.raises(ValueError, match="调用宿主已配置的模型"):
+        _validate_script_contract_static(
+            file_path="scripts/generate_fairy_tale.py",
+            content=script,
+            skill_md=skill_md,
+        )
+
+
+def test_creator_accepts_creative_script_that_calls_configured_text_model():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: fairy-tale
+description: 生成童话故事
+---
+
+执行命令：
+```bash
+python scripts/generate_fairy_tale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+```
+"""
+    script = """import json
+import os
+import sys
+import httpx
+
+def main():
+    payload = json.loads(sys.argv[1])
+    theme = payload.get('theme')
+    character = payload.get('character')
+    response = httpx.post(
+        os.environ['LLM_BASE_URL'].rstrip('/') + '/v1/chat/completions',
+        json={
+            'model': os.environ.get('TEXT_MODEL'),
+            'messages': [{'role': 'user', 'content': f'写一个{character}在{theme}冒险的童话'}],
+            'stream': False,
+        },
+        headers={'Authorization': 'Bearer ' + os.environ.get('LLM_API_KEY', 'ollama')},
+        timeout=120,
+    )
+    response.raise_for_status()
+    text = response.json()['choices'][0]['message']['content']
+    print(json.dumps({'text': text, 'image': ''}, ensure_ascii=False))
+
+if __name__ == '__main__':
+    main()
+"""
+
+    _validate_script_contract_static(
+        file_path="scripts/generate_fairy_tale.py",
+        content=script,
+        skill_md=skill_md,
+    )
+
+
 def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 
@@ -813,3 +921,4 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     assert "生成的 Skill.md Markdown 运行说明" in phase3_prompt
     assert "不会触发宿主执行" in phase3_prompt
     assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt
+    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt

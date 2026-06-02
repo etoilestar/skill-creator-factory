@@ -1656,7 +1656,22 @@ def _execute_single_task(
             "EXECUTION_ROOT": str(execution_root) if execution_root else "",
             "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
             "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+            # Expose configured model endpoints to generated skill scripts so
+            # creative/text/image tasks can use the same capability routing as
+            # the host instead of hard-coded templates or fake image stubs.
+            "LLM_BASE_URL": settings.llm_base_url,
+            "DEFAULT_MODEL": settings.default_model,
+            "TEXT_MODEL": settings.text_model or settings.default_model,
+            "CODE_MODEL": settings.code_model or settings.default_model,
+            "IMAGE_MODEL": settings.image_model or settings.default_model,
+            "VISION_MODEL": settings.vision_model or settings.default_model,
+            "PLANNER_MODEL": settings.planner_model or settings.default_model,
+            "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
         }
+        if settings.llm_api_key:
+            _run_cmd_extra_env["LLM_API_KEY"] = settings.llm_api_key
+        if settings.openai_api_key:
+            _run_cmd_extra_env["OPENAI_API_KEY"] = settings.openai_api_key
         if session_input_dir is not None:
             _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(session_input_dir)
 

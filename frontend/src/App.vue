@@ -14,6 +14,9 @@
       <RouterLink to="/sandbox" class="nav-item">
         <span>🧪</span> 沙盒测试
       </RouterLink>
+      <RouterLink to="/publish" class="nav-item">
+        <span>🚀</span> 端口发布
+      </RouterLink>
       <div class="sidebar-footer">
         <div class="llm-status" :class="llmStatus">
           <span class="dot"></span>

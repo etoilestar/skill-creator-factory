@@ -24,9 +24,10 @@ from ..services.kernel_loader import (
     load_skill_metadata_prompt,
     read_skill_resource_text,
 )
-from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.llm_proxy import complete_chat_once, stream_chat, generate_image_once
 from ..services.model_router import (
     TEXT_TASK,
+    IMAGE_TASK,
     infer_sandbox_response_task,
     route_model,
 )

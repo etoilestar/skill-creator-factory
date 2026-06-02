@@ -47,6 +47,24 @@ def _build_chat_completions_url(base_url: str) -> str:
 
     return f"{base}/v1/chat/completions"
 
+def _build_image_generations_url(base_url: str) -> str:
+    """
+    Build OpenAI-compatible image generations URL.
+
+    Supported forms:
+    - http://127.0.0.1:11435
+    - http://127.0.0.1:11435/v1
+    - http://127.0.0.1:11435/v1/images/generations
+    """
+    base = base_url.rstrip("/")
+
+    if base.endswith("/v1/images/generations"):
+        return base
+
+    if base.endswith("/v1"):
+        return f"{base}/images/generations"
+
+    return f"{base}/v1/images/generations"
 
 def _get_api_key() -> str:
     """Ollama ignores the key, but OpenAI-compatible services usually expect one."""
@@ -137,6 +155,32 @@ async def complete_chat_once(messages: list[dict], model: str) -> str:
 
     return content
 
+async def generate_image_once(
+    *,
+    prompt: str,
+    model: str,
+    size: str | None = None,
+    response_format: str = "b64_json",
+) -> dict:
+    """Call OpenAI-compatible image generation API."""
+    url = _build_image_generations_url(settings.image_base_url)
+    headers = _build_headers()
+    timeout = float(settings.llm_timeout_seconds)
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": size or settings.image_size,
+        "response_format": response_format,
+    }
+
+    logger.info("[IMAGE][once] request model=%s url=%s size=%s", model, url, payload["size"])
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
 
 async def stream_chat(
     messages: list[dict],

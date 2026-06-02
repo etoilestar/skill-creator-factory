@@ -196,29 +196,23 @@ def _has_image_input(input_files: list[dict] | None) -> bool:
     return False
 
 
-def infer_sandbox_response_task(*, body_prompt: str, user_text: str, plan: dict | None = None, input_files: list[dict] | None = None) -> str:
-    """Infer the best response model for a sandbox skill turn.
-
-    The skill decides *what* needs to happen in SKILL.md.  The backend only
-    classifies the observed task surface (planned actions, resources, and the
-    user's request) into a model capability.
+def infer_sandbox_response_task(
+    *,
+    body_prompt: str,
+    user_text: str,
+    plan: dict | None = None,
+    input_files: list[dict] | None = None,
+) -> str:
     """
-    plan = plan or {}
-    text = f"{user_text}\n{body_prompt[:4000]}".lower()
+    沙盒最终响应模型路由。
 
+    通用原则：
+    - sandbox final response 是 Skill Controller 的最终表达层，默认必须是文本模型；
+    - 图片生成、文件生成、数据处理等外部能力只能通过脚本/命令动作完成；
+    - VISION_TASK 只用于用户上传图片并需要视觉理解；
+    - 不允许因为 SKILL.md 或用户文本中出现图片语义，就直接调用 IMAGE_MODEL。
+    """
     if _has_image_input(input_files):
         return VISION_TASK
 
-    tasks = plan.get("tasks") if isinstance(plan, dict) else []
-    if isinstance(tasks, list):
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            action = str(task.get("action") or "").lower()
-            command = str(task.get("command") or task.get("path") or "").lower()
-            if action in {"run_command", "write_file"} and re.search(r"\.(py|js|ts|sh|rb|go|rs|java|cpp|c|cs)\b", command):
-                return CODE_TASK
-
-    if any(keyword in text for keyword in _image_keywords()):
-        return IMAGE_TASK
     return TEXT_TASK

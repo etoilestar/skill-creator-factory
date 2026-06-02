@@ -24,10 +24,9 @@ from ..services.kernel_loader import (
     load_skill_metadata_prompt,
     read_skill_resource_text,
 )
-from ..services.llm_proxy import complete_chat_once, stream_chat, generate_image_once
+from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import (
     TEXT_TASK,
-    IMAGE_TASK,
     infer_sandbox_response_task,
     route_model,
 )
@@ -1033,13 +1032,19 @@ def _compose_final_answer_prompt() -> str:
     """Generate final answer from action observations."""
     return (
         "你是 Skill Agent 的最终回答生成器。\n\n"
-        "你会收到用户请求、Loaded SKILL.md、运行时 action plan 和 executor observation。\n"
-        "你必须基于 observation 回答用户，不要假装执行未发生的动作。\n"
-        "如果命令执行成功，优先返回脚本 stdout 中的有效结果。\n"
-        "如果命令执行失败，简要说明失败原因和 stderr/stdout 中的关键信息。\n"
-        "如果 execution_result 中包含 output_files 列表（非空），必须在回答末尾以 Markdown 链接格式列出每个文件，"
-        "格式示例：[下载 presentation.pptx](/api/skills/xxx/files/outputs/presentation.pptx)。\n"
-        "不要输出内部 JSON，不要重复完整 SKILL.md，不要编造 observation 之外的执行结果。\n"
+        "你会收到用户请求、Loaded SKILL.md、运行时 action plan、主模型动作前草稿 assistant_draft "
+        "以及 executor observation。\n\n"
+        "你的任务是基于这些材料生成最终给用户看的结果。\n\n"
+        "核心规则：\n"
+        "1. 必须遵循 Loaded SKILL.md 的输出格式要求。\n"
+        "2. 如果 assistant_draft 中包含有用的正文草稿，可以保留并整理。\n"
+        "3. 如果 assistant_draft 中包含用于执行的 fenced command block，最终回答中不要保留这些命令块。\n"
+        "4. 如果命令 stdout 是 JSON，应解析其中的 text、markdown、image、image_path、file、path 等字段。\n"
+        "5. 如果 observation 中有 output_files，应把对应 url/path 作为 Markdown 链接或图片插入。\n"
+        "6. 如果生成的是图片文件，优先用 Markdown 图片语法展示：![说明](路径或URL)。\n"
+        "7. 不要输出 base64 data URI，除非 observation 里没有文件路径且 Skill 明确要求 base64。\n"
+        "8. 不要输出内部 JSON、plan、完整 SKILL.md 或执行日志。\n"
+        "9. 不要假装执行未发生的动作；如果命令失败，简要说明失败原因。\n"
     )
 
 async def _generate_final_answer_from_observation(
@@ -2531,41 +2536,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             )
             response_model = response_route.model
             yield _sse({"model_ack": response_route.ack()})
-            if response_route.task == IMAGE_TASK:
-                yield _sse({"status": {"phase": "generating_image", "message": "正在生成图片…"}})
-
-                prompt = _last_user_text(request).strip()
-                if not prompt:
-                    prompt = "a simple image"
-
-                image_resp = await generate_image_once(
-                    prompt=prompt,
-                    model=response_model,
-                    size=settings.image_size,
-                    response_format="b64_json",
-                )
-
-                data = image_resp.get("data") or []
-                if not data:
-                    yield _sse({"status": None})
-                    yield _sse({"error": "图片服务没有返回图片数据"})
-                    yield "data: [DONE]\n\n"
-                    return
-
-                b64 = data[0].get("b64_json")
-                url = data[0].get("url")
-
-                yield _sse({"status": None})
-
-                if b64:
-                    yield _sse({"content": f"已生成图片：\n\n![生成图片](data:image/png;base64,{b64})"})
-                elif url:
-                    yield _sse({"content": f"已生成图片：\n\n![生成图片]({url})"})
-                else:
-                    yield _sse({"error": "图片服务返回格式不包含 b64_json 或 url"})
-
-                yield "data: [DONE]\n\n"
-                return
 
             final_messages: list[dict] = []
             final_messages.append(
@@ -2648,12 +2618,37 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
                     if exec_result.get("executed"):
-                        rendered_payload = _render_success_stdout_payload(exec_result)
-                        if rendered_payload:
-                            yield _sse({"content": rendered_payload})
-                        else:
-                            yield _sse({"content": assistant_text})
-                            yield _sse({"content": _format_execution_report(exec_result)})
+                        exec_result["assistant_draft"] = assistant_text
+
+                        yield _sse({"status": {"phase": "generating", "message": "整合执行结果…"}})
+
+                        final_answer = await _generate_final_answer_from_observation(
+                            body_prompt=body_prompt,
+                            request=request,
+                            model=route_model(
+                                TEXT_TASK,
+                                requested_model=requested_model,
+                                reason="sandbox finalization after actions",
+                            ).model,
+                            plan=locals().get("runtime_plan")
+                            if isinstance(locals().get("runtime_plan"), dict)
+                            else exec_result.get("plan", {}),
+                            execution_result=exec_result,
+                        )
+
+                        yield _sse({"content": final_answer})
+
+                        output_files = exec_result.get("output_files") or []
+                        if output_files:
+                            yield _sse({
+                                "action_result": {
+                                    "action": "output_files",
+                                    "name": parent_skill_name,
+                                    "success": True,
+                                    "message": f"生成了 {len(output_files)} 个文件",
+                                    "output_files": output_files,
+                                }
+                            })
 
                         # Emit structured output_files event for the fallback path too.
                         output_files = exec_result.get("output_files") or []

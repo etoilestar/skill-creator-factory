@@ -1,13 +1,13 @@
 <template>
   <div class="sandbox">
     <div class="header">
-      <h2>Sandbox</h2>
-      <p class="muted">选择一个 Skill，模拟它被加载后的对话效果</p>
+      <h2>沙盒测试</h2>
+      <p class="muted">选择一个技能，模拟它被加载后的对话效果</p>
     </div>
 
     <div class="toolbar">
       <select v-model="selectedSkill" @change="resetChat" :disabled="streaming">
-        <option value="">-- 选择 Skill --</option>
+        <option value="">-- 选择技能 --</option>
         <option v-for="sk in skills" :key="sk.name" :value="sk.name">
           {{ sk.display_name || sk.name }} · {{ sk.scope }} · {{ sk.status }}
         </option>

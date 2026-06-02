@@ -456,6 +456,43 @@ def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     assert "\"对，开始做吧\"" in prompt
 
 
+def test_creator_phase_refinement_revision_hint_overrides_confirmation():
+    import asyncio
+    from backend.routers.creator_chat import _refine_creator_phase_with_model
+
+    messages = [
+        {"role": "assistant", "content": "## 📋 Skill 架构蓝图\n### 资源清单\n- 图片API密钥\n- 关键词数据库"},
+        {"role": "user", "content": "确认，继续构建"},
+        {"role": "user", "content": "我的模型不需要api密钥，直接使用内置的多模态模型就行，关键词也不需要数据库"},
+    ]
+
+    result = asyncio.run(_refine_creator_phase_with_model(messages, "phase3+", "general-model"))
+
+    assert result["phase"] == "phase2"
+    assert result["used_model"] is False
+
+
+def test_creator_phase_refinement_uses_model_for_ambiguous_revision(monkeypatch):
+    import asyncio
+    from backend.routers.creator_chat import _refine_creator_phase_with_model
+
+    async def fake_complete_chat_once(messages, model):
+        return '{"phase":"phase2","reason":"用户在调整蓝图约束"}'
+
+    monkeypatch.setattr("backend.routers.creator_chat.complete_chat_once", fake_complete_chat_once)
+
+    messages = [
+        {"role": "assistant", "content": "## 📋 Skill 架构蓝图\n### 资源清单\n- 图片API密钥"},
+        {"role": "user", "content": "确认，继续构建"},
+        {"role": "user", "content": "资源部分按我刚才说的方案处理"},
+    ]
+
+    result = asyncio.run(_refine_creator_phase_with_model(messages, "phase3+", "general-model"))
+
+    assert result["phase"] == "phase2"
+    assert result["used_model"] is True
+
+
 def test_creator_phase_guess_accepts_continue_build_confirmation():
     from backend.routers.creator_chat import _guess_current_phase
 

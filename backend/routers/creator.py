@@ -68,7 +68,7 @@ _MAX_HISTORY_TURNS = 6
 
 # Script generation can repair itself by sending trial-run failures back to the
 # same routed model before returning content to the frontend.
-_MAX_SCRIPT_REPAIR_ATTEMPTS = 2
+_MAX_SCRIPT_REPAIR_ATTEMPTS = 5
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.

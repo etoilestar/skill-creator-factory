@@ -1662,6 +1662,8 @@ def _execute_single_task(
             # the host instead of hard-coded templates or fake image stubs.
             "LLM_BASE_URL": settings.llm_base_url,
             "DEFAULT_MODEL": settings.default_model,
+            "IMAGE_BASE_URL": settings.image_base_url,
+            "IMAGE_SIZE": settings.image_size,
             "TEXT_MODEL": settings.text_model or settings.default_model,
             "CODE_MODEL": settings.code_model or settings.default_model,
             "IMAGE_MODEL": settings.image_model or settings.default_model,
@@ -2529,6 +2531,41 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             )
             response_model = response_route.model
             yield _sse({"model_ack": response_route.ack()})
+            if response_route.task == IMAGE_TASK:
+                yield _sse({"status": {"phase": "generating_image", "message": "正在生成图片…"}})
+
+                prompt = _last_user_text(request).strip()
+                if not prompt:
+                    prompt = "a simple image"
+
+                image_resp = await generate_image_once(
+                    prompt=prompt,
+                    model=response_model,
+                    size=settings.image_size,
+                    response_format="b64_json",
+                )
+
+                data = image_resp.get("data") or []
+                if not data:
+                    yield _sse({"status": None})
+                    yield _sse({"error": "图片服务没有返回图片数据"})
+                    yield "data: [DONE]\n\n"
+                    return
+
+                b64 = data[0].get("b64_json")
+                url = data[0].get("url")
+
+                yield _sse({"status": None})
+
+                if b64:
+                    yield _sse({"content": f"已生成图片：\n\n![生成图片](data:image/png;base64,{b64})"})
+                elif url:
+                    yield _sse({"content": f"已生成图片：\n\n![生成图片]({url})"})
+                else:
+                    yield _sse({"error": "图片服务返回格式不包含 b64_json 或 url"})
+
+                yield "data: [DONE]\n\n"
+                return
 
             final_messages: list[dict] = []
             final_messages.append(

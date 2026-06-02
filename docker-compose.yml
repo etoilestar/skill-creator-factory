@@ -20,7 +20,9 @@ services:
       - CODE_MODEL=${CODE_MODEL:-qwen3-coder:30b}
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3:30b}
       - VALIDATOR_MODEL=${VALIDATOR_MODEL:-qwen3:8b}
-      - IMAGE_MODEL=${IMAGE_MODEL:-qwen3-vl:32b}
+      - IMAGE_MODEL=${IMAGE_MODEL:-stable-diffusion-2-1-base}
+      - IMAGE_BASE_URL=${IMAGE_BASE_URL:-http://host.docker.internal:11435}
+      - IMAGE_SIZE=${IMAGE_SIZE:-512x512}
       - VISION_MODEL=${VISION_MODEL:-qwen3-vl:32b}
       - SKILL_COMMAND_TIMEOUT=${SKILL_COMMAND_TIMEOUT:-180}
       - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-6000}

@@ -1676,10 +1676,15 @@ def _execute_single_task(
             "PLANNER_MODEL": settings.planner_model or settings.default_model,
             "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
         }
-        if settings.llm_api_key:
-            _run_cmd_extra_env["LLM_API_KEY"] = settings.llm_api_key
-        if settings.openai_api_key:
-            _run_cmd_extra_env["OPENAI_API_KEY"] = settings.openai_api_key
+        api_key = (
+            settings.llm_api_key
+            or settings.openai_api_key
+            or os.environ.get("LLM_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "ollama"
+        )
+        _run_cmd_extra_env["LLM_API_KEY"] = api_key
+        _run_cmd_extra_env["OPENAI_API_KEY"] = settings.openai_api_key or api_key
         if session_input_dir is not None:
             _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(session_input_dir)
 

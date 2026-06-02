@@ -1921,6 +1921,82 @@ def _execute_planned_actions(
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。
 
+
+_IMAGE_OUTPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".svg"}
+_MARKDOWN_LINK_RE = re.compile(r"(!?\[[^\]]*\]\()([^()\s]+)(\))")
+
+
+def _is_external_or_absolute_link(target: str) -> bool:
+    lowered = target.strip().lower()
+    return bool(
+        re.match(r"^[a-z][a-z0-9+.-]*:", lowered)
+        or lowered.startswith("//")
+        or lowered.startswith("/")
+        or lowered.startswith("#")
+    )
+
+
+def _normalize_output_file_ref(value: str) -> str:
+    return value.strip().replace("\\", "/").lstrip("./")
+
+
+def _output_file_lookup(output_files: list[dict] | None) -> dict[str, str]:
+    """Build path/basename -> download URL lookup for generated files."""
+    lookup: dict[str, str] = {}
+    for item in output_files or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        path = _normalize_output_file_ref(str(item.get("path") or ""))
+        if not url or not path:
+            continue
+        lookup[path] = url
+        lookup[Path(path).name] = url
+    return lookup
+
+
+def _rewrite_output_file_markdown_links(answer: str, output_files: list[dict] | None) -> str:
+    """Rewrite relative Markdown links/images for generated files to served URLs."""
+    lookup = _output_file_lookup(output_files)
+    if not answer or not lookup:
+        return answer
+
+    def replace(match: re.Match) -> str:
+        prefix, target, suffix = match.groups()
+        if _is_external_or_absolute_link(target):
+            return match.group(0)
+        normalized = _normalize_output_file_ref(target)
+        url = lookup.get(normalized) or lookup.get(Path(normalized).name)
+        if not url:
+            return match.group(0)
+        return f"{prefix}{url}{suffix}"
+
+    return _MARKDOWN_LINK_RE.sub(replace, answer)
+
+
+def _append_missing_output_images(answer: str, output_files: list[dict] | None) -> str:
+    """Append generated images when finalization omitted them entirely."""
+    parts = [answer.strip()] if answer and answer.strip() else []
+    existing = answer or ""
+    for item in output_files or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not path or not url or Path(path).suffix.lower() not in _IMAGE_OUTPUT_EXTENSIONS:
+            continue
+        if path in existing or Path(path).name in existing or url in existing:
+            continue
+        parts.append(f"![生成图片]({url})")
+    return "\n\n".join(parts)
+
+
+def _finalize_answer_output_file_links(answer: str, output_files: list[dict] | None) -> str:
+    """Ensure final answers reference generated files through accessible URLs."""
+    rewritten = _rewrite_output_file_markdown_links(answer, output_files)
+    return _append_missing_output_images(rewritten, output_files)
+
+
 def _render_success_stdout_payload(result: dict) -> str | None:
     """Render structured JSON stdout from a successful command as final user content."""
     for item in result.get("results") or []:
@@ -2463,6 +2539,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             plan=runtime_plan,
                             execution_result=exec_result,
                         )
+                        final_answer = _finalize_answer_output_file_links(final_answer, _exec_all_output_files)
                         yield _thought(
                             "final_answer",
                             "生成回答",
@@ -2641,9 +2718,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             execution_result=exec_result,
                         )
 
+                        output_files = exec_result.get("output_files") or []
+                        final_answer = _finalize_answer_output_file_links(final_answer, output_files)
                         yield _sse({"content": final_answer})
 
-                        output_files = exec_result.get("output_files") or []
                         if output_files:
                             yield _sse({
                                 "action_result": {

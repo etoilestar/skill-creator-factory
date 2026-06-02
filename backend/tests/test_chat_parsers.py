@@ -595,6 +595,30 @@ def test_render_success_stdout_payload_extracts_story_json():
     assert "![插图](generated_image.png)" in rendered
 
 
+def test_finalize_answer_rewrites_generated_image_to_download_url():
+    from backend.routers.sandbox_chat import _finalize_answer_output_file_links
+
+    answer = "# 科普故事\n\n正文\n\n![插图](generated-image.png)"
+    rendered = _finalize_answer_output_file_links(
+        answer,
+        [{"path": "outputs/generated-image.png", "url": "/api/skills/story/files/outputs/generated-image.png"}],
+    )
+
+    assert "![插图](/api/skills/story/files/outputs/generated-image.png)" in rendered
+    assert "![插图](generated-image.png)" not in rendered
+
+
+def test_finalize_answer_appends_missing_generated_image_url():
+    from backend.routers.sandbox_chat import _finalize_answer_output_file_links
+
+    rendered = _finalize_answer_output_file_links(
+        "# 科普故事\n\n正文",
+        [{"path": "generated-image.png", "url": "/api/skills/story/files/generated-image.png"}],
+    )
+
+    assert rendered.endswith("![生成图片](/api/skills/story/files/generated-image.png)")
+
+
 def test_runtime_planner_prompt_requires_fenced_block_trigger():
     from backend.routers.sandbox_chat import _compose_skill_runtime_planner_prompt
 

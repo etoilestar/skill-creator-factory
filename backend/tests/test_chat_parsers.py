@@ -611,7 +611,7 @@ def test_normalize_plan_rejects_generated_command_without_skill_template():
     result = _normalize_skill_runtime_plan(plan, command_contract=command_contract)
 
     assert result["mode"] == "ask_user"
-    assert any("缺少可执行命令 fenced block 模板" in str(error) for error in result["errors"])
+    assert any("缺少可执行命令 fenced block 示例" in str(error) for error in result["errors"])
 
 
 def test_normalize_plan_allows_generated_command_with_skill_template():
@@ -747,7 +747,7 @@ def main():
     )
 
 
-def test_creator_generate_skill_md_prompt_requires_block_contract():
+def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guidance():
     from backend.routers.creator import _build_generate_file_prompt
 
     messages = _build_generate_file_prompt(
@@ -759,10 +759,47 @@ def test_creator_generate_skill_md_prompt_requires_block_contract():
     )
     prompt = messages[0]["content"]
 
-    assert "宿主 Block 执行契约" in prompt
-    assert "只有 assistant 当轮回复中出现的 fenced code block" in prompt
-    assert "禁止只写‘立即调用 `scripts/...`’" in prompt
-    assert "具体命令模板" in prompt
+    assert "宿主 Markdown 执行说明" in prompt
+    assert "普通 Markdown 说明书" in prompt
+    assert "只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block" in prompt
+    assert "禁止在 SKILL.md 中只写“立即调用 `scripts/...`”" in prompt
+    assert "不要引入自定义协议章节" in prompt
+
+
+def test_creator_rejects_custom_runtime_contract_section():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    skill_md = """---
+name: demo
+description: demo
+---
+
+### Runtime Contract
+```json
+{}
+```
+"""
+
+    with pytest.raises(ValueError, match="Runtime Contract"):
+        _sanitize_generated_file_content("SKILL.md", skill_md)
+
+
+def test_creator_rejects_placeholder_image_script():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    script = """import os
+
+def main():
+    os.makedirs('generated_images', exist_ok=True)
+    with open('generated_images/demo.png', 'w') as f:
+        f.write('placeholder for image')
+
+if __name__ == '__main__':
+    main()
+"""
+
+    with pytest.raises(ValueError, match="占位|placeholder"):
+        _sanitize_generated_file_content("scripts/generate_image.py", script)
 
 
 def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
@@ -772,6 +809,7 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     phase3_prompt = load_kernel_creator_for_phase("phase3+")
 
     assert "宿主执行方式" in phase2_prompt
-    assert "显式 fenced block" in phase2_prompt
-    assert "生成的 Skill.md 运行时约束" in phase3_prompt
+    assert "标准 Markdown fenced block" in phase2_prompt
+    assert "生成的 Skill.md Markdown 运行说明" in phase3_prompt
     assert "不会触发宿主执行" in phase3_prompt
+    assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt

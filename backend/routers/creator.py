@@ -30,26 +30,23 @@ from ..services.skill_executor import run_action
 
 logger = logging.getLogger(__name__)
 
-_SKILL_MD_BLOCK_RUNTIME_CONTRACT = """
+_SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 
-宿主 Block 执行契约（必须写入生成的 SKILL.md 正文）：
-- SKILL.md 只描述做什么、何时使用资源，以及 assistant 应该如何表达动作；不要把资源存在本身写成执行触发器。
-- 如果本 Skill 需要运行 scripts/ 下的脚本，必须在 SKILL.md 正文里写出具体、完整、可复用的命令模板，并指示 assistant 在 Sandbox 当轮回复中按模板替换真实参数后输出显式可执行 fenced code block，格式为：
+宿主 Markdown 执行说明（写入生成的 SKILL.md 正文时必须保持常见 Markdown 形态）：
+- SKILL.md 是普通 Markdown 说明书，只描述做什么、何时使用资源，以及 assistant 在运行时应如何表达动作；不要引入自定义协议章节（例如 `Runtime Contract` JSON）。
+- 对纯文本即可完成的任务，明确写“直接回答”，不要要求运行脚本。
+- 如果确实需要运行 scripts/ 下的脚本，使用市面常见的 Markdown fenced code block 给出命令示例/模板，例如：
   执行命令：
   ```bash
-  python scripts/<script-name> '<与脚本接口一致的 JSON 或参数模板>'
+  python scripts/<script-name> '{"topic":"{{topic}}","keywords":"{{keywords}}"}'
   ```
-- 命令模板必须与脚本真实接口一致：如果脚本读取 argv[1] 的 JSON，就在 block 里写 JSON 字符串模板；如果脚本读取 stdin，就明确 stdin 协议；禁止让运行时主模型根据脚本名临时猜 CLI flags。
-- 必须补充 `Runtime Contract` JSON 小节，声明 command template、inputs 参数来源/default/required、stdout JSON 输出字段；inputs 中必须覆盖用户需求里的可变槽位（如 theme、character、age_range）。
-- 只有 assistant 当轮回复中出现的 fenced code block 才会被宿主解析和执行；`scripts/foo.py` 这样的行内路径引用或“立即调用脚本”的自然语言不会触发执行。
-- 如果需要写文件，必须指示 assistant 输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放入紧随其后的 fenced code block。
+- 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 参数映射用普通 Markdown 列表说明，例如 `topic` 从用户输入提取、`keywords` 从用户输入提取、可选参数给出默认值；不要使用单独的 JSON contract。
+- 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
+- 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
-- 对纯文本即可完成的任务，不要要求运行脚本，直接按 SKILL.md 生成最终文本。
-- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”；应写成“输出以下显式命令块交由宿主执行”，并给出具体命令模板。
-- 示例 Runtime Contract：
-  ```json
-  {"commands":[{"template":"python scripts/main.py '{\"theme\":\"{{theme}}\",\"character\":\"{{character}}\"}'","inputs":{"theme":{"source":"user_text","required":true},"character":{"source":"user_text","required":true}},"output":{"type":"json","fields":["text","image"]}}]}
-  ```
+- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
+- 如果用户要求使用平台内置图像/多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的图像/多模态模型完成视觉/图像相关步骤，脚本最多产出图像提示词或处理宿主返回的真实结果。
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
@@ -277,9 +274,41 @@ _MULTI_FILE_MARKER_RE = re.compile(
 )
 
 
+_SCRIPT_FAKE_IMPLEMENTATION_RE = re.compile(
+    r"placeholder|TODO|your_api_key|api\.example\.com|example\.com|模拟|占位|假装|"
+    r"实际使用时|实际开发中|仅为演示|演示目的|空的占位图|纯色图片|fake",
+    re.IGNORECASE,
+)
+_SKILL_CUSTOM_RUNTIME_CONTRACT_RE = re.compile(r"(?im)^\s*#{1,6}\s*Runtime\s+Contract\s*$")
+
+
+def _reject_custom_skill_md_protocol(content: str) -> None:
+    """Reject non-standard runtime protocol sections in generated SKILL.md."""
+    if _SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content):
+        raise ValueError(
+            "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；"
+            "请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
+        )
+
+
+def _reject_fake_script_implementation(file_path: str, content: str) -> None:
+    """Reject placeholder/mock scripts that pretend to implement capabilities."""
+    if _SCRIPT_FAKE_IMPLEMENTATION_RE.search(content):
+        raise ValueError(
+            f"{file_path} 包含占位/模拟/假 API 实现。"
+            "Creator 生成的脚本必须具备真实可执行功能；"
+            "如需图像或多模态能力，应通过宿主配置的模型/服务完成，不能写 placeholder 文件或假装调用 API。"
+        )
+
+
 def _validate_generated_file_content(file_path: str, content: str) -> None:
     """Reject content that is clearly not the requested single file."""
+    if file_path == "SKILL.md":
+        _reject_custom_skill_md_protocol(content)
+        return
+
     if file_path.startswith("scripts/"):
+        _reject_fake_script_implementation(file_path, content)
         if "```" in content or _MULTI_FILE_MARKER_RE.search(content):
             raise ValueError(
                 f"{file_path} 生成内容包含 Markdown 代码块或多文件包，"
@@ -314,7 +343,8 @@ def _script_reads_json_argv(content: str) -> bool:
 
 
 def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
-    """Validate script source against existing SKILL.md command templates."""
+    """Validate script source against existing SKILL.md command examples."""
+    _reject_fake_script_implementation(file_path, content)
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
@@ -322,15 +352,15 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
     json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
     if json_argv_commands and not _script_reads_json_argv(content):
         raise ValueError(
-            f"{file_path} 的 SKILL.md 命令模板传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
-            "禁止保存与命令契约不一致的脚本。"
+            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
+            "禁止保存与命令示例不一致的脚本。"
         )
 
     for cmd in commands:
         for key in re.findall(r"{{\s*([a-zA-Z_][\w-]*)\s*}}", cmd):
             if key not in content:
                 raise ValueError(
-                    f"{file_path} 的命令模板包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
+                    f"{file_path} 的 Markdown 命令示例包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
                 )
 
 
@@ -402,11 +432,11 @@ def _build_generate_file_prompt(
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
             "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
-            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须包含下面的宿主 Block 执行契约；\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须包含下面的宿主 Markdown 执行说明；\n"
             "   即使蓝图没有脚本，也应说明纯文本任务可直接回答，不要假装执行。\n"
             "6. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部允许包含示例 fenced code block。\n"
             "7. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            f"{_SKILL_MD_BLOCK_RUNTIME_CONTRACT}\n"
+            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
             f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
         )
     elif file_path.startswith("scripts/"):
@@ -416,12 +446,12 @@ def _build_generate_file_prompt(
             "要求：\n"
             f"1. 只输出完整可运行的 {lang} 代码，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出内容。\n"
-            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图、SKILL.md 命令模板和 Runtime Contract 一致。\n"
-            "4. 如果命令模板传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
+            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
+            "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例故事、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
-            "7. 所有导入的第三方库必须真实存在且常见；需要图像/VL 能力时优先通过宿主模型/服务，不要假装 AI 绘图。\n"
-            "8. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "7. 禁止生成占位实现、模拟实现、假 API、placeholder 文件或纯色/空白图片；如果缺少真实图像生成能力，应让 SKILL.md 使用宿主配置的图像/多模态模型，脚本不要假装生成图片。\n"
+            "8. 所有导入的第三方库必须真实存在且常见；包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):

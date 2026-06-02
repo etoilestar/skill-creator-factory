@@ -330,6 +330,32 @@ def _snapshot_skill_files(skill_dir: Path) -> set[str]:
     return result
 
 
+def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
+    """Return stable environment variables injected into generated scripts.
+
+    The creator prompts generated scripts to use these names instead of
+    hard-coded model IDs or service URLs.  Building this map in one place keeps
+    sandbox script runs and creator validation trial runs consistent.
+    """
+    env = {**os.environ}
+    env.update({
+        "LLM_BASE_URL": settings.llm_base_url,
+        "IMAGE_BASE_URL": settings.image_base_url,
+        "DEFAULT_MODEL": settings.default_model,
+        "TEXT_MODEL": settings.text_model or settings.default_model,
+        "CODE_MODEL": settings.code_model or settings.default_model,
+        "IMAGE_MODEL": settings.image_model or settings.default_model,
+        "VISION_MODEL": settings.vision_model or settings.default_model,
+        "IMAGE_SIZE": settings.image_size,
+        "OUTPUT_DIR": str(skill_dir / "outputs"),
+        "INPUT_DIR": str(skill_dir / "inputs"),
+    })
+    api_key = settings.llm_api_key or settings.openai_api_key or env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY") or "ollama"
+    env["LLM_API_KEY"] = api_key
+    env["OPENAI_API_KEY"] = settings.openai_api_key or api_key
+    return env
+
+
 def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Path) -> dict:
     """Execute a Python script from skills/{name}/scripts/ and return its output.
 
@@ -374,11 +400,7 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
             capture_output=True,
             timeout=_SCRIPT_RUN_TIMEOUT,
             cwd=str(skill_dir / "scripts"),
-            env={
-                **os.environ,
-                "OUTPUT_DIR": str(skill_dir / "outputs"),
-                "INPUT_DIR": str(skill_dir / "inputs"),
-            },
+            env=_build_script_runtime_env(skill_dir),
         )
         stdout = proc.stdout[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
         stderr = proc.stderr[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")

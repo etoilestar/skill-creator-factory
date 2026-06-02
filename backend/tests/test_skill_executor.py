@@ -246,3 +246,21 @@ def test_snapshot_excludes_pycache(tmp_path):
     snapshot = _snapshot_skill_files(tmp_path)
     assert "main.py" in snapshot
     assert not any("__pycache__" in p for p in snapshot)
+
+
+def test_build_script_runtime_env_injects_model_variables(tmp_path):
+    from backend.services import skill_executor
+
+    with patch.object(skill_executor.settings, "llm_base_url", "http://llm.test"), \
+         patch.object(skill_executor.settings, "image_base_url", "http://image.test"), \
+         patch.object(skill_executor.settings, "text_model", "text-a"), \
+         patch.object(skill_executor.settings, "image_model", "image-a"), \
+         patch.object(skill_executor.settings, "llm_api_key", "key-a"):
+        env = skill_executor._build_script_runtime_env(tmp_path)
+
+    assert env["LLM_BASE_URL"] == "http://llm.test"
+    assert env["IMAGE_BASE_URL"] == "http://image.test"
+    assert env["TEXT_MODEL"] == "text-a"
+    assert env["IMAGE_MODEL"] == "image-a"
+    assert env["LLM_API_KEY"] == "key-a"
+    assert env["OUTPUT_DIR"] == str(tmp_path / "outputs")

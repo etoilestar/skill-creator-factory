@@ -101,3 +101,40 @@ def test_kernel_path_must_exist(tmp_path):
     missing_kernel = tmp_path / "no_kernel_here"
     with pytest.raises(Exception):
         Settings(kernel_path=missing_kernel, skills_path=tmp_path / "skills")
+
+
+def test_uppercase_env_model_settings_override_defaults(monkeypatch, tmp_path):
+    """Project .env-style uppercase names should populate Settings fields explicitly."""
+    from backend.config import Settings
+
+    kernel = tmp_path / "kernel"
+    kernel.mkdir()
+    monkeypatch.setenv("LLM_BASE_URL", "http://172.18.127.67:11434")
+    monkeypatch.setenv("DEFAULT_MODEL", "qwen3:30b")
+    monkeypatch.setenv("TEXT_MODEL", "qwen-text")
+    monkeypatch.setenv("CODE_MODEL", "qwen-code")
+    monkeypatch.setenv("PLANNER_MODEL", "qwen-plan")
+    monkeypatch.setenv("VALIDATOR_MODEL", "qwen-validate")
+    monkeypatch.setenv("IMAGE_MODEL", "qwen-image")
+    monkeypatch.setenv("VISION_MODEL", "qwen-vision")
+    monkeypatch.setenv("SKILL_COMMAND_TIMEOUT", "180")
+
+    s = Settings(kernel_path=kernel, skills_path=tmp_path / "skills")
+
+    assert s.llm_base_url == "http://172.18.127.67:11434"
+    assert s.default_model == "qwen3:30b"
+    assert s.text_model == "qwen-text"
+    assert s.code_model == "qwen-code"
+    assert s.planner_model == "qwen-plan"
+    assert s.validator_model == "qwen-validate"
+    assert s.image_model == "qwen-image"
+    assert s.vision_model == "qwen-vision"
+    assert s.skill_command_timeout == 180
+
+
+def test_settings_reads_project_root_env_file():
+    """The configured .env path should be pinned to the repository root."""
+    from backend.config import PROJECT_ROOT, Settings
+
+    assert Settings.model_config["env_file"] == PROJECT_ROOT / ".env"
+    assert Settings.model_config["extra"] == "ignore"

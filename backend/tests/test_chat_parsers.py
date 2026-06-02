@@ -469,6 +469,31 @@ def test_run_command_injects_configured_model_environment(tmp_path, monkeypatch)
     assert "text-env-model|image-env-model|vision-env-model" in result["stdout"]
 
 
+def test_run_command_injects_default_model_api_keys(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers.sandbox_chat import _execute_single_task
+
+    monkeypatch.setattr(settings, "llm_api_key", None)
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    request = ChatRequest(messages=[])
+    result, _ = _execute_single_task(
+        {
+            "action": "run_command",
+            "command": "python -c \"import os; print(os.environ['LLM_API_KEY'] + '|' + os.environ['OPENAI_API_KEY'])\"",
+        },
+        [],
+        request,
+        execution_root=tmp_path,
+    )
+
+    assert result["success"] is True
+    assert "ollama|ollama" in result["stdout"]
+
+
 def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 

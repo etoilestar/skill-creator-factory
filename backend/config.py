@@ -36,9 +36,11 @@ class Settings(BaseSettings):
     text_model: Optional[str] = None
     code_model: Optional[str] = None
     image_model: Optional[str] = None
+    # Optional vision-language model for understanding uploaded images/screenshots.
+    vision_model: Optional[str] = None
 
     # Optional JSON routing overrides, e.g.
-    # {"tasks": {"code": "qwen-coder", "image": "sdxl"},
+    # {"tasks": {"code": "qwen-coder", "image": "sdxl", "vision": "qwen-vl"},
     #  "creator_paths": {"scripts/*": "code", "assets/*.png": "image"}}
     model_routing_json: Optional[str] = None
 

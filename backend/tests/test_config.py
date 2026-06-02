@@ -31,6 +31,7 @@ def test_new_fields_declared():
         "text_model",
         "code_model",
         "image_model",
+        "vision_model",
         "model_routing_json",
         "code_file_extensions",
         "image_task_keywords",

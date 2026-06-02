@@ -475,6 +475,40 @@ def test_strip_phase3_marker_from_visible_creator_text():
     assert _strip_phase3_marker_from_visible_text(text) == "蓝图内容\n后续文字"
 
 
+def test_request_messages_with_inline_images_builds_data_url(tmp_path):
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _request_messages_with_inline_images
+
+    image = tmp_path / "inputs" / "s1" / "photo.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"fakepng")
+    request = ChatRequest(
+        messages=[Message(role="user", content="分析图片")],
+        input_files=[{"path": "inputs/s1/photo.png", "filename": "photo.png"}],
+    )
+
+    messages = _request_messages_with_inline_images(request, tmp_path)
+
+    assert isinstance(messages[-1]["content"], list)
+    assert messages[-1]["content"][0]["type"] == "text"
+    assert messages[-1]["content"][1]["type"] == "image_url"
+    assert messages[-1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_render_success_stdout_payload_extracts_story_json():
+    from backend.routers.sandbox_chat import _render_success_stdout_payload
+
+    rendered = _render_success_stdout_payload({
+        "results": [{
+            "success": True,
+            "stdout": json.dumps({"text": "# 小猪冒险\n\n故事正文", "image": "generated_image.png"}, ensure_ascii=False),
+        }]
+    })
+
+    assert "# 小猪冒险" in rendered
+    assert "![插图](generated_image.png)" in rendered
+
+
 def test_runtime_planner_prompt_requires_fenced_block_trigger():
     from backend.routers.sandbox_chat import _compose_skill_runtime_planner_prompt
 
@@ -627,6 +661,53 @@ print("wrong target")
 
     with pytest.raises(ValueError, match="不是单个脚本源码"):
         _sanitize_generated_file_content("scripts/generate_story.py", bundle)
+
+
+def test_creator_rejects_script_that_ignores_json_argv_contract():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """执行命令：
+```bash
+python scripts/generate_fairytale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+```
+"""
+    script = """import json
+
+def main():
+    print(json.dumps({"text": "固定小兔子故事"}))
+"""
+
+    with pytest.raises(ValueError, match="json.loads"):
+        _validate_script_contract_static(
+            file_path="scripts/generate_fairytale.py",
+            content=script,
+            skill_md=skill_md,
+        )
+
+
+def test_creator_accepts_script_that_reads_contract_placeholders():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """执行命令：
+```bash
+python scripts/generate_fairytale.py '{"theme":"{{theme}}","character":"{{character}}"}'
+```
+"""
+    script = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    theme = payload.get("theme")
+    character = payload.get("character")
+    print(json.dumps({"text": f"{character}的{theme}故事"}, ensure_ascii=False))
+"""
+
+    _validate_script_contract_static(
+        file_path="scripts/generate_fairytale.py",
+        content=script,
+        skill_md=skill_md,
+    )
 
 
 def test_creator_generate_skill_md_prompt_requires_block_contract():

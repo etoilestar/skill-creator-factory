@@ -75,3 +75,20 @@ def test_sandbox_plan_code_action_routes_to_code():
 
     assert task == "code"
     assert route.model == "coder"
+
+
+def test_sandbox_image_upload_routes_to_vision_model():
+    from backend.config import settings
+    from backend.services.model_router import infer_sandbox_response_task, route_model
+
+    task = infer_sandbox_response_task(
+        body_prompt="",
+        user_text="分析这张图片",
+        plan={},
+        input_files=[{"filename": "photo.png", "path": "inputs/session/photo.png"}],
+    )
+    with patch.object(settings, "vision_model", "qwen-vl"):
+        route = route_model(task, requested_model="general", reason="test")
+
+    assert task == "vision"
+    assert route.model == "qwen-vl"

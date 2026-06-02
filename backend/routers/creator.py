@@ -40,11 +40,16 @@ _SKILL_MD_BLOCK_RUNTIME_CONTRACT = """
   python scripts/<script-name> '<与脚本接口一致的 JSON 或参数模板>'
   ```
 - 命令模板必须与脚本真实接口一致：如果脚本读取 argv[1] 的 JSON，就在 block 里写 JSON 字符串模板；如果脚本读取 stdin，就明确 stdin 协议；禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 必须补充 `Runtime Contract` JSON 小节，声明 command template、inputs 参数来源/default/required、stdout JSON 输出字段；inputs 中必须覆盖用户需求里的可变槽位（如 theme、character、age_range）。
 - 只有 assistant 当轮回复中出现的 fenced code block 才会被宿主解析和执行；`scripts/foo.py` 这样的行内路径引用或“立即调用脚本”的自然语言不会触发执行。
 - 如果需要写文件，必须指示 assistant 输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放入紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
 - 对纯文本即可完成的任务，不要要求运行脚本，直接按 SKILL.md 生成最终文本。
 - 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”；应写成“输出以下显式命令块交由宿主执行”，并给出具体命令模板。
+- 示例 Runtime Contract：
+  ```json
+  {"commands":[{"template":"python scripts/main.py '{\"theme\":\"{{theme}}\",\"character\":\"{{character}}\"}'","inputs":{"theme":{"source":"user_text","required":true},"character":{"source":"user_text","required":true}},"output":{"type":"json","fields":["text","image"]}}]}
+  ```
 """
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
@@ -290,6 +295,56 @@ def _validate_generated_file_content(file_path: str, content: str) -> None:
                 ) from exc
 
 
+def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
+    """Return shell command templates in SKILL.md that invoke script_path."""
+    commands: list[str] = []
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", skill_md, flags=re.IGNORECASE):
+        command = match.group(1).strip()
+        if script_path in command:
+            commands.append(command)
+    return commands
+
+
+def _command_uses_json_argv(command: str) -> bool:
+    return "{" in command and "}" in command
+
+
+def _script_reads_json_argv(content: str) -> bool:
+    return "json.loads" in content and "sys.argv" in content
+
+
+def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Validate script source against existing SKILL.md command templates."""
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return
+
+    json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
+    if json_argv_commands and not _script_reads_json_argv(content):
+        raise ValueError(
+            f"{file_path} 的 SKILL.md 命令模板传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
+            "禁止保存与命令契约不一致的脚本。"
+        )
+
+    for cmd in commands:
+        for key in re.findall(r"{{\s*([a-zA-Z_][\w-]*)\s*}}", cmd):
+            if key not in content:
+                raise ValueError(
+                    f"{file_path} 的命令模板包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
+                )
+
+
+def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
+    """Refuse saving scripts that do not match the current SKILL.md contract."""
+    if not file_path.startswith("scripts/"):
+        return
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    if not skill_md_path.is_file():
+        return
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+
 def _sanitize_generated_file_content(file_path: str, content: str) -> str:
     """Normalize model output into exactly the requested file content."""
     extracted = _extract_target_file_from_bundle(content, file_path)
@@ -361,9 +416,12 @@ def _build_generate_file_prompt(
             "要求：\n"
             f"1. 只输出完整可运行的 {lang} 代码，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出内容。\n"
-            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图中描述的一致。\n"
-            "4. 所有导入的第三方库必须真实存在且常见。\n"
-            "5. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图、SKILL.md 命令模板和 Runtime Contract 一致。\n"
+            "4. 如果命令模板传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
+            "5. 必须实际使用用户可变参数生成结果；禁止把示例故事、示例标题、示例图片路径硬编码成固定输出。\n"
+            "6. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image\": ...}），不要混入调试说明。\n"
+            "7. 所有导入的第三方库必须真实存在且常见；需要图像/VL 能力时优先通过宿主模型/服务，不要假装 AI 绘图。\n"
+            "8. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
             f"以下是已确认的蓝图：\n\n{blueprint_text}"
         )
     elif file_path.startswith("references/"):
@@ -516,6 +574,7 @@ async def write_file(request: WriteFileRequest):
 
     try:
         content = _sanitize_generated_file_content(request.file_path, request.content)
+        _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

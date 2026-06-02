@@ -1,10 +1,12 @@
 """Sandbox-mode chat helpers, planners, and execution routines."""
 
 import asyncio
+import base64
 import functools
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shlex
@@ -633,6 +635,45 @@ async def _run_child_skill_selection_round(
         decision_text,
         valid_child_refs=valid_child_refs,
     )
+
+_VISION_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _request_messages_with_inline_images(request: ChatRequest, execution_root: Path | None) -> list[dict]:
+    """Build OpenAI-compatible multimodal user messages for VL models."""
+    messages = _request_messages_with_files(request)
+    if execution_root is None or not request.input_files:
+        return messages
+
+    image_parts: list[dict] = []
+    root = execution_root.resolve()
+    for item in request.input_files:
+        rel = str(item.get("path") or "")
+        path = (root / rel).resolve()
+        if path.suffix.lower() not in _VISION_IMAGE_EXTS:
+            continue
+        if not _is_within_sandbox(path, root) or not path.is_file():
+            continue
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        image_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+        })
+
+    if not image_parts:
+        return messages
+
+    for i in reversed(range(len(messages))):
+        if messages[i].get("role") == "user":
+            text = str(messages[i].get("content") or "")
+            messages[i] = {
+                "role": "user",
+                "content": [{"type": "text", "text": text}, *image_parts],
+            }
+            break
+    return messages
+
 
 def _strip_runtime_resource_manifest(body_prompt: str) -> str:
     """Remove generated resource manifest section from planner text.
@@ -1852,6 +1893,32 @@ def _execute_planned_actions(
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。
 
+def _render_success_stdout_payload(result: dict) -> str | None:
+    """Render structured JSON stdout from a successful command as final user content."""
+    for item in result.get("results") or []:
+        if not isinstance(item, dict) or not item.get("success"):
+            continue
+        stdout = str(item.get("stdout") or "").strip()
+        if not stdout:
+            continue
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("text") or payload.get("markdown") or "").strip()
+        image = str(payload.get("image") or payload.get("image_path") or "").strip()
+        parts: list[str] = []
+        if text:
+            parts.append(text)
+        if image and image not in text:
+            parts.append(f"![插图]({image})")
+        if parts:
+            return "\n\n".join(parts)
+    return None
+
+
 def _format_execution_report(result: dict) -> str:
     if not result.get("executed"):
         reason = result.get("reason", "未知原因")
@@ -2439,6 +2506,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     body_prompt=body_prompt,
                     user_text=_last_user_text(request),
                     plan=locals().get("runtime_plan") if isinstance(locals().get("runtime_plan"), dict) else None,
+                    input_files=request.input_files,
                 ),
                 requested_model=requested_model,
                 reason="sandbox final response classification",
@@ -2494,7 +2562,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     }
                 )
 
-            final_messages.extend(_request_messages_with_files(request))
+            if response_route.task == "vision":
+                final_messages.extend(_request_messages_with_inline_images(request, execution_root))
+            else:
+                final_messages.extend(_request_messages_with_files(request))
 
             assistant_chunks: list[str] = []
             ack_payload = {}
@@ -2507,7 +2578,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield _sse({"model_ack": {**response_route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
                     ack_payload.clear()
                 assistant_chunks.append(chunk)
-                yield _sse({"content": chunk})
+                if not enable_action_execution:
+                    yield _sse({"content": chunk})
 
             assistant_text = "".join(assistant_chunks)
 
@@ -2523,7 +2595,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
                     if exec_result.get("executed"):
-                        yield _sse({"content": _format_execution_report(exec_result)})
+                        rendered_payload = _render_success_stdout_payload(exec_result)
+                        if rendered_payload:
+                            yield _sse({"content": rendered_payload})
+                        else:
+                            yield _sse({"content": assistant_text})
+                            yield _sse({"content": _format_execution_report(exec_result)})
 
                         # Emit structured output_files event for the fallback path too.
                         output_files = exec_result.get("output_files") or []
@@ -2544,6 +2621,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     yield _sse({"error": "错误：后台规划或执行文件操作失败"})
                     yield "data: [DONE]\n\n"
                     return
+            if enable_action_execution and assistant_text and not locals().get("exec_result", {}).get("executed"):
+                yield _sse({"content": assistant_text})
             yield _sse({"status": None})
             yield "data: [DONE]\n\n"
 

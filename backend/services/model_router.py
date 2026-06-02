@@ -24,6 +24,7 @@ CODE_TASK = "code"
 IMAGE_TASK = "image"
 PLANNER_TASK = "planner"
 VALIDATOR_TASK = "validator"
+VISION_TASK = "vision"
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,8 @@ def _model_for_task(task: str, requested_model: str | None = None) -> str:
         return settings.code_model
     if task == IMAGE_TASK and settings.image_model:
         return settings.image_model
+    if task == VISION_TASK and settings.vision_model:
+        return settings.vision_model
     if task == PLANNER_TASK and settings.planner_model:
         return settings.planner_model
     if task == VALIDATOR_TASK and settings.validator_model:
@@ -114,7 +117,7 @@ def _model_for_task(task: str, requested_model: str | None = None) -> str:
 
 def route_model(task: str, *, requested_model: str | None = None, reason: str = "") -> ModelRoute:
     """Route an already-classified task to a configured model."""
-    normalized = task if task in {TEXT_TASK, CODE_TASK, IMAGE_TASK, PLANNER_TASK, VALIDATOR_TASK} else TEXT_TASK
+    normalized = task if task in {TEXT_TASK, CODE_TASK, IMAGE_TASK, VISION_TASK, PLANNER_TASK, VALIDATOR_TASK} else TEXT_TASK
     return ModelRoute(
         task=normalized,
         model=_model_for_task(normalized, requested_model),
@@ -140,7 +143,7 @@ def infer_creator_file_task(file_path: str, purpose: str = "") -> str:
         if fnmatch.fnmatch(file_path, str(pattern)):
             # If a custom path maps to a known task name, return it; otherwise
             # treat it as code/text later via route_creator_file_model.
-            if task_or_model in {TEXT_TASK, CODE_TASK, IMAGE_TASK, PLANNER_TASK, VALIDATOR_TASK}:
+            if task_or_model in {TEXT_TASK, CODE_TASK, IMAGE_TASK, VISION_TASK, PLANNER_TASK, VALIDATOR_TASK}:
                 return str(task_or_model)
             return TEXT_TASK
 
@@ -167,6 +170,7 @@ def route_creator_file_model(
             TEXT_TASK,
             CODE_TASK,
             IMAGE_TASK,
+            VISION_TASK,
             PLANNER_TASK,
             VALIDATOR_TASK,
         }:
@@ -181,7 +185,18 @@ def route_creator_file_model(
     return route_model(task, requested_model=requested_model, reason=f"creator file {file_path}")
 
 
-def infer_sandbox_response_task(*, body_prompt: str, user_text: str, plan: dict | None = None) -> str:
+_IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".svg"}
+
+
+def _has_image_input(input_files: list[dict] | None) -> bool:
+    for item in input_files or []:
+        filename = str(item.get("filename") or item.get("path") or "").lower()
+        if any(filename.endswith(ext) for ext in _IMAGE_FILE_EXTENSIONS):
+            return True
+    return False
+
+
+def infer_sandbox_response_task(*, body_prompt: str, user_text: str, plan: dict | None = None, input_files: list[dict] | None = None) -> str:
     """Infer the best response model for a sandbox skill turn.
 
     The skill decides *what* needs to happen in SKILL.md.  The backend only
@@ -190,6 +205,9 @@ def infer_sandbox_response_task(*, body_prompt: str, user_text: str, plan: dict 
     """
     plan = plan or {}
     text = f"{user_text}\n{body_prompt[:4000]}".lower()
+
+    if _has_image_input(input_files):
+        return VISION_TASK
 
     tasks = plan.get("tasks") if isinstance(plan, dict) else []
     if isinstance(tasks, list):

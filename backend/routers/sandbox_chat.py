@@ -10,10 +10,12 @@ import re
 import shlex
 import shutil
 import subprocess
+import time as _time_module
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from ..config import settings
 from ..services.kernel_loader import (
@@ -648,6 +650,165 @@ def _strip_runtime_resource_manifest(body_prompt: str) -> str:
         + "资源清单已由宿主以结构化 resource_catalog 单独提供。"
         + "规划 read_resource 时只能使用 resource_handle，不能生成 path。\n"
     )
+
+# ---------------------------------------------------------------------------
+# Instruction Analysis Round
+# ---------------------------------------------------------------------------
+
+def _compose_instruction_analysis_prompt() -> str:
+    """System prompt for the instruction semantic analysis round."""
+    return (
+        "你是指令语义分析器。你的任务是精准识别用户自然语言指令的任务意图、执行范围、约束条件和输出要求。\n\n"
+        "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释或 Markdown。\n\n"
+        "分析维度：\n"
+        "1. intent：用户想要完成的核心任务（一句话描述）\n"
+        "2. scope：任务的执行范围（涉及哪些数据、文件、对象）\n"
+        "3. constraints：约束条件列表（格式要求、数量限制、时间约束等）\n"
+        "4. output_requirements：输出要求列表（文件格式、内容结构、展示形式等）\n"
+        "5. complexity：任务复杂度 simple|moderate|complex\n"
+        "   - simple：单步即可完成（直接回答/单个命令）\n"
+        "   - moderate：需2-3步有序执行\n"
+        "   - complex：需多步骤、多资源、有依赖的复合任务\n\n"
+        "输出格式：\n"
+        "{\n"
+        '  "intent": "任务意图描述",\n'
+        '  "scope": "执行范围描述",\n'
+        '  "constraints": ["约束1", "约束2"],\n'
+        '  "output_requirements": ["输出要求1", "输出要求2"],\n'
+        '  "complexity": "simple|moderate|complex"\n'
+        "}\n"
+    )
+
+
+async def _run_instruction_analysis_round(
+    *,
+    body_prompt: str,
+    request: "ChatRequest",
+    model: str,
+) -> dict:
+    """Analyze user instruction semantics and return structured understanding."""
+    user_text = _last_user_text(request)
+    messages = [
+        {"role": "system", "content": _compose_instruction_analysis_prompt()},
+        {"role": "user", "content": (
+            f"## Skill 上下文摘要\n{body_prompt[:2000]}\n\n"
+            f"## 用户指令\n{user_text}"
+        )},
+    ]
+
+    planner_model = _planner_model_name(model)
+    result_text = await complete_chat_once(messages, planner_model)
+    stripped = _strip_markdown_json_fence(result_text)
+
+    try:
+        analysis = json.loads(stripped)
+    except json.JSONDecodeError:
+        analysis = {
+            "intent": user_text[:200],
+            "scope": "未能解析",
+            "constraints": [],
+            "output_requirements": [],
+            "complexity": "moderate",
+        }
+
+    # Ensure required keys exist
+    for key in ("intent", "scope", "constraints", "output_requirements", "complexity"):
+        if key not in analysis:
+            analysis[key] = [] if key in ("constraints", "output_requirements") else ""
+
+    return analysis
+
+
+# ---------------------------------------------------------------------------
+# SOP Generator
+# ---------------------------------------------------------------------------
+
+def _generate_sop_from_plan(
+    *,
+    instruction_analysis: dict,
+    runtime_plan: dict,
+    skill_name: str = "",
+) -> dict:
+    """Convert a runtime plan + instruction analysis into a standardized SOP document."""
+    tasks = runtime_plan.get("tasks") or []
+    mode = runtime_plan.get("mode", "execute")
+
+    steps = []
+    for i, task in enumerate(tasks, 1):
+        action = task.get("action", "")
+        reason = task.get("reason", "")
+        command = task.get("command", "")
+        path = task.get("path", "")
+
+        step_name = ""
+        description = reason or ""
+        inputs = []
+        outputs = []
+
+        if action == "read_resource":
+            step_name = f"读取资源：{path or task.get('resource_handle', '')}"
+            inputs.append(path or task.get("resource_handle", ""))
+        elif action == "run_command":
+            step_name = f"执行命令"
+            description = command[:200] if command else reason
+            inputs.append(command[:100] if command else "")
+        elif action == "write_file":
+            step_name = f"写入文件：{path}"
+            outputs.append(path)
+        elif action == "create_directory":
+            step_name = f"创建目录：{path}"
+            outputs.append(path)
+        else:
+            step_name = action
+
+        steps.append({
+            "order": i,
+            "name": step_name,
+            "description": description,
+            "action": action,
+            "inputs": inputs,
+            "outputs": outputs,
+            "responsible": "agent",
+        })
+
+    # Build mermaid flowchart
+    mermaid_lines = ["graph TD"]
+    for i, step in enumerate(steps):
+        node_id = f"S{step['order']}"
+        label = step["name"][:30].replace('"', "'")
+        mermaid_lines.append(f'    {node_id}["{label}"]')
+        if i > 0:
+            prev_id = f"S{steps[i-1]['order']}"
+            mermaid_lines.append(f"    {prev_id} --> {node_id}")
+
+    return {
+        "title": f"SOP：{instruction_analysis.get('intent', skill_name)[:50]}",
+        "version": "1.0",
+        "skill_name": skill_name,
+        "mode": mode,
+        "complexity": instruction_analysis.get("complexity", "moderate"),
+        "steps": steps,
+        "total_steps": len(steps),
+        "flowchart_mermaid": "\n".join(mermaid_lines),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plan Confirmation Store (in-memory for simplicity)
+# ---------------------------------------------------------------------------
+
+# Stores pending plans awaiting user confirmation: { plan_id: { plan, skill_context, request, ts } }
+_pending_plans: dict[str, dict] = {}
+_PLAN_EXPIRY_SECONDS = 600  # plans expire after 10 minutes
+
+
+def _cleanup_expired_plans():
+    """Remove expired pending plans."""
+    now = _time_module.time()
+    expired = [k for k, v in _pending_plans.items() if now - v.get("ts", 0) > _PLAN_EXPIRY_SECONDS]
+    for k in expired:
+        del _pending_plans[k]
+
 
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
@@ -1936,6 +2097,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     parent_skill_name = skill_context.get("skill_name", "")
     enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
 
+    # Dual execution mode: "plan" (preview before execute) or "craft" (direct execute)
+    execution_mode = getattr(request, "execution_mode", None) or "craft"
+
     if execution_root is not None:
         execution_root = Path(execution_root).resolve()
         # Verify the resolved path is within an allowed skill root so that
@@ -2168,6 +2332,21 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
             if enable_action_execution:
+                # --- Instruction Analysis Round ---
+                yield _sse({"status": {"phase": "analyzing_instruction", "message": "分析指令语义…"}})
+                instruction_analysis = await _run_instruction_analysis_round(
+                    body_prompt=body_prompt,
+                    request=request,
+                    model=model,
+                )
+                yield _thought(
+                    "instruction_analysis",
+                    "指令语义分析",
+                    f"意图：{instruction_analysis.get('intent', '')[:80]}，复杂度：{instruction_analysis.get('complexity', '')}",
+                    instruction_analysis,
+                )
+
+                # --- Runtime Planner Round ---
                 try:
                     yield _sse({"status": {"phase": "planning", "message": "规划执行方案…"}})
                     runtime_plan = await _run_skill_runtime_planner_round(
@@ -2201,6 +2380,66 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "missing": runtime_plan.get("missing") or [],
                         },
                     )
+
+                    # --- Generate SOP document ---
+                    sop_document = _generate_sop_from_plan(
+                        instruction_analysis=instruction_analysis,
+                        runtime_plan=runtime_plan,
+                        skill_name=parent_skill_name,
+                    )
+                    yield _sse({"sop_plan": sop_document})
+                    yield _thought(
+                        "sop_generated",
+                        "SOP 方案",
+                        f"共 {sop_document.get('total_steps', 0)} 个步骤",
+                        {"title": sop_document.get("title", ""), "total_steps": sop_document.get("total_steps", 0)},
+                    )
+
+                    # --- Plan Mode: preview and await confirmation ---
+                    if execution_mode == "plan" and mode == "execute" and tasks:
+                        plan_id = hashlib.sha256(
+                            f"{parent_skill_name}:{_time_module.time()}:{_last_user_text(request)[:100]}".encode()
+                        ).hexdigest()[:16]
+
+                        _cleanup_expired_plans()
+                        _pending_plans[plan_id] = {
+                            "plan": runtime_plan,
+                            "instruction_analysis": instruction_analysis,
+                            "sop": sop_document,
+                            "skill_context": skill_context,
+                            "request": request,
+                            "ts": _time_module.time(),
+                        }
+
+                        yield _sse({
+                            "plan_preview": {
+                                "plan_id": plan_id,
+                                "mode": mode,
+                                "instruction_analysis": instruction_analysis,
+                                "sop": sop_document,
+                                "tasks": [
+                                    {
+                                        "action": t.get("action"),
+                                        "command": (str(t.get("command") or ""))[:200] or None,
+                                        "path": t.get("path") or t.get("resource_handle") or None,
+                                        "reason": str(t.get("reason") or "")[:300],
+                                    }
+                                    for t in tasks
+                                ],
+                                "total_tasks": len(tasks),
+                                "awaiting_confirmation": True,
+                            }
+                        })
+                        yield _sse({"status": None})
+                        yield _sse({"content": (
+                            f"📋 **执行方案已生成**（共 {len(tasks)} 个步骤）\n\n"
+                            f"**任务意图**：{instruction_analysis.get('intent', '')}\n"
+                            f"**复杂度**：{instruction_analysis.get('complexity', '')}\n\n"
+                            "请在左侧面板查看详细方案，确认后将开始执行。\n"
+                            f"（方案ID：`{plan_id}`）"
+                        )})
+                        yield "data: [DONE]\n\n"
+                        return
 
                     if mode == "execute" and tasks:
                         # Set up shared execution context for the per-task loop.
@@ -2522,3 +2761,74 @@ async def chat_in_sandbox(skill_name: str, request: ChatRequest):
         raise HTTPException(status_code=404, detail=str(exc))
 
     return _make_stream(skill_context, request)
+
+
+class PlanConfirmRequest(BaseModel):
+    """Request body for confirming a pending plan execution."""
+    plan_id: str
+    action: str = "confirm"  # "confirm" | "cancel"
+
+
+@router.post("/sandbox/{skill_name}/confirm")
+async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
+    """Confirm or cancel a pending plan in Plan mode."""
+    _cleanup_expired_plans()
+
+    pending = _pending_plans.pop(request.plan_id, None)
+    if not pending:
+        raise HTTPException(status_code=404, detail="方案不存在或已过期，请重新发送请求。")
+
+    if request.action == "cancel":
+        return {"status": "cancelled", "message": "执行方案已取消。"}
+
+    # Re-execute the plan by building a new stream with craft mode
+    skill_context = pending["skill_context"]
+    original_request = pending["request"]
+    # Override to craft mode for actual execution
+    original_request.execution_mode = "craft"
+
+    return _make_stream(skill_context, original_request)
+
+
+class SOPExportRequest(BaseModel):
+    """Request body for SOP export."""
+    plan_id: str | None = None
+    format: str = "markdown"  # "markdown" | "json"
+
+
+@router.post("/sandbox/{skill_name}/sop")
+async def export_sop(skill_name: str, request: SOPExportRequest):
+    """Export the SOP document for a pending or last-executed plan."""
+    if request.plan_id:
+        pending = _pending_plans.get(request.plan_id)
+        if not pending:
+            raise HTTPException(status_code=404, detail="方案不存在或已过期。")
+        sop = pending.get("sop", {})
+    else:
+        raise HTTPException(status_code=400, detail="需要提供 plan_id。")
+
+    if request.format == "json":
+        return sop
+
+    # Markdown format
+    lines = [f"# {sop.get('title', 'SOP')}\n"]
+    lines.append(f"**版本**：{sop.get('version', '1.0')}\n")
+    lines.append(f"**技能**：{sop.get('skill_name', skill_name)}\n")
+    lines.append(f"**复杂度**：{sop.get('complexity', '')}\n")
+    lines.append(f"\n## 执行步骤\n")
+
+    for step in sop.get("steps", []):
+        lines.append(f"### 步骤 {step['order']}：{step['name']}\n")
+        lines.append(f"- **描述**：{step.get('description', '')}\n")
+        if step.get("inputs"):
+            lines.append(f"- **输入**：{', '.join(step['inputs'])}\n")
+        if step.get("outputs"):
+            lines.append(f"- **输出**：{', '.join(step['outputs'])}\n")
+        lines.append(f"- **执行者**：{step.get('responsible', 'agent')}\n")
+        lines.append("")
+
+    if sop.get("flowchart_mermaid"):
+        lines.append("\n## 流程图\n")
+        lines.append(f"```mermaid\n{sop['flowchart_mermaid']}\n```\n")
+
+    return {"format": "markdown", "content": "\n".join(lines)}

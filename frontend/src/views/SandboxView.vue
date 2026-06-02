@@ -12,6 +12,25 @@
           {{ sk.display_name || sk.name }} · {{ sk.scope }} · {{ sk.status }}
         </option>
       </select>
+
+      <!-- Execution Mode Switch -->
+      <div v-if="selectedSkill" class="mode-switch">
+        <button
+          class="mode-btn"
+          :class="{ active: executionMode === 'plan' }"
+          @click="executionMode = 'plan'"
+          :disabled="streaming"
+          title="Plan 模式：先规划后确认再执行"
+        >📋 Plan</button>
+        <button
+          class="mode-btn"
+          :class="{ active: executionMode === 'craft' }"
+          @click="executionMode = 'craft'"
+          :disabled="streaming"
+          title="Craft 模式：直接执行"
+        >⚡ Craft</button>
+      </div>
+
       <button class="btn-ghost" @click="resetChat" :disabled="streaming || !selectedSkill">
         重置对话
       </button>
@@ -23,6 +42,15 @@
         title="显示/隐藏执行过程面板"
       >
         🔍 执行过程{{ thoughts.length ? ` (${thoughts.length})` : '' }}
+      </button>
+      <button
+        v-if="selectedSkill && (currentPlanPreview || currentSOP)"
+        class="btn-ghost btn-plan-panel"
+        :class="{ active: showPlanPanel }"
+        @click="showPlanPanel = !showPlanPanel"
+        title="显示/隐藏方案面板"
+      >
+        📋 方案{{ currentPlanPreview ? ' (待确认)' : '' }}
       </button>
     </div>
 
@@ -38,6 +66,12 @@
             <div v-if="messages.length === 0" class="empty muted">
               <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
               <p>向它发送消息，测试它的行为。</p>
+              <p class="mode-hint" v-if="executionMode === 'plan'">
+                📋 当前为 <strong>Plan 模式</strong>：AI 会先生成执行方案供你确认后再执行。
+              </p>
+              <p class="mode-hint" v-else>
+                ⚡ 当前为 <strong>Craft 模式</strong>：AI 将直接执行任务。
+              </p>
             </div>
             <template v-for="(msg, i) in messages" :key="i">
               <!-- action result card -->
@@ -164,6 +198,39 @@
             <ThinkingPanel :thoughts="thoughts" />
           </div>
         </transition>
+
+        <!-- Plan / SOP panel sidebar -->
+        <transition name="panel-slide">
+          <div v-if="showPlanPanel" class="thinking-sidebar plan-sidebar">
+            <div class="thinking-sidebar-header">
+              <div class="plan-tabs">
+                <button
+                  class="plan-tab"
+                  :class="{ active: planTab === 'plan' }"
+                  @click="planTab = 'plan'"
+                >任务方案</button>
+                <button
+                  class="plan-tab"
+                  :class="{ active: planTab === 'sop' }"
+                  @click="planTab = 'sop'"
+                >SOP</button>
+              </div>
+              <button class="btn-ghost btn-close-panel" @click="showPlanPanel = false">✕</button>
+            </div>
+            <TaskPlanPanel
+              v-if="planTab === 'plan'"
+              :plan="currentPlanPreview"
+              :confirming="confirming"
+              @confirm="confirmCurrentPlan"
+              @cancel="cancelCurrentPlan"
+            />
+            <SOPPanel
+              v-if="planTab === 'sop'"
+              :sop="currentSOP"
+              @export="exportSOP"
+            />
+          </div>
+        </transition>
       </div>
     </template>
   </div>
@@ -172,9 +239,11 @@
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
-import { streamChat } from '../composables/useChat.js'
+import { streamChat, confirmPlan, streamConfirmResponse } from '../composables/useChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
+import TaskPlanPanel from '../components/TaskPlanPanel.vue'
+import SOPPanel from '../components/SOPPanel.vue'
 
 const ACTION_LABELS = {
   run_script: '运行脚本',
@@ -216,9 +285,19 @@ const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
 
+// Execution mode: "plan" or "craft"
+const executionMode = ref('craft')
+
 // Thinking panel state
 const thoughts = ref([])          // accumulated thought events for the current round
 const showThoughts = ref(false)   // sidebar visibility
+
+// Plan/SOP panel state
+const showPlanPanel = ref(false)
+const planTab = ref('plan')       // 'plan' | 'sop'
+const currentPlanPreview = ref(null)  // plan_preview data from backend
+const currentSOP = ref(null)          // SOP document from backend
+const confirming = ref(false)
 
 // File upload state
 const sessionId = ref(newSessionId())
@@ -248,6 +327,10 @@ function resetChat() {
   sessionId.value = newSessionId()
   roundOutputFiles.value = []
   thoughts.value = []
+  currentPlanPreview.value = null
+  currentSOP.value = null
+  showPlanPanel.value = false
+  confirming.value = false
 }
 
 function removeUploadedFile(idx) {
@@ -307,13 +390,18 @@ async function send() {
   currentStatus.value = null
   roundOutputFiles.value = []
   thoughts.value = []           // clear previous round's thoughts
+  currentPlanPreview.value = null
+  currentSOP.value = null
 
   // Snapshot the uploaded files for this message, then keep them until reset
   const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
 
   try {
     const url = `/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}`
-    const body = { messages: chatHistory.value }
+    const body = {
+      messages: chatHistory.value,
+      execution_mode: executionMode.value,
+    }
     if (inputFilesSnapshot.length) body.input_files = inputFilesSnapshot
     for await (const chunk of streamChat(url, body)) {
       if (typeof chunk === 'string') {
@@ -344,6 +432,12 @@ async function send() {
           roundOutputFiles.value.push(...r.output_files)
         }
         await scrollBottom()
+      } else if (chunk.type === 'plan_preview') {
+        currentPlanPreview.value = chunk.data
+        showPlanPanel.value = true
+        planTab.value = 'plan'
+      } else if (chunk.type === 'sop_plan') {
+        currentSOP.value = chunk.data
       }
     }
     if (streamBuffer.value) {
@@ -356,6 +450,143 @@ async function send() {
     streaming.value = false
     currentStatus.value = null
     await scrollBottom()
+  }
+}
+
+/** Confirm a pending plan in Plan mode */
+async function confirmCurrentPlan() {
+  if (!currentPlanPreview.value || confirming.value) return
+
+  const planId = currentPlanPreview.value.plan_id
+  confirming.value = true
+  streaming.value = true
+  streamBuffer.value = ''
+  thoughts.value = []
+  roundOutputFiles.value = []
+
+  try {
+    const response = await confirmPlan(selectedSkill.value, planId, 'confirm')
+
+    // Check if it's a streaming response (SSE) or JSON
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('text/event-stream')) {
+      for await (const chunk of streamConfirmResponse(response)) {
+        if (typeof chunk === 'string') {
+          streamBuffer.value += chunk
+          await scrollBottom()
+        } else if (chunk.type === 'status') {
+          currentStatus.value = chunk.data
+        } else if (chunk.type === 'thought') {
+          thoughts.value.push(chunk.data)
+          if (!showThoughts.value) showThoughts.value = true
+        } else if (chunk.type === 'action_result') {
+          const r = chunk.data
+          messages.value.push({
+            role: 'system',
+            action: r.action,
+            name: r.name,
+            success: r.success,
+            message: r.message,
+            path: r.path,
+            stdout: r.stdout || '',
+            stderr: r.stderr || '',
+            exit_code: r.exit_code,
+            output_files: r.output_files || [],
+          })
+          if (r.output_files && r.output_files.length) {
+            roundOutputFiles.value.push(...r.output_files)
+          }
+          await scrollBottom()
+        }
+      }
+      if (streamBuffer.value) {
+        messages.value.push({ role: 'assistant', content: streamBuffer.value })
+        streamBuffer.value = ''
+      }
+    } else {
+      // JSON response (e.g., cancel confirmation)
+      const data = await response.json()
+      messages.value.push({ role: 'assistant', content: data.message || '方案已执行完成。' })
+    }
+
+    currentPlanPreview.value = null
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    confirming.value = false
+    streaming.value = false
+    currentStatus.value = null
+    await scrollBottom()
+  }
+}
+
+/** Cancel a pending plan */
+async function cancelCurrentPlan() {
+  if (!currentPlanPreview.value) return
+
+  const planId = currentPlanPreview.value.plan_id
+  try {
+    await confirmPlan(selectedSkill.value, planId, 'cancel')
+    messages.value.push({ role: 'assistant', content: '❌ 执行方案已取消。' })
+    currentPlanPreview.value = null
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+/** Export SOP in the specified format */
+async function exportSOP(format) {
+  if (!currentSOP.value) return
+
+  if (format === 'json') {
+    const blob = new Blob([JSON.stringify(currentSOP.value, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `sop-${selectedSkill.value}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  } else {
+    // Request markdown export from backend if plan_id available, otherwise format locally
+    const planId = currentPlanPreview.value?.plan_id
+    if (planId) {
+      try {
+        const res = await fetch(`/api/chat/sandbox/${encodeURIComponent(selectedSkill.value)}/sop`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plan_id: planId, format: 'markdown' }),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          const blob = new Blob([data.content], { type: 'text/markdown' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = `sop-${selectedSkill.value}.md`
+          a.click()
+          URL.revokeObjectURL(url)
+          return
+        }
+      } catch (_) { /* fallthrough to local export */ }
+    }
+
+    // Local markdown generation fallback
+    const sop = currentSOP.value
+    let md = `# ${sop.title}\n\n`
+    md += `**版本**：${sop.version}\n**复杂度**：${sop.complexity}\n\n## 步骤\n\n`
+    for (const step of (sop.steps || [])) {
+      md += `### ${step.order}. ${step.name}\n${step.description}\n\n`
+    }
+    if (sop.flowchart_mermaid) {
+      md += `\n## 流程图\n\n\`\`\`mermaid\n${sop.flowchart_mermaid}\n\`\`\`\n`
+    }
+    const blob = new Blob([md], { type: 'text/markdown' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `sop-${selectedSkill.value}.md`
+    a.click()
+    URL.revokeObjectURL(url)
   }
 }
 </script>

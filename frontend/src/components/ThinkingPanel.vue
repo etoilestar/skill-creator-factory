@@ -63,7 +63,9 @@ const STEP_ICONS = {
   body_loaded: '📖',
   child_decision: '🧩',
   resource_selection: '📦',
+  instruction_analysis: '🧠',
   planner_output: '📋',
+  sop_generated: '📑',
   action_start: '▶️',
   action_result: null, // dynamic — see stepIcon()
   final_answer: '💬',
@@ -138,7 +140,9 @@ function stepIcon(step, data) {
 .step-body_loaded       .thought-header { border-left-color: #4a90d9; }
 .step-child_decision    .thought-header { border-left-color: #9b59b6; }
 .step-resource_selection .thought-header { border-left-color: #e67e22; }
+.step-instruction_analysis .thought-header { border-left-color: #8e44ad; }
 .step-planner_output    .thought-header { border-left-color: #27ae60; }
+.step-sop_generated     .thought-header { border-left-color: #2980b9; }
 .step-action_start      .thought-header { border-left-color: #1abc9c; }
 .step-action_result     .thought-header { border-left-color: #2ecc71; }
 .step-action_result.expanded .thought-header { border-left-color: #e74c3c; }

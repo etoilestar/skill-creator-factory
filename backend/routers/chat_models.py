@@ -19,11 +19,13 @@ class ChatRequest(BaseModel):
     - messages: ordered chat history
     - model: optional model override (defaults to settings.default_model)
     - input_files: uploaded file descriptors with path/filename
+    - execution_mode: "plan" (preview before execute) or "craft" (direct execute)
     """
 
     messages: list[Message]
     model: Optional[str] = None
     input_files: list[dict] = []  # [{"path": "inputs/session/file.csv", "filename": "file.csv"}, ...]
+    execution_mode: Optional[str] = "craft"  # "plan" | "craft"
 
 
 @dataclass

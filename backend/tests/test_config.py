@@ -48,16 +48,25 @@ def test_new_fields_declared():
         assert name in fields, f"Missing field: {name}"
 
 
-def test_planner_model_defaults_to_none():
+def test_planner_model_has_stronger_default():
     from backend.config import settings
 
-    assert settings.planner_model is None or isinstance(settings.planner_model, str)
+    assert settings.planner_model == "qwen3:30b"
 
 
-def test_validator_model_defaults_to_none():
+def test_validator_model_has_fast_default():
     from backend.config import settings
 
-    assert settings.validator_model is None or isinstance(settings.validator_model, str)
+    assert settings.validator_model == "qwen3:8b"
+
+
+def test_capability_models_have_local_defaults():
+    from backend.config import settings
+
+    assert settings.text_model == "qwen3:30b"
+    assert settings.code_model == "qwen3-coder:30b"
+    assert settings.image_model == "qwen3-vl:32b"
+    assert settings.vision_model == "qwen3-vl:32b"
 
 
 def test_temperature_defaults_to_none():

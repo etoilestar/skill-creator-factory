@@ -23,21 +23,21 @@ class Settings(BaseSettings):
 
     # Optional separate model for silent planner rounds (metadata / block / skill planner).
     # Falls back to default_model when unset.
-    planner_model: Optional[str] = None
+    planner_model: Optional[str] = "qwen3:30b"
 
     # Optional separate model used exclusively for output-format validation rounds
     # inside retry_with_validation().  A small/fast model is sufficient here because
     # validation only requires JSON-structured classification of a prior output.
     # Falls back to default_model when unset.
-    validator_model: Optional[str] = None
+    validator_model: Optional[str] = "qwen3:8b"
 
     # Optional capability-specific models. These allow the runtime to keep
     # action classification in code while SKILL.md only describes what to do.
-    text_model: Optional[str] = None
-    code_model: Optional[str] = None
-    image_model: Optional[str] = None
+    text_model: Optional[str] = "qwen3:30b"
+    code_model: Optional[str] = "qwen3-coder:30b"
+    image_model: Optional[str] = "qwen3-vl:32b"
     # Optional vision-language model for understanding uploaded images/screenshots.
-    vision_model: Optional[str] = None
+    vision_model: Optional[str] = "qwen3-vl:32b"
 
     # Optional JSON routing overrides, e.g.
     # {"tasks": {"code": "qwen-coder", "image": "sdxl", "vision": "qwen-vl"},

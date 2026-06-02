@@ -37,7 +37,7 @@ def test_requested_text_model_is_fallback_when_no_specialized_model():
     from backend.config import settings
     from backend.services.model_router import route_creator_file_model
 
-    with patch.object(settings, "code_model", None), patch.object(settings, "image_model", None):
+    with patch.object(settings, "code_model", None), patch.object(settings, "image_model", None), patch.object(settings, "text_model", None):
         route = route_creator_file_model(
             file_path="SKILL.md",
             purpose="说明工作流",

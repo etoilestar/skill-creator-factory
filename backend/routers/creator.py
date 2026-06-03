@@ -192,11 +192,21 @@ class InitFromBlueprintResponse(BaseModel):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _contains_path_wildcard(file_path: str) -> bool:
+    return any(ch in file_path for ch in "*?[]{}")
+
+
 def _validate_file_path(file_path: str) -> None:
     """Raise HTTP 400 if file_path is outside allowed locations."""
     p = Path(file_path)
-    if p.is_absolute() or ".." in p.parts:
-        raise HTTPException(status_code=400, detail=f"非法文件路径: {file_path}")
+    if p.is_absolute() or ".." in p.parts or _contains_path_wildcard(file_path):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"非法文件路径: {file_path}。"
+                "Creator 只能逐个生成具体文件，不能生成通配符路径。"
+            ),
+        )
 
     if file_path == "SKILL.md":
         return
@@ -627,7 +637,24 @@ def _validate_reference_file_contract(file_path: str, content: str, purpose: str
 def _check_script_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
     stripped = content.strip()
     has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
-    has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
+    raw_ok = bool(stripped) and not has_markdown_or_bundle
+    results = [
+        ContractCheckResult(
+            id="script.raw_source.single_file",
+            passed=raw_ok,
+            target=file_path,
+            message=(
+                "脚本是单个裸源码文件。"
+                if raw_ok
+                else f"{file_path} 生成内容包含 Markdown 代码块或多文件包，不是单个脚本源码。请重新生成该文件。"
+            ),
+            expected="只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+            minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
+        )
+    ]
+    if not raw_ok:
+        return results
+
     syntax_ok = True
     syntax_message = "Python 语法合法。"
     if Path(file_path).suffix.lower() == ".py":
@@ -636,20 +663,7 @@ def _check_script_file_contract(file_path: str, content: str) -> list[ContractCh
         except SyntaxError as exc:
             syntax_ok = False
             syntax_message = f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
-
-    return [
-        ContractCheckResult(
-            id="script.raw_source.single_file",
-            passed=bool(stripped) and not has_markdown_or_bundle,
-            target=file_path,
-            message=(
-                "脚本是单个裸源码文件。"
-                if stripped and not has_markdown_or_bundle
-                else f"{file_path} 生成内容包含 Markdown 代码块或多文件包，不是单个脚本源码。请重新生成该文件。"
-            ),
-            expected="只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
-            minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
-        ),
+    results.append(
         ContractCheckResult(
             id="script.source.syntax",
             passed=syntax_ok,
@@ -657,7 +671,11 @@ def _check_script_file_contract(file_path: str, content: str) -> list[ContractCh
             message=syntax_message,
             expected="Python 脚本必须能通过 ast.parse 语法检查。",
             minimal_edit="修正 Python 语法错误，同时保持 stdout JSON 和参数接口不变。",
-        ),
+        )
+    )
+
+    has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
+    results.append(
         ContractCheckResult(
             id="script.no_fake_implementation",
             passed=not has_fake,
@@ -669,8 +687,9 @@ def _check_script_file_contract(file_path: str, content: str) -> list[ContractCh
             ),
             expected="不得使用 placeholder/mock/fake API/固定模板冒充真实能力。",
             minimal_edit="替换占位或模拟逻辑，实现真实可执行算法或调用平台配置模型/helper。",
-        ),
-    ]
+        )
+    )
+    return results
 
 
 def _validate_script_file_source_contract(file_path: str, content: str) -> None:
@@ -1000,13 +1019,18 @@ async def _repair_generated_file_with_feedback(
         )
 
     repair_messages = [*prompt_messages]
+    previous_for_prompt = previous_content[-16000:]
+    previous_label = "待编辑草稿"
+    if is_script and repair_mode == "strict_contract_rewrite":
+        previous_for_prompt = _extract_probable_python_source(previous_content) or ""
+        previous_label = "可参考的源码候选（已移除 Markdown 外壳；若为空，请根据原始任务重新生成）"
     repair_messages.append({
         "role": "user",
         "content": (
             f"以下是上一次生成但未通过校验的 {file_path} 内容。它可能包含错误示范（例如 Markdown fence 或 Creator 流程泄露），"
-            "不要模仿错误格式，只把它当作待编辑草稿：\n"
+            f"不要模仿错误格式，只把它当作{previous_label}：\n"
             "<previous_content>\n"
-            f"{previous_content[-16000:]}\n"
+            f"{previous_for_prompt}\n"
             "</previous_content>"
         ),
     })
@@ -1025,10 +1049,14 @@ async def _repair_generated_file_with_feedback(
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
             + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
+            + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是 Python 源码字符，全文不得出现 ```。" if is_script and repair_mode == "strict_contract_rewrite" else "")
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
     })
-    return await complete_chat_once(repair_messages, model)
+    repaired = await complete_chat_once(repair_messages, model)
+    if is_script:
+        return _normalize_generated_file_content(file_path, repaired)
+    return repaired
 
 
 def _parse_validator_json_object(text: str) -> dict | None:
@@ -1297,14 +1325,106 @@ def _extract_only_fenced_block(content: str) -> str | None:
     return blocks[0]
 
 
+def _extract_first_fenced_block(content: str) -> str | None:
+    """Extract the first fenced block body, or None if no complete block exists."""
+    lines = content.strip().lstrip("\ufeff").splitlines()
+    idx = 0
+    while idx < len(lines):
+        opening = lines[idx].strip()
+        opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+        if not opening_match:
+            idx += 1
+            continue
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        body: list[str] = []
+        idx += 1
+        while idx < len(lines):
+            closing = lines[idx].strip()
+            if re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+                return "\n".join(body).strip()
+            body.append(lines[idx])
+            idx += 1
+        return None
+    return None
+
+
+def _drop_common_non_code_lines(text: str) -> str:
+    """Remove common chat/file-label prose that models place around scripts."""
+    drop_patterns = [
+        r"^\s*下面是",
+        r"^\s*以下是",
+        r"^\s*(?:文件|路径)[:：]",
+        r"^\s*写入文件[:：]",
+        r"^\s*#+\s*scripts/",
+        r"^\s*`?scripts/[^`]+`?\s*$",
+    ]
+    cleaned: list[str] = []
+    for line in text.strip().splitlines():
+        if any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in drop_patterns):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def _looks_like_python_source(text: str) -> bool:
+    """Return True for probable Python source without requiring valid syntax yet."""
+    stripped = text.strip()
+    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+        return False
+    return bool(re.search(
+        r"(?m)^\s*(?:import\s+|from\s+|def\s+|class\s+|if __name__\s*==\s*['\"]__main__['\"]|#!/usr/bin/env python|#)",
+        stripped,
+    ))
+
+
+def _extract_probable_python_source(content: str) -> str | None:
+    """Extract a raw Python source candidate before syntax validation."""
+    stripped = content.strip().lstrip("\ufeff")
+    candidates: list[str] = []
+
+    normalized = stripped
+    for _ in range(3):
+        wrapping = _extract_single_wrapping_fence(normalized)
+        if wrapping is None:
+            break
+        normalized = wrapping.strip()
+        candidates.append(normalized)
+
+    only_block = _extract_only_fenced_block(stripped)
+    if only_block is not None:
+        candidates.append(only_block.strip())
+
+    # Use the first block only when the response does not look like an explicit
+    # multi-file bundle.  Multi-file bundles are rejected rather than guessed.
+    if not _MULTI_FILE_MARKER_RE.search(stripped) and not re.search(r"(?im)^\s*写入文件[:：]", stripped):
+        first_block = _extract_first_fenced_block(stripped)
+        if first_block is not None:
+            candidates.append(first_block.strip())
+
+    candidates.append(stripped)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = _drop_common_non_code_lines(candidate)
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        if _looks_like_python_source(cleaned):
+            return cleaned
+    return None
+
+
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
     """Normalize model output while keeping script extraction conservative."""
     if file_path.startswith("scripts/"):
         stripped = content.strip()
+        if Path(file_path).suffix.lower() == ".py":
+            extracted = _extract_probable_python_source(stripped)
+            if extracted:
+                return extracted
 
-        # Low-risk deterministic recovery for common coder behavior: first peel
-        # whole-response fences.  A repeated pass handles responses like
-        # ```text wrapping a complete ```python block.
         normalized = stripped
         for _ in range(3):
             wrapping_fence = _extract_single_wrapping_fence(normalized)
@@ -1314,9 +1434,6 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
             if _is_valid_normalized_script_source(file_path, normalized):
                 return normalized
 
-        # Be more tolerant of chatty models: if the response contains exactly one
-        # fenced block and that block is a valid single script, accept it while
-        # still rejecting multi-block bundles and invalid extracted source.
         only_block = _extract_only_fenced_block(stripped)
         if only_block is not None:
             normalized = only_block.strip()
@@ -1407,9 +1524,10 @@ def _build_generate_file_prompt(
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
             f"职责说明：{purpose}\n\n"
+            "你是文件内容生成器，不是聊天助手；当前输出会被直接写入目标文件。\n"
             "要求：\n"
-            f"1. 只输出完整可运行的 {lang} 代码，不要任何说明文字。\n"
-            "2. 不要用 ``` 代码块包裹输出内容。\n"
+            f"1. 只输出完整可运行的 {lang} 文件字节内容本身，不要任何说明文字。\n"
+            "2. 禁止 Markdown，禁止 ```，禁止‘下面是代码’，禁止文件名标题，禁止多文件输出；如果输出包含 ```，系统会判定失败。\n"
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"

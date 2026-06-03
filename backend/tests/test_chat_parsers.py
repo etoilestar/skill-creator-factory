@@ -2115,3 +2115,113 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
     assert trial_contents == [expected_content]
     assert events[-2] == {"content": expected_content}
     assert events[-1] == {"done": True}
+
+
+def test_creator_rejects_wildcard_generate_file_path():
+    import pytest
+    from fastapi import HTTPException
+
+    from backend.routers.creator import _validate_file_path
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_file_path("scripts/*.py")
+
+    assert exc_info.value.status_code == 400
+    assert "通配符路径" in exc_info.value.detail
+
+
+def test_blueprint_parser_skips_wildcard_script_paths():
+    from backend.services.blueprint_parser import parse_files_from_blueprint
+
+    blueprint = """
+- scripts/：请创建 `scripts/*.py` 处理用户主题
+"""
+
+    files, warnings = parse_files_from_blueprint(blueprint)
+
+    assert all(file.path != "scripts/*.py" for file in files)
+    assert any(file.path == "scripts/main.py" for file in files)
+    assert any("忽略通配符文件路径 scripts/*.py" in warning for warning in warnings)
+
+
+def test_creator_script_normalize_extracts_invalid_fenced_python_before_syntax_check():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _sanitize_generated_file_content
+
+    content = """下面是修复后的代码：
+```python
+# scripts/generate_love_story.py
+def main(:
+    pass
+```
+"""
+
+    with pytest.raises(ContractValidationError) as exc_info:
+        _sanitize_generated_file_content("scripts/generate_love_story.py", content)
+
+    failed_ids = [result.id for result in exc_info.value.results if not result.passed]
+    assert "script.raw_source.single_file" not in failed_ids
+    assert "script.source.syntax" in failed_ids
+    assert "```" not in str(exc_info.value)
+
+
+def test_creator_script_raw_source_failure_short_circuits_syntax_check():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract("scripts/generate_love_story.py", "```python\nprint('ok')\n```")
+
+    assert [result.id for result in results] == ["script.raw_source.single_file"]
+    assert results[0].passed is False
+
+
+def test_creator_script_repair_normalizes_fenced_model_response(monkeypatch):
+    import asyncio
+
+    from backend.routers import creator
+
+    async def fake_complete_chat_once(_messages, _model):
+        return "```python\nimport json\nprint(json.dumps({'ok': True}))\n```"
+
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    repaired = asyncio.run(creator._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "system", "content": "generate file"}],
+        model="code-model",
+        file_path="scripts/generate_love_story.py",
+        previous_content="```python\nprint('bad')\n```",
+        validation_error="script.raw_source.single_file",
+        repair_mode="minimal_edit",
+    ))
+
+    assert repaired == "import json\nprint(json.dumps({'ok': True}))"
+
+
+def test_creator_script_strict_rewrite_uses_extracted_candidate_not_fenced_draft(monkeypatch):
+    import asyncio
+
+    from backend.routers import creator
+
+    captured_prompts = []
+
+    async def fake_complete_chat_once(messages, _model):
+        captured_prompts.append(messages[-2]["content"])
+        return "import json\nprint(json.dumps({'ok': True}))"
+
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    asyncio.run(creator._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "system", "content": "generate file"}],
+        model="code-model",
+        file_path="scripts/generate_love_story.py",
+        previous_content="下面是代码：\n```python\n# scripts/generate_love_story.py\nimport json\nprint(json.dumps({'ok': True}))\n```",
+        validation_error="script.raw_source.single_file",
+        repair_mode="strict_contract_rewrite",
+    ))
+
+    previous_prompt = captured_prompts[0]
+    assert "可参考的源码候选" in previous_prompt
+    previous_body = previous_prompt.split("<previous_content>", 1)[1].split("</previous_content>", 1)[0]
+    assert "```" not in previous_body
+    assert "scripts/generate_love_story.py" not in previous_body
+    assert "import json" in previous_body

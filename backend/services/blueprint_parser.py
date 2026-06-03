@@ -118,6 +118,10 @@ def _should_skip(text: str) -> bool:
     return any(stripped.startswith(phrase.lower()) for phrase in _SKIP_PHRASES)
 
 
+def _contains_path_wildcard(path: str) -> bool:
+    return any(ch in path for ch in "*?[]{}")
+
+
 def _extract_inline_paths(text: str, prefix: str) -> list[str]:
     """Return all backtick-wrapped paths matching `prefix/...` found in text."""
     found: list[str] = []
@@ -187,6 +191,11 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         required: bool = True,
         can_skip: bool = False,
     ) -> None:
+        if _contains_path_wildcard(path):
+            warning = f"忽略通配符文件路径 {path}；Creator 只能逐个生成具体文件，请在蓝图中展开为具体文件名。"
+            if warning not in warnings:
+                warnings.append(warning)
+            return
         if path in seen:
             return
         seen.add(path)

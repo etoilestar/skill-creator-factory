@@ -1479,6 +1479,164 @@ def test_creator_phase3_retry_messages_include_feedback():
     assert "重新生成完整实现动作" in messages[-1]["content"]
 
 
+
+
+def test_creator_script_prompt_includes_generated_file_contract():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="scripts/generate_story_and_image.py",
+        skill_name="story-image",
+        purpose="根据 topic 生成故事和图片",
+        blueprint_text="scripts/generate_story_and_image.py: 根据 topic 生成故事和图片",
+        conversation_history=[],
+    )
+
+    prompt = messages[0]["content"]
+    assert "必须满足以下脚本文件合同" in prompt
+    assert "scripts/generate_story_and_image.py" in prompt
+    assert "读取 sys.argv[1] 并 json.loads" in prompt
+    assert "stdout 输出结构化 JSON" in prompt
+
+
+
+def test_creator_script_markdown_error_uses_contract_failed_checks(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    fenced_script = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
+    fixed_script = "import json\nprint(json.dumps({'text': 'ok'}))"
+    repair_prompts = []
+    validator_prompts = []
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        yield fenced_script
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_prompts.append(messages[-1]["content"])
+            return json.dumps({
+                "passed": False,
+                "issues": ["脚本仍被 Markdown fence 包裹"],
+                "failed_checks": [{"id": "script.raw_source.single_file", "target": "scripts/generate_love_story.py"}],
+                "repair_instructions": "删除 fence，只返回裸源码。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return fixed_script
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+    monkeypatch.setattr(creator, "_trial_run_generated_script", lambda *_args: None)
+
+    request = GenerateFileRequest(
+        skill_name="love-story",
+        file_path="scripts/generate_love_story.py",
+        purpose="生成爱情故事",
+        blueprint_text="scripts/generate_love_story.py: 根据 topic 生成爱情故事",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert validator_prompts
+    assert repair_prompts
+    assert "script.raw_source.single_file" in validator_prompts[0]
+    assert "script.raw_source.single_file" in repair_prompts[0]
+    assert "删除所有 ``` fence" in repair_prompts[0]
+    assert any(event.get("content") == fixed_script for event in events)
+
+def test_creator_reference_prompt_includes_generated_file_contract():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="references/style.md",
+        skill_name="story-image",
+        purpose="故事写作风格参考",
+        blueprint_text="references/style.md: 故事写作风格参考",
+        conversation_history=[],
+    )
+
+    prompt = messages[0]["content"]
+    assert "必须满足以下参考资料文件合同" in prompt
+    assert "references/style.md" in prompt
+    assert "故事写作风格参考" in prompt
+    assert "不要包含 Creator 创建流程" in prompt
+
+
+def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    bad_reference = "若当前无误，点击开始创建：系统将自动创建 references/style.md"
+    fixed_reference = "# 写作风格参考\n\n- 使用清晰的故事结构。\n- 描写画面、角色和情绪。"
+    repair_prompts = []
+    validator_prompts = []
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        yield bad_reference
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_prompts.append(messages[-1]["content"])
+            return json.dumps({
+                "passed": False,
+                "issues": ["reference 包含 Creator 流程"],
+                "failed_checks": [{"id": "reference.no_creator_flow", "target": "references/style.md"}],
+                "repair_instructions": "删除 Creator 流程，只保留参考资料正文。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return fixed_reference
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    request = GenerateFileRequest(
+        skill_name="story-image",
+        file_path="references/style.md",
+        purpose="故事写作风格参考",
+        blueprint_text="references/style.md: 故事写作风格参考",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert validator_prompts
+    assert repair_prompts
+    assert "必须满足以下参考资料文件合同" in validator_prompts[0]
+    assert "reference.no_creator_flow" in repair_prompts[0]
+    assert "本轮修复模式：minimal_edit" in repair_prompts[0]
+    assert any(event.get("content") == fixed_reference for event in events)
+
 def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     from backend.routers.creator import _build_generate_file_prompt
 
@@ -1508,6 +1666,10 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
 
     prompt = messages[0]["content"]
     assert "```bash fenced code block" in prompt
+    assert "必须满足以下 SKILL.md 合同" in prompt
+    assert "scripts/generate_nursery_rhyme.py" in prompt
+    assert "推荐命令模板：python scripts/generate_nursery_rhyme.py" in prompt
+    assert "references/best-practices.md" in prompt
     assert "明确引用每个 references/ 路径" in prompt
     assert "禁止复制 Creator 界面流程" in prompt
     assert "不要逐字复制这些约束" in prompt
@@ -1564,12 +1726,223 @@ python scripts/generate_nursery_rhyme.py '{"topic":"{{topic}}"}'
     _validate_skill_md_contract(valid, blueprint)
 
 
-def test_creator_sanitize_rejects_prose_wrapped_script_fence():
+def test_creator_skill_md_contract_returns_structured_checks():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _check_skill_md_contract, _validate_skill_md_contract
+
+    blueprint = "scripts/generate_story_and_image.py\nreferences/style.md"
+    content = """---
+name: story-image
+description: demo
+---
+# 使用
+根据用户主题生成故事和图片。
+"""
+
+    results = _check_skill_md_contract(content, blueprint)
+    failed = [result for result in results if not result.passed]
+
+    assert any(result.id == "skill_md.frontmatter" and result.passed for result in results)
+    assert any(result.id == "skill_md.script_command.exists" and result.target == "scripts/generate_story_and_image.py" for result in failed)
+    assert any(result.id == "skill_md.reference.mentioned" and result.target == "references/style.md" for result in failed)
+
+    with pytest.raises(ContractValidationError) as exc_info:
+        _validate_skill_md_contract(content, blueprint)
+    assert any(result.id == "skill_md.script_command.exists" for result in exc_info.value.results)
+
+
+def test_creator_targeted_repair_instructions_for_missing_skill_script_block():
+    from backend.routers.creator import _targeted_generated_file_repair_instructions
+
+    instructions = _targeted_generated_file_repair_instructions(
+        file_path="SKILL.md",
+        deterministic_error=(
+            "SKILL.md 缺少调用 scripts/generate_story_and_image.py 的可执行 Markdown 命令块。"
+            "请在正文中加入 ```bash fenced code block。"
+        ),
+    )
+
+    assert "scripts/generate_story_and_image.py" in instructions
+    assert "```bash" in instructions
+    assert "{{topic}}" in instructions
+    assert "${topic}" in instructions
+
+
+def test_creator_skill_md_repair_prompt_includes_targeted_missing_block_feedback(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    initial_skill_md = """---
+name: story-image
+description: demo
+---
+# 使用
+根据用户主题生成故事和图片。
+"""
+    fixed_skill_md = """---
+name: story-image
+description: demo
+---
+# 使用
+根据用户主题生成故事和图片。
+
+执行命令：
+```bash
+python scripts/generate_story_and_image.py '{"topic":"{{topic}}"}'
+```
+"""
+    repair_prompts = []
+    validator_prompts = []
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        if model_ack_callback:
+            model_ack_callback({"actual_model": "fake-text-model"})
+        yield initial_skill_md
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_prompts.append(messages[-1]["content"])
+            return json.dumps({
+                "passed": False,
+                "issues": ["缺少 scripts/generate_story_and_image.py 的 bash 命令块"],
+                "repair_instructions": "插入后端给出的 bash fenced block。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return fixed_skill_md
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    request = GenerateFileRequest(
+        skill_name="story-image",
+        file_path="SKILL.md",
+        purpose="主说明",
+        blueprint_text="scripts/generate_story_and_image.py: 根据 topic 生成故事和图片",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert validator_prompts
+    assert repair_prompts
+    assert "完整 contract" in validator_prompts[0]
+    assert "已通过检查" in validator_prompts[0]
+    assert "未通过检查" in validator_prompts[0]
+    assert "后端根据该错误生成的必做修复步骤" in validator_prompts[0]
+    assert "完整 contract" in repair_prompts[0]
+    assert "已通过检查" in repair_prompts[0]
+    assert "未通过检查" in repair_prompts[0]
+    assert "本轮修复模式：minimal_edit" in repair_prompts[0]
+    assert "后端确定性修复指令" in repair_prompts[0]
+    assert "python scripts/generate_story_and_image.py" in repair_prompts[0]
+    assert "{{topic}}" in repair_prompts[0]
+    assert any(event.get("content") == fixed_skill_md.strip() for event in events)
+
+
+
+def test_creator_skill_md_repeated_contract_failure_escalates_repair_mode(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    initial_skill_md = """---
+name: story-image
+description: demo
+---
+# 使用
+根据用户主题生成故事和图片。
+"""
+    fixed_skill_md = """---
+name: story-image
+description: demo
+---
+# 使用
+根据用户主题生成故事和图片。
+
+执行命令：
+```bash
+python scripts/generate_story_and_image.py '{"topic":"{{topic}}"}'
+```
+"""
+    repair_prompts = []
+    repair_outputs = [initial_skill_md, fixed_skill_md]
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        yield initial_skill_md
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            return json.dumps({
+                "passed": False,
+                "issues": ["仍缺少 bash command block"],
+                "failed_checks": [{"id": "skill_md.script_command.exists", "target": "scripts/generate_story_and_image.py"}],
+                "repair_instructions": "只修缺失命令块。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return repair_outputs.pop(0)
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    request = GenerateFileRequest(
+        skill_name="story-image",
+        file_path="SKILL.md",
+        purpose="主说明",
+        blueprint_text="scripts/generate_story_and_image.py: 根据 topic 生成故事和图片",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert len(repair_prompts) == 2
+    assert "本轮修复模式：minimal_edit" in repair_prompts[0]
+    assert "本轮修复模式：strict_contract_rewrite" in repair_prompts[1]
+    assert any(event.get("content") == fixed_skill_md.strip() for event in events)
+
+def test_creator_sanitize_accepts_prose_wrapped_single_script_fence():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "这里是脚本：\n```python\nprint('ok')\n```\n请保存。"
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_rejects_multiple_prose_wrapped_script_fences():
     import pytest
 
     from backend.routers.creator import _sanitize_generated_file_content
 
-    content = "这里是脚本：\n```python\nprint('ok')\n```\n请保存。"
+    content = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
 
     with pytest.raises(ValueError, match="Markdown 代码块"):
         _sanitize_generated_file_content("scripts/main.py", content)
@@ -1592,6 +1965,44 @@ print('target')
 """
 
     with pytest.raises(ValueError, match="Markdown 代码块"):
+        _sanitize_generated_file_content("scripts/main.py", content)
+
+
+def test_creator_sanitize_accepts_single_wrapping_script_fence():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```python\nprint('ok')\n```"
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_accepts_text_wrapped_script_fence():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```text\r\nimport json\nprint(json.dumps({'ok': True}))\n````"
+
+    assert (
+        _sanitize_generated_file_content("scripts/main.py", content)
+        == "import json\nprint(json.dumps({'ok': True}))"
+    )
+
+
+def test_creator_sanitize_accepts_nested_whole_response_script_fences():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```text\n```python\nprint('ok')\n```\n```"
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_rejects_invalid_wrapping_script_fence():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```python\nprint('unterminated'\n```"
+
+    with pytest.raises(ValueError, match="合法 Python 源码|Markdown 代码块"):
         _sanitize_generated_file_content("scripts/main.py", content)
 
 def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch):
@@ -1687,7 +2098,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
 
     assert [event["attempt"] for event in repair_events] == [1, 2]
     assert "VISION_MODEL" in repair_events[0]["error"]
-    assert "Markdown 代码块" in repair_events[1]["error"]
+    assert "脚本没有调用" in repair_events[1]["error"]
     assert all(event["validator"]["issues"] == ["不要返回 Markdown 代码块或错误模型调用"] for event in repair_events)
     assert len(validator_calls) == 2
     assert len(repair_prompts) == 2
@@ -1696,3 +2107,113 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
     assert trial_contents == [expected_content]
     assert events[-2] == {"content": expected_content}
     assert events[-1] == {"done": True}
+
+
+def test_creator_rejects_wildcard_generate_file_path():
+    import pytest
+    from fastapi import HTTPException
+
+    from backend.routers.creator import _validate_file_path
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_file_path("scripts/*.py")
+
+    assert exc_info.value.status_code == 400
+    assert "通配符路径" in exc_info.value.detail
+
+
+def test_blueprint_parser_skips_wildcard_script_paths():
+    from backend.services.blueprint_parser import parse_files_from_blueprint
+
+    blueprint = """
+- scripts/：请创建 `scripts/*.py` 处理用户主题
+"""
+
+    files, warnings = parse_files_from_blueprint(blueprint)
+
+    assert all(file.path != "scripts/*.py" for file in files)
+    assert any(file.path == "scripts/main.py" for file in files)
+    assert any("忽略通配符文件路径 scripts/*.py" in warning for warning in warnings)
+
+
+def test_creator_script_normalize_extracts_invalid_fenced_python_before_syntax_check():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _sanitize_generated_file_content
+
+    content = """下面是修复后的代码：
+```python
+# scripts/generate_love_story.py
+def main(:
+    pass
+```
+"""
+
+    with pytest.raises(ContractValidationError) as exc_info:
+        _sanitize_generated_file_content("scripts/generate_love_story.py", content)
+
+    failed_ids = [result.id for result in exc_info.value.results if not result.passed]
+    assert "script.raw_source.single_file" not in failed_ids
+    assert "script.source.syntax" in failed_ids
+    assert "```" not in str(exc_info.value)
+
+
+def test_creator_script_raw_source_failure_short_circuits_syntax_check():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract("scripts/generate_love_story.py", "```python\nprint('ok')\n```")
+
+    assert [result.id for result in results] == ["script.raw_source.single_file"]
+    assert results[0].passed is False
+
+
+def test_creator_script_repair_normalizes_fenced_model_response(monkeypatch):
+    import asyncio
+
+    from backend.routers import creator
+
+    async def fake_complete_chat_once(_messages, _model):
+        return "```python\nimport json\nprint(json.dumps({'ok': True}))\n```"
+
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    repaired = asyncio.run(creator._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "system", "content": "generate file"}],
+        model="code-model",
+        file_path="scripts/generate_love_story.py",
+        previous_content="```python\nprint('bad')\n```",
+        validation_error="script.raw_source.single_file",
+        repair_mode="minimal_edit",
+    ))
+
+    assert repaired == "import json\nprint(json.dumps({'ok': True}))"
+
+
+def test_creator_script_strict_rewrite_uses_extracted_candidate_not_fenced_draft(monkeypatch):
+    import asyncio
+
+    from backend.routers import creator
+
+    captured_prompts = []
+
+    async def fake_complete_chat_once(messages, _model):
+        captured_prompts.append(messages[-2]["content"])
+        return "import json\nprint(json.dumps({'ok': True}))"
+
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    asyncio.run(creator._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "system", "content": "generate file"}],
+        model="code-model",
+        file_path="scripts/generate_love_story.py",
+        previous_content="下面是代码：\n```python\n# scripts/generate_love_story.py\nimport json\nprint(json.dumps({'ok': True}))\n```",
+        validation_error="script.raw_source.single_file",
+        repair_mode="strict_contract_rewrite",
+    ))
+
+    previous_prompt = captured_prompts[0]
+    assert "可参考的源码候选" in previous_prompt
+    previous_body = previous_prompt.split("<previous_content>", 1)[1].split("</previous_content>", 1)[0]
+    assert "```" not in previous_body
+    assert "scripts/generate_love_story.py" not in previous_body
+    assert "import json" in previous_body

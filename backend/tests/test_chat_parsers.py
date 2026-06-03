@@ -909,7 +909,7 @@ python scripts/generate_chord.py '{"style":"{{style}}","key":"{{key}}"}'
     assert result["errors"] == []
 
 
-def test_creator_sanitizes_script_from_multifile_bundle():
+def test_creator_rejects_script_from_multifile_bundle():
     from backend.routers.creator import _sanitize_generated_file_content
 
     bundle = """# fairy-tale-generator
@@ -939,11 +939,8 @@ if __name__ == "__main__":
 ```
 """
 
-    result = _sanitize_generated_file_content("scripts/generate_story.py", bundle)
-
-    assert result.startswith("import argparse")
-    assert "## 📜 SKILL.md" not in result
-    assert "```" not in result
+    with pytest.raises(ValueError, match="Markdown 代码块或多文件包"):
+        _sanitize_generated_file_content("scripts/generate_story.py", bundle)
 
 
 def test_creator_rejects_markdown_bundle_for_script_without_target_section():
@@ -1482,6 +1479,36 @@ def test_creator_phase3_retry_messages_include_feedback():
     assert "重新生成完整实现动作" in messages[-1]["content"]
 
 
+def test_creator_sanitize_rejects_prose_wrapped_script_fence():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "这里是脚本：\n```python\nprint('ok')\n```\n请保存。"
+
+    with pytest.raises(ValueError, match="Markdown 代码块"):
+        _sanitize_generated_file_content("scripts/main.py", content)
+
+
+def test_creator_sanitize_rejects_labeled_multifile_bundle():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = """写入文件：scripts/main.py
+```python
+print('target')
+```
+
+写入文件：references/readme.md
+```markdown
+# ignored
+```
+"""
+
+    with pytest.raises(ValueError, match="Markdown 代码块"):
+        _sanitize_generated_file_content("scripts/main.py", content)
+
 def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch):
     import asyncio
     import json
@@ -1502,6 +1529,8 @@ def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch
         ),
     ]
     trial_contents = []
+    repair_prompts = []
+    validator_calls = []
 
     skill_md = """---
 name: repair-skill
@@ -1520,7 +1549,15 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         for chunk in stream_outputs:
             yield chunk
 
-    async def fake_complete_chat_once(_messages, _model):
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_calls.append(messages)
+            return json.dumps({
+                "passed": False,
+                "issues": ["不要返回 Markdown 代码块或错误模型调用"],
+                "repair_instructions": "只做局部修改，返回目标脚本源码本身，不要 Markdown fence。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
         return repairs.pop(0)
 
     def fake_trial_run(_skill_name, file_path, content):
@@ -1565,7 +1602,12 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
 
     assert [event["attempt"] for event in repair_events] == [1, 2]
     assert "VISION_MODEL" in repair_events[0]["error"]
-    assert "SKILL.md 声明需要使用宿主" in repair_events[1]["error"]
+    assert "Markdown 代码块" in repair_events[1]["error"]
+    assert all(event["validator"]["issues"] == ["不要返回 Markdown 代码块或错误模型调用"] for event in repair_events)
+    assert len(validator_calls) == 2
+    assert len(repair_prompts) == 2
+    assert "校验模型给 coder 的修复意见" in repair_prompts[0]
+    assert "只做局部修改" in repair_prompts[0]
     assert trial_contents == [expected_content]
     assert events[-2] == {"content": expected_content}
     assert events[-1] == {"done": True}

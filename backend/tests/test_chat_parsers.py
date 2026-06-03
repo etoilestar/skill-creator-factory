@@ -494,6 +494,29 @@ def test_run_command_injects_default_model_api_keys(tmp_path, monkeypatch):
     assert "ollama|ollama" in result["stdout"]
 
 
+def test_creator_followup_guard_prevents_repeating_opening_question():
+    from backend.routers.creator_chat import _compose_creator_followup_guard_prompt
+
+    prompt = _compose_creator_followup_guard_prompt([
+        {"role": "assistant", "content": "问题: \"你希望 智能助手 帮你做什么事情？\""},
+        {"role": "user", "content": "帮我创建一个写神话故事的skill"},
+    ])
+
+    assert "不要重复询问开场分类问题" in prompt
+    assert "帮我创建一个写神话故事的skill" in prompt
+    assert "处理文件 / 帮我写东西 / 连接某个服务 / 其他" in prompt
+    assert _compose_creator_followup_guard_prompt([]) == ""
+
+
+def test_kernel_creator_phase1_prompt_includes_no_repeat_opening_guard():
+    from backend.services.kernel_loader import load_kernel_creator_for_phase
+
+    prompt = load_kernel_creator_for_phase("phase1")
+
+    assert "不要重复上述开场分类问题" in prompt
+    assert "不要再次询问“你希望 智能助手 帮你做什么事情？”" in prompt
+
+
 def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 

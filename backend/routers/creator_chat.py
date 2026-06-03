@@ -103,6 +103,27 @@ def _latest_blueprint_text(messages: list) -> str:
     return ""
 
 
+def _compose_creator_followup_guard_prompt(messages: list) -> str:
+    """Prevent Phase 1 models from repeating the opening category question after a user request."""
+    latest_user = _last_user_message_content(messages).strip()
+    if not latest_user:
+        return ""
+
+    latest_user_excerpt = latest_user[:500]
+    return f"""
+
+---
+## 当前轮防重复要求
+
+用户已经给出了本轮需求："{latest_user_excerpt}"
+
+- 不要重复询问开场分类问题："你希望 智能助手 帮你做什么事情？"。
+- 不要再次原样输出“处理文件 / 帮我写东西 / 连接某个服务 / 其他”这组选项。
+- 请承接用户已经提供的需求，追问一个更具体的下一步问题（例如输入参数、输出格式、触发词、是否需要脚本/资源/模型能力等）。
+- 如果信息已经足够，请进入 Phase 2 输出完整 Skill 架构蓝图，而不是回到开场问题。
+"""
+
+
 _REVISION_INTENT_HINT_RE = re.compile(
     r"(不需要|无需|不用|不要用|去掉|移除|删除|改成|换成|使用内置|内置.*模型|"
     r"多模态模型|不需要\s*api|不需要.*密钥|不需要.*数据库|api\s*密钥|关键词.*数据库)",
@@ -1049,6 +1070,8 @@ async def _make_stream_creator_generator(
 一次只问一个问题，等待用户回复。
 """
         body_prompt = body_prompt + single_step_instruction
+        if not is_first_time:
+            body_prompt = body_prompt + _compose_creator_followup_guard_prompt(messages_list)
 
     final_messages: list[dict] = [{"role": "system", "content": body_prompt}]
     final_messages.extend(_request_messages_with_files(request))

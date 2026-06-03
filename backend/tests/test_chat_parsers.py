@@ -642,6 +642,44 @@ def test_creator_conversation_valid_opening_question_skips_validator_model(monke
     assert "你希望 智能助手 帮你做什么事情" in serialized
 
 
+def test_creator_phase1_normal_chat_skips_format_validator(monkeypatch, tmp_path):
+    import asyncio
+
+    import backend.routers.creator_chat as creator_chat
+    from backend.routers.chat_models import ChatRequest
+
+    calls = {"validator": 0}
+
+    async def fake_stream_chat(messages, model):
+        yield "请补充一个输入示例，这样我能判断是否需要脚本。"
+
+    async def fake_complete_chat_once(messages, model):
+        calls["validator"] += 1
+        return '{"valid": false, "issues": ["should not run"]}'
+
+    monkeypatch.setattr(creator_chat, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fake_complete_chat_once)
+
+    request = ChatRequest(messages=[{"role": "user", "content": "我想做一个文本整理助手"}])
+
+    async def collect():
+        return [
+            item async for item in creator_chat._execute_conversation_mode(
+                final_messages=[{"role": "system", "content": "phase1 prompt"}],
+                model="text-model",
+                current_phase="phase1",
+                request=request,
+                execution_root=tmp_path,
+                parent_skill_name="kernel",
+            )
+        ]
+
+    events = asyncio.run(collect())
+
+    assert calls["validator"] == 0
+    assert "请补充一个输入示例" in "".join(events)
+
+
 def test_creator_conversation_invalid_phase_json_is_validated_and_retried(monkeypatch, tmp_path):
     import asyncio
     import json
@@ -691,7 +729,7 @@ def test_creator_conversation_invalid_phase_json_is_validated_and_retried(monkey
     assert "phase3_start" not in serialized
     assert "## 📋 Skill 架构蓝图" in serialized
     assert len(seen_prompts) == 2
-    assert "违反 Creator Phase 1/2 格式契约" in seen_prompts[1][-1]["content"]
+    assert "没有通过 Creator 关键协议校验" in seen_prompts[1][-1]["content"]
 
 
 def test_creator_phase3_format_validator_rejects_start_json(monkeypatch):

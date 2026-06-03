@@ -34,6 +34,7 @@ from .chat_utils import (
     _SCRIPT_INTERPRETERS,
     _allowed_skill_roots,
     _blocks_for_planner,
+    _correct_expanded_input_paths,
     _expand_arg_env_vars,
     _extract_all_fenced_blocks,
     _extract_input_session_dir,
@@ -56,8 +57,11 @@ from .chat_utils import (
     _validate_skill_md,
     _retry_install_node_dep,
     _retry_install_python_dep,
+    _task_checklist,
+    _sandbox_retry,
+    _validate_input_file_paths,
 )
-from .chat_models import ChatRequest, MarkdownBlock
+from .chat_models import ChatRequest, MarkdownBlock, SandboxExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -668,14 +672,18 @@ def _compose_instruction_analysis_prompt() -> str:
         "5. complexity：任务复杂度 simple|moderate|complex\n"
         "   - simple：单步即可完成（直接回答/单个命令）\n"
         "   - moderate：需2-3步有序执行\n"
-        "   - complex：需多步骤、多资源、有依赖的复合任务\n\n"
+        "   - complex：需多步骤、多资源、有依赖的复合任务\n"
+        "6. requires_script_execution：是否需要执行脚本或命令（true/false）\n"
+        "   - 当用户请求涉及运行程序、调用工具、执行脚本、数据处理、文件转换时为 true\n"
+        "   - 当用户请求仅需文本回答、查询信息时为 false\n\n"
         "输出格式：\n"
         "{\n"
         '  "intent": "任务意图描述",\n'
         '  "scope": "执行范围描述",\n'
         '  "constraints": ["约束1", "约束2"],\n'
         '  "output_requirements": ["输出要求1", "输出要求2"],\n'
-        '  "complexity": "simple|moderate|complex"\n'
+        '  "complexity": "simple|moderate|complex",\n'
+        '  "requires_script_execution": true\n'
         "}\n"
     )
 
@@ -712,9 +720,22 @@ async def _run_instruction_analysis_round(
         }
 
     # Ensure required keys exist
-    for key in ("intent", "scope", "constraints", "output_requirements", "complexity"):
+    for key in ("intent", "scope", "constraints", "output_requirements", "complexity", "requires_script_execution"):
         if key not in analysis:
-            analysis[key] = [] if key in ("constraints", "output_requirements") else ""
+            if key in ("constraints", "output_requirements"):
+                analysis[key] = []
+            elif key == "requires_script_execution":
+                # Default to false for safety; let the planner decide
+                analysis[key] = False
+            else:
+                analysis[key] = ""
+
+    # Normalize requires_script_execution to bool
+    rse = analysis.get("requires_script_execution")
+    if isinstance(rse, str):
+        analysis["requires_script_execution"] = rse.strip().lower() in {"true", "1", "yes", "y"}
+    elif not isinstance(rse, bool):
+        analysis["requires_script_execution"] = bool(rse)
 
     return analysis
 
@@ -808,6 +829,54 @@ def _cleanup_expired_plans():
     expired = [k for k, v in _pending_plans.items() if now - v.get("ts", 0) > _PLAN_EXPIRY_SECONDS]
     for k in expired:
         del _pending_plans[k]
+
+
+def _format_task_checklist_markdown(tasks: list[dict], *, instruction_analysis: dict | None = None) -> str:
+    """Format a task list as a Markdown checklist for inline display in chat bubbles.
+
+    Uses `- [ ]` / `- [x]` syntax that can be rendered by ChatBubble.
+    This is the structured task checklist format shown in the planning mode
+    conversation bubble, distinct from the detailed side panel view.
+    """
+    lines: list[str] = []
+
+    if instruction_analysis:
+        intent = instruction_analysis.get("intent", "")
+        complexity = instruction_analysis.get("complexity", "")
+        if intent:
+            lines.append(f"**任务意图**：{intent}")
+        if complexity:
+            lines.append(f"**复杂度**：{complexity}")
+        lines.append("")
+
+    lines.append(f"**待执行任务清单**（共 {len(tasks)} 项）：")
+    lines.append("")
+
+    for idx, task in enumerate(tasks):
+        action = str(task.get("action") or "").strip()
+        reason = str(task.get("reason") or "").strip()
+
+        # Build a concise description for each task
+        if action == "run_command":
+            cmd = str(task.get("command") or "")
+            desc = f"执行命令：`{cmd[:80]}{'…' if len(cmd) > 80 else ''}`"
+        elif action == "write_file":
+            path = str(task.get("path") or "")
+            desc = f"写入文件：`{path}`"
+        elif action == "read_resource":
+            path = str(task.get("path") or task.get("resource_handle") or "")
+            desc = f"读取资源：`{path}`"
+        elif action == "create_directory":
+            path = str(task.get("path") or "")
+            desc = f"创建目录：`{path}`"
+        elif action in {"display", "ignore"}:
+            desc = reason or action
+        else:
+            desc = reason or action
+
+        lines.append(f"- [ ] {desc}")
+
+    return "\n".join(lines)
 
 
 def _compose_skill_runtime_planner_prompt() -> str:
@@ -1642,6 +1711,173 @@ def _safe_command_argv(command: str, *, base_dir: Path | None = None) -> list[st
 
     return argv
 
+
+# ---------------------------------------------------------------------------
+# Sandbox Execution Error Correction & Retry (需求6: LLM反馈重试机制)
+# ---------------------------------------------------------------------------
+
+_MAX_SANDBOX_RETRY = 3  # Maximum LLM-based retry attempts for failed sandbox tasks
+
+
+def _compose_error_correction_prompt(
+    *,
+    task: dict,
+    error_result: dict,
+    attempt: int,
+    max_retries: int,
+) -> str:
+    """Build a system prompt for LLM-based error correction.
+
+    The LLM receives the failed task and its error output, then suggests
+    a corrected task. This prompt is designed to be generic and compatible
+    with all skill types, without hardcoding any specific skill logic.
+    """
+    action = task.get("action", "")
+    return (
+        "你是沙盒执行错误修正助手。\n\n"
+        "一个 Skill 任务在沙盒环境中执行失败。你需要根据错误信息分析失败原因，"
+        "并提供修正后的任务描述。\n\n"
+        "重要规则：\n"
+        "1. 只修正导致失败的参数（如命令、路径、参数值），不要改变任务的 action 类型。\n"
+        "2. 修正后的命令或路径必须仍然在沙盒安全范围内。\n"
+        "3. 如果错误是由于缺少文件或路径不存在，尝试修正路径。\n"
+        "4. 如果错误是由于命令参数错误，尝试修正参数。\n"
+        "5. 如果无法确定修正方案，将 corrected 设为 false。\n"
+        "6. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
+        f"当前是第 {attempt}/{max_retries} 次重试。\n\n"
+        "输出格式：\n"
+        "{\n"
+        '  "corrected": true,\n'
+        '  "reason": "修正原因",\n'
+        '  "task": { ... 修正后的完整 task 对象 ... }\n'
+        "}\n\n"
+        "如果无法修正：\n"
+        "{\n"
+        '  "corrected": false,\n'
+        '  "reason": "无法修正的原因"\n'
+        "}\n"
+    )
+
+
+def _parse_error_correction_decision(text: str) -> dict:
+    """Parse the LLM error correction decision."""
+    stripped = _strip_markdown_json_fence(text)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("error correction decision is not valid JSON: %s", text[:500])
+        return {"corrected": False, "reason": "JSON 解析失败"}
+
+    if not isinstance(data, dict):
+        return {"corrected": False, "reason": "输出不是 JSON object"}
+
+    corrected = data.get("corrected", False)
+    if isinstance(corrected, str):
+        corrected = corrected.strip().lower() in {"true", "1", "yes", "y"}
+    else:
+        corrected = bool(corrected)
+
+    if not corrected:
+        return {
+            "corrected": False,
+            "reason": str(data.get("reason") or "").strip(),
+        }
+
+    corrected_task = data.get("task")
+    if not isinstance(corrected_task, dict):
+        return {"corrected": False, "reason": "corrected=true 但缺少有效的 task 对象"}
+
+    return {
+        "corrected": True,
+        "reason": str(data.get("reason") or "").strip(),
+        "task": corrected_task,
+    }
+
+
+async def _get_llm_error_correction(
+    *,
+    task: dict,
+    error_result: dict,
+    attempt: int,
+    max_retries: int,
+    body_prompt: str,
+    model: str,
+) -> dict:
+    """Call LLM to analyze a sandbox execution error and suggest a correction.
+
+    This function does NOT modify any skill content. It only suggests
+    parameter adjustments for the failed task.
+    """
+    system_prompt = _compose_error_correction_prompt(
+        task=task,
+        error_result=error_result,
+        attempt=attempt,
+        max_retries=max_retries,
+    )
+
+    # Build a concise error context for the LLM
+    error_context = {
+        "failed_task": {
+            "action": task.get("action"),
+            "command": str(task.get("command") or "")[:500],
+            "path": task.get("path"),
+            "reason": task.get("reason"),
+        },
+        "error_result": {
+            "success": error_result.get("success"),
+            "returncode": error_result.get("returncode"),
+            "stderr": str(error_result.get("stderr") or "")[:1000],
+            "stdout": str(error_result.get("stdout") or "")[:500],
+            "message": str(error_result.get("message") or "")[:500],
+        },
+        "attempt": attempt,
+        "max_retries": max_retries,
+    }
+
+    # Include a truncated version of the skill body for context
+    skill_context = body_prompt[:2000] if body_prompt else ""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "skill_context": skill_context,
+                    "error_context": error_context,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    try:
+        correction_text = await complete_chat_once(messages, _planner_model_name(model))
+        return _parse_error_correction_decision(correction_text)
+    except Exception as exc:
+        logger.warning("LLM error correction call failed: %s", exc)
+        return {"corrected": False, "reason": f"LLM 调用失败: {exc}"}
+
+
+def _apply_error_correction(original_task: dict, correction: dict) -> dict:
+    """Apply LLM-suggested correction to a failed task.
+
+    Merges corrected fields from the LLM suggestion into the original task,
+    preserving any fields not present in the correction.
+    """
+    corrected_task = correction.get("task", {})
+    if not isinstance(corrected_task, dict):
+        return original_task
+
+    # Start with original task and overlay corrected fields
+    merged = {**original_task, **corrected_task}
+
+    # Ensure the action type is preserved (security: prevent action type change)
+    merged["action"] = original_task.get("action", "")
+
+    return merged
+
 def _execute_single_task(
     task: dict,
     blocks: "list[MarkdownBlock]",
@@ -1771,6 +2007,20 @@ def _execute_single_task(
 
         _effective_env = {**os.environ, **_run_cmd_extra_env}
         argv = [_expand_arg_env_vars(arg, _effective_env) for arg in argv]
+
+        # Correct placeholder file paths that the LLM may have used
+        # (e.g., SKILL.md example filenames instead of real uploaded filenames)
+        argv = _correct_expanded_input_paths(
+            argv,
+            input_files=getattr(request, "input_files", []) or [],
+            execution_root=execution_root,
+            session_input_dir=session_input_dir,
+        )
+
+        # Log warnings for any remaining non-existent input paths
+        input_warnings = _validate_input_file_paths(argv, session_input_dir)
+        for w in input_warnings:
+            logger.warning("Sandbox input path warning: %s", w)
 
         # Error-driven retry: up to _MAX_DEP_RETRY times for missing deps.
         completed = None
@@ -2097,8 +2347,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     parent_skill_name = skill_context.get("skill_name", "")
     enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
 
-    # Dual execution mode: "plan" (preview before execute) or "craft" (direct execute)
-    execution_mode = getattr(request, "execution_mode", None) or "craft"
+    # Dual execution mode: "plan" (规划模式，预览后确认再执行) or "execute" (执行模式，直接执行)
+    # Backward compatible: "craft" is mapped to "execute" via effective_execution_mode()
+    execution_mode = request.effective_execution_mode()
 
     if execution_root is not None:
         execution_root = Path(execution_root).resolve()
@@ -2411,30 +2662,50 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "ts": _time_module.time(),
                         }
 
+                        # Build task items for both plan_preview and task_checklist events
+                        plan_tasks = [
+                            {
+                                "action": t.get("action"),
+                                "command": (str(t.get("command") or ""))[:200] or None,
+                                "path": t.get("path") or t.get("resource_handle") or None,
+                                "reason": str(t.get("reason") or "")[:300],
+                            }
+                            for t in tasks
+                        ]
+
                         yield _sse({
                             "plan_preview": {
                                 "plan_id": plan_id,
                                 "mode": mode,
                                 "instruction_analysis": instruction_analysis,
                                 "sop": sop_document,
-                                "tasks": [
-                                    {
-                                        "action": t.get("action"),
-                                        "command": (str(t.get("command") or ""))[:200] or None,
-                                        "path": t.get("path") or t.get("resource_handle") or None,
-                                        "reason": str(t.get("reason") or "")[:300],
-                                    }
-                                    for t in tasks
-                                ],
+                                "tasks": plan_tasks,
                                 "total_tasks": len(tasks),
                                 "awaiting_confirmation": True,
                             }
                         })
+
+                        # Push inline task checklist for display in the chat bubble
+                        checklist_tasks = [
+                            {
+                                "index": idx,
+                                "action": t.get("action"),
+                                "description": str(t.get("reason") or ""),
+                                "command": (str(t.get("command") or ""))[:200] or None,
+                                "path": t.get("path") or t.get("resource_handle") or None,
+                            }
+                            for idx, t in enumerate(tasks)
+                        ]
+                        yield _task_checklist(checklist_tasks)
+
+                        # Also push Markdown checklist as content for backward compatibility
+                        checklist_md = _format_task_checklist_markdown(
+                            tasks, instruction_analysis=instruction_analysis
+                        )
                         yield _sse({"status": None})
                         yield _sse({"content": (
                             f"📋 **执行方案已生成**（共 {len(tasks)} 个步骤）\n\n"
-                            f"**任务意图**：{instruction_analysis.get('intent', '')}\n"
-                            f"**复杂度**：{instruction_analysis.get('complexity', '')}\n\n"
+                            f"{checklist_md}\n\n"
                             "请在左侧面板查看详细方案，确认后将开始执行。\n"
                             f"（方案ID：`{plan_id}`）"
                         )})
@@ -2453,15 +2724,68 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                         _exec_all_results: list[dict] = []
                         _exec_all_touched: list[Path] = []
+                        _exec_completed_indices: list[int] = []
+
+                        # --- Progressive Resource Disclosure (需求4: 渐进式披露) ---
+                        # Resource cache: maps resource_handle/path to loaded content.
+                        # Resources are loaded on-demand per task rather than all upfront.
+                        _resource_cache: dict[str, str] = {}
+                        _resource_catalog = _extract_runtime_resource_catalog(
+                            body_prompt, execution_root=execution_root
+                        ) if execution_root else []
+
+                        def _load_resource_for_task(t: dict) -> str | None:
+                            """Load a resource on-demand for a specific task.
+
+                            Returns the loaded content, or None if no resource needed.
+                            Caches results to avoid redundant reads.
+                            """
+                            handle = str(t.get("resource_handle") or "").strip()
+                            rel_path = str(t.get("path") or "").strip()
+
+                            # Check cache first
+                            cache_key = handle or rel_path
+                            if cache_key and cache_key in _resource_cache:
+                                return _resource_cache[cache_key]
+
+                            # Load from disk if not cached
+                            if rel_path and parent_skill_name:
+                                try:
+                                    observation = read_skill_resource_text(
+                                        parent_skill_name, rel_path,
+                                        max_chars=settings.skill_resource_max_chars,
+                                    )
+                                    content = observation.get("content", "")
+                                    if cache_key:
+                                        _resource_cache[cache_key] = content
+                                    return content
+                                except Exception:
+                                    pass
+
+                            return None
+
+                        # Push initial task checklist for execute mode
+                        exec_checklist_tasks = [
+                            {
+                                "index": idx,
+                                "action": t.get("action"),
+                                "description": str(t.get("reason") or ""),
+                                "command": (str(t.get("command") or ""))[:200] or None,
+                                "path": t.get("path") or t.get("resource_handle") or None,
+                            }
+                            for idx, t in enumerate(tasks)
+                        ]
+                        yield _task_checklist(exec_checklist_tasks, completed_indices=[], executing_index=-1)
 
                         # Execute tasks one at a time so the frontend receives
                         # real-time thought events after each task completes.
-                        for task in tasks:
+                        for task_idx, task in enumerate(tasks):
                             task_action = str(task.get("action") or "").strip()
+                            current_task = task  # may be modified by retry logic
 
                             # Announce what is about to happen.
                             if task_action == "run_command":
-                                cmd = str(task.get("command") or "")
+                                cmd = str(current_task.get("command") or "")
                                 short_cmd = cmd[:_MAX_CMD_DISPLAY_LENGTH] + (
                                     "…" if len(cmd) > _MAX_CMD_DISPLAY_LENGTH else ""
                                 )
@@ -2472,8 +2796,23 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     short_cmd,
                                     {"action": "run_command", "command": cmd[:200]},
                                 )
+                                # Auto-detect sandbox execution requirement (需求5)
+                                # When run_command is detected, automatically flag as sandbox execution
+                                if instruction_analysis.get("requires_script_execution"):
+                                    yield _thought(
+                                        "sandbox_auto_detect",
+                                        "沙箱自动检测",
+                                        "检测到脚本执行需求，自动调用沙箱环境",
+                                        {
+                                            "requires_script_execution": True,
+                                            "execution_root": str(execution_root) if execution_root else None,
+                                            "auto_injected_env": [
+                                                "EXECUTION_ROOT", "OUTPUT_DIR", "INPUT_DIR", "INPUT_SESSION_DIR",
+                                            ],
+                                        },
+                                    )
                             elif task_action == "read_resource":
-                                res_path = str(task.get("path") or task.get("resource_handle") or "")
+                                res_path = str(current_task.get("path") or current_task.get("resource_handle") or "")
                                 yield _sse({"status": {"phase": "reading", "message": f"读取资源：{res_path}"}})
                                 yield _thought(
                                     "action_start",
@@ -2482,7 +2821,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     {"action": "read_resource", "path": res_path},
                                 )
                             elif task_action == "write_file":
-                                wf_path = str(task.get("path") or "")
+                                wf_path = str(current_task.get("path") or "")
                                 yield _sse({"status": {"phase": "writing", "message": f"写入文件：{wf_path}"}})
                                 yield _thought(
                                     "action_start",
@@ -2491,7 +2830,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     {"action": "write_file", "path": wf_path},
                                 )
                             elif task_action == "create_directory":
-                                cd_path = str(task.get("path") or "")
+                                cd_path = str(current_task.get("path") or "")
                                 yield _sse({"status": {"phase": "creating", "message": f"创建目录：{cd_path}"}})
                                 yield _thought(
                                     "action_start",
@@ -2507,21 +2846,105 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     {"action": task_action},
                                 )
 
-                            # Run the task in a thread and capture the result.
-                            task_result, task_touched = await asyncio.to_thread(
-                                functools.partial(
-                                    _execute_single_task,
-                                    task,
-                                    [],
-                                    request,
-                                    execution_root=execution_root,
-                                    inferred_skill_root=_exec_inferred_root,
-                                    skill_name=parent_skill_name,
-                                    session_input_dir=_exec_session_dir,
+                            # --- LLM Feedback Retry Loop ---
+                            # When a task fails, feed the error back to the LLM
+                            # for correction and retry up to _MAX_SANDBOX_RETRY times.
+                            task_result = {}
+                            task_touched = []
+
+                            # --- Progressive Resource Loading ---
+                            # For read_resource tasks, load on-demand with cache
+                            if task_action == "read_resource":
+                                loaded = _load_resource_for_task(current_task)
+                                if loaded is not None:
+                                    yield _thought(
+                                        "resource_on_demand",
+                                        "按需加载资源",
+                                        f"已加载资源（{len(loaded)} 字符）",
+                                        {
+                                            "path": current_task.get("path", ""),
+                                            "cached": current_task.get("resource_handle") or current_task.get("path") in _resource_cache,
+                                        },
+                                    )
+
+                            for retry_attempt in range(_MAX_SANDBOX_RETRY + 1):
+                                # Run the task in a thread and capture the result.
+                                task_result, task_touched = await asyncio.to_thread(
+                                    functools.partial(
+                                        _execute_single_task,
+                                        current_task,
+                                        [],
+                                        request,
+                                        execution_root=execution_root,
+                                        inferred_skill_root=_exec_inferred_root,
+                                        skill_name=parent_skill_name,
+                                        session_input_dir=_exec_session_dir,
+                                    )
                                 )
-                            )
+
+                                success_flag = task_result.get("success", True)
+
+                                # If successful or last attempt, break the retry loop
+                                if success_flag or retry_attempt >= _MAX_SANDBOX_RETRY:
+                                    break
+
+                                # Task failed — attempt LLM-based error correction
+                                yield _thought(
+                                    "sandbox_retry",
+                                    f"执行失败，尝试修正 ({retry_attempt + 1}/{_MAX_SANDBOX_RETRY})",
+                                    str(task_result.get("message") or task_result.get("stderr") or "")[:200],
+                                    {
+                                        "attempt": retry_attempt + 1,
+                                        "max_retries": _MAX_SANDBOX_RETRY,
+                                        "action": task_action,
+                                    },
+                                )
+                                yield _sandbox_retry(
+                                    attempt=retry_attempt + 1,
+                                    max_retries=_MAX_SANDBOX_RETRY,
+                                    error=str(task_result.get("stderr") or task_result.get("message") or "")[:500],
+                                    corrected=False,
+                                )
+
+                                # Call LLM for error correction
+                                correction = await _get_llm_error_correction(
+                                    task=current_task,
+                                    error_result=task_result,
+                                    attempt=retry_attempt + 1,
+                                    max_retries=_MAX_SANDBOX_RETRY,
+                                    body_prompt=body_prompt,
+                                    model=model,
+                                )
+
+                                if not correction.get("corrected"):
+                                    # LLM could not suggest a correction, stop retrying
+                                    yield _thought(
+                                        "sandbox_retry",
+                                        "无法修正",
+                                        correction.get("reason", "LLM 无法提供修正建议"),
+                                        {"corrected": False, "reason": correction.get("reason")},
+                                    )
+                                    break
+
+                                # Apply the correction and retry
+                                current_task = _apply_error_correction(current_task, correction)
+                                yield _sandbox_retry(
+                                    attempt=retry_attempt + 1,
+                                    max_retries=_MAX_SANDBOX_RETRY,
+                                    error=str(task_result.get("stderr") or task_result.get("message") or "")[:500],
+                                    corrected=True,
+                                )
+                                yield _thought(
+                                    "sandbox_retry",
+                                    "已修正，重新执行",
+                                    correction.get("reason", ""),
+                                    {"corrected": True, "reason": correction.get("reason")},
+                                )
+
+                            # End of retry loop — record the final result
                             _exec_all_results.append(task_result)
                             _exec_all_touched.extend(task_touched)
+                            _exec_completed_indices.append(task_idx)
 
                             # Build safe result data for the thought (truncate stdout/stderr).
                             _safe_result = {
@@ -2554,6 +2977,19 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     f"{'成功' if success_flag else '失败'}",
                                     _safe_result,
                                 )
+
+                            # Push task_progress and updated checklist for real-time visualization
+                            yield _sse({
+                                "task_progress": {
+                                    "executing_index": task_idx + 1 if task_idx < len(tasks) - 1 else -1,
+                                    "completed_indices": list(_exec_completed_indices),
+                                }
+                            })
+                            yield _task_checklist(
+                                exec_checklist_tasks,
+                                completed_indices=list(_exec_completed_indices),
+                                executing_index=task_idx + 1 if task_idx < len(tasks) - 1 else -1,
+                            )
 
                         # Post-loop: validate any newly created Skill roots.
                         for root in _find_created_skill_roots(_exec_all_touched):
@@ -2781,11 +3217,11 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
     if request.action == "cancel":
         return {"status": "cancelled", "message": "执行方案已取消。"}
 
-    # Re-execute the plan by building a new stream with craft mode
+    # Re-execute the plan by building a new stream with execute mode
     skill_context = pending["skill_context"]
     original_request = pending["request"]
-    # Override to craft mode for actual execution
-    original_request.execution_mode = "craft"
+    # Override to execute mode for actual execution
+    original_request.execution_mode = "execute"
 
     return _make_stream(skill_context, original_request)
 

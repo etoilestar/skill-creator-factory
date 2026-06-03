@@ -579,7 +579,8 @@ def _thought(step: str, label: str, detail: str, data: dict | None = None) -> st
 
     step values:
       metadata_decision | body_loaded | child_decision | resource_selection |
-      planner_output | action_start | action_result | final_answer
+      planner_output | action_start | action_result | final_answer |
+      sandbox_retry | resource_on_demand
     """
     return _sse({
         "thought": {
@@ -587,6 +588,41 @@ def _thought(step: str, label: str, detail: str, data: dict | None = None) -> st
             "label": label,
             "detail": detail,
             "data": data or {},
+            "ts": time.time(),
+        }
+    })
+
+
+def _task_checklist(
+    tasks: list[dict],
+    *,
+    completed_indices: list[int] | None = None,
+    executing_index: int = -1,
+) -> str:
+    """Build a 'task_checklist' SSE event for inline task list display.
+
+    Unlike 'task_progress' which only carries index state, this event
+    carries the full task list so the frontend can render an inline
+    checklist in the chat bubble with real-time status updates.
+    """
+    return _sse({
+        "task_checklist": {
+            "tasks": tasks,
+            "completed_indices": completed_indices or [],
+            "executing_index": executing_index,
+            "ts": time.time(),
+        }
+    })
+
+
+def _sandbox_retry(attempt: int, max_retries: int, error: str, corrected: bool) -> str:
+    """Build a 'sandbox_retry' SSE event to notify frontend of a retry attempt."""
+    return _sse({
+        "sandbox_retry": {
+            "attempt": attempt,
+            "max_retries": max_retries,
+            "error": error[:500],
+            "corrected": corrected,
             "ts": time.time(),
         }
     })
@@ -663,6 +699,7 @@ def _rewrite_argv_input_paths(
     input_files: list[dict],
     execution_root: "Path | None",
     session_input_dir: "Path | None",
+    previous_output_files: "list[dict] | None" = None,
 ) -> list[str]:
     """Rewrite argv elements that reference uploaded files to absolute paths.
 
@@ -682,10 +719,12 @@ def _rewrite_argv_input_paths(
          resolved (the script itself will then report a meaningful error if the
          file is truly absent).
     """
-    if not input_files or execution_root is None:
+    if not input_files and not previous_output_files:
+        return argv
+    if execution_root is None:
         return argv
 
-    # Build a filename → absolute-path map from uploaded file records.
+    # Build a filename → absolute-path map from uploaded file records AND previous_output_files.
     filename_to_abs: dict[str, str] = {}
     for f in input_files:
         rel = f.get("path", "")
@@ -693,6 +732,14 @@ def _rewrite_argv_input_paths(
         if rel and fname:
             abs_path = execution_root / rel
             filename_to_abs[fname] = str(abs_path)
+
+    if previous_output_files:
+        for f in previous_output_files:
+            rel = f.get("path", "")
+            fname = Path(rel).name if rel else ""
+            if rel and fname:
+                abs_path = execution_root / rel
+                filename_to_abs[fname] = str(abs_path)
 
     if not filename_to_abs:
         return argv
@@ -723,24 +770,156 @@ def _rewrite_argv_input_paths(
                     matches = ext_to_abs.get(placeholder_ext, [])
                     if len(matches) == 1:
                         rewritten = matches[0]
+                    elif len(matches) > 1 and session_input_dir is not None:
+                        rewritten = matches[0]
                     elif session_input_dir is not None:
-                        # Multiple (or zero) extension matches: redirect the
-                        # directory portion to the session input dir and keep
-                        # the original filename so the script can report a
-                        # meaningful "file not found" error if needed.
                         rewritten = str(session_input_dir / candidate)
                 break
-        # Pattern 2: bare filename that exactly matches an upload (only when the
+        # Pattern 2: bare filename that matches an upload (only when the
         # argument doesn't already look like an absolute or relative path).
         if (
-            rewritten == arg  # not yet rewritten
+            rewritten == arg
             and "/" not in rewritten
             and "\\" not in rewritten
-            and rewritten in filename_to_abs
         ):
-            rewritten = filename_to_abs[rewritten]
+            if rewritten in filename_to_abs:
+                rewritten = filename_to_abs[rewritten]
+            else:
+                placeholder_ext = Path(rewritten).suffix.lower()
+                if placeholder_ext:
+                    matches = ext_to_abs.get(placeholder_ext, [])
+                    if len(matches) >= 1:
+                        rewritten = matches[0]
         result.append(rewritten)
     return result
+
+
+def _correct_expanded_input_paths(
+    argv: list[str],
+    input_files: list[dict],
+    execution_root: "Path | None",
+    session_input_dir: "Path | None",
+    previous_output_files: "list[dict] | None" = None,
+) -> list[str]:
+    """After env var expansion, correct input file paths that don't exist.
+
+    When the LLM uses a placeholder filename from SKILL.md (e.g., document.pdf)
+    instead of the real uploaded filename (e.g., 2603.pdf), the expanded path
+    won't exist on disk. This function detects such cases and substitutes the
+    correct file from:
+      - session_input_dir (user-uploaded files)
+      - previous_output_files (intermediate files generated by earlier steps)
+
+    Must be called AFTER _expand_arg_env_vars so that $INPUT_SESSION_DIR etc.
+    have already been resolved to absolute paths.
+    """
+    if not input_files and not previous_output_files:
+        return argv
+
+    # Collect all candidate files: from session_input_dir AND previous_output_files.
+    all_candidate_paths: list[Path] = []
+
+    if session_input_dir is not None and session_input_dir.is_dir():
+        for entry in sorted(session_input_dir.iterdir()):
+            if entry.is_file():
+                all_candidate_paths.append(entry.resolve())
+
+    if previous_output_files and execution_root is not None:
+        for f in previous_output_files:
+            rel = f.get("path", "")
+            if rel:
+                full_path = (execution_root / rel).resolve()
+                if full_path.is_file():
+                    all_candidate_paths.append(full_path)
+
+    if not all_candidate_paths:
+        return argv
+
+    # Build indexes by extension.
+    session_files_by_ext: dict[str, list[Path]] = {}
+    for p in all_candidate_paths:
+        ext = p.suffix.lower()
+        session_files_by_ext.setdefault(ext, []).append(p)
+
+    if not session_files_by_ext:
+        return argv
+
+    filename_to_abs: dict[str, str] = {}
+    for f in input_files:
+        rel = f.get("path", "")
+        fname = f.get("filename") or (Path(rel).name if rel else "")
+        if rel and fname and execution_root is not None:
+            filename_to_abs[fname] = str((execution_root / rel).resolve())
+
+    result: list[str] = []
+    for arg in argv:
+        corrected = arg
+        path = Path(arg)
+
+        if path.exists():
+            result.append(arg)
+            continue
+
+        if not path.suffix:
+            result.append(arg)
+            continue
+
+        try:
+            path.resolve().relative_to(session_input_dir.resolve())
+            wrong_ext = path.suffix.lower()
+            candidates = session_files_by_ext.get(wrong_ext, [])
+            if len(candidates) >= 1:
+                corrected = str(candidates[0].resolve())
+                if len(candidates) == 1:
+                    logger.info(
+                        "Corrected input path: %s -> %s (LLM used placeholder filename)",
+                        arg, corrected,
+                    )
+                else:
+                    logger.warning(
+                        "Multiple files with extension '%s' in session dir, using first: %s -> %s",
+                        wrong_ext, arg, corrected,
+                    )
+        except ValueError:
+            if "/" not in arg and "\\" not in arg:
+                wrong_ext = Path(arg).suffix.lower()
+                candidates = session_files_by_ext.get(wrong_ext, [])
+                if len(candidates) == 1:
+                    corrected = str(candidates[0].resolve())
+                    logger.info(
+                        "Corrected bare input filename: %s -> %s",
+                        arg, corrected,
+                    )
+
+        result.append(corrected)
+
+    return result
+
+
+def _validate_input_file_paths(argv: list[str], session_input_dir: "Path | None") -> list[str]:
+    """Check argv for file paths that look like uploaded input references but don't exist.
+
+    Returns a list of warning messages for non-existent input paths.
+    """
+    warnings: list[str] = []
+    if session_input_dir is None:
+        return warnings
+
+    for arg in argv:
+        path = Path(arg)
+        if not path.suffix:
+            continue
+        if path.exists():
+            continue
+        try:
+            path.resolve().relative_to(session_input_dir.resolve())
+            warnings.append(
+                f"Input file path does not exist: {arg}"
+            )
+        except ValueError:
+            pass
+
+    return warnings
 
 
 def _strip_markdown_json_fence(text: str) -> str:

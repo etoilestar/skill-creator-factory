@@ -1,7 +1,9 @@
 import asyncio
 import re as _re
+import shutil
 import subprocess
 import sys as _sys
+import time as _time
 from pathlib import Path as _Path
 from typing import Literal
 
@@ -340,6 +342,17 @@ _SANDBOX_INPUT_ALLOWED_SUFFIXES: frozenset[str] = frozenset({
     ".zip", ".tar", ".gz", ".log",
 })
 
+_SESSION_TTL_SECONDS = 24 * 3600
+
+
+def _cleanup_expired_sessions(inputs_dir: _Path) -> None:
+    if not inputs_dir.is_dir():
+        return
+    now = _time.time()
+    for session_dir in list(inputs_dir.iterdir()):
+        if session_dir.is_dir() and (now - session_dir.stat().st_mtime) > _SESSION_TTL_SECONDS:
+            shutil.rmtree(session_dir, ignore_errors=True)
+
 
 @router.post("/{skill_name}/sandbox-inputs")
 async def upload_sandbox_input(
@@ -383,7 +396,16 @@ async def upload_sandbox_input(
 
     target_dir = skill_dir / "inputs" / session_id
     target_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_expired_sessions(skill_dir / "inputs")
     dest = target_dir / safe_name
+    if dest.exists():
+        stem = _Path(safe_name).stem
+        suffix = _Path(safe_name).suffix
+        counter = 1
+        while dest.exists():
+            dest = target_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+        safe_name = dest.name
     dest.write_bytes(data)
 
     rel = dest.relative_to(skill_dir)
@@ -393,6 +415,41 @@ async def upload_sandbox_input(
         "filename": safe_name,
         "size": len(data),
     }
+
+
+@router.delete("/{skill_name}/sandbox-inputs/{session_id}")
+async def cleanup_sandbox_session(skill_name: str, session_id: str):
+    """Delete a sandbox session's input directory and its outputs.
+
+    Called by the frontend when a sandbox conversation ends (page close,
+    refresh, or explicit reset) to ensure session files are cleaned up
+    promptly rather than waiting for the 24h TTL expiry.
+    """
+    if not session_id or not _re.fullmatch(r"[a-zA-Z0-9_\-]{1,64}", session_id):
+        raise HTTPException(status_code=400, detail="session_id 格式非法")
+
+    try:
+        skill_dir = get_execution_skill_dir(skill_name, mode="sandbox").resolve()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    cleaned = []
+
+    # Remove inputs/<session_id>/
+    inputs_session_dir = skill_dir / "inputs" / session_id
+    if inputs_session_dir.is_dir():
+        shutil.rmtree(inputs_session_dir, ignore_errors=True)
+        cleaned.append(f"inputs/{session_id}")
+
+    # Remove outputs/<session_id>/ if exists (sandbox outputs may be session-scoped)
+    outputs_session_dir = skill_dir / "outputs" / session_id
+    if outputs_session_dir.is_dir():
+        shutil.rmtree(outputs_session_dir, ignore_errors=True)
+        cleaned.append(f"outputs/{session_id}")
+
+    return {"status": "cleaned", "session_id": session_id, "cleaned": cleaned}
 
 
 @router.get("/{skill_name}/outputs")

@@ -7,6 +7,7 @@ rejects symlinks escaping the skill execution sandbox.
 
 import json
 import pytest
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # _strip_markdown_json_fence
@@ -443,3 +444,248 @@ def test_is_within_sandbox_nested_path_ok(tmp_path):
 
     sandbox = (tmp_path / "skill").resolve()
     assert _is_within_sandbox(nested, sandbox) is True
+
+
+# ---------------------------------------------------------------------------
+# _rewrite_argv_input_paths — input file path rewriting
+# ---------------------------------------------------------------------------
+
+def test_rewrite_argv_uploads_prefix_exact_match(tmp_path):
+    from backend.routers.chat_utils import _rewrite_argv_input_paths
+
+    input_files = [{"path": "inputs/s1/report.pdf", "filename": "report.pdf"}]
+    execution_root = tmp_path
+    session_input_dir = tmp_path / "inputs" / "s1"
+    session_input_dir.mkdir(parents=True)
+
+    argv = ["python", "scripts/run.py", "uploads/report.pdf"]
+    result = _rewrite_argv_input_paths(argv, input_files, execution_root, session_input_dir)
+
+    assert result[2] == str(execution_root / "inputs" / "s1" / "report.pdf")
+
+
+def test_rewrite_argv_uploads_prefix_fuzzy_by_extension(tmp_path):
+    from backend.routers.chat_utils import _rewrite_argv_input_paths
+
+    input_files = [{"path": "inputs/s1/2603.pdf", "filename": "2603.pdf"}]
+    execution_root = tmp_path
+    session_input_dir = tmp_path / "inputs" / "s1"
+    session_input_dir.mkdir(parents=True)
+
+    argv = ["python", "scripts/run.py", "uploads/document.pdf"]
+    result = _rewrite_argv_input_paths(argv, input_files, execution_root, session_input_dir)
+
+    assert result[2] == str(execution_root / "inputs" / "s1" / "2603.pdf")
+
+
+def test_rewrite_argv_bare_filename_exact_match(tmp_path):
+    from backend.routers.chat_utils import _rewrite_argv_input_paths
+
+    input_files = [{"path": "inputs/s1/data.csv", "filename": "data.csv"}]
+    execution_root = tmp_path
+    session_input_dir = tmp_path / "inputs" / "s1"
+    session_input_dir.mkdir(parents=True)
+
+    argv = ["python", "scripts/run.py", "data.csv"]
+    result = _rewrite_argv_input_paths(argv, input_files, execution_root, session_input_dir)
+
+    assert result[2] == str(execution_root / "inputs" / "s1" / "data.csv")
+
+
+def test_rewrite_argv_bare_filename_fuzzy_by_extension(tmp_path):
+    from backend.routers.chat_utils import _rewrite_argv_input_paths
+
+    input_files = [{"path": "inputs/s1/2603.pdf", "filename": "2603.pdf"}]
+    execution_root = tmp_path
+    session_input_dir = tmp_path / "inputs" / "s1"
+    session_input_dir.mkdir(parents=True)
+
+    argv = ["python", "scripts/run.py", "document.pdf"]
+    result = _rewrite_argv_input_paths(argv, input_files, execution_root, session_input_dir)
+
+    assert result[2] == str(execution_root / "inputs" / "s1" / "2603.pdf")
+
+
+# ---------------------------------------------------------------------------
+# _correct_expanded_input_paths — post-expansion path correction
+# ---------------------------------------------------------------------------
+
+def test_correct_expanded_input_paths_placeholder_under_session_dir(tmp_path):
+    from backend.routers.chat_utils import _correct_expanded_input_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+    real_file = session_dir / "2603.pdf"
+    real_file.write_bytes(b"%PDF-1.4 fake")
+
+    input_files = [{"path": "inputs/s1/2603.pdf", "filename": "2603.pdf"}]
+
+    placeholder_path = str(session_dir / "document.pdf")
+    argv = ["python", "scripts/extract_text.py", placeholder_path]
+
+    result = _correct_expanded_input_paths(argv, input_files, tmp_path, session_dir)
+
+    assert result[2] == str(real_file.resolve())
+
+
+def test_correct_expanded_input_paths_existing_file_unchanged(tmp_path):
+    from backend.routers.chat_utils import _correct_expanded_input_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+    real_file = session_dir / "2603.pdf"
+    real_file.write_bytes(b"%PDF-1.4 fake")
+
+    input_files = [{"path": "inputs/s1/2603.pdf", "filename": "2603.pdf"}]
+
+    existing_path = str(real_file)
+    argv = ["python", "scripts/extract_text.py", existing_path]
+
+    result = _correct_expanded_input_paths(argv, input_files, tmp_path, session_dir)
+
+    assert result[2] == existing_path
+
+
+def test_correct_expanded_input_paths_no_input_files(tmp_path):
+    from backend.routers.chat_utils import _correct_expanded_input_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+
+    argv = ["python", "scripts/run.py", "/some/path/file.pdf"]
+    result = _correct_expanded_input_paths(argv, [], tmp_path, session_dir)
+
+    assert result == argv
+
+
+def test_correct_expanded_input_paths_bare_filename_correction(tmp_path):
+    from backend.routers.chat_utils import _correct_expanded_input_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+    real_file = session_dir / "2603.pdf"
+    real_file.write_bytes(b"%PDF-1.4 fake")
+
+    input_files = [{"path": "inputs/s1/2603.pdf", "filename": "2603.pdf"}]
+
+    argv = ["python", "scripts/extract_text.py", "document.pdf"]
+    result = _correct_expanded_input_paths(argv, input_files, tmp_path, session_dir)
+
+    assert result[2] == str(real_file.resolve())
+
+
+# ---------------------------------------------------------------------------
+# _validate_input_file_paths — pre-execution validation
+# ---------------------------------------------------------------------------
+
+def test_validate_input_file_paths_missing_file_warns(tmp_path):
+    from backend.routers.chat_utils import _validate_input_file_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+
+    missing_path = str(session_dir / "nonexistent.pdf")
+    argv = ["python", "scripts/run.py", missing_path]
+
+    warnings = _validate_input_file_paths(argv, session_dir)
+    assert len(warnings) == 1
+    assert "nonexistent.pdf" in warnings[0]
+
+
+def test_validate_input_file_paths_existing_file_no_warning(tmp_path):
+    from backend.routers.chat_utils import _validate_input_file_paths
+
+    session_dir = tmp_path / "inputs" / "s1"
+    session_dir.mkdir(parents=True)
+    real_file = session_dir / "data.csv"
+    real_file.write_text("a,b\n1,2")
+
+    argv = ["python", "scripts/run.py", str(real_file)]
+    warnings = _validate_input_file_paths(argv, session_dir)
+    assert len(warnings) == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: upload → path rewrite → env expand → correct → validate
+# ---------------------------------------------------------------------------
+
+def test_e2e_pdf_translator_pipeline(tmp_path):
+    from backend.routers.chat_utils import (
+        _correct_expanded_input_paths,
+        _expand_arg_env_vars,
+        _extract_input_session_dir,
+        _rewrite_argv_input_paths,
+        _validate_input_file_paths,
+    )
+
+    skill_root = tmp_path / "pdf-translator"
+    session_dir = skill_root / "inputs" / "sess-abc"
+    session_dir.mkdir(parents=True)
+    scripts_dir = skill_root / "scripts"
+    scripts_dir.mkdir()
+
+    extract_script = scripts_dir / "extract_text.py"
+    extract_script.write_text("import sys; print(sys.argv[1])")
+
+    real_pdf = session_dir / "2603.pdf"
+    real_pdf.write_bytes(b"%PDF-1.4 fake content")
+
+    input_files = [{"path": "inputs/sess-abc/2603.pdf", "filename": "2603.pdf"}]
+
+    extracted = _extract_input_session_dir(input_files, skill_root)
+    assert extracted == session_dir
+
+    command = "python scripts/extract_text.py $INPUT_SESSION_DIR/document.pdf"
+    argv = command.split()
+
+    argv = _rewrite_argv_input_paths(argv, input_files, skill_root, session_dir)
+
+    env = {
+        "INPUT_SESSION_DIR": str(session_dir),
+        "INPUT_DIR": str(skill_root / "inputs"),
+        "OUTPUT_DIR": str(skill_root / "outputs"),
+        "EXECUTION_ROOT": str(skill_root),
+    }
+    argv = [_expand_arg_env_vars(arg, env) for arg in argv]
+
+    assert not Path(argv[2]).exists(), "placeholder path should not exist before correction"
+
+    argv = _correct_expanded_input_paths(argv, input_files, skill_root, session_dir)
+
+    assert Path(argv[2]).exists(), f"corrected path should exist: {argv[2]}"
+    assert "2603.pdf" in argv[2], f"should reference real file: {argv[2]}"
+
+    warnings = _validate_input_file_paths(argv, session_dir)
+    assert len(warnings) == 0, f"no warnings expected after correction: {warnings}"
+
+
+def test_e2e_uploads_prefix_pipeline(tmp_path):
+    from backend.routers.chat_utils import (
+        _correct_expanded_input_paths,
+        _expand_arg_env_vars,
+        _rewrite_argv_input_paths,
+        _validate_input_file_paths,
+    )
+
+    skill_root = tmp_path / "pdf-translator"
+    session_dir = skill_root / "inputs" / "sess-abc"
+    session_dir.mkdir(parents=True)
+
+    real_pdf = session_dir / "2603.pdf"
+    real_pdf.write_bytes(b"%PDF-1.4 fake content")
+
+    input_files = [{"path": "inputs/sess-abc/2603.pdf", "filename": "2603.pdf"}]
+
+    argv = ["python", "scripts/extract_text.py", "uploads/document.pdf"]
+    argv = _rewrite_argv_input_paths(argv, input_files, skill_root, session_dir)
+
+    env = {
+        "INPUT_SESSION_DIR": str(session_dir),
+        "INPUT_DIR": str(skill_root / "inputs"),
+    }
+    argv = [_expand_arg_env_vars(arg, env) for arg in argv]
+
+    argv = _correct_expanded_input_paths(argv, input_files, skill_root, session_dir)
+
+    assert Path(argv[2]).exists(), f"corrected path should exist: {argv[2]}"
+    assert "2603.pdf" in argv[2]

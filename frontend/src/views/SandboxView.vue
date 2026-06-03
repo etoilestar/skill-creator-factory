@@ -20,15 +20,15 @@
           :class="{ active: executionMode === 'plan' }"
           @click="executionMode = 'plan'"
           :disabled="streaming"
-          title="Plan 模式：先规划后确认再执行"
-        >📋 Plan</button>
+          title="规划模式：先生成任务清单，确认后再执行"
+        >📋 规划模式</button>
         <button
           class="mode-btn"
-          :class="{ active: executionMode === 'craft' }"
-          @click="executionMode = 'craft'"
+          :class="{ active: executionMode === 'execute' }"
+          @click="executionMode = 'execute'"
           :disabled="streaming"
-          title="Craft 模式：直接执行"
-        >⚡ Craft</button>
+          title="执行模式：自动规划并直接执行"
+        >⚡ 执行模式</button>
       </div>
 
       <button class="btn-ghost" @click="resetChat" :disabled="streaming || !selectedSkill">
@@ -67,10 +67,10 @@
               <p>Skill <strong>{{ selectedSkill }}</strong> 已加载为 system prompt。</p>
               <p>向它发送消息，测试它的行为。</p>
               <p class="mode-hint" v-if="executionMode === 'plan'">
-                📋 当前为 <strong>Plan 模式</strong>：AI 会先生成执行方案供你确认后再执行。
+                📋 当前为 <strong>规划模式</strong>：AI 会先生成任务清单供你确认后再执行。
               </p>
               <p class="mode-hint" v-else>
-                ⚡ 当前为 <strong>Craft 模式</strong>：AI 将直接执行任务。
+                ⚡ 当前为 <strong>执行模式</strong>：AI 将自动规划并直接执行任务。
               </p>
             </div>
             <template v-for="(msg, i) in messages" :key="i">
@@ -106,7 +106,14 @@
                 :class="msg.role"
               >
                 <div class="bubble">
-                  <ChatBubble :content="msg.content" />
+                  <ChatBubble :content="msg.content" :files="msg.files" />
+                  <!-- Inline task checklist (shown when task_checklist data is attached) -->
+                  <InlineTaskList
+                    v-if="msg.taskChecklist"
+                    :tasks="msg.taskChecklist.tasks"
+                    :completed-indices="msg.taskChecklist.completedIndices"
+                    :executing-index="msg.taskChecklist.executingIndex"
+                  />
                 </div>
               </div>
             </template>
@@ -220,6 +227,8 @@
             <TaskPlanPanel
               v-if="planTab === 'plan'"
               :plan="currentPlanPreview"
+              :executing-index="executingIndex"
+              :completed-indices="completedIndices"
               :confirming="confirming"
               @confirm="confirmCurrentPlan"
               @cancel="cancelCurrentPlan"
@@ -237,13 +246,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { fetchSkills } from '../composables/useSkills.js'
 import { streamChat, confirmPlan, streamConfirmResponse } from '../composables/useChat.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
 import TaskPlanPanel from '../components/TaskPlanPanel.vue'
 import SOPPanel from '../components/SOPPanel.vue'
+import InlineTaskList from '../components/InlineTaskList.vue'
 
 const ACTION_LABELS = {
   run_script: '运行脚本',
@@ -285,8 +295,8 @@ const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)  // { phase, message } | null
 
-// Execution mode: "plan" or "craft"
-const executionMode = ref('craft')
+// Execution mode: "plan" or "execute"
+const executionMode = ref('execute')
 
 // Thinking panel state
 const thoughts = ref([])          // accumulated thought events for the current round
@@ -294,10 +304,15 @@ const showThoughts = ref(false)   // sidebar visibility
 
 // Plan/SOP panel state
 const showPlanPanel = ref(false)
-const planTab = ref('plan')       // 'plan' | 'sop'
-const currentPlanPreview = ref(null)  // plan_preview data from backend
-const currentSOP = ref(null)          // SOP document from backend
+const planTab = ref('plan') // 'plan' | 'sop'
+const currentPlanPreview = ref(null) // plan_preview data from backend
+const currentSOP = ref(null) // SOP document from backend
 const confirming = ref(false)
+const executingIndex = ref(-1)
+const completedIndices = ref([])
+
+// Inline task checklist state
+const pendingChecklist = ref(null) // task_checklist data awaiting attachment to next assistant message
 
 // File upload state
 const sessionId = ref(newSessionId())
@@ -314,9 +329,46 @@ const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system
 
 onMounted(async () => {
   skills.value = await fetchSkills('sandbox')
+  // Clean up session files when the page is closed or refreshed
+  window.addEventListener('beforeunload', _beforeUnloadHandler)
 })
 
+onBeforeUnmount(() => {
+  // Clean up session files when navigating away from the sandbox view
+  cleanupSession()
+  window.removeEventListener('beforeunload', _beforeUnloadHandler)
+})
+
+/** Synchronous cleanup handler for beforeunload (uses sendBeacon for reliability) */
+function _beforeUnloadHandler() {
+  if (!selectedSkill.value || !sessionId.value) return
+  const url = `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs/${encodeURIComponent(sessionId.value)}`
+  // sendBeacon doesn't support DELETE, so we use a synchronous XMLHttpRequest as fallback
+  try {
+    const xhr = new XMLHttpRequest()
+    xhr.open('DELETE', url, false) // synchronous
+    xhr.send()
+  } catch {
+    // Best-effort; ignore errors during page unload
+  }
+}
+
+/** Clean up the current session's files on the backend (inputs + outputs). */
+async function cleanupSession() {
+  if (!selectedSkill.value || !sessionId.value) return
+  try {
+    await fetch(
+      `/api/skills/${encodeURIComponent(selectedSkill.value)}/sandbox-inputs/${encodeURIComponent(sessionId.value)}`,
+      { method: 'DELETE' },
+    )
+  } catch {
+    // Best-effort cleanup; ignore network errors
+  }
+}
+
 function resetChat() {
+  // Clean up the old session's files before creating a new session
+  cleanupSession()
   messages.value = []
   streamBuffer.value = ''
   error.value = ''
@@ -331,6 +383,25 @@ function resetChat() {
   currentSOP.value = null
   showPlanPanel.value = false
   confirming.value = false
+  executingIndex.value = -1
+  completedIndices.value = []
+  pendingChecklist.value = null
+}
+
+/** Update inline task checklist in the last assistant message when task_progress arrives */
+function updateInlineChecklist(execIdx, completedIdxs) {
+  // Find the last assistant message with a taskChecklist and update it
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const msg = messages.value[i]
+    if (msg.role === 'assistant' && msg.taskChecklist) {
+      msg.taskChecklist = {
+        ...msg.taskChecklist,
+        executingIndex: execIdx,
+        completedIndices: [...completedIdxs],
+      }
+      break
+    }
+  }
 }
 
 function removeUploadedFile(idx) {
@@ -381,7 +452,10 @@ async function send() {
   if (!text || streaming.value || !selectedSkill.value) return
 
   error.value = ''
-  messages.value.push({ role: 'user', content: text })
+  const fileAttachments = uploadedFiles.value.length
+    ? uploadedFiles.value.map(f => ({ filename: f.filename, path: f.path }))
+    : undefined
+  messages.value.push({ role: 'user', content: text, files: fileAttachments })
   input.value = ''
   await scrollBottom()
 
@@ -392,6 +466,8 @@ async function send() {
   thoughts.value = []           // clear previous round's thoughts
   currentPlanPreview.value = null
   currentSOP.value = null
+  executingIndex.value = -1
+  completedIndices.value = []
 
   // Snapshot the uploaded files for this message, then keep them until reset
   const inputFilesSnapshot = uploadedFiles.value.map(f => ({ path: f.path, filename: f.filename }))
@@ -408,7 +484,7 @@ async function send() {
         streamBuffer.value += chunk
         await scrollBottom()
       } else if (chunk.type === 'status') {
-        currentStatus.value = chunk.data  // null clears the status bar
+        currentStatus.value = chunk.data // null clears the status bar
       } else if (chunk.type === 'thought') {
         thoughts.value.push(chunk.data)
         // Auto-show the panel when thoughts start arriving
@@ -438,10 +514,34 @@ async function send() {
         planTab.value = 'plan'
       } else if (chunk.type === 'sop_plan') {
         currentSOP.value = chunk.data
+      } else if (chunk.type === 'task_progress') {
+        executingIndex.value = chunk.data.executing_index
+        completedIndices.value = chunk.data.completed_indices
+        // Update inline task checklist in the last assistant message
+        updateInlineChecklist(chunk.data.executing_index, chunk.data.completed_indices)
+      } else if (chunk.type === 'task_checklist') {
+        // Store checklist data to attach to the next assistant message
+        pendingChecklist.value = chunk.data
+      } else if (chunk.type === 'sandbox_retry') {
+        // Show retry notification as a thought
+        thoughts.value.push({
+          step: 'sandbox_retry',
+          label: `重试 (${chunk.data.attempt}/${chunk.data.max_retries})`,
+          detail: chunk.data.corrected ? '已根据错误信息调整输入' : '重试执行',
+          data: chunk.data,
+          ts: chunk.data.ts,
+        })
+        if (!showThoughts.value) showThoughts.value = true
       }
     }
     if (streamBuffer.value) {
-      messages.value.push({ role: 'assistant', content: streamBuffer.value })
+      const msg = { role: 'assistant', content: streamBuffer.value }
+      // Attach pending checklist data if available
+      if (pendingChecklist.value) {
+        msg.taskChecklist = pendingChecklist.value
+        pendingChecklist.value = null
+      }
+      messages.value.push(msg)
       streamBuffer.value = ''
     }
   } catch (e) {
@@ -463,6 +563,8 @@ async function confirmCurrentPlan() {
   streamBuffer.value = ''
   thoughts.value = []
   roundOutputFiles.value = []
+  executingIndex.value = -1
+  completedIndices.value = []
 
   try {
     const response = await confirmPlan(selectedSkill.value, planId, 'confirm')
@@ -497,6 +599,9 @@ async function confirmCurrentPlan() {
             roundOutputFiles.value.push(...r.output_files)
           }
           await scrollBottom()
+        } else if (chunk.type === 'task_progress') {
+          executingIndex.value = chunk.data.executing_index
+          completedIndices.value = chunk.data.completed_indices
         }
       }
       if (streamBuffer.value) {
@@ -516,6 +621,8 @@ async function confirmCurrentPlan() {
     confirming.value = false
     streaming.value = false
     currentStatus.value = null
+    executingIndex.value = -1
+    completedIndices.value = []
     await scrollBottom()
   }
 }

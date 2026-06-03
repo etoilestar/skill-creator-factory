@@ -79,7 +79,7 @@
 </template>
 
 <script setup>
-defineProps({
+const props = defineProps({
   plan: {
     type: Object,
     default: null,
@@ -130,14 +130,14 @@ function actionLabel(action) {
 }
 
 function taskStatusClass(idx) {
-  if (this?.completedIndices?.includes(idx)) return 'completed'
-  if (this?.executingIndex === idx) return 'executing'
+  if (props.completedIndices.includes(idx)) return 'completed'
+  if (props.executingIndex === idx) return 'executing'
   return 'pending'
 }
 
 function statusIcon(idx) {
-  if (this?.completedIndices?.includes(idx)) return '✅'
-  if (this?.executingIndex === idx) return '⏳'
+  if (props.completedIndices.includes(idx)) return '✅'
+  if (props.executingIndex === idx) return '⏳'
   return '⬜'
 }
 </script>

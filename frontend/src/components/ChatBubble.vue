@@ -14,6 +14,9 @@
       <!-- Normal text -->
       <pre v-else-if="seg.content" class="content">{{ seg.content }}<span v-if="streaming && idx === segments.length - 1" class="cursor">▋</span></pre>
     </template>
+    <div v-if="files && files.length" class="file-attachments">
+      <span v-for="f in files" :key="f.filename" class="file-chip">📎 {{ f.filename }}</span>
+    </div>
   </div>
 </template>
 
@@ -23,6 +26,7 @@ import { computed, reactive, watchEffect } from 'vue'
 const props = defineProps({
   content: { type: String, required: true },
   streaming: { type: Boolean, default: false },
+  files: { type: Array, default: undefined },
 })
 
 /**
@@ -150,4 +154,22 @@ function toggleThink(idx) {
 
 .cursor { animation: blink 1s step-end infinite; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+.file-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--surface2, #f0f0f0);
+  color: var(--text-muted, #666);
+  white-space: nowrap;
+}
 </style>

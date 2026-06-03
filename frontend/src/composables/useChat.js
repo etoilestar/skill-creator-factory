@@ -9,6 +9,8 @@
  *   - { type: 'quick_actions', data: {actions: [...], ts} } — quick action buttons to display
  *   - { type: 'plan_preview', data: {...} } — plan preview awaiting confirmation (Plan mode)
  *   - { type: 'sop_plan', data: {...} } — SOP document generated from the plan
+ *   - { type: 'task_checklist', data: {tasks, completed_indices, executing_index, ts} } — inline task checklist
+ *   - { type: 'sandbox_retry', data: {attempt, max_retries, error, corrected, ts} } — sandbox retry notification
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model?, execution_mode? }
@@ -51,6 +53,9 @@ export async function* streamChat(url, body) {
         else if (parsed.quick_actions) yield { type: 'quick_actions', data: parsed.quick_actions }
         else if (parsed.plan_preview) yield { type: 'plan_preview', data: parsed.plan_preview }
         else if (parsed.sop_plan) yield { type: 'sop_plan', data: parsed.sop_plan }
+        else if (parsed.task_progress) yield { type: 'task_progress', data: parsed.task_progress }
+        else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
+        else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines
@@ -117,6 +122,9 @@ export async function* streamConfirmResponse(response) {
         else if (parsed.quick_actions) yield { type: 'quick_actions', data: parsed.quick_actions }
         else if (parsed.plan_preview) yield { type: 'plan_preview', data: parsed.plan_preview }
         else if (parsed.sop_plan) yield { type: 'sop_plan', data: parsed.sop_plan }
+        else if (parsed.task_progress) yield { type: 'task_progress', data: parsed.task_progress }
+        else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
+        else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         if (e.message && !e.message.startsWith('JSON')) throw e

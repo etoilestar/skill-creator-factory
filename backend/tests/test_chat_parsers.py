@@ -604,6 +604,44 @@ def test_creator_phase_guess_enters_phase3_only_after_confirmed_blueprint():
     assert _guess_current_phase(messages) == "phase3+"
 
 
+
+def test_creator_conversation_valid_opening_question_skips_validator_model(monkeypatch, tmp_path):
+    import asyncio
+
+    import backend.routers.creator_chat as creator_chat
+    from backend.routers.chat_models import ChatRequest
+
+    async def fake_stream_chat(messages, model):
+        yield '```text\n问题: "你希望 智能助手 帮你做什么事情？"\n选项:\n- "处理文件 (比如 PDF、Excel、图片等)"\n- "帮我写东西 (比如文档、代码、报告)"\n- "连接某个服务 (比如发消息、查数据)"\n- "其他 (我来描述)"\n```'
+
+    async def fail_if_validator_called(messages, model):
+        raise AssertionError("validator should not be called when deterministic checks pass")
+
+    monkeypatch.setattr(creator_chat, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fail_if_validator_called)
+
+    request = ChatRequest(messages=[])
+
+    async def collect():
+        return [
+            item async for item in creator_chat._execute_conversation_mode(
+                final_messages=[{"role": "system", "content": "first prompt"}],
+                model="text-model",
+                current_phase="phase1",
+                request=request,
+                execution_root=tmp_path,
+                parent_skill_name="kernel",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    serialized = "".join(events)
+
+    assert "对话格式校验未通过" not in serialized
+    assert "Creator 对话模型连续输出" not in serialized
+    assert "你希望 智能助手 帮你做什么事情" in serialized
+
+
 def test_creator_conversation_invalid_phase_json_is_validated_and_retried(monkeypatch, tmp_path):
     import asyncio
     import json

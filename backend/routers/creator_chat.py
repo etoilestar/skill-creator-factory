@@ -436,6 +436,86 @@ def _deterministic_conversation_format_issues(text: str, current_phase: str, mes
 async def _run_creator_conversation_format_validator_round(
     *, text: str, current_phase: str, request: ChatRequest, model: str
 ) -> dict:
+    """Validate Phase 1/2 response format without letting the validator over-block normal chat."""
+    deterministic_issues = _deterministic_conversation_format_issues(
+        text,
+        current_phase,
+        getattr(request, "messages", []) or [],
+    )
+    if not deterministic_issues:
+        return {"valid": True, "issues": [], "model": None, "used_model": False}
+
+    validator_model = route_model(
+        VALIDATOR_TASK,
+        requested_model=model,
+        reason="creator phase1/2 format validation",
+    ).model
+    payload = {
+        "current_phase": current_phase,
+        "response_excerpt": (text or "")[:6000],
+        "deterministic_issues": deterministic_issues,
+        "contract": (
+            "Phase 1/2 只能向用户澄清需求、输出完整 Skill 架构蓝图或 AskUserQuestion；"
+            "不得输出阶段启动 JSON、纯 JSON、写入文件或执行命令。"
+        ),
+        "instruction": (
+            "请判断 deterministic_issues 是否确实违反契约，并给出给生成模型的修复建议。"
+            "不要新增与 deterministic_issues 无关的阻断规则。"
+        ),
+    }
+    messages = [
+        {"role": "system", "content": "你是 Creator 对话格式校验器，只输出严格 JSON。"},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    try:
+        text_result = await complete_chat_once(messages, validator_model)
+        data = json.loads(_strip_markdown_json_fence(text_result))
+    except Exception as exc:
+        logger.warning("Creator conversation format validator failed; using deterministic issues: %s", exc)
+        return {"valid": False, "issues": deterministic_issues, "model": validator_model, "used_model": True}
+
+    if not isinstance(data, dict):
+        return {"valid": False, "issues": deterministic_issues, "model": validator_model, "used_model": True}
+
+    suggestions = data.get("issues") if isinstance(data.get("issues"), list) else []
+    issues = [*deterministic_issues, *[str(item) for item in suggestions if str(item).strip()]]
+    return {"valid": False, "issues": issues, "model": validator_model, "used_model": True}
+
+
+def _creator_conversation_retry_messages(base_messages: list[dict], *, previous_output: str, issues: list[str]) -> list[dict]:
+    retry_messages = [*base_messages]
+    retry_messages.append({"role": "assistant", "content": previous_output[-6000:]})
+    retry_messages.append({
+        "role": "user",
+        "content": (
+            "上一条回复违反 Creator Phase 1/2 格式契约，已被后端拦截且不会展示给用户。"
+            "请根据以下校验反馈重新输出一条合规回复：如果还没有完整蓝图，输出完整 `## 📋 Skill 架构蓝图` 并用 AskUserQuestion 请求确认；"
+            "如果仍需澄清，只问一个问题。不要输出 JSON、阶段启动标记、写入文件或执行命令。\n\n"
+            + "\n".join(f"- {issue}" for issue in issues[:10])
+        ),
+    })
+    return retry_messages
+
+
+def _deterministic_conversation_format_issues(text: str, current_phase: str, messages: list) -> list[str]:
+    """Reject protocol-breaking Phase 1/2 text before it is shown to users."""
+    issues: list[str] = []
+    if not (text or "").strip():
+        issues.append("回复为空。")
+    if _contains_phase_transition_or_action_output(text):
+        issues.append(
+            "Phase 1/2 对话输出包含阶段切换标记或可执行动作；阶段切换必须由后端根据蓝图确认决定，模型不得输出启动 JSON 或文件/命令动作。"
+        )
+    if _looks_like_json_only(text):
+        issues.append("Phase 1/2 面向用户回复不能是纯 JSON，必须是自然语言蓝图或 AskUserQuestion。")
+    if current_phase == "phase2" and _latest_user_confirmed_without_blueprint(messages) and "📋 Skill 架构蓝图" not in text:
+        issues.append("用户确认的是需求摘要，但历史中还没有完整 Skill 架构蓝图；本轮必须先输出完整蓝图并再次请求确认，不能进入 Phase 3。")
+    return issues
+
+
+async def _run_creator_conversation_format_validator_round(
+    *, text: str, current_phase: str, request: ChatRequest, model: str
+) -> dict:
     """Use the validator model to review Phase 1/2 response format, with deterministic fallback."""
     deterministic_issues = _deterministic_conversation_format_issues(text, current_phase, getattr(request, "messages", []) or [])
     validator_model = route_model(

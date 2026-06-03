@@ -241,18 +241,28 @@ async function send() {
   input.value = ''
   await scrollBottom()
 
-  // If the user just confirmed the blueprint, trigger blueprint analysis in parallel
-  // with the chat call (pure-rule extraction, no LLM, very fast).
+  // If the user just confirmed the blueprint, switch to the explicit
+  // file-creation panel and do not call /api/chat/creator again.  The chat
+  // endpoint still supports a legacy Phase 3 auto-execution path that validates
+  // artifacts immediately; here the user should stay in control and validation
+  // must wait until they click "开始创建".
   if (isCreationConfirmation(text) && hasBlueprintInHistory()) {
-    analyzeBlueprintPlan(chatHistory.value)
-      .then(plan => {
-        creationPlan.value = plan
-        showCreationPanel.value = true
-        nextTick(scrollBottom)
+    streaming.value = true
+    try {
+      const plan = await analyzeBlueprintPlan(chatHistory.value)
+      creationPlan.value = plan
+      showCreationPanel.value = true
+      messages.value.push({
+        role: 'assistant',
+        content: '已根据蓝图整理好文件清单。请先检查下方列表；点击 **开始创建** 后才会生成、写入并校验 SKILL.md 与脚本格式。',
       })
-      .catch(err => {
-        error.value = `蓝图解析失败：${err.message}，请重试`
-      })
+      await scrollBottom()
+    } catch (err) {
+      error.value = `蓝图解析失败：${err.message}，请重试`
+    } finally {
+      streaming.value = false
+    }
+    return
   }
 
   streaming.value = true

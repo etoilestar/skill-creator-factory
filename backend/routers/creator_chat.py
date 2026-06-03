@@ -31,6 +31,7 @@ from .chat_utils import (
     _thought,
     _validate_skill_md,
 )
+from .creator import _trial_run_generated_script
 from .sandbox_chat import (
     _execute_single_task,
     _format_execution_report,
@@ -461,6 +462,144 @@ async def _execute_conversation_mode(
     yield "data: [DONE]\n\n"
 
 
+_CREATOR_PHASE3_MAX_ATTEMPTS = 8
+
+
+def _creator_phase3_retry_messages(base_messages: list[dict], *, previous_output: str, feedback: str) -> list[dict]:
+    """Build a coder-model retry prompt using validator/trial-run feedback."""
+    retry_messages = [*base_messages]
+    if previous_output:
+        retry_messages.append({"role": "assistant", "content": previous_output[-12000:]})
+    retry_messages.append({
+        "role": "user",
+        "content": (
+            "上一次 Phase 3 生成/执行/校验没有通过。请根据反馈重新生成完整实现动作。\n"
+            "要求：仍然只输出后端可解析的 Phase 3 动作（写入文件/执行命令 fenced blocks），"
+            "不要解释，不要只输出补丁片段；需要覆盖/修复之前写入的文件。\n\n"
+            f"反馈：\n{feedback[-8000:]}"
+        ),
+    })
+    return retry_messages
+
+
+def _created_skill_roots_from_exec_result(exec_result: dict) -> list[Path]:
+    """Resolve created Skill roots from executor touched paths/output metadata."""
+    candidates: list[Path] = []
+    for raw in exec_result.get("touched_paths") or []:
+        try:
+            candidates.append(Path(str(raw)))
+        except Exception:
+            continue
+
+    for item in exec_result.get("output_files") or []:
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            continue
+        try:
+            candidates.append(Path(raw_path))
+        except Exception:
+            continue
+
+    roots = _find_created_skill_roots(candidates)
+    if roots:
+        return roots
+
+    # Fallback for metadata paths like /api/skills/<name>/files/... or
+    # relative outputs that include skills/<name>/... but were not touched paths.
+    discovered: set[Path] = set()
+    for item in exec_result.get("output_files") or []:
+        for raw in (str(item.get("path") or ""), str(item.get("url") or "")):
+            match = re.search(r"(?:^|/)skills/([a-z0-9][a-z0-9-]*)/", raw)
+            if match:
+                root = settings.skills_path / match.group(1)
+                if (root / "SKILL.md").exists():
+                    discovered.add(root)
+    return sorted(discovered)
+
+
+def _validate_creator_phase3_artifacts(exec_result: dict) -> dict:
+    """Deterministically validate created Skill files and trial-run scripts."""
+    issues: list[str] = []
+    roots = _created_skill_roots_from_exec_result(exec_result)
+    if not exec_result.get("executed"):
+        issues.append(str(exec_result.get("reason") or "Phase 3 没有执行任何文件操作。"))
+    if not roots:
+        issues.append("没有发现已创建且包含 SKILL.md 的 Skill 根目录。")
+
+    for root in roots:
+        skill_md = root / "SKILL.md"
+        try:
+            _validate_skill_md(skill_md)
+        except Exception as exc:
+            issues.append(f"{skill_md}: SKILL.md 校验失败：{exc}")
+            continue
+
+        skill_name = root.name
+        scripts_dir = root / "scripts"
+        if scripts_dir.is_dir():
+            for script_path in sorted(scripts_dir.glob("*.py")):
+                rel_path = f"scripts/{script_path.name}"
+                try:
+                    _trial_run_generated_script(
+                        skill_name,
+                        rel_path,
+                        script_path.read_text(encoding="utf-8"),
+                    )
+                except Exception as exc:
+                    issues.append(f"{skill_name}/{rel_path}: 脚本试运行失败：{exc}")
+
+    return {
+        "passed": not issues,
+        "issues": issues,
+        "skill_roots": [str(root) for root in roots],
+    }
+
+
+async def _run_creator_phase3_validator_round(*, exec_result: dict, artifact_report: dict, model: str) -> dict:
+    """Ask validator model to review the execution result without blocking deterministic checks."""
+    validator_model = route_model(
+        VALIDATOR_TASK,
+        requested_model=model,
+        reason="creator phase3 validation",
+    ).model
+    payload = {
+        "execution_summary": {
+            "executed": exec_result.get("executed"),
+            "reason": exec_result.get("reason"),
+            "logs": (exec_result.get("logs") or [])[-20:],
+            "output_files": exec_result.get("output_files") or [],
+        },
+        "artifact_validation": artifact_report,
+        "instruction": (
+            "判断 Creator Phase3 是否可以视为成功。只输出 JSON："
+            "{\"passed\": true|false, \"issues\": [\"...\"]}。"
+            "如果 deterministic artifact_validation 已有 issues，必须 passed=false。"
+        ),
+    }
+    messages = [
+        {"role": "system", "content": "你是 Creator 产物校验器，只输出严格 JSON。"},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    text = await complete_chat_once(messages, validator_model)
+    try:
+        data = json.loads(_strip_markdown_json_fence(text))
+    except json.JSONDecodeError:
+        logger.warning("Creator Phase3 validator returned non-JSON; using deterministic validation: %s", text[:300])
+        return {
+            "passed": artifact_report.get("passed", False),
+            "issues": [],
+            "model": validator_model,
+        }
+    if not isinstance(data, dict):
+        return {"passed": False, "issues": ["评判模型输出不是 JSON object"], "model": validator_model}
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    return {
+        "passed": bool(data.get("passed")) and not issues,
+        "issues": [str(item) for item in issues],
+        "model": validator_model,
+    }
+
+
 @_safe_async_generator
 async def _execute_phase3_mode(
         final_messages: list[dict],
@@ -469,60 +608,114 @@ async def _execute_phase3_mode(
         execution_root: Path,
         parent_skill_name: str,
 ) -> AsyncGenerator[str, None]:
-    """Phase 3+ execution mode: collect model output and execute."""
+    """Phase 3+ execution mode: generate, validate, trial-run, and repair."""
 
     yield _sse({"type": "phase3_start", "message": "开始执行 Skill 创建流程..."})
-    yield _sse({"status": {"phase": "phase3", "message": "正在生成实现方案…"}})
 
-    # 1. 收集模型完整输出（不流式展示给用户）
-    assistant_chunks: list[str] = []
-    try:
-        yield _sse({"model_ack": {"task": "code", "model": model, "reason": "creator phase3 implementation"}})
-        async for chunk in stream_chat(final_messages, model):
-            assistant_chunks.append(chunk)
-    except Exception as e:
-        logger.exception("Error during Phase 3 streaming")
-        yield _sse({"error": f"模型输出错误: {str(e)}"})
-        yield "data: [DONE]\n\n"
-        return
+    feedback = ""
+    last_error = ""
+    last_assistant_text = ""
 
-    if not assistant_chunks:
-        yield _sse({"error": "模型没有输出内容"})
-        yield "data: [DONE]\n\n"
-        return
+    for attempt in range(1, _CREATOR_PHASE3_MAX_ATTEMPTS + 1):
+        yield _sse({
+            "status": {
+                "phase": "phase3",
+                "message": f"正在生成实现方案（第 {attempt}/{_CREATOR_PHASE3_MAX_ATTEMPTS} 轮）…",
+            }
+        })
 
-    assistant_text = "".join(assistant_chunks)
-    yield _sse({"status": {"phase": "planning", "message": "正在解析实现输出并规划执行…"}})
-
-    # 2. 调用执行函数
-    try:
-        yield _sse({"status": {"phase": "executing", "message": "正在执行生成的文件操作…"}})
-        exec_result = await _plan_and_execute_generated_output(
-            assistant_text=assistant_text,
-            request=request,
-            model=model,
-            require_confirmation=False,
-            execution_root=execution_root,
-            skill_name=parent_skill_name,
+        messages_for_coder = (
+            final_messages
+            if attempt == 1
+            else _creator_phase3_retry_messages(
+                final_messages,
+                previous_output=last_assistant_text,
+                feedback=feedback or last_error,
+            )
         )
 
-        # 3. 返回结果
-        yield _sse({"type": "progress", "step": "执行完成", "step_num": 3, "total_steps": 3})
+        assistant_chunks: list[str] = []
+        try:
+            yield _sse({
+                "model_ack": {
+                    "task": "code",
+                    "model": model,
+                    "reason": f"creator phase3 implementation attempt {attempt}",
+                }
+            })
+            async for chunk in stream_chat(messages_for_coder, model):
+                assistant_chunks.append(chunk)
+        except Exception as exc:
+            logger.exception("Error during Phase 3 code generation attempt %s", attempt)
+            last_error = f"模型输出错误: {exc}"
+            feedback = last_error
+            continue
 
-        if exec_result.get("executed"):
+        if not assistant_chunks:
+            last_error = "模型没有输出内容"
+            feedback = last_error
+            continue
+
+        assistant_text = "".join(assistant_chunks)
+        last_assistant_text = assistant_text
+
+        yield _sse({
+            "status": {
+                "phase": "planning",
+                "message": f"正在解析并执行实现输出（第 {attempt}/{_CREATOR_PHASE3_MAX_ATTEMPTS} 轮）…",
+            }
+        })
+
+        try:
+            exec_result = await _plan_and_execute_generated_output(
+                assistant_text=assistant_text,
+                request=request,
+                model=model,
+                require_confirmation=False,
+                execution_root=execution_root,
+                skill_name=parent_skill_name,
+            )
+        except Exception as exc:
+            logger.exception("Phase 3 execution attempt %s failed", attempt)
+            last_error = f"执行失败: {_friendly_error(exc)}"
+            feedback = last_error
+            yield _sse({"type": "progress", "step": f"第 {attempt} 轮执行失败，准备反馈给 coder 模型修复…"})
+            continue
+
+        yield _sse({
+            "status": {
+                "phase": "validating",
+                "message": f"正在评判与试运行产物（第 {attempt}/{_CREATOR_PHASE3_MAX_ATTEMPTS} 轮）…",
+            }
+        })
+
+        artifact_report = await asyncio.to_thread(_validate_creator_phase3_artifacts, exec_result)
+        validator_report = await _run_creator_phase3_validator_round(
+            exec_result=exec_result,
+            artifact_report=artifact_report,
+            model=model,
+        )
+        issues = [*artifact_report.get("issues", []), *validator_report.get("issues", [])]
+
+        if artifact_report.get("passed") and validator_report.get("passed"):
+            yield _sse({"type": "progress", "step": "执行、评判与试运行均已通过", "step_num": 3, "total_steps": 3})
             output_files = exec_result.get("output_files", [])
 
-            # 查找 skill 名称和路径
             skill_name = None
             skill_path = None
-            for file_info in output_files:
-                file_path = file_info.get("path", "")
-                if "skills/" in file_path and "/SKILL.md" in file_path:
-                    parts = file_path.split("skills/", 1)[1].split("/", 1)
-                    if parts:
-                        skill_name = parts[0]
-                        skill_path = str(Path(file_path).parent)
-                    break
+            roots = artifact_report.get("skill_roots") or []
+            if roots:
+                skill_path = str(roots[0])
+                skill_name = Path(skill_path).name
+            else:
+                for file_info in output_files:
+                    file_path = file_info.get("path", "")
+                    if "skills/" in file_path and "/SKILL.md" in file_path:
+                        parts = file_path.split("skills/", 1)[1].split("/", 1)
+                        if parts:
+                            skill_name = parts[0]
+                            skill_path = str(Path(file_path).parent)
+                        break
 
             yield _sse({
                 "type": "completed",
@@ -530,13 +723,28 @@ async def _execute_phase3_mode(
                 "skill_name": skill_name,
                 "skill_path": skill_path,
                 "created_files": output_files,
-                "message": "Skill 创建成功！" if skill_name else "文件创建完成！"
+                "attempts": attempt,
+                "message": f"Skill 创建成功！（已通过 {attempt} 轮生成-评判-试运行闭环）" if skill_name else "文件创建完成！",
             })
+            yield "data: [DONE]\n\n"
+            return
 
-    except Exception as e:
-        logger.exception("Phase 3 execution failed")
-        yield _sse({"type": "error", "message": f"执行失败: {_friendly_error(e)}"})
+        feedback = (
+            "评判/试运行未通过，请修复以下问题：\n"
+            + "\n".join(f"- {issue}" for issue in issues[:20])
+        )
+        last_error = feedback
+        yield _sse({
+            "type": "progress",
+            "step": f"第 {attempt} 轮未通过评判/试运行，反馈给 coder 模型修复…",
+            "issues": issues[:10],
+        })
 
+    logger.error("Creator Phase 3 failed after %s attempts: %s", _CREATOR_PHASE3_MAX_ATTEMPTS, last_error)
+    yield _sse({
+        "type": "error",
+        "message": f"执行失败：已达到 {_CREATOR_PHASE3_MAX_ATTEMPTS} 轮生成-评判-试运行上限。最后错误：{last_error}",
+    })
     yield "data: [DONE]\n\n"
 
 def _extract_creator_resource_catalog(body_prompt: str) -> list[dict]:
@@ -643,8 +851,77 @@ def _compose_creator_loaded_resources_prompt(
     resource_catalog: list,
     selected_handles: list
 ):
-    """Compose loaded resources into a prompt for the LLM."""
-    return ""
+    """Compose loaded creator resources into a prompt for the LLM."""
+    resource_by_handle = {str(item.get("resource_handle")): item for item in resource_catalog}
+    sections: list[str] = []
+
+    for handle in selected_handles:
+        resource = resource_by_handle.get(str(handle))
+        if not resource:
+            continue
+
+        path = str(resource.get("path") or "")
+        try:
+            observation = read_skill_resource_text(
+                skill_name,
+                path,
+                max_chars=settings.skill_resource_max_chars,
+            )
+        except Exception as exc:
+            sections.append(
+                f"### {handle}\n"
+                f"- path: `{path}`\n"
+                f"- load_error: {exc}\n"
+            )
+            continue
+
+        content = observation.get("content", "")
+        truncated = observation.get("truncated", False)
+        sections.append(
+            f"### {handle}\n"
+            f"- kind: {resource.get('kind')}\n"
+            f"- path: `{path}`\n"
+            f"- truncated: {truncated}\n\n"
+            "```text\n"
+            f"{content}\n"
+            "```"
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        "\n\n---\n\n"
+        "## Loaded Creator Resources\n\n"
+        "下面是宿主按需加载的 Creator 资源正文；只能依据已加载内容使用这些资源。\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+def _compose_creator_runtime_contract_prompt() -> str:
+    """Inject non-negotiable platform runtime contracts for generated Skills."""
+    image_model = settings.image_model or settings.default_model
+    text_model = settings.text_model or settings.default_model
+    vision_model = settings.vision_model or settings.default_model
+    return f"""
+
+---
+
+## Platform Runtime Contract for Generated Skills
+
+生成 Skill 时必须遵守以下平台运行时契约：
+
+1. 模型来源必须分离：
+   - 文本、翻译、语义改写：`LLM_BASE_URL` + `TEXT_MODEL`。
+   - 看图理解、OCR、多模态问答：`LLM_BASE_URL` + `VISION_MODEL`。
+   - 生成图片：Stable Diffusion 图片运行时，使用 `IMAGE_BASE_URL` + `IMAGE_MODEL` 与 `IMAGE_SIZE`；不得使用 `VISION_MODEL` 生成图片。
+2. 创建出来的 `SKILL.md` 不要写中文 topic 翻译、TEXT_MODEL 翻译调用、图片接口字段解析等平台细节；只写“使用平台 Stable Diffusion 图片生成能力”。
+3. 生成的 `scripts/*.py` 如果需要图片生成，必须调用：
+   `from backend.services.skill_runtime import generate_stable_diffusion_image, print_json`
+   并把用户 topic 原文传给 `generate_stable_diffusion_image(...)`。平台 helper 会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、`b64_json` 解析、图片写入 `OUTPUT_DIR`。
+4. 图片脚本 stdout 必须输出 JSON，包含 `image_path`；禁止输出 base64 data URI，禁止假设图片接口只返回 `url`。
+5. 模型与认证相关参数由平台运行时注入；生成脚本可按需读取 `IMAGE_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 等环境变量，但不要硬编码这些值，也不需要额外校验它们是否存在。
+"""
 
 
 @_safe_async_generator
@@ -752,6 +1029,8 @@ async def _make_stream_creator_generator(
                             resource_catalog=resource_catalog,
                             selected_handles=selected,
                         )
+
+    body_prompt = body_prompt + _compose_creator_runtime_contract_prompt()
 
     if loaded_resources_prompt:
         body_prompt = body_prompt + loaded_resources_prompt

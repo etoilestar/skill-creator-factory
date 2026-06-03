@@ -1479,6 +1479,99 @@ def test_creator_phase3_retry_messages_include_feedback():
     assert "重新生成完整实现动作" in messages[-1]["content"]
 
 
+
+
+def test_creator_script_prompt_includes_generated_file_contract():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="scripts/generate_story_and_image.py",
+        skill_name="story-image",
+        purpose="根据 topic 生成故事和图片",
+        blueprint_text="scripts/generate_story_and_image.py: 根据 topic 生成故事和图片",
+        conversation_history=[],
+    )
+
+    prompt = messages[0]["content"]
+    assert "必须满足以下脚本文件合同" in prompt
+    assert "scripts/generate_story_and_image.py" in prompt
+    assert "读取 sys.argv[1] 并 json.loads" in prompt
+    assert "stdout 输出结构化 JSON" in prompt
+
+
+def test_creator_reference_prompt_includes_generated_file_contract():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="references/style.md",
+        skill_name="story-image",
+        purpose="故事写作风格参考",
+        blueprint_text="references/style.md: 故事写作风格参考",
+        conversation_history=[],
+    )
+
+    prompt = messages[0]["content"]
+    assert "必须满足以下参考资料文件合同" in prompt
+    assert "references/style.md" in prompt
+    assert "故事写作风格参考" in prompt
+    assert "不要包含 Creator 创建流程" in prompt
+
+
+def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    bad_reference = "若当前无误，点击开始创建：系统将自动创建 references/style.md"
+    fixed_reference = "# 写作风格参考\n\n- 使用清晰的故事结构。\n- 描写画面、角色和情绪。"
+    repair_prompts = []
+    validator_prompts = []
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        yield bad_reference
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_prompts.append(messages[-1]["content"])
+            return json.dumps({
+                "passed": False,
+                "issues": ["reference 包含 Creator 流程"],
+                "failed_checks": [{"id": "reference.no_creator_flow", "target": "references/style.md"}],
+                "repair_instructions": "删除 Creator 流程，只保留参考资料正文。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return fixed_reference
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+
+    request = GenerateFileRequest(
+        skill_name="story-image",
+        file_path="references/style.md",
+        purpose="故事写作风格参考",
+        blueprint_text="references/style.md: 故事写作风格参考",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert validator_prompts
+    assert repair_prompts
+    assert "必须满足以下参考资料文件合同" in validator_prompts[0]
+    assert "reference.no_creator_flow" in repair_prompts[0]
+    assert "本轮修复模式：minimal_edit" in repair_prompts[0]
+    assert any(event.get("content") == fixed_reference for event in events)
+
 def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     from backend.routers.creator import _build_generate_file_prompt
 

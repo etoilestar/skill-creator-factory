@@ -532,6 +532,96 @@ def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
         raise ContractValidationError(_format_contract_failures(results), results)
 
 
+
+
+def _build_script_file_contract_text(file_path: str, blueprint_text: str) -> str:
+    keys = ", ".join(_infer_script_input_keys_from_blueprint(file_path, blueprint_text))
+    return "\n".join([
+        f"必须满足以下脚本文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+        "- Python 脚本必须能通过 ast.parse 语法检查。",
+        "B. 参数接口:",
+        "- 默认使用 JSON argv 接口：读取 sys.argv[1] 并 json.loads 解析。",
+        f"- 必须实际使用用户输入 keys：{keys}。",
+        f"- 与 SKILL.md 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text)}",
+        "C. 输出接口:",
+        "- stdout 输出结构化 JSON，不要混入调试说明。",
+        "D. 禁止项:",
+        "- 禁止 placeholder/mock/fake API/固定模板冒充真实能力。",
+        "- 需要图片生成时必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
+    ])
+
+
+def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
+    return "\n".join([
+        f"必须满足以下参考资料文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出该 reference 的 Markdown 文档内容，不要写入文件标签、Creator 流程说明或多文件包。",
+        "- 可以包含普通 Markdown 标题/列表/示例；如确实需要代码示例，可以包含文档内部 fenced block。",
+        "B. 内容职责:",
+        f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
+        "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
+        "C. 禁止项:",
+        "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
+    ])
+
+
+def _build_generated_file_contract_text(file_path: str, blueprint_text: str, purpose: str = "") -> str:
+    if file_path == "SKILL.md":
+        return _build_skill_md_contract_text(blueprint_text)
+    if file_path.startswith("scripts/"):
+        return _build_script_file_contract_text(file_path, blueprint_text)
+    if file_path.startswith("references/"):
+        return _build_reference_file_contract_text(file_path, purpose, blueprint_text)
+    return ""
+
+
+def _check_reference_file_contract(file_path: str, content: str, purpose: str = "") -> list[ContractCheckResult]:
+    stripped = content.strip()
+    results = [
+        ContractCheckResult(
+            id="reference.not_empty",
+            passed=bool(stripped),
+            target=file_path,
+            message=("参考资料内容非空。" if stripped else f"{file_path} 参考资料内容为空。"),
+            expected="输出该 reference 的 Markdown 文档内容。",
+            minimal_edit="补充有实际指导价值的 Markdown 参考资料正文。",
+        ),
+        ContractCheckResult(
+            id="reference.no_creator_flow",
+            passed=not bool(_CREATOR_FLOW_LEAK_RE.search(content)),
+            target=file_path,
+            message=(
+                "未包含 Creator 创建流程文案。"
+                if not _CREATOR_FLOW_LEAK_RE.search(content)
+                else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
+            ),
+            expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+            minimal_edit="删除平台创建流程文案，只保留参考资料正文。",
+        ),
+        ContractCheckResult(
+            id="reference.single_file",
+            passed=not bool(_MULTI_FILE_MARKER_RE.search(content)) and not bool(re.search(r"(?im)^\s*写入文件[:：]", content)),
+            target=file_path,
+            message=(
+                "参考资料是单文件内容。"
+                if not _MULTI_FILE_MARKER_RE.search(content) and not re.search(r"(?im)^\s*写入文件[:：]", content)
+                else f"{file_path} 包含多文件包、其它文件路径标题或写入文件标签。"
+            ),
+            expected="只输出当前 reference 文件内容，不要包含 SKILL.md/scripts/assets/references 的多文件包。",
+            minimal_edit="删除其它文件内容、路径标题和写入文件标签，只保留当前参考资料正文。",
+        ),
+    ]
+    return results
+
+
+def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
+    results = _check_reference_file_contract(file_path, content, purpose)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
 def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> None:
     """Validate SKILL.md against files already initialized in the Skill dir."""
     skill_dir = settings.skills_path / skill_name
@@ -952,10 +1042,23 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
             )
 
-    if file_path.startswith("scripts/") and "Markdown 代码块或多文件包" in deterministic_error:
-        return (
-            "只返回单个脚本源码本身；不要输出说明文字、文件路径标题、写入文件标签、Markdown fence 或多文件包。"
-        )
+    if file_path.startswith("scripts/"):
+        if "Markdown 代码块或多文件包" in deterministic_error:
+            return (
+                "只返回单个脚本源码本身；不要输出说明文字、文件路径标题、写入文件标签、Markdown fence 或多文件包。"
+            )
+        if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
+            return (
+                "按脚本合同修复：保持单文件源码，修正语法/参数解析/运行错误；"
+                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON。"
+            )
+
+    if file_path.startswith("references/"):
+        if "contract 未通过" in deterministic_error or "多文件包" in deterministic_error or "Creator" in deterministic_error:
+            return (
+                "按 reference 合同修复：只输出当前参考资料 Markdown 正文；"
+                "删除 Creator 流程、写入文件标签、多文件包和其它文件路径标题。"
+            )
 
     return ""
 
@@ -1229,7 +1332,8 @@ def _build_generate_file_prompt(
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
     declared_paths = _extract_declared_skill_paths(blueprint_text)
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
-    skill_md_contract_text = _build_skill_md_contract_text(blueprint_text) if file_path == "SKILL.md" else ""
+    generated_file_contract_text = _build_generated_file_contract_text(file_path, blueprint_text, purpose)
+    skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
 
     if file_path == "SKILL.md":
         instruction = (
@@ -1270,7 +1374,9 @@ def _build_generate_file_prompt(
             "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_path；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image_path\": ...}），不要混入调试说明。\n"
-            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
+            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
+            "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
+            f"{generated_file_contract_text}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
@@ -1281,7 +1387,9 @@ def _build_generate_file_prompt(
             "要求：\n"
             "1. 只输出 Markdown 文档内容，不要额外的说明文字。\n"
             "2. 不要在文档外套 ``` 代码块。\n"
-            "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n\n"
+            "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n"
+            "生成前请先隐式检查以下 reference 合同，最终输出必须逐项满足：\n"
+            f"{generated_file_contract_text}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{clean_blueprint_text}"
         )
@@ -1407,17 +1515,23 @@ async def generate_file(request: GenerateFileRequest):
 
             raw_content = "".join(generated_chunks)
 
-            should_repair = request.file_path.startswith("scripts/") or request.file_path == "SKILL.md"
+            should_repair = (
+                request.file_path.startswith("scripts/")
+                or request.file_path.startswith("references/")
+                or request.file_path == "SKILL.md"
+            )
             if should_repair:
                 content = raw_content
                 last_error = ""
                 repeated_error_counts: dict[str, int] = {}
-                contract_text = _build_skill_md_contract_text(request.blueprint_text) if request.file_path == "SKILL.md" else ""
+                contract_text = _build_generated_file_contract_text(request.file_path, request.blueprint_text, request.purpose)
                 for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
                         content = _sanitize_generated_file_content(request.file_path, content)
                         if request.file_path == "SKILL.md":
                             _validate_skill_md_contract(content, request.blueprint_text)
+                        elif request.file_path.startswith("references/"):
+                            _validate_reference_file_contract(request.file_path, content, request.purpose)
                         else:
                             _trial_run_generated_script(skill_name, request.file_path, content)
                         last_error = ""

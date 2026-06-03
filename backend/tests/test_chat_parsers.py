@@ -1514,12 +1514,6 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
 ```
 """
 
-    def fake_is_file():
-        return True
-
-    def fake_read_text(*_args, **_kwargs):
-        return skill_md
-
     async def fake_stream_chat(_messages, _model, model_ack_callback=None):
         if model_ack_callback:
             model_ack_callback({"actual_model": "fake-model"})
@@ -1530,19 +1524,16 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         return repairs.pop(0)
 
     def fake_trial_run(_skill_name, file_path, content):
-        skill_md_for_validation = creator.Path("unused").read_text()
         creator._validate_script_contract_static(
             file_path=file_path,
             content=content,
-            skill_md=skill_md_for_validation,
+            skill_md=skill_md,
         )
         trial_contents.append(content)
 
     monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
     monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
     monkeypatch.setattr(creator, "_trial_run_generated_script", fake_trial_run)
-    monkeypatch.setattr(creator.Path, "is_file", fake_is_file)
-    monkeypatch.setattr(creator.Path, "read_text", fake_read_text)
 
     request = GenerateFileRequest(
         skill_name="repair-skill",

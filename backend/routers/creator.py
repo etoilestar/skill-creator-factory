@@ -594,7 +594,8 @@ async def _repair_generated_script_with_feedback(
         "role": "user",
         "content": (
             f"上一次生成的 {file_path} 没有通过保存前静态校验/试运行。"
-            "请根据以下错误修复，并且只返回完整脚本源码，不要解释，不要 Markdown 代码块。\n"
+            "请优先做局部修复：只修改导致报错的最小代码片段，保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
+            "虽然最终仍需返回完整脚本源码以便覆盖文件，但不要重写无关部分，不要新增解释，不要 Markdown 代码块。\n"
             "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
             "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。\n\n"
             f"错误信息：\n{validation_error}"

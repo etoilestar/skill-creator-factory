@@ -1815,6 +1815,8 @@ def _execute_single_task(
 
         assert completed is not None  # noqa: S101 — loop always runs at least once (range >= 1)
         success = completed.returncode == 0
+        if success:
+            _validate_success_stdout_json_if_structured(completed.stdout)
 
         result: dict = {
             "action": action,
@@ -2016,6 +2018,77 @@ def _finalize_answer_output_file_links(answer: str, output_files: list[dict] | N
     return _rewrite_output_file_markdown_links(answer, output_files)
 
 
+def _validate_structured_stdout_payload(payload: dict) -> None:
+    """Validate JSON stdout fields consumed by sandbox UI/finalization."""
+    if "text" in payload and not isinstance(payload.get("text"), str):
+        raise ValueError("stdout JSON 字段 text 必须是字符串")
+
+    if "image_paths" in payload:
+        image_paths = payload.get("image_paths")
+        if not isinstance(image_paths, list):
+            raise ValueError("stdout JSON 字段 image_paths 必须是 list[str]")
+        for path in image_paths:
+            if not isinstance(path, str):
+                raise ValueError("stdout JSON 字段 image_paths 的每一项都必须是字符串")
+
+    if "images" in payload:
+        images = payload.get("images")
+        if not isinstance(images, list):
+            raise ValueError("stdout JSON 字段 images 必须是 list[dict]")
+        for image in images:
+            if not isinstance(image, dict):
+                raise ValueError("stdout JSON 字段 images 的每一项都必须是 object")
+            if "image_path" in image and not isinstance(image.get("image_path"), str):
+                raise ValueError("stdout JSON 字段 images[].image_path 必须是字符串")
+
+
+def _validate_success_stdout_json_if_structured(stdout: str) -> None:
+    """Validate structured JSON stdout without rejecting legacy plain text."""
+    stripped = (stdout or "").strip()
+    if not stripped:
+        return
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if "error" in payload:
+        raise ValueError("stdout JSON 不得包含 error 字段")
+    if any(key in payload for key in ("text", "image_paths", "images")):
+        _validate_structured_stdout_payload(payload)
+
+
+def _payload_image_paths(payload: dict) -> list[str]:
+    paths: list[str] = []
+
+    for key in ("image_path", "image"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+
+    image_paths = payload.get("image_paths")
+    if isinstance(image_paths, list):
+        paths.extend(path.strip() for path in image_paths if isinstance(path, str) and path.strip())
+
+    images = payload.get("images")
+    if isinstance(images, list):
+        for image in images:
+            if isinstance(image, dict):
+                path = image.get("image_path")
+                if isinstance(path, str) and path.strip():
+                    paths.append(path.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
 def _render_success_stdout_payload(result: dict) -> str | None:
     """Render structured JSON stdout from a successful command as final user content."""
     for item in result.get("results") or []:
@@ -2030,13 +2103,18 @@ def _render_success_stdout_payload(result: dict) -> str | None:
             continue
         if not isinstance(payload, dict):
             continue
+        try:
+            _validate_structured_stdout_payload(payload)
+        except ValueError:
+            continue
         text = str(payload.get("text") or payload.get("markdown") or "").strip()
-        image = str(payload.get("image") or payload.get("image_path") or "").strip()
+        image_paths = _payload_image_paths(payload)
         parts: list[str] = []
         if text:
             parts.append(text)
-        if image and image not in text:
-            parts.append(f"![插图]({image})")
+        for image_path in image_paths:
+            if image_path not in text:
+                parts.append(f"![插图]({image_path})")
         if parts:
             return "\n\n".join(parts)
     return None

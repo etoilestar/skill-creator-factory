@@ -788,6 +788,31 @@ def test_render_success_stdout_payload_extracts_story_json():
     assert "![插图](generated_image.png)" in rendered
 
 
+def test_render_success_stdout_payload_extracts_unified_image_paths():
+    from backend.routers.sandbox_chat import _render_success_stdout_payload
+
+    rendered = _render_success_stdout_payload({
+        "results": [{
+            "success": True,
+            "stdout": json.dumps({
+                "text": "# 小猪冒险\n\n故事正文",
+                "image_paths": ["outputs/story.png"],
+                "images": [{"image_path": "outputs/story.png"}],
+            }, ensure_ascii=False),
+        }]
+    })
+
+    assert "# 小猪冒险" in rendered
+    assert "![插图](outputs/story.png)" in rendered
+
+
+def test_sandbox_structured_stdout_validator_rejects_bad_image_paths():
+    from backend.routers.sandbox_chat import _validate_success_stdout_json_if_structured
+
+    with pytest.raises(ValueError, match="image_paths"):
+        _validate_success_stdout_json_if_structured(json.dumps({"text": "ok", "image_paths": [123]}))
+
+
 def test_finalize_answer_rewrites_generated_image_to_download_url():
     from backend.routers.sandbox_chat import _finalize_answer_output_file_links
 
@@ -1317,6 +1342,48 @@ print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'], prompt)
             content=script,
             skill_md=skill_md,
         )
+
+
+def test_creator_trial_args_add_text_optional_cases():
+    from backend.routers.creator import _trial_args_for_script
+
+    skill_md = """```bash
+python scripts/story.py '{"topic":"{{topic}}","text":"{{text}}"}'
+```"""
+
+    arg_sets = _trial_args_for_script(skill_md, "scripts/story.py", "import json, sys\njson.loads(sys.argv[1])")
+    payloads = [json.loads(args[0]) for args in arg_sets]
+
+    assert any("text" in payload and payload["text"] for payload in payloads)
+    assert any("topic" in payload and "text" not in payload for payload in payloads)
+    assert any(payload.get("text") == "" for payload in payloads)
+
+
+def test_creator_trial_stdout_requires_json_object_for_scripts():
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    with pytest.raises(ValueError, match="stdout 不是合法 JSON object"):
+        _validate_trial_stdout_json(stdout="not json", content="print('not json')", args=[])
+
+    with pytest.raises(ValueError, match="不得包含 error"):
+        _validate_trial_stdout_json(stdout=json.dumps({"error": "bad"}), content="print('{}')", args=[])
+
+
+def test_creator_trial_stdout_requires_image_path_for_image_helper():
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    with pytest.raises(ValueError, match="缺少可消费的图片路径字段"):
+        _validate_trial_stdout_json(
+            stdout=json.dumps({"text": "ok", "image_paths": []}),
+            content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+            args=[],
+        )
+
+    _validate_trial_stdout_json(
+        stdout=json.dumps({"text": "ok", "image_paths": ["outputs/demo.png"], "images": [{"image_path": "outputs/demo.png"}]}),
+        content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+        args=[],
+    )
 
 
 def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):

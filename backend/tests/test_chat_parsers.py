@@ -1924,7 +1924,33 @@ python scripts/generate_story_and_image.py '{"topic":"{{topic}}"}'
 def test_creator_sanitize_accepts_prose_wrapped_single_script_fence():
     from backend.routers.creator import _sanitize_generated_file_content
 
-    content = "这里是脚本：\n```python\nprint('ok')\n```\n请保存。"
+    content = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_rejects_multiple_prose_wrapped_script_fences():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
 
     assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
 

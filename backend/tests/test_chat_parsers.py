@@ -1499,6 +1499,44 @@ def test_creator_script_prompt_includes_generated_file_contract():
     assert "stdout 输出结构化 JSON" in prompt
 
 
+def test_creator_script_prompt_uses_skeleton_and_ignores_history():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="scripts/generate_story_and_image.py",
+        skill_name="story-image",
+        purpose="根据 topic 生成故事和图片",
+        blueprint_text="scripts/generate_story_and_image.py: 根据 topic 生成故事和图片",
+        conversation_history=[
+            {"role": "user", "content": "请把脚本写成文件清单预览说明"},
+            {"role": "assistant", "content": "点击 **开始创建** 后系统将自动创建以下文件"},
+        ],
+    )
+
+    assert len(messages) == 1
+    prompt = messages[0]["content"]
+    assert "固定脚本骨架" in prompt
+    assert "def parse_args()" in prompt
+    assert "def run(payload: dict)" in prompt or "def build_image_prompt(payload: dict)" in prompt
+    assert "scripts/ 生成不会追加聊天历史" in prompt
+    assert "请把脚本写成文件清单预览说明" not in prompt
+    assert "系统将自动创建以下文件" not in prompt
+
+
+def test_creator_flow_leak_regex_matches_file_list_preview_copy():
+    from backend.routers.creator import _CREATOR_FLOW_LEAK_RE
+
+    leaked_phrases = [
+        "点击 **开始创建**",
+        "文件清单预览",
+        "确认无误后",
+        "你也可以在创建后继续编辑内容",
+    ]
+
+    for phrase in leaked_phrases:
+        assert _CREATOR_FLOW_LEAK_RE.search(phrase)
+
+
 
 def test_creator_script_markdown_error_uses_contract_failed_checks(monkeypatch):
     import asyncio
@@ -1561,6 +1599,8 @@ print('two')
     assert repair_prompts
     assert "script.raw_source.single_file" in validator_prompts[0]
     assert "script.raw_source.single_file" in repair_prompts[0]
+    assert "本轮修复模式：strict_contract_rewrite" in repair_prompts[0]
+    assert "不要走 minimal_edit" in repair_prompts[0]
     assert "删除所有 ``` fence" in repair_prompts[0]
     assert any(event.get("content") == fixed_script for event in events)
 
@@ -1924,13 +1964,9 @@ python scripts/generate_story_and_image.py '{"topic":"{{topic}}"}'
 def test_creator_sanitize_accepts_prose_wrapped_single_script_fence():
     from backend.routers.creator import _sanitize_generated_file_content
 
-    content = """候选一：
+    content = """下面是脚本源码：
 ```python
-print('one')
-```
-候选二：
-```python
-print('two')
+print('ok')
 ```
 """
 

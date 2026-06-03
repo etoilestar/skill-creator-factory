@@ -170,6 +170,7 @@ const ACTION_LABELS = {
   validate: '校验格式',
   package: '打包 Skill',
   run_script: '运行脚本',
+  creator_panel: '文件清单预览',
 }
 
 function actionLabel(action) {
@@ -253,8 +254,11 @@ async function send() {
       creationPlan.value = plan
       showCreationPanel.value = true
       messages.value.push({
-        role: 'assistant',
-        content: '已根据蓝图整理好文件清单。请先检查下方列表；点击 **开始创建** 后才会生成、写入并校验 SKILL.md 与脚本格式。',
+        role: 'system',
+        action: 'creator_panel',
+        name: plan.skill_name,
+        success: true,
+        message: '已整理文件清单，准备生成脚本',
       })
       await scrollBottom()
     } catch (err) {

@@ -66,9 +66,9 @@ _ALLOWED_FOLDERS: frozenset[str] = frozenset({"scripts", "references", "assets"}
 # Trailing conversation turns to include in file-generation prompts.
 _MAX_HISTORY_TURNS = 6
 
-# Script generation can repair itself by sending trial-run failures back to the
-# same routed model before returning content to the frontend.
-_MAX_SCRIPT_REPAIR_ATTEMPTS = 8
+# Generated files can repair themselves by sending validator/static/trial-run
+# failures back to the same routed model before returning content to the frontend.
+_MAX_FILE_REPAIR_ATTEMPTS = 8
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
@@ -301,6 +301,14 @@ _CONFIGURED_MODEL_CALL_RE = re.compile(
     r"generate_stable_diffusion_image|backend\.services\.skill_runtime",
     re.IGNORECASE,
 )
+_CREATOR_FLOW_LEAK_RE = re.compile(
+    r"点击[‘'\"]?开始创建|开始生成文件|确认项列表|系统将自动创建|自动创建以下文件|"
+    r"创建文件面板|文件创建面板|若当前无误|已预置|所有路径与命名与蓝图一致|"
+    r"不包含任何隐藏逻辑或隐式执行|输出格式符合 Markdown 标准，支持宿主解析",
+    re.IGNORECASE,
+)
+_SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)(?![\w./-])")
+
 _IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations|generate_stable_diffusion_image", re.IGNORECASE)
 _DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
 _PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image|backend\.services\.skill_runtime", re.IGNORECASE)
@@ -315,6 +323,97 @@ def _reject_custom_skill_md_protocol(content: str) -> None:
             "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；"
             "请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
         )
+
+
+def _extract_declared_skill_paths(text: str) -> list[str]:
+    """Return normalized Skill package file paths mentioned by a blueprint."""
+    seen: set[str] = set()
+    paths: list[str] = []
+    for raw in _SKILL_FILE_PATH_RE.findall(text or ""):
+        path = raw.strip().rstrip("`，,。；;:)）]").replace("\\", "/")
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> list[str]:
+    return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
+
+
+def _reject_creator_flow_leak(content: str) -> None:
+    """Reject Creator UI/workflow text copied into generated SKILL.md."""
+    if _CREATOR_FLOW_LEAK_RE.search(content):
+        raise ValueError(
+            "SKILL.md 包含 Creator 界面流程/确认清单文本（例如“点击开始创建”“确认项列表”“系统将自动创建”），"
+            "这是平台创建流程泄露，不属于 Skill 使用说明。请删除这些流程文本，只保留 Skill 的使用说明、资源引用和可执行命令示例。"
+        )
+
+
+def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
+    """Validate generated SKILL.md against blueprint-declared resources."""
+    _reject_custom_skill_md_protocol(content)
+    _reject_creator_flow_leak(content)
+
+    if not re.match(r"^---\nname: [^\n]+\ndescription: [^\n]+\n---\n", content.strip()):
+        raise ValueError(
+            "SKILL.md 必须以 YAML frontmatter 开始，且包含 name 和 description："
+            "--- / name: ... / description: ... / ---。"
+        )
+
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    for script_path in script_paths:
+        commands = _extract_script_command_templates(content, script_path)
+        if not commands:
+            raise ValueError(
+                f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块。"
+                "请在正文中加入 ```bash fenced code block，并在其中给出与脚本接口一致的 python scripts/... 命令示例。"
+            )
+
+    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
+    for reference_path in reference_paths:
+        if reference_path not in content:
+            raise ValueError(
+                f"SKILL.md 缺少对参考资料 {reference_path} 的引用。"
+                "请在“参考资料/资源”小节用普通 Markdown 明确说明何时读取该 reference。"
+            )
+
+
+def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> None:
+    """Validate SKILL.md against files already initialized in the Skill dir."""
+    skill_dir = settings.skills_path / skill_name
+    if not skill_dir.exists():
+        return
+    declared_paths: list[str] = []
+    for folder in ("scripts", "references"):
+        folder_path = skill_dir / folder
+        if not folder_path.is_dir():
+            continue
+        for child in sorted(path for path in folder_path.iterdir() if path.is_file()):
+            declared_paths.append(f"{folder}/{child.name}")
+    if declared_paths:
+        _validate_skill_md_contract(content, "\n".join(declared_paths))
+    else:
+        _reject_creator_flow_leak(content)
+
+
+def _clean_blueprint_for_file_prompt(blueprint_text: str) -> str:
+    """Remove Creator UI confirmation text from blueprint context before generation."""
+    cleaned_lines: list[str] = []
+    in_confirmation_block = False
+    for line in (blueprint_text or "").splitlines():
+        stripped = line.strip()
+        if _CREATOR_FLOW_LEAK_RE.search(stripped):
+            in_confirmation_block = True
+            continue
+        if in_confirmation_block:
+            if stripped.startswith("```") or stripped.startswith("- [") or stripped.startswith(">"):
+                continue
+            if not stripped:
+                in_confirmation_block = False
+                continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip() or blueprint_text
 
 
 def _reject_fake_script_implementation(file_path: str, content: str) -> None:
@@ -570,7 +669,7 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -
                 ))
 
 
-async def _repair_generated_script_with_feedback(
+async def _repair_generated_file_with_feedback(
     *,
     prompt_messages: list[dict],
     model: str,
@@ -578,26 +677,57 @@ async def _repair_generated_script_with_feedback(
     previous_content: str,
     validation_error: str,
 ) -> str:
-    """Ask the original routed model to fix script content using trial-run feedback.
+    """Ask the routed generation model to fix one file using validator feedback.
 
-    The repaired model output is intentionally not validated here.  Validation
+    The repaired model output is intentionally not validated here. Validation
     happens at the top of the generate-file retry loop so format errors in the
-    repaired response consume one retry attempt and can be sent back as feedback
-    instead of aborting the stream before the configured repair budget is used.
+    repaired response consume one retry attempt and can be sent back as feedback.
+    Previous content is passed as user-quoted data instead of an assistant turn
+    so Markdown-wrapped failures are not reinforced as the desired answer shape.
     """
+    is_script = file_path.startswith("scripts/")
+    output_contract = (
+        "最终只返回完整脚本源码；不要解释，不要 Markdown 代码块，不要多文件包，不要写 `写入文件：...`。"
+        if is_script
+        else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
+    )
+    local_edit_scope = (
+        "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
+        if is_script
+        else "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
+    )
+    if is_script:
+        extra_rules = (
+            "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
+            "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
+        )
+    else:
+        extra_rules = (
+            "如果蓝图包含 scripts/，必须包含调用对应 scripts/ 路径的 ```bash fenced code block；"
+            "如果蓝图包含 references/，必须在正文中明确引用对应 reference 路径；"
+            "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
+        )
+
     repair_messages = [*prompt_messages]
     repair_messages.append({
-        "role": "assistant",
-        "content": previous_content,
+        "role": "user",
+        "content": (
+            f"以下是上一次生成但未通过校验的 {file_path} 内容。它可能包含错误示范（例如 Markdown fence 或 Creator 流程泄露），"
+            "不要模仿错误格式，只把它当作待编辑草稿：\n"
+            "<previous_content>\n"
+            f"{previous_content[-16000:]}\n"
+            "</previous_content>"
+        ),
     })
     repair_messages.append({
         "role": "user",
         "content": (
             f"上一次生成的 {file_path} 没有通过校验模型/静态校验/试运行。"
-            "请优先做局部修改：只修改校验意见指出的最小错误片段，保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
-            "修改完成后可以整合输出，但最终只能返回完整脚本源码；不要解释，不要 Markdown 代码块，不要多文件包，不要写 `写入文件：...`。\n"
-            "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
-            "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。\n\n"
+            "请优先做局部修改：只修改校验意见指出的最小错误片段，"
+            f"{local_edit_scope}"
+            "修改完成后可以整合输出。"
+            f"{output_contract}\n"
+            f"{extra_rules}\n\n"
             f"错误信息：\n{validation_error}"
         ),
     })
@@ -752,6 +882,10 @@ def _build_generate_file_prompt(
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
 
+    clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
+    declared_paths = _extract_declared_skill_paths(blueprint_text)
+    declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
+
     if file_path == "SKILL.md":
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 SKILL.md 文件。\n\n'
@@ -764,12 +898,15 @@ def _build_generate_file_prompt(
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
             "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
-            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须包含下面的宿主 Markdown 执行说明；\n"
-            "   即使蓝图没有脚本，也应说明纯文本任务可直接回答，不要假装执行。\n"
-            "6. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部允许包含示例 fenced code block。\n"
-            "7. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
+            "6. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "7. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"
+            "8. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "9. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "10. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
-            f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("scripts/"):
         instruction = (
@@ -787,7 +924,8 @@ def _build_generate_file_prompt(
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image_path\": ...}），不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
-            f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("references/"):
         instruction = (
@@ -797,7 +935,8 @@ def _build_generate_file_prompt(
             "1. 只输出 Markdown 文档内容，不要额外的说明文字。\n"
             "2. 不要在文档外套 ``` 代码块。\n"
             "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n\n"
-            f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("assets/"):
         instruction = (
@@ -806,22 +945,30 @@ def _build_generate_file_prompt(
             "要求：\n"
             f"1. 只输出 {lang} 格式的文件内容，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出。\n\n"
-            f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
     else:
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
             f"职责说明：{purpose}\n\n"
             "要求：直接输出文件内容，不要任何解释，不要 Markdown 代码块包裹。\n\n"
-            f"蓝图：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"蓝图：\n\n{clean_blueprint_text}"
         )
 
     messages: list[dict] = [{"role": "system", "content": instruction}]
 
-    # Include recent conversation turns for context but cap to limit token usage.
+    # Include recent user context but skip Creator UI confirmation text. Assistant
+    # blueprint confirmations often contain "click Start" operational prose that
+    # must never be copied into generated files.
     for msg in conversation_history[-_MAX_HISTORY_TURNS:]:
-        if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}:
-            messages.append(msg)
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+            continue
+        content = str(msg.get("content") or "")
+        if msg.get("role") == "assistant" and _CREATOR_FLOW_LEAK_RE.search(content):
+            continue
+        messages.append({**msg, "content": _clean_blueprint_for_file_prompt(content)})
 
     return messages
 
@@ -913,13 +1060,17 @@ async def generate_file(request: GenerateFileRequest):
 
             raw_content = "".join(generated_chunks)
 
-            if request.file_path.startswith("scripts/"):
+            should_repair = request.file_path.startswith("scripts/") or request.file_path == "SKILL.md"
+            if should_repair:
                 content = raw_content
                 last_error = ""
-                for attempt in range(_MAX_SCRIPT_REPAIR_ATTEMPTS + 1):
+                for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
                         content = _sanitize_generated_file_content(request.file_path, content)
-                        _trial_run_generated_script(skill_name, request.file_path, content)
+                        if request.file_path == "SKILL.md":
+                            _validate_skill_md_contract(content, request.blueprint_text)
+                        else:
+                            _trial_run_generated_script(skill_name, request.file_path, content)
                         last_error = ""
                         break
                     except ValueError as validation_exc:
@@ -932,7 +1083,7 @@ async def generate_file(request: GenerateFileRequest):
                         )
                         last_error = _format_file_validator_feedback(deterministic_error, validator_report)
                         last_validation_error = last_error
-                        if attempt >= _MAX_SCRIPT_REPAIR_ATTEMPTS:
+                        if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                             repair_attempts = attempt
                             yield _sse({
                                 "validation": {
@@ -945,7 +1096,7 @@ async def generate_file(request: GenerateFileRequest):
                             raise
                         repair_attempts = attempt + 1
                         logger.info(
-                            "repairing generated script skill=%s file=%s attempt=%s error=%s validator_issues=%s",
+                            "repairing generated file skill=%s file=%s attempt=%s error=%s validator_issues=%s",
                             skill_name,
                             request.file_path,
                             repair_attempts,
@@ -960,7 +1111,7 @@ async def generate_file(request: GenerateFileRequest):
                                 "validator": validator_report,
                             }
                         })
-                        content = await _repair_generated_script_with_feedback(
+                        content = await _repair_generated_file_with_feedback(
                             prompt_messages=prompt_messages,
                             model=model,
                             file_path=request.file_path,
@@ -1004,6 +1155,8 @@ async def write_file(request: WriteFileRequest):
 
     try:
         content = _sanitize_generated_file_content(request.file_path, request.content)
+        if request.file_path == "SKILL.md":
+            _validate_skill_md_against_existing_files(skill_name, content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
         _trial_run_generated_script(skill_name, request.file_path, content)
     except ValueError as exc:

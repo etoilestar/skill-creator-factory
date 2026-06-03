@@ -1479,6 +1479,91 @@ def test_creator_phase3_retry_messages_include_feedback():
     assert "重新生成完整实现动作" in messages[-1]["content"]
 
 
+def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    conversation_history = [
+        {
+            "role": "assistant",
+            "content": (
+                "若当前无误，点击“开始创建”：\n\n"
+                "```text\n确认项列表：\n- [x] SKILL.md 将包含完整执行说明\n```\n"
+                "> 点击“开始创建”后，系统将自动创建以下文件：\n"
+                "> - `skills/demo/SKILL.md`\n"
+            ),
+        }
+    ]
+    messages = _build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="nursery-rhyme-story",
+        purpose="主说明",
+        blueprint_text=(
+            "Skill: nursery-rhyme-story\n"
+            "scripts/generate_nursery_rhyme.py: 生成童谣\n"
+            "references/best-practices.md: 写作参考\n"
+            "若当前无误，点击“开始创建”：\n确认项列表：\n- [x] 所有路径与命名与蓝图一致"
+        ),
+        conversation_history=conversation_history,
+    )
+
+    prompt = messages[0]["content"]
+    assert "```bash fenced code block" in prompt
+    assert "明确引用每个 references/ 路径" in prompt
+    assert "禁止复制 Creator 界面流程" in prompt
+    assert "不要逐字复制这些约束" in prompt
+    assert "若当前无误" not in prompt
+    assert "确认项列表" not in prompt
+    assert len(messages) == 1
+
+
+def test_creator_skill_md_contract_rejects_flow_leak_missing_bash_and_reference():
+    import pytest
+
+    from backend.routers.creator import _validate_skill_md_contract
+
+    blueprint = "scripts/generate_nursery_rhyme.py\nreferences/best-practices.md"
+    leaked = """---
+name: nursery-rhyme-story
+description: demo
+---
+若当前无误，点击“开始创建”：
+```text
+确认项列表：
+- [x] scripts/generate_nursery_rhyme.py 为可用脚本（已预置）
+```
+"""
+    with pytest.raises(ValueError, match="Creator 界面流程"):
+        _validate_skill_md_contract(leaked, blueprint)
+
+    missing_bash = """---
+name: nursery-rhyme-story
+description: demo
+---
+# 使用
+运行 scripts/generate_nursery_rhyme.py。
+
+参考资料：references/best-practices.md
+"""
+    with pytest.raises(ValueError, match="可执行 Markdown 命令块"):
+        _validate_skill_md_contract(missing_bash, blueprint)
+
+    missing_reference = """---
+name: nursery-rhyme-story
+description: demo
+---
+# 使用
+执行命令：
+```bash
+python scripts/generate_nursery_rhyme.py '{"topic":"{{topic}}"}'
+```
+"""
+    with pytest.raises(ValueError, match="缺少对参考资料"):
+        _validate_skill_md_contract(missing_reference, blueprint)
+
+    valid = missing_reference + "\n参考资料：`references/best-practices.md` 用于童谣写作规范。\n"
+    _validate_skill_md_contract(valid, blueprint)
+
+
 def test_creator_sanitize_rejects_prose_wrapped_script_fence():
     import pytest
 

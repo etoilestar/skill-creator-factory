@@ -622,6 +622,62 @@ def _validate_reference_file_contract(file_path: str, content: str, purpose: str
     if any(not result.passed for result in results):
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
+
+
+def _check_script_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
+    stripped = content.strip()
+    has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+    has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
+    syntax_ok = True
+    syntax_message = "Python 语法合法。"
+    if Path(file_path).suffix.lower() == ".py":
+        try:
+            ast.parse(stripped)
+        except SyntaxError as exc:
+            syntax_ok = False
+            syntax_message = f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+
+    return [
+        ContractCheckResult(
+            id="script.raw_source.single_file",
+            passed=bool(stripped) and not has_markdown_or_bundle,
+            target=file_path,
+            message=(
+                "脚本是单个裸源码文件。"
+                if stripped and not has_markdown_or_bundle
+                else f"{file_path} 生成内容包含 Markdown 代码块或多文件包，不是单个脚本源码。请重新生成该文件。"
+            ),
+            expected="只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+            minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
+        ),
+        ContractCheckResult(
+            id="script.source.syntax",
+            passed=syntax_ok,
+            target=file_path,
+            message=syntax_message,
+            expected="Python 脚本必须能通过 ast.parse 语法检查。",
+            minimal_edit="修正 Python 语法错误，同时保持 stdout JSON 和参数接口不变。",
+        ),
+        ContractCheckResult(
+            id="script.no_fake_implementation",
+            passed=not has_fake,
+            target=file_path,
+            message=(
+                "脚本未包含占位/模拟/假 API 实现。"
+                if not has_fake
+                else f"{file_path} 包含占位/模拟/假 API 实现。Creator 生成的脚本必须具备真实可执行功能。"
+            ),
+            expected="不得使用 placeholder/mock/fake API/固定模板冒充真实能力。",
+            minimal_edit="替换占位或模拟逻辑，实现真实可执行算法或调用平台配置模型/helper。",
+        ),
+    ]
+
+
+def _validate_script_file_source_contract(file_path: str, content: str) -> None:
+    results = _check_script_file_contract(file_path, content)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
 def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> None:
     """Validate SKILL.md against files already initialized in the Skill dir."""
     skill_dir = settings.skills_path / skill_name
@@ -735,20 +791,7 @@ def _validate_generated_file_content(file_path: str, content: str) -> None:
         return
 
     if file_path.startswith("scripts/"):
-        _reject_fake_script_implementation(file_path, content)
-        if "```" in content or _MULTI_FILE_MARKER_RE.search(content):
-            raise ValueError(
-                f"{file_path} 生成内容包含 Markdown 代码块或多文件包，"
-                "不是单个脚本源码。请重新生成该文件。"
-            )
-
-        if Path(file_path).suffix.lower() == ".py":
-            try:
-                ast.parse(content)
-            except SyntaxError as exc:
-                raise ValueError(
-                    f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
-                ) from exc
+        _validate_script_file_source_contract(file_path, content)
 
 
 def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
@@ -1043,9 +1086,10 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             )
 
     if file_path.startswith("scripts/"):
-        if "Markdown 代码块或多文件包" in deterministic_error:
+        if "Markdown 代码块或多文件包" in deterministic_error or "script.raw_source.single_file" in deterministic_error:
             return (
-                "只返回单个脚本源码本身；不要输出说明文字、文件路径标题、写入文件标签、Markdown fence 或多文件包。"
+                "本轮必须把上一次内容改成单个裸脚本源码：删除所有 ``` fence、```python/```text 标签、"
+                "文件路径标题、写入文件标签、解释性文字和多文件包内容；最终响应第一个字符应是脚本源码字符。"
             )
         if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
             return (

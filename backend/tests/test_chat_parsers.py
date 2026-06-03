@@ -1499,6 +1499,71 @@ def test_creator_script_prompt_includes_generated_file_contract():
     assert "stdout 输出结构化 JSON" in prompt
 
 
+
+def test_creator_script_markdown_error_uses_contract_failed_checks(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    fenced_script = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
+    fixed_script = "import json\nprint(json.dumps({'text': 'ok'}))"
+    repair_prompts = []
+    validator_prompts = []
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        yield fenced_script
+
+    async def fake_complete_chat_once(messages, _model):
+        if messages and "Creator 生成文件校验模型" in messages[0].get("content", ""):
+            validator_prompts.append(messages[-1]["content"])
+            return json.dumps({
+                "passed": False,
+                "issues": ["脚本仍被 Markdown fence 包裹"],
+                "failed_checks": [{"id": "script.raw_source.single_file", "target": "scripts/generate_love_story.py"}],
+                "repair_instructions": "删除 fence，只返回裸源码。",
+            }, ensure_ascii=False)
+        repair_prompts.append(messages[-1]["content"])
+        return fixed_script
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+    monkeypatch.setattr(creator, "_trial_run_generated_script", lambda *_args: None)
+
+    request = GenerateFileRequest(
+        skill_name="love-story",
+        file_path="scripts/generate_love_story.py",
+        purpose="生成爱情故事",
+        blueprint_text="scripts/generate_love_story.py: 根据 topic 生成爱情故事",
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert validator_prompts
+    assert repair_prompts
+    assert "script.raw_source.single_file" in validator_prompts[0]
+    assert "script.raw_source.single_file" in repair_prompts[0]
+    assert "删除所有 ``` fence" in repair_prompts[0]
+    assert any(event.get("content") == fixed_script for event in events)
+
 def test_creator_reference_prompt_includes_generated_file_contract():
     from backend.routers.creator import _build_generate_file_prompt
 

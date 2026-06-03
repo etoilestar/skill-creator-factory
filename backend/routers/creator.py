@@ -20,7 +20,7 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -599,9 +599,11 @@ def _build_script_file_contract_text(file_path: str, blueprint_text: str) -> str
         f"- 与 SKILL.md 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text)}",
         "C. 输出接口:",
         "- stdout 输出结构化 JSON，不要混入调试说明。",
+        "- 推荐统一输出字段：{\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}。",
         "D. 禁止项:",
         "- 禁止 placeholder/mock/fake API/固定模板冒充真实能力。",
         "- 需要图片生成时必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
+        "- 图片脚本必须保留 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架结构；禁止 image_path = generate_stable_diffusion_image(...)。",
     ])
 
 
@@ -831,7 +833,14 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
     if _DATA_URI_RE.search(content):
         raise ValueError(
             f"{file_path} 输出 base64 data URI。"
-            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_path。"
+            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_paths/images。"
+        )
+
+    if re.search(r"(?m)^\s*image_path\s*=\s*generate_stable_diffusion_image\s*\(", content):
+        raise ValueError(
+            f"{file_path} 将 helper 返回 dict 直接赋给 image_path。"
+            "图片脚本必须先保存 result = generate_stable_diffusion_image(desc)，"
+            "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
         )
 
     if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
@@ -938,18 +947,58 @@ def _render_trial_command_args(command: str, script_path: str) -> list[str] | No
     return None
 
 
+def _dedupe_trial_arg_sets(arg_sets: list[list[str]]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    deduped: list[list[str]] = []
+    for args in arg_sets:
+        key = tuple(args)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(args)
+    return deduped
+
+
+def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
+    """Add trial cases proving optional text can be omitted or empty."""
+    if len(args) != 1:
+        return []
+    try:
+        payload = json.loads(args[0])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or "text" not in payload:
+        return []
+
+    variants: list[list[str]] = []
+    without_text = dict(payload)
+    without_text.pop("text", None)
+    if without_text:
+        variants.append([json.dumps(without_text, ensure_ascii=False)])
+
+    empty_text = dict(payload)
+    empty_text["text"] = ""
+    variants.append([json.dumps(empty_text, ensure_ascii=False)])
+    return variants
+
+
 def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
     commands = _extract_script_command_templates(skill_md, file_path)
     arg_sets = [args for cmd in commands if (args := _render_trial_command_args(cmd, file_path)) is not None]
-    if arg_sets:
-        return arg_sets
-    if _script_reads_json_argv(content):
-        return [[json.dumps({
+    if not arg_sets and _script_reads_json_argv(content):
+        arg_sets = [[json.dumps({
             "prompt": _sample_value_for_placeholder("prompt"),
             "text": _sample_value_for_placeholder("text"),
             "topic": _sample_value_for_placeholder("topic"),
         }, ensure_ascii=False)]]
-    return [[]]
+    if not arg_sets:
+        arg_sets = [[]]
+
+    expanded: list[list[str]] = []
+    for args in arg_sets:
+        expanded.append(args)
+        expanded.extend(_json_argv_text_optional_variants(args))
+    return _dedupe_trial_arg_sets(expanded)
 
 
 def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stderr: str) -> str:
@@ -960,6 +1009,47 @@ def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stde
         f"stdout={stdout[-4000:]}\n"
         f"stderr={stderr[-4000:]}"
     )
+
+
+def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
+    image_path = payload.get("image_path")
+    if isinstance(image_path, str) and image_path.strip():
+        return True
+
+    image_paths = payload.get("image_paths")
+    if isinstance(image_paths, list) and image_paths and all(isinstance(p, str) and p.strip() for p in image_paths):
+        return True
+
+    images = payload.get("images")
+    if (
+        isinstance(images, list)
+        and images
+        and all(isinstance(item, dict) and isinstance(item.get("image_path"), str) and item.get("image_path").strip() for item in images)
+    ):
+        return True
+
+    return False
+
+
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str]) -> None:
+    stripped = (stdout or "").strip()
+    if not stripped:
+        raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"脚本试运行 stdout 不是合法 JSON object：argv={args!r} stdout={stripped[-4000:]}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"脚本试运行 stdout 必须是 JSON object：argv={args!r} stdout={stripped[-4000:]}")
+    if "error" in payload:
+        raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
+
+    if "generate_stable_diffusion_image" in content and not _validate_image_payload_shape(payload):
+        raise ValueError(
+            "图片脚本调用了 generate_stable_diffusion_image，但 stdout JSON 缺少可消费的图片路径字段："
+            "必须包含 image_path(str) 或 image_paths(list[str]) 或 images(list[dict] 且每项含 image_path)。"
+            f" argv={args!r} stdout={stripped[-4000:]}"
+        )
 
 
 def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -> None:
@@ -1014,6 +1104,7 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -
                     stdout=proc.stdout,
                     stderr=proc.stderr,
                 ))
+            _validate_trial_stdout_json(stdout=proc.stdout, content=content, args=args)
 
 
 async def _repair_generated_file_with_feedback(
@@ -1583,19 +1674,21 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
             "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
             "def parse_args() -> dict:\n"
             "    if len(sys.argv) < 2:\n"
-            "        raise SystemExit('missing JSON argument')\n"
+            "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def build_image_prompt(payload: dict) -> str:\n"
             "    # Derive a concrete prompt from payload keys required by the blueprint.\n"
-            "    topic = str(payload.get('topic') or payload.get('prompt') or '').strip()\n"
-            "    if not topic:\n"
-            "        raise SystemExit('missing topic/prompt')\n"
-            "    return topic\n\n"
+            "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
+            "    return topic or 'helpful generated illustration'\n\n"
             "def run(payload: dict) -> dict:\n"
-            "    prompt = build_image_prompt(payload)\n"
-            "    result = generate_stable_diffusion_image(prompt, filename_prefix='generated')\n"
-            "    image_path = result.get('image_path') if isinstance(result, dict) else str(result)\n"
-            "    return {'image_path': image_path, 'prompt': prompt}\n\n"
+            "    desc = build_image_prompt(payload)\n"
+            "    image_paths = []\n"
+            "    images = []\n"
+            "    result = generate_stable_diffusion_image(desc, filename_prefix='generated')\n"
+            "    image_paths.append(result.get('image_path'))\n"
+            "    images.append(result)\n"
+            "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
+            "    return {'text': '', 'image_paths': image_paths, 'images': images}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -1610,12 +1703,12 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
         "import sys\n\n"
         "def parse_args() -> dict:\n"
         "    if len(sys.argv) < 2:\n"
-        "        raise SystemExit('missing JSON argument')\n"
+        "        return {}\n"
         "    return json.loads(sys.argv[1])\n\n"
         "def run(payload: dict) -> dict:\n"
         "    # Implement the real deterministic business logic required by the blueprint.\n"
-        "    # Use payload keys instead of hard-coded example outputs.\n"
-        "    return {'text': ''}\n\n"
+        "    # Treat payload.get('text') as optional; topic/prompt-only invocations must work.\n"
+        "    return {'text': '', 'image_paths': [], 'images': []}\n\n"
         "def main() -> None:\n"
         "    payload = parse_args()\n"
         "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -1682,9 +1775,9 @@ def _build_generate_file_prompt(
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；生成图片使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
             "7. 如果脚本需要生成图片，不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
-            "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_path；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image_path\": ...}），不要混入调试说明。\n"
+            "10. stdout 应输出结构化 JSON，字段统一为 {\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}；不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
             "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"

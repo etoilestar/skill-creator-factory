@@ -704,13 +704,13 @@ def _compose_creator_runtime_contract_prompt() -> str:
 生成 Skill 时必须遵守以下平台运行时契约：
 
 1. 模型来源必须分离：
-   - 文本、翻译、语义改写：`LLM_BASE_URL` + `TEXT_MODEL`（当前配置：`{text_model}`）。
-   - 看图理解、OCR、多模态问答：`LLM_BASE_URL` + `VISION_MODEL`（当前配置：`{vision_model}`）。
-   - 生成图片：Stable Diffusion 图片运行时，使用 `IMAGE_BASE_URL` + `IMAGE_MODEL`（当前配置：`{image_model}`）与 `IMAGE_SIZE`；不得使用 `VISION_MODEL` 生成图片。
+   - 文本、翻译、语义改写：`LLM_BASE_URL` + `TEXT_MODEL`。
+   - 看图理解、OCR、多模态问答：`LLM_BASE_URL` + `VISION_MODEL`。
+   - 生成图片：Stable Diffusion 图片运行时，使用 `IMAGE_BASE_URL` + `IMAGE_MODEL` 与 `IMAGE_SIZE`；不得使用 `VISION_MODEL` 生成图片。
 2. 创建出来的 `SKILL.md` 不要写中文 topic 翻译、TEXT_MODEL 翻译调用、图片接口字段解析等平台细节；只写“使用平台 Stable Diffusion 图片生成能力”。
 3. 生成的 `scripts/*.py` 如果需要图片生成，必须调用：
    `from backend.services.skill_runtime import generate_stable_diffusion_image, print_json`
-   并把用户 topic 原文传给 `generate_stable_diffusion_image(...)`。平台 helper 会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、`b64_json`/`url` 兼容解析、图片写入 `OUTPUT_DIR`。
+   并把用户 topic 原文传给 `generate_stable_diffusion_image(...)`。平台 helper 会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、`b64_json` 解析、图片写入 `OUTPUT_DIR`。
 4. 图片脚本 stdout 必须输出 JSON，包含 `image_path`；禁止输出 base64 data URI，禁止假设图片接口只返回 `url`。
 5. 图片服务认证可使用独立 `IMAGE_API_KEY`；LLM 文本/视觉认证使用 `LLM_API_KEY`/`OPENAI_API_KEY`。不要硬编码任何 key、base URL 或模型名。
 """

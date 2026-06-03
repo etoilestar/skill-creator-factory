@@ -287,3 +287,20 @@ def test_skill_runtime_trial_image_helper_writes_output_file(monkeypatch, tmp_pa
     assert image_path.is_file()
     assert image_path.parent == tmp_path
     assert image_path.suffix == ".png"
+
+
+def test_skill_runtime_requires_injected_image_model(monkeypatch, tmp_path):
+    from backend.services.skill_runtime import generate_stable_diffusion_image
+
+    monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
+    monkeypatch.delenv("IMAGE_MODEL", raising=False)
+
+    with pytest.raises(RuntimeError, match="IMAGE_MODEL"):
+        generate_stable_diffusion_image("一只猫", output_dir=tmp_path)
+
+
+def test_skill_runtime_rejects_image_response_without_b64_json():
+    from backend.services.skill_runtime import _decode_image_response
+
+    with pytest.raises(ValueError, match="b64_json"):
+        _decode_image_response({"data": [{"url": "https://example.invalid/image.png"}]})

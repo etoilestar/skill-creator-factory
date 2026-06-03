@@ -75,6 +75,16 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name) or default
 
 
+def _required_env(name: str) -> str:
+    value = _env(name).strip()
+    if not value:
+        raise RuntimeError(
+            f"Required platform environment variable {name} is not set. "
+            "Skill scripts must run through the platform sandbox/runtime."
+        )
+    return value
+
+
 def _llm_api_key() -> str:
     return (
         _env("LLM_API_KEY")
@@ -119,8 +129,8 @@ def translate_image_prompt_to_english(topic: str) -> str:
     if os.environ.get("SKILL_TRIAL_RUN") == "1":
         return "a cinematic watercolor cat under a warm sunset"
 
-    url = _build_chat_completions_url(_env("LLM_BASE_URL", "http://localhost:11434"))
-    model = _env("TEXT_MODEL", _env("DEFAULT_MODEL", "qwen3:32b"))
+    url = _build_chat_completions_url(_required_env("LLM_BASE_URL"))
+    model = _required_env("TEXT_MODEL")
     payload = {
         "model": model,
         "stream": False,
@@ -183,12 +193,7 @@ def _decode_image_response(data: dict[str, Any]) -> tuple[bytes, str]:
     if b64_json:
         return base64.b64decode(str(b64_json)), "b64_json"
 
-    url = first.get("url")
-    if url:
-        with urllib.request.urlopen(str(url), timeout=30) as response:  # nosec: platform-configured URL
-            return response.read(), "url"
-
-    raise ValueError("image API response must include data[0].b64_json or data[0].url")
+    raise ValueError(f"Image API did not return b64_json: {data}")
 
 
 def generate_stable_diffusion_image(
@@ -215,14 +220,16 @@ def generate_stable_diffusion_image(
         )
         return {
             "prompt": english_prompt,
-            "model": _env("IMAGE_MODEL", _env("DEFAULT_MODEL", "stable-diffusion-2-1-base")),
+            "model": _required_env("IMAGE_MODEL"),
             "image_path": str(image_path),
             "source": "trial",
         }
 
-    image_model = _env("IMAGE_MODEL", _env("DEFAULT_MODEL", "stable-diffusion-2-1-base"))
-    image_base_url = _env("IMAGE_BASE_URL", "http://localhost:11435")
-    image_size = size or _env("IMAGE_SIZE", "512x512")
+    # IMAGE_MODEL is injected by the platform from settings.image_model.
+    # Do not hardcode Stable Diffusion model names in generated Skills.
+    image_model = _required_env("IMAGE_MODEL")
+    image_base_url = _required_env("IMAGE_BASE_URL")
+    image_size = size or _required_env("IMAGE_SIZE")
     url = _build_image_generations_url(image_base_url)
     payload = {
         "model": image_model,

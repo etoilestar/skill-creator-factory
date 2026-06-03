@@ -501,7 +501,7 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "- 如果 Skill 需要运行 scripts/ 下的脚本，SKILL.md 可用普通 ```bash fenced block 给出命令示例，并说明 assistant 在 Sandbox 当轮回复中按示例替换真实参数后输出。\n"
             "- 只写 `scripts/foo.py` 行内路径或‘立即调用脚本’不会触发宿主执行；必须用普通 Markdown 说明 block 触发规则。\n"
             "- SKILL.md 必须要求 assistant 等待宿主 observation 后再生成最终回答，不得假装执行。\n"
-            "- 如果用户要求使用平台内置图像/多模态模型，不要生成外部 API key、关键词数据库或假图片脚本；应说明由宿主配置的模型能力完成相关步骤。模型来源必须区分：文本/翻译/语义改写使用 LLM_BASE_URL + TEXT_MODEL；看图理解/OCR/多模态问答使用 LLM_BASE_URL + VISION_MODEL；生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL（不要用 VISION_MODEL 生成图片）。生成出来的 SKILL.md 不要写中文 topic 翻译细节；图片脚本如必须生成图片，应调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`，由平台静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、b64_json/url 兼容解析与 OUTPUT_DIR 落盘。确定性脚本必须实现真实算法，禁止固定模板/随机词表/ASCII 图冒充模型生成。\n\n"
+            "- 如果用户要求使用平台内置图像/多模态模型，不要生成外部 API key、关键词数据库或假图片脚本；应说明由宿主配置的模型能力完成相关步骤。模型来源必须区分：文本/翻译/语义改写使用 LLM_BASE_URL + TEXT_MODEL；看图理解/OCR/多模态问答使用 LLM_BASE_URL + VISION_MODEL；生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL（不要用 VISION_MODEL 生成图片）。生成出来的 SKILL.md 不要写中文 topic 翻译细节；图片脚本如必须生成图片，应调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`，由平台静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、b64_json 解析与 OUTPUT_DIR 落盘。确定性脚本必须实现真实算法，禁止固定模板/随机词表/ASCII 图冒充模型生成。\n\n"
             "Phase 3+ 行为约束：\n"
             "- 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3\n"
             "- 进入 Phase 3 后，才可以按 SKILL.md 规定输出\"写入文件/执行命令\"的动作格式\n"

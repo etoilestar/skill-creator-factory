@@ -1949,6 +1949,7 @@ def _execute_planned_actions(
         "results": results,
         "logs": logs,
         "output_files": all_output_files,
+        "touched_paths": [str(path) for path in touched],
     }
 
 # 兼容保留：旧的 bash-block 执行器。不再作为主路径使用。

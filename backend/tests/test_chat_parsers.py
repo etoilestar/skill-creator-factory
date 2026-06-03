@@ -1244,3 +1244,46 @@ def test_block_planner_retries_invalid_json(monkeypatch):
     assert plan == {"tasks": [], "errors": []}
     assert len(calls) == 2
     assert "只输出 JSON" in calls[1][-1]["content"]
+
+
+def test_creator_phase3_artifact_validation_trial_runs_scripts(tmp_path, monkeypatch):
+    from backend.routers import creator_chat
+
+    skill_root = tmp_path / "demo-skill"
+    scripts = skill_root / "scripts"
+    scripts.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: demo\n---\n",
+        encoding="utf-8",
+    )
+    (scripts / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(creator_chat, "_find_created_skill_roots", lambda paths: [skill_root])
+    monkeypatch.setattr(creator_chat, "_trial_run_generated_script", lambda name, rel, content: calls.append((name, rel, content)))
+
+    report = creator_chat._validate_creator_phase3_artifacts({
+        "executed": True,
+        "touched_paths": [str(skill_root / "SKILL.md"), str(scripts / "main.py")],
+    })
+
+    assert report["passed"] is True
+    assert report["issues"] == []
+    assert report["skill_roots"] == [str(skill_root)]
+    assert calls and calls[0][0] == "demo-skill" and calls[0][1] == "scripts/main.py"
+
+
+def test_creator_phase3_retry_messages_include_feedback():
+    from backend.routers.creator_chat import _creator_phase3_retry_messages
+
+    messages = _creator_phase3_retry_messages(
+        [{"role": "system", "content": "base"}],
+        previous_output="old output",
+        feedback="trial failed",
+    )
+
+    assert messages[0] == {"role": "system", "content": "base"}
+    assert messages[-2]["role"] == "assistant"
+    assert "old output" in messages[-2]["content"]
+    assert "trial failed" in messages[-1]["content"]
+    assert "重新生成完整实现动作" in messages[-1]["content"]

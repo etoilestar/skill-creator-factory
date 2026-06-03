@@ -830,10 +830,120 @@ def _format_file_validator_feedback(deterministic_error: str, validator_report: 
     )
 
 
+def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
+    """Return whether content is safe to accept as the requested raw script.
+
+    This helper is intentionally narrower than the full script validator: it only
+    checks that deterministic Markdown/bundle cleanup produced one raw source
+    file.  Full fake-implementation, contract, dependency and trial-run checks
+    still happen in the normal validation pipeline.
+    """
+    stripped = content.strip()
+    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+        return False
+
+    if Path(file_path).suffix.lower() == ".py":
+        try:
+            ast.parse(stripped)
+        except SyntaxError:
+            return False
+
+    return True
+
+
+def _extract_single_wrapping_fence(content: str) -> str | None:
+    """Extract a code block only when it wraps the entire model response.
+
+    Models often wrap repaired scripts in ```text fences, sometimes with CRLF
+    line endings or a closing fence that is longer than the opener.  This parser
+    intentionally accepts only a whole-response fence: any prose before/after the
+    block, or any non-fence trailing line, returns None and lets validation reject
+    the ambiguous output.
+    """
+    stripped = content.strip().lstrip("\ufeff")
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return None
+
+    opening = lines[0].strip()
+    opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+    if not opening_match:
+        return None
+
+    fence = opening_match.group(1)
+    fence_char = fence[0]
+    min_fence_len = len(fence)
+    closing = lines[-1].strip()
+    if not re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+        return None
+
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _extract_only_fenced_block(content: str) -> str | None:
+    """Extract the body only when exactly one fenced block appears in content."""
+    lines = content.strip().lstrip("\ufeff").splitlines()
+    blocks: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        opening = lines[idx].strip()
+        opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+        if not opening_match:
+            idx += 1
+            continue
+
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        body: list[str] = []
+        idx += 1
+        while idx < len(lines):
+            closing = lines[idx].strip()
+            if re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+                blocks.append("\n".join(body).strip())
+                break
+            body.append(lines[idx])
+            idx += 1
+        else:
+            return None
+
+        if len(blocks) > 1:
+            return None
+        idx += 1
+
+    if len(blocks) != 1:
+        return None
+    return blocks[0]
+
+
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
-    """Normalize generated non-script content while keeping scripts strict."""
+    """Normalize model output while keeping script extraction conservative."""
     if file_path.startswith("scripts/"):
-        return content.strip()
+        stripped = content.strip()
+
+        # Low-risk deterministic recovery for common coder behavior: first peel
+        # whole-response fences.  A repeated pass handles responses like
+        # ```text wrapping a complete ```python block.
+        normalized = stripped
+        for _ in range(3):
+            wrapping_fence = _extract_single_wrapping_fence(normalized)
+            if wrapping_fence is None:
+                break
+            normalized = wrapping_fence.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        # Be more tolerant of chatty models: if the response contains exactly one
+        # fenced block and that block is a valid single script, accept it while
+        # still rejecting multi-block bundles and invalid extracted source.
+        only_block = _extract_only_fenced_block(stripped)
+        if only_block is not None:
+            normalized = only_block.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        return stripped
+
     extracted = _extract_target_file_from_bundle(content, file_path)
     return _strip_code_fence(extracted if extracted is not None else content)
 

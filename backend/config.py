@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"))
     # Alternative field name accepted by some deployments
     llm_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("LLM_API_KEY", "llm_api_key"))
+    # Optional key for image-generation backends when they differ from the LLM provider.
+    image_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("IMAGE_API_KEY", "image_api_key"))
 
     # Optional separate model for silent planner rounds (metadata / block / skill planner).
     # Falls back to default_model when unset.

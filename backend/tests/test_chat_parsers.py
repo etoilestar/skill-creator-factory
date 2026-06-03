@@ -840,8 +840,8 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
     assert "禁止在 SKILL.md 中只写“立即调用 `scripts/...`”" in prompt
     assert "不要引入自定义协议章节" in prompt
     assert "宿主已配置的模型能力" in prompt
-    assert "认证类参数" in prompt
-    assert "生成脚本不要读取或校验" in prompt
+    assert "可按需读取" in prompt
+    assert "不需要额外校验" in prompt
 
 
 def test_creator_rejects_custom_runtime_contract_section():
@@ -1032,7 +1032,8 @@ def test_creator_script_prompt_requires_platform_image_runtime_helper():
     assert "generate_stable_diffusion_image" in prompt
     assert "不要在脚本里写中文 prompt 翻译逻辑" in prompt
     assert "禁止输出 base64 data URI" in prompt
-    assert "不要在生成脚本中读取或校验 IMAGE_API_KEY" in prompt
+    assert "可按需读取平台注入的 IMAGE_MODEL" in prompt
+    assert "不需要额外校验它们是否存在" in prompt
 
 
 def test_creator_rejects_direct_image_api_without_platform_helper():

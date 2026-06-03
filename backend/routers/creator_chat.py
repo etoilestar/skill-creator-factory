@@ -712,7 +712,7 @@ def _compose_creator_runtime_contract_prompt() -> str:
    `from backend.services.skill_runtime import generate_stable_diffusion_image, print_json`
    并把用户 topic 原文传给 `generate_stable_diffusion_image(...)`。平台 helper 会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、`b64_json` 解析、图片写入 `OUTPUT_DIR`。
 4. 图片脚本 stdout 必须输出 JSON，包含 `image_path`；禁止输出 base64 data URI，禁止假设图片接口只返回 `url`。
-5. 认证类参数由平台运行时与 helper 处理；生成脚本不要读取、校验或硬编码 `IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY`。
+5. 模型与认证相关参数由平台运行时注入；生成脚本可按需读取 `IMAGE_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 等环境变量，但不要硬编码这些值，也不需要额外校验它们是否存在。
 """
 
 

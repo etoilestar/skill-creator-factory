@@ -880,22 +880,65 @@ def _extract_single_wrapping_fence(content: str) -> str | None:
     return "\n".join(lines[1:-1]).strip()
 
 
+def _extract_only_fenced_block(content: str) -> str | None:
+    """Extract the body only when exactly one fenced block appears in content."""
+    lines = content.strip().lstrip("\ufeff").splitlines()
+    blocks: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        opening = lines[idx].strip()
+        opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+        if not opening_match:
+            idx += 1
+            continue
+
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        body: list[str] = []
+        idx += 1
+        while idx < len(lines):
+            closing = lines[idx].strip()
+            if re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+                blocks.append("\n".join(body).strip())
+                break
+            body.append(lines[idx])
+            idx += 1
+        else:
+            return None
+
+        if len(blocks) > 1:
+            return None
+        idx += 1
+
+    if len(blocks) != 1:
+        return None
+    return blocks[0]
+
+
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
     """Normalize model output while keeping script extraction conservative."""
     if file_path.startswith("scripts/"):
         stripped = content.strip()
 
-        # Low-risk deterministic recovery for common coder behavior: peel only
+        # Low-risk deterministic recovery for common coder behavior: first peel
         # whole-response fences.  A repeated pass handles responses like
-        # ```text wrapping a complete ```python block, but we deliberately do not
-        # extract scripts from multi-file bundles or prose because those responses
-        # are ambiguous and should be repaired by the model instead.
+        # ```text wrapping a complete ```python block.
         normalized = stripped
         for _ in range(3):
             wrapping_fence = _extract_single_wrapping_fence(normalized)
             if wrapping_fence is None:
                 break
             normalized = wrapping_fence.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        # Be more tolerant of chatty models: if the response contains exactly one
+        # fenced block and that block is a valid single script, accept it while
+        # still rejecting multi-block bundles and invalid extracted source.
+        only_block = _extract_only_fenced_block(stripped)
+        if only_block is not None:
+            normalized = only_block.strip()
             if _is_valid_normalized_script_source(file_path, normalized):
                 return normalized
 

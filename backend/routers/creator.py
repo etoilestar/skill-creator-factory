@@ -35,6 +35,47 @@ from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
 logger = logging.getLogger(__name__)
 
+
+def _log_creator_model_usage(
+    *,
+    phase: str,
+    file_path: str,
+    route=None,
+    model: str | None = None,
+    skill_name: str = "",
+    attempt: int | None = None,
+    actual_model: str | None = None,
+    provider: dict | None = None,
+    extra: str = "",
+) -> None:
+    """Emit compact model routing/ack logs for docker logs debugging."""
+    expected_model = model or (getattr(route, "model", "") if route is not None else "")
+    task = getattr(route, "task", "") if route is not None else ""
+    requested_model = getattr(route, "requested_model", None) if route is not None else None
+    reason = getattr(route, "reason", "") if route is not None else ""
+    matched = None
+    if route is not None and actual_model:
+        try:
+            matched = route.ack(actual_model=actual_model).get("matched")
+        except Exception:  # pragma: no cover - defensive logging only
+            matched = None
+    logger.info(
+        "[Creator][model] phase=%s skill=%s file=%s attempt=%s task=%s model=%s requested_model=%s actual_model=%s matched=%s reason=%s provider=%s%s",
+        phase,
+        skill_name,
+        file_path,
+        "" if attempt is None else attempt,
+        task,
+        expected_model,
+        requested_model or "",
+        actual_model or "",
+        "" if matched is None else matched,
+        reason,
+        provider or {},
+        f" extra={extra}" if extra else "",
+    )
+
+
 _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 
 宿主 Markdown 执行说明（写入生成的 SKILL.md 正文时必须保持常见 Markdown 形态）：
@@ -1053,9 +1094,36 @@ async def _repair_generated_file_with_feedback(
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
     })
+    logger.info(
+        "[Creator][model] phase=repair.request file=%s model=%s repair_mode=%s messages=%d previous_chars=%d contract_chars=%d failed_checks_chars=%d",
+        file_path,
+        model,
+        repair_mode,
+        len(repair_messages),
+        len(previous_content or ""),
+        len(contract_text or ""),
+        len(failed_checks_text or ""),
+    )
     repaired = await complete_chat_once(repair_messages, model)
     if is_script:
-        return _normalize_generated_file_content(file_path, repaired)
+        normalized = _normalize_generated_file_content(file_path, repaired)
+        logger.info(
+            "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d normalized_chars=%d normalized=%s",
+            file_path,
+            model,
+            repair_mode,
+            len(repaired or ""),
+            len(normalized or ""),
+            normalized != repaired,
+        )
+        return normalized
+    logger.info(
+        "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d",
+        file_path,
+        model,
+        repair_mode,
+        len(repaired or ""),
+    )
     return repaired
 
 
@@ -1152,6 +1220,12 @@ async def _run_generated_file_validator_round(
         requested_model=requested_model,
         reason=f"creator generated file validation: {file_path}",
     )
+    _log_creator_model_usage(
+        phase="validator.route",
+        file_path=file_path,
+        route=route,
+        extra=f"requested_generation_model={requested_model} repair_mode={repair_mode} content_chars={len(content)}",
+    )
     messages = [
         {
             "role": "system",
@@ -1185,6 +1259,13 @@ async def _run_generated_file_validator_round(
     ]
     try:
         text = await complete_chat_once(messages, route.model)
+        logger.info(
+            "[Creator][model] phase=validator.response file=%s model=%s chars=%d repair_mode=%s",
+            file_path,
+            route.model,
+            len(text or ""),
+            repair_mode,
+        )
     except Exception as exc:  # pragma: no cover - defensive fallback
         logger.warning("Creator file validator failed; using deterministic feedback: %s", exc)
         return {
@@ -1649,6 +1730,13 @@ async def generate_file(request: GenerateFileRequest):
         requested_model=request.model,
     )
     model = route.model
+    _log_creator_model_usage(
+        phase="generate.route",
+        skill_name=skill_name,
+        file_path=request.file_path,
+        route=route,
+        extra=f"purpose_chars={len(request.purpose or '')} requested_ui_model={request.model or ''}",
+    )
 
     prompt_messages = _build_generate_file_prompt(
         file_path=request.file_path,
@@ -1667,6 +1755,14 @@ async def generate_file(request: GenerateFileRequest):
 
             def _capture_ack(payload: dict) -> None:
                 ack_payload.update(payload)
+                _log_creator_model_usage(
+                    phase="generate.provider_ack",
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    route=route,
+                    actual_model=payload.get("actual_model"),
+                    provider=payload,
+                )
 
             generated_chunks: list[str] = []
             async for chunk in stream_chat(prompt_messages, model, model_ack_callback=_capture_ack):
@@ -1676,6 +1772,14 @@ async def generate_file(request: GenerateFileRequest):
                 generated_chunks.append(chunk)
 
             raw_content = "".join(generated_chunks)
+            logger.info(
+                "[Creator][model] phase=generate.response skill=%s file=%s model=%s raw_chars=%d chunks=%d",
+                skill_name,
+                request.file_path,
+                model,
+                len(raw_content),
+                len(generated_chunks),
+            )
 
             should_repair = (
                 request.file_path.startswith("scripts/")

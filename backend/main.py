@@ -1,5 +1,17 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+_LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=_LOG_FORMAT,
+)
+logging.getLogger().setLevel(logging.INFO)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 
 from .routers import chat, creator, creator_chat, health, sandbox_chat, skills, skills_chat
 

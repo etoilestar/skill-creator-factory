@@ -1952,6 +1952,24 @@ print('two')
 ```
 """
 
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
+def test_creator_sanitize_rejects_multiple_prose_wrapped_script_fences():
+    import pytest
+
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = """候选一：
+```python
+print('one')
+```
+候选二：
+```python
+print('two')
+```
+"""
+
     with pytest.raises(ValueError, match="Markdown 代码块"):
         _sanitize_generated_file_content("scripts/main.py", content)
 

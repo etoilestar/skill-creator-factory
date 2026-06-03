@@ -494,6 +494,29 @@ def test_run_command_injects_default_model_api_keys(tmp_path, monkeypatch):
     assert "ollama|ollama" in result["stdout"]
 
 
+def test_creator_followup_guard_prevents_repeating_opening_question():
+    from backend.routers.creator_chat import _compose_creator_followup_guard_prompt
+
+    prompt = _compose_creator_followup_guard_prompt([
+        {"role": "assistant", "content": "问题: \"你希望 智能助手 帮你做什么事情？\""},
+        {"role": "user", "content": "帮我创建一个写神话故事的skill"},
+    ])
+
+    assert "不要重复询问开场分类问题" in prompt
+    assert "帮我创建一个写神话故事的skill" in prompt
+    assert "处理文件 / 帮我写东西 / 连接某个服务 / 其他" in prompt
+    assert _compose_creator_followup_guard_prompt([]) == ""
+
+
+def test_kernel_creator_phase1_prompt_includes_no_repeat_opening_guard():
+    from backend.services.kernel_loader import load_kernel_creator_for_phase
+
+    prompt = load_kernel_creator_for_phase("phase1")
+
+    assert "不要重复上述开场分类问题" in prompt
+    assert "不要再次询问“你希望 智能助手 帮你做什么事情？”" in prompt
+
+
 def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     from backend.services.kernel_loader import load_kernel_creator_for_phase
 
@@ -553,12 +576,144 @@ def test_creator_phase_guess_accepts_continue_build_confirmation():
     assert _guess_current_phase(messages) == "phase3+"
 
 
-def test_strip_phase3_marker_from_visible_creator_text():
-    from backend.routers.creator_chat import _strip_phase3_marker_from_visible_text
 
-    text = "蓝图内容\n{\"creator_phase\":\"phase3_start\"}\n后续文字"
 
-    assert _strip_phase3_marker_from_visible_text(text) == "蓝图内容\n后续文字"
+def test_creator_phase_guess_ignores_model_phase3_json_without_blueprint():
+    from backend.routers.creator_chat import _guess_current_phase
+
+    messages = [
+        {"role": "assistant", "content": "问题: \"这是我理解的你的需求，对吗？\""},
+        {"role": "user", "content": "对，开始做吧"},
+        {"role": "assistant", "content": '{"phase3_start": true, "skill_name": "demo"}'},
+    ]
+
+    # Model-emitted startup JSON is not a phase signal anymore.  Without a real
+    # blueprint, the backend must return to Phase 2 and ask for blueprint
+    # confirmation instead of executing.
+    assert _guess_current_phase(messages) == "phase2"
+
+
+def test_creator_phase_guess_enters_phase3_only_after_confirmed_blueprint():
+    from backend.routers.creator_chat import _guess_current_phase
+
+    messages = [
+        {"role": "assistant", "content": "## 📋 Skill 架构蓝图\n### 基本信息\n- **Skill 名称**: demo"},
+        {"role": "user", "content": "对，开始做吧"},
+    ]
+
+    assert _guess_current_phase(messages) == "phase3+"
+
+
+
+def test_creator_conversation_valid_opening_question_skips_validator_model(monkeypatch, tmp_path):
+    import asyncio
+
+    import backend.routers.creator_chat as creator_chat
+    from backend.routers.chat_models import ChatRequest
+
+    async def fake_stream_chat(messages, model):
+        yield '```text\n问题: "你希望 智能助手 帮你做什么事情？"\n选项:\n- "处理文件 (比如 PDF、Excel、图片等)"\n- "帮我写东西 (比如文档、代码、报告)"\n- "连接某个服务 (比如发消息、查数据)"\n- "其他 (我来描述)"\n```'
+
+    async def fail_if_validator_called(messages, model):
+        raise AssertionError("validator should not be called when deterministic checks pass")
+
+    monkeypatch.setattr(creator_chat, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fail_if_validator_called)
+
+    request = ChatRequest(messages=[])
+
+    async def collect():
+        return [
+            item async for item in creator_chat._execute_conversation_mode(
+                final_messages=[{"role": "system", "content": "first prompt"}],
+                model="text-model",
+                current_phase="phase1",
+                request=request,
+                execution_root=tmp_path,
+                parent_skill_name="kernel",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    serialized = "".join(events)
+
+    assert "对话格式校验未通过" not in serialized
+    assert "Creator 对话模型连续输出" not in serialized
+    assert "你希望 智能助手 帮你做什么事情" in serialized
+
+
+def test_creator_conversation_invalid_phase_json_is_validated_and_retried(monkeypatch, tmp_path):
+    import asyncio
+    import json
+
+    import backend.routers.creator_chat as creator_chat
+    from backend.routers.chat_models import ChatRequest
+
+    outputs = iter([
+        '{"phase3_start": true, "skill_name": "generate-epic-fantasy-story"}',
+        '## 📋 Skill 架构蓝图\n### 基本信息\n- **Skill 名称**: generate-epic-fantasy-story\n```text\n问题: "请确认是否接受当前生成的 Skill 蓝图？"\n选项:\n- "对，开始做吧"\n- "大体对，但有些地方要改"\n- "不对，我重新说一下"\n```',
+    ])
+    seen_prompts = []
+
+    async def fake_stream_chat(messages, model):
+        seen_prompts.append(messages)
+        yield next(outputs)
+
+    async def fake_complete_chat_once(messages, model):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("deterministic_issues"):
+            return json.dumps({"valid": False, "issues": payload["deterministic_issues"]}, ensure_ascii=False)
+        return '{"valid": true, "issues": []}'
+
+    monkeypatch.setattr(creator_chat, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fake_complete_chat_once)
+
+    request = ChatRequest(messages=[
+        {"role": "assistant", "content": "问题: \"这是我理解的你的需求，对吗？\""},
+        {"role": "user", "content": "对，开始做吧"},
+    ])
+
+    async def collect():
+        return [
+            item async for item in creator_chat._execute_conversation_mode(
+                final_messages=[{"role": "system", "content": "phase2 prompt"}],
+                model="text-model",
+                current_phase="phase2",
+                request=request,
+                execution_root=tmp_path,
+                parent_skill_name="kernel",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    serialized = "".join(events)
+
+    assert "phase3_start" not in serialized
+    assert "## 📋 Skill 架构蓝图" in serialized
+    assert len(seen_prompts) == 2
+    assert "违反 Creator Phase 1/2 格式契约" in seen_prompts[1][-1]["content"]
+
+
+def test_creator_phase3_format_validator_rejects_start_json(monkeypatch):
+    import asyncio
+    import json
+
+    import backend.routers.creator_chat as creator_chat
+
+    async def fake_complete_chat_once(messages, model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps({"passed": False, "issues": payload["deterministic_issues"]}, ensure_ascii=False)
+
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fake_complete_chat_once)
+
+    report = asyncio.run(creator_chat._run_creator_phase3_format_validator_round(
+        assistant_text='{"phase3_start": true, "skill_name": "demo"}',
+        model="code-model",
+    ))
+
+    assert report["passed"] is False
+    assert any("阶段启动 JSON" in issue for issue in report["issues"])
+    assert any("没有可执行动作块" in issue for issue in report["issues"])
 
 
 def test_request_messages_with_inline_images_builds_data_url(tmp_path):
@@ -839,8 +994,9 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
     assert "只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block" in prompt
     assert "禁止在 SKILL.md 中只写“立即调用 `scripts/...`”" in prompt
     assert "不要引入自定义协议章节" in prompt
-    assert "LLM_BASE_URL" in prompt
-    assert "TEXT_MODEL" in prompt
+    assert "宿主已配置的模型能力" in prompt
+    assert "可按需读取" in prompt
+    assert "不需要额外校验" in prompt
 
 
 def test_creator_rejects_custom_runtime_contract_section():
@@ -1007,10 +1163,12 @@ def test_kernel_creator_phase_prompts_include_block_runtime_requirements():
     assert "生成的 Skill.md Markdown 运行说明" in phase3_prompt
     assert "不会触发宿主执行" in phase3_prompt
     assert "不要加入自定义 Runtime Contract JSON" in phase3_prompt
-    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt or "LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL" in phase3_prompt
+    assert "LLM_BASE_URL + TEXT_MODEL" in phase3_prompt
+    assert "IMAGE_BASE_URL + IMAGE_MODEL" in phase3_prompt
+    assert "generate_stable_diffusion_image" in phase3_prompt
 
 
-def test_creator_script_prompt_requires_stable_env_and_diffusion_translation():
+def test_creator_script_prompt_requires_platform_image_runtime_helper():
     from backend.routers.creator import _build_generate_file_prompt
 
     messages = _build_generate_file_prompt(
@@ -1024,12 +1182,16 @@ def test_creator_script_prompt_requires_stable_env_and_diffusion_translation():
 
     assert "LLM_BASE_URL" in prompt
     assert "IMAGE_BASE_URL" in prompt
-    assert "LLM_API_KEY" in prompt
-    assert "先调用 TEXT_MODEL" in prompt
-    assert "英文 prompt" in prompt
+    assert "IMAGE_MODEL" in prompt
+    assert "VISION_MODEL" in prompt
+    assert "generate_stable_diffusion_image" in prompt
+    assert "不要在脚本里写中文 prompt 翻译逻辑" in prompt
+    assert "禁止输出 base64 data URI" in prompt
+    assert "可按需读取平台注入的 IMAGE_MODEL" in prompt
+    assert "不需要额外校验它们是否存在" in prompt
 
 
-def test_creator_rejects_image_model_script_without_english_translation():
+def test_creator_rejects_direct_image_api_without_platform_helper():
     from backend.routers.creator import _validate_script_contract_static
 
     skill_md = """---
@@ -1048,16 +1210,78 @@ import sys
 
 payload = json.loads(sys.argv[1])
 prompt = payload.get('prompt')
-print(os.environ['IMAGE_MODEL'], prompt)
+print(os.environ['IMAGE_BASE_URL'], os.environ['IMAGE_MODEL'], prompt)
 """
 
-    with pytest.raises(ValueError, match="翻译成英文"):
+    with pytest.raises(ValueError, match="直接调用图片生成接口"):
         _validate_script_contract_static(
             file_path="scripts/generate.py",
             content=script,
             skill_md=skill_md,
         )
 
+
+
+
+def test_creator_accepts_platform_image_helper_for_image_generation():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: image-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+    script = """import json
+import sys
+
+from backend.services.skill_runtime import generate_stable_diffusion_image, print_json
+
+payload = json.loads(sys.argv[1])
+prompt = payload.get('prompt')
+result = generate_stable_diffusion_image(prompt, filename_prefix='generated')
+print_json({"image_path": result["image_path"], "prompt": result["prompt"]})
+"""
+
+    _validate_script_contract_static(
+        file_path="scripts/generate.py",
+        content=script,
+        skill_md=skill_md,
+    )
+
+
+def test_creator_rejects_vision_model_for_image_generation_endpoint():
+    from backend.routers.creator import _validate_script_contract_static
+
+    skill_md = """---
+name: image-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+    script = """import json
+import os
+import sys
+
+payload = json.loads(sys.argv[1])
+prompt = payload.get('prompt')
+print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'], prompt)
+"""
+
+    with pytest.raises(ValueError, match="VISION_MODEL"):
+        _validate_script_contract_static(
+            file_path="scripts/generate.py",
+            content=script,
+            skill_md=skill_md,
+        )
 
 
 def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
@@ -1079,6 +1303,7 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
     def fake_run(argv, **kwargs):
         prepared["argv"] = argv
         prepared["cwd"] = kwargs.get("cwd")
+        prepared["env"] = kwargs.get("env")
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
     monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
@@ -1095,6 +1320,8 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
     assert prepared["venv_python"] == Path("/tmp/fake-skill-venv/bin/python")
     assert prepared["argv"][0] == "/tmp/fake-skill-venv/bin/python"
     assert prepared["argv"][1].endswith("use_dep.py")
+    assert prepared["env"]["SKILL_TRIAL_RUN"] == "1"
+    assert "PYTHONPATH" in prepared["env"]
 
 def test_creator_trial_args_render_skill_md_template():
     from backend.routers.creator import _trial_args_for_script
@@ -1114,3 +1341,104 @@ python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
     payload = json.loads(args[0][0])
     assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
     assert payload["topic"] == "system time"
+
+
+def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from backend.routers.chat_models import ChatRequest
+    from backend.routers import sandbox_chat
+
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    missing_skill_root = skills_root / "my-skill"
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sandbox_chat.subprocess, "run", fake_run)
+
+    result, _ = sandbox_chat._execute_single_task(
+        {"action": "run_command", "command": "python -c 'print(1)'"},
+        [],
+        ChatRequest(messages=[]),
+        inferred_skill_root=missing_skill_root,
+    )
+
+    assert result["success"] is True
+    assert captured["cwd"] == str(skills_root)
+
+
+def test_block_planner_retries_invalid_json(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers.chat_models import ChatRequest, MarkdownBlock
+    from backend.routers import sandbox_chat
+
+    calls = []
+
+    async def fake_complete_chat_once(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return ""
+        return json.dumps({"tasks": [], "errors": []})
+
+    monkeypatch.setattr(sandbox_chat, "complete_chat_once", fake_complete_chat_once)
+
+    plan = asyncio.run(sandbox_chat._run_block_planner_round(
+        assistant_text="执行命令：\n```bash\necho ok\n```",
+        blocks=[MarkdownBlock(index=0, lang="bash", code="echo ok", before_context="执行命令：", after_context="")],
+        request=ChatRequest(messages=[]),
+        model="planner-model",
+    ))
+
+    assert plan == {"tasks": [], "errors": []}
+    assert len(calls) == 2
+    assert "只输出 JSON" in calls[1][-1]["content"]
+
+
+def test_creator_phase3_artifact_validation_trial_runs_scripts(tmp_path, monkeypatch):
+    from backend.routers import creator_chat
+
+    skill_root = tmp_path / "demo-skill"
+    scripts = skill_root / "scripts"
+    scripts.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: demo\n---\n",
+        encoding="utf-8",
+    )
+    (scripts / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(creator_chat, "_find_created_skill_roots", lambda paths: [skill_root])
+    monkeypatch.setattr(creator_chat, "_trial_run_generated_script", lambda name, rel, content: calls.append((name, rel, content)))
+
+    report = creator_chat._validate_creator_phase3_artifacts({
+        "executed": True,
+        "touched_paths": [str(skill_root / "SKILL.md"), str(scripts / "main.py")],
+    })
+
+    assert report["passed"] is True
+    assert report["issues"] == []
+    assert report["skill_roots"] == [str(skill_root)]
+    assert calls and calls[0][0] == "demo-skill" and calls[0][1] == "scripts/main.py"
+
+
+def test_creator_phase3_retry_messages_include_feedback():
+    from backend.routers.creator_chat import _creator_phase3_retry_messages
+
+    messages = _creator_phase3_retry_messages(
+        [{"role": "system", "content": "base"}],
+        previous_output="old output",
+        feedback="trial failed",
+    )
+
+    assert messages[0] == {"role": "system", "content": "base"}
+    assert messages[-2]["role"] == "assistant"
+    assert "old output" in messages[-2]["content"]
+    assert "trial failed" in messages[-1]["content"]
+    assert "重新生成完整实现动作" in messages[-1]["content"]

@@ -489,7 +489,7 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "Phase 3+ 执行要求：\n"
             "1. 不要输出自然语言给用户看 - 你的输出是给后端执行引擎解析的\n"
             "2. 只输出执行指令，使用 fenced code blocks 格式\n"
-            "3. 首先输出 phase3_start 标记（在回复的最前面）\n"
+            "3. 不要输出 phase3_start / creator_phase 等阶段启动 JSON；后端已经完成阶段切换\n"
             "4. 严格按照 SKILL.md 中的 3.1.1 动作输出格式\n\n"
             "动作输出格式（必须严格遵守）：\n"
             "- 写入文件：代码块前一行写 `写入文件：<path>` 或 `保存到：<path>`，紧跟一个 code block\n"
@@ -501,16 +501,13 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "- 如果 Skill 需要运行 scripts/ 下的脚本，SKILL.md 可用普通 ```bash fenced block 给出命令示例，并说明 assistant 在 Sandbox 当轮回复中按示例替换真实参数后输出。\n"
             "- 只写 `scripts/foo.py` 行内路径或‘立即调用脚本’不会触发宿主执行；必须用普通 Markdown 说明 block 触发规则。\n"
             "- SKILL.md 必须要求 assistant 等待宿主 observation 后再生成最终回答，不得假装执行。\n"
-            "- 如果用户要求使用平台内置图像/多模态模型，不要生成外部 API key、关键词数据库或假图片脚本；应说明由宿主配置的模型能力完成相关步骤。任何需要模型判断的脚本必须调用宿主注入的 LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL；确定性脚本必须实现真实算法，禁止固定模板/随机词表/ASCII 图冒充模型生成。\n\n"
+            "- 如果用户要求使用平台内置图像/多模态模型，不要生成外部 API key、关键词数据库或假图片脚本；应说明由宿主配置的模型能力完成相关步骤。模型来源必须区分：文本/翻译/语义改写使用 LLM_BASE_URL + TEXT_MODEL；看图理解/OCR/多模态问答使用 LLM_BASE_URL + VISION_MODEL；生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL（不要用 VISION_MODEL 生成图片）。生成出来的 SKILL.md 不要写中文 topic 翻译细节；图片脚本如必须生成图片，应调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`，由平台静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、b64_json 解析与 OUTPUT_DIR 落盘。确定性脚本必须实现真实算法，禁止固定模板/随机词表/ASCII 图冒充模型生成。\n\n"
             "Phase 3+ 行为约束：\n"
             "- 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3\n"
             "- 进入 Phase 3 后，才可以按 SKILL.md 规定输出\"写入文件/执行命令\"的动作格式\n"
             "- 如果需要命名规范或输出格式示例，可在资源选择阶段请求加载 `references/best-practices.md` 与 `references/output-patterns.md`\n"
             "- 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 `references/workflows.md`\n\n"
-            "输出示例（严格按照此格式）：\n"
-            "```\n"
-            '{ "creator_phase":"phase3_start"}\n'
-            "\n"
+            "输出示例（严格按照此格式，不包含任何阶段启动 JSON）：\n"
             "执行命令：\n"
             "```bash\n"
             "python ../kernel/scripts/init_skill.py query-system-time --path .\n"
@@ -733,6 +730,7 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
 2. **每次只问一个问题**：不要在一次回复中问多个问题
 3. **使用指定的问题模板**：必须使用 SKILL.md 中用 ``` 包裹的问题模板
 4. **不要跳过步骤**：每个步骤都要执行，不要省略
+5. **不要重复开场问题**：如果对话历史中用户已经描述了要创建的 Skill，不要再次询问“你希望 智能助手 帮你做什么事情？”，应继续追问具体需求或生成蓝图。
 
 现在，让我们开始执行 Phase 1 吧！
 
@@ -758,7 +756,7 @@ Phase 2 的任务是：
    - 必须包含 I/O 契约、目录结构、工作流逻辑
    - 必须包含“宿主执行方式”，明确哪些任务直接回答，哪些任务需要输出标准 Markdown fenced block
    - 如果涉及图像/多模态能力，必须明确使用宿主已配置模型，不要虚构 API 密钥、关键词数据库或占位图片脚本
-   - 如果涉及需要模型判断的开放式能力，优先设计为模型直接回答；若必须生成 scripts/，脚本必须调用宿主注入的 LLM_BASE_URL + TEXT_MODEL/IMAGE_MODEL/VISION_MODEL；确定性脚本必须实现真实算法，不得用固定模板/随机词表/ASCII 图冒充模型能力
+   - 如果涉及需要模型判断的开放式能力，优先设计为模型直接回答；若必须生成 scripts/，脚本必须区分模型来源：文本/语义使用 LLM_BASE_URL + TEXT_MODEL，看图理解使用 LLM_BASE_URL + VISION_MODEL，生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL 且优先调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`；确定性脚本必须实现真实算法，不得用固定模板/随机词表/ASCII 图冒充模型能力
 3. 完整蓝图之后，再输出一个 AskUserQuestion 确认问题。
 4. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
 5. **AskUserQuestion 选项必须使用以下三项原文**：

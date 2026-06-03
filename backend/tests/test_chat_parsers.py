@@ -1480,3 +1480,101 @@ def test_creator_phase3_retry_messages_include_feedback():
     assert "old output" in messages[-2]["content"]
     assert "trial failed" in messages[-1]["content"]
     assert "重新生成完整实现动作" in messages[-1]["content"]
+
+
+def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch):
+    import asyncio
+    import json
+
+    from backend.routers import creator
+    from backend.routers.creator import GenerateFileRequest
+
+    stream_outputs = ["print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'])"]
+    repairs = [
+        "```python\nprint('still fenced')\n```",
+        (
+            "import json\n"
+            "import sys\n"
+            "from backend.services.skill_runtime import generate_stable_diffusion_image, print_json\n"
+            "payload = json.loads(sys.argv[1])\n"
+            "result = generate_stable_diffusion_image(payload.get('prompt', ''), filename_prefix='generated')\n"
+            "print_json({'image_path': result['image_path'], 'prompt': result['prompt']})\n"
+        ),
+    ]
+    trial_contents = []
+
+    skill_md = """---
+name: repair-skill
+description: 使用图像模型生成图片
+---
+
+执行命令：
+```bash
+python scripts/generate.py '{"prompt":"{{prompt}}"}'
+```
+"""
+
+    def fake_is_file():
+        return True
+
+    def fake_read_text(*_args, **_kwargs):
+        return skill_md
+
+    async def fake_stream_chat(_messages, _model, model_ack_callback=None):
+        if model_ack_callback:
+            model_ack_callback({"actual_model": "fake-model"})
+        for chunk in stream_outputs:
+            yield chunk
+
+    async def fake_complete_chat_once(_messages, _model):
+        return repairs.pop(0)
+
+    def fake_trial_run(_skill_name, file_path, content):
+        skill_md_for_validation = creator.Path("unused").read_text()
+        creator._validate_script_contract_static(
+            file_path=file_path,
+            content=content,
+            skill_md=skill_md_for_validation,
+        )
+        trial_contents.append(content)
+
+    monkeypatch.setattr(creator, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+    monkeypatch.setattr(creator, "_trial_run_generated_script", fake_trial_run)
+    monkeypatch.setattr(creator.Path, "is_file", fake_is_file)
+    monkeypatch.setattr(creator.Path, "read_text", fake_read_text)
+
+    request = GenerateFileRequest(
+        skill_name="repair-skill",
+        file_path="scripts/generate.py",
+        purpose="生成脚本",
+        blueprint_text=skill_md,
+        conversation_history=[],
+    )
+
+    async def collect_events():
+        response = await creator.generate_file(request)
+        events = []
+        async for line in response.body_iterator:
+            if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    repair_events = [event["validation"] for event in events if "validation" in event]
+    expected_content = (
+        "import json\n"
+        "import sys\n"
+        "from backend.services.skill_runtime import generate_stable_diffusion_image, print_json\n"
+        "payload = json.loads(sys.argv[1])\n"
+        "result = generate_stable_diffusion_image(payload.get('prompt', ''), filename_prefix='generated')\n"
+        "print_json({'image_path': result['image_path'], 'prompt': result['prompt']})"
+    )
+
+    assert [event["attempt"] for event in repair_events] == [1, 2]
+    assert "VISION_MODEL" in repair_events[0]["error"]
+    assert "SKILL.md 声明需要使用宿主" in repair_events[1]["error"]
+    assert trial_contents == [expected_content]
+    assert events[-2] == {"content": expected_content}
+    assert events[-1] == {"done": True}

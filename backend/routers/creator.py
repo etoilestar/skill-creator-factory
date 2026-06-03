@@ -578,7 +578,13 @@ async def _repair_generated_script_with_feedback(
     previous_content: str,
     validation_error: str,
 ) -> str:
-    """Ask the original routed model to fix script content using trial-run feedback."""
+    """Ask the original routed model to fix script content using trial-run feedback.
+
+    The repaired model output is intentionally not validated here.  Validation
+    happens at the top of the generate-file retry loop so format errors in the
+    repaired response consume one retry attempt and can be sent back as feedback
+    instead of aborting the stream before the configured repair budget is used.
+    """
     repair_messages = [*prompt_messages]
     repair_messages.append({
         "role": "assistant",
@@ -588,18 +594,25 @@ async def _repair_generated_script_with_feedback(
         "role": "user",
         "content": (
             f"上一次生成的 {file_path} 没有通过保存前静态校验/试运行。"
-            "请根据以下错误修复，并且只返回完整脚本源码，不要解释，不要 Markdown 代码块。\n\n"
+            "请根据以下错误修复，并且只返回完整脚本源码，不要解释，不要 Markdown 代码块。\n"
+            "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
+            "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。\n\n"
             f"错误信息：\n{validation_error}"
         ),
     })
     repaired = await complete_chat_once(repair_messages, model)
-    return _sanitize_generated_file_content(file_path, repaired)
+    return _normalize_generated_file_content(file_path, repaired)
+
+
+def _normalize_generated_file_content(file_path: str, content: str) -> str:
+    """Strip benign wrappers from model output without enforcing validity."""
+    extracted = _extract_target_file_from_bundle(content, file_path)
+    return _strip_code_fence(extracted if extracted is not None else content)
 
 
 def _sanitize_generated_file_content(file_path: str, content: str) -> str:
     """Normalize model output into exactly the requested file content."""
-    extracted = _extract_target_file_from_bundle(content, file_path)
-    sanitized = _strip_code_fence(extracted if extracted is not None else content)
+    sanitized = _normalize_generated_file_content(file_path, content)
     _validate_generated_file_content(file_path, sanitized)
     return sanitized
 
@@ -798,15 +811,14 @@ async def generate_file(request: GenerateFileRequest):
                     ack_payload.clear()
                 generated_chunks.append(chunk)
 
-            content = _sanitize_generated_file_content(
-                request.file_path,
-                "".join(generated_chunks),
-            )
+            raw_content = "".join(generated_chunks)
 
             if request.file_path.startswith("scripts/"):
+                content = raw_content
                 last_error = ""
                 for attempt in range(_MAX_SCRIPT_REPAIR_ATTEMPTS + 1):
                     try:
+                        content = _sanitize_generated_file_content(request.file_path, content)
                         _trial_run_generated_script(skill_name, request.file_path, content)
                         last_error = ""
                         break
@@ -822,6 +834,8 @@ async def generate_file(request: GenerateFileRequest):
                             previous_content=content,
                             validation_error=last_error,
                         )
+            else:
+                content = _sanitize_generated_file_content(request.file_path, raw_content)
 
             yield _sse({"content": content})
             yield _sse({"done": True})

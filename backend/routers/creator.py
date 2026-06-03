@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.llm_proxy import complete_chat_once, stream_chat
-from ..services.model_router import route_creator_file_model
+from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
 from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
@@ -68,7 +68,7 @@ _MAX_HISTORY_TURNS = 6
 
 # Script generation can repair itself by sending trial-run failures back to the
 # same routed model before returning content to the frontend.
-_MAX_SCRIPT_REPAIR_ATTEMPTS = 5
+_MAX_SCRIPT_REPAIR_ATTEMPTS = 8
 _SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
@@ -593,19 +593,117 @@ async def _repair_generated_script_with_feedback(
     repair_messages.append({
         "role": "user",
         "content": (
-            f"上一次生成的 {file_path} 没有通过保存前静态校验/试运行。"
-            "请根据以下错误修复，并且只返回完整脚本源码，不要解释，不要 Markdown 代码块。\n"
+            f"上一次生成的 {file_path} 没有通过校验模型/静态校验/试运行。"
+            "请优先做局部修改：只修改校验意见指出的最小错误片段，保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
+            "修改完成后可以整合输出，但最终只能返回完整脚本源码；不要解释，不要 Markdown 代码块，不要多文件包，不要写 `写入文件：...`。\n"
             "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
             "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。\n\n"
             f"错误信息：\n{validation_error}"
         ),
     })
-    repaired = await complete_chat_once(repair_messages, model)
-    return _normalize_generated_file_content(file_path, repaired)
+    return await complete_chat_once(repair_messages, model)
+
+
+def _parse_validator_json_object(text: str) -> dict | None:
+    stripped = (text or "").strip()
+    if stripped.startswith("```json"):
+        stripped = stripped[7:].strip()
+    if stripped.startswith("```"):
+        stripped = stripped[3:].strip()
+    if stripped.endswith("```"):
+        stripped = stripped[:-3].strip()
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _run_generated_file_validator_round(
+    *,
+    file_path: str,
+    content: str,
+    deterministic_error: str,
+    requested_model: str,
+) -> dict:
+    """Ask the validator model for actionable repair feedback for the coder."""
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=f"creator generated file validation: {file_path}",
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator 生成文件校验模型，只输出严格 JSON object。"
+                "你不改代码，只给 coder 可执行的局部修复意见。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标文件：{file_path}\n"
+                "后端确定性校验/试运行错误：\n"
+                f"{deterministic_error}\n\n"
+                "候选内容：\n"
+                "```text\n"
+                f"{content[-12000:]}\n"
+                "```\n\n"
+                "请输出 JSON："
+                "{\"passed\": false, \"issues\": [\"...\"], "
+                "\"repair_instructions\": \"给 coder 的局部修改指令；若有 Markdown fence/多文件包，明确要求只返回目标脚本源码本身，不要 fence/说明/写入文件标签。\"}"
+            ),
+        },
+    ]
+    try:
+        text = await complete_chat_once(messages, route.model)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        logger.warning("Creator file validator failed; using deterministic feedback: %s", exc)
+        return {
+            "passed": False,
+            "issues": [deterministic_error],
+            "repair_instructions": deterministic_error,
+            "model": route.model,
+        }
+
+    data = _parse_validator_json_object(text)
+    if not data:
+        return {
+            "passed": False,
+            "issues": [deterministic_error],
+            "repair_instructions": deterministic_error,
+            "model": route.model,
+        }
+
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
+    return {
+        "passed": bool(data.get("passed", data.get("valid", False))) and not issues,
+        "issues": [str(item) for item in issues],
+        "repair_instructions": instructions,
+        "model": route.model,
+    }
+
+
+def _format_file_validator_feedback(deterministic_error: str, validator_report: dict) -> str:
+    issues = validator_report.get("issues") or []
+    issue_text = "\n".join(f"- {issue}" for issue in issues) if issues else "- （校验模型未返回额外问题）"
+    return (
+        "后端确定性校验/试运行错误：\n"
+        f"{deterministic_error}\n\n"
+        f"校验模型：{validator_report.get('model', '')}\n"
+        "校验模型问题列表：\n"
+        f"{issue_text}\n\n"
+        "校验模型给 coder 的修复意见：\n"
+        f"{validator_report.get('repair_instructions') or deterministic_error}"
+    )
 
 
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
-    """Strip benign wrappers from model output without enforcing validity."""
+    """Normalize generated non-script content while keeping scripts strict."""
+    if file_path.startswith("scripts/"):
+        return content.strip()
     extracted = _extract_target_file_from_bundle(content, file_path)
     return _strip_code_fence(extracted if extracted is not None else content)
 
@@ -797,6 +895,8 @@ async def generate_file(request: GenerateFileRequest):
     )
 
     async def event_stream():
+        last_validation_error = ""
+        repair_attempts = 0
         try:
             yield _sse({"model_ack": route.ack()})
             ack_payload = {}
@@ -823,10 +923,43 @@ async def generate_file(request: GenerateFileRequest):
                         last_error = ""
                         break
                     except ValueError as validation_exc:
-                        last_error = str(validation_exc)
+                        deterministic_error = str(validation_exc)
+                        validator_report = await _run_generated_file_validator_round(
+                            file_path=request.file_path,
+                            content=content,
+                            deterministic_error=deterministic_error,
+                            requested_model=model,
+                        )
+                        last_error = _format_file_validator_feedback(deterministic_error, validator_report)
+                        last_validation_error = last_error
                         if attempt >= _MAX_SCRIPT_REPAIR_ATTEMPTS:
+                            repair_attempts = attempt
+                            yield _sse({
+                                "validation": {
+                                    "status": "failed",
+                                    "attempt": attempt,
+                                    "error": deterministic_error,
+                                    "validator": validator_report,
+                                }
+                            })
                             raise
-                        yield _sse({"validation": {"status": "repairing", "attempt": attempt + 1, "error": last_error}})
+                        repair_attempts = attempt + 1
+                        logger.info(
+                            "repairing generated script skill=%s file=%s attempt=%s error=%s validator_issues=%s",
+                            skill_name,
+                            request.file_path,
+                            repair_attempts,
+                            deterministic_error,
+                            validator_report.get("issues"),
+                        )
+                        yield _sse({
+                            "validation": {
+                                "status": "repairing",
+                                "attempt": repair_attempts,
+                                "error": deterministic_error,
+                                "validator": validator_report,
+                            }
+                        })
                         content = await _repair_generated_script_with_feedback(
                             prompt_messages=prompt_messages,
                             model=model,
@@ -846,7 +979,15 @@ async def generate_file(request: GenerateFileRequest):
                 request.file_path,
             )
             # Return a safe user-facing message; full stack trace is in server logs.
-            yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
+            if last_validation_error:
+                yield _sse({
+                    "error": (
+                        f"文件内容生成失败：已自动修复 {repair_attempts} 次仍未通过。"
+                        f"最后错误：{last_validation_error}"
+                    )
+                })
+            else:
+                yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

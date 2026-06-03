@@ -53,7 +53,7 @@
           已写入 ({{ formatBytes(file.bytesWritten) }})
         </span>
         <span v-else-if="file.status === 'generating'" class="file-meta generating">
-          生成中…
+          {{ file.repairMessage || '生成中…' }}
         </span>
         <span v-else-if="file.status === 'writing'" class="file-meta">写入中…</span>
         <span v-else-if="file.status === 'error'" class="file-meta error">{{ file.error }}</span>
@@ -231,6 +231,7 @@ const localFiles = ref(
     bytesWritten: 0,
     error: '',
     showPreview: false,
+    repairMessage: '',
   }))
 )
 
@@ -351,6 +352,7 @@ function addFile() {
     bytesWritten: 0,
     error: '',
     showPreview: false,
+    repairMessage: '',
   })
   newFilePath.value = ''
   newFilePurpose.value = ''
@@ -374,6 +376,7 @@ async function generateOneFile(idx) {
   file.status = 'generating'
   file.error = ''
   file.generatedContent = ''
+  file.repairMessage = ''
 
   try {
     for await (const chunk of generateFileStream({
@@ -388,6 +391,9 @@ async function generateOneFile(idx) {
         file.generatedContent += chunk
       } else if (chunk?.done) {
         break
+      } else if (chunk?.validation) {
+        const statusText = chunk.validation.status === 'failed' ? '自动修复失败' : '自动修复中'
+        file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
       } else if (chunk?.error) {
         throw new Error(chunk.error)
       }
@@ -397,6 +403,7 @@ async function generateOneFile(idx) {
       throw new Error('模型未返回任何内容，请重试或手动填写')
     }
 
+    file.repairMessage = ''
     file.status = 'preview'
   } catch (err) {
     file.status = 'error'

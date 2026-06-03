@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from ..config import settings
+from ..config import PROJECT_ROOT, settings
 from ..services.kernel_loader import (
     load_child_skill_body_prompt,
     load_skill_body_prompt,
@@ -1668,6 +1668,7 @@ def _execute_single_task(
             "LLM_BASE_URL": settings.llm_base_url,
             "DEFAULT_MODEL": settings.default_model,
             "IMAGE_BASE_URL": settings.image_base_url,
+            "IMAGE_API_KEY": settings.image_api_key or os.environ.get("IMAGE_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "ollama",
             "IMAGE_SIZE": settings.image_size,
             "TEXT_MODEL": settings.text_model or settings.default_model,
             "CODE_MODEL": settings.code_model or settings.default_model,
@@ -1675,6 +1676,9 @@ def _execute_single_task(
             "VISION_MODEL": settings.vision_model or settings.default_model,
             "PLANNER_MODEL": settings.planner_model or settings.default_model,
             "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
+            "PYTHONPATH": os.pathsep.join(
+                part for part in [str(PROJECT_ROOT), os.environ.get("PYTHONPATH", "")] if part
+            ),
         }
         api_key = (
             settings.llm_api_key

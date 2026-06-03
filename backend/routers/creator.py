@@ -354,7 +354,8 @@ _CONFIGURED_MODEL_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 _CREATOR_FLOW_LEAK_RE = re.compile(
-    r"点击[‘'\"]?开始创建|开始生成文件|确认项列表|系统将自动创建|自动创建以下文件|"
+    r"点击\s*(?:\*\*)?[‘'\"“”]?开始创建[’'\"“”]?(?:\*\*)?|开始生成文件|文件清单预览|确认无误后|"
+    r"你也可以在创建后继续编辑内容|确认项列表|系统将自动创建|自动创建以下文件|"
     r"创建文件面板|文件创建面板|若当前无误|已预置|所有路径与命名与蓝图一致|"
     r"不包含任何隐藏逻辑或隐式执行|输出格式符合 Markdown 标准，支持宿主解析",
     re.IGNORECASE,
@@ -1075,13 +1076,21 @@ async def _repair_generated_file_with_feedback(
             "</previous_content>"
         ),
     })
+    edit_strategy = (
+        "这是 scripts/ 首次失败后的严格重写：不要走 minimal_edit，不要修补错误外壳；"
+        "请根据合同、蓝图和骨架重新输出完整可运行源码。"
+        if is_script and repair_mode == "strict_contract_rewrite"
+        else (
+            "请优先做局部修改：只修改校验意见指出的最小错误片段，"
+            f"{local_edit_scope}"
+            "修改完成后可以整合输出。"
+        )
+    )
     repair_messages.append({
         "role": "user",
         "content": (
             f"上一次生成的 {file_path} 没有通过校验模型/静态校验/试运行。"
-            "请优先做局部修改：只修改校验意见指出的最小错误片段，"
-            f"{local_edit_scope}"
-            "修改完成后可以整合输出。"
+            f"{edit_strategy}"
             f"{output_contract}\n"
             f"{extra_rules}\n\n"
             f"错误信息：\n{validation_error}"
@@ -1556,6 +1565,64 @@ def _strip_code_fence(content: str) -> str:
     return stripped
 
 
+
+
+def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: str) -> str:
+    """Return a fixed Python script scaffold for script generation prompts."""
+    if Path(file_path).suffix.lower() != ".py":
+        return ""
+
+    context = f"{file_path}\n{purpose}\n{blueprint_text}"
+    needs_image = bool(re.search(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration", context, re.IGNORECASE))
+    if needs_image:
+        return (
+            "必须使用下面的图片脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() "
+            "中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
+            "import json\n"
+            "import sys\n"
+            "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        raise SystemExit('missing JSON argument')\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def build_image_prompt(payload: dict) -> str:\n"
+            "    # Derive a concrete prompt from payload keys required by the blueprint.\n"
+            "    topic = str(payload.get('topic') or payload.get('prompt') or '').strip()\n"
+            "    if not topic:\n"
+            "        raise SystemExit('missing topic/prompt')\n"
+            "    return topic\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    prompt = build_image_prompt(payload)\n"
+            "    result = generate_stable_diffusion_image(prompt, filename_prefix='generated')\n"
+            "    image_path = result.get('image_path') if isinstance(result, dict) else str(result)\n"
+            "    return {'image_path': image_path, 'prompt': prompt}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    return (
+        "必须使用下面的业务逻辑脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() "
+        "中的真实业务逻辑并按蓝图使用 payload 字段：\n"
+        "import json\n"
+        "import sys\n\n"
+        "def parse_args() -> dict:\n"
+        "    if len(sys.argv) < 2:\n"
+        "        raise SystemExit('missing JSON argument')\n"
+        "    return json.loads(sys.argv[1])\n\n"
+        "def run(payload: dict) -> dict:\n"
+        "    # Implement the real deterministic business logic required by the blueprint.\n"
+        "    # Use payload keys instead of hard-coded example outputs.\n"
+        "    return {'text': ''}\n\n"
+        "def main() -> None:\n"
+        "    payload = parse_args()\n"
+        "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()"
+    )
+
 def _build_generate_file_prompt(
     file_path: str,
     skill_name: str,
@@ -1576,6 +1643,7 @@ def _build_generate_file_prompt(
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
     generated_file_contract_text = _build_generated_file_contract_text(file_path, blueprint_text, purpose)
     skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
+    script_skeleton_text = _script_generation_skeleton(file_path, purpose, blueprint_text) if file_path.startswith("scripts/") else ""
 
     if file_path == "SKILL.md":
         instruction = (
@@ -1618,10 +1686,13 @@ def _build_generate_file_prompt(
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 应输出结构化 JSON（例如 {\"text\": ..., \"image_path\": ...}），不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
+            "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
+            "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
+            f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
-            f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
+            f"以下是已确认的蓝图（scripts/ 生成不会追加聊天历史，只使用本蓝图）：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("references/"):
         instruction = (
@@ -1656,6 +1727,13 @@ def _build_generate_file_prompt(
         )
 
     messages: list[dict] = [{"role": "system", "content": instruction}]
+
+    if file_path.startswith("scripts/"):
+        # Scripts are generated from the system instruction plus the confirmed
+        # blueprint only.  Do not append conversation history: recent Creator UI
+        # copy (file-list previews, confirmation instructions, panel messages)
+        # has repeatedly polluted first-pass script output.
+        return messages
 
     # Include recent user context but skip Creator UI confirmation text. Assistant
     # blueprint confirmations often contain "click Start" operational prose that
@@ -1805,7 +1883,11 @@ async def generate_file(request: GenerateFileRequest):
                     except ValueError as validation_exc:
                         deterministic_error = str(validation_exc)
                         repeated_error_counts[deterministic_error] = repeated_error_counts.get(deterministic_error, 0) + 1
-                        repair_mode = "strict_contract_rewrite" if repeated_error_counts[deterministic_error] >= 2 else "minimal_edit"
+                        first_attempt_failed = attempt == 0
+                        if request.file_path.startswith("scripts/") and first_attempt_failed:
+                            repair_mode = "strict_contract_rewrite"
+                        else:
+                            repair_mode = "strict_contract_rewrite" if repeated_error_counts[deterministic_error] >= 2 else "minimal_edit"
                         contract_results = (
                             validation_exc.results
                             if isinstance(validation_exc, ContractValidationError)

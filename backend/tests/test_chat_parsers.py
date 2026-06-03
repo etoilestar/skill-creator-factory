@@ -1603,6 +1603,25 @@ def test_creator_sanitize_accepts_single_wrapping_script_fence():
     assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
 
 
+def test_creator_sanitize_accepts_text_wrapped_script_fence():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```text\r\nimport json\nprint(json.dumps({'ok': True}))\n````"
+
+    assert (
+        _sanitize_generated_file_content("scripts/main.py", content)
+        == "import json\nprint(json.dumps({'ok': True}))"
+    )
+
+
+def test_creator_sanitize_accepts_nested_whole_response_script_fences():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    content = "```text\n```python\nprint('ok')\n```\n```"
+
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+
+
 def test_creator_sanitize_rejects_invalid_wrapping_script_fence():
     import pytest
 

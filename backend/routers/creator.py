@@ -852,12 +852,32 @@ def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
 
 
 def _extract_single_wrapping_fence(content: str) -> str | None:
-    """Extract a code block only when it wraps the entire model response."""
-    stripped = content.strip()
-    match = re.match(r"^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1\s*$", stripped)
-    if not match:
+    """Extract a code block only when it wraps the entire model response.
+
+    Models often wrap repaired scripts in ```text fences, sometimes with CRLF
+    line endings or a closing fence that is longer than the opener.  This parser
+    intentionally accepts only a whole-response fence: any prose before/after the
+    block, or any non-fence trailing line, returns None and lets validation reject
+    the ambiguous output.
+    """
+    stripped = content.strip().lstrip("\ufeff")
+    lines = stripped.splitlines()
+    if len(lines) < 2:
         return None
-    return match.group(2).strip()
+
+    opening = lines[0].strip()
+    opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+    if not opening_match:
+        return None
+
+    fence = opening_match.group(1)
+    fence_char = fence[0]
+    min_fence_len = len(fence)
+    closing = lines[-1].strip()
+    if not re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+        return None
+
+    return "\n".join(lines[1:-1]).strip()
 
 
 def _normalize_generated_file_content(file_path: str, content: str) -> str:
@@ -865,12 +885,16 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     if file_path.startswith("scripts/"):
         stripped = content.strip()
 
-        # Low-risk deterministic recovery for common coder behavior: accept only
-        # one fenced code block wrapping the entire response.  We deliberately do
-        # not extract scripts from multi-file bundles or prose, because those
-        # responses are ambiguous and should be repaired by the model instead.
-        wrapping_fence = _extract_single_wrapping_fence(stripped)
-        if wrapping_fence is not None:
+        # Low-risk deterministic recovery for common coder behavior: peel only
+        # whole-response fences.  A repeated pass handles responses like
+        # ```text wrapping a complete ```python block, but we deliberately do not
+        # extract scripts from multi-file bundles or prose because those responses
+        # are ambiguous and should be repaired by the model instead.
+        normalized = stripped
+        for _ in range(3):
+            wrapping_fence = _extract_single_wrapping_fence(normalized)
+            if wrapping_fence is None:
+                break
             normalized = wrapping_fence.strip()
             if _is_valid_normalized_script_source(file_path, normalized):
                 return normalized

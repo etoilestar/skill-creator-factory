@@ -576,12 +576,106 @@ def test_creator_phase_guess_accepts_continue_build_confirmation():
     assert _guess_current_phase(messages) == "phase3+"
 
 
-def test_strip_phase3_marker_from_visible_creator_text():
-    from backend.routers.creator_chat import _strip_phase3_marker_from_visible_text
 
-    text = "蓝图内容\n{\"creator_phase\":\"phase3_start\"}\n后续文字"
 
-    assert _strip_phase3_marker_from_visible_text(text) == "蓝图内容\n后续文字"
+def test_creator_phase_guess_ignores_model_phase3_json_without_blueprint():
+    from backend.routers.creator_chat import _guess_current_phase
+
+    messages = [
+        {"role": "assistant", "content": "问题: \"这是我理解的你的需求，对吗？\""},
+        {"role": "user", "content": "对，开始做吧"},
+        {"role": "assistant", "content": '{"phase3_start": true, "skill_name": "demo"}'},
+    ]
+
+    # Model-emitted startup JSON is not a phase signal anymore.  Without a real
+    # blueprint, the backend must return to Phase 2 and ask for blueprint
+    # confirmation instead of executing.
+    assert _guess_current_phase(messages) == "phase2"
+
+
+def test_creator_phase_guess_enters_phase3_only_after_confirmed_blueprint():
+    from backend.routers.creator_chat import _guess_current_phase
+
+    messages = [
+        {"role": "assistant", "content": "## 📋 Skill 架构蓝图\n### 基本信息\n- **Skill 名称**: demo"},
+        {"role": "user", "content": "对，开始做吧"},
+    ]
+
+    assert _guess_current_phase(messages) == "phase3+"
+
+
+def test_creator_conversation_invalid_phase_json_is_validated_and_retried(monkeypatch, tmp_path):
+    import asyncio
+    import json
+
+    import backend.routers.creator_chat as creator_chat
+    from backend.routers.chat_models import ChatRequest
+
+    outputs = iter([
+        '{"phase3_start": true, "skill_name": "generate-epic-fantasy-story"}',
+        '## 📋 Skill 架构蓝图\n### 基本信息\n- **Skill 名称**: generate-epic-fantasy-story\n```text\n问题: "请确认是否接受当前生成的 Skill 蓝图？"\n选项:\n- "对，开始做吧"\n- "大体对，但有些地方要改"\n- "不对，我重新说一下"\n```',
+    ])
+    seen_prompts = []
+
+    async def fake_stream_chat(messages, model):
+        seen_prompts.append(messages)
+        yield next(outputs)
+
+    async def fake_complete_chat_once(messages, model):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("deterministic_issues"):
+            return json.dumps({"valid": False, "issues": payload["deterministic_issues"]}, ensure_ascii=False)
+        return '{"valid": true, "issues": []}'
+
+    monkeypatch.setattr(creator_chat, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fake_complete_chat_once)
+
+    request = ChatRequest(messages=[
+        {"role": "assistant", "content": "问题: \"这是我理解的你的需求，对吗？\""},
+        {"role": "user", "content": "对，开始做吧"},
+    ])
+
+    async def collect():
+        return [
+            item async for item in creator_chat._execute_conversation_mode(
+                final_messages=[{"role": "system", "content": "phase2 prompt"}],
+                model="text-model",
+                current_phase="phase2",
+                request=request,
+                execution_root=tmp_path,
+                parent_skill_name="kernel",
+            )
+        ]
+
+    events = asyncio.run(collect())
+    serialized = "".join(events)
+
+    assert "phase3_start" not in serialized
+    assert "## 📋 Skill 架构蓝图" in serialized
+    assert len(seen_prompts) == 2
+    assert "违反 Creator Phase 1/2 格式契约" in seen_prompts[1][-1]["content"]
+
+
+def test_creator_phase3_format_validator_rejects_start_json(monkeypatch):
+    import asyncio
+    import json
+
+    import backend.routers.creator_chat as creator_chat
+
+    async def fake_complete_chat_once(messages, model):
+        payload = json.loads(messages[-1]["content"])
+        return json.dumps({"passed": False, "issues": payload["deterministic_issues"]}, ensure_ascii=False)
+
+    monkeypatch.setattr(creator_chat, "complete_chat_once", fake_complete_chat_once)
+
+    report = asyncio.run(creator_chat._run_creator_phase3_format_validator_round(
+        assistant_text='{"phase3_start": true, "skill_name": "demo"}',
+        model="code-model",
+    ))
+
+    assert report["passed"] is False
+    assert any("阶段启动 JSON" in issue for issue in report["issues"])
+    assert any("没有可执行动作块" in issue for issue in report["issues"])
 
 
 def test_request_messages_with_inline_images_builds_data_url(tmp_path):

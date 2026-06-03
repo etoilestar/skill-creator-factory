@@ -13,6 +13,7 @@ These endpoints decouple the file-creation phase from the main
 
 import ast
 import json
+from dataclasses import dataclass
 import logging
 import re
 import shlex
@@ -350,33 +351,185 @@ def _reject_creator_flow_leak(content: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class ContractCheckResult:
+    id: str
+    passed: bool
+    target: str
+    message: str
+    expected: str
+    minimal_edit: str
+
+
+class ContractValidationError(ValueError):
+    """Validation error carrying structured contract check results."""
+
+    def __init__(self, message: str, results: list[ContractCheckResult]):
+        super().__init__(message)
+        self.results = results
+
+
+def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
+    """Infer stable JSON argv keys from the blueprint for a script path."""
+    lowered = (blueprint_text or "").lower()
+    key_candidates = ["topic", "prompt", "text", "keywords"]
+    keys = [key for key in key_candidates if key in lowered]
+    if not keys:
+        keys = ["topic"]
+    return keys[:3]
+
+
+def _script_command_template(script_path: str, blueprint_text: str) -> str:
+    keys = _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
+    payload = json.dumps({key: f"{{{{{key}}}}}" for key in keys}, ensure_ascii=False)
+    return f"python {script_path} '{payload}'"
+
+
+def _build_skill_md_contract_text(blueprint_text: str) -> str:
+    """Build the explicit SKILL.md contract injected before generation/repair."""
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
+
+    lines = [
+        "必须满足以下 SKILL.md 合同，逐项覆盖：",
+        "A. frontmatter:",
+        "- 必须以 --- 开始。",
+        "- 必须包含 name 和 description。",
+        "- 必须用 --- 关闭 frontmatter。",
+        "B. scripts 命令块:",
+    ]
+    if script_paths:
+        for script_path in script_paths:
+            keys = ", ".join(_infer_script_input_keys_from_blueprint(script_path, blueprint_text))
+            lines.extend([
+                "- 必须包含一个普通 Markdown ```bash fenced code block。",
+                f"- block 内必须出现精确路径：{script_path}",
+                f"- 命令必须使用 JSON argv，占位符 keys：{keys}。",
+                f"- 推荐命令模板：{_script_command_template(script_path, blueprint_text)}",
+            ])
+    else:
+        lines.append("- 蓝图没有 scripts/，不要强行写脚本命令。")
+
+    lines.append("C. references 引用:")
+    if reference_paths:
+        for reference_path in reference_paths:
+            lines.append(f"- 必须在正文中出现并说明用途：{reference_path}")
+    else:
+        lines.append("- 蓝图没有 references/，不要强行编造参考资料。")
+
+    lines.extend([
+        "D. 禁止项:",
+        "- 不要包含 Runtime Contract JSON。",
+        "- 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等平台流程文案。",
+    ])
+    return "\n".join(lines)
+
+
+def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
+    """Return structured SKILL.md contract checks for generation and repair."""
+    stripped = content.strip()
+    results: list[ContractCheckResult] = []
+
+    has_frontmatter = bool(re.match(r"^---\nname: [^\n]+\ndescription: [^\n]+\n---\n", stripped))
+    results.append(ContractCheckResult(
+        id="skill_md.frontmatter",
+        passed=has_frontmatter,
+        target="SKILL.md",
+        message=(
+            "SKILL.md frontmatter 合格。" if has_frontmatter
+            else "SKILL.md 必须以 YAML frontmatter 开始，且包含 name 和 description：--- / name: ... / description: ... / ---。"
+        ),
+        expected="文件以 --- / name: ... / description: ... / --- 开头。",
+        minimal_edit="修正文件开头的 YAML frontmatter，不要改动正文其它已通过内容。",
+    ))
+
+    has_runtime_contract = bool(_SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_runtime_contract",
+        passed=not has_runtime_contract,
+        target="SKILL.md",
+        message=(
+            "未包含自定义 Runtime Contract JSON 协议。" if not has_runtime_contract
+            else "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
+        ),
+        expected="不要包含 Runtime Contract JSON。",
+        minimal_edit="删除 Runtime Contract JSON/协议小节，改为普通 Markdown 说明。",
+    ))
+
+    has_creator_flow = bool(_CREATOR_FLOW_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_creator_flow",
+        passed=not has_creator_flow,
+        target="SKILL.md",
+        message=(
+            "未包含 Creator 界面流程文案。" if not has_creator_flow
+            else "SKILL.md 包含 Creator 界面流程/确认清单文本（例如“点击开始创建”“确认项列表”“系统将自动创建”），这是平台创建流程泄露，不属于 Skill 使用说明。"
+        ),
+        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        minimal_edit="删除 Creator UI/确认清单/点击开始创建相关文案，只保留 Skill 使用说明。",
+    ))
+
+    for script_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/"):
+        commands = _extract_script_command_templates(content, script_path)
+        passed = bool(commands)
+        template = _script_command_template(script_path, blueprint_text)
+        results.append(ContractCheckResult(
+            id="skill_md.script_command.exists",
+            passed=passed,
+            target=script_path,
+            message=(
+                f"SKILL.md 已包含调用 {script_path} 的可执行 Markdown 命令块。" if passed
+                else f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块。请在正文中加入 ```bash fenced code block，并在其中给出与脚本接口一致的 python scripts/... 命令示例。"
+            ),
+            expected=f"一个 ```bash fenced code block，block 内包含精确脚本路径 {script_path}。推荐命令：{template}",
+            minimal_edit=f"在执行/运行脚本小节加入命令块：```bash\n{template}\n```",
+        ))
+
+    for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
+        passed = reference_path in content
+        results.append(ContractCheckResult(
+            id="skill_md.reference.mentioned",
+            passed=passed,
+            target=reference_path,
+            message=(
+                f"SKILL.md 已引用参考资料 {reference_path}。" if passed
+                else f"SKILL.md 缺少对参考资料 {reference_path} 的引用。请在“参考资料/资源”小节用普通 Markdown 明确说明何时读取该 reference。"
+            ),
+            expected=f"正文中逐字出现 {reference_path} 并说明用途/何时读取。",
+            minimal_edit=f"在参考资料/资源小节加入 `{reference_path}` 及其用途说明。",
+        ))
+
+    return results
+
+
+def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool) -> str:
+    selected = [result for result in results if result.passed is passed]
+    if not selected:
+        return "- 无"
+    return "\n".join(
+        f"- {result.id} target={result.target}: {result.message}\n"
+        f"  expected: {result.expected}\n"
+        f"  minimal_edit: {result.minimal_edit}"
+        for result in selected
+    )
+
+
+def _format_contract_failures(results: list[ContractCheckResult]) -> str:
+    failed = [result for result in results if not result.passed]
+    if not failed:
+        return ""
+    return (
+        "SKILL.md contract 未通过：\n"
+        + _format_contract_checks(failed, passed=False)
+    )
+
+
 def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
     """Validate generated SKILL.md against blueprint-declared resources."""
-    _reject_custom_skill_md_protocol(content)
-    _reject_creator_flow_leak(content)
-
-    if not re.match(r"^---\nname: [^\n]+\ndescription: [^\n]+\n---\n", content.strip()):
-        raise ValueError(
-            "SKILL.md 必须以 YAML frontmatter 开始，且包含 name 和 description："
-            "--- / name: ... / description: ... / ---。"
-        )
-
-    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
-    for script_path in script_paths:
-        commands = _extract_script_command_templates(content, script_path)
-        if not commands:
-            raise ValueError(
-                f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块。"
-                "请在正文中加入 ```bash fenced code block，并在其中给出与脚本接口一致的 python scripts/... 命令示例。"
-            )
-
-    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
-    for reference_path in reference_paths:
-        if reference_path not in content:
-            raise ValueError(
-                f"SKILL.md 缺少对参考资料 {reference_path} 的引用。"
-                "请在“参考资料/资源”小节用普通 Markdown 明确说明何时读取该 reference。"
-            )
+    results = _check_skill_md_contract(content, blueprint_text)
+    failed = [result for result in results if not result.passed]
+    if failed:
+        raise ContractValidationError(_format_contract_failures(results), results)
 
 
 def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> None:
@@ -676,6 +829,11 @@ async def _repair_generated_file_with_feedback(
     file_path: str,
     previous_content: str,
     validation_error: str,
+    targeted_repair: str = "",
+    contract_text: str = "",
+    passed_checks_text: str = "",
+    failed_checks_text: str = "",
+    repair_mode: str = "minimal_edit",
 ) -> str:
     """Ask the routed generation model to fix one file using validator feedback.
 
@@ -729,6 +887,12 @@ async def _repair_generated_file_with_feedback(
             f"{output_contract}\n"
             f"{extra_rules}\n\n"
             f"错误信息：\n{validation_error}"
+            + (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else "")
+            + (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else "")
+            + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
+            + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
+            + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
+            + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
     })
     return await complete_chat_once(repair_messages, model)
@@ -749,12 +913,63 @@ def _parse_validator_json_object(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+_MISSING_SKILL_SCRIPT_BLOCK_RE = re.compile(
+    r"SKILL\.md 缺少调用 (?P<script>scripts/[A-Za-z0-9_./-]+) 的可执行 Markdown 命令块"
+)
+_MISSING_SKILL_REFERENCE_RE = re.compile(
+    r"SKILL\.md 缺少对参考资料 (?P<reference>references/[A-Za-z0-9_./-]+) 的引用"
+)
+
+
+def _targeted_generated_file_repair_instructions(*, file_path: str, deterministic_error: str) -> str:
+    """Return deterministic, actionable instructions for recurring validation failures."""
+    if file_path == "SKILL.md":
+        script_match = _MISSING_SKILL_SCRIPT_BLOCK_RE.search(deterministic_error)
+        if script_match:
+            script_path = script_match.group("script")
+            return (
+                f"必须在 SKILL.md 正文中加入一个真实的 bash fenced code block，且 block 内必须逐字包含 `{script_path}`。\n"
+                "注意：‘不要在文件外层套 Markdown 代码块’不等于禁止 SKILL.md 正文内部的命令示例；"
+                "这个内部 ```bash block 是校验必需内容。\n"
+                "请使用平台占位符 `{{topic}}`，不要使用 shell 变量 `${topic}`。\n"
+                "可直接插入如下命令示例，并围绕它补充参数说明：\n"
+                "```bash\n"
+                f"python {script_path} " "'{\"topic\":\"{{topic}}\"}'" "\n"
+                "```"
+            )
+
+        reference_match = _MISSING_SKILL_REFERENCE_RE.search(deterministic_error)
+        if reference_match:
+            reference_path = reference_match.group("reference")
+            return (
+                f"必须在 SKILL.md 的参考资料/资源小节逐字引用 `{reference_path}`，"
+                "并说明何时读取该 reference；不要只泛称‘参考资料’。"
+            )
+
+        if "Creator 界面流程" in deterministic_error:
+            return (
+                "删除 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等 UI 文案；"
+                "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
+            )
+
+    if file_path.startswith("scripts/") and "Markdown 代码块或多文件包" in deterministic_error:
+        return (
+            "只返回单个脚本源码本身；不要输出说明文字、文件路径标题、写入文件标签、Markdown fence 或多文件包。"
+        )
+
+    return ""
+
 async def _run_generated_file_validator_round(
     *,
     file_path: str,
     content: str,
     deterministic_error: str,
     requested_model: str,
+    targeted_repair: str = "",
+    contract_text: str = "",
+    passed_checks_text: str = "",
+    failed_checks_text: str = "",
+    repair_mode: str = "minimal_edit",
 ) -> dict:
     """Ask the validator model for actionable repair feedback for the coder."""
     route = route_model(
@@ -776,13 +991,20 @@ async def _run_generated_file_validator_round(
                 f"目标文件：{file_path}\n"
                 "后端确定性校验/试运行错误：\n"
                 f"{deterministic_error}\n\n"
-                "候选内容：\n"
+                + (f"完整 contract：\n{contract_text}\n\n" if contract_text else "")
+                + (f"已通过检查（repair 时必须保留）：\n{passed_checks_text}\n\n" if passed_checks_text else "")
+                + (f"未通过检查（repair 只修这些项）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
+                + (f"本轮修复模式：{repair_mode}\n\n" if repair_mode else "")
+                + (f"后端根据该错误生成的必做修复步骤：\n{targeted_repair}\n\n" if targeted_repair else "")
+                + "候选内容：\n"
                 "```text\n"
                 f"{content[-12000:]}\n"
                 "```\n\n"
                 "请输出 JSON："
                 "{\"passed\": false, \"issues\": [\"...\"], "
-                "\"repair_instructions\": \"给 coder 的局部修改指令；若有 Markdown fence/多文件包，明确要求只返回目标脚本源码本身，不要 fence/说明/写入文件标签。\"}"
+                "\"failed_checks\": [{\"id\": \"...\", \"target\": \"...\", \"expected\": \"...\", \"minimal_edit\": \"...\"}], "
+                "\"preserve\": [\"已通过检查对应内容\"], "
+                "\"repair_instructions\": \"给 coder 的局部修改指令；如果上方有必做修复步骤，必须复述并细化这些步骤，不得改用其它占位符或省略必需的 fenced block。若有 Markdown fence/多文件包，明确要求只返回目标脚本源码本身，不要 fence/说明/写入文件标签。\"}"
             ),
         },
     ]
@@ -807,24 +1029,36 @@ async def _run_generated_file_validator_round(
         }
 
     issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
+    preserve = data.get("preserve") if isinstance(data.get("preserve"), list) else []
     instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
     return {
-        "passed": bool(data.get("passed", data.get("valid", False))) and not issues,
+        "passed": bool(data.get("passed", data.get("valid", False))) and not issues and not failed_checks,
         "issues": [str(item) for item in issues],
+        "failed_checks": failed_checks,
+        "preserve": [str(item) for item in preserve],
         "repair_instructions": instructions,
         "model": route.model,
     }
 
 
-def _format_file_validator_feedback(deterministic_error: str, validator_report: dict) -> str:
+def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
     issues = validator_report.get("issues") or []
     issue_text = "\n".join(f"- {issue}" for issue in issues) if issues else "- （校验模型未返回额外问题）"
+    failed_checks = validator_report.get("failed_checks") or []
+    failed_check_text = (
+        "\n".join(f"- {json.dumps(check, ensure_ascii=False)}" for check in failed_checks)
+        if failed_checks else "- （校验模型未返回结构化 failed_checks）"
+    )
     return (
         "后端确定性校验/试运行错误：\n"
         f"{deterministic_error}\n\n"
-        f"校验模型：{validator_report.get('model', '')}\n"
+        + (f"后端确定性修复指令：\n{targeted_repair}\n\n" if targeted_repair else "")
+        + f"校验模型：{validator_report.get('model', '')}\n"
         "校验模型问题列表：\n"
         f"{issue_text}\n\n"
+        "校验模型结构化 failed_checks：\n"
+        f"{failed_check_text}\n\n"
         "校验模型给 coder 的修复意见：\n"
         f"{validator_report.get('repair_instructions') or deterministic_error}"
     )
@@ -995,6 +1229,7 @@ def _build_generate_file_prompt(
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
     declared_paths = _extract_declared_skill_paths(blueprint_text)
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
+    skill_md_contract_text = _build_skill_md_contract_text(blueprint_text) if file_path == "SKILL.md" else ""
 
     if file_path == "SKILL.md":
         instruction = (
@@ -1015,6 +1250,8 @@ def _build_generate_file_prompt(
             "9. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
             "10. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
+            "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
+            f"{skill_md_contract_text}\n\n"
             f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
         )
@@ -1174,6 +1411,8 @@ async def generate_file(request: GenerateFileRequest):
             if should_repair:
                 content = raw_content
                 last_error = ""
+                repeated_error_counts: dict[str, int] = {}
+                contract_text = _build_skill_md_contract_text(request.blueprint_text) if request.file_path == "SKILL.md" else ""
                 for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
                         content = _sanitize_generated_file_content(request.file_path, content)
@@ -1185,13 +1424,31 @@ async def generate_file(request: GenerateFileRequest):
                         break
                     except ValueError as validation_exc:
                         deterministic_error = str(validation_exc)
+                        repeated_error_counts[deterministic_error] = repeated_error_counts.get(deterministic_error, 0) + 1
+                        repair_mode = "strict_contract_rewrite" if repeated_error_counts[deterministic_error] >= 2 else "minimal_edit"
+                        contract_results = (
+                            validation_exc.results
+                            if isinstance(validation_exc, ContractValidationError)
+                            else []
+                        )
+                        passed_checks_text = _format_contract_checks(contract_results, passed=True) if contract_results else ""
+                        failed_checks_text = _format_contract_checks(contract_results, passed=False) if contract_results else ""
+                        targeted_repair = _targeted_generated_file_repair_instructions(
+                            file_path=request.file_path,
+                            deterministic_error=deterministic_error,
+                        )
                         validator_report = await _run_generated_file_validator_round(
                             file_path=request.file_path,
                             content=content,
                             deterministic_error=deterministic_error,
                             requested_model=model,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
                         )
-                        last_error = _format_file_validator_feedback(deterministic_error, validator_report)
+                        last_error = _format_file_validator_feedback(deterministic_error, validator_report, targeted_repair)
                         last_validation_error = last_error
                         if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                             repair_attempts = attempt
@@ -1227,6 +1484,11 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                             previous_content=content,
                             validation_error=last_error,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
                         )
             else:
                 content = _sanitize_generated_file_content(request.file_path, raw_content)

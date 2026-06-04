@@ -2467,14 +2467,76 @@ def test_creator_asset_contract_extension_aware_formats():
 
     from backend.routers.creator import _validate_asset_file_contract, ContractValidationError
 
-    _validate_asset_file_contract("assets/table.csv", "name,value\na,1\n")
-    _validate_asset_file_contract("assets/doc.pdf", "%PDF-1.4\n% test\n")
+    _validate_asset_file_contract("assets/table.csv", "name,value\na,1\nb,2\n")
+    _validate_asset_file_contract("assets/doc.pdf", "%PDF-1.4\n" + "% test body\n" * 12 + "%%EOF\n")
+    png_64_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + (64).to_bytes(4, "big")
+        + (64).to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
     _validate_asset_file_contract(
         "assets/pixel.png",
-        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode("ascii"),
+        base64.b64encode(png_64_header + b"0" * 32).decode("ascii"),
     )
 
     with pytest.raises(ContractValidationError, match="CSV 必须包含非空表头"):
         _validate_asset_file_contract("assets/table.csv", "onlyheader\n")
     with pytest.raises(ContractValidationError, match="必须以 %PDF-"):
         _validate_asset_file_contract("assets/doc.pdf", "not a pdf")
+
+
+def test_blueprint_plan_parses_multiline_skillplan_role_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: composite-demo
+- scripts/：创建 `scripts/build.py`
+
+### SkillPlan / 文件职责计划
+- path: `scripts/build.py`
+  role: pdf_builder
+  inputs: [text]
+  outputs: [pdf_path, file_paths]
+  dependencies: [references/layout.md]
+  required_capabilities: [pdf_generation, file_output]
+  forbidden_capabilities: [image_generation]
+  references: [references/layout.md]
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/build.py")
+
+    assert entry.role == "pdf_builder"
+    assert "pdf_path" in entry.outputs
+    assert "image_generation" in entry.forbidden_capabilities
+
+
+def test_creator_write_file_request_accepts_role_contract_fields():
+    from backend.routers.creator import WriteFileRequest
+
+    request = WriteFileRequest(
+        skill_name="demo",
+        file_path="scripts/build.py",
+        content="print('{}')",
+        role="pdf_builder",
+        skill_plan_entry={"path": "scripts/build.py", "role": "pdf_builder"},
+    )
+
+    assert request.role == "pdf_builder"
+    assert request.skill_plan_entry["role"] == "pdf_builder"
+
+
+def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
+    from backend.routers.creator import _script_generation_skeleton
+
+    skeleton = _script_generation_skeleton(
+        "scripts/build_pdf.py",
+        "build report PDF",
+        "scripts/build_pdf.py role: pdf_builder",
+        role="pdf_builder",
+    )
+
+    assert "from fpdf import FPDF" in skeleton
+    assert "pdf.output" in skeleton
+    assert "write_bytes(b'%PDF-1.4" not in skeleton

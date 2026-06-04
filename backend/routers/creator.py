@@ -163,6 +163,8 @@ class FileSpecOut(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)
     reference_files: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    low_confidence: bool = False
     confidence: float = 0.0
     reason: str = ""
     heuristic_signals: list[str] = Field(default_factory=list)
@@ -199,6 +201,8 @@ class WriteFileRequest(BaseModel):
     skill_name: str
     file_path: str
     content: str
+    role: Optional[str] = None
+    skill_plan_entry: Optional[dict[str, Any]] = None
 
 
 class WriteFileResponse(BaseModel):
@@ -694,7 +698,11 @@ def _build_script_file_contract_text(
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
     entry = _skill_plan_entry_for_file(
-        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
     )
     keys = ", ".join(_infer_script_input_keys_from_blueprint(file_path, blueprint_text))
     lines = [
@@ -897,9 +905,9 @@ def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, st
     if ext == ".csv":
         rows = list(csv.reader(io.StringIO(stripped)))
         header = rows[0] if rows else []
-        if len(rows) < 2 or not header or any(not cell.strip() for cell in header):
-            return False, f"{file_path} CSV 必须包含非空表头和至少一行数据。", "CSV asset 必须包含 header 和至少一行数据。"
-        return True, "CSV asset 包含表头和数据行。", "CSV asset 必须包含 header 和至少一行数据。"
+        if len(rows) < 3 or not header or any(not cell.strip() for cell in header):
+            return False, f"{file_path} CSV 必须包含非空表头和至少 2 行数据。", "CSV asset 必须包含 header 和至少 2 行数据。"
+        return True, "CSV asset 包含表头和至少 2 行数据。", "CSV asset 必须包含 header 和至少 2 行数据。"
     if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
         data = stripped.encode("latin1", errors="ignore")
         if re.fullmatch(r"[A-Za-z0-9+/=\s]+", stripped) and len(stripped) > 24:
@@ -914,17 +922,20 @@ def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, st
             or data.startswith(b"GIF89a")
             or data.startswith(b"RIFF") and b"WEBP" in data[:16]
         )
+        dims = _image_dimensions(data)
+        size_ok = dims is not None and dims[0] >= 64 and dims[1] >= 64
+        image_ok = magic_ok and size_ok
         return (
-            magic_ok,
-            "image asset 头部合法。" if magic_ok else f"{file_path} 不是可识别的 PNG/JPEG/GIF/WEBP 图片内容或 base64。",
-            "图片 asset 必须是有效图片字节或 base64 编码的有效图片。",
+            image_ok,
+            "image asset 头部和尺寸合法。" if image_ok else f"{file_path} 不是有效图片或尺寸小于 64x64。",
+            "图片 asset 必须是有效图片字节或 base64，且尺寸 >= 64x64。",
         )
     if ext == ".pdf":
-        pdf_ok = stripped.startswith("%PDF-")
+        pdf_ok = stripped.startswith("%PDF-") and "%%EOF" in stripped and len(stripped.encode("latin1", errors="ignore")) > 100
         return (
             pdf_ok,
-            "PDF asset 头部合法。" if pdf_ok else f"{file_path} 必须以 %PDF- 开头。",
-            "PDF asset 必须是有效 PDF 内容。",
+            "PDF asset 结构合法。" if pdf_ok else f"{file_path} 必须以 %PDF- 开头、包含 %%EOF 且大于 100 bytes。",
+            "PDF asset 必须是有效、非空 PDF 内容。",
         )
     if ext in {".md", ".txt"}:
         quality_ok = len(stripped) >= 40 and not _REFERENCE_PLACEHOLDER_RE.search(stripped)
@@ -935,6 +946,59 @@ def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, st
         )
     return True, "asset 格式可解析。", "当前 asset 文件内容必须符合其扩展名对应格式。"
 
+
+
+def _image_dimensions(data: bytes) -> tuple[int, int] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data.startswith(b"\xff\xd8"):
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            idx += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if idx + 2 > len(data):
+                break
+            length = int.from_bytes(data[idx:idx + 2], "big")
+            if length < 2:
+                break
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and idx + 7 <= len(data):
+                height = int.from_bytes(data[idx + 3:idx + 5], "big")
+                width = int.from_bytes(data[idx + 5:idx + 7], "big")
+                return width, height
+            idx += length
+    return None
+
+
+def _validate_pdf_trial_outputs(payload: dict[str, Any], *, skill_dir: Path | None, args: list[str], stdout: str) -> None:
+    candidates: list[str] = []
+    pdf_path = payload.get("pdf_path")
+    if isinstance(pdf_path, str) and pdf_path.strip():
+        candidates.append(pdf_path.strip())
+    file_paths = payload.get("file_paths")
+    if isinstance(file_paths, list):
+        candidates.extend(p.strip() for p in file_paths if isinstance(p, str) and p.strip())
+
+    checked: list[Path] = []
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.is_absolute() and skill_dir is not None:
+            path = (skill_dir / "scripts" / path).resolve()
+        checked.append(path)
+        if path.is_file():
+            data = path.read_bytes()
+            if len(data) > 100 and data.startswith(b"%PDF-") and b"%%EOF" in data[-2048:]:
+                return
+    raise ValueError(
+        "pdf_builder 试运行必须生成真实可用 PDF：文件存在、大小 > 100 bytes、以 %PDF- 开头且包含 %%EOF。"
+        f" argv={args!r} stdout={stdout[-4000:]} checked={[str(p) for p in checked]}"
+    )
 
 def _check_asset_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
     stripped = content.strip()
@@ -1052,20 +1116,37 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             )
         )
 
+    writes_pdf = bool(re.search(r"\.pdf[\"']|pdf_path|FPDF|reportlab|PdfWriter|write_bytes\s*\(\s*b?[\"']%PDF-", stripped, re.IGNORECASE))
+    if plan_entry.role == "text_generator":
+        results.append(
+            ContractCheckResult(
+                id="script.role.text_forbidden_pdf_generation",
+                passed=not writes_pdf,
+                target=file_path,
+                message=(
+                    "text_generator 未生成 PDF。"
+                    if not writes_pdf
+                    else f"{file_path} 是 text_generator，但源码包含 PDF 生成/输出逻辑。"
+                ),
+                expected="text_generator 只能输出 text，不得生成 PDF。",
+                minimal_edit="删除 PDF 生成逻辑；若任务需要 PDF，请拆分为单独 pdf_builder 脚本。",
+            )
+        )
+
     if plan_entry.role == "image_generator":
         pdf_only = ("pdf_path" in stripped or "file_paths" in stripped) and "image_paths" not in stripped and "images" not in stripped
         results.append(
             ContractCheckResult(
                 id="script.role.image_forbidden_pdf_only_outputs",
-                passed=not pdf_only,
+                passed=not pdf_only and not writes_pdf,
                 target=file_path,
                 message=(
-                    "image_generator 未输出 PDF-only 结果。"
-                    if not pdf_only
-                    else f"{file_path} 是 image_generator，但源码只声明 pdf_path/file_paths 等 PDF-only 输出。"
+                    "image_generator 未输出或生成 PDF-only 结果。"
+                    if not pdf_only and not writes_pdf
+                    else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出或 PDF 生成逻辑。"
                 ),
-                expected="image_generator 必须输出 image_paths/images，不得只输出 pdf_path/file_paths。",
-                minimal_edit="返回 image_paths/images；若要构建 PDF，请拆分为单独 pdf_builder 脚本。",
+                expected="image_generator 必须输出 image_paths/images，不得写 PDF 或只输出 pdf_path/file_paths。",
+                minimal_edit="返回 image_paths/images 并删除 PDF 写入逻辑；若要构建 PDF，请拆分为单独 pdf_builder 脚本。",
             )
         )
     return results
@@ -1199,8 +1280,13 @@ def _validate_generated_file_content(file_path: str, content: str, role: str | N
         _validate_script_file_source_contract(file_path, content, role=role)
         return
 
+    if file_path.startswith("references/"):
+        _validate_reference_file_contract(file_path, content)
+        return
+
     if file_path.startswith("assets/"):
         _validate_asset_file_contract(file_path, content)
+        return
 
 
 def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
@@ -1382,7 +1468,7 @@ def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None) -> None:
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None) -> None:
     stripped = (stdout or "").strip()
     if not stripped:
         raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
@@ -1400,8 +1486,10 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
     if plan_entry and plan_entry.role == "text_generator" and not str(payload.get("text") or "").strip():
         raise ValueError(f"text_generator stdout JSON 必须包含非空 text 字段：argv={args!r} stdout={stripped[-4000:]}")
 
-    if plan_entry and plan_entry.role == "pdf_builder" and not _validate_file_payload_shape(payload):
-        raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
+    if plan_entry and plan_entry.role == "pdf_builder":
+        if not _validate_file_payload_shape(payload):
+            raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
+        _validate_pdf_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
 
     if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
         raise ValueError(
@@ -1411,7 +1499,33 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         )
 
 
-def _trial_run_generated_script(skill_name: str, file_path: str, content: str, role: str | None = None) -> None:
+
+def _trial_run_generated_script_with_plan(
+    skill_name: str,
+    file_path: str,
+    content: str,
+    *,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> None:
+    try:
+        _trial_run_generated_script(skill_name, file_path, content, role, skill_plan_entry)
+    except TypeError as exc:
+        # Some tests monkeypatch the trial runner with the historical
+        # 4-argument signature; keep production role-aware calls while allowing
+        # those narrow fakes to exercise the repair loop.
+        if "positional" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        _trial_run_generated_script(skill_name, file_path, content, role)
+
+
+def _trial_run_generated_script(
+    skill_name: str,
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> None:
     """Run a generated Python script before accepting it from Creator.
 
     Python scripts are executed in a temporary per-skill virtual environment.
@@ -1463,8 +1577,18 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str, r
                     stdout=proc.stdout,
                     stderr=proc.stderr,
                 ))
-            inferred_role = role or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md).role
-            _validate_trial_stdout_json(stdout=proc.stdout, content=content, args=args, role=inferred_role)
+            inferred_role = role or _skill_plan_entry_for_file(
+                file_path=file_path,
+                blueprint_text=skill_md,
+                skill_plan_entry=skill_plan_entry,
+            ).role
+            _validate_trial_stdout_json(
+                stdout=proc.stdout,
+                content=content,
+                args=args,
+                role=inferred_role,
+                skill_dir=skill_dir,
+            )
 
 
 async def _repair_generated_file_with_feedback(
@@ -2031,13 +2155,18 @@ def _script_generation_skeleton(
     blueprint_text: str,
     *,
     role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
     """Return a fixed Python script scaffold selected by SkillPlan role."""
     if Path(file_path).suffix.lower() != ".py":
         return ""
 
     plan_entry = _skill_plan_entry_for_file(
-        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
     )
 
     if plan_entry.role == "image_generator":
@@ -2086,7 +2215,13 @@ def _script_generation_skeleton(
             "    output_dir = Path(payload.get('output_dir') or '.').resolve()\n"
             "    output_dir.mkdir(parents=True, exist_ok=True)\n"
             "    pdf_path = output_dir / 'output.pdf'\n"
-            "    pdf_path.write_bytes(b'%PDF-1.4\n% Generated PDF bytes\n')\n"
+            "    from fpdf import FPDF\n"
+            "    text = str(payload.get('text') or payload.get('topic') or payload.get('prompt') or 'Generated PDF').strip()\n"
+            "    pdf = FPDF()\n"
+            "    pdf.add_page()\n"
+            "    pdf.set_font('Helvetica', size=14)\n"
+            "    pdf.multi_cell(0, 10, text[:2000])\n"
+            "    pdf.output(str(pdf_path))\n"
             "    return {'pdf_path': str(pdf_path), 'file_paths': [str(pdf_path)]}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
@@ -2163,7 +2298,13 @@ def _build_generate_file_prompt(
         file_path, blueprint_text, purpose, role=role, skill_plan_entry=skill_plan_entry
     )
     skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
-    script_skeleton_text = _script_generation_skeleton(file_path, purpose, blueprint_text, role=plan_entry.role) if file_path.startswith("scripts/") else ""
+    script_skeleton_text = _script_generation_skeleton(
+        file_path,
+        purpose,
+        blueprint_text,
+        role=plan_entry.role,
+        skill_plan_entry=skill_plan_entry,
+    ) if file_path.startswith("scripts/") else ""
     plan_summary = (
         f"SkillPlan role：{plan_entry.role}；"
         f"inputs：{', '.join(plan_entry.inputs)}；"
@@ -2212,7 +2353,7 @@ def _build_generate_file_prompt(
             "7. 只有 SkillPlan role == image_generator 时才生成图片；否则即使蓝图其它位置提到图片，也不得调用图片生成 helper。image_generator 不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
             "8. image_generator stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 输出结构化 JSON，字段统一为 {\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}；不要混入调试说明。\n"
+            "10. stdout 输出结构化 JSON，字段必须根据 SkillPlan role contract 输出：text_generator 返回 text；image_generator 返回 image_paths/images；pdf_builder 返回 pdf_path/file_paths；generic_script 返回与职责匹配的 text/file_paths 等明确字段；不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
             "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
@@ -2311,6 +2452,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required_capabilities=entries_by_path[f.path].required_capabilities if f.path in entries_by_path else [],
                 forbidden_capabilities=entries_by_path[f.path].forbidden_capabilities if f.path in entries_by_path else [],
                 reference_files=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
+                references=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
+                low_confidence=(entries_by_path[f.path].confidence < 0.7) if f.path in entries_by_path else False,
                 confidence=entries_by_path[f.path].confidence if f.path in entries_by_path else 0.0,
                 reason=entries_by_path[f.path].reason if f.path in entries_by_path else "",
                 heuristic_signals=entries_by_path[f.path].heuristic_signals if f.path in entries_by_path else [],
@@ -2413,7 +2556,13 @@ async def generate_file(request: GenerateFileRequest):
                 content = raw_content
                 last_error = ""
                 repeated_error_counts: dict[str, int] = {}
-                contract_text = _build_generated_file_contract_text(request.file_path, request.blueprint_text, request.purpose)
+                contract_text = _build_generated_file_contract_text(
+                    request.file_path,
+                    request.blueprint_text,
+                    request.purpose,
+                    role=request.role,
+                    skill_plan_entry=request.skill_plan_entry,
+                )
                 for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
                         content = _sanitize_generated_file_content(request.file_path, content, role=request.role)
@@ -2424,7 +2573,13 @@ async def generate_file(request: GenerateFileRequest):
                         elif request.file_path.startswith("assets/"):
                             _validate_asset_file_contract(request.file_path, content)
                         else:
-                            _trial_run_generated_script(skill_name, request.file_path, content, request.role)
+                            _trial_run_generated_script_with_plan(
+                                skill_name,
+                                request.file_path,
+                                content,
+                                role=request.role,
+                                skill_plan_entry=request.skill_plan_entry,
+                            )
                         last_error = ""
                         break
                     except ValueError as validation_exc:
@@ -2535,11 +2690,17 @@ async def write_file(request: WriteFileRequest):
     skill_name = _validate_skill_name(request.skill_name)
 
     try:
-        content = _sanitize_generated_file_content(request.file_path, request.content)
+        content = _sanitize_generated_file_content(request.file_path, request.content, role=request.role)
         if request.file_path == "SKILL.md":
             _validate_skill_md_against_existing_files(skill_name, content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
-        _trial_run_generated_script(skill_name, request.file_path, content, request.role)
+        _trial_run_generated_script(
+            skill_name,
+            request.file_path,
+            content,
+            request.role,
+            request.skill_plan_entry,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

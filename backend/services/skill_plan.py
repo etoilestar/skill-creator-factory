@@ -113,15 +113,43 @@ def _normalize_role(value: str) -> FileRole | None:
 
 
 def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> FileRole | None:
-    """Extract an explicit role declared by the plan/model, not by domain keywords."""
+    """Extract an explicit role declared by the plan/model, not by domain keywords.
+
+    Supports both compact one-line declarations such as
+    ``scripts/a.py role: text_generator`` and SkillPlan blocks where the path
+    appears on one line and ``role: ...`` appears in the following indented
+    contract lines.
+    """
     next_path_re = r"(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md"
+
+    def segment_after_path(text: str) -> str:
+        if file_path not in text:
+            return text
+        after = text.split(file_path, 1)[1]
+        next_match = re.search(next_path_re, after)
+        if next_match:
+            between = after[: next_match.start()]
+            # Inline prose may mention a reference/dependency path before the
+            # role; block-style SkillPlan keeps role on following indented lines.
+            if _EXPLICIT_ROLE_RE.search(between):
+                return between
+            role_before_next_file = _EXPLICIT_ROLE_RE.search(after)
+            if role_before_next_file and role_before_next_file.start() < 500:
+                return after[: role_before_next_file.end()]
+            return between
+        return after
+
     for text in (purpose, blueprint_summary):
-        for line in (text or "").splitlines():
+        text = text or ""
+        if file_path in text:
+            segment = segment_after_path(text)
+            match = _EXPLICIT_ROLE_RE.search(segment)
+            if match:
+                return _normalize_role(match.group(1))
+        for line in text.splitlines():
             if file_path not in line and line.strip() != purpose.strip():
                 continue
-            segment = line
-            if file_path in line:
-                segment = re.split(next_path_re, line.split(file_path, 1)[1], maxsplit=1)[0]
+            segment = segment_after_path(line)
             match = _EXPLICIT_ROLE_RE.search(segment)
             if match:
                 return _normalize_role(match.group(1))

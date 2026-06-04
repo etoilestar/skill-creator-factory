@@ -49,6 +49,9 @@
 
         <!-- Path & meta -->
         <span class="file-path">{{ file.path }}</span>
+        <span v-if="file.role" class="role-badge" :class="{ warning: file.low_confidence }">
+          {{ file.role }}<span v-if="file.low_confidence"> · low confidence</span>
+        </span>
         <span v-if="file.status === 'done'" class="file-meta">
           已写入 ({{ formatBytes(file.bytesWritten) }})
         </span>
@@ -347,6 +350,16 @@ function addFile() {
     purpose: newFilePurpose.value.trim() || path,
     required: true,
     can_skip: false,
+    file_type: path === 'SKILL.md' ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
+    role: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'generic_script')),
+    inputs: [],
+    outputs: [],
+    dependencies: [],
+    required_capabilities: [],
+    forbidden_capabilities: [],
+    reference_files: [],
+    references: [],
+    low_confidence: path.startsWith('scripts/'),
     status: 'pending',
     generatedContent: '',
     bytesWritten: 0,
@@ -417,7 +430,13 @@ async function writeOneFile(idx) {
   const file = localFiles.value[idx]
   file.status = 'writing'
   try {
-    const result = await writeFile(localSkillName.value, file.path, file.generatedContent)
+    const result = await writeFile(
+      localSkillName.value,
+      file.path,
+      file.generatedContent,
+      file.role || null,
+      file
+    )
     if (!result.success) throw new Error(result.message)
     file.status = 'done'
     file.bytesWritten = result.bytes || 0
@@ -632,6 +651,20 @@ function openInSandbox() {
 
 .file-icon { font-size: 14px; flex-shrink: 0; }
 .file-path { font-family: monospace; flex: 1; }
+.role-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid #3f5f7f;
+  color: #9fd0ff;
+  background: #1d2a36;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.role-badge.warning {
+  border-color: #7a5a24;
+  color: #f0c060;
+  background: #332817;
+}
 
 .file-meta { font-size: 12px; color: #888; }
 .file-meta.error { color: #e05c5c; }

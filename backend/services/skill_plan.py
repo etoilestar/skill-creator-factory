@@ -13,7 +13,9 @@ from pathlib import Path
 import re
 from typing import Literal
 
-FileType = Literal["skill", "script", "reference", "asset"]
+FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
+Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
+Runtime = Literal["python", "node", "bash", "none"]
 ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
@@ -51,6 +53,10 @@ class SkillPlanEntry:
     required_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
     reference_files: list[str] = field(default_factory=list)
+    language: Language = "text"
+    runtime: Runtime = "none"
+    entrypoint: str = ""
+    command_template: str = ""
     required: bool = True
     can_skip: bool = False
     confidence: float = 0.0
@@ -75,7 +81,7 @@ _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_
 
 def file_type_for_path(path: str) -> FileType:
     if path == "SKILL.md":
-        return "skill"
+        return "skill_md"
     if path.startswith("scripts/"):
         return "script"
     if path.startswith("references/"):
@@ -98,6 +104,53 @@ def heuristic_signals_for_file(file_path: str, purpose: str = "", blueprint_summ
     if Path(file_path).suffix.lower() == ".py":
         signals.append("python_script")
     return signals
+
+
+def language_for_path(path: str) -> Language:
+    ext = Path(path).suffix.lower()
+    if ext == ".py":
+        return "python"
+    if ext in {".js", ".mjs", ".cjs", ".ts"}:
+        return "javascript"
+    if ext in {".sh", ".bash"}:
+        return "bash"
+    if ext == ".sql":
+        return "sql"
+    if ext in {".yaml", ".yml"}:
+        return "yaml"
+    if ext == ".json":
+        return "json"
+    if ext == ".md":
+        return "markdown"
+    if ext == ".html":
+        return "html"
+    if ext == ".css":
+        return "css"
+    return "text"
+
+
+def runtime_for_language(language: str, file_type: FileType) -> Runtime:
+    if file_type != "script":
+        return "none"
+    if language == "python":
+        return "python"
+    if language == "javascript":
+        return "node"
+    if language == "bash":
+        return "bash"
+    return "none"
+
+
+def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
+    keys = inputs or ["payload"]
+    payload = "{" + ",".join(f'"{key}":"{{{{{key}}}}}"' for key in keys) + "}"
+    if runtime == "python":
+        return f"python {path} '{payload}'"
+    if runtime == "node":
+        return f"node {path} '{payload}'"
+    if runtime == "bash":
+        return f"bash {path} '{payload}'"
+    return f"{path} '{payload}'"
 
 
 
@@ -150,6 +203,19 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
     cleaned = [re.sub(r"[^A-Za-z0-9_./-]", "", item) for item in values]
     return [item for item in cleaned if item]
 
+
+
+
+def _explicit_scalar_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> str | None:
+    """Extract scalar SkillPlan fields such as language/runtime from local plan text."""
+    segment = _segment_for_file(file_path, purpose, blueprint_summary)
+    pattern = re.compile(rf"(?:{re.escape(field_name)}|{re.escape(field_name.replace('_', ' '))})\s*[：:=]\s*([^\s\n;,]+)", re.I)
+    match = pattern.search(segment)
+    if not match:
+        return None
+    value = match.group(1).strip().strip("'\"").lower()
+    value = re.sub(r"[^a-z0-9_-]", "", value)
+    return value or None
 
 def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> FileRole | None:
     """Extract an explicit role declared by the plan/model, not by domain keywords.
@@ -217,7 +283,7 @@ def file_role_classifier(
     file_type = file_type_for_path(file_path)
     signals = list(heuristic_signals or heuristic_signals_for_file(file_path, purpose, blueprint_summary))
 
-    if file_type == "skill":
+    if file_type == "skill_md":
         return RoleClassification("skill_overview", 1.0, "SKILL.md is the process overview file", signals)
     if file_type == "reference":
         return RoleClassification("reference", 1.0, "references/ files contain subtask guidance", signals)
@@ -293,9 +359,16 @@ def build_skill_plan_entry(
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(classification.role)
     required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_required_capabilities
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
+    file_type = file_type_for_path(file_path)
+    detected_language = language_for_path(file_path)
+    explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
+    detected_runtime = runtime_for_language(language, file_type)
+    explicit_runtime = _explicit_scalar_field("runtime", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "none"} else detected_runtime
     return SkillPlanEntry(
         path=file_path,
-        file_type=file_type_for_path(file_path),
+        file_type=file_type,
         role=classification.role,
         purpose=purpose,
         inputs=inputs,
@@ -304,6 +377,10 @@ def build_skill_plan_entry(
         required_capabilities=required_capabilities,
         forbidden_capabilities=forbidden_capabilities,
         reference_files=list(reference_files or []),
+        language=language,
+        runtime=runtime,
+        entrypoint=file_path if file_type == "script" else "",
+        command_template=command_template_for_entry(file_path, runtime, inputs) if file_type == "script" else "",
         required=required,
         can_skip=can_skip,
         confidence=classification.confidence,

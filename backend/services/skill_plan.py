@@ -16,7 +16,7 @@ from typing import Literal
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "generic_script"]
+ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
 
@@ -24,6 +24,7 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "text_generator",
     "image_generator",
     "pdf_builder",
+    "composite_generator",
     "generic_script",
 })
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
@@ -75,7 +76,7 @@ class SkillPlan:
 
 _IMAGE_RE = re.compile(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration|stable\s*diffusion", re.I)
 _PDF_RE = re.compile(r"pdf|报告|排版|layout|document|report", re.I)
-_TEXT_RE = re.compile(r"文本|文案|故事|谜语|摘要|写作|text|story|riddle|summary|copy", re.I)
+_TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|text|story|tale|fairy|riddle|summary|copy", re.I)
 _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
 _IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
 _CUSTOM_CHARACTER_RE = re.compile(r"custom_character|character|角色|主角", re.I)
@@ -159,7 +160,7 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|generic_script)",
+    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|generic_script)",
     re.I,
 )
 
@@ -302,7 +303,7 @@ def _should_promote_image_script_role(file_path: str, purpose: str = "", bluepri
 def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
     augmented = list(inputs)
     text = f"{purpose}\n{blueprint_summary}"
-    if role == "image_generator" and _CUSTOM_CHARACTER_RE.search(text) and "custom_character" not in augmented:
+    if role in {"image_generator", "composite_generator"} and _CUSTOM_CHARACTER_RE.search(text) and "custom_character" not in augmented:
         augmented.append("custom_character")
     return augmented
 
@@ -342,6 +343,15 @@ def file_role_classifier(
     if _should_promote_image_script_role(file_path, purpose, blueprint_summary):
         if "inferred_image_script_role" not in signals:
             signals.append("inferred_image_script_role")
+        if _TEXT_RE.search(f"{file_path}\n{purpose}\n{blueprint_summary}"):
+            if "inferred_composite_script_role" not in signals:
+                signals.append("inferred_composite_script_role")
+            return RoleClassification(
+                "composite_generator",
+                0.84,
+                "image-oriented script also requires text_generation capability",
+                signals,
+            )
         return RoleClassification(
             "image_generator",
             0.82,
@@ -362,6 +372,8 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["topic", "prompt", "text"], ["text"]
     if role == "image_generator":
         return ["topic", "prompt", "text"], ["image_paths", "images", "text_with_image_prompts"]
+    if role == "composite_generator":
+        return ["topic", "prompt", "text"], ["text", "image_paths", "images", "text_with_image_prompts"]
     if role == "pdf_builder":
         return ["text", "image_paths", "template_path"], ["pdf_path", "file_paths"]
     if role == "reference":
@@ -378,6 +390,8 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["text_generation"], ["image_generation", "pdf_generation"]
     if role == "image_generator":
         return ["image_generation"], ["text_generation", "pdf_generation"]
+    if role == "composite_generator":
+        return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
         return ["pdf_generation", "file_output"], ["image_generation"]
     if role == "reference":
@@ -386,7 +400,7 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["static_resource"], ["runtime_execution", "image_generation"]
     if role == "skill_overview":
         return ["workflow_overview"], ["hidden_runtime_protocol"]
-    return ["deterministic_execution"], []
+    return ["deterministic_execution"], ["text_generation", "image_generation", "pdf_generation"]
 
 
 def build_skill_plan_entry(
@@ -411,6 +425,7 @@ def build_skill_plan_entry(
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(classification.role)
     required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_required_capabilities
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
+    forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
     file_type = file_type_for_path(file_path)
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)

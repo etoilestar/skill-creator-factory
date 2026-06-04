@@ -357,7 +357,7 @@ console.log(JSON.stringify({ text: payload.topic || '' }));
     assert "```" not in sanitized
 
 
-def test_image_named_script_is_promoted_to_image_generator_contract():
+def test_image_and_text_named_script_is_promoted_to_composite_generator_contract():
     from backend.services.blueprint_parser import parse_blueprint
 
     blueprint = """
@@ -368,9 +368,9 @@ def test_image_named_script_is_promoted_to_image_generator_contract():
     plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
     entry = next(item for item in plan.skill_plan.files if item.path == "scripts/generate_fairy_tale_with_images.py")
 
-    assert entry.role == "image_generator"
-    assert entry.required_capabilities == ["image_generation"]
-    assert "text_generation" in entry.forbidden_capabilities
+    assert entry.role == "composite_generator"
+    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert "text_generation" not in entry.forbidden_capabilities
     assert "pdf_generation" in entry.forbidden_capabilities
     assert "custom_character" in entry.inputs
     assert "text_with_image_prompts" in entry.outputs
@@ -444,9 +444,135 @@ if __name__ == '__main__':
     }
     guidance = _targeted_generated_file_repair_instructions(
         file_path="scripts/main.py",
-        deterministic_error="script.role.forbidden_image_generation: generic_script 调用了图片生成 helper",
+        deterministic_error="script.capability.forbidden_image_generation: forbidden_capabilities 禁止但脚本调用了图片生成 helper",
     )
 
-    assert "script.role.forbidden_image_generation" in failed
+    assert "script.capability.forbidden_image_generation" in failed
     assert "不要删除真实图片 helper" in guidance
-    assert "role=image_generator" in guidance
+    assert "role=image_generator" in guidance or "role=composite_generator" in guidance
+
+
+def test_composite_generator_can_call_text_and_image_helpers():
+    from backend.routers.creator import _check_script_file_contract, _script_generation_skeleton
+
+    entry = {
+        "path": "scripts/generate_fairy_tale_with_images.py",
+        "role": "composite_generator",
+        "inputs": ["topic", "custom_character"],
+        "outputs": ["text", "image_paths", "images", "text_with_image_prompts"],
+        "required_capabilities": ["text_generation", "image_generation"],
+        "forbidden_capabilities": ["pdf_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    source = """import json
+import sys
+from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image
+
+def main():
+    payload = json.loads(sys.argv[1])
+    prompt = payload.get('topic', '') + payload.get('custom_character', '')
+    text = generate_text_with_llm(prompt)
+    result = generate_stable_diffusion_image(text, filename_prefix='generated')
+    print(json.dumps({'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text}], 'image_paths': [result.get('image_path')], 'images': [result]}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {result.id for result in _check_script_file_contract("scripts/generate_fairy_tale_with_images.py", source, skill_plan_entry=entry) if not result.passed}
+    skeleton = _script_generation_skeleton("scripts/generate_fairy_tale_with_images.py", "", "", skill_plan_entry=entry)
+
+    assert "script.required_capabilities.called" not in failed
+    assert "script.capability.forbidden_image_generation" not in failed
+    assert "generate_text_with_llm" in skeleton
+    assert "generate_stable_diffusion_image" in skeleton
+
+
+def test_explicit_composite_role_overrides_blueprint_and_command_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: composite-skill
+- scripts/: `scripts/main.py`
+  scripts/main.py
+  role: composite_generator
+  inputs: topic, custom_character
+  outputs: text, image_paths, images, text_with_image_prompts
+  required_capabilities: text_generation, image_generation
+  forbidden_capabilities: pdf_generation
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/main.py")
+
+    assert entry.role == "composite_generator"
+    assert entry.inputs == ["topic", "custom_character"]
+    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert "image_generation" not in entry.forbidden_capabilities
+    assert "text_generation" not in entry.forbidden_capabilities
+    assert entry.command_template == 'python scripts/main.py \'{"topic":"{{topic}}","custom_character":"{{custom_character}}"}\''
+
+
+def test_creator_prompt_injects_kernel_references_for_scripts():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "required_capabilities": ["text_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+    messages = _build_generate_file_prompt(
+        "scripts/write.py",
+        "demo-skill",
+        "生成文本",
+        "scripts/write.py role: text_generator inputs: topic",
+        [],
+        skill_plan_entry=entry,
+    )
+    prompt = messages[-1]["content"]
+
+    assert "Creator kernel references" in prompt
+    assert "kernel/references/best-practices.md" in prompt
+    assert "kernel/references/output-patterns.md" in prompt
+
+
+def test_reference_contract_requires_capability_mentions_for_composite_commands():
+    from backend.routers.creator import _check_reference_file_contract
+
+    content = """
+## 输入输出
+inputs: topic
+outputs: text, image_paths
+
+## 执行步骤
+```bash
+python scripts/composite_images.py '{"topic":"{{topic}}"}'
+```
+
+## 角色与能力边界
+role: composite_generator，required_capabilities: text_generation, image_generation，禁止 PDF。
+
+## 规范
+先生成文本，再将文本传递给图片生成 helper，保持 JSON stdout。
+
+## 示例
+输入 topic=猫，输出 text 和 image_paths。
+
+## 反例
+不要输出固定模板，不要省略 image_generation。
+
+## 约束
+JSON argv keys 必须与 SkillPlan inputs 对齐，text 输出可作为 image prompt 跨能力传递。
+"""
+    results = _check_reference_file_contract(
+        "references/composite.md",
+        content,
+        purpose="scripts/composite_images.py role: composite_generator inputs: topic outputs: text, image_paths required_capabilities: text_generation, image_generation",
+    )
+    failed = {result.id for result in results if not result.passed}
+
+    assert "reference.required_capabilities.mentioned" not in failed

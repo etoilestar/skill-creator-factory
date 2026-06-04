@@ -321,7 +321,7 @@ def _skill_plan_entry_for_file(
     """
     if skill_plan_entry and skill_plan_entry.get("path") == file_path:
         explicit_role = str(skill_plan_entry.get("role") or role or "").strip()
-        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "generic_script", "skill_overview", "reference", "asset"}
+        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
         if explicit_role in allowed_roles:
             inputs = list(skill_plan_entry.get("inputs") or default_io_for_role(explicit_role)[0])
             outputs = list(skill_plan_entry.get("outputs") or default_io_for_role(explicit_role)[1])
@@ -331,6 +331,7 @@ def _skill_plan_entry_for_file(
             forbidden_capabilities = list(
                 skill_plan_entry.get("forbidden_capabilities") or capabilities_for_role(explicit_role)[1]
             )
+            forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
             file_type = file_type_for_path(file_path)
             language = str(skill_plan_entry.get("language") or language_for_path(file_path))
             runtime = str(skill_plan_entry.get("runtime") or runtime_for_language(language, file_type))
@@ -367,9 +368,10 @@ def _skill_plan_entry_for_file(
             purpose=purpose,
             blueprint_summary=blueprint_text[:4000],
         )
-        if role in {"text_generator", "image_generator", "pdf_builder", "generic_script", "skill_overview", "reference", "asset"}:
+        if role in {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
             inputs, outputs = default_io_for_role(role)
             required_capabilities, forbidden_capabilities = capabilities_for_role(role)
+            forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
             return SkillPlanEntry(
                 path=entry.path,
                 file_type=entry.file_type,
@@ -890,7 +892,13 @@ def _build_script_file_contract_text(
     if entry.role == "text_generator":
         lines.extend([
             "- stdout 必须输出 JSON object，且 text 字段为非空字符串。",
-            "- forbidden_capabilities 生效：不得调用图片生成 helper，不得输出 pdf_path 作为主要结果。",
+            "- 能力边界由 required_capabilities/forbidden_capabilities 决定；若 required_capabilities 额外包含 image_generation，则必须调用图片 helper。",
+        ])
+    elif entry.role == "composite_generator":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 text 字段非空，同时 image_paths 或 images 至少一个非空。",
+            "- 必须同时调用 generate_text_with_llm 与 generate_stable_diffusion_image；不得用固定 f-string/template-only 文本或占位图片替代。",
+            "- 上一步 text 可作为 image prompt，输出 text_with_image_prompts 说明 text → image 的跨能力数据流。",
         ])
     elif entry.role == "image_generator":
         lines.extend([
@@ -1058,7 +1066,7 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         "execution": bool(re.search(r"(?im)^#{1,3}.*(执行|命令|步骤|Execution|Commands?)", stripped)) or "```bash" in stripped,
         "role_constraints": bool(re.search(r"(?im)^#{1,3}.*(角色|能力|禁止|Role|Capabilities?)", stripped)),
     }
-    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|generic_script|命令模板|执行参考", purpose, re.I))
+    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
     role_sections_ok = (not role_section_required) or all(role_sections.values())
     missing_role_sections = [name for name, present in role_sections.items() if not present]
     results.append(ContractCheckResult(
@@ -1078,6 +1086,20 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
     for script_path, command in reference_commands:
         entry = _skill_plan_entry_for_file(file_path=script_path, purpose=purpose, blueprint_text=f"{purpose}\n{content}")
         results.extend(_check_command_block_contract(script_path, [command], entry))
+        required_capabilities = list(entry.required_capabilities or [])
+        missing_capability_mentions = [capability for capability in required_capabilities if capability not in stripped]
+        results.append(ContractCheckResult(
+            id="reference.required_capabilities.mentioned",
+            passed=not missing_capability_mentions,
+            target=f"{file_path}#{script_path}",
+            message=(
+                "reference 命令块说明了脚本 required_capabilities。"
+                if not missing_capability_mentions
+                else f"reference 缺少这些 required_capabilities 说明：{', '.join(missing_capability_mentions)}。"
+            ),
+            expected=f"执行型 reference 必须说明 role={entry.role} 以及 required_capabilities={', '.join(required_capabilities) or 'none'}。",
+            minimal_edit="在角色与能力边界小节补充 role 和 required_capabilities，并说明输入/输出如何跨脚本传递。",
+        ))
 
     has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
     results.append(ContractCheckResult(
@@ -1414,6 +1436,22 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
+    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    results.append(
+        ContractCheckResult(
+            id="script.required_capabilities.called",
+            passed=not missing_capabilities,
+            target=file_path,
+            message=(
+                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                if not missing_capabilities
+                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+            ),
+            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
+            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+        )
+    )
+
     has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
     results.append(
         ContractCheckResult(
@@ -1430,37 +1468,54 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
-    if plan_entry.role != "image_generator":
-        uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+    uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+    if "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
-                id="script.role.forbidden_image_generation",
+                id="script.capability.forbidden_image_generation",
                 passed=not uses_image_helper,
                 target=file_path,
                 message=(
-                    "非 image_generator 脚本未调用图片生成能力。"
+                    "脚本未调用 forbidden_capabilities 中禁止的 image_generation。"
                     if not uses_image_helper
-                    else f"{file_path} 的 SkillPlan role 是 {plan_entry.role}，但脚本调用了图片生成 helper。"
+                    else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 image_generation，但脚本调用了图片生成 helper。"
                 ),
-                expected="只有 image_generator role 可以调用 generate_stable_diffusion_image。",
-                minimal_edit="删除图片生成调用；若任务确实要生成图片，请拆分为单独 image_generator 脚本。",
+                expected="只有 required_capabilities 包含 image_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_stable_diffusion_image。",
+                minimal_edit="若脚本确实需要图片能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除图片 helper 调用。",
+            )
+        )
+
+    uses_text_helper = bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", stripped, re.IGNORECASE))
+    if "text_generation" in (plan_entry.forbidden_capabilities or []):
+        results.append(
+            ContractCheckResult(
+                id="script.capability.forbidden_text_generation",
+                passed=not uses_text_helper,
+                target=file_path,
+                message=(
+                    "脚本未调用 forbidden_capabilities 中禁止的 text_generation。"
+                    if not uses_text_helper
+                    else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 text_generation，但脚本调用了文本生成 helper/LLM。"
+                ),
+                expected="只有 required_capabilities 包含 text_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_text_with_llm 或平台文本模型。",
+                minimal_edit="若脚本确实需要文本生成能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除文本模型调用。",
             )
         )
 
     writes_pdf = bool(re.search(r"\.pdf[\"']|pdf_path|FPDF|reportlab|PdfWriter|write_bytes\s*\(\s*b?[\"']%PDF-", stripped, re.IGNORECASE))
-    if plan_entry.role == "text_generator":
+    if "pdf_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
-                id="script.role.text_forbidden_pdf_generation",
+                id="script.capability.forbidden_pdf_generation",
                 passed=not writes_pdf,
                 target=file_path,
                 message=(
-                    "text_generator 未生成 PDF。"
+                    "脚本未调用 forbidden_capabilities 中禁止的 pdf_generation。"
                     if not writes_pdf
-                    else f"{file_path} 是 text_generator，但源码包含 PDF 生成/输出逻辑。"
+                    else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 pdf_generation，但源码包含 PDF 生成/输出逻辑。"
                 ),
-                expected="text_generator 只能输出 text，不得生成 PDF。",
-                minimal_edit="删除 PDF 生成逻辑；若任务需要 PDF，请拆分为单独 pdf_builder 脚本。",
+                expected="只有 required_capabilities 包含 pdf_generation 且未被 forbidden_capabilities 禁止时，脚本才可构建 PDF。",
+                minimal_edit="若脚本确实需要 PDF 能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除 PDF 生成逻辑。",
             )
         )
 
@@ -1476,8 +1531,8 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     if not pdf_only and not writes_pdf
                     else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出或 PDF 生成逻辑。"
                 ),
-                expected="image_generator 必须输出 image_paths/images，不得写 PDF 或只输出 pdf_path/file_paths。",
-                minimal_edit="返回 image_paths/images 并删除 PDF 写入逻辑；若要构建 PDF，请拆分为单独 pdf_builder 脚本。",
+                expected="image_generator 必须输出 image_paths/images，不得写 PDF 或只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
+                minimal_edit="返回 image_paths/images 并删除 PDF 写入逻辑；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
             )
         )
     return results
@@ -2009,14 +2064,16 @@ async def _repair_generated_file_with_feedback(
     )
     if is_script:
         role_rule = ""
-        if plan_entry is not None and plan_entry.role == "image_generator":
+        if plan_entry is not None and plan_entry.role == "composite_generator":
+            role_rule = "role=composite_generator：必须保留并调用 generate_text_with_llm 与 generate_stable_diffusion_image，stdout 同时输出 text 与 image_paths/images；禁止删除任何合法 helper。"
+        elif plan_entry is not None and plan_entry.role == "image_generator":
             role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image，stdout 输出 image_paths/images；禁止占位图片或删除真实 helper。"
         elif plan_entry is not None and plan_entry.role == "text_generator":
             role_rule = "role=text_generator：必须调用 generate_text_with_llm 或平台 LLM，禁止调用图片 helper 或输出固定 template-only 文本。"
         elif plan_entry is not None and plan_entry.role == "pdf_builder":
             role_rule = "role=pdf_builder：必须真实构建 PDF/file_paths，禁止调用图片 helper。"
         elif plan_entry is not None and plan_entry.role == "generic_script":
-            role_rule = "role=generic_script：禁止调用 generate_stable_diffusion_image；若任务确实要生成图片，必须先修正 SkillPlan role 或拆分 image_generator 脚本，而不是在 generic_script 中保留图片 helper。"
+            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若需要文本+图片，必须将 role/required_capabilities 修正为 composite_generator + text_generation/image_generation。"
         extra_rules = (
             "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys = SkillPlan inputs；"
             "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
@@ -2167,17 +2224,16 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "本轮必须把上一次内容改成单个裸脚本源码：删除所有 ``` fence、```python/```text 标签、"
                 "文件路径标题、写入文件标签、解释性文字和多文件包内容；最终响应第一个字符应是脚本源码字符。"
             )
-        if "script.role.forbidden_image_generation" in deterministic_error or "调用了图片生成 helper" in deterministic_error:
+        if "forbidden_image_generation" in deterministic_error or "调用了图片生成 helper" in deterministic_error:
             return (
-                "当前脚本的 SkillPlan role 不是 image_generator，因此 validator 禁止调用 generate_stable_diffusion_image。"
-                "如果该脚本确实负责生成图片，不要删除真实图片 helper；应先把 Blueprint/SkillPlan 中该脚本声明为 role=image_generator，"
-                "required_capabilities=[image_generation]，并输出 image_paths/images。"
-                "如果该脚本必须保持 generic_script，则拆分图片生成为单独 image_generator 脚本，并从当前源码移除图片 helper 调用。"
+                "当前脚本的 SkillPlan forbidden_capabilities 禁止 image_generation，因此 validator 禁止调用 generate_stable_diffusion_image。"
+                "如果该脚本确实负责生成图片，不要删除真实图片 helper；应修正 Blueprint/SkillPlan 为 role=image_generator 或 role=composite_generator，"
+                "并设置 required_capabilities 包含 image_generation（若同时生成文本，也包含 text_generation），输出 image_paths/images。"
             )
         if "script.required_capabilities.called" in deterministic_error or "未调用这些 required_capabilities" in deterministic_error or "没有调用这些 required_capabilities" in deterministic_error:
             return (
-                "按 SkillPlan role 补齐真实平台能力调用：image_generator 必须调用 generate_stable_diffusion_image；"
-                "text_generator 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder 必须真实构建 PDF/file_paths。"
+                "按 SkillPlan role + required_capabilities 补齐真实平台能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
+                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder 必须真实构建 PDF/file_paths。"
                 "禁止返回固定 f-string/template-only 文本或 placeholder。"
             )
         if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
@@ -2623,6 +2679,27 @@ def _script_generation_skeleton(
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
+        if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+            return (
+                "必须使用下面的 node composite_generator skeleton；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
+                "const { spawnSync } = require('child_process');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function pyEval(code, arg) {\n"
+                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', code, arg], { encoding: 'utf8' });\n"
+                "  if (proc.status !== 0) throw new Error(proc.stderr || 'platform helper failed');\n"
+                "  return JSON.parse(proc.stdout);\n"
+                "}\n"
+                "function run(payload) {\n"
+                f"  const prompt = String({js_value_expr}).trim();\n"
+                "  const textCode = `from backend.services.skill_runtime import generate_text_with_llm\\nimport json,sys\\nprint(json.dumps({'text': generate_text_with_llm(sys.argv[1])}, ensure_ascii=False))`;\n"
+                "  const textResult = pyEval(textCode, prompt);\n"
+                "  const imagePrompt = textResult.text || prompt;\n"
+                "  const imageCode = `from backend.services.skill_runtime import generate_stable_diffusion_image\\nimport json,sys\\nresult = generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
+                "  const imageResult = pyEval(imageCode, imagePrompt);\n"
+                "  return { text: textResult.text, text_with_image_prompts: [{ text: textResult.text, image_prompt: imagePrompt }], image_paths: [imageResult.image_path].filter(Boolean), images: [imageResult] };\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
+            )
         if plan_entry.role == "image_generator":
             return (
                 "必须使用下面的 node image_generator skeleton；通过 Python 平台 helper 生成图片，stdout 只能 console.log JSON 字符串：\n"
@@ -2686,7 +2763,9 @@ def _script_generation_skeleton(
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        if plan_entry.role == "image_generator":
+        if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+            helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
+        elif plan_entry.role == "image_generator":
             helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "pdf_builder":
             helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or '.').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
@@ -2700,6 +2779,33 @@ def _script_generation_skeleton(
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
             f"python -c {shlex.quote(helper)} \"$payload_json\""
+        )
+
+    if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+        return (
+            "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths/images：\n"
+            "import json\n"
+            "import sys\n"
+            "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def build_prompt(payload: dict) -> str:\n"
+            f"    return str({py_value_expr}).strip()\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    prompt = build_prompt(payload)\n"
+            "    text = generate_text_with_llm(prompt).strip()\n"
+            "    image_prompt = text or prompt\n"
+            "    result = generate_stable_diffusion_image(image_prompt, filename_prefix='generated')\n"
+            "    image_paths = [result.get('image_path')]\n"
+            "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
+            "    return {'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': image_prompt}], 'image_paths': image_paths, 'images': [result]}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
         )
 
     if plan_entry.role == "image_generator":
@@ -2801,6 +2907,33 @@ def _script_generation_skeleton(
         "    main()"
     )
 
+
+def _creator_kernel_reference_context() -> str:
+    """Load small Creator prompt context from kernel references.
+
+    These references are advisory generation context only; SKILL.md protocol and
+    generated file contracts remain unchanged.
+    """
+    kernel_dir = Path(__file__).resolve().parents[2] / "kernel"
+    candidates = [
+        kernel_dir / "references" / "best-practices.md",
+        kernel_dir / "references" / "workflows.md",
+        kernel_dir / "references" / "output-patterns.md",
+        kernel_dir / "SKILL.md",
+    ]
+    chunks: list[str] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            rel = path.relative_to(kernel_dir.parent)
+            chunks.append(f"### {rel}\n{text[:1800]}")
+    return "\n\n".join(chunks)
+
 def _build_generate_file_prompt(
     file_path: str,
     skill_name: str,
@@ -2835,6 +2968,7 @@ def _build_generate_file_prompt(
         role=plan_entry.role,
         skill_plan_entry=skill_plan_entry,
     ) if file_path.startswith("scripts/") else ""
+    kernel_reference_context = _creator_kernel_reference_context()
     plan_summary = (
         f"SkillPlan role：{plan_entry.role}；"
         f"inputs：{', '.join(plan_entry.inputs)}；"
@@ -2882,17 +3016,18 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；只有 image_generator role 才使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 只有 SkillPlan role == image_generator 时才生成图片；否则即使蓝图其它位置提到图片，也不得调用图片生成 helper。image_generator 不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
-            "8. image_generator stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
+            "7. 是否允许生成图片由 SkillPlan.required_capabilities 决定：只要 required_capabilities 包含 image_generation，就必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；不要在脚本里写中文 prompt 翻译逻辑；如果同时包含 text_generation 和 image_generation，使用 composite_generator 或等价合并脚本同时保留文本和图片 helper。\n"
+            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 输出结构化 JSON，字段必须根据 SkillPlan role contract 输出：text_generator 返回 text；image_generator 返回 image_paths/images；pdf_builder 返回 pdf_path/file_paths；generic_script 返回与职责匹配的 text/file_paths 等明确字段；不要混入调试说明。\n"
+            "10. stdout 输出结构化 JSON，字段必须根据 SkillPlan role/capability contract 输出：text_generator 返回 text；image_generator 返回 image_paths/images；composite_generator 返回 text 与 image_paths/images；pdf_builder 返回 pdf_path/file_paths；generic_script 返回与职责匹配的 text/file_paths 等明确字段；不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
+            f"Creator kernel references（作为脚本生成上下文，可用于 workflow/output pattern/reference/assets 读取策略；不得照抄为占位内容）：\n{kernel_reference_context}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（scripts/ 生成不会追加聊天历史，只使用本蓝图）：\n\n{clean_blueprint_text}"
         )

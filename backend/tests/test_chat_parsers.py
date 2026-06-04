@@ -1235,8 +1235,9 @@ def test_creator_script_prompt_requires_platform_image_runtime_helper():
         file_path="scripts/generate_image.py",
         skill_name="image-skill",
         purpose="调用平台 diffusion 生成图片",
-        blueprint_text="需要根据用户输入生成图片",
+        blueprint_text="需要根据用户输入生成图片；role: image_generator",
         conversation_history=[],
+        role="image_generator",
     )
     prompt = messages[0]["content"]
 
@@ -1697,7 +1698,21 @@ def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
     from backend.routers.creator import GenerateFileRequest
 
     bad_reference = "若当前无误，点击开始创建：系统将自动创建 references/style.md"
-    fixed_reference = "# 写作风格参考\n\n- 使用清晰的故事结构。\n- 描写画面、角色和情绪。"
+    fixed_reference = """# 写作风格参考
+
+## 规范
+- 使用清晰的三段式故事结构：开端、冲突、回响。
+- 描写画面、角色动作和情绪变化，避免空泛形容。
+
+## 示例
+- 好：雨夜里，角色先听到窗沿水声，再发现信纸被浸湿。
+
+## 反例
+- 坏：这个故事很感人、很精彩，但没有具体场景。
+
+## 约束
+- 禁止复制 Creator 流程文案；禁止只写口号式风格词。
+"""
     repair_prompts = []
     validator_prompts = []
 
@@ -1742,7 +1757,7 @@ def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
     assert "必须满足以下参考资料文件合同" in validator_prompts[0]
     assert "reference.no_creator_flow" in repair_prompts[0]
     assert "本轮修复模式：minimal_edit" in repair_prompts[0]
-    assert any(event.get("content") == fixed_reference for event in events)
+    assert any(str(event.get("content", "")).strip() == fixed_reference.strip() for event in events)
 
 def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     from backend.routers.creator import _build_generate_file_prompt
@@ -2185,7 +2200,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         repair_prompts.append(messages[-1]["content"])
         return repairs.pop(0)
 
-    def fake_trial_run(_skill_name, file_path, content):
+    def fake_trial_run(_skill_name, file_path, content, role=None):
         creator._validate_script_contract_static(
             file_path=file_path,
             content=content,
@@ -2203,6 +2218,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         purpose="生成脚本",
         blueprint_text=skill_md,
         conversation_history=[],
+        role="image_generator",
     )
 
     async def collect_events():
@@ -2346,3 +2362,119 @@ def test_creator_script_strict_rewrite_uses_extracted_candidate_not_fenced_draft
     assert "```" not in previous_body
     assert "scripts/generate_love_story.py" not in previous_body
     assert "import json" in previous_body
+
+
+def test_creator_skeleton_uses_role_not_blueprint_global_image_keyword():
+    from backend.routers.creator import _script_generation_skeleton
+
+    skeleton = _script_generation_skeleton(
+        "scripts/build_pdf.py",
+        "把已有 text 和 image_paths 排版成 PDF",
+        "复合流程：先生成图片，再调用 scripts/build_pdf.py 输出 PDF。",
+        role="pdf_builder",
+    )
+
+    assert "pdf_builder" in skeleton
+    assert "generate_stable_diffusion_image" not in skeleton
+    assert "pdf_path" in skeleton
+
+
+def test_blueprint_plan_adds_per_file_roles_and_contracts():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: riddle-book
+- scripts/：创建 `scripts/generate_riddle.py` role: text_generator 写谜语，`scripts/generate_image.py` role: image_generator 生成图片，`scripts/build_pdf.py` role: pdf_builder 构建 PDF
+- references/：创建 `references/pdf-layout-guide.md`
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    roles = {entry.path: entry.role for entry in plan.skill_plan.files}
+
+    assert roles["scripts/generate_riddle.py"] == "text_generator"
+    assert roles["scripts/generate_image.py"] == "image_generator"
+    assert roles["scripts/build_pdf.py"] == "pdf_builder"
+    assert roles["references/pdf-layout-guide.md"] == "reference"
+
+
+def test_creator_asset_contract_rejects_empty_and_invalid_json():
+    import pytest
+
+    from backend.routers.creator import _validate_asset_file_contract, ContractValidationError
+
+    with pytest.raises(ContractValidationError, match="asset 内容为空"):
+        _validate_asset_file_contract("assets/template.json", "")
+
+    with pytest.raises(ContractValidationError, match="不是合法 JSON"):
+        _validate_asset_file_contract("assets/template.json", "{bad json")
+
+    _validate_asset_file_contract("assets/template.json", '{"layout":"simple"}')
+
+
+def test_skill_plan_low_confidence_script_falls_back_to_generic_with_warning():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: utility-skill
+- scripts/：创建 `scripts/process.py` 处理输入
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/process.py")
+
+    assert entry.role == "generic_script"
+    assert entry.confidence < 0.7
+    assert "mentions" in " ".join(entry.heuristic_signals) or "python_script" in entry.heuristic_signals
+    assert any("generic_script" in warning and "高影响能力" in warning for warning in plan.warnings)
+
+
+def test_creator_forbidden_capability_blocks_pdf_builder_image_helper():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _validate_script_file_source_contract
+
+    content = """import json
+from backend.services.skill_runtime import generate_stable_diffusion_image
+result = generate_stable_diffusion_image('cat')
+print(json.dumps({'pdf_path': 'out.pdf'}))
+"""
+
+    with pytest.raises(ContractValidationError, match="forbidden_image_generation"):
+        _validate_script_file_source_contract("scripts/build_pdf.py", content, role="pdf_builder")
+
+
+def test_creator_skill_md_prompt_requires_composite_orchestration():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="riddle-book",
+        purpose="复合任务总览",
+        blueprint_text="scripts/a.py role: text_generator\nreferences/a.md",
+        conversation_history=[],
+    )
+    prompt = messages[0]["content"]
+
+    assert "复合任务 orchestrator" in prompt
+    assert "执行顺序" in prompt
+    assert "outputs 如何传给下一步 inputs" in prompt
+    assert "详细规则必须引用 references/*.md" in prompt
+
+
+def test_creator_asset_contract_extension_aware_formats():
+    import base64
+    import pytest
+
+    from backend.routers.creator import _validate_asset_file_contract, ContractValidationError
+
+    _validate_asset_file_contract("assets/table.csv", "name,value\na,1\n")
+    _validate_asset_file_contract("assets/doc.pdf", "%PDF-1.4\n% test\n")
+    _validate_asset_file_contract(
+        "assets/pixel.png",
+        base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode("ascii"),
+    )
+
+    with pytest.raises(ContractValidationError, match="CSV 必须包含非空表头"):
+        _validate_asset_file_contract("assets/table.csv", "onlyheader\n")
+    with pytest.raises(ContractValidationError, match="必须以 %PDF-"):
+        _validate_asset_file_contract("assets/doc.pdf", "not a pdf")

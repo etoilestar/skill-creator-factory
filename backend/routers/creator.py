@@ -12,6 +12,9 @@ These endpoints decouple the file-creation phase from the main
 """
 
 import ast
+import base64
+import csv
+import io
 import json
 from dataclasses import dataclass
 import logging
@@ -24,10 +27,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, default_io_for_role, file_role_classifier, file_type_for_path
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -151,6 +155,17 @@ class FileSpecOut(BaseModel):
     purpose: str
     required: bool
     can_skip: bool
+    file_type: Optional[str] = None
+    role: Optional[str] = None
+    inputs: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+    required_capabilities: list[str] = Field(default_factory=list)
+    forbidden_capabilities: list[str] = Field(default_factory=list)
+    reference_files: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    reason: str = ""
+    heuristic_signals: list[str] = Field(default_factory=list)
 
 
 class AnalyzeBlueprintResponse(BaseModel):
@@ -176,6 +191,8 @@ class GenerateFileRequest(BaseModel):
     blueprint_text: str
     conversation_history: list[dict]
     model: Optional[str] = None
+    role: Optional[str] = None
+    skill_plan_entry: Optional[dict[str, Any]] = None
 
 
 class WriteFileRequest(BaseModel):
@@ -279,6 +296,84 @@ def _validate_skill_name(skill_name: str) -> str:
     return name
 
 
+def _skill_plan_entry_for_file(
+    *,
+    file_path: str,
+    purpose: str = "",
+    blueprint_text: str = "",
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> SkillPlanEntry:
+    """Return the per-file SkillPlan contract used by Creator.
+
+    If the UI passes an explicit role from /analyze-blueprint, keep it.
+    Otherwise classify from the concrete file path/purpose, using blueprint text
+    only as auxiliary context.
+    """
+    if skill_plan_entry and skill_plan_entry.get("path") == file_path:
+        explicit_role = str(skill_plan_entry.get("role") or role or "").strip()
+        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "generic_script", "skill_overview", "reference", "asset"}
+        if explicit_role in allowed_roles:
+            inputs = list(skill_plan_entry.get("inputs") or default_io_for_role(explicit_role)[0])
+            outputs = list(skill_plan_entry.get("outputs") or default_io_for_role(explicit_role)[1])
+            required_capabilities = list(
+                skill_plan_entry.get("required_capabilities") or capabilities_for_role(explicit_role)[0]
+            )
+            forbidden_capabilities = list(
+                skill_plan_entry.get("forbidden_capabilities") or capabilities_for_role(explicit_role)[1]
+            )
+            return SkillPlanEntry(
+                path=file_path,
+                file_type=file_type_for_path(file_path),
+                role=explicit_role,  # type: ignore[arg-type]
+                purpose=str(skill_plan_entry.get("purpose") or purpose),
+                inputs=inputs,
+                outputs=outputs,
+                dependencies=list(skill_plan_entry.get("dependencies") or []),
+                required_capabilities=required_capabilities,
+                forbidden_capabilities=forbidden_capabilities,
+                reference_files=list(skill_plan_entry.get("reference_files") or []),
+                required=bool(skill_plan_entry.get("required", True)),
+                can_skip=bool(skill_plan_entry.get("can_skip", False)),
+                confidence=float(skill_plan_entry.get("confidence") or 1.0),
+                reason=str(skill_plan_entry.get("reason") or "explicit SkillPlan entry from UI"),
+                heuristic_signals=list(skill_plan_entry.get("heuristic_signals") or []),
+            )
+
+    entry = build_skill_plan_entry(
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_text[:4000],
+    )
+    if role and role != entry.role:
+        classification = file_role_classifier(
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_text[:4000],
+        )
+        if role in {"text_generator", "image_generator", "pdf_builder", "generic_script", "skill_overview", "reference", "asset"}:
+            inputs, outputs = default_io_for_role(role)
+            required_capabilities, forbidden_capabilities = capabilities_for_role(role)
+            return SkillPlanEntry(
+                path=entry.path,
+                file_type=entry.file_type,
+                role=role,  # type: ignore[arg-type]
+                purpose=entry.purpose,
+                inputs=inputs,
+                outputs=outputs,
+                dependencies=entry.dependencies,
+                required_capabilities=required_capabilities,
+                forbidden_capabilities=forbidden_capabilities,
+                reference_files=entry.reference_files,
+                required=entry.required,
+                can_skip=entry.can_skip,
+                confidence=classification.confidence,
+                reason=f"explicit role from SkillPlan/UI: {role}",
+                heuristic_signals=entry.heuristic_signals,
+            )
+    return entry
+
+
 def _extract_first_fenced_block(content: str) -> str | None:
     """Return the first fenced block body from content, or None."""
     lines = content.splitlines(keepends=True)
@@ -367,6 +462,7 @@ _DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images
 _PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image|backend\.services\.skill_runtime", re.IGNORECASE)
 _IMAGE_URL_ONLY_RE = re.compile(r'\[0\]\s*\.get\(\s*[\'"]url[\'"]|\[\s*[\'"]url[\'"]\s*\]', re.IGNORECASE)
 _DATA_URI_RE = re.compile(r"data:image/[^;]+;base64", re.IGNORECASE)
+_REFERENCE_PLACEHOLDER_RE = re.compile(r"placeholder|TODO|待补充|将要生成|仅为示例|空壳|占位", re.IGNORECASE)
 
 
 def _reject_custom_skill_md_protocol(content: str) -> None:
@@ -448,7 +544,10 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 必须以 --- 开始。",
         "- 必须包含 name 和 description。",
         "- 必须用 --- 关闭 frontmatter。",
-        "B. scripts 命令块:",
+        "B. 复合任务编排:",
+        "- SKILL.md 必须作为总流程/编排说明，描述执行顺序、数据流、每步预期输出，以及何时读取 references/assets。",
+        "- 对复合任务，SKILL.md 只做流程总览，不把子任务详细规则写满；详细规范放入对应 references/*.md。",
+        "C. scripts 命令块:",
     ]
     if script_paths:
         for script_path in script_paths:
@@ -462,7 +561,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     else:
         lines.append("- 蓝图没有 scripts/，不要强行写脚本命令。")
 
-    lines.append("C. references 引用:")
+    lines.append("D. references 引用:")
     if reference_paths:
         for reference_path in reference_paths:
             lines.append(f"- 必须在正文中出现并说明用途：{reference_path}")
@@ -470,7 +569,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         lines.append("- 蓝图没有 references/，不要强行编造参考资料。")
 
     lines.extend([
-        "D. 禁止项:",
+        "E. 禁止项:",
         "- 不要包含 Runtime Contract JSON。",
         "- 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等平台流程文案。",
     ])
@@ -586,10 +685,25 @@ def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
 
 
 
-def _build_script_file_contract_text(file_path: str, blueprint_text: str) -> str:
+def _build_script_file_contract_text(
+    file_path: str,
+    blueprint_text: str,
+    *,
+    purpose: str = "",
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> str:
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role
+    )
     keys = ", ".join(_infer_script_input_keys_from_blueprint(file_path, blueprint_text))
-    return "\n".join([
+    lines = [
         f"必须满足以下脚本文件合同：{file_path}",
+        f"SkillPlan role: {entry.role}",
+        f"inputs: {', '.join(entry.inputs) or 'payload'}",
+        f"outputs: {', '.join(entry.outputs)}",
+        f"required_capabilities: {', '.join(entry.required_capabilities) or 'none'}",
+        f"forbidden_capabilities: {', '.join(entry.forbidden_capabilities) or 'none'}",
         "A. 输出形态:",
         "- 只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
         "- Python 脚本必须能通过 ast.parse 语法检查。",
@@ -597,14 +711,36 @@ def _build_script_file_contract_text(file_path: str, blueprint_text: str) -> str
         "- 默认使用 JSON argv 接口：读取 sys.argv[1] 并 json.loads 解析。",
         f"- 必须实际使用用户输入 keys：{keys}。",
         f"- 与 SKILL.md 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text)}",
-        "C. 输出接口:",
-        "- stdout 输出结构化 JSON，不要混入调试说明。",
-        "- 推荐统一输出字段：{\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}。",
-        "D. 禁止项:",
+        "C. 角色输出合同:",
+    ]
+    if entry.role == "text_generator":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 text 字段为非空字符串。",
+            "- forbidden_capabilities 生效：不得调用图片生成 helper，不得输出 pdf_path 作为主要结果。",
+        ])
+    elif entry.role == "image_generator":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 image_paths 或 images 至少一个非空。",
+            "- 必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
+            "- 必须保留 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get('image_path'))、images.append(result) 的骨架结构；禁止 image_path = generate_stable_diffusion_image(...)。",
+        ])
+    elif entry.role == "pdf_builder":
+        lines.extend([
+            "- stdout 必须输出 JSON object，且 pdf_path 或 file_paths 至少一个指向真实生成文件。",
+            "- forbidden_capabilities 生效：PDF 构建脚本不得生成图片或调用 generate_stable_diffusion_image。",
+            "- 只能消费已有 text/image_paths/template/assets 并构建 PDF/文件。",
+        ])
+    else:
+        lines.extend([
+            "- stdout 必须输出 JSON object，不要混入调试说明。",
+            "- 根据角色职责返回 text、file_paths 或其它明确结果字段。",
+        ])
+    lines.extend([
+        "E. 禁止项:",
         "- 禁止 placeholder/mock/fake API/固定模板冒充真实能力。",
-        "- 需要图片生成时必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
-        "- 图片脚本必须保留 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架结构；禁止 image_path = generate_stable_diffusion_image(...)。",
+        "- 只能实现本 role 的职责；复合任务由 SKILL.md 编排多个 scripts/references/assets 完成。",
     ])
+    return "\n".join(lines)
 
 
 def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
@@ -616,19 +752,42 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         "B. 内容职责:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
         "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
+        "- 必须包含任务规范/步骤、示例、反例、约束/禁止项等章节，且正文长度足以指导子任务。",
         "C. 禁止项:",
         "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
         "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
     ])
 
 
-def _build_generated_file_contract_text(file_path: str, blueprint_text: str, purpose: str = "") -> str:
+def _build_asset_file_contract_text(file_path: str, purpose: str) -> str:
+    return "\n".join([
+        f"必须满足以下 asset 文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出当前 asset 文件内容，不要写入文件标签、说明文字或多文件包。",
+        "- 文件必须非空；JSON 资源必须可被 json.loads 解析。",
+        "B. 内容职责:",
+        f"- 职责说明：{purpose or '根据蓝图提供模板或静态资源'}",
+        "C. 禁止项:",
+        "- asset 是模板或静态资源，不得包含运行时代码、图片生成调用或 Creator 创建流程文案。",
+    ])
+
+
+def _build_generated_file_contract_text(
+    file_path: str,
+    blueprint_text: str,
+    purpose: str = "",
+    *,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> str:
     if file_path == "SKILL.md":
         return _build_skill_md_contract_text(blueprint_text)
     if file_path.startswith("scripts/"):
-        return _build_script_file_contract_text(file_path, blueprint_text)
+        return _build_script_file_contract_text(file_path, blueprint_text, purpose=purpose, role=role, skill_plan_entry=skill_plan_entry)
     if file_path.startswith("references/"):
         return _build_reference_file_contract_text(file_path, purpose, blueprint_text)
+    if file_path.startswith("assets/"):
+        return _build_asset_file_contract_text(file_path, purpose)
     return ""
 
 
@@ -668,6 +827,53 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
             minimal_edit="删除其它文件内容、路径标题和写入文件标签，只保留当前参考资料正文。",
         ),
     ]
+    min_chars = 120
+    has_min_length = len(stripped) >= min_chars
+    results.append(ContractCheckResult(
+        id="reference.min_quality_length",
+        passed=has_min_length,
+        target=file_path,
+        message=(
+            "参考资料长度满足最低质量要求。"
+            if has_min_length
+            else f"{file_path} 内容过短，无法作为子任务参考资料。"
+        ),
+        expected=f"至少 {min_chars} 个字符，包含可执行的任务规则、示例和约束。",
+        minimal_edit="扩充为任务专用参考资料，加入步骤、格式要求、示例、反例和约束。",
+    ))
+    required_sections = {
+        "rules": bool(re.search(r"(?im)^#{1,3}.*(规范|规则|步骤|流程|要求|Rules|Steps)", stripped)),
+        "examples": bool(re.search(r"(?im)^#{1,3}.*(示例|例子|Examples?)", stripped)),
+        "anti_examples": bool(re.search(r"(?im)^#{1,3}.*(反例|错误示例|Anti[- ]?examples?)", stripped)),
+        "constraints": bool(re.search(r"(?im)^#{1,3}.*(约束|限制|禁止|Constraints?)", stripped)),
+    }
+    sections_ok = all(required_sections.values())
+    missing_sections = [name for name, present in required_sections.items() if not present]
+    results.append(ContractCheckResult(
+        id="reference.required_sections",
+        passed=sections_ok,
+        target=file_path,
+        message=(
+            "参考资料包含规范/示例/反例/约束章节。"
+            if sections_ok
+            else f"{file_path} 缺少必要章节：{', '.join(missing_sections)}。"
+        ),
+        expected="包含规范/步骤、示例、反例、约束/禁止项章节。",
+        minimal_edit="补齐 Markdown 标题章节：## 规范、## 示例、## 反例、## 约束。",
+    ))
+    has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
+    results.append(ContractCheckResult(
+        id="reference.no_placeholder_phrases",
+        passed=not has_placeholder,
+        target=file_path,
+        message=(
+            "参考资料未包含占位短语。"
+            if not has_placeholder
+            else f"{file_path} 包含 placeholder/TODO/待补充等占位短语。"
+        ),
+        expected="不要使用 placeholder、TODO、待补充、将要生成等占位表达。",
+        minimal_edit="删除占位短语并替换为实际任务规则和示例。",
+    ))
     return results
 
 
@@ -678,7 +884,102 @@ def _validate_reference_file_contract(file_path: str, content: str, purpose: str
 
 
 
-def _check_script_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
+def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, str]:
+    ext = Path(file_path).suffix.lower()
+    if not stripped:
+        return True, "空内容由 asset.not_empty 检查处理。", "当前 asset 文件内容非空。"
+    if ext == ".json":
+        try:
+            json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            return False, f"{file_path} 不是合法 JSON: {exc.msg}", "JSON asset 必须可被 json.loads 解析。"
+        return True, "JSON asset 可解析。", "JSON asset 必须可被 json.loads 解析。"
+    if ext == ".csv":
+        rows = list(csv.reader(io.StringIO(stripped)))
+        header = rows[0] if rows else []
+        if len(rows) < 2 or not header or any(not cell.strip() for cell in header):
+            return False, f"{file_path} CSV 必须包含非空表头和至少一行数据。", "CSV asset 必须包含 header 和至少一行数据。"
+        return True, "CSV asset 包含表头和数据行。", "CSV asset 必须包含 header 和至少一行数据。"
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        data = stripped.encode("latin1", errors="ignore")
+        if re.fullmatch(r"[A-Za-z0-9+/=\s]+", stripped) and len(stripped) > 24:
+            try:
+                data = base64.b64decode(stripped, validate=True)
+            except ValueError:
+                data = stripped.encode("latin1", errors="ignore")
+        magic_ok = (
+            data.startswith(b"\x89PNG\r\n\x1a\n")
+            or data.startswith(b"\xff\xd8\xff")
+            or data.startswith(b"GIF87a")
+            or data.startswith(b"GIF89a")
+            or data.startswith(b"RIFF") and b"WEBP" in data[:16]
+        )
+        return (
+            magic_ok,
+            "image asset 头部合法。" if magic_ok else f"{file_path} 不是可识别的 PNG/JPEG/GIF/WEBP 图片内容或 base64。",
+            "图片 asset 必须是有效图片字节或 base64 编码的有效图片。",
+        )
+    if ext == ".pdf":
+        pdf_ok = stripped.startswith("%PDF-")
+        return (
+            pdf_ok,
+            "PDF asset 头部合法。" if pdf_ok else f"{file_path} 必须以 %PDF- 开头。",
+            "PDF asset 必须是有效 PDF 内容。",
+        )
+    if ext in {".md", ".txt"}:
+        quality_ok = len(stripped) >= 40 and not _REFERENCE_PLACEHOLDER_RE.search(stripped)
+        return (
+            quality_ok,
+            "Markdown/text asset 满足最低质量要求。" if quality_ok else f"{file_path} 文本资源过短或包含占位短语。",
+            "Markdown/text asset 至少 40 个字符且不能包含占位短语。",
+        )
+    return True, "asset 格式可解析。", "当前 asset 文件内容必须符合其扩展名对应格式。"
+
+
+def _check_asset_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
+    stripped = content.strip()
+    has_runtime_code = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+    parse_ok, parse_message, parse_expected = _asset_extension_check(file_path, stripped)
+    return [
+        ContractCheckResult(
+            id="asset.not_empty",
+            passed=bool(stripped),
+            target=file_path,
+            message=("asset 内容非空。" if stripped else f"{file_path} asset 内容为空。"),
+            expected="输出当前 asset 的模板或静态资源内容。",
+            minimal_edit="补充真实模板/静态资源内容，不要输出空壳。",
+        ),
+        ContractCheckResult(
+            id="asset.parseable",
+            passed=parse_ok,
+            target=file_path,
+            message=parse_message,
+            expected=parse_expected,
+            minimal_edit="按文件扩展名修正格式：JSON/CSV/image/PDF/Markdown 文本必须可解析且非空。",
+        ),
+        ContractCheckResult(
+            id="asset.no_runtime_capability",
+            passed=not has_runtime_code,
+            target=file_path,
+            message=(
+                "asset 未包含运行时图片生成能力。"
+                if not has_runtime_code
+                else f"{file_path} 是 asset，但包含图片生成 helper/运行时代码。"
+            ),
+            expected="asset 只能是模板或静态资源，不得执行 image_generation 等能力。",
+            minimal_edit="删除运行时代码或将该职责拆分为 scripts/ 文件。",
+        ),
+    ]
+
+
+def _validate_asset_file_contract(file_path: str, content: str) -> None:
+    results = _check_asset_file_contract(file_path, content)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
+
+def _check_script_file_contract(file_path: str, content: str, role: str | None = None) -> list[ContractCheckResult]:
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role)
     stripped = content.strip()
     has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
     raw_ok = bool(stripped) and not has_markdown_or_bundle
@@ -733,11 +1034,45 @@ def _check_script_file_contract(file_path: str, content: str) -> list[ContractCh
             minimal_edit="替换占位或模拟逻辑，实现真实可执行算法或调用平台配置模型/helper。",
         )
     )
+
+    if plan_entry.role != "image_generator":
+        uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+        results.append(
+            ContractCheckResult(
+                id="script.role.forbidden_image_generation",
+                passed=not uses_image_helper,
+                target=file_path,
+                message=(
+                    "非 image_generator 脚本未调用图片生成能力。"
+                    if not uses_image_helper
+                    else f"{file_path} 的 SkillPlan role 是 {plan_entry.role}，但脚本调用了图片生成 helper。"
+                ),
+                expected="只有 image_generator role 可以调用 generate_stable_diffusion_image。",
+                minimal_edit="删除图片生成调用；若任务确实要生成图片，请拆分为单独 image_generator 脚本。",
+            )
+        )
+
+    if plan_entry.role == "image_generator":
+        pdf_only = ("pdf_path" in stripped or "file_paths" in stripped) and "image_paths" not in stripped and "images" not in stripped
+        results.append(
+            ContractCheckResult(
+                id="script.role.image_forbidden_pdf_only_outputs",
+                passed=not pdf_only,
+                target=file_path,
+                message=(
+                    "image_generator 未输出 PDF-only 结果。"
+                    if not pdf_only
+                    else f"{file_path} 是 image_generator，但源码只声明 pdf_path/file_paths 等 PDF-only 输出。"
+                ),
+                expected="image_generator 必须输出 image_paths/images，不得只输出 pdf_path/file_paths。",
+                minimal_edit="返回 image_paths/images；若要构建 PDF，请拆分为单独 pdf_builder 脚本。",
+            )
+        )
     return results
 
 
-def _validate_script_file_source_contract(file_path: str, content: str) -> None:
-    results = _check_script_file_contract(file_path, content)
+def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None) -> None:
+    results = _check_script_file_contract(file_path, content, role=role)
     if any(not result.passed for result in results):
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
@@ -854,14 +1189,18 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
         "或者把该 Skill 设计为无需 scripts/ 的模型直接回答。"
     )
 
-def _validate_generated_file_content(file_path: str, content: str) -> None:
+def _validate_generated_file_content(file_path: str, content: str, role: str | None = None) -> None:
     """Reject content that is clearly not the requested single file."""
     if file_path == "SKILL.md":
         _reject_custom_skill_md_protocol(content)
         return
 
     if file_path.startswith("scripts/"):
-        _validate_script_file_source_contract(file_path, content)
+        _validate_script_file_source_contract(file_path, content, role=role)
+        return
+
+    if file_path.startswith("assets/"):
+        _validate_asset_file_contract(file_path, content)
 
 
 def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
@@ -1031,7 +1370,19 @@ def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str]) -> None:
+def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
+    pdf_path = payload.get("pdf_path")
+    if isinstance(pdf_path, str) and pdf_path.strip():
+        return True
+
+    file_paths = payload.get("file_paths")
+    if isinstance(file_paths, list) and file_paths and all(isinstance(p, str) and p.strip() for p in file_paths):
+        return True
+
+    return False
+
+
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None) -> None:
     stripped = (stdout or "").strip()
     if not stripped:
         raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
@@ -1044,7 +1395,15 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str]) -
     if "error" in payload:
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
 
-    if "generate_stable_diffusion_image" in content and not _validate_image_payload_shape(payload):
+    plan_entry = _skill_plan_entry_for_file(file_path="scripts/trial.py", role=role) if role else None
+
+    if plan_entry and plan_entry.role == "text_generator" and not str(payload.get("text") or "").strip():
+        raise ValueError(f"text_generator stdout JSON 必须包含非空 text 字段：argv={args!r} stdout={stripped[-4000:]}")
+
+    if plan_entry and plan_entry.role == "pdf_builder" and not _validate_file_payload_shape(payload):
+        raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
+
+    if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
         raise ValueError(
             "图片脚本调用了 generate_stable_diffusion_image，但 stdout JSON 缺少可消费的图片路径字段："
             "必须包含 image_path(str) 或 image_paths(list[str]) 或 images(list[dict] 且每项含 image_path)。"
@@ -1052,7 +1411,7 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str]) -
         )
 
 
-def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -> None:
+def _trial_run_generated_script(skill_name: str, file_path: str, content: str, role: str | None = None) -> None:
     """Run a generated Python script before accepting it from Creator.
 
     Python scripts are executed in a temporary per-skill virtual environment.
@@ -1104,7 +1463,8 @@ def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -
                     stdout=proc.stdout,
                     stderr=proc.stderr,
                 ))
-            _validate_trial_stdout_json(stdout=proc.stdout, content=content, args=args)
+            inferred_role = role or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md).role
+            _validate_trial_stdout_json(stdout=proc.stdout, content=content, args=args, role=inferred_role)
 
 
 async def _repair_generated_file_with_feedback(
@@ -1291,6 +1651,13 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             return (
                 "按脚本合同修复：保持单文件源码，修正语法/参数解析/运行错误；"
                 "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON。"
+            )
+
+    if file_path.startswith("assets/"):
+        if "contract 未通过" in deterministic_error or "asset" in deterministic_error or "JSON" in deterministic_error:
+            return (
+                "按 asset 合同修复：只输出当前资源文件内容；确保非空、JSON 可解析，"
+                "删除 Creator 流程、多文件包和运行时代码。"
             )
 
     if file_path.startswith("references/"):
@@ -1627,10 +1994,10 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     return _strip_code_fence(extracted if extracted is not None else content)
 
 
-def _sanitize_generated_file_content(file_path: str, content: str) -> str:
+def _sanitize_generated_file_content(file_path: str, content: str, role: str | None = None) -> str:
     """Normalize model output into exactly the requested file content."""
     sanitized = _normalize_generated_file_content(file_path, content)
-    _validate_generated_file_content(file_path, sanitized)
+    _validate_generated_file_content(file_path, sanitized, role=role)
     return sanitized
 
 
@@ -1658,16 +2025,24 @@ def _strip_code_fence(content: str) -> str:
 
 
 
-def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: str) -> str:
-    """Return a fixed Python script scaffold for script generation prompts."""
+def _script_generation_skeleton(
+    file_path: str,
+    purpose: str,
+    blueprint_text: str,
+    *,
+    role: str | None = None,
+) -> str:
+    """Return a fixed Python script scaffold selected by SkillPlan role."""
     if Path(file_path).suffix.lower() != ".py":
         return ""
 
-    context = f"{file_path}\n{purpose}\n{blueprint_text}"
-    needs_image = bool(re.search(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration", context, re.IGNORECASE))
-    if needs_image:
+    plan_entry = _skill_plan_entry_for_file(
+        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role
+    )
+
+    if plan_entry.role == "image_generator":
         return (
-            "必须使用下面的图片脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() "
+            "必须使用下面的 image_generator 脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() "
             "中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
             "import json\n"
             "import sys\n"
@@ -1677,7 +2052,7 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def build_image_prompt(payload: dict) -> str:\n"
-            "    # Derive a concrete prompt from payload keys required by the blueprint.\n"
+            "    # Derive a concrete prompt from payload keys required by the SkillPlan.\n"
             "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
             "    return topic or 'helpful generated illustration'\n\n"
             "def run(payload: dict) -> dict:\n"
@@ -1688,7 +2063,53 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
             "    image_paths.append(result.get('image_path'))\n"
             "    images.append(result)\n"
             "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return {'text': '', 'image_paths': image_paths, 'images': images}\n\n"
+            "    return {'image_paths': image_paths, 'images': images}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    if plan_entry.role == "pdf_builder":
+        return (
+            "必须使用下面的 pdf_builder 脚本骨架；该角色只负责 PDF/文件构建，禁止生成图片：\n"
+            "import json\n"
+            "import sys\n"
+            "from pathlib import Path\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def build_pdf(payload: dict) -> dict:\n"
+            "    # Build or transform real files using payload text/image_paths/template_path.\n"
+            "    output_dir = Path(payload.get('output_dir') or '.').resolve()\n"
+            "    output_dir.mkdir(parents=True, exist_ok=True)\n"
+            "    pdf_path = output_dir / 'output.pdf'\n"
+            "    pdf_path.write_bytes(b'%PDF-1.4\n% Generated PDF bytes\n')\n"
+            "    return {'pdf_path': str(pdf_path), 'file_paths': [str(pdf_path)]}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(build_pdf(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    if plan_entry.role == "text_generator":
+        return (
+            "必须使用下面的 text_generator 脚本骨架；stdout JSON 必须包含非空 text，不要生成图片或 PDF：\n"
+            "import json\n"
+            "import sys\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def generate_text(payload: dict) -> str:\n"
+            "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
+            "    return topic\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    text = generate_text(payload).strip()\n"
+            "    return {'text': text}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -1697,8 +2118,8 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
         )
 
     return (
-        "必须使用下面的业务逻辑脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() "
-        "中的真实业务逻辑并按蓝图使用 payload 字段：\n"
+        "必须使用下面的 generic_script 脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() "
+        "中的真实业务逻辑并按 SkillPlan 使用 payload 字段：\n"
         "import json\n"
         "import sys\n\n"
         "def parse_args() -> dict:\n"
@@ -1706,9 +2127,8 @@ def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: st
         "        return {}\n"
         "    return json.loads(sys.argv[1])\n\n"
         "def run(payload: dict) -> dict:\n"
-        "    # Implement the real deterministic business logic required by the blueprint.\n"
-        "    # Treat payload.get('text') as optional; topic/prompt-only invocations must work.\n"
-        "    return {'text': '', 'image_paths': [], 'images': []}\n\n"
+        "    # Implement the real deterministic business logic required by the SkillPlan.\n"
+        "    return {'text': '', 'file_paths': []}\n\n"
         "def main() -> None:\n"
         "    payload = parse_args()\n"
         "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -1722,6 +2142,8 @@ def _build_generate_file_prompt(
     purpose: str,
     blueprint_text: str,
     conversation_history: list[dict],
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file.
 
@@ -1734,9 +2156,20 @@ def _build_generate_file_prompt(
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
     declared_paths = _extract_declared_skill_paths(blueprint_text)
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
-    generated_file_contract_text = _build_generated_file_contract_text(file_path, blueprint_text, purpose)
+    plan_entry = _skill_plan_entry_for_file(
+        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry
+    )
+    generated_file_contract_text = _build_generated_file_contract_text(
+        file_path, blueprint_text, purpose, role=role, skill_plan_entry=skill_plan_entry
+    )
     skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
-    script_skeleton_text = _script_generation_skeleton(file_path, purpose, blueprint_text) if file_path.startswith("scripts/") else ""
+    script_skeleton_text = _script_generation_skeleton(file_path, purpose, blueprint_text, role=plan_entry.role) if file_path.startswith("scripts/") else ""
+    plan_summary = (
+        f"SkillPlan role：{plan_entry.role}；"
+        f"inputs：{', '.join(plan_entry.inputs)}；"
+        f"outputs：{', '.join(plan_entry.outputs)}；"
+        f"forbidden_capabilities：{', '.join(plan_entry.forbidden_capabilities)}"
+    )
 
     if file_path == "SKILL.md":
         instruction = (
@@ -1749,13 +2182,14 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
-            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
-            "6. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
-            "7. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"
-            "8. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            "9. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
-            "10. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
+            "4. SKILL.md 必须作为复合任务 orchestrator：描述执行顺序、上一步 outputs 如何传给下一步 inputs、每步 expected outputs、失败/跳过条件，以及何时读取 references/assets。\n"
+            "5. SKILL.md 只写总流程和调用顺序；子任务详细规则必须引用 references/*.md，不要把 text/image/pdf 子任务规范混在 SKILL.md 中。\n"
+            "6. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
+            "7. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "8. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"
+            "9. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "10. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "11. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
             f"{skill_md_contract_text}\n\n"
@@ -1765,7 +2199,8 @@ def _build_generate_file_prompt(
     elif file_path.startswith("scripts/"):
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
-            f"职责说明：{purpose}\n\n"
+            f"职责说明：{purpose}\n"
+            f"{plan_summary}\n\n"
             "你是文件内容生成器，不是聊天助手；当前输出会被直接写入目标文件。\n"
             "要求：\n"
             f"1. 只输出完整可运行的 {lang} 文件字节内容本身，不要任何说明文字。\n"
@@ -1773,11 +2208,11 @@ def _build_generate_file_prompt(
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；生成图片使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 如果脚本需要生成图片，不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
-            "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；只有 image_generator role 才使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
+            "7. 只有 SkillPlan role == image_generator 时才生成图片；否则即使蓝图其它位置提到图片，也不得调用图片生成 helper。image_generator 不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
+            "8. image_generator stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 应输出结构化 JSON，字段统一为 {\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}；不要混入调试说明。\n"
+            "10. stdout 输出结构化 JSON，字段统一为 {\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}；不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
             "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
@@ -1806,7 +2241,9 @@ def _build_generate_file_prompt(
             f"职责说明：{purpose}\n\n"
             "要求：\n"
             f"1. 只输出 {lang} 格式的文件内容，不要任何说明文字。\n"
-            "2. 不要用 ``` 代码块包裹输出。\n\n"
+            "2. 不要用 ``` 代码块包裹输出。\n"
+            "生成前请先隐式检查以下 asset 合同，最终输出必须逐项满足：\n"
+            f"{generated_file_contract_text}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
@@ -1857,6 +2294,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     Pure rule-based extraction — no LLM call is made.
     """
     plan: BlueprintPlan = parse_blueprint(request.messages)
+    entries_by_path = {entry.path: entry for entry in (plan.skill_plan.files if plan.skill_plan else [])}
     return AnalyzeBlueprintResponse(
         skill_name=plan.skill_name,
         files=[
@@ -1865,6 +2303,17 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 purpose=f.purpose,
                 required=f.required,
                 can_skip=f.can_skip,
+                file_type=entries_by_path[f.path].file_type if f.path in entries_by_path else None,
+                role=entries_by_path[f.path].role if f.path in entries_by_path else None,
+                inputs=entries_by_path[f.path].inputs if f.path in entries_by_path else [],
+                outputs=entries_by_path[f.path].outputs if f.path in entries_by_path else [],
+                dependencies=entries_by_path[f.path].dependencies if f.path in entries_by_path else [],
+                required_capabilities=entries_by_path[f.path].required_capabilities if f.path in entries_by_path else [],
+                forbidden_capabilities=entries_by_path[f.path].forbidden_capabilities if f.path in entries_by_path else [],
+                reference_files=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
+                confidence=entries_by_path[f.path].confidence if f.path in entries_by_path else 0.0,
+                reason=entries_by_path[f.path].reason if f.path in entries_by_path else "",
+                heuristic_signals=entries_by_path[f.path].heuristic_signals if f.path in entries_by_path else [],
             )
             for f in plan.files
         ],
@@ -1915,6 +2364,8 @@ async def generate_file(request: GenerateFileRequest):
         purpose=request.purpose,
         blueprint_text=request.blueprint_text,
         conversation_history=request.conversation_history,
+        role=request.role,
+        skill_plan_entry=request.skill_plan_entry,
     )
 
     async def event_stream():
@@ -1955,6 +2406,7 @@ async def generate_file(request: GenerateFileRequest):
             should_repair = (
                 request.file_path.startswith("scripts/")
                 or request.file_path.startswith("references/")
+                or request.file_path.startswith("assets/")
                 or request.file_path == "SKILL.md"
             )
             if should_repair:
@@ -1964,13 +2416,15 @@ async def generate_file(request: GenerateFileRequest):
                 contract_text = _build_generated_file_contract_text(request.file_path, request.blueprint_text, request.purpose)
                 for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
-                        content = _sanitize_generated_file_content(request.file_path, content)
+                        content = _sanitize_generated_file_content(request.file_path, content, role=request.role)
                         if request.file_path == "SKILL.md":
                             _validate_skill_md_contract(content, request.blueprint_text)
                         elif request.file_path.startswith("references/"):
                             _validate_reference_file_contract(request.file_path, content, request.purpose)
+                        elif request.file_path.startswith("assets/"):
+                            _validate_asset_file_contract(request.file_path, content)
                         else:
-                            _trial_run_generated_script(skill_name, request.file_path, content)
+                            _trial_run_generated_script(skill_name, request.file_path, content, request.role)
                         last_error = ""
                         break
                     except ValueError as validation_exc:
@@ -2046,7 +2500,7 @@ async def generate_file(request: GenerateFileRequest):
                             repair_mode=repair_mode,
                         )
             else:
-                content = _sanitize_generated_file_content(request.file_path, raw_content)
+                content = _sanitize_generated_file_content(request.file_path, raw_content, role=request.role)
 
             yield _sse({"content": content})
             yield _sse({"done": True})
@@ -2085,7 +2539,7 @@ async def write_file(request: WriteFileRequest):
         if request.file_path == "SKILL.md":
             _validate_skill_md_against_existing_files(skill_name, content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
-        _trial_run_generated_script(skill_name, request.file_path, content)
+        _trial_run_generated_script(skill_name, request.file_path, content, request.role)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

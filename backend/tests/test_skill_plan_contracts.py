@@ -355,3 +355,98 @@ console.log(JSON.stringify({ text: payload.topic || '' }));
     assert sanitized.endswith("));")
     assert "说明文字" not in sanitized
     assert "```" not in sanitized
+
+
+def test_image_named_script_is_promoted_to_image_generator_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: fairy-images
+- scripts/: `scripts/generate_fairy_tale_with_images.py` 负责根据 topic 和 custom_character 生成童话配图，调用平台图片能力。
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/generate_fairy_tale_with_images.py")
+
+    assert entry.role == "image_generator"
+    assert entry.required_capabilities == ["image_generation"]
+    assert "text_generation" in entry.forbidden_capabilities
+    assert "pdf_generation" in entry.forbidden_capabilities
+    assert "custom_character" in entry.inputs
+    assert "text_with_image_prompts" in entry.outputs
+    assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
+
+
+def test_main_script_with_ambiguous_image_pdf_wording_stays_generic():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: vague-skill
+- scripts/: `scripts/main.py` 生成图片和 PDF，但未声明 role
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/main.py")
+
+    assert entry.role == "generic_script"
+    assert "image_generation" not in entry.required_capabilities
+
+
+def test_image_generator_contract_requires_helper_without_strict_skillplan_entry():
+    from backend.routers.creator import _check_script_file_contract
+
+    no_helper = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    print(json.dumps({'image_paths': [payload.get('topic', '')]}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {
+        result.id
+        for result in _check_script_file_contract("scripts/render_images.py", no_helper, role="image_generator")
+        if not result.passed
+    }
+
+    assert "script.required_capabilities.called" in failed
+
+
+def test_generic_script_forbids_image_helper_and_repair_guidance_keeps_role_context():
+    from backend.routers.creator import _check_script_file_contract, _targeted_generated_file_repair_instructions
+
+    entry = {
+        "path": "scripts/main.py",
+        "role": "generic_script",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "python",
+        "runtime": "python",
+    }
+    content = """import json
+import sys
+from backend.services.skill_runtime import generate_stable_diffusion_image
+
+def main():
+    payload = json.loads(sys.argv[1])
+    result = generate_stable_diffusion_image(payload.get('topic', 'cat'))
+    print(json.dumps({'text': result.get('image_path')}))
+
+if __name__ == '__main__':
+    main()
+"""
+    failed = {
+        result.id
+        for result in _check_script_file_contract("scripts/main.py", content, skill_plan_entry=entry)
+        if not result.passed
+    }
+    guidance = _targeted_generated_file_repair_instructions(
+        file_path="scripts/main.py",
+        deterministic_error="script.role.forbidden_image_generation: generic_script 调用了图片生成 helper",
+    )
+
+    assert "script.role.forbidden_image_generation" in failed
+    assert "不要删除真实图片 helper" in guidance
+    assert "role=image_generator" in guidance

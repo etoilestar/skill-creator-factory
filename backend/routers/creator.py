@@ -1273,7 +1273,11 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
     if capability == "text_generation":
         return bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", content, re.IGNORECASE))
     if capability == "image_generation":
-        return bool(_PLATFORM_IMAGE_HELPER_RE.search(content))
+        # Direct image API usage is rejected later with a more specific error
+        # (for example VISION_MODEL misuse).  Treat it as an attempted image
+        # capability here so the repair loop sees the precise role/API failure
+        # instead of a generic "missing required_capabilities" message.
+        return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
         return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
     if capability == "file_output":
@@ -1321,10 +1325,10 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         syntax_ok = "process.argv" in stripped and "console.log" in stripped
         syntax_message = "Node/JS 脚本包含 process.argv 和 stdout JSON 输出。" if syntax_ok else f"{file_path} Node/JS 脚本必须使用 process.argv 读取 JSON argv 并 console.log 输出 JSON。"
         syntax_expected = "Node/JS 脚本必须使用 process.argv[2] + JSON.parse，并通过 console.log(JSON.stringify(...)) 输出 JSON。"
-    elif plan_entry.runtime == "bash":
+    elif plan_entry.runtime in {"bash", "shell"}:
         syntax_ok = "$1" in stripped or "${1" in stripped
-        syntax_message = "Bash 脚本读取 $1 JSON argv。" if syntax_ok else f"{file_path} Bash 脚本必须读取 $1 JSON argv。"
-        syntax_expected = "Bash 脚本必须读取 $1 JSON argv，并向 stdout 输出 JSON 或写入声明的文件产物。"
+        syntax_message = "Shell/Bash 脚本读取 $1 JSON argv。" if syntax_ok else f"{file_path} Shell/Bash 脚本必须读取 $1 JSON argv。"
+        syntax_expected = "Shell/Bash 脚本必须读取 $1 JSON argv，并向 stdout 输出 JSON 或写入声明的文件产物。"
     results.append(
         ContractCheckResult(
             id="script.source.syntax",
@@ -1393,6 +1397,22 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
             )
         )
+
+    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    results.append(
+        ContractCheckResult(
+            id="script.required_capabilities.called",
+            passed=not missing_capabilities,
+            target=file_path,
+            message=(
+                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                if not missing_capabilities
+                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+            ),
+            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
+            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+        )
+    )
 
     has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
     results.append(
@@ -1988,10 +2008,19 @@ async def _repair_generated_file_with_feedback(
         else "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
     )
     if is_script:
+        role_rule = ""
+        if plan_entry is not None and plan_entry.role == "image_generator":
+            role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image，stdout 输出 image_paths/images；禁止占位图片或删除真实 helper。"
+        elif plan_entry is not None and plan_entry.role == "text_generator":
+            role_rule = "role=text_generator：必须调用 generate_text_with_llm 或平台 LLM，禁止调用图片 helper 或输出固定 template-only 文本。"
+        elif plan_entry is not None and plan_entry.role == "pdf_builder":
+            role_rule = "role=pdf_builder：必须真实构建 PDF/file_paths，禁止调用图片 helper。"
+        elif plan_entry is not None and plan_entry.role == "generic_script":
+            role_rule = "role=generic_script：禁止调用 generate_stable_diffusion_image；若任务确实要生成图片，必须先修正 SkillPlan role 或拆分 image_generator 脚本，而不是在 generic_script 中保留图片 helper。"
         extra_rules = (
             "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys = SkillPlan inputs；"
             "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
-            "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
+            f"{role_rule}"
             "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
         )
     else:
@@ -2137,6 +2166,19 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             return (
                 "本轮必须把上一次内容改成单个裸脚本源码：删除所有 ``` fence、```python/```text 标签、"
                 "文件路径标题、写入文件标签、解释性文字和多文件包内容；最终响应第一个字符应是脚本源码字符。"
+            )
+        if "script.role.forbidden_image_generation" in deterministic_error or "调用了图片生成 helper" in deterministic_error:
+            return (
+                "当前脚本的 SkillPlan role 不是 image_generator，因此 validator 禁止调用 generate_stable_diffusion_image。"
+                "如果该脚本确实负责生成图片，不要删除真实图片 helper；应先把 Blueprint/SkillPlan 中该脚本声明为 role=image_generator，"
+                "required_capabilities=[image_generation]，并输出 image_paths/images。"
+                "如果该脚本必须保持 generic_script，则拆分图片生成为单独 image_generator 脚本，并从当前源码移除图片 helper 调用。"
+            )
+        if "script.required_capabilities.called" in deterministic_error or "未调用这些 required_capabilities" in deterministic_error or "没有调用这些 required_capabilities" in deterministic_error:
+            return (
+                "按 SkillPlan role 补齐真实平台能力调用：image_generator 必须调用 generate_stable_diffusion_image；"
+                "text_generator 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder 必须真实构建 PDF/file_paths。"
+                "禁止返回固定 f-string/template-only 文本或 placeholder。"
             )
         if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
             return (

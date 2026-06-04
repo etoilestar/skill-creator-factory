@@ -386,6 +386,8 @@ async function generateOneFile(idx) {
       blueprintText: props.blueprintText,
       conversationHistory: props.conversationHistory,
       model: props.model,
+      role: file.role || null,
+      skillPlanEntry: file,
     })) {
       if (typeof chunk === 'string') {
         file.generatedContent += chunk

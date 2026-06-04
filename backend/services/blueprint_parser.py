@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ class BlueprintPlan:
     skill_name: str
     files: list[FileSpec] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    skill_plan: SkillPlan | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +334,36 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     return files, warnings
 
 
+def build_skill_plan_from_files(
+    *,
+    skill_name: str,
+    files: list[FileSpec],
+    warnings: list[str] | None = None,
+    blueprint_text: str = "",
+) -> SkillPlan:
+    """Build the role/contract plan used by Creator generation and validation."""
+    reference_files = [file.path for file in files if file.path.startswith("references/")]
+    entries: list[SkillPlanEntry] = []
+    plan_warnings = list(warnings or [])
+    for file in files:
+        refs_for_file = reference_files if file.path == "SKILL.md" or file.path.startswith("scripts/") else []
+        entry = build_skill_plan_entry(
+            file_path=file.path,
+            purpose=file.purpose,
+            required=file.required,
+            can_skip=file.can_skip,
+            blueprint_summary=blueprint_text[:4000],
+            reference_files=refs_for_file,
+        )
+        entries.append(entry)
+        if file.path.startswith("scripts/") and entry.confidence < 0.7:
+            plan_warnings.append(
+                f"{file.path} 未声明明确 role，已使用保守 generic_script；"
+                "不会自动启用图片生成/PDF 生成等高影响能力。"
+            )
+    return SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings)
+
+
 def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
     """Parse a Skill blueprint from the conversation message history.
 
@@ -339,10 +372,15 @@ def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
     """
     blueprint_text = extract_blueprint_text(messages)
     if not blueprint_text:
+        files = [FileSpec(path="SKILL.md", purpose="Skill 核心说明文件", required=True)]
+        warnings = ["未在对话历史中找到蓝图，将创建最小 Skill 包（仅 SKILL.md）。"]
         return BlueprintPlan(
             skill_name="new-skill",
-            files=[FileSpec(path="SKILL.md", purpose="Skill 核心说明文件", required=True)],
-            warnings=["未在对话历史中找到蓝图，将创建最小 Skill 包（仅 SKILL.md）。"],
+            files=files,
+            warnings=warnings,
+            skill_plan=build_skill_plan_from_files(
+                skill_name="new-skill", files=files, warnings=warnings, blueprint_text=""
+            ),
         )
 
     skill_name = parse_skill_name(blueprint_text)
@@ -356,4 +394,12 @@ def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
     files, file_warnings = parse_files_from_blueprint(blueprint_text)
     warnings.extend(file_warnings)
 
-    return BlueprintPlan(skill_name=skill_name, files=files, warnings=warnings)
+    skill_plan = build_skill_plan_from_files(
+        skill_name=skill_name, files=files, warnings=warnings, blueprint_text=blueprint_text
+    )
+    return BlueprintPlan(
+        skill_name=skill_name,
+        files=files,
+        warnings=skill_plan.warnings,
+        skill_plan=skill_plan,
+    )

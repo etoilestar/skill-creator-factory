@@ -60,7 +60,9 @@ export async function initSkill(skillName) {
  *   purpose: string,
  *   blueprintText: string,
  *   conversationHistory: Array,
- *   model?: string|null
+ *   model?: string|null,
+ *   role?: string|null,
+ *   skillPlanEntry?: object|null
  * }} params
  * @yields {string | {done:true} | {validation:object} | {error:string}}
  */
@@ -71,6 +73,8 @@ export async function* generateFileStream({
   blueprintText,
   conversationHistory,
   model = null,
+  role = null,
+  skillPlanEntry = null,
 }) {
   const resp = await fetch('/api/creator/generate-file', {
     method: 'POST',
@@ -82,6 +86,8 @@ export async function* generateFileStream({
       blueprint_text: blueprintText,
       conversation_history: conversationHistory,
       model,
+      role,
+      skill_plan_entry: skillPlanEntry,
     }),
   })
 

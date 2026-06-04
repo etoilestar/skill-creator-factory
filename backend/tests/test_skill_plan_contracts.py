@@ -173,3 +173,101 @@ def test_strict_script_contract_validates_runtime_json_argv_and_inputs():
     assert "script.skillplan_inputs.used" in bad_failed
     assert "script.json_argv.runtime" not in good_failed
     assert "script.skillplan_inputs.used" not in good_failed
+
+
+def test_skill_plan_inputs_strip_types_defaults_without_concatenation():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/write.py",
+        purpose="inputs: topic: string, tone=humorous, style (default: popular-science)",
+    )
+
+    assert entry.inputs == ["topic", "tone", "style"]
+    assert "topicstring" not in entry.command_template
+    assert "tonehumorous" not in entry.command_template
+    assert "stylepopular-science" not in entry.command_template
+
+
+def test_script_sanitize_strips_orphan_trailing_fences_for_python_node_bash():
+    from backend.routers.creator import _sanitize_generated_file_content
+
+    py_entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "python",
+        "runtime": "python",
+    }
+    py = """import json
+import sys
+
+def main():
+    payload = json.loads(sys.argv[1])
+    print(json.dumps({'text': payload.get('topic', '')}))
+
+if __name__ == '__main__':
+    main()
+```"""
+    assert _sanitize_generated_file_content("scripts/write.py", py, skill_plan_entry=py_entry).endswith("main()")
+
+    node_entry = {**py_entry, "path": "scripts/write.js", "language": "javascript", "runtime": "node"}
+    node = """const payload = JSON.parse(process.argv[2] || '{}');
+console.log(JSON.stringify({ text: payload.topic || '' }));
+~~~"""
+    assert "~~~" not in _sanitize_generated_file_content("scripts/write.js", node, skill_plan_entry=node_entry)
+
+    bash_entry = {**py_entry, "path": "scripts/write.sh", "language": "bash", "runtime": "bash"}
+    bash = """#!/usr/bin/env bash
+payload_json=${1:-'{}'}
+text=$(python -c 'import json,sys; p=json.loads(sys.argv[1]); print(p.get("topic", ""))' "$payload_json")
+printf '{"text":"%s"}\n' "$text"
+```"""
+    assert "```" not in _sanitize_generated_file_content("scripts/write.sh", bash, skill_plan_entry=bash_entry)
+
+
+def test_reference_command_block_validates_runtime_and_skillplan_inputs():
+    from backend.routers.creator import _check_reference_file_contract
+
+    content = """
+## 输入输出
+inputs: topic
+outputs: text
+
+## 执行步骤
+```bash
+node scripts/write.py '{"topic":"{{topic}}"}'
+```
+
+## 角色与能力边界
+role: text_generator runtime: python，禁止生成图片或 PDF。
+
+## 规范
+按照 topic 生成文本，stdout 输出 JSON。
+
+## 示例
+输入 topic=猫，输出 {"text":"猫"}。
+
+## 反例
+不要使用 extra 参数，不要输出图片。
+
+## 约束
+JSON argv keys 必须与 SkillPlan inputs 对齐，文档内容足够长，可直接指导执行。
+"""
+    results = _check_reference_file_contract("references/text-generation.md", content, purpose="scripts/write.py role: text_generator runtime: python inputs: topic outputs: text")
+    failed_ids = {result.id for result in results if not result.passed}
+
+    assert "command_block.runtime.matches_skillplan" in failed_ids
+
+
+def test_asset_contract_validates_yaml_and_markdown_placeholders():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _validate_asset_file_contract
+
+    _validate_asset_file_contract("assets/config.yaml", "name: demo\nitems:\n  - one\n")
+    with pytest.raises(ContractValidationError, match="不是合法 YAML"):
+        _validate_asset_file_contract("assets/config.yaml", "name: [unterminated")
+    with pytest.raises(ContractValidationError, match="占位短语"):
+        _validate_asset_file_contract("assets/guide.md", "TODO: 待补充内容，需要以后再写。" * 3)

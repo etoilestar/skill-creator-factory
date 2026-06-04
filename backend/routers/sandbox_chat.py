@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import csv
 import functools
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -705,34 +707,388 @@ _HOST_COMMAND_INSTRUCTION_RE = re.compile(
     r"执行命令|运行命令|执行脚本|运行脚本|调用脚本|scripts/|输出[^\n]{0,30}(?:命令|可执行)"
 )
 
+_SKILL_LOCAL_RESOURCE_RE = re.compile(r"(?<![\w./-])(?P<path>(?:scripts|references|assets)/[A-Za-z0-9_./-]+)")
+_ACTION_SCHEMA_FIELD_RE = re.compile(r"(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
+_ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|generic_script)", re.I)
+_RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
+_SCRIPT_ROLES = {"text_generator", "image_generator", "pdf_builder", "generic_script"}
+_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation"}
 
-def _extract_skill_command_contract(body_prompt: str) -> dict:
+
+def _extract_script_path_from_command(command: str) -> str | None:
+    """Return the skill-local scripts/... path invoked by a command."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    for part in parts:
+        normalized = part.replace("\\", "/").lstrip("./")
+        if normalized.startswith("scripts/"):
+            return normalized
+        idx = normalized.find("/scripts/")
+        if idx >= 0:
+            return normalized[idx + 1 :]
+    return None
+
+
+def _command_json_argv_keys(command: str, script_path: str | None = None) -> set[str] | None:
+    """Return JSON argv keys after the script path, accepting template placeholders."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/").lstrip("./")
+        matches = bool(script_path and normalized.endswith(script_path)) or normalized.startswith("scripts/")
+        if not matches:
+            continue
+        if idx + 1 >= len(parts):
+            return set()
+        candidate = parts[idx + 1]
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {str(key) for key in payload.keys()}
+    return None
+
+
+def _parse_schema_list_field(text: str, field: str) -> list[str]:
+    pattern = _ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape(field))
+    match = re.search(pattern, text or "", re.I)
+    if not match:
+        return []
+    values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
+    return [re.sub(r"[^A-Za-z0-9_./-]", "", item) for item in values if re.sub(r"[^A-Za-z0-9_./-]", "", item)]
+
+
+def _block_context(text: str, block: MarkdownBlock) -> str:
+    before = (block.before_context or "")[-800:]
+    after = (block.after_context or "")[:800]
+    return before + "\n" + after
+
+
+def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[dict]:
+    """Extract portable Action schema entries from Markdown shell blocks.
+
+    This keeps the fenced-block compatibility path but normalizes it into a
+    schema the runtime can validate before execution.
+    """
+    schemas: list[dict] = []
+    for block in _extract_all_fenced_blocks(text or ""):
+        lang = (block.lang or "").lower()
+        command = (block.code or "").strip()
+        if lang not in _COMMAND_BLOCK_LANGS or not command or not _COMMAND_BLOCK_CODE_RE.search(command):
+            continue
+        script_path = _extract_script_path_from_command(command)
+        if not script_path:
+            continue
+        context = _block_context(text, block)
+        role_match = _ACTION_SCHEMA_ROLE_RE.search(context)
+        role = role_match.group(1).lower() if role_match else "generic_script"
+        inputs = _parse_schema_list_field(context, "inputs")
+        outputs = _parse_schema_list_field(context, "outputs")
+        required_capabilities = _parse_schema_list_field(context, "required_capabilities")
+        forbidden_capabilities = _parse_schema_list_field(context, "forbidden_capabilities")
+        command_keys = _command_json_argv_keys(command, script_path)
+        placeholder_keys = set(_RUNTIME_PLACEHOLDER_RE.findall(command))
+        schemas.append({
+            "script_path": script_path,
+            "command": command,
+            "source_path": source_path,
+            "role": role,
+            "inputs": inputs,
+            "outputs": outputs,
+            "required_capabilities": required_capabilities,
+            "forbidden_capabilities": forbidden_capabilities,
+            "command_keys": sorted(command_keys) if command_keys is not None else None,
+            "placeholder_keys": sorted(placeholder_keys),
+        })
+    return schemas
+
+
+def _reference_contract_texts(execution_root: Path | None) -> dict[str, str]:
+    if execution_root is None:
+        return {}
+    root = execution_root.resolve()
+    references_dir = root / "references"
+    if not references_dir.is_dir() or not _is_within_sandbox(references_dir, root):
+        return {}
+    texts: dict[str, str] = {}
+    for path in sorted(references_dir.rglob("*.md")):
+        if not path.is_file() or not _is_within_sandbox(path, root):
+            continue
+        rel = path.relative_to(root).as_posix()
+        texts[rel] = path.read_text(encoding="utf-8", errors="replace")[: settings.skill_resource_max_chars]
+    return texts
+
+
+def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return (errors, warnings) for runtime action schemas."""
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    by_script: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_script.setdefault(str(entry.get("script_path") or ""), []).append(entry)
+        role = str(entry.get("role") or "generic_script")
+        if role not in _SCRIPT_ROLES:
+            errors.append({"error": "未知 script role", "entry": entry})
+        command_keys = set(entry.get("command_keys") or [])
+        inputs = set(entry.get("inputs") or [])
+        if inputs and command_keys != inputs:
+            errors.append({
+                "error": "命令块 JSON keys 与 Action schema inputs 不一致",
+                "script_path": entry.get("script_path"),
+                "source_path": entry.get("source_path"),
+                "inputs": sorted(inputs),
+                "command_keys": sorted(command_keys),
+            })
+        if role == "generic_script" and set(entry.get("required_capabilities") or []) & _HIGH_IMPACT_CAPABILITIES:
+            errors.append({
+                "error": "generic_script 不允许声明高风险能力，必须显式声明 image_generator 或 pdf_builder role",
+                "script_path": entry.get("script_path"),
+                "required_capabilities": entry.get("required_capabilities"),
+            })
+        if role == "generic_script":
+            warnings.append({
+                "warning": "低置信度/未显式 role 的 generic_script runtime fallback；不会自动启用图片/PDF能力",
+                "script_path": entry.get("script_path"),
+                "source_path": entry.get("source_path"),
+            })
+
+    for script_path, script_entries in by_script.items():
+        distinct_commands = {str(item.get("command") or "").strip() for item in script_entries}
+        if len(distinct_commands) > 1:
+            errors.append({
+                "error": "同一 script 存在多个不一致执行入口",
+                "script_path": script_path,
+                "sources": [item.get("source_path") for item in script_entries],
+            })
+        elif len(script_entries) > 1:
+            warnings.append({
+                "warning": "同一 script 的执行入口在多个文档中重复声明；runtime 将按唯一命令执行",
+                "script_path": script_path,
+                "sources": [item.get("source_path") for item in script_entries],
+            })
+    return errors, warnings
+
+
+def _build_runtime_action_schema(body_prompt: str, *, execution_root: Path | None = None) -> dict:
+    """Build a unified Action schema from SKILL.md and reference command blocks."""
+    skill_text = _strip_runtime_resource_manifest(body_prompt)
+    reference_texts = _reference_contract_texts(execution_root)
+    texts: list[tuple[str, str]] = [("SKILL.md", skill_text), *reference_texts.items()]
+    entries: list[dict] = []
+    for source_path, text in texts:
+        entries.extend(_extract_action_schemas_from_text(text, source_path=source_path))
+    errors, warnings = _validate_action_schema_entries(entries)
+    errors.extend(_validate_referenced_assets_in_texts(texts, execution_root=execution_root))
+    canonical: dict[str, dict] = {}
+    for entry in entries:
+        script_path = str(entry.get("script_path") or "")
+        if script_path and script_path not in canonical:
+            canonical[script_path] = entry
+    return {
+        "version": "skill-action-schema/v1",
+        "entries": list(canonical.values()),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def _find_runtime_action_entry(action_schema: dict, command: str) -> dict | None:
+    script_path = _extract_script_path_from_command(command)
+    if not script_path:
+        return None
+    for entry in action_schema.get("entries") or []:
+        if entry.get("script_path") == script_path:
+            return entry
+    return None
+
+
+def _validate_runtime_command_against_action_schema(command: str, *, execution_root: Path | None) -> dict | None:
+    """Ensure a runtime command block is declared by SKILL.md/reference schema."""
+    script_path = _extract_script_path_from_command(command)
+    if not script_path:
+        return None
+    skill_md = ""
+    if execution_root is not None and (execution_root / "SKILL.md").is_file():
+        skill_md = (execution_root / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+    action_schema = _build_runtime_action_schema(skill_md, execution_root=execution_root)
+    if action_schema.get("errors"):
+        raise ValueError("Skill Action schema 校验失败: " + json.dumps(action_schema["errors"], ensure_ascii=False))
+    entry = _find_runtime_action_entry(action_schema, command)
+    if entry is None:
+        raise ValueError(f"命令调用 {script_path}，但 SKILL.md/references 中没有唯一声明的执行入口")
+    expected_keys = set(entry.get("inputs") or entry.get("command_keys") or [])
+    actual_keys = _command_json_argv_keys(command, script_path)
+    if actual_keys is None:
+        raise ValueError(f"命令 {script_path} 必须使用可解析 JSON argv")
+    if expected_keys and actual_keys != expected_keys:
+        raise ValueError(
+            f"命令 {script_path} JSON keys 与 Action schema inputs 不一致："
+            f"expected={sorted(expected_keys)} actual={sorted(actual_keys)}"
+        )
+    return entry
+
+
+def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> None:
+    if not entry:
+        _validate_success_stdout_json_if_structured(stdout)
+        return
+    stripped = (stdout or "").strip()
+    if not stripped:
+        return
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder"}:
+            raise ValueError("角色脚本 stdout 必须是 JSON object")
+        return
+    if not isinstance(payload, dict):
+        raise ValueError("角色脚本 stdout 必须是 JSON object")
+    _validate_structured_stdout_payload(payload)
+    role = str(entry.get("role") or "generic_script")
+    if role == "text_generator" and not str(payload.get("text") or payload.get("markdown") or "").strip():
+        raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
+    if role == "image_generator" and not _payload_image_paths(payload):
+        raise ValueError("image_generator stdout JSON 必须包含 image_path/image_paths/images")
+    if role == "pdf_builder":
+        pdf_path = payload.get("pdf_path")
+        file_paths = payload.get("file_paths")
+        has_file = isinstance(pdf_path, str) and pdf_path.strip()
+        has_file = has_file or (isinstance(file_paths, list) and any(isinstance(p, str) and p.strip() for p in file_paths))
+        if not has_file:
+            raise ValueError("pdf_builder stdout JSON 必须包含 pdf_path 或 file_paths")
+
+
+
+
+def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a") and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data.startswith(b"\xff\xd8"):
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            idx += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if idx + 2 > len(data):
+                break
+            length = int.from_bytes(data[idx:idx + 2], "big")
+            if length < 2:
+                break
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and idx + 7 <= len(data):
+                return int.from_bytes(data[idx + 5:idx + 7], "big"), int.from_bytes(data[idx + 3:idx + 5], "big")
+            idx += length
+    return None
+
+
+def _validate_runtime_asset_contract(path: Path, *, root: Path | None = None) -> None:
+    """Type-aware runtime asset validation for referenced/read assets."""
+    if not path.is_file():
+        raise ValueError(f"asset 不存在或不是文件: {path}")
+    if root is not None and not _is_within_sandbox(path, root):
+        raise ValueError(f"asset 路径越界: {path}")
+    ext = path.suffix.lower()
+    data = path.read_bytes()
+    if not data:
+        raise ValueError(f"asset 不能为空: {path}")
+    if ext == ".json":
+        json.loads(data.decode("utf-8"))
+    elif ext == ".csv":
+        rows = list(csv.reader(io.StringIO(data.decode("utf-8"))))
+        if len(rows) < 2 or not rows[0] or any(not str(cell).strip() for cell in rows[0]):
+            raise ValueError(f"CSV asset 必须包含非空表头和数据行: {path}")
+    elif ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        magic_ok = data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff") or data.startswith(b"GIF87a") or data.startswith(b"GIF89a") or (data.startswith(b"RIFF") and b"WEBP" in data[:16])
+        if not magic_ok:
+            raise ValueError(f"image asset 文件头不合法: {path}")
+        dims = _image_dimensions_from_bytes(data)
+        if dims is not None and (dims[0] < 1 or dims[1] < 1):
+            raise ValueError(f"image asset 尺寸不合法: {path}")
+    elif ext == ".pdf":
+        if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-4096:]:
+            raise ValueError(f"PDF asset 文件格式不合法: {path}")
+    elif ext in {".md", ".txt", ".yaml", ".yml", ".jinja", ".jinja2", ".template", ".tmpl"}:
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            raise ValueError(f"Markdown/text asset 不能为空: {path}")
+
+
+def _validate_referenced_assets_in_texts(texts: list[tuple[str, str]], *, execution_root: Path | None) -> list[dict]:
+    if execution_root is None:
+        return []
+    root = execution_root.resolve()
+    errors: list[dict] = []
+    seen: set[str] = set()
+    for source_path, text in texts:
+        for match in _SKILL_LOCAL_RESOURCE_RE.finditer(text or ""):
+            rel_path = match.group("path")
+            if not rel_path.startswith("assets/") or rel_path in seen:
+                continue
+            seen.add(rel_path)
+            try:
+                _validate_runtime_asset_contract((root / rel_path).resolve(), root=root)
+            except Exception as exc:
+                errors.append({"error": str(exc), "source_path": source_path, "asset_path": rel_path})
+    return errors
+
+
+def _extract_skill_command_contract(body_prompt: str, reference_texts: dict[str, str] | None = None, execution_root: Path | None = None) -> dict:
     """Extract concrete host-executable command examples declared in SKILL.md.
 
     The sandbox must not ask the final model to invent script invocations from an
     inline `scripts/...` mention.  A skill that wants host execution must include
     a concrete shell fenced block that shows the invocation shape.
     """
-    blocks = _extract_all_fenced_blocks(_strip_runtime_resource_manifest(body_prompt))
-    command_blocks: list[dict] = []
+    skill_text = _strip_runtime_resource_manifest(body_prompt)
+    texts: list[tuple[str, str]] = [("SKILL.md", skill_text)]
+    if reference_texts is not None:
+        texts.extend((path, text) for path, text in reference_texts.items())
+    elif execution_root is not None:
+        texts.extend((path, text) for path, text in _reference_contract_texts(execution_root).items())
 
-    for block in blocks:
-        lang = (block.lang or "").lower()
-        code = (block.code or "").strip()
-        if lang not in _COMMAND_BLOCK_LANGS or not code:
-            continue
-        if not _COMMAND_BLOCK_CODE_RE.search(code):
-            continue
-        command_blocks.append({
-            "block_index": block.index,
-            "lang": lang,
-            "code": code[:600],
-            "before_context": block.before_context[-300:],
-        })
+    command_blocks: list[dict] = []
+    action_entries: list[dict] = []
+    for source_path, text in texts:
+        blocks = _extract_all_fenced_blocks(text)
+        for block in blocks:
+            lang = (block.lang or "").lower()
+            code = (block.code or "").strip()
+            if lang not in _COMMAND_BLOCK_LANGS or not code:
+                continue
+            if not _COMMAND_BLOCK_CODE_RE.search(code):
+                continue
+            command_blocks.append({
+                "block_index": block.index,
+                "lang": lang,
+                "code": code[:600],
+                "before_context": block.before_context[-300:],
+                "source_path": source_path,
+            })
+        action_entries.extend(_extract_action_schemas_from_text(text, source_path=source_path))
+
+    errors, warnings = _validate_action_schema_entries(action_entries)
+    errors.extend(_validate_referenced_assets_in_texts(texts, execution_root=execution_root))
 
     return {
         "has_executable_command_block": bool(command_blocks),
         "command_blocks": command_blocks[:5],
+        "action_schema": {
+            "version": "skill-action-schema/v1",
+            "entries": action_entries[:20],
+            "errors": errors,
+            "warnings": warnings,
+        },
     }
 
 
@@ -756,8 +1112,8 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
         "但不要在本轮规划 run_command、write_file 或 create_directory。\n"
         "5. 如果任务需要运行 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求调用脚本，"
-        "只有在 Loaded SKILL.md 已经包含具体 shell fenced 命令示例时，才可使用 mode=direct_answer 并让主模型按该示例替换真实参数。\n"
-        "6. 如果 Skill.md 只写了 `scripts/...` 行内路径、‘调用脚本’等自然语言，但没有具体 fenced 命令示例，"
+        "只有在 SKILL.md 或其明确引用的 references 中已经包含具体 shell fenced 命令示例、且宿主 Action schema 校验通过时，才可使用 mode=direct_answer 并让主模型按该示例替换真实参数。\n"
+        "6. 如果 Skill.md/reference 只写了 `scripts/...` 行内路径、‘调用脚本’等自然语言，但没有具体 fenced 命令示例，"
         "必须使用 mode=ask_user，说明该 Skill 缺少可执行命令 block 示例，不能让主模型临时拼命令。\n"
         "7. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
         "8. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令。\n"
@@ -774,7 +1130,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- display / ignore：展示或忽略。\n"
         "禁止的 action：run_command、write_file、create_directory；这些只能由后续主模型显式 fenced block 触发。\n\n"
         "显式可执行块触发规则（给 final_instruction 使用）：\n"
-        "- 需要执行命令时，只能要求主模型复用 Loaded SKILL.md 已声明的具体 shell fenced 命令示例，"
+        "- 需要执行命令时，只能要求主模型复用 Action schema 中来自 SKILL.md/references 的具体 shell fenced 命令示例，"
         "替换用户真实参数后输出；禁止从 available_scripts 或脚本文件名临时发明 CLI 参数。\n"
         "- 需要写文件时，要求主模型在代码块前写 `写入文件：<path>` 或 `保存到：<path>`，"
         "文件内容必须放在紧随其后的 fenced code block 内。\n"
@@ -934,7 +1290,7 @@ async def _run_skill_runtime_planner_round(
     """
     resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
     planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
-    command_contract = _extract_skill_command_contract(planner_body_prompt)
+    command_contract = _extract_skill_command_contract(planner_body_prompt, execution_root=execution_root)
 
     # 扫描磁盘上真实存在的脚本文件，注入给 planner 以便直接规划 run_command
     available_scripts: list[str] = []
@@ -968,6 +1324,9 @@ async def _run_skill_runtime_planner_round(
             "execution_requires_main_model_fenced_block": True,
             "action_observation_loop": True,
             "command_generation_requires_skill_md_markdown_example": True,
+            "fenced_blocks_are_normalized_to_action_schema": True,
+            "reference_command_blocks_are_valid_execution_entries": True,
+            "stdout_json_is_observation_for_final_answer": True,
         },
     }
 
@@ -975,7 +1334,7 @@ async def _run_skill_runtime_planner_round(
         {"role": "system", "content": _compose_skill_runtime_planner_prompt()},
         {"role": "user", "content": f"## Skill 执行规范\n{planner_body_prompt}"},
         {"role": "user", "content": f"## 可用脚本\n{json.dumps(available_scripts, ensure_ascii=False)}"},
-        {"role": "user", "content": f"## SKILL.md Markdown 命令块示例\n{json.dumps(command_contract, ensure_ascii=False)}"},
+        {"role": "user", "content": f"## SKILL.md / references Action schema\n{json.dumps(command_contract, ensure_ascii=False)}"},
         {"role": "user", "content": f"## 用户请求\n{_last_user_text(request)}"},
         {"role": "user", "content": f"## 执行根目录\n{str(execution_root) if execution_root else ''}"},
         {"role": "user", "content": f"## 技能名称\n{skill_name}"},
@@ -1596,6 +1955,9 @@ def _execute_single_task(
             raise ValueError("read_resource 任务缺少 path")
         if not skill_name:
             raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+        if rel_path.startswith("assets/"):
+            asset_root = execution_root.resolve() if execution_root is not None else _skill_root_for_name(skill_name)
+            _validate_runtime_asset_contract((asset_root / rel_path).resolve(), root=asset_root)
         observation = read_skill_resource_text(
             skill_name, rel_path, max_chars=settings.skill_resource_max_chars
         )
@@ -1666,6 +2028,12 @@ def _execute_single_task(
             fallback_cwd = execution_root or cwd.parent
             if fallback_cwd.exists():
                 cwd = fallback_cwd
+
+        # Validate script commands against the unified SKILL.md/reference Action schema
+        # before execution. This prevents the main model from inventing a
+        # fenced-block command that does not match the SkillPlan inputs/role
+        # declared by the Skill package.
+        action_entry = _validate_runtime_command_against_action_schema(command, execution_root=cwd)
 
         # Per-task snapshot taken *before* execution to detect new output files.
         pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
@@ -1816,7 +2184,7 @@ def _execute_single_task(
         assert completed is not None  # noqa: S101 — loop always runs at least once (range >= 1)
         success = completed.returncode == 0
         if success:
-            _validate_success_stdout_json_if_structured(completed.stdout)
+            _validate_stdout_against_action_entry(completed.stdout, action_entry)
 
         result: dict = {
             "action": action,

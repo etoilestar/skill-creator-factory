@@ -16,7 +16,7 @@ import base64
 import csv
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import re
 import shlex
@@ -531,10 +531,76 @@ def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: st
     return keys[:3]
 
 
-def _script_command_template(script_path: str, blueprint_text: str) -> str:
-    keys = _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
+def _script_command_template(script_path: str, blueprint_text: str, entry: SkillPlanEntry | None = None) -> str:
+    """Render a JSON argv command template from the SkillPlan inputs.
+
+    Blueprint keywords are used only as a legacy fallback when no SkillPlan
+    entry is available.  The mainstream Skill contract is that commands are
+    derived from the declared inputs and emit placeholders with exactly those
+    keys, avoiding natural-language/script-name guessing at runtime.
+    """
+    keys = list(entry.inputs) if entry is not None else _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
+    if not keys:
+        keys = ["payload"]
     payload = json.dumps({key: f"{{{{{key}}}}}" for key in keys}, ensure_ascii=False)
     return f"python {script_path} '{payload}'"
+
+
+def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
+    """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            if idx + 1 >= len(parts):
+                return set()
+            try:
+                payload = json.loads(parts[idx + 1])
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            return {str(key) for key in payload.keys()}
+    return None
+
+
+def _check_command_block_contract(script_path: str, commands: list[str], entry: SkillPlanEntry) -> list[ContractCheckResult]:
+    """Validate Markdown command examples against the SkillPlan input contract."""
+    required = set(entry.inputs or ["payload"])
+    results: list[ContractCheckResult] = []
+    for idx, command in enumerate(commands, start=1):
+        keys = _command_payload_keys(command, script_path)
+        target = f"{script_path}#command-{idx}"
+        results.append(ContractCheckResult(
+            id="command_block.json_argv.parseable",
+            passed=keys is not None,
+            target=target,
+            message=(
+                "命令块使用可解析 JSON argv。" if keys is not None
+                else f"{script_path} 命令块必须在脚本路径后传入一个 JSON object argv。"
+            ),
+            expected=f"命令形如：{_script_command_template(script_path, '', entry)}",
+            minimal_edit=f"将命令改为：{_script_command_template(script_path, '', entry)}",
+        ))
+        if keys is None:
+            continue
+        missing = sorted(required - keys)
+        extra = sorted(keys - required)
+        results.append(ContractCheckResult(
+            id="command_block.skillplan_inputs.exact",
+            passed=not missing and not extra,
+            target=target,
+            message=(
+                "命令块 JSON keys 与 SkillPlan inputs 完全一致。" if not missing and not extra
+                else f"命令块 JSON keys 与 SkillPlan inputs 不一致；missing={missing} extra={extra}。"
+            ),
+            expected=f"JSON argv keys 必须且只能是：{', '.join(sorted(required))}",
+            minimal_edit=f"将 JSON argv 调整为：{json.dumps({key: '{{' + key + '}}' for key in sorted(required)}, ensure_ascii=False)}",
+        ))
+    return results
 
 
 def _build_skill_md_contract_text(blueprint_text: str) -> str:
@@ -555,12 +621,13 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     ]
     if script_paths:
         for script_path in script_paths:
-            keys = ", ".join(_infer_script_input_keys_from_blueprint(script_path, blueprint_text))
+            entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+            keys = ", ".join(entry.inputs or ["payload"])
             lines.extend([
-                "- 必须包含一个普通 Markdown ```bash fenced code block。",
-                f"- block 内必须出现精确路径：{script_path}",
-                f"- 命令必须使用 JSON argv，占位符 keys：{keys}。",
-                f"- 推荐命令模板：{_script_command_template(script_path, blueprint_text)}",
+                "- SKILL.md 可以直接包含普通 Markdown ```bash fenced code block；若不直接包含，必须明确说明由对应 reference 定义命令或执行步骤。",
+                f"- 直接命令 block 内必须出现精确路径：{script_path}",
+                f"- 命令必须使用 JSON argv，JSON keys 必须且只能来自 SkillPlan inputs：{keys}。",
+                f"- 推荐命令模板：{_script_command_template(script_path, blueprint_text, entry)}",
             ])
     else:
         lines.append("- 蓝图没有 scripts/，不要强行写脚本命令。")
@@ -627,18 +694,33 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
     for script_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/"):
         commands = _extract_script_command_templates(content, script_path)
         passed = bool(commands)
-        template = _script_command_template(script_path, blueprint_text)
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        if entry.role == "generic_script" and entry.inputs == ["payload"]:
+            inferred_inputs = _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
+            if commands:
+                command_keys: set[str] = set()
+                for command in commands:
+                    keys = _command_payload_keys(command, script_path)
+                    if keys:
+                        command_keys.update(keys)
+                if command_keys:
+                    inferred_inputs = sorted(command_keys)
+            entry = replace(entry, inputs=inferred_inputs)
+        template = _script_command_template(script_path, blueprint_text, entry)
+        reference_delegates_execution = bool(reference_path_candidates := _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")) and any(ref in content for ref in reference_path_candidates) and bool(re.search(r"命令|执行|步骤|command|execute|steps", content, re.I))
         results.append(ContractCheckResult(
             id="skill_md.script_command.exists",
-            passed=passed,
+            passed=passed or reference_delegates_execution,
             target=script_path,
             message=(
                 f"SKILL.md 已包含调用 {script_path} 的可执行 Markdown 命令块。" if passed
-                else f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块。请在正文中加入 ```bash fenced code block，并在其中给出与脚本接口一致的 python scripts/... 命令示例。"
+                else (f"SKILL.md 未直接写 {script_path} 命令块，但已显式委托 references 定义执行步骤。" if reference_delegates_execution else f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块，且未显式说明由 references 定义命令/执行步骤。")
             ),
-            expected=f"一个 ```bash fenced code block，block 内包含精确脚本路径 {script_path}。推荐命令：{template}",
-            minimal_edit=f"在执行/运行脚本小节加入命令块：```bash\n{template}\n```",
+            expected=f"SKILL.md 直接包含命令块，或明确说明由 references/*.md 定义执行命令；直接命令推荐：{template}",
+            minimal_edit=f"在执行/运行脚本小节加入命令块：```bash\n{template}\n```，或明确写明读取 reference 中的命令模板。",
         ))
+        if commands:
+            results.extend(_check_command_block_contract(script_path, commands, entry))
 
     for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
         passed = reference_path in content
@@ -704,7 +786,7 @@ def _build_script_file_contract_text(
         role=role,
         skill_plan_entry=skill_plan_entry,
     )
-    keys = ", ".join(_infer_script_input_keys_from_blueprint(file_path, blueprint_text))
+    keys = ", ".join(entry.inputs or ["payload"])
     lines = [
         f"必须满足以下脚本文件合同：{file_path}",
         f"SkillPlan role: {entry.role}",
@@ -718,7 +800,7 @@ def _build_script_file_contract_text(
         "B. 参数接口:",
         "- 默认使用 JSON argv 接口：读取 sys.argv[1] 并 json.loads 解析。",
         f"- 必须实际使用用户输入 keys：{keys}。",
-        f"- 与 SKILL.md 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text)}",
+        f"- 与 SKILL.md/reference 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text, entry)}",
         "C. 角色输出合同:",
     ]
     if entry.role == "text_generator":
@@ -752,6 +834,19 @@ def _build_script_file_contract_text(
 
 
 def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    script_lines: list[str] = []
+    for script_path in script_paths:
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        if file_path in entry.reference_files or not entry.reference_files:
+            script_lines.extend([
+                f"- 如本 reference 负责 {script_path} 子任务，必须写明 SkillPlanEntry：role={entry.role}; inputs={', '.join(entry.inputs) or 'payload'}; outputs={', '.join(entry.outputs)}; dependencies={', '.join(entry.dependencies) or 'none'}。",
+                f"- 若 SKILL.md 没有直接命令块，本 reference 必须提供 validated command block，推荐：```bash\n{_script_command_template(script_path, blueprint_text, entry)}\n```",
+                f"- 命令 JSON keys 必须且只能是：{', '.join(entry.inputs or ['payload'])}。",
+                f"- 角色边界：required_capabilities={', '.join(entry.required_capabilities) or 'none'}; forbidden_capabilities={', '.join(entry.forbidden_capabilities) or 'none'}。",
+            ])
+    if not script_lines:
+        script_lines.append("- 本 reference 对应一个独立子任务/模块；必须写清 inputs、outputs、执行步骤、约束和示例。")
     return "\n".join([
         f"必须满足以下参考资料文件合同：{file_path}",
         "A. 输出形态:",
@@ -759,11 +854,15 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         "- 可以包含普通 Markdown 标题/列表/示例；如确实需要代码示例，可以包含文档内部 fenced block。",
         "B. 内容职责:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
+        "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
+        "- 必须包含 inputs/outputs、执行步骤或命令模板、角色约束/禁止能力、示例、反例、最佳实践。",
+        *script_lines,
         "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
         "- 必须包含任务规范/步骤、示例、反例、约束/禁止项等章节，且正文长度足以指导子任务。",
         "C. 禁止项:",
         "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
         "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
+        "- 不要包含 placeholder/TODO/待补充等占位文本。",
     ])
 
 
@@ -868,6 +967,27 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         ),
         expected="包含规范/步骤、示例、反例、约束/禁止项章节。",
         minimal_edit="补齐 Markdown 标题章节：## 规范、## 示例、## 反例、## 约束。",
+    ))
+
+    role_sections = {
+        "io": bool(re.search(r"(?im)^#{1,3}.*(输入|输出|Inputs?|Outputs?)", stripped)),
+        "execution": bool(re.search(r"(?im)^#{1,3}.*(执行|命令|步骤|Execution|Commands?)", stripped)) or "```bash" in stripped,
+        "role_constraints": bool(re.search(r"(?im)^#{1,3}.*(角色|能力|禁止|Role|Capabilities?)", stripped)),
+    }
+    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|generic_script|命令模板|执行参考", purpose, re.I))
+    role_sections_ok = (not role_section_required) or all(role_sections.values())
+    missing_role_sections = [name for name, present in role_sections.items() if not present]
+    results.append(ContractCheckResult(
+        id="reference.subtask_contract_sections",
+        passed=role_sections_ok,
+        target=file_path,
+        message=(
+            "参考资料包含 inputs/outputs、执行步骤、角色能力边界，或该 reference 是非执行型指导文档。"
+            if role_sections_ok
+            else f"{file_path} 缺少子任务合同章节：{', '.join(missing_role_sections)}。"
+        ),
+        expected="执行型 reference 包含 inputs/outputs、执行步骤或命令模板、角色能力/禁止能力边界；非执行型 reference 可只保留规则/示例/约束。",
+        minimal_edit="增加 ## Inputs / Outputs、## 执行步骤、## 角色与能力边界 等章节。",
     ))
     has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
     results.append(ContractCheckResult(
@@ -1314,6 +1434,26 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
+
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+    # Backward compatibility for existing SKILL.md files that predate explicit
+    # SkillPlan inputs: keep generic_script conservative capabilities, but treat
+    # the JSON argv command itself as the declared interface for static script
+    # validation.  New Creator generation still emits command blocks from
+    # SkillPlan inputs via _check_skill_md_contract.
+    if plan_entry.role == "generic_script" and plan_entry.inputs == ["payload"]:
+        command_keys: set[str] = set()
+        for command in commands:
+            keys = _command_payload_keys(command, file_path)
+            if keys:
+                command_keys.update(keys)
+        if command_keys:
+            plan_entry = replace(plan_entry, inputs=sorted(command_keys))
+    command_results: list[ContractCheckResult] = []
+    command_results.extend(_check_command_block_contract(file_path, commands, plan_entry))
+    failed_command_results = [result for result in command_results if not result.passed]
+    if failed_command_results:
+        raise ValueError(_format_contract_checks(failed_command_results, passed=False))
 
     json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
     if json_argv_commands and not _script_reads_json_argv(content):

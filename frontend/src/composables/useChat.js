@@ -47,9 +47,23 @@ export async function* streamChat(url, body) {
       try {
         const parsed = JSON.parse(data)
         if (parsed.error) throw new Error(parsed.error)
+        if (parsed.type === 'error') throw new Error(parsed.message || '执行失败')
         if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
         else if (parsed.thought) yield { type: 'thought', data: parsed.thought }
         else if ('status' in parsed) yield { type: 'status', data: parsed.status }
+        else if (parsed.type === 'phase3_start') yield { type: 'status', data: { phase: 'phase3', message: parsed.message || '开始执行 Skill 创建流程…' } }
+        else if (parsed.type === 'progress') yield { type: 'status', data: { phase: 'phase3', message: parsed.step || parsed.message || '正在执行…' } }
+        else if (parsed.type === 'completed') yield {
+          type: 'action_result',
+          data: {
+            action: 'creator_phase3_completed',
+            success: parsed.success,
+            name: parsed.skill_name,
+            path: parsed.skill_path,
+            message: parsed.message || 'Skill 创建完成',
+            output_files: parsed.created_files || [],
+          },
+        }
         else if (parsed.quick_actions) yield { type: 'quick_actions', data: parsed.quick_actions }
         else if (parsed.plan_preview) yield { type: 'plan_preview', data: parsed.plan_preview }
         else if (parsed.sop_plan) yield { type: 'sop_plan', data: parsed.sop_plan }

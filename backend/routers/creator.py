@@ -11,11 +11,16 @@ These endpoints decouple the file-creation phase from the main
 - POST /api/creator/package-skill       — package Skill directory into .skill archive
 """
 
+import ast
 import json
+from dataclasses import dataclass
 import logging
 import re
+import shlex
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -23,10 +28,73 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.llm_proxy import stream_chat
-from ..services.skill_executor import run_action
+from ..services.llm_proxy import complete_chat_once, stream_chat
+from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
+from ..services.skill_executor import _build_script_runtime_env, run_action
+from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
 logger = logging.getLogger(__name__)
+
+
+def _log_creator_model_usage(
+    *,
+    phase: str,
+    file_path: str,
+    route=None,
+    model: str | None = None,
+    skill_name: str = "",
+    attempt: int | None = None,
+    actual_model: str | None = None,
+    provider: dict | None = None,
+    extra: str = "",
+) -> None:
+    """Emit compact model routing/ack logs for docker logs debugging."""
+    expected_model = model or (getattr(route, "model", "") if route is not None else "")
+    task = getattr(route, "task", "") if route is not None else ""
+    requested_model = getattr(route, "requested_model", None) if route is not None else None
+    reason = getattr(route, "reason", "") if route is not None else ""
+    matched = None
+    if route is not None and actual_model:
+        try:
+            matched = route.ack(actual_model=actual_model).get("matched")
+        except Exception:  # pragma: no cover - defensive logging only
+            matched = None
+    logger.info(
+        "[Creator][model] phase=%s skill=%s file=%s attempt=%s task=%s model=%s requested_model=%s actual_model=%s matched=%s reason=%s provider=%s%s",
+        phase,
+        skill_name,
+        file_path,
+        "" if attempt is None else attempt,
+        task,
+        expected_model,
+        requested_model or "",
+        actual_model or "",
+        "" if matched is None else matched,
+        reason,
+        provider or {},
+        f" extra={extra}" if extra else "",
+    )
+
+
+_SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
+
+宿主 Markdown 执行说明（写入生成的 SKILL.md 正文时必须保持常见 Markdown 形态）：
+- SKILL.md 是普通 Markdown 说明书，只描述做什么、何时使用资源，以及 assistant 在运行时应如何表达动作；不要引入自定义协议章节（例如 `Runtime Contract` JSON）。
+- 对纯文本即可完成的任务，明确写“直接回答”，不要要求运行脚本。
+- 如果确实需要运行 scripts/ 下的脚本，使用市面常见的 Markdown fenced code block 给出命令示例/模板，例如：
+  执行命令：
+  ```bash
+  python scripts/<script-name> '{"topic":"{{topic}}","keywords":"{{keywords}}"}'
+  ```
+- 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 参数映射用普通 Markdown 列表说明，例如 `topic` 从用户输入提取、`keywords` 从用户输入提取、可选参数给出默认值；不要使用单独的 JSON contract。
+- 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
+- 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
+- assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
+- 禁止在 SKILL.md 中只写“立即调用 `scripts/...`”这种隐式执行描述；应写成“运行时 assistant 输出以下命令块交由宿主执行”，并给出具体命令示例。
+- 如果用户要求使用平台内置模型、图像模型或多模态模型，不要写外部 API key、关键词数据库或假 API；应说明由宿主配置的模型完成相关步骤。任何脚本都必须是有实际功能的实现：要么执行确定性的真实计算/转换/文件处理，要么在需要开放式生成、语义理解、视觉/图像能力时使用宿主已配置的模型能力；模型与认证相关参数由平台运行时注入；生成脚本可按需读取 `IMAGE_MODEL`、`IMAGE_BASE_URL`、`IMAGE_SIZE`、`IMAGE_API_KEY` / `LLM_API_KEY` / `OPENAI_API_KEY` 等环境变量，但不要硬编码这些值，也不需要额外校验它们是否存在。
+- 如果需要生成图片，SKILL.md 只描述“使用平台稳定扩散图片生成能力”即可；不要把中文 prompt 翻译、TEXT_MODEL 调用、接口字段解析等平台细节写入创建出来的 Skill 正文。平台运行时会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换。
+"""
 
 router = APIRouter(prefix="/api/creator", tags=["creator"])
 
@@ -39,6 +107,11 @@ _ALLOWED_FOLDERS: frozenset[str] = frozenset({"scripts", "references", "assets"}
 
 # Trailing conversation turns to include in file-generation prompts.
 _MAX_HISTORY_TURNS = 6
+
+# Generated files can repair themselves by sending validator/static/trial-run
+# failures back to the same routed model before returning content to the frontend.
+_MAX_FILE_REPAIR_ATTEMPTS = 8
+_SCRIPT_TRIAL_TIMEOUT_SECONDS = 30
 
 # Human-readable language labels indexed by file extension.
 _LANG_LABELS: dict[str, str] = {
@@ -160,11 +233,21 @@ class InitFromBlueprintResponse(BaseModel):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _contains_path_wildcard(file_path: str) -> bool:
+    return any(ch in file_path for ch in "*?[]{}")
+
+
 def _validate_file_path(file_path: str) -> None:
     """Raise HTTP 400 if file_path is outside allowed locations."""
     p = Path(file_path)
-    if p.is_absolute() or ".." in p.parts:
-        raise HTTPException(status_code=400, detail=f"非法文件路径: {file_path}")
+    if p.is_absolute() or ".." in p.parts or _contains_path_wildcard(file_path):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"非法文件路径: {file_path}。"
+                "Creator 只能逐个生成具体文件，不能生成通配符路径。"
+            ),
+        )
 
     if file_path == "SKILL.md":
         return
@@ -196,6 +279,1361 @@ def _validate_skill_name(skill_name: str) -> str:
     return name
 
 
+def _extract_first_fenced_block(content: str) -> str | None:
+    """Return the first fenced block body from content, or None."""
+    lines = content.splitlines(keepends=True)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        match = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
+        if not match:
+            i += 1
+            continue
+
+        fence = match.group(1)
+        fence_char = fence[0]
+        fence_len = len(fence)
+        code_lines: list[str] = []
+        i += 1
+
+        while i < len(lines):
+            close_line = lines[i]
+            close_stripped = close_line.lstrip()
+            close_match = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}\s*$",
+                close_stripped.rstrip("\n"),
+            )
+            if close_match:
+                return "".join(code_lines).strip()
+            code_lines.append(close_line)
+            i += 1
+
+        return "".join(code_lines).strip()
+
+    return None
+
+
+def _extract_target_file_from_bundle(content: str, file_path: str) -> str | None:
+    """Extract the requested file when a model returns a multi-file bundle."""
+    escaped_path = re.escape(file_path)
+    heading_re = re.compile(
+        rf"(?im)^\s*#{{1,6}}\s*(?:[^\n`]*?)`?{escaped_path}`?\s*$"
+    )
+
+    for match in heading_re.finditer(content):
+        section = content[match.end():]
+        block = _extract_first_fenced_block(section)
+        if block is not None:
+            return block
+
+    return None
+
+
+_MULTI_FILE_MARKER_RE = re.compile(
+    r"(?im)^\s*#{1,6}\s*(?:[^\n`]*)(?:SKILL\.md|scripts/|references/|assets/)"
+)
+
+
+_SCRIPT_FAKE_IMPLEMENTATION_RE = re.compile(
+    r"placeholder|TODO|your_api_key|api\.example\.com|example\.com|模拟|占位|假装|"
+    r"实际使用时|实际开发中|仅为演示|演示目的|空的占位图|纯色图片|ASCII插图|ascii_art|fake",
+    re.IGNORECASE,
+)
+_SKILL_CUSTOM_RUNTIME_CONTRACT_RE = re.compile(r"(?im)^\s*#{1,6}\s*Runtime\s+Contract\s*$")
+_HOST_MODEL_CAPABILITY_RE = re.compile(
+    r"宿主.{0,12}模型|内置.{0,12}模型|配置.{0,12}模型|文本模型|图像模型|视觉模型|"
+    r"多模态|大语言模型|LLM|AI生成|模型生成|调用模型|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL",
+    re.IGNORECASE,
+)
+_CONFIGURED_MODEL_CALL_RE = re.compile(
+    r"LLM_BASE_URL|TEXT_MODEL|IMAGE_MODEL|VISION_MODEL|/v1/chat/completions|"
+    r"chat/completions|complete_chat_once|stream_chat|openai|"
+    r"generate_stable_diffusion_image|backend\.services\.skill_runtime",
+    re.IGNORECASE,
+)
+_CREATOR_FLOW_LEAK_RE = re.compile(
+    r"点击\s*(?:\*\*)?[‘'\"“”]?开始创建[’'\"“”]?(?:\*\*)?|开始生成文件|文件清单预览|确认无误后|"
+    r"你也可以在创建后继续编辑内容|确认项列表|系统将自动创建|自动创建以下文件|"
+    r"创建文件面板|文件创建面板|若当前无误|已预置|所有路径与命名与蓝图一致|"
+    r"不包含任何隐藏逻辑或隐式执行|输出格式符合 Markdown 标准，支持宿主解析",
+    re.IGNORECASE,
+)
+_SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)(?![\w./-])")
+
+_IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations|generate_stable_diffusion_image", re.IGNORECASE)
+_DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
+_PLATFORM_IMAGE_HELPER_RE = re.compile(r"generate_stable_diffusion_image|backend\.services\.skill_runtime", re.IGNORECASE)
+_IMAGE_URL_ONLY_RE = re.compile(r'\[0\]\s*\.get\(\s*[\'"]url[\'"]|\[\s*[\'"]url[\'"]\s*\]', re.IGNORECASE)
+_DATA_URI_RE = re.compile(r"data:image/[^;]+;base64", re.IGNORECASE)
+
+
+def _reject_custom_skill_md_protocol(content: str) -> None:
+    """Reject non-standard runtime protocol sections in generated SKILL.md."""
+    if _SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content):
+        raise ValueError(
+            "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；"
+            "请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
+        )
+
+
+def _extract_declared_skill_paths(text: str) -> list[str]:
+    """Return normalized Skill package file paths mentioned by a blueprint."""
+    seen: set[str] = set()
+    paths: list[str] = []
+    for raw in _SKILL_FILE_PATH_RE.findall(text or ""):
+        path = raw.strip().rstrip("`，,。；;:)）]").replace("\\", "/")
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> list[str]:
+    return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
+
+
+def _reject_creator_flow_leak(content: str) -> None:
+    """Reject Creator UI/workflow text copied into generated SKILL.md."""
+    if _CREATOR_FLOW_LEAK_RE.search(content):
+        raise ValueError(
+            "SKILL.md 包含 Creator 界面流程/确认清单文本（例如“点击开始创建”“确认项列表”“系统将自动创建”），"
+            "这是平台创建流程泄露，不属于 Skill 使用说明。请删除这些流程文本，只保留 Skill 的使用说明、资源引用和可执行命令示例。"
+        )
+
+
+@dataclass(frozen=True)
+class ContractCheckResult:
+    id: str
+    passed: bool
+    target: str
+    message: str
+    expected: str
+    minimal_edit: str
+
+
+class ContractValidationError(ValueError):
+    """Validation error carrying structured contract check results."""
+
+    def __init__(self, message: str, results: list[ContractCheckResult]):
+        super().__init__(message)
+        self.results = results
+
+
+def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
+    """Infer stable JSON argv keys from the blueprint for a script path."""
+    lowered = (blueprint_text or "").lower()
+    key_candidates = ["topic", "prompt", "text", "keywords"]
+    keys = [key for key in key_candidates if key in lowered]
+    if not keys:
+        keys = ["topic"]
+    return keys[:3]
+
+
+def _script_command_template(script_path: str, blueprint_text: str) -> str:
+    keys = _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
+    payload = json.dumps({key: f"{{{{{key}}}}}" for key in keys}, ensure_ascii=False)
+    return f"python {script_path} '{payload}'"
+
+
+def _build_skill_md_contract_text(blueprint_text: str) -> str:
+    """Build the explicit SKILL.md contract injected before generation/repair."""
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
+
+    lines = [
+        "必须满足以下 SKILL.md 合同，逐项覆盖：",
+        "A. frontmatter:",
+        "- 必须以 --- 开始。",
+        "- 必须包含 name 和 description。",
+        "- 必须用 --- 关闭 frontmatter。",
+        "B. scripts 命令块:",
+    ]
+    if script_paths:
+        for script_path in script_paths:
+            keys = ", ".join(_infer_script_input_keys_from_blueprint(script_path, blueprint_text))
+            lines.extend([
+                "- 必须包含一个普通 Markdown ```bash fenced code block。",
+                f"- block 内必须出现精确路径：{script_path}",
+                f"- 命令必须使用 JSON argv，占位符 keys：{keys}。",
+                f"- 推荐命令模板：{_script_command_template(script_path, blueprint_text)}",
+            ])
+    else:
+        lines.append("- 蓝图没有 scripts/，不要强行写脚本命令。")
+
+    lines.append("C. references 引用:")
+    if reference_paths:
+        for reference_path in reference_paths:
+            lines.append(f"- 必须在正文中出现并说明用途：{reference_path}")
+    else:
+        lines.append("- 蓝图没有 references/，不要强行编造参考资料。")
+
+    lines.extend([
+        "D. 禁止项:",
+        "- 不要包含 Runtime Contract JSON。",
+        "- 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等平台流程文案。",
+    ])
+    return "\n".join(lines)
+
+
+def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
+    """Return structured SKILL.md contract checks for generation and repair."""
+    stripped = content.strip()
+    results: list[ContractCheckResult] = []
+
+    has_frontmatter = bool(re.match(r"^---\nname: [^\n]+\ndescription: [^\n]+\n---\n", stripped))
+    results.append(ContractCheckResult(
+        id="skill_md.frontmatter",
+        passed=has_frontmatter,
+        target="SKILL.md",
+        message=(
+            "SKILL.md frontmatter 合格。" if has_frontmatter
+            else "SKILL.md 必须以 YAML frontmatter 开始，且包含 name 和 description：--- / name: ... / description: ... / ---。"
+        ),
+        expected="文件以 --- / name: ... / description: ... / --- 开头。",
+        minimal_edit="修正文件开头的 YAML frontmatter，不要改动正文其它已通过内容。",
+    ))
+
+    has_runtime_contract = bool(_SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_runtime_contract",
+        passed=not has_runtime_contract,
+        target="SKILL.md",
+        message=(
+            "未包含自定义 Runtime Contract JSON 协议。" if not has_runtime_contract
+            else "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；请使用普通 Markdown 说明和 ```bash 命令示例描述运行时动作。"
+        ),
+        expected="不要包含 Runtime Contract JSON。",
+        minimal_edit="删除 Runtime Contract JSON/协议小节，改为普通 Markdown 说明。",
+    ))
+
+    has_creator_flow = bool(_CREATOR_FLOW_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_creator_flow",
+        passed=not has_creator_flow,
+        target="SKILL.md",
+        message=(
+            "未包含 Creator 界面流程文案。" if not has_creator_flow
+            else "SKILL.md 包含 Creator 界面流程/确认清单文本（例如“点击开始创建”“确认项列表”“系统将自动创建”），这是平台创建流程泄露，不属于 Skill 使用说明。"
+        ),
+        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        minimal_edit="删除 Creator UI/确认清单/点击开始创建相关文案，只保留 Skill 使用说明。",
+    ))
+
+    for script_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/"):
+        commands = _extract_script_command_templates(content, script_path)
+        passed = bool(commands)
+        template = _script_command_template(script_path, blueprint_text)
+        results.append(ContractCheckResult(
+            id="skill_md.script_command.exists",
+            passed=passed,
+            target=script_path,
+            message=(
+                f"SKILL.md 已包含调用 {script_path} 的可执行 Markdown 命令块。" if passed
+                else f"SKILL.md 缺少调用 {script_path} 的可执行 Markdown 命令块。请在正文中加入 ```bash fenced code block，并在其中给出与脚本接口一致的 python scripts/... 命令示例。"
+            ),
+            expected=f"一个 ```bash fenced code block，block 内包含精确脚本路径 {script_path}。推荐命令：{template}",
+            minimal_edit=f"在执行/运行脚本小节加入命令块：```bash\n{template}\n```",
+        ))
+
+    for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
+        passed = reference_path in content
+        results.append(ContractCheckResult(
+            id="skill_md.reference.mentioned",
+            passed=passed,
+            target=reference_path,
+            message=(
+                f"SKILL.md 已引用参考资料 {reference_path}。" if passed
+                else f"SKILL.md 缺少对参考资料 {reference_path} 的引用。请在“参考资料/资源”小节用普通 Markdown 明确说明何时读取该 reference。"
+            ),
+            expected=f"正文中逐字出现 {reference_path} 并说明用途/何时读取。",
+            minimal_edit=f"在参考资料/资源小节加入 `{reference_path}` 及其用途说明。",
+        ))
+
+    return results
+
+
+def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool) -> str:
+    selected = [result for result in results if result.passed is passed]
+    if not selected:
+        return "- 无"
+    return "\n".join(
+        f"- {result.id} target={result.target}: {result.message}\n"
+        f"  expected: {result.expected}\n"
+        f"  minimal_edit: {result.minimal_edit}"
+        for result in selected
+    )
+
+
+def _format_contract_failures(results: list[ContractCheckResult]) -> str:
+    failed = [result for result in results if not result.passed]
+    if not failed:
+        return ""
+    return (
+        "SKILL.md contract 未通过：\n"
+        + _format_contract_checks(failed, passed=False)
+    )
+
+
+def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
+    """Validate generated SKILL.md against blueprint-declared resources."""
+    results = _check_skill_md_contract(content, blueprint_text)
+    failed = [result for result in results if not result.passed]
+    if failed:
+        raise ContractValidationError(_format_contract_failures(results), results)
+
+
+
+
+def _build_script_file_contract_text(file_path: str, blueprint_text: str) -> str:
+    keys = ", ".join(_infer_script_input_keys_from_blueprint(file_path, blueprint_text))
+    return "\n".join([
+        f"必须满足以下脚本文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+        "- Python 脚本必须能通过 ast.parse 语法检查。",
+        "B. 参数接口:",
+        "- 默认使用 JSON argv 接口：读取 sys.argv[1] 并 json.loads 解析。",
+        f"- 必须实际使用用户输入 keys：{keys}。",
+        f"- 与 SKILL.md 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text)}",
+        "C. 输出接口:",
+        "- stdout 输出结构化 JSON，不要混入调试说明。",
+        "- 推荐统一输出字段：{\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}。",
+        "D. 禁止项:",
+        "- 禁止 placeholder/mock/fake API/固定模板冒充真实能力。",
+        "- 需要图片生成时必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
+        "- 图片脚本必须保留 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架结构；禁止 image_path = generate_stable_diffusion_image(...)。",
+    ])
+
+
+def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
+    return "\n".join([
+        f"必须满足以下参考资料文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出该 reference 的 Markdown 文档内容，不要写入文件标签、Creator 流程说明或多文件包。",
+        "- 可以包含普通 Markdown 标题/列表/示例；如确实需要代码示例，可以包含文档内部 fenced block。",
+        "B. 内容职责:",
+        f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
+        "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
+        "C. 禁止项:",
+        "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
+    ])
+
+
+def _build_generated_file_contract_text(file_path: str, blueprint_text: str, purpose: str = "") -> str:
+    if file_path == "SKILL.md":
+        return _build_skill_md_contract_text(blueprint_text)
+    if file_path.startswith("scripts/"):
+        return _build_script_file_contract_text(file_path, blueprint_text)
+    if file_path.startswith("references/"):
+        return _build_reference_file_contract_text(file_path, purpose, blueprint_text)
+    return ""
+
+
+def _check_reference_file_contract(file_path: str, content: str, purpose: str = "") -> list[ContractCheckResult]:
+    stripped = content.strip()
+    results = [
+        ContractCheckResult(
+            id="reference.not_empty",
+            passed=bool(stripped),
+            target=file_path,
+            message=("参考资料内容非空。" if stripped else f"{file_path} 参考资料内容为空。"),
+            expected="输出该 reference 的 Markdown 文档内容。",
+            minimal_edit="补充有实际指导价值的 Markdown 参考资料正文。",
+        ),
+        ContractCheckResult(
+            id="reference.no_creator_flow",
+            passed=not bool(_CREATOR_FLOW_LEAK_RE.search(content)),
+            target=file_path,
+            message=(
+                "未包含 Creator 创建流程文案。"
+                if not _CREATOR_FLOW_LEAK_RE.search(content)
+                else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
+            ),
+            expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+            minimal_edit="删除平台创建流程文案，只保留参考资料正文。",
+        ),
+        ContractCheckResult(
+            id="reference.single_file",
+            passed=not bool(_MULTI_FILE_MARKER_RE.search(content)) and not bool(re.search(r"(?im)^\s*写入文件[:：]", content)),
+            target=file_path,
+            message=(
+                "参考资料是单文件内容。"
+                if not _MULTI_FILE_MARKER_RE.search(content) and not re.search(r"(?im)^\s*写入文件[:：]", content)
+                else f"{file_path} 包含多文件包、其它文件路径标题或写入文件标签。"
+            ),
+            expected="只输出当前 reference 文件内容，不要包含 SKILL.md/scripts/assets/references 的多文件包。",
+            minimal_edit="删除其它文件内容、路径标题和写入文件标签，只保留当前参考资料正文。",
+        ),
+    ]
+    return results
+
+
+def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
+    results = _check_reference_file_contract(file_path, content, purpose)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
+
+
+def _check_script_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
+    stripped = content.strip()
+    has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+    raw_ok = bool(stripped) and not has_markdown_or_bundle
+    results = [
+        ContractCheckResult(
+            id="script.raw_source.single_file",
+            passed=raw_ok,
+            target=file_path,
+            message=(
+                "脚本是单个裸源码文件。"
+                if raw_ok
+                else f"{file_path} 生成内容包含 Markdown 代码块或多文件包，不是单个脚本源码。请重新生成该文件。"
+            ),
+            expected="只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+            minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
+        )
+    ]
+    if not raw_ok:
+        return results
+
+    syntax_ok = True
+    syntax_message = "Python 语法合法。"
+    if Path(file_path).suffix.lower() == ".py":
+        try:
+            ast.parse(stripped)
+        except SyntaxError as exc:
+            syntax_ok = False
+            syntax_message = f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+    results.append(
+        ContractCheckResult(
+            id="script.source.syntax",
+            passed=syntax_ok,
+            target=file_path,
+            message=syntax_message,
+            expected="Python 脚本必须能通过 ast.parse 语法检查。",
+            minimal_edit="修正 Python 语法错误，同时保持 stdout JSON 和参数接口不变。",
+        )
+    )
+
+    has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
+    results.append(
+        ContractCheckResult(
+            id="script.no_fake_implementation",
+            passed=not has_fake,
+            target=file_path,
+            message=(
+                "脚本未包含占位/模拟/假 API 实现。"
+                if not has_fake
+                else f"{file_path} 包含占位/模拟/假 API 实现。Creator 生成的脚本必须具备真实可执行功能。"
+            ),
+            expected="不得使用 placeholder/mock/fake API/固定模板冒充真实能力。",
+            minimal_edit="替换占位或模拟逻辑，实现真实可执行算法或调用平台配置模型/helper。",
+        )
+    )
+    return results
+
+
+def _validate_script_file_source_contract(file_path: str, content: str) -> None:
+    results = _check_script_file_contract(file_path, content)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
+def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> None:
+    """Validate SKILL.md against files already initialized in the Skill dir."""
+    skill_dir = settings.skills_path / skill_name
+    if not skill_dir.exists():
+        return
+    declared_paths: list[str] = []
+    for folder in ("scripts", "references"):
+        folder_path = skill_dir / folder
+        if not folder_path.is_dir():
+            continue
+        for child in sorted(path for path in folder_path.iterdir() if path.is_file()):
+            declared_paths.append(f"{folder}/{child.name}")
+    if declared_paths:
+        _validate_skill_md_contract(content, "\n".join(declared_paths))
+    else:
+        _reject_creator_flow_leak(content)
+
+
+def _clean_blueprint_for_file_prompt(blueprint_text: str) -> str:
+    """Remove Creator UI confirmation text from blueprint context before generation."""
+    cleaned_lines: list[str] = []
+    in_confirmation_block = False
+    for line in (blueprint_text or "").splitlines():
+        stripped = line.strip()
+        if _CREATOR_FLOW_LEAK_RE.search(stripped):
+            in_confirmation_block = True
+            continue
+        if in_confirmation_block:
+            if stripped.startswith("```") or stripped.startswith("- [") or stripped.startswith(">"):
+                continue
+            if not stripped:
+                in_confirmation_block = False
+                continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip() or blueprint_text
+
+
+def _reject_fake_script_implementation(file_path: str, content: str) -> None:
+    """Reject placeholder/mock scripts that pretend to implement capabilities."""
+    if _SCRIPT_FAKE_IMPLEMENTATION_RE.search(content):
+        raise ValueError(
+            f"{file_path} 包含占位/模拟/假 API 实现。"
+            "Creator 生成的脚本必须具备真实可执行功能；"
+            "如需图像或多模态能力，应通过宿主配置的模型/服务完成，不能写 placeholder 文件或假装调用 API。"
+        )
+
+
+def _requires_configured_model_call(*, skill_md: str, file_path: str) -> bool:
+    """Return whether SKILL.md declares host-model-powered behavior for a script.
+
+    This intentionally keys off model-capability wording (host/built-in/
+    configured models, LLM, multimodal, image/vision models) rather than a
+    finite list of Skill domains.
+    """
+    if not skill_md:
+        return False
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return False
+    return bool(_HOST_MODEL_CAPABILITY_RE.search(skill_md))
+
+
+def _script_uses_configured_model(content: str) -> bool:
+    """Detect whether script calls the configured host LLM/VL endpoint."""
+    return bool(_CONFIGURED_MODEL_CALL_RE.search(content))
+
+
+def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Reject scripts that claim host-model behavior but do not call models."""
+    if _DIRECT_IMAGE_API_RE.search(content) and "VISION_MODEL" in content:
+        raise ValueError(
+            f"{file_path} 将 VISION_MODEL 与图片生成接口混用。"
+            "生成图片必须使用平台 Stable Diffusion 图片运行时或 IMAGE_MODEL；"
+            "VISION_MODEL 只用于看图理解/OCR/多模态问答。"
+        )
+
+    if _DIRECT_IMAGE_API_RE.search(content) and not _PLATFORM_IMAGE_HELPER_RE.search(content):
+        raise ValueError(
+            f"{file_path} 直接调用图片生成接口。"
+            "Creator 生成的图片脚本必须调用 backend.services.skill_runtime.generate_stable_diffusion_image，"
+            "由平台侧静默完成中文 topic 翻译、Stable Diffusion IMAGE_MODEL 选择、b64_json 解析和图片落盘。"
+        )
+
+    if _IMAGE_MODEL_USAGE_RE.search(content) and _IMAGE_URL_ONLY_RE.search(content) and "b64_json" not in content:
+        raise ValueError(
+            f"{file_path} 假设图片接口只返回 url。"
+            "平台图片运行时默认使用 b64_json，并会落盘为文件路径；请调用平台图片运行时 helper。"
+        )
+
+    if _DATA_URI_RE.search(content):
+        raise ValueError(
+            f"{file_path} 输出 base64 data URI。"
+            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_paths/images。"
+        )
+
+    if re.search(r"(?m)^\s*image_path\s*=\s*generate_stable_diffusion_image\s*\(", content):
+        raise ValueError(
+            f"{file_path} 将 helper 返回 dict 直接赋给 image_path。"
+            "图片脚本必须先保存 result = generate_stable_diffusion_image(desc)，"
+            "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
+        )
+
+    if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
+        return
+    if _script_uses_configured_model(content):
+        return
+    raise ValueError(
+        f"{file_path} 的 SKILL.md 声明需要使用宿主/内置/配置模型，但脚本没有调用这些模型。"
+        "脚本不能用固定模板、随机词表或 ASCII 图替代模型能力；"
+        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL，"
+        "或者把该 Skill 设计为无需 scripts/ 的模型直接回答。"
+    )
+
+def _validate_generated_file_content(file_path: str, content: str) -> None:
+    """Reject content that is clearly not the requested single file."""
+    if file_path == "SKILL.md":
+        _reject_custom_skill_md_protocol(content)
+        return
+
+    if file_path.startswith("scripts/"):
+        _validate_script_file_source_contract(file_path, content)
+
+
+def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
+    """Return shell command templates in SKILL.md that invoke script_path."""
+    commands: list[str] = []
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", skill_md, flags=re.IGNORECASE):
+        command = match.group(1).strip()
+        if script_path in command:
+            commands.append(command)
+    return commands
+
+
+def _command_uses_json_argv(command: str) -> bool:
+    return "{" in command and "}" in command
+
+
+def _script_reads_json_argv(content: str) -> bool:
+    return "json.loads" in content and "sys.argv" in content
+
+
+def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
+    """Validate script source against existing SKILL.md command examples."""
+    _reject_fake_script_implementation(file_path, content)
+    _validate_configured_model_usage_static(file_path=file_path, content=content, skill_md=skill_md)
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return
+
+    json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
+    if json_argv_commands and not _script_reads_json_argv(content):
+        raise ValueError(
+            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
+            "禁止保存与命令示例不一致的脚本。"
+        )
+
+    for cmd in commands:
+        for key in re.findall(r"{{\s*([a-zA-Z_][\w-]*)\s*}}", cmd):
+            if key not in content:
+                raise ValueError(
+                    f"{file_path} 的 Markdown 命令示例包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
+                )
+
+
+def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
+    """Refuse saving scripts that do not match the current SKILL.md contract."""
+    if not file_path.startswith("scripts/"):
+        return
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    if not skill_md_path.is_file():
+        return
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+
+def _sample_value_for_placeholder(key: str) -> str:
+    """Return realistic trial input; image/diffusion prompts are already English."""
+    lowered = key.lower()
+    if any(token in lowered for token in ("prompt", "diffusion", "image", "picture", "photo", "scene")):
+        return "a cinematic watercolor cat under a warm sunset"
+    if any(token in lowered for token in ("text", "content", "input", "query")):
+        return "测试输入 text sample"
+    if any(token in lowered for token in ("topic", "theme", "subject")):
+        return "system time"
+    return f"sample {key}"
+
+
+def _render_trial_command_args(command: str, script_path: str) -> list[str] | None:
+    """Extract argv for script_path from a SKILL.md command template."""
+    rendered = re.sub(
+        r"{{\s*([a-zA-Z_][\w-]*)\s*}}",
+        lambda m: _sample_value_for_placeholder(m.group(1)),
+        command,
+    )
+    try:
+        parts = shlex.split(rendered)
+    except ValueError:
+        return None
+
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            return parts[idx + 1:]
+    return None
+
+
+def _dedupe_trial_arg_sets(arg_sets: list[list[str]]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    deduped: list[list[str]] = []
+    for args in arg_sets:
+        key = tuple(args)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(args)
+    return deduped
+
+
+def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
+    """Add trial cases proving optional text can be omitted or empty."""
+    if len(args) != 1:
+        return []
+    try:
+        payload = json.loads(args[0])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or "text" not in payload:
+        return []
+
+    variants: list[list[str]] = []
+    without_text = dict(payload)
+    without_text.pop("text", None)
+    if without_text:
+        variants.append([json.dumps(without_text, ensure_ascii=False)])
+
+    empty_text = dict(payload)
+    empty_text["text"] = ""
+    variants.append([json.dumps(empty_text, ensure_ascii=False)])
+    return variants
+
+
+def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
+    commands = _extract_script_command_templates(skill_md, file_path)
+    arg_sets = [args for cmd in commands if (args := _render_trial_command_args(cmd, file_path)) is not None]
+    if not arg_sets and _script_reads_json_argv(content):
+        arg_sets = [[json.dumps({
+            "prompt": _sample_value_for_placeholder("prompt"),
+            "text": _sample_value_for_placeholder("text"),
+            "topic": _sample_value_for_placeholder("topic"),
+        }, ensure_ascii=False)]]
+    if not arg_sets:
+        arg_sets = [[]]
+
+    expanded: list[list[str]] = []
+    for args in arg_sets:
+        expanded.append(args)
+        expanded.extend(_json_argv_text_optional_variants(args))
+    return _dedupe_trial_arg_sets(expanded)
+
+
+def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stderr: str) -> str:
+    return (
+        "脚本试运行失败：\n"
+        f"argv={args!r}\n"
+        f"exit_code={returncode}\n"
+        f"stdout={stdout[-4000:]}\n"
+        f"stderr={stderr[-4000:]}"
+    )
+
+
+def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
+    image_path = payload.get("image_path")
+    if isinstance(image_path, str) and image_path.strip():
+        return True
+
+    image_paths = payload.get("image_paths")
+    if isinstance(image_paths, list) and image_paths and all(isinstance(p, str) and p.strip() for p in image_paths):
+        return True
+
+    images = payload.get("images")
+    if (
+        isinstance(images, list)
+        and images
+        and all(isinstance(item, dict) and isinstance(item.get("image_path"), str) and item.get("image_path").strip() for item in images)
+    ):
+        return True
+
+    return False
+
+
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str]) -> None:
+    stripped = (stdout or "").strip()
+    if not stripped:
+        raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"脚本试运行 stdout 不是合法 JSON object：argv={args!r} stdout={stripped[-4000:]}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"脚本试运行 stdout 必须是 JSON object：argv={args!r} stdout={stripped[-4000:]}")
+    if "error" in payload:
+        raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
+
+    if "generate_stable_diffusion_image" in content and not _validate_image_payload_shape(payload):
+        raise ValueError(
+            "图片脚本调用了 generate_stable_diffusion_image，但 stdout JSON 缺少可消费的图片路径字段："
+            "必须包含 image_path(str) 或 image_paths(list[str]) 或 images(list[dict] 且每项含 image_path)。"
+            f" argv={args!r} stdout={stripped[-4000:]}"
+        )
+
+
+def _trial_run_generated_script(skill_name: str, file_path: str, content: str) -> None:
+    """Run a generated Python script before accepting it from Creator.
+
+    Python scripts are executed in a temporary per-skill virtual environment.
+    Before each trial run, imports are statically scanned and missing common
+    third-party packages are installed into that venv, matching sandbox runtime
+    behavior and allowing generation-test-repair-test loops to focus on real
+    script defects instead of missing packages.
+    """
+    if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
+        return
+
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+    with tempfile.TemporaryDirectory(prefix="creator-script-trial-") as tmp:
+        skill_dir = Path(tmp) / skill_name
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            skill_md or f"---\nname: {skill_name}\ndescription: trial\n---\n",
+            encoding="utf-8",
+        )
+        script_path = scripts_dir / Path(file_path).name
+        script_path.write_text(content, encoding="utf-8")
+
+        try:
+            venv_python = _get_skill_venv_python(skill_dir)
+            _scan_and_install_python_deps(script_path, venv_python)
+        except RuntimeError as exc:
+            raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc
+
+        for args in _trial_args_for_script(skill_md, file_path, content):
+            try:
+                proc = subprocess.run(
+                    [str(venv_python), str(script_path), *args],
+                    cwd=str(scripts_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
+                    env={**_build_script_runtime_env(skill_dir), "SKILL_TRIAL_RUN": "1"},
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError(f"脚本试运行超时（超过 {_SCRIPT_TRIAL_TIMEOUT_SECONDS} 秒）：argv={args!r}") from exc
+            if proc.returncode != 0:
+                raise ValueError(_format_trial_failure(
+                    args=args,
+                    returncode=proc.returncode,
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                ))
+            _validate_trial_stdout_json(stdout=proc.stdout, content=content, args=args)
+
+
+async def _repair_generated_file_with_feedback(
+    *,
+    prompt_messages: list[dict],
+    model: str,
+    file_path: str,
+    previous_content: str,
+    validation_error: str,
+    targeted_repair: str = "",
+    contract_text: str = "",
+    passed_checks_text: str = "",
+    failed_checks_text: str = "",
+    repair_mode: str = "minimal_edit",
+) -> str:
+    """Ask the routed generation model to fix one file using validator feedback.
+
+    The repaired model output is intentionally not validated here. Validation
+    happens at the top of the generate-file retry loop so format errors in the
+    repaired response consume one retry attempt and can be sent back as feedback.
+    Previous content is passed as user-quoted data instead of an assistant turn
+    so Markdown-wrapped failures are not reinforced as the desired answer shape.
+    """
+    is_script = file_path.startswith("scripts/")
+    output_contract = (
+        "最终只返回完整脚本源码；不要解释，不要 Markdown 代码块，不要多文件包，不要写 `写入文件：...`。"
+        if is_script
+        else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
+    )
+    local_edit_scope = (
+        "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
+        if is_script
+        else "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
+    )
+    if is_script:
+        extra_rules = (
+            "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
+            "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
+        )
+    else:
+        extra_rules = (
+            "如果蓝图包含 scripts/，必须包含调用对应 scripts/ 路径的 ```bash fenced code block；"
+            "如果蓝图包含 references/，必须在正文中明确引用对应 reference 路径；"
+            "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
+        )
+
+    repair_messages = [*prompt_messages]
+    previous_for_prompt = previous_content[-16000:]
+    previous_label = "待编辑草稿"
+    if is_script and repair_mode == "strict_contract_rewrite":
+        previous_for_prompt = _extract_probable_python_source(previous_content) or ""
+        previous_label = "可参考的源码候选（已移除 Markdown 外壳；若为空，请根据原始任务重新生成）"
+    repair_messages.append({
+        "role": "user",
+        "content": (
+            f"以下是上一次生成但未通过校验的 {file_path} 内容。它可能包含错误示范（例如 Markdown fence 或 Creator 流程泄露），"
+            f"不要模仿错误格式，只把它当作{previous_label}：\n"
+            "<previous_content>\n"
+            f"{previous_for_prompt}\n"
+            "</previous_content>"
+        ),
+    })
+    edit_strategy = (
+        "这是 scripts/ 首次失败后的严格重写：不要走 minimal_edit，不要修补错误外壳；"
+        "请根据合同、蓝图和骨架重新输出完整可运行源码。"
+        if is_script and repair_mode == "strict_contract_rewrite"
+        else (
+            "请优先做局部修改：只修改校验意见指出的最小错误片段，"
+            f"{local_edit_scope}"
+            "修改完成后可以整合输出。"
+        )
+    )
+    repair_messages.append({
+        "role": "user",
+        "content": (
+            f"上一次生成的 {file_path} 没有通过校验模型/静态校验/试运行。"
+            f"{edit_strategy}"
+            f"{output_contract}\n"
+            f"{extra_rules}\n\n"
+            f"错误信息：\n{validation_error}"
+            + (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else "")
+            + (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else "")
+            + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
+            + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
+            + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
+            + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是 Python 源码字符，全文不得出现 ```。" if is_script and repair_mode == "strict_contract_rewrite" else "")
+            + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
+        ),
+    })
+    logger.info(
+        "[Creator][model] phase=repair.request file=%s model=%s repair_mode=%s messages=%d previous_chars=%d contract_chars=%d failed_checks_chars=%d",
+        file_path,
+        model,
+        repair_mode,
+        len(repair_messages),
+        len(previous_content or ""),
+        len(contract_text or ""),
+        len(failed_checks_text or ""),
+    )
+    repaired = await complete_chat_once(repair_messages, model)
+    if is_script:
+        normalized = _normalize_generated_file_content(file_path, repaired)
+        logger.info(
+            "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d normalized_chars=%d normalized=%s",
+            file_path,
+            model,
+            repair_mode,
+            len(repaired or ""),
+            len(normalized or ""),
+            normalized != repaired,
+        )
+        return normalized
+    logger.info(
+        "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d",
+        file_path,
+        model,
+        repair_mode,
+        len(repaired or ""),
+    )
+    return repaired
+
+
+def _parse_validator_json_object(text: str) -> dict | None:
+    stripped = (text or "").strip()
+    if stripped.startswith("```json"):
+        stripped = stripped[7:].strip()
+    if stripped.startswith("```"):
+        stripped = stripped[3:].strip()
+    if stripped.endswith("```"):
+        stripped = stripped[:-3].strip()
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+_MISSING_SKILL_SCRIPT_BLOCK_RE = re.compile(
+    r"SKILL\.md 缺少调用 (?P<script>scripts/[A-Za-z0-9_./-]+) 的可执行 Markdown 命令块"
+)
+_MISSING_SKILL_REFERENCE_RE = re.compile(
+    r"SKILL\.md 缺少对参考资料 (?P<reference>references/[A-Za-z0-9_./-]+) 的引用"
+)
+
+
+def _targeted_generated_file_repair_instructions(*, file_path: str, deterministic_error: str) -> str:
+    """Return deterministic, actionable instructions for recurring validation failures."""
+    if file_path == "SKILL.md":
+        script_match = _MISSING_SKILL_SCRIPT_BLOCK_RE.search(deterministic_error)
+        if script_match:
+            script_path = script_match.group("script")
+            return (
+                f"必须在 SKILL.md 正文中加入一个真实的 bash fenced code block，且 block 内必须逐字包含 `{script_path}`。\n"
+                "注意：‘不要在文件外层套 Markdown 代码块’不等于禁止 SKILL.md 正文内部的命令示例；"
+                "这个内部 ```bash block 是校验必需内容。\n"
+                "请使用平台占位符 `{{topic}}`，不要使用 shell 变量 `${topic}`。\n"
+                "可直接插入如下命令示例，并围绕它补充参数说明：\n"
+                "```bash\n"
+                f"python {script_path} " "'{\"topic\":\"{{topic}}\"}'" "\n"
+                "```"
+            )
+
+        reference_match = _MISSING_SKILL_REFERENCE_RE.search(deterministic_error)
+        if reference_match:
+            reference_path = reference_match.group("reference")
+            return (
+                f"必须在 SKILL.md 的参考资料/资源小节逐字引用 `{reference_path}`，"
+                "并说明何时读取该 reference；不要只泛称‘参考资料’。"
+            )
+
+        if "Creator 界面流程" in deterministic_error:
+            return (
+                "删除 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等 UI 文案；"
+                "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
+            )
+
+    if file_path.startswith("scripts/"):
+        if "Markdown 代码块或多文件包" in deterministic_error or "script.raw_source.single_file" in deterministic_error:
+            return (
+                "本轮必须把上一次内容改成单个裸脚本源码：删除所有 ``` fence、```python/```text 标签、"
+                "文件路径标题、写入文件标签、解释性文字和多文件包内容；最终响应第一个字符应是脚本源码字符。"
+            )
+        if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
+            return (
+                "按脚本合同修复：保持单文件源码，修正语法/参数解析/运行错误；"
+                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON。"
+            )
+
+    if file_path.startswith("references/"):
+        if "contract 未通过" in deterministic_error or "多文件包" in deterministic_error or "Creator" in deterministic_error:
+            return (
+                "按 reference 合同修复：只输出当前参考资料 Markdown 正文；"
+                "删除 Creator 流程、写入文件标签、多文件包和其它文件路径标题。"
+            )
+
+    return ""
+
+async def _run_generated_file_validator_round(
+    *,
+    file_path: str,
+    content: str,
+    deterministic_error: str,
+    requested_model: str,
+    targeted_repair: str = "",
+    contract_text: str = "",
+    passed_checks_text: str = "",
+    failed_checks_text: str = "",
+    repair_mode: str = "minimal_edit",
+) -> dict:
+    """Ask the validator model for actionable repair feedback for the coder."""
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=f"creator generated file validation: {file_path}",
+    )
+    _log_creator_model_usage(
+        phase="validator.route",
+        file_path=file_path,
+        route=route,
+        extra=f"requested_generation_model={requested_model} repair_mode={repair_mode} content_chars={len(content)}",
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator 生成文件校验模型，只输出严格 JSON object。"
+                "你不改代码，只给 coder 可执行的局部修复意见。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标文件：{file_path}\n"
+                "后端确定性校验/试运行错误：\n"
+                f"{deterministic_error}\n\n"
+                + (f"完整 contract：\n{contract_text}\n\n" if contract_text else "")
+                + (f"已通过检查（repair 时必须保留）：\n{passed_checks_text}\n\n" if passed_checks_text else "")
+                + (f"未通过检查（repair 只修这些项）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
+                + (f"本轮修复模式：{repair_mode}\n\n" if repair_mode else "")
+                + (f"后端根据该错误生成的必做修复步骤：\n{targeted_repair}\n\n" if targeted_repair else "")
+                + "候选内容：\n"
+                "```text\n"
+                f"{content[-12000:]}\n"
+                "```\n\n"
+                "请输出 JSON："
+                "{\"passed\": false, \"issues\": [\"...\"], "
+                "\"failed_checks\": [{\"id\": \"...\", \"target\": \"...\", \"expected\": \"...\", \"minimal_edit\": \"...\"}], "
+                "\"preserve\": [\"已通过检查对应内容\"], "
+                "\"repair_instructions\": \"给 coder 的局部修改指令；如果上方有必做修复步骤，必须复述并细化这些步骤，不得改用其它占位符或省略必需的 fenced block。若有 Markdown fence/多文件包，明确要求只返回目标脚本源码本身，不要 fence/说明/写入文件标签。\"}"
+            ),
+        },
+    ]
+    try:
+        text = await complete_chat_once(messages, route.model)
+        logger.info(
+            "[Creator][model] phase=validator.response file=%s model=%s chars=%d repair_mode=%s",
+            file_path,
+            route.model,
+            len(text or ""),
+            repair_mode,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        logger.warning("Creator file validator failed; using deterministic feedback: %s", exc)
+        return {
+            "passed": False,
+            "issues": [deterministic_error],
+            "repair_instructions": deterministic_error,
+            "model": route.model,
+        }
+
+    data = _parse_validator_json_object(text)
+    if not data:
+        return {
+            "passed": False,
+            "issues": [deterministic_error],
+            "repair_instructions": deterministic_error,
+            "model": route.model,
+        }
+
+    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
+    failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
+    preserve = data.get("preserve") if isinstance(data.get("preserve"), list) else []
+    instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
+    return {
+        "passed": bool(data.get("passed", data.get("valid", False))) and not issues and not failed_checks,
+        "issues": [str(item) for item in issues],
+        "failed_checks": failed_checks,
+        "preserve": [str(item) for item in preserve],
+        "repair_instructions": instructions,
+        "model": route.model,
+    }
+
+
+def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
+    issues = validator_report.get("issues") or []
+    issue_text = "\n".join(f"- {issue}" for issue in issues) if issues else "- （校验模型未返回额外问题）"
+    failed_checks = validator_report.get("failed_checks") or []
+    failed_check_text = (
+        "\n".join(f"- {json.dumps(check, ensure_ascii=False)}" for check in failed_checks)
+        if failed_checks else "- （校验模型未返回结构化 failed_checks）"
+    )
+    return (
+        "后端确定性校验/试运行错误：\n"
+        f"{deterministic_error}\n\n"
+        + (f"后端确定性修复指令：\n{targeted_repair}\n\n" if targeted_repair else "")
+        + f"校验模型：{validator_report.get('model', '')}\n"
+        "校验模型问题列表：\n"
+        f"{issue_text}\n\n"
+        "校验模型结构化 failed_checks：\n"
+        f"{failed_check_text}\n\n"
+        "校验模型给 coder 的修复意见：\n"
+        f"{validator_report.get('repair_instructions') or deterministic_error}"
+    )
+
+
+def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
+    """Return whether content is safe to accept as the requested raw script.
+
+    This helper is intentionally narrower than the full script validator: it only
+    checks that deterministic Markdown/bundle cleanup produced one raw source
+    file.  Full fake-implementation, contract, dependency and trial-run checks
+    still happen in the normal validation pipeline.
+    """
+    stripped = content.strip()
+    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+        return False
+
+    if Path(file_path).suffix.lower() == ".py":
+        try:
+            ast.parse(stripped)
+        except SyntaxError:
+            return False
+
+    return True
+
+
+def _extract_single_wrapping_fence(content: str) -> str | None:
+    """Extract a code block only when it wraps the entire model response.
+
+    Models often wrap repaired scripts in ```text fences, sometimes with CRLF
+    line endings or a closing fence that is longer than the opener.  This parser
+    intentionally accepts only a whole-response fence: any prose before/after the
+    block, or any non-fence trailing line, returns None and lets validation reject
+    the ambiguous output.
+    """
+    stripped = content.strip().lstrip("\ufeff")
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return None
+
+    opening = lines[0].strip()
+    opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+    if not opening_match:
+        return None
+
+    fence = opening_match.group(1)
+    fence_char = fence[0]
+    min_fence_len = len(fence)
+    closing = lines[-1].strip()
+    if not re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+        return None
+
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _extract_only_fenced_block(content: str) -> str | None:
+    """Extract the body only when exactly one fenced block appears in content."""
+    lines = content.strip().lstrip("\ufeff").splitlines()
+    blocks: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        opening = lines[idx].strip()
+        opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+        if not opening_match:
+            idx += 1
+            continue
+
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        body: list[str] = []
+        idx += 1
+        while idx < len(lines):
+            closing = lines[idx].strip()
+            if re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+                blocks.append("\n".join(body).strip())
+                break
+            body.append(lines[idx])
+            idx += 1
+        else:
+            return None
+
+        if len(blocks) > 1:
+            return None
+        idx += 1
+
+    if len(blocks) != 1:
+        return None
+    return blocks[0]
+
+
+def _extract_first_fenced_block(content: str) -> str | None:
+    """Extract the first fenced block body, or None if no complete block exists."""
+    lines = content.strip().lstrip("\ufeff").splitlines()
+    idx = 0
+    while idx < len(lines):
+        opening = lines[idx].strip()
+        opening_match = re.match(r"^(`{3,}|~{3,})[^`~]*$", opening)
+        if not opening_match:
+            idx += 1
+            continue
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        body: list[str] = []
+        idx += 1
+        while idx < len(lines):
+            closing = lines[idx].strip()
+            if re.fullmatch(rf"{re.escape(fence_char)}{{{min_fence_len},}}", closing):
+                return "\n".join(body).strip()
+            body.append(lines[idx])
+            idx += 1
+        return None
+    return None
+
+
+def _drop_common_non_code_lines(text: str) -> str:
+    """Remove common chat/file-label prose that models place around scripts."""
+    drop_patterns = [
+        r"^\s*下面是",
+        r"^\s*以下是",
+        r"^\s*(?:文件|路径)[:：]",
+        r"^\s*写入文件[:：]",
+        r"^\s*#+\s*scripts/",
+        r"^\s*`?scripts/[^`]+`?\s*$",
+    ]
+    cleaned: list[str] = []
+    for line in text.strip().splitlines():
+        if any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in drop_patterns):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def _looks_like_python_source(text: str) -> bool:
+    """Return True for probable Python source without requiring valid syntax yet."""
+    stripped = text.strip()
+    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+        return False
+    return bool(re.search(
+        r"(?m)^\s*(?:import\s+|from\s+|def\s+|class\s+|if __name__\s*==\s*['\"]__main__['\"]|#!/usr/bin/env python|#)",
+        stripped,
+    ))
+
+
+def _extract_probable_python_source(content: str) -> str | None:
+    """Extract a raw Python source candidate before syntax validation."""
+    stripped = content.strip().lstrip("\ufeff")
+    candidates: list[str] = []
+
+    normalized = stripped
+    for _ in range(3):
+        wrapping = _extract_single_wrapping_fence(normalized)
+        if wrapping is None:
+            break
+        normalized = wrapping.strip()
+        candidates.append(normalized)
+
+    only_block = _extract_only_fenced_block(stripped)
+    if only_block is not None:
+        candidates.append(only_block.strip())
+
+    # Use the first block only when the response does not look like an explicit
+    # multi-file bundle.  Multi-file bundles are rejected rather than guessed.
+    if not _MULTI_FILE_MARKER_RE.search(stripped) and not re.search(r"(?im)^\s*写入文件[:：]", stripped):
+        first_block = _extract_first_fenced_block(stripped)
+        if first_block is not None:
+            candidates.append(first_block.strip())
+
+    candidates.append(stripped)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        cleaned = _drop_common_non_code_lines(candidate)
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        if _looks_like_python_source(cleaned):
+            return cleaned
+    return None
+
+
+def _normalize_generated_file_content(file_path: str, content: str) -> str:
+    """Normalize model output while keeping script extraction conservative."""
+    if file_path.startswith("scripts/"):
+        stripped = content.strip()
+        if Path(file_path).suffix.lower() == ".py":
+            extracted = _extract_probable_python_source(stripped)
+            if extracted:
+                return extracted
+
+        normalized = stripped
+        for _ in range(3):
+            wrapping_fence = _extract_single_wrapping_fence(normalized)
+            if wrapping_fence is None:
+                break
+            normalized = wrapping_fence.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        only_block = _extract_only_fenced_block(stripped)
+        if only_block is not None:
+            normalized = only_block.strip()
+            if _is_valid_normalized_script_source(file_path, normalized):
+                return normalized
+
+        return stripped
+
+    extracted = _extract_target_file_from_bundle(content, file_path)
+    return _strip_code_fence(extracted if extracted is not None else content)
+
+
+def _sanitize_generated_file_content(file_path: str, content: str) -> str:
+    """Normalize model output into exactly the requested file content."""
+    sanitized = _normalize_generated_file_content(file_path, content)
+    _validate_generated_file_content(file_path, sanitized)
+    return sanitized
+
+
 def _strip_code_fence(content: str) -> str:
     """Strip wrapping code-fence markers that a model may output despite instructions.
 
@@ -218,6 +1656,66 @@ def _strip_code_fence(content: str) -> str:
     return stripped
 
 
+
+
+def _script_generation_skeleton(file_path: str, purpose: str, blueprint_text: str) -> str:
+    """Return a fixed Python script scaffold for script generation prompts."""
+    if Path(file_path).suffix.lower() != ".py":
+        return ""
+
+    context = f"{file_path}\n{purpose}\n{blueprint_text}"
+    needs_image = bool(re.search(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration", context, re.IGNORECASE))
+    if needs_image:
+        return (
+            "必须使用下面的图片脚本骨架；不要改变 import/helper/main/JSON stdout 结构，只填充 build_image_prompt() "
+            "中的业务 prompt 组装逻辑，必要时补充返回字段：\n"
+            "import json\n"
+            "import sys\n"
+            "from backend.services.skill_runtime import generate_stable_diffusion_image\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def build_image_prompt(payload: dict) -> str:\n"
+            "    # Derive a concrete prompt from payload keys required by the blueprint.\n"
+            "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
+            "    return topic or 'helpful generated illustration'\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    desc = build_image_prompt(payload)\n"
+            "    image_paths = []\n"
+            "    images = []\n"
+            "    result = generate_stable_diffusion_image(desc, filename_prefix='generated')\n"
+            "    image_paths.append(result.get('image_path'))\n"
+            "    images.append(result)\n"
+            "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
+            "    return {'text': '', 'image_paths': image_paths, 'images': images}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    return (
+        "必须使用下面的业务逻辑脚本骨架；不要改变 import/parse_args/main/JSON stdout 结构，只填充 run() "
+        "中的真实业务逻辑并按蓝图使用 payload 字段：\n"
+        "import json\n"
+        "import sys\n\n"
+        "def parse_args() -> dict:\n"
+        "    if len(sys.argv) < 2:\n"
+        "        return {}\n"
+        "    return json.loads(sys.argv[1])\n\n"
+        "def run(payload: dict) -> dict:\n"
+        "    # Implement the real deterministic business logic required by the blueprint.\n"
+        "    # Treat payload.get('text') as optional; topic/prompt-only invocations must work.\n"
+        "    return {'text': '', 'image_paths': [], 'images': []}\n\n"
+        "def main() -> None:\n"
+        "    payload = parse_args()\n"
+        "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()"
+    )
+
 def _build_generate_file_prompt(
     file_path: str,
     skill_name: str,
@@ -233,6 +1731,13 @@ def _build_generate_file_prompt(
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
 
+    clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
+    declared_paths = _extract_declared_skill_paths(blueprint_text)
+    declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
+    generated_file_contract_text = _build_generated_file_contract_text(file_path, blueprint_text, purpose)
+    skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
+    script_skeleton_text = _script_generation_skeleton(file_path, purpose, blueprint_text) if file_path.startswith("scripts/") else ""
+
     if file_path == "SKILL.md":
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 SKILL.md 文件。\n\n'
@@ -244,21 +1749,43 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. 执行说明应指导宿主 AI 如何理解用户请求、调用脚本/工具、生成回答。\n"
-            "5. 不要在输出内容的外侧套 ``` 代码块。\n\n"
-            f"以下是已确认的蓝图，你的内容必须与此一致：\n\n{blueprint_text}"
+            "4. 执行说明应指导宿主 AI 如何理解用户请求、何时直接回答、何时输出显式可执行 block。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
+            "6. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "7. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"
+            "8. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "9. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "10. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
+            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
+            "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
+            f"{skill_md_contract_text}\n\n"
+            f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("scripts/"):
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
             f"职责说明：{purpose}\n\n"
+            "你是文件内容生成器，不是聊天助手；当前输出会被直接写入目标文件。\n"
             "要求：\n"
-            f"1. 只输出完整可运行的 {lang} 代码，不要任何说明文字。\n"
-            "2. 不要用 ``` 代码块包裹输出内容。\n"
-            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图中描述的一致。\n"
-            "4. 所有导入的第三方库必须真实存在且常见。\n"
-            "5. 包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n\n"
-            f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            f"1. 只输出完整可运行的 {lang} 文件字节内容本身，不要任何说明文字。\n"
+            "2. 禁止 Markdown，禁止 ```，禁止‘下面是代码’，禁止文件名标题，禁止多文件输出；如果输出包含 ```，系统会判定失败。\n"
+            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
+            "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
+            "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
+            "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；生成图片使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
+            "7. 如果脚本需要生成图片，不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
+            "8. 图片脚本 stdout 必须输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
+            "10. stdout 应输出结构化 JSON，字段统一为 {\"text\": str, \"image_paths\": list[str], \"images\": list[dict]}；不要混入调试说明。\n"
+            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
+            "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
+            "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
+            "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
+            f"{generated_file_contract_text}\n\n"
+            f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图（scripts/ 生成不会追加聊天历史，只使用本蓝图）：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("references/"):
         instruction = (
@@ -267,8 +1794,11 @@ def _build_generate_file_prompt(
             "要求：\n"
             "1. 只输出 Markdown 文档内容，不要额外的说明文字。\n"
             "2. 不要在文档外套 ``` 代码块。\n"
-            "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n\n"
-            f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{blueprint_text}"
+            "3. 内容应是有实际指导价值的参考资料，不是对参考资料的再描述。\n"
+            "生成前请先隐式检查以下 reference 合同，最终输出必须逐项满足：\n"
+            f"{generated_file_contract_text}\n\n"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("assets/"):
         instruction = (
@@ -277,22 +1807,37 @@ def _build_generate_file_prompt(
             "要求：\n"
             f"1. 只输出 {lang} 格式的文件内容，不要任何说明文字。\n"
             "2. 不要用 ``` 代码块包裹输出。\n\n"
-            f"以下是已确认的蓝图：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
     else:
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
             f"职责说明：{purpose}\n\n"
             "要求：直接输出文件内容，不要任何解释，不要 Markdown 代码块包裹。\n\n"
-            f"蓝图：\n\n{blueprint_text}"
+            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
+            f"蓝图：\n\n{clean_blueprint_text}"
         )
 
     messages: list[dict] = [{"role": "system", "content": instruction}]
 
-    # Include recent conversation turns for context but cap to limit token usage.
+    if file_path.startswith("scripts/"):
+        # Scripts are generated from the system instruction plus the confirmed
+        # blueprint only.  Do not append conversation history: recent Creator UI
+        # copy (file-list previews, confirmation instructions, panel messages)
+        # has repeatedly polluted first-pass script output.
+        return messages
+
+    # Include recent user context but skip Creator UI confirmation text. Assistant
+    # blueprint confirmations often contain "click Start" operational prose that
+    # must never be copied into generated files.
     for msg in conversation_history[-_MAX_HISTORY_TURNS:]:
-        if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}:
-            messages.append(msg)
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+            continue
+        content = str(msg.get("content") or "")
+        if msg.get("role") == "assistant" and _CREATOR_FLOW_LEAK_RE.search(content):
+            continue
+        messages.append({**msg, "content": _clean_blueprint_for_file_prompt(content)})
 
     return messages
 
@@ -350,7 +1895,19 @@ async def generate_file(request: GenerateFileRequest):
     """
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
-    model = request.model or settings.default_model
+    route = route_creator_file_model(
+        file_path=request.file_path,
+        purpose=request.purpose,
+        requested_model=request.model,
+    )
+    model = route.model
+    _log_creator_model_usage(
+        phase="generate.route",
+        skill_name=skill_name,
+        file_path=request.file_path,
+        route=route,
+        extra=f"purpose_chars={len(request.purpose or '')} requested_ui_model={request.model or ''}",
+    )
 
     prompt_messages = _build_generate_file_prompt(
         file_path=request.file_path,
@@ -361,9 +1918,137 @@ async def generate_file(request: GenerateFileRequest):
     )
 
     async def event_stream():
+        last_validation_error = ""
+        repair_attempts = 0
         try:
-            async for chunk in stream_chat(prompt_messages, model):
-                yield _sse({"content": chunk})
+            yield _sse({"model_ack": route.ack()})
+            ack_payload = {}
+
+            def _capture_ack(payload: dict) -> None:
+                ack_payload.update(payload)
+                _log_creator_model_usage(
+                    phase="generate.provider_ack",
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    route=route,
+                    actual_model=payload.get("actual_model"),
+                    provider=payload,
+                )
+
+            generated_chunks: list[str] = []
+            async for chunk in stream_chat(prompt_messages, model, model_ack_callback=_capture_ack):
+                if ack_payload:
+                    yield _sse({"model_ack": {**route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
+                    ack_payload.clear()
+                generated_chunks.append(chunk)
+
+            raw_content = "".join(generated_chunks)
+            logger.info(
+                "[Creator][model] phase=generate.response skill=%s file=%s model=%s raw_chars=%d chunks=%d",
+                skill_name,
+                request.file_path,
+                model,
+                len(raw_content),
+                len(generated_chunks),
+            )
+
+            should_repair = (
+                request.file_path.startswith("scripts/")
+                or request.file_path.startswith("references/")
+                or request.file_path == "SKILL.md"
+            )
+            if should_repair:
+                content = raw_content
+                last_error = ""
+                repeated_error_counts: dict[str, int] = {}
+                contract_text = _build_generated_file_contract_text(request.file_path, request.blueprint_text, request.purpose)
+                for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
+                    try:
+                        content = _sanitize_generated_file_content(request.file_path, content)
+                        if request.file_path == "SKILL.md":
+                            _validate_skill_md_contract(content, request.blueprint_text)
+                        elif request.file_path.startswith("references/"):
+                            _validate_reference_file_contract(request.file_path, content, request.purpose)
+                        else:
+                            _trial_run_generated_script(skill_name, request.file_path, content)
+                        last_error = ""
+                        break
+                    except ValueError as validation_exc:
+                        deterministic_error = str(validation_exc)
+                        repeated_error_counts[deterministic_error] = repeated_error_counts.get(deterministic_error, 0) + 1
+                        first_attempt_failed = attempt == 0
+                        if request.file_path.startswith("scripts/") and first_attempt_failed:
+                            repair_mode = "strict_contract_rewrite"
+                        else:
+                            repair_mode = "strict_contract_rewrite" if repeated_error_counts[deterministic_error] >= 2 else "minimal_edit"
+                        contract_results = (
+                            validation_exc.results
+                            if isinstance(validation_exc, ContractValidationError)
+                            else []
+                        )
+                        passed_checks_text = _format_contract_checks(contract_results, passed=True) if contract_results else ""
+                        failed_checks_text = _format_contract_checks(contract_results, passed=False) if contract_results else ""
+                        targeted_repair = _targeted_generated_file_repair_instructions(
+                            file_path=request.file_path,
+                            deterministic_error=deterministic_error,
+                        )
+                        validator_report = await _run_generated_file_validator_round(
+                            file_path=request.file_path,
+                            content=content,
+                            deterministic_error=deterministic_error,
+                            requested_model=model,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
+                        )
+                        last_error = _format_file_validator_feedback(deterministic_error, validator_report, targeted_repair)
+                        last_validation_error = last_error
+                        if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
+                            repair_attempts = attempt
+                            yield _sse({
+                                "validation": {
+                                    "status": "failed",
+                                    "attempt": attempt,
+                                    "error": deterministic_error,
+                                    "validator": validator_report,
+                                }
+                            })
+                            raise
+                        repair_attempts = attempt + 1
+                        logger.info(
+                            "repairing generated file skill=%s file=%s attempt=%s error=%s validator_issues=%s",
+                            skill_name,
+                            request.file_path,
+                            repair_attempts,
+                            deterministic_error,
+                            validator_report.get("issues"),
+                        )
+                        yield _sse({
+                            "validation": {
+                                "status": "repairing",
+                                "attempt": repair_attempts,
+                                "error": deterministic_error,
+                                "validator": validator_report,
+                            }
+                        })
+                        content = await _repair_generated_file_with_feedback(
+                            prompt_messages=prompt_messages,
+                            model=model,
+                            file_path=request.file_path,
+                            previous_content=content,
+                            validation_error=last_error,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
+                        )
+            else:
+                content = _sanitize_generated_file_content(request.file_path, raw_content)
+
+            yield _sse({"content": content})
             yield _sse({"done": True})
         except Exception as exc:
             logger.exception(
@@ -372,7 +2057,15 @@ async def generate_file(request: GenerateFileRequest):
                 request.file_path,
             )
             # Return a safe user-facing message; full stack trace is in server logs.
-            yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
+            if last_validation_error:
+                yield _sse({
+                    "error": (
+                        f"文件内容生成失败：已自动修复 {repair_attempts} 次仍未通过。"
+                        f"最后错误：{last_validation_error}"
+                    )
+                })
+            else:
+                yield _sse({"error": "文件内容生成失败，请重试。详情已记录在服务器日志中。"})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -387,7 +2080,14 @@ async def write_file(request: WriteFileRequest):
     _validate_file_path(request.file_path)
     skill_name = _validate_skill_name(request.skill_name)
 
-    content = _strip_code_fence(request.content)
+    try:
+        content = _sanitize_generated_file_content(request.file_path, request.content)
+        if request.file_path == "SKILL.md":
+            _validate_skill_md_against_existing_files(skill_name, content)
+        _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)
+        _trial_run_generated_script(skill_name, request.file_path, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if request.file_path == "SKILL.md":
         result = run_action({"action": "write", "name": skill_name, "content": content})
@@ -418,6 +2118,21 @@ async def validate_skill(request: SkillActionRequest):
     """Validate SKILL.md format for a Skill package."""
     skill_name = _validate_skill_name(request.skill_name)
     result = run_action({"action": "validate", "name": skill_name})
+    if result["success"]:
+        skill_dir = settings.skills_path / skill_name
+        trial_errors: list[str] = []
+        for script_path in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
+            rel_path = f"scripts/{script_path.name}"
+            try:
+                _trial_run_generated_script(skill_name, rel_path, script_path.read_text(encoding="utf-8"))
+            except ValueError as exc:
+                trial_errors.append(f"{rel_path}: {exc}")
+        if trial_errors:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message="SKILL.md 格式校验通过，但脚本试运行失败：\n" + "\n\n".join(trial_errors),
+            )
     return SkillActionResponse(
         success=result["success"],
         path=result.get("path"),

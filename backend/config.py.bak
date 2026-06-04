@@ -1,0 +1,97 @@
+from pathlib import Path
+from typing import Optional
+from pydantic import model_validator
+from pydantic_settings import BaseSettings
+import os
+
+# 获取环境变量
+PROJECT_ROOT = Path(__file__).parent.parent
+# 获取环境变量 LLM_BASE_URL
+# 获取环境变量 DEFAULT_MODEL
+default_model = os.getenv("DEFAULT_MODEL", "qwen3:32b")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+
+
+class Settings(BaseSettings):
+    # LLM backend
+    llm_base_url: str = LLM_BASE_URL
+    default_model: str = default_model
+    # Leave empty to use a local backend; set to your sk-... key for OpenAI.
+    openai_api_key: Optional[str] = None
+    # Alternative field name accepted by some deployments
+    llm_api_key: Optional[str] = None
+
+    # Optional separate model for silent planner rounds (metadata / block / skill planner).
+    # Falls back to default_model when unset.
+    planner_model: Optional[str] = "qwen3:30b-instruct"
+
+    # Optional separate model used exclusively for output-format validation rounds
+    # inside retry_with_validation().  A small/fast model is sufficient here because
+    # validation only requires JSON-structured classification of a prior output.
+    # Falls back to default_model when unset.
+    validator_model: Optional[str] = "qwen3:8b"
+
+    # Optional capability-specific models. These allow the runtime to keep
+    # action classification in code while SKILL.md only describes what to do.
+    text_model: Optional[str] = "qwen3:30b"
+    code_model: Optional[str] = "qwen3-coder:30b"
+    image_model: Optional[str] = "qwen3-vl:32b"
+
+    # Optional JSON routing overrides, e.g.
+    # {"tasks": {"code": "qwen-coder", "image": "sdxl"},
+    #  "creator_paths": {"scripts/*": "code", "assets/*.png": "image"}}
+    model_routing_json: Optional[str] = None
+
+    # Configurable heuristics used only for capability classification.
+    code_file_extensions: str = ".py,.js,.mjs,.cjs,.ts,.tsx,.jsx,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.cs,.php,.swift,.kt,.sql"
+    image_task_keywords: str = "image,images,picture,pictures,photo,photos,logo,icon,illustration,draw,绘图,图片,图像,照片,海报,插画,图标,logo"
+
+    # When true, raise if the provider echoes a different response model.
+    # Defaults to non-strict because many local OpenAI-compatible backends
+    # canonicalize model IDs in streamed chunks.
+    model_ack_strict: bool = False
+
+    # LLM generation parameters — omitted from request payload when unset so the
+    # backend can apply its own defaults.
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+    # Timeout for LLM HTTP requests in seconds.
+    llm_timeout_seconds: int = 6000
+
+    # Filesystem paths
+    kernel_path: Path = PROJECT_ROOT / "kernel"
+    skills_path: Path = PROJECT_ROOT / "skills"
+    managed_skills_path: Path = PROJECT_ROOT / "skills"
+    workspace_skills_path: Path = PROJECT_ROOT / ".agents" / "skills"
+    shared_skills_path: Path = Path.home() / ".agents" / "skills"
+    bundled_skills_path: Path = PROJECT_ROOT / "bundled-skills"
+    governance_path: Path = PROJECT_ROOT / ".skill-governance"
+
+    # Resource reading limit per file (characters) used by read_skill_resource_text.
+    skill_resource_max_chars: int = 20000
+
+    # Maximum wall-clock seconds allowed for a single run_command subprocess.
+    skill_command_timeout: int = 60
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @model_validator(mode="after")
+    def _ensure_paths(self) -> "Settings":
+        """Create skills_path if it does not exist; kernel_path must already exist."""
+        self.managed_skills_path = self.skills_path
+        self.managed_skills_path.mkdir(parents=True, exist_ok=True)
+        self.workspace_skills_path.mkdir(parents=True, exist_ok=True)
+        self.shared_skills_path.mkdir(parents=True, exist_ok=True)
+        self.bundled_skills_path.mkdir(parents=True, exist_ok=True)
+        self.governance_path.mkdir(parents=True, exist_ok=True)
+        self.skills_path = self.managed_skills_path
+        if not self.kernel_path.exists():
+            raise ValueError(
+                f"kernel_path does not exist: {self.kernel_path}. "
+                "Ensure the kernel/ directory is present in the project root."
+            )
+        return self
+
+
+settings = Settings()

@@ -352,15 +352,9 @@ def compose_metadata_prompt(skill: SkillPackage) -> str:
 
 
 def _compose_agent_runtime_contract() -> str:
-    """Runtime contract injected into body stage.
-
-    新版 contract：
-    - SKILL.md 仍保持普通 Markdown。
-    - 主执行路径由宿主 runtime planner 读取 Loaded SKILL.md 后生成结构化 action。
-    - 主模型不再承担“必须吐 bash 代码块才能触发执行”的责任。
-    """
+    """Host runtime guidance injected into body stage."""
     return (
-        "## Host Agent Runtime Contract\n\n"
+        "## Host Agent Runtime Guidance\n\n"
         "你运行在一个分层 Agent 宿主中，当前不是普通自由问答模式，而是 Skill 执行模式。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前任务的最高执行规范，而不是普通参考资料。\n"
@@ -405,9 +399,8 @@ def _compose_creator_workflow_contract() -> str:
         "4. 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 "
         "`references/workflows.md`。\n\n"
         "蓝图确认信号：\n"
-        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-        '{"creator_phase":"phase3_start"}\n'
-        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "Phase 2 输出完整蓝图与确认问题；用户确认后由后端进入 Phase 3。\n"
+        "Phase 1-2 期间禁止输出 phase3_start JSON 标记。\n\n"
         "运行时安全：\n"
         "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
         "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
@@ -480,10 +473,9 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "Phase 1-2 行为约束：\n"
             "1. 只进行需求澄清与蓝图确认，不得输出任何文件写入或命令执行格式。\n"
             "2. 需要更好的问法时，可在资源选择阶段请求加载 `references/interaction-guide.md`。\n\n"
-            "蓝图确认信号：\n"
-            "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-            '{"creator_phase":"phase3_start"}\n'
-            "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+            "蓝图确认规则：\n"
+            "1. Phase 2 的输出必须先展示完整蓝图，再询问用户确认。\n"
+            "2. Phase 2 期间禁止输出 phase3_start JSON 标记；必须等用户在下一轮确认后由后端进入 Phase 3。\n\n"
             "运行时安全：\n"
             "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
             "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
@@ -497,22 +489,25 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "Phase 3+ 执行要求：\n"
             "1. 不要输出自然语言给用户看 - 你的输出是给后端执行引擎解析的\n"
             "2. 只输出执行指令，使用 fenced code blocks 格式\n"
-            "3. 首先输出 phase3_start 标记（在回复的最前面）\n"
+            "3. 不要输出 phase3_start / creator_phase 等阶段启动 JSON；后端已经完成阶段切换\n"
             "4. 严格按照 SKILL.md 中的 3.1.1 动作输出格式\n\n"
             "动作输出格式（必须严格遵守）：\n"
             "- 写入文件：代码块前一行写 `写入文件：<path>` 或 `保存到：<path>`，紧跟一个 code block\n"
             "- 运行命令：代码块前一行写 `执行命令：`，code block 中写完整命令\n"
             "- 路径必须包含完整 Skill 根目录，例如 `skills/<skill-name>/SKILL.md`\n"
             "- 一个 code block 只对应一个文件或一条命令\n\n"
+            "生成的 Skill.md Markdown 运行说明：\n"
+            "- 生成的 SKILL.md 必须保持标准 Markdown，不要加入自定义 Runtime Contract JSON、小型 DSL 或 action 标签。\n"
+            "- 如果 Skill 需要运行 scripts/ 下的脚本，SKILL.md 可用普通 ```bash fenced block 给出命令示例，并说明 assistant 在 Sandbox 当轮回复中按示例替换真实参数后输出。\n"
+            "- 只写 `scripts/foo.py` 行内路径或‘立即调用脚本’不会触发宿主执行；必须用普通 Markdown 说明 block 触发规则。\n"
+            "- SKILL.md 必须要求 assistant 等待宿主 observation 后再生成最终回答，不得假装执行。\n"
+            "- 如果用户要求使用平台内置图像/多模态模型，不要生成外部 API key、关键词数据库或假图片脚本；应说明由宿主配置的模型能力完成相关步骤。模型来源必须区分：文本/翻译/语义改写使用 LLM_BASE_URL + TEXT_MODEL；看图理解/OCR/多模态问答使用 LLM_BASE_URL + VISION_MODEL；生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL（不要用 VISION_MODEL 生成图片）。生成出来的 SKILL.md 不要写中文 topic 翻译细节；图片脚本如必须生成图片，应调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`，由平台静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、b64_json 解析与 OUTPUT_DIR 落盘。确定性脚本必须实现真实算法，禁止固定模板/随机词表/ASCII 图冒充模型生成。\n\n"
             "Phase 3+ 行为约束：\n"
             "- 只有在 Phase 2 完成并获得用户确认后，才能进入 Phase 3\n"
             "- 进入 Phase 3 后，才可以按 SKILL.md 规定输出\"写入文件/执行命令\"的动作格式\n"
             "- 如果需要命名规范或输出格式示例，可在资源选择阶段请求加载 `references/best-practices.md` 与 `references/output-patterns.md`\n"
             "- 如果需要多步骤流程设计参考，可在资源选择阶段请求加载 `references/workflows.md`\n\n"
-            "输出示例（严格按照此格式）：\n"
-            "```\n"
-            '{ "creator_phase":"phase3_start"}\n'
-            "\n"
+            "输出示例（严格按照此格式，不包含任何阶段启动 JSON）：\n"
             "执行命令：\n"
             "```bash\n"
             "python ../kernel/scripts/init_skill.py query-system-time --path .\n"
@@ -625,9 +620,8 @@ def compose_kernel_creator_metadata_prompt(skill: SkillPackage) -> str:
         "- Phase 2：蓝图确认 - 设计并确认 Skill 架构蓝图\n"
         "- Phase 3+：工程化实现 - 执行文件创建和脚本编写\n\n"
         "蓝图确认信号：\n"
-        "当你判断 Phase 2 完成并进入 Phase 3 时，在该条回复的末尾追加一行 JSON 标记：\n"
-        '{"creator_phase":"phase3_start"}\n'
-        "该标记必须单独成行，不要放入代码块或 Markdown。\n\n"
+        "Phase 2 输出完整蓝图与确认问题；用户确认后由后端进入 Phase 3。\n"
+        "Phase 1-2 期间禁止输出 phase3_start JSON 标记。\n\n"
         "请确保：\n"
         "- 严格按 Phase 流程执行\n"
         "- Phase 1-2 只做需求澄清和蓝图确认\n"
@@ -736,6 +730,7 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
 2. **每次只问一个问题**：不要在一次回复中问多个问题
 3. **使用指定的问题模板**：必须使用 SKILL.md 中用 ``` 包裹的问题模板
 4. **不要跳过步骤**：每个步骤都要执行，不要省略
+5. **不要重复开场问题**：如果对话历史中用户已经描述了要创建的 Skill，不要再次询问“你希望 智能助手 帮你做什么事情？”，应继续追问具体需求或生成蓝图。
 
 现在，让我们开始执行 Phase 1 吧！
 
@@ -754,13 +749,21 @@ Phase 2 的任务是：
 2. 使用 AskUserQuestion 询问用户确认蓝图
 
 【关键要求！】
-1. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
+1. **必须先输出完整蓝图正文**，不要只输出确认问题。
+2. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
    - 必须包含 `## 📋 Skill 架构蓝图` 标记
    - 必须明确列出 Skill 名称
    - 必须包含 I/O 契约、目录结构、工作流逻辑
-2. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
-3. **AskUserQuestion 选项中必须包含"对，开始做吧"**
-4. **不要输出 phase3_start 标记**，必须等用户确认后再说
+   - 必须包含“宿主执行方式”，明确哪些任务直接回答，哪些任务需要输出标准 Markdown fenced block
+   - 如果涉及图像/多模态能力，必须明确使用宿主已配置模型，不要虚构 API 密钥、关键词数据库或占位图片脚本
+   - 如果涉及需要模型判断的开放式能力，优先设计为模型直接回答；若必须生成 scripts/，脚本必须区分模型来源：文本/语义使用 LLM_BASE_URL + TEXT_MODEL，看图理解使用 LLM_BASE_URL + VISION_MODEL，生成图片使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL 且优先调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`；确定性脚本必须实现真实算法，不得用固定模板/随机词表/ASCII 图冒充模型能力
+3. 完整蓝图之后，再输出一个 AskUserQuestion 确认问题。
+4. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
+5. **AskUserQuestion 选项必须使用以下三项原文**：
+   - "对，开始做吧"
+   - "大体对，但有些地方要改"
+   - "不对，我重新说一下"
+6. **不要输出 phase3_start 标记**，必须等用户确认后再说
 
 现在，让我们开始执行 Phase 2 吧！
 

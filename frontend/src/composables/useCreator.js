@@ -51,6 +51,7 @@ export async function initSkill(skillName) {
  * Yields:
  *   - string chunks while the model is generating
  *   - { done: true } when generation is complete
+ *   - { validation: object } when backend is repairing generated output
  *   - { error: string } on failure
  *
  * @param {{
@@ -61,7 +62,7 @@ export async function initSkill(skillName) {
  *   conversationHistory: Array,
  *   model?: string|null
  * }} params
- * @yields {string | {done:true} | {error:string}}
+ * @yields {string | {done:true} | {validation:object} | {error:string}}
  */
 export async function* generateFileStream({
   skillName,
@@ -114,6 +115,10 @@ export async function* generateFileStream({
         if (parsed.done) {
           yield { done: true }
           return
+        }
+        if (parsed.validation) {
+          yield { validation: parsed.validation }
+          continue
         }
         if (typeof parsed.content === 'string') {
           yield parsed.content

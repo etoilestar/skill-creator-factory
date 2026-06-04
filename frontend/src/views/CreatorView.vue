@@ -140,6 +140,9 @@ const CONFIRM_KEYWORDS = [
   '开始创建',
   '开始生成',
   '确认，开始',
+  '确认，继续构建',
+  '继续构建',
+  '确认继续',
   '确认开始',
   '可以开始',
   '没问题，开始',
@@ -167,6 +170,7 @@ const ACTION_LABELS = {
   validate: '校验格式',
   package: '打包 Skill',
   run_script: '运行脚本',
+  creator_panel: '文件清单预览',
 }
 
 function actionLabel(action) {
@@ -238,18 +242,31 @@ async function send() {
   input.value = ''
   await scrollBottom()
 
-  // If the user just confirmed the blueprint, trigger blueprint analysis in parallel
-  // with the chat call (pure-rule extraction, no LLM, very fast).
+  // If the user just confirmed the blueprint, switch to the explicit
+  // file-creation panel and do not call /api/chat/creator again.  The chat
+  // endpoint still supports a legacy Phase 3 auto-execution path that validates
+  // artifacts immediately; here the user should stay in control and validation
+  // must wait until they click "开始创建".
   if (isCreationConfirmation(text) && hasBlueprintInHistory()) {
-    analyzeBlueprintPlan(chatHistory.value)
-      .then(plan => {
-        creationPlan.value = plan
-        showCreationPanel.value = true
-        nextTick(scrollBottom)
+    streaming.value = true
+    try {
+      const plan = await analyzeBlueprintPlan(chatHistory.value)
+      creationPlan.value = plan
+      showCreationPanel.value = true
+      messages.value.push({
+        role: 'system',
+        action: 'creator_panel',
+        name: plan.skill_name,
+        success: true,
+        message: '已整理文件清单，准备生成脚本',
       })
-      .catch(err => {
-        error.value = `蓝图解析失败：${err.message}，请重试`
-      })
+      await scrollBottom()
+    } catch (err) {
+      error.value = `蓝图解析失败：${err.message}，请重试`
+    } finally {
+      streaming.value = false
+    }
+    return
   }
 
   streaming.value = true

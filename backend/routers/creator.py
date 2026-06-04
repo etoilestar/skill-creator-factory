@@ -1499,6 +1499,22 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
+    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    results.append(
+        ContractCheckResult(
+            id="script.required_capabilities.called",
+            passed=not missing_capabilities,
+            target=file_path,
+            message=(
+                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                if not missing_capabilities
+                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+            ),
+            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
+            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+        )
+    )
+
     has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
     results.append(
         ContractCheckResult(

@@ -847,7 +847,7 @@ def test_runtime_planner_prompt_requires_fenced_block_trigger():
     assert "显式可执行 fenced code block 触发" in prompt
     assert "不要因为磁盘上存在脚本就直接规划 run_command" in prompt
     assert "禁止的 action：run_command、write_file、create_directory" in prompt
-
+    assert "Creator" not in prompt
 
 
 def test_normalize_plan_rejects_direct_run_command_trigger():
@@ -2590,3 +2590,118 @@ def test_normalize_runtime_plan_marks_stale_resource_handle_missing(tmp_path):
     assert result["tasks"] == []
     assert result["missing"]
     assert result["missing"][0]["path"] == "references/missing.md"
+
+
+def test_compose_loaded_resources_returns_loaded_and_failed_paths(tmp_path):
+    from backend.routers.sandbox_chat import _compose_loaded_resources_prompt
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "references" / "best-practices.md").write_text("real guidance", encoding="utf-8")
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/best-practices.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+        {
+            "resource_handle": "resource:1",
+            "path": "references/missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+    ]
+
+    result = _compose_loaded_resources_prompt(
+        skill_name="",
+        resource_catalog=catalog,
+        selected_handles=["resource:0", "resource:1"],
+        execution_root=skill_root,
+    )
+
+    assert result["loaded_paths"] == ["references/best-practices.md"]
+    assert result["failed_paths"][0]["path"] == "references/missing.md"
+    assert result["failed_paths"][0]["missing_type"] == "file_missing"
+    assert "real guidance" in result["prompt"]
+
+
+def test_normalize_runtime_plan_removes_loaded_resource_false_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "references" / "best-practices.md").write_text("exists", encoding="utf-8")
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/best-practices.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        }
+    ]
+    plan = {
+        "mode": "ask_user",
+        "actions": [],
+        "missing": [{"resource_handle": "resource:0", "path": "references/best-practices.md"}],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        resource_catalog=catalog,
+        execution_root=skill_root,
+        loaded_paths=["references/best-practices.md"],
+    )
+
+    assert result["missing"] == []
+    assert result["planner_inconsistent"][0]["path"] == "references/best-practices.md"
+    assert result["planner_inconsistent"][0]["missing_type"] == "planner_inconsistent"
+
+
+def test_normalize_runtime_plan_distinguishes_load_failed_from_file_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    skill_root.mkdir()
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/load-failed.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+        {
+            "resource_handle": "resource:1",
+            "path": "references/file-missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+    ]
+    plan = {
+        "mode": "execute",
+        "actions": [
+            {"action": "read_resource", "resource_handle": "resource:0"},
+            {"action": "read_resource", "resource_handle": "resource:1"},
+        ],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        resource_catalog=catalog,
+        execution_root=skill_root,
+        failed_paths=[
+            {
+                "resource_handle": "resource:0",
+                "path": "references/load-failed.md",
+                "missing_type": "load_failed",
+                "reason": "decode failed",
+            }
+        ],
+    )
+
+    missing_by_path = {item["path"]: item for item in result["missing"]}
+    assert missing_by_path["references/load-failed.md"]["missing_type"] == "load_failed"
+    assert missing_by_path["references/file-missing.md"]["missing_type"] == "file_missing"

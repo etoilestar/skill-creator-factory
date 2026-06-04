@@ -112,6 +112,45 @@ def _normalize_role(value: str) -> FileRole | None:
     return lowered if lowered in SCRIPT_ROLES or lowered in RESOURCE_ROLES else None  # type: ignore[return-value]
 
 
+
+
+def _segment_for_file(file_path: str, *texts: str) -> str:
+    """Return nearby plan text for a file path, stopping before the next file block."""
+    next_path_re = r"(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md"
+    best = ""
+    for text in texts:
+        text = text or ""
+        for occurrence in re.finditer(re.escape(file_path), text):
+            after = text[occurrence.end():]
+            next_match = re.search(next_path_re, after)
+            segment = after[: next_match.start()] if next_match else after
+            # Prefer block-style segments that actually contain contract fields;
+            # inline path mentions in section summaries often have no local data.
+            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
+                return segment
+            if len(segment) > len(best):
+                best = segment
+    return best or "\n".join(texts)
+
+
+def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
+    """Extract SkillPlan list fields such as inputs/outputs/dependencies.
+
+    Accepted syntaxes include `inputs: topic, prompt`, `inputs=[topic,prompt]`,
+    and Chinese full-width separators.  The extraction is deliberately local to
+    the file's plan segment so domain prose elsewhere cannot enable contracts.
+    """
+    segment = _segment_for_file(file_path, purpose, blueprint_summary)
+    pattern = re.compile(rf"(?:{re.escape(field_name)}|{re.escape(field_name.replace('_', ' '))})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
+    match = pattern.search(segment)
+    if not match:
+        return None
+    raw = match.group(1)
+    values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
+    cleaned = [re.sub(r"[^A-Za-z0-9_./-]", "", item) for item in values]
+    return [item for item in cleaned if item]
+
+
 def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> FileRole | None:
     """Extract an explicit role declared by the plan/model, not by domain keywords.
 
@@ -247,8 +286,13 @@ def build_skill_plan_entry(
         purpose=purpose,
         blueprint_summary=blueprint_summary,
     )
-    inputs, outputs = default_io_for_role(classification.role)
-    required_capabilities, forbidden_capabilities = capabilities_for_role(classification.role)
+    default_inputs, default_outputs = default_io_for_role(classification.role)
+    inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_inputs
+    outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_outputs
+    dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or list(reference_files or [])
+    default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(classification.role)
+    required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_required_capabilities
+    forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
     return SkillPlanEntry(
         path=file_path,
         file_type=file_type_for_path(file_path),
@@ -256,7 +300,7 @@ def build_skill_plan_entry(
         purpose=purpose,
         inputs=inputs,
         outputs=outputs,
-        dependencies=list(reference_files or []),
+        dependencies=dependencies,
         required_capabilities=required_capabilities,
         forbidden_capabilities=forbidden_capabilities,
         reference_files=list(reference_files or []),

@@ -125,3 +125,51 @@ def test_reference_contract_requires_subtask_contract_sections():
     failed_ids = {result.id for result in results if not result.passed}
 
     assert "reference.subtask_contract_sections" in failed_ids
+
+
+def test_skill_plan_runtime_defaults_python_and_supports_node_bash():
+    from backend.services.skill_plan import build_skill_plan_entry
+    from backend.routers.creator import _script_command_template, _script_generation_skeleton
+
+    py_entry = build_skill_plan_entry(file_path="scripts/main.py", purpose="inputs: topic")
+    js_entry = build_skill_plan_entry(file_path="scripts/main.js", purpose="inputs: topic")
+    sh_entry = build_skill_plan_entry(file_path="scripts/main.sh", purpose="inputs: topic")
+    explicit_node_entry = build_skill_plan_entry(file_path="scripts/runner.txt", purpose="language: javascript runtime: node inputs: topic")
+
+    assert py_entry.language == "python"
+    assert py_entry.runtime == "python"
+    assert _script_command_template("scripts/main.py", "", py_entry).startswith("python scripts/main.py")
+    assert js_entry.language == "javascript"
+    assert js_entry.runtime == "node"
+    assert _script_command_template("scripts/main.js", "", js_entry).startswith("node scripts/main.js")
+    assert "process.argv[2]" in _script_generation_skeleton("scripts/main.js", "", "", skill_plan_entry=js_entry.__dict__)
+    assert explicit_node_entry.language == "javascript"
+    assert explicit_node_entry.runtime == "node"
+    assert explicit_node_entry.command_template.startswith("node scripts/runner.txt")
+    assert sh_entry.language == "bash"
+    assert sh_entry.runtime == "bash"
+    assert _script_command_template("scripts/main.sh", "", sh_entry).startswith("bash scripts/main.sh")
+    assert "$1" in _script_generation_skeleton("scripts/main.sh", "", "", skill_plan_entry=sh_entry.__dict__)
+
+
+def test_strict_script_contract_validates_runtime_json_argv_and_inputs():
+    from backend.routers.creator import _check_script_file_contract
+
+    entry = {
+        "path": "scripts/main.js",
+        "role": "generic_script",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "language": "javascript",
+        "runtime": "node",
+    }
+    bad = "console.log(JSON.stringify({text: 'fixed'}));"
+    good = "const payload = JSON.parse(process.argv[2]);\nconsole.log(JSON.stringify({text: payload.topic}));"
+
+    bad_failed = {result.id for result in _check_script_file_contract("scripts/main.js", bad, skill_plan_entry=entry) if not result.passed}
+    good_failed = {result.id for result in _check_script_file_contract("scripts/main.js", good, skill_plan_entry=entry) if not result.passed}
+
+    assert "script.json_argv.runtime" in bad_failed
+    assert "script.skillplan_inputs.used" in bad_failed
+    assert "script.json_argv.runtime" not in good_failed
+    assert "script.skillplan_inputs.used" not in good_failed

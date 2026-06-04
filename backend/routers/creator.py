@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, default_io_for_role, file_role_classifier, file_type_for_path
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -163,6 +163,10 @@ class FileSpecOut(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)
     reference_files: list[str] = Field(default_factory=list)
+    language: str = "text"
+    runtime: str = "none"
+    entrypoint: str = ""
+    command_template: str = ""
     references: list[str] = Field(default_factory=list)
     low_confidence: bool = False
     confidence: float = 0.0
@@ -326,9 +330,12 @@ def _skill_plan_entry_for_file(
             forbidden_capabilities = list(
                 skill_plan_entry.get("forbidden_capabilities") or capabilities_for_role(explicit_role)[1]
             )
+            file_type = file_type_for_path(file_path)
+            language = str(skill_plan_entry.get("language") or language_for_path(file_path))
+            runtime = str(skill_plan_entry.get("runtime") or runtime_for_language(language, file_type))
             return SkillPlanEntry(
                 path=file_path,
-                file_type=file_type_for_path(file_path),
+                file_type=file_type,
                 role=explicit_role,  # type: ignore[arg-type]
                 purpose=str(skill_plan_entry.get("purpose") or purpose),
                 inputs=inputs,
@@ -337,6 +344,10 @@ def _skill_plan_entry_for_file(
                 required_capabilities=required_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=list(skill_plan_entry.get("reference_files") or []),
+                language=language,  # type: ignore[arg-type]
+                runtime=runtime,  # type: ignore[arg-type]
+                entrypoint=str(skill_plan_entry.get("entrypoint") or (file_path if file_type == "script" else "")),
+                command_template=str(skill_plan_entry.get("command_template") or (command_template_for_entry(file_path, runtime, inputs) if file_type == "script" else "")),
                 required=bool(skill_plan_entry.get("required", True)),
                 can_skip=bool(skill_plan_entry.get("can_skip", False)),
                 confidence=float(skill_plan_entry.get("confidence") or 1.0),
@@ -369,6 +380,10 @@ def _skill_plan_entry_for_file(
                 required_capabilities=required_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=entry.reference_files,
+                language=entry.language,
+                runtime=entry.runtime,
+                entrypoint=entry.entrypoint,
+                command_template=command_template_for_entry(entry.path, entry.runtime, inputs) if entry.file_type == "script" else "",
                 required=entry.required,
                 can_skip=entry.can_skip,
                 confidence=classification.confidence,
@@ -543,7 +558,14 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
     if not keys:
         keys = ["payload"]
     payload = json.dumps({key: f"{{{{{key}}}}}" for key in keys}, ensure_ascii=False)
-    return f"python {script_path} '{payload}'"
+    runtime = entry.runtime if entry is not None else runtime_for_language(language_for_path(script_path), file_type_for_path(script_path))
+    if runtime == "node":
+        return f"node {script_path} '{payload}'"
+    if runtime == "bash":
+        return f"bash {script_path} '{payload}'"
+    if runtime == "python":
+        return f"python {script_path} '{payload}'"
+    return f"{script_path} '{payload}'"
 
 
 def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
@@ -790,6 +812,11 @@ def _build_script_file_contract_text(
     lines = [
         f"必须满足以下脚本文件合同：{file_path}",
         f"SkillPlan role: {entry.role}",
+        f"file_type: {entry.file_type}",
+        f"language: {entry.language}",
+        f"runtime: {entry.runtime}",
+        f"entrypoint: {entry.entrypoint or file_path}",
+        f"command_template: {_script_command_template(file_path, blueprint_text, entry)}",
         f"inputs: {', '.join(entry.inputs) or 'payload'}",
         f"outputs: {', '.join(entry.outputs)}",
         f"required_capabilities: {', '.join(entry.required_capabilities) or 'none'}",
@@ -798,7 +825,7 @@ def _build_script_file_contract_text(
         "- 只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
         "- Python 脚本必须能通过 ast.parse 语法检查。",
         "B. 参数接口:",
-        "- 默认使用 JSON argv 接口：读取 sys.argv[1] 并 json.loads 解析。",
+        "- 默认使用 JSON argv 接口：按脚本 runtime 读取 JSON argv 并解析。",
         f"- 必须实际使用用户输入 keys：{keys}。",
         f"- 与 SKILL.md/reference 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text, entry)}",
         "C. 角色输出合同:",
@@ -1162,8 +1189,9 @@ def _validate_asset_file_contract(file_path: str, content: str) -> None:
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
 
-def _check_script_file_contract(file_path: str, content: str, role: str | None = None) -> list[ContractCheckResult]:
-    plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role)
+def _check_script_file_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> list[ContractCheckResult]:
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role, skill_plan_entry=skill_plan_entry)
+    strict_interface = skill_plan_entry is not None
     stripped = content.strip()
     has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
     raw_ok = bool(stripped) and not has_markdown_or_bundle
@@ -1185,23 +1213,76 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         return results
 
     syntax_ok = True
-    syntax_message = "Python 语法合法。"
-    if Path(file_path).suffix.lower() == ".py":
+    syntax_message = f"{plan_entry.language} 源码基础校验通过。"
+    syntax_expected = "脚本源码必须符合 language/runtime 的基础语法与入口约定。"
+    if plan_entry.language == "python":
         try:
             ast.parse(stripped)
         except SyntaxError as exc:
             syntax_ok = False
             syntax_message = f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+        syntax_expected = "Python 脚本必须能通过 ast.parse 语法检查。"
+    elif plan_entry.runtime == "node":
+        syntax_ok = "process.argv" in stripped and "console.log" in stripped
+        syntax_message = "Node/JS 脚本包含 process.argv 和 stdout JSON 输出。" if syntax_ok else f"{file_path} Node/JS 脚本必须使用 process.argv 读取 JSON argv 并 console.log 输出 JSON。"
+        syntax_expected = "Node/JS 脚本必须使用 process.argv[2] + JSON.parse，并通过 console.log(JSON.stringify(...)) 输出 JSON。"
+    elif plan_entry.runtime == "bash":
+        syntax_ok = "$1" in stripped or "${1" in stripped
+        syntax_message = "Bash 脚本读取 $1 JSON argv。" if syntax_ok else f"{file_path} Bash 脚本必须读取 $1 JSON argv。"
+        syntax_expected = "Bash 脚本必须读取 $1 JSON argv，并向 stdout 输出 JSON 或写入声明的文件产物。"
     results.append(
         ContractCheckResult(
             id="script.source.syntax",
             passed=syntax_ok,
             target=file_path,
             message=syntax_message,
-            expected="Python 脚本必须能通过 ast.parse 语法检查。",
-            minimal_edit="修正 Python 语法错误，同时保持 stdout JSON 和参数接口不变。",
+            expected=syntax_expected,
+            minimal_edit="修正源码语法/入口错误，同时保持 stdout JSON 和参数接口不变。",
         )
     )
+
+    if strict_interface:
+        reads_json = _script_reads_json_argv(stripped, plan_entry.runtime)
+        results.append(
+            ContractCheckResult(
+                id="script.json_argv.runtime",
+                passed=reads_json,
+                target=file_path,
+                message=(
+                    f"脚本按 {plan_entry.runtime} runtime 读取 JSON argv。"
+                    if reads_json
+                    else f"{file_path} 必须按 {plan_entry.runtime} runtime 读取 JSON argv。"
+                ),
+                expected="Python: sys.argv[1]+json.loads；Node: process.argv[2]+JSON.parse；Bash: $1 JSON。",
+                minimal_edit="补充 runtime 对应 JSON argv 解析入口。",
+            )
+        )
+        uses_keys, missing_keys = _script_uses_input_keys(stripped, list(plan_entry.inputs or ["payload"]))
+        results.append(
+            ContractCheckResult(
+                id="script.skillplan_inputs.used",
+                passed=uses_keys,
+                target=file_path,
+                message=(
+                    "脚本源码使用了所有 SkillPlan inputs。"
+                    if uses_keys
+                    else f"脚本源码未使用这些 SkillPlan inputs：{', '.join(missing_keys)}。"
+                ),
+                expected=f"源码必须实际读取/使用 inputs：{', '.join(plan_entry.inputs or ['payload'])}。",
+                minimal_edit="在参数解析或业务逻辑中读取并使用缺失的 payload key。",
+            )
+        )
+        has_entry = _script_has_main_entry(stripped, plan_entry.runtime)
+        results.append(
+            ContractCheckResult(
+                id="script.runtime.entrypoint",
+                passed=has_entry,
+                target=file_path,
+                message=("脚本包含 runtime 入口与 stdout 输出。" if has_entry else f"{file_path} 缺少 {plan_entry.runtime} 入口或 stdout 输出。"),
+                expected="脚本包含对应 runtime 的入口函数/语句，并向 stdout 输出 JSON。",
+                minimal_edit="补齐 main/入口调用和 JSON stdout 输出。",
+            )
+        )
 
     has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
     results.append(
@@ -1272,8 +1353,8 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
     return results
 
 
-def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None) -> None:
-    results = _check_script_file_contract(file_path, content, role=role)
+def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+    results = _check_script_file_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
     if any(not result.passed for result in results):
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
@@ -1390,14 +1471,14 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
         "或者把该 Skill 设计为无需 scripts/ 的模型直接回答。"
     )
 
-def _validate_generated_file_content(file_path: str, content: str, role: str | None = None) -> None:
+def _validate_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
     """Reject content that is clearly not the requested single file."""
     if file_path == "SKILL.md":
         _reject_custom_skill_md_protocol(content)
         return
 
     if file_path.startswith("scripts/"):
-        _validate_script_file_source_contract(file_path, content, role=role)
+        _validate_script_file_source_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
         return
 
     if file_path.startswith("references/"):
@@ -1423,8 +1504,27 @@ def _command_uses_json_argv(command: str) -> bool:
     return "{" in command and "}" in command
 
 
-def _script_reads_json_argv(content: str) -> bool:
+def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
+    if runtime == "node":
+        return "JSON.parse" in content and "process.argv" in content
+    if runtime == "bash":
+        return "$1" in content or "${1" in content or "jq" in content
     return "json.loads" in content and "sys.argv" in content
+
+
+def _script_uses_input_keys(content: str, keys: list[str]) -> tuple[bool, list[str]]:
+    missing = [key for key in keys if key not in content]
+    return not missing, missing
+
+
+def _script_has_main_entry(content: str, runtime: str) -> bool:
+    if runtime == "python":
+        return "def main" in content and "__main__" in content
+    if runtime == "node":
+        return "process.argv" in content and "console.log" in content
+    if runtime == "bash":
+        return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content)
+    return True
 
 
 def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
@@ -1456,9 +1556,9 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
         raise ValueError(_format_contract_checks(failed_command_results, passed=False))
 
     json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
-    if json_argv_commands and not _script_reads_json_argv(content):
+    if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
         raise ValueError(
-            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有读取 sys.argv[1] 并 json.loads 解析；"
+            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有按脚本 runtime 读取 JSON argv 并解析（Python 应读取 sys.argv[1] 并 json.loads）；"
             "禁止保存与命令示例不一致的脚本。"
         )
 
@@ -1550,7 +1650,7 @@ def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
 def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
     commands = _extract_script_command_templates(skill_md, file_path)
     arg_sets = [args for cmd in commands if (args := _render_trial_command_args(cmd, file_path)) is not None]
-    if not arg_sets and _script_reads_json_argv(content):
+    if not arg_sets and _script_reads_json_argv(content, runtime_for_language(language_for_path(file_path), file_type_for_path(file_path))):
         arg_sets = [[json.dumps({
             "prompt": _sample_value_for_placeholder("prompt"),
             "text": _sample_value_for_placeholder("text"),
@@ -1753,8 +1853,15 @@ async def _repair_generated_file_with_feedback(
     so Markdown-wrapped failures are not reinforced as the desired answer shape.
     """
     is_script = file_path.startswith("scripts/")
+    repair_language = language_for_path(file_path)
+    repair_runtime = runtime_for_language(repair_language, file_type_for_path(file_path))
+    runtime_rule = {
+        "python": "Python: parse sys.argv[1] as JSON，保留 main() 入口并 print JSON。",
+        "node": "Node: parse process.argv[2] as JSON，并 console.log(JSON.stringify(...))。",
+        "bash": "Bash: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
+    }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
-        "最终只返回完整脚本源码；不要解释，不要 Markdown 代码块，不要多文件包，不要写 `写入文件：...`。"
+        f"Only output raw {repair_language} source. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Follow SkillPlanEntry inputs/outputs strictly. {runtime_rule}"
         if is_script
         else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
     )
@@ -1779,7 +1886,7 @@ async def _repair_generated_file_with_feedback(
     previous_for_prompt = previous_content[-16000:]
     previous_label = "待编辑草稿"
     if is_script and repair_mode == "strict_contract_rewrite":
-        previous_for_prompt = _extract_probable_python_source(previous_content) or ""
+        previous_for_prompt = (_extract_probable_python_source(previous_content) if repair_language == "python" else _drop_common_non_code_lines(_extract_single_wrapping_fence(previous_content) or previous_content)) or ""
         previous_label = "可参考的源码候选（已移除 Markdown 外壳；若为空，请根据原始任务重新生成）"
     repair_messages.append({
         "role": "user",
@@ -2258,10 +2365,10 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     return _strip_code_fence(extracted if extracted is not None else content)
 
 
-def _sanitize_generated_file_content(file_path: str, content: str, role: str | None = None) -> str:
+def _sanitize_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> str:
     """Normalize model output into exactly the requested file content."""
     sanitized = _normalize_generated_file_content(file_path, content)
-    _validate_generated_file_content(file_path, sanitized, role=role)
+    _validate_generated_file_content(file_path, sanitized, role=role, skill_plan_entry=skill_plan_entry)
     return sanitized
 
 
@@ -2297,10 +2404,7 @@ def _script_generation_skeleton(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Return a fixed Python script scaffold selected by SkillPlan role."""
-    if Path(file_path).suffix.lower() != ".py":
-        return ""
-
+    """Return a fixed script scaffold selected by SkillPlan role and runtime."""
     plan_entry = _skill_plan_entry_for_file(
         file_path=file_path,
         purpose=purpose,
@@ -2308,6 +2412,27 @@ def _script_generation_skeleton(
         role=role,
         skill_plan_entry=skill_plan_entry,
     )
+
+    if plan_entry.runtime == "node":
+        return (
+            "必须使用下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
+            "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+            "function run(payload) {\n"
+            "  const text = String(payload.topic || payload.prompt || payload.text || payload.payload || '').trim();\n"
+            "  return { text, file_paths: [] };\n"
+            "}\n"
+            "console.log(JSON.stringify(run(payload)));"
+        )
+
+    if plan_entry.runtime == "bash":
+        return (
+            '必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON：\n'
+            '#!/usr/bin/env bash\n'
+            'set -euo pipefail\n'
+            "payload_json=${1:-'{}'}\n"
+            'text=$(python -c \'import json,sys; p=json.loads(sys.argv[1]); print(p.get("topic") or p.get("prompt") or p.get("text") or p.get("payload") or "")\' "$payload_json")\n'
+            'python -c \'import json,sys; print(json.dumps({"text": sys.argv[1], "file_paths": []}, ensure_ascii=False))\' "$text"'
+        )
 
     if plan_entry.role == "image_generator":
         return (
@@ -2449,6 +2574,9 @@ def _build_generate_file_prompt(
         f"SkillPlan role：{plan_entry.role}；"
         f"inputs：{', '.join(plan_entry.inputs)}；"
         f"outputs：{', '.join(plan_entry.outputs)}；"
+        f"language：{plan_entry.language}；"
+        f"runtime：{plan_entry.runtime}；"
+        f"command_template：{_script_command_template(file_path, blueprint_text, plan_entry)}；"
         f"forbidden_capabilities：{', '.join(plan_entry.forbidden_capabilities)}"
     )
 
@@ -2487,7 +2615,7 @@ def _build_generate_file_prompt(
             f"1. 只输出完整可运行的 {lang} 文件字节内容本身，不要任何说明文字。\n"
             "2. 禁止 Markdown，禁止 ```，禁止‘下面是代码’，禁止文件名标题，禁止多文件输出；如果输出包含 ```，系统会判定失败。\n"
             "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
-            "4. 如果命令示例传入 JSON 字符串参数，脚本必须读取 sys.argv[1] 并使用 json.loads 解析。\n"
+            "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：文本语义能力使用 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；只有 image_generator role 才使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
             "7. 只有 SkillPlan role == image_generator 时才生成图片；否则即使蓝图其它位置提到图片，也不得调用图片生成 helper。image_generator 不要在脚本里写中文 prompt 翻译逻辑，也不要直接调用 /v1/images/generations；必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`，把用户 topic 原文传入该 helper。平台会静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、IMAGE_MODEL 选择、b64_json 解析和 OUTPUT_DIR 图片落盘。\n"
@@ -2495,8 +2623,8 @@ def _build_generate_file_prompt(
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 输出结构化 JSON，字段必须根据 SkillPlan role contract 输出：text_generator 返回 text；image_generator 返回 image_paths/images；pdf_builder 返回 pdf_path/file_paths；generic_script 返回与职责匹配的 text/file_paths 等明确字段；不要混入调试说明。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
-            "12. 必须基于下方固定骨架生成：保留骨架的入口、参数解析和 JSON stdout，只把业务函数补全为真实逻辑；不要自由改成 UI 文案、壳代码或多 helper 协议。\n"
-            "13. 最终响应必须是单个 Python 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
+            "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
+            f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
@@ -2592,6 +2720,10 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required_capabilities=entries_by_path[f.path].required_capabilities if f.path in entries_by_path else [],
                 forbidden_capabilities=entries_by_path[f.path].forbidden_capabilities if f.path in entries_by_path else [],
                 reference_files=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
+                language=entries_by_path[f.path].language if f.path in entries_by_path else "text",
+                runtime=entries_by_path[f.path].runtime if f.path in entries_by_path else "none",
+                entrypoint=entries_by_path[f.path].entrypoint if f.path in entries_by_path else "",
+                command_template=entries_by_path[f.path].command_template if f.path in entries_by_path else "",
                 references=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
                 low_confidence=(entries_by_path[f.path].confidence < 0.7) if f.path in entries_by_path else False,
                 confidence=entries_by_path[f.path].confidence if f.path in entries_by_path else 0.0,
@@ -2705,7 +2837,7 @@ async def generate_file(request: GenerateFileRequest):
                 )
                 for attempt in range(_MAX_FILE_REPAIR_ATTEMPTS + 1):
                     try:
-                        content = _sanitize_generated_file_content(request.file_path, content, role=request.role)
+                        content = _sanitize_generated_file_content(request.file_path, content, role=request.role, skill_plan_entry=request.skill_plan_entry)
                         if request.file_path == "SKILL.md":
                             _validate_skill_md_contract(content, request.blueprint_text)
                         elif request.file_path.startswith("references/"):
@@ -2795,7 +2927,7 @@ async def generate_file(request: GenerateFileRequest):
                             repair_mode=repair_mode,
                         )
             else:
-                content = _sanitize_generated_file_content(request.file_path, raw_content, role=request.role)
+                content = _sanitize_generated_file_content(request.file_path, raw_content, role=request.role, skill_plan_entry=request.skill_plan_entry)
 
             yield _sse({"content": content})
             yield _sse({"done": True})
@@ -2830,7 +2962,7 @@ async def write_file(request: WriteFileRequest):
     skill_name = _validate_skill_name(request.skill_name)
 
     try:
-        content = _sanitize_generated_file_content(request.file_path, request.content, role=request.role)
+        content = _sanitize_generated_file_content(request.file_path, request.content, role=request.role, skill_plan_entry=request.skill_plan_entry)
         if request.file_path == "SKILL.md":
             _validate_skill_md_against_existing_files(skill_name, content)
         _validate_script_against_existing_skill_contract(skill_name, request.file_path, content)

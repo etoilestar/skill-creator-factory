@@ -22,6 +22,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import yaml
 from pathlib import Path
 from typing import Any, Optional
 
@@ -589,6 +590,25 @@ def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
     return None
 
 
+
+def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            runner = parts[idx - 1] if idx > 0 else ""
+            if entry.runtime == "python":
+                return Path(runner).name.startswith("python")
+            if entry.runtime == "node":
+                return Path(runner).name == "node"
+            if entry.runtime == "bash":
+                return Path(runner).name in {"bash", "sh"}
+            return True
+    return False
+
 def _check_command_block_contract(script_path: str, commands: list[str], entry: SkillPlanEntry) -> list[ContractCheckResult]:
     """Validate Markdown command examples against the SkillPlan input contract."""
     required = set(entry.inputs or ["payload"])
@@ -596,6 +616,18 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
     for idx, command in enumerate(commands, start=1):
         keys = _command_payload_keys(command, script_path)
         target = f"{script_path}#command-{idx}"
+        runtime_matches = _command_runtime_matches(command, script_path, entry)
+        results.append(ContractCheckResult(
+            id="command_block.runtime.matches_skillplan",
+            passed=runtime_matches,
+            target=target,
+            message=(
+                "命令块 runner 与 SkillPlan runtime 一致。" if runtime_matches
+                else f"命令块必须按 SkillPlan.runtime={entry.runtime} 调用 {script_path}。"
+            ),
+            expected=f"按 runtime 调用：{_script_command_template(script_path, '', entry)}",
+            minimal_edit=f"将命令改为：{_script_command_template(script_path, '', entry)}",
+        ))
         results.append(ContractCheckResult(
             id="command_block.json_argv.parseable",
             passed=keys is not None,
@@ -791,6 +823,27 @@ def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
         raise ContractValidationError(_format_contract_failures(results), results)
 
 
+
+
+
+def _strip_orphan_trailing_fence(content: str) -> str:
+    """Remove isolated Markdown fence markers at file boundaries.
+
+    This is intentionally narrower than generic fence stripping: it deletes only
+    standalone trailing ```/~~~ lines left by model output, plus an optional
+    standalone opening fence when no matching closing fence remains.
+    """
+    lines = content.strip().splitlines()
+    changed = False
+    while lines and re.fullmatch(r"\s*(`{3,}|~{3,})\s*", lines[-1]):
+        lines.pop()
+        changed = True
+    if lines and re.fullmatch(r"\s*(`{3,}|~{3,})[A-Za-z0-9_-]*\s*", lines[0]):
+        body = "\n".join(lines[1:])
+        if "```" not in body and "~~~" not in body:
+            lines = lines[1:]
+            changed = True
+    return ("\n".join(lines).strip() if changed else content.strip())
 
 
 def _build_script_file_contract_text(
@@ -1016,6 +1069,12 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         expected="执行型 reference 包含 inputs/outputs、执行步骤或命令模板、角色能力/禁止能力边界；非执行型 reference 可只保留规则/示例/约束。",
         minimal_edit="增加 ## Inputs / Outputs、## 执行步骤、## 角色与能力边界 等章节。",
     ))
+
+    reference_commands = _reference_script_commands(stripped)
+    for script_path, command in reference_commands:
+        entry = _skill_plan_entry_for_file(file_path=script_path, purpose=purpose, blueprint_text=f"{purpose}\n{content}")
+        results.extend(_check_command_block_contract(script_path, [command], entry))
+
     has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
     results.append(ContractCheckResult(
         id="reference.no_placeholder_phrases",
@@ -1031,6 +1090,15 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
     ))
     return results
 
+
+
+def _reference_script_commands(content: str) -> list[tuple[str, str]]:
+    commands: list[tuple[str, str]] = []
+    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", content, flags=re.IGNORECASE):
+        command = match.group(1).strip()
+        for script_match in re.finditer(r"scripts/[A-Za-z0-9_./-]+", command):
+            commands.append((script_match.group(0), command))
+    return commands
 
 def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
     results = _check_reference_file_contract(file_path, content, purpose)
@@ -1049,6 +1117,12 @@ def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, st
         except json.JSONDecodeError as exc:
             return False, f"{file_path} 不是合法 JSON: {exc.msg}", "JSON asset 必须可被 json.loads 解析。"
         return True, "JSON asset 可解析。", "JSON asset 必须可被 json.loads 解析。"
+    if ext in {".yaml", ".yml"}:
+        try:
+            yaml.safe_load(stripped)
+        except yaml.YAMLError as exc:
+            return False, f"{file_path} 不是合法 YAML: {exc}", "YAML asset 必须可被 yaml.safe_load 解析。"
+        return True, "YAML asset 可解析。", "YAML asset 必须可被 yaml.safe_load 解析。"
     if ext == ".csv":
         rows = list(csv.reader(io.StringIO(stripped)))
         header = rows[0] if rows else []
@@ -1166,7 +1240,7 @@ def _check_asset_file_contract(file_path: str, content: str) -> list[ContractChe
             target=file_path,
             message=parse_message,
             expected=parse_expected,
-            minimal_edit="按文件扩展名修正格式：JSON/CSV/image/PDF/Markdown 文本必须可解析且非空。",
+            minimal_edit="按文件扩展名修正格式：JSON/YAML/CSV/image/PDF/Markdown 文本必须可解析且非空。",
         ),
         ContractCheckResult(
             id="asset.no_runtime_capability",
@@ -1193,7 +1267,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
     plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role, skill_plan_entry=skill_plan_entry)
     strict_interface = skill_plan_entry is not None
     stripped = content.strip()
-    has_markdown_or_bundle = "```" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+    has_markdown_or_bundle = "```" in stripped or "~~~" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
     raw_ok = bool(stripped) and not has_markdown_or_bundle
     results = [
         ContractCheckResult(
@@ -1354,7 +1428,11 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
 
 
 def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
-    results = _check_script_file_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
+    # Accept otherwise-valid raw source with a dangling orphan fence marker at
+    # the boundary.  Full fenced/bundled responses are still rejected by the
+    # lower-level checker unless the sanitize path extracted a single code block.
+    candidate = _strip_orphan_trailing_fence(content)
+    results = _check_script_file_contract(file_path, candidate, role=role, skill_plan_entry=skill_plan_entry)
     if any(not result.passed for result in results):
         raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
 
@@ -1523,7 +1601,7 @@ def _script_has_main_entry(content: str, runtime: str) -> bool:
     if runtime == "node":
         return "process.argv" in content and "console.log" in content
     if runtime == "bash":
-        return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content)
+        return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content or "print(json.dumps" in content)
     return True
 
 
@@ -1861,7 +1939,7 @@ async def _repair_generated_file_with_feedback(
         "bash": "Bash: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
-        f"Only output raw {repair_language} source. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Follow SkillPlanEntry inputs/outputs strictly. {runtime_rule}"
+        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys exactly with SkillPlan inputs. {runtime_rule}"
         if is_script
         else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
     )
@@ -1872,6 +1950,8 @@ async def _repair_generated_file_with_feedback(
     )
     if is_script:
         extra_rules = (
+            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys = SkillPlan inputs；"
+            "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
             "如果错误涉及图片生成：必须调用 `backend.services.skill_runtime.generate_stable_diffusion_image`；"
             "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
         )
@@ -1921,7 +2001,8 @@ async def _repair_generated_file_with_feedback(
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
             + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
-            + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是 Python 源码字符，全文不得出现 ```。" if is_script and repair_mode == "strict_contract_rewrite" else "")
+            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, align JSON argv keys with SkillPlan inputs." if is_script else "")
+            + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是当前 runtime 的源码字符，全文不得出现 ``` 或 ~~~。" if is_script and repair_mode == "strict_contract_rewrite" else "")
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
     })
@@ -2167,7 +2248,7 @@ def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     still happen in the normal validation pipeline.
     """
     stripped = content.strip()
-    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+    if not stripped or "```" in stripped or "~~~" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
         return False
 
     if Path(file_path).suffix.lower() == ".py":
@@ -2290,7 +2371,7 @@ def _drop_common_non_code_lines(text: str) -> str:
 def _looks_like_python_source(text: str) -> bool:
     """Return True for probable Python source without requiring valid syntax yet."""
     stripped = text.strip()
-    if not stripped or "```" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
+    if not stripped or "```" in stripped or "~~~" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
         return False
     return bool(re.search(
         r"(?m)^\s*(?:import\s+|from\s+|def\s+|class\s+|if __name__\s*==\s*['\"]__main__['\"]|#!/usr/bin/env python|#)",
@@ -2359,7 +2440,10 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
             if _is_valid_normalized_script_source(file_path, normalized):
                 return normalized
 
-        return stripped
+        candidate = _strip_orphan_trailing_fence(stripped)
+        if _is_valid_normalized_script_source(file_path, candidate):
+            return candidate
+        return candidate
 
     extracted = _extract_target_file_from_bundle(content, file_path)
     return _strip_code_fence(extracted if extracted is not None else content)
@@ -2412,13 +2496,17 @@ def _script_generation_skeleton(
         role=role,
         skill_plan_entry=skill_plan_entry,
     )
+    input_keys = list(plan_entry.inputs or ["payload"])
+    py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
+    js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
+    bash_py_expr = " or ".join(f'p.get({key!r})' for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
         return (
             "必须使用下面的 node_skeleton；解析 process.argv[2] JSON，stdout 只能 console.log JSON 字符串：\n"
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
-            "  const text = String(payload.topic || payload.prompt || payload.text || payload.payload || '').trim();\n"
+            f"  const text = String({js_value_expr}).trim();\n"
             "  return { text, file_paths: [] };\n"
             "}\n"
             "console.log(JSON.stringify(run(payload)));"
@@ -2430,7 +2518,7 @@ def _script_generation_skeleton(
             '#!/usr/bin/env bash\n'
             'set -euo pipefail\n'
             "payload_json=${1:-'{}'}\n"
-            'text=$(python -c \'import json,sys; p=json.loads(sys.argv[1]); print(p.get("topic") or p.get("prompt") or p.get("text") or p.get("payload") or "")\' "$payload_json")\n'
+            f'text=$(python -c \'import json,sys; p=json.loads(sys.argv[1]); print({bash_py_expr})\' "$payload_json")\n'
             'python -c \'import json,sys; print(json.dumps({"text": sys.argv[1], "file_paths": []}, ensure_ascii=False))\' "$text"'
         )
 
@@ -2447,7 +2535,7 @@ def _script_generation_skeleton(
             "    return json.loads(sys.argv[1])\n\n"
             "def build_image_prompt(payload: dict) -> str:\n"
             "    # Derive a concrete prompt from payload keys required by the SkillPlan.\n"
-            "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
+            f"    topic = str({py_value_expr}).strip()\n"
             "    return topic or 'helpful generated illustration'\n\n"
             "def run(payload: dict) -> dict:\n"
             "    desc = build_image_prompt(payload)\n"
@@ -2481,7 +2569,7 @@ def _script_generation_skeleton(
             "    output_dir.mkdir(parents=True, exist_ok=True)\n"
             "    pdf_path = output_dir / 'output.pdf'\n"
             "    from fpdf import FPDF\n"
-            "    text = str(payload.get('text') or payload.get('topic') or payload.get('prompt') or 'Generated PDF').strip()\n"
+            f"    text = str({py_value_expr} or 'Generated PDF').strip()\n"
             "    pdf = FPDF()\n"
             "    pdf.add_page()\n"
             "    pdf.set_font('Helvetica', size=14)\n"
@@ -2505,7 +2593,7 @@ def _script_generation_skeleton(
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
             "def generate_text(payload: dict) -> str:\n"
-            "    topic = str(payload.get('topic') or payload.get('prompt') or payload.get('text') or '').strip()\n"
+            f"    topic = str({py_value_expr}).strip()\n"
             "    return topic\n\n"
             "def run(payload: dict) -> dict:\n"
             "    text = generate_text(payload).strip()\n"
@@ -2528,7 +2616,8 @@ def _script_generation_skeleton(
         "    return json.loads(sys.argv[1])\n\n"
         "def run(payload: dict) -> dict:\n"
         "    # Implement the real deterministic business logic required by the SkillPlan.\n"
-        "    return {'text': '', 'file_paths': []}\n\n"
+        f"    text = str({py_value_expr}).strip()\n"
+        "    return {'text': text, 'file_paths': []}\n\n"
         "def main() -> None:\n"
         "    payload = parse_args()\n"
         "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"

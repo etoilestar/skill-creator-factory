@@ -94,6 +94,14 @@ def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
 def _looks_like_skill_resource_dir(path: Path) -> bool:
     return path.name in {"scripts", "references", "assets"}
 
+
+def _normalize_skill_resource_path(value: str) -> str:
+    """Normalize a skill-local resource path for catalog/loaded-path comparison."""
+    normalized = str(value or "").strip().replace("\\", "/").lstrip("./")
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+    return normalized
+
 def _infer_skill_root_from_tasks(plan: dict, *, execution_root: Path | None = None) -> Path | None:
     """Infer the active skill root from create_directory/write_file tasks.
 
@@ -214,10 +222,19 @@ def _extract_runtime_resource_catalog(body_prompt: str, *, execution_root: "Path
     )
 
     def _add_entry(path: str, title: str = "") -> None:
+        path = _normalize_skill_resource_path(path)
         if path in seen:
             return
-        seen.add(path)
         kind = path.split("/", 1)[0]
+        if kind not in {"references", "assets", "scripts"}:
+            return
+        if execution_root is not None:
+            root = execution_root.resolve()
+            candidate = (root / path).resolve()
+            if not _is_within_sandbox(candidate, root) or not candidate.is_file():
+                logger.info("skip missing/non-local skill resource from catalog: root=%s path=%s", root, path)
+                return
+        seen.add(path)
         if kind == "references":
             allowed_actions = ["read_resource"]
             usage_hint = "参考资料，可在任务需要领域知识、示例、规范时读取。"
@@ -389,35 +406,96 @@ async def _run_resource_selection_round(
         resource_catalog=resource_catalog,
     )
 
+def _read_runtime_skill_resource_text(
+    *,
+    skill_name: str,
+    path: str,
+    execution_root: Path | None = None,
+) -> dict:
+    """Read a skill-local resource from the execution root when available."""
+    rel_path = _normalize_skill_resource_path(path)
+    if execution_root is not None:
+        root = execution_root.resolve()
+        resource_path = (root / rel_path).resolve()
+        if not _is_within_sandbox(resource_path, root) or not resource_path.is_file():
+            raise FileNotFoundError(f"resource does not exist in current skill: {rel_path}")
+        raw = resource_path.read_text(encoding="utf-8", errors="replace")
+        max_chars = settings.skill_resource_max_chars
+        return {
+            "content": raw[:max_chars],
+            "truncated": len(raw) > max_chars,
+        }
+
+    if not skill_name:
+        raise ValueError("读取 Skill 资源需要 skill_name 或 execution_root")
+
+    return read_skill_resource_text(
+        skill_name,
+        rel_path,
+        max_chars=settings.skill_resource_max_chars,
+    )
+
+
 def _compose_loaded_resources_prompt(
     *,
     skill_name: str,
     resource_catalog: list[dict],
     selected_handles: list[str],
-) -> str:
+    execution_root: Path | None = None,
+) -> dict:
     resource_by_handle = _resource_catalog_by_handle(resource_catalog)
     sections: list[str] = []
+    loaded_paths: list[str] = []
+    failed_paths: list[dict] = []
 
     for handle in selected_handles:
         resource = resource_by_handle.get(handle)
         if not resource:
+            failed_paths.append({
+                "resource_handle": handle,
+                "path": "",
+                "missing_type": "planner_inconsistent",
+                "reason": "selected resource_handle is not in resource_catalog",
+            })
             continue
 
-        path = resource["path"]
+        path = _normalize_skill_resource_path(resource["path"])
         try:
-            observation = read_skill_resource_text(
-                skill_name,
-                path,
-                max_chars=settings.skill_resource_max_chars,
+            observation = _read_runtime_skill_resource_text(
+                skill_name=skill_name,
+                path=path,
+                execution_root=execution_root,
             )
-        except Exception as exc:
+        except FileNotFoundError as exc:
+            failed_paths.append({
+                "resource_handle": handle,
+                "path": path,
+                "missing_type": "file_missing",
+                "reason": str(exc),
+            })
             sections.append(
                 f"### {handle}\n"
                 f"- path: `{path}`\n"
+                f"- load_error_type: file_missing\n"
+                f"- load_error: {exc}\n"
+            )
+            continue
+        except Exception as exc:
+            failed_paths.append({
+                "resource_handle": handle,
+                "path": path,
+                "missing_type": "load_failed",
+                "reason": str(exc),
+            })
+            sections.append(
+                f"### {handle}\n"
+                f"- path: `{path}`\n"
+                f"- load_error_type: load_failed\n"
                 f"- load_error: {exc}\n"
             )
             continue
 
+        loaded_paths.append(path)
         content = observation.get("content", "")
         truncated = observation.get("truncated", False)
 
@@ -431,16 +509,22 @@ def _compose_loaded_resources_prompt(
             "```"
         )
 
-    if not sections:
-        return ""
+    prompt = ""
+    if sections:
+        prompt = (
+            "\n\n---\n\n"
+            "## Loaded On-Demand Resources\n\n"
+            "以下资源由宿主根据当前请求按需读取。"
+            "这些内容现在可以作为执行当前 Skill 的依据。"
+            "如果资源已成功加载，后续规划不得再把它标记为 missing。\n\n"
+            + "\n\n".join(sections)
+        )
 
-    return (
-        "\n\n---\n\n"
-        "## Loaded On-Demand Resources\n\n"
-        "以下资源由宿主根据当前请求按需读取。"
-        "这些内容现在可以作为执行当前 Skill 的依据。\n\n"
-        + "\n\n".join(sections)
-    )
+    return {
+        "prompt": prompt,
+        "loaded_paths": loaded_paths,
+        "failed_paths": failed_paths,
+    }
 
 def _parse_need_body_decision(text: str) -> bool:
     """Parse first-round metadata decision.
@@ -1105,7 +1189,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "resource_catalog、available_scripts 和用户请求判断本轮是否需要先让主模型输出显式可执行块。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
-        "2. resource_catalog 和 available_scripts 只是宿主提供的真实资源树，用于安全校验候选动作是否可能存在；"
+        "2. resource_catalog 和 available_scripts 只包含当前业务 Skill 目录内真实存在的 skill-local resources；kernel references 不会暴露给运行时，不能读取或引用。\n"
         "不能用它们推导、补全或发明命令参数。\n"
         "3. 是否执行命令，必须由后续主模型回复里的显式可执行 fenced code block 触发；"
         "不要因为磁盘上存在脚本就直接规划 run_command，也不要让主模型临时拼接 Skill.md 中没有声明的命令。\n"
@@ -1163,6 +1247,8 @@ def _normalize_skill_runtime_plan(
     resource_catalog: list[dict] | None = None,
     execution_root: Path | None = None,
     command_contract: dict | None = None,
+    loaded_paths: list[str] | None = None,
+    failed_paths: list[dict] | None = None,
 ) -> dict:
     """Normalize planner JSON into executor-compatible plan.
 
@@ -1175,6 +1261,14 @@ def _normalize_skill_runtime_plan(
         raise ValueError("运行时规划模型输出必须是 JSON object")
 
     resource_by_handle = _resource_catalog_by_handle(resource_catalog or [])
+    loaded_path_set = {_normalize_skill_resource_path(path) for path in (loaded_paths or []) if str(path or "").strip()}
+    failed_by_path: dict[str, dict] = {}
+    for item in failed_paths or []:
+        if not isinstance(item, dict):
+            continue
+        failed_path = _normalize_skill_resource_path(str(item.get("path") or ""))
+        if failed_path:
+            failed_by_path[failed_path] = item
 
     mode = str(plan.get("mode") or "").strip()
     if mode not in {"execute", "direct_answer", "ask_user", "not_applicable"}:
@@ -1192,6 +1286,37 @@ def _normalize_skill_runtime_plan(
 
     if not isinstance(missing, list):
         missing = []
+
+    planner_inconsistent: list[dict] = []
+    normalized_missing: list[dict] = []
+    for missing_item in missing:
+        if not isinstance(missing_item, dict):
+            normalized_missing.append({"missing_type": "planner_inconsistent", "reason": str(missing_item)})
+            continue
+        normalized_item = dict(missing_item)
+        rel_path = _normalize_skill_resource_path(str(normalized_item.get("path") or ""))
+        resource_handle = str(normalized_item.get("resource_handle") or "").strip()
+        if not rel_path and resource_handle and resource_handle in resource_by_handle:
+            rel_path = _normalize_skill_resource_path(str(resource_by_handle[resource_handle].get("path") or ""))
+            normalized_item["path"] = rel_path
+
+        if rel_path in loaded_path_set:
+            planner_inconsistent.append({
+                "missing_type": "planner_inconsistent",
+                "resource_handle": resource_handle,
+                "path": rel_path,
+                "reason": "planner reported an already loaded resource as missing",
+            })
+            continue
+
+        if rel_path in failed_by_path:
+            failed = failed_by_path[rel_path]
+            normalized_item["missing_type"] = failed.get("missing_type") or "load_failed"
+            normalized_item["reason"] = failed.get("reason") or normalized_item.get("reason") or "resource load failed"
+        else:
+            normalized_item["missing_type"] = normalized_item.get("missing_type") or "file_missing"
+        normalized_missing.append(normalized_item)
+    missing = normalized_missing
 
     normalized_actions: list[dict] = []
 
@@ -1224,9 +1349,33 @@ def _normalize_skill_runtime_plan(
                 errors.append({
                     "error": "read_resource 使用了不存在的 resource_handle",
                     "resource_handle": resource_handle,
+                    "reason": "planner_inconsistent",
                     "available_resource_handles": sorted(resource_by_handle.keys()),
                 })
                 continue
+
+            rel_path = _normalize_skill_resource_path(str(resource.get("path") or ""))
+            if rel_path in failed_by_path:
+                failed = failed_by_path[rel_path]
+                missing.append({
+                    "resource_handle": resource_handle,
+                    "path": rel_path,
+                    "missing_type": failed.get("missing_type") or "load_failed",
+                    "reason": failed.get("reason") or "resource load failed",
+                })
+                continue
+
+            if execution_root is not None:
+                root = execution_root.resolve()
+                resource_path = (root / rel_path).resolve()
+                if not _is_within_sandbox(resource_path, root) or not resource_path.is_file():
+                    missing.append({
+                        "resource_handle": resource_handle,
+                        "path": rel_path,
+                        "missing_type": "file_missing",
+                        "reason": "resource_catalog entry no longer exists in current skill",
+                    })
+                    continue
 
             allowed_actions = set(resource.get("allowed_actions") or [])
             if "read_resource" not in allowed_actions:
@@ -1260,7 +1409,7 @@ def _normalize_skill_runtime_plan(
         mode = "ask_user"
         errors.append({
             "error": "Skill.md 缺少可执行命令 fenced block 示例，禁止主模型临时拼接命令",
-            "hint": "请在 Creator 生成的 SKILL.md 中用普通 Markdown 写入具体 ```bash 命令示例，并让脚本接口与示例一致。",
+            "hint": "请在当前 SKILL.md 中用普通 Markdown 写入具体 ```bash 命令示例，并让脚本接口与示例一致。",
         })
 
     return {
@@ -1269,6 +1418,7 @@ def _normalize_skill_runtime_plan(
         "actions": normalized_actions,
         "missing": missing,
         "errors": errors,
+        "planner_inconsistent": planner_inconsistent,
         "final_instruction": final_instruction,
     }
 
@@ -1279,6 +1429,8 @@ async def _run_skill_runtime_planner_round(
     model: str,
     execution_root: Path | None = None,
     skill_name: str = "",
+    loaded_paths: list[str] | None = None,
+    failed_paths: list[dict] | None = None,
 ) -> dict:
     """Generate an action plan from Loaded SKILL.md and structured host resources.
 
@@ -1314,6 +1466,8 @@ async def _run_skill_runtime_planner_round(
         "last_user_text": _last_user_text(request),
         "execution_root": str(execution_root) if execution_root else "",
         "skill_name": skill_name,
+        "loaded_paths": list(loaded_paths or []),
+        "failed_paths": list(failed_paths or []),
         "runtime_contract": {
             "skill_md_is_markdown": True,
             "skill_md_code_blocks_have_no_action_tag": True,
@@ -1338,6 +1492,7 @@ async def _run_skill_runtime_planner_round(
         {"role": "user", "content": f"## 用户请求\n{_last_user_text(request)}"},
         {"role": "user", "content": f"## 执行根目录\n{str(execution_root) if execution_root else ''}"},
         {"role": "user", "content": f"## 技能名称\n{skill_name}"},
+        {"role": "user", "content": "## 已加载/加载失败资源\n" + json.dumps({"loaded_paths": list(loaded_paths or []), "failed_paths": list(failed_paths or [])}, ensure_ascii=False)},
         {"role": "user", "content": "请根据以上信息，输出 JSON 格式的执行计划。只输出 JSON，不要任何其他内容。"},
     ]
 
@@ -1384,6 +1539,8 @@ async def _run_skill_runtime_planner_round(
             resource_catalog=resource_catalog,
             execution_root=execution_root,
             command_contract=command_contract,
+            loaded_paths=loaded_paths,
+            failed_paths=failed_paths,
         )
     )
 
@@ -1953,13 +2110,18 @@ def _execute_single_task(
         rel_path = str(task.get("path") or "").strip()
         if not rel_path:
             raise ValueError("read_resource 任务缺少 path")
-        if not skill_name:
-            raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+        if not skill_name and execution_root is None:
+            raise ValueError("read_resource 任务缺少 skill_name 或 execution_root，无法确定读取哪个 Skill 的资源")
+        resource_root = execution_root.resolve() if execution_root is not None else _skill_root_for_name(skill_name)
+        resource_path = (resource_root / rel_path).resolve()
+        if not _is_within_sandbox(resource_path, resource_root) or not resource_path.is_file():
+            raise FileNotFoundError(f"read_resource resource does not exist in current skill: {rel_path}")
         if rel_path.startswith("assets/"):
-            asset_root = execution_root.resolve() if execution_root is not None else _skill_root_for_name(skill_name)
-            _validate_runtime_asset_contract((asset_root / rel_path).resolve(), root=asset_root)
-        observation = read_skill_resource_text(
-            skill_name, rel_path, max_chars=settings.skill_resource_max_chars
+            _validate_runtime_asset_contract(resource_path, root=resource_root)
+        observation = _read_runtime_skill_resource_text(
+            skill_name=skill_name,
+            path=rel_path,
+            execution_root=execution_root,
         )
         return {
             "action": action,
@@ -2697,8 +2859,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "请不要假装已经读取该子 Skill 正文。"
                         )
 
+            loaded_resource_paths: list[str] = []
+            failed_resource_paths: list[dict] = []
+
             if enable_resource_preload:
-                resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                resource_catalog = _extract_runtime_resource_catalog(body_prompt, execution_root=execution_root)
                 if resource_catalog:
                     yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
                 resource_decision = await _run_resource_selection_round(
@@ -2726,11 +2891,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 if resource_decision.get("need_resources"):
                     selected = resource_decision.get("resource_handles") or []
                     yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
-                    loaded_resources_prompt = _compose_loaded_resources_prompt(
+                    loaded_resources = _compose_loaded_resources_prompt(
                         skill_name=parent_skill_name,
                         resource_catalog=resource_catalog,
                         selected_handles=selected,
+                        execution_root=execution_root,
                     )
+                    loaded_resource_paths = loaded_resources.get("loaded_paths", [])
+                    failed_resource_paths = loaded_resources.get("failed_paths", [])
+                    loaded_resources_prompt = str(loaded_resources.get("prompt") or "")
 
                     if loaded_resources_prompt:
                         body_prompt = body_prompt + loaded_resources_prompt
@@ -2823,6 +2992,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         request=request,
                         model=model,
                         execution_root=execution_root,
+                        skill_name=parent_skill_name,
+                        loaded_paths=loaded_resource_paths,
+                        failed_paths=failed_resource_paths,
                     )
 
                     response_route = route_model(

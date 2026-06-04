@@ -54,6 +54,8 @@ class SkillPlanEntry:
     required_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
     reference_files: list[str] = field(default_factory=list)
+    skill_local_references: list[str] = field(default_factory=list)
+    creator_internal_references: list[str] = field(default_factory=list)
     language: Language = "text"
     runtime: Runtime = "none"
     entrypoint: str = ""
@@ -444,6 +446,8 @@ def build_skill_plan_entry(
         required_capabilities=required_capabilities,
         forbidden_capabilities=forbidden_capabilities,
         reference_files=list(reference_files or []),
+        skill_local_references=[ref for ref in list(reference_files or []) if ref.startswith(("references/", "assets/", "scripts/"))],
+        creator_internal_references=["kernel/references/best-practices.md", "kernel/references/workflows.md", "kernel/references/output-patterns.md"],
         language=language,
         runtime=runtime,
         entrypoint=file_path if file_type == "script" else "",

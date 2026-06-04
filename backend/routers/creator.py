@@ -346,6 +346,8 @@ def _skill_plan_entry_for_file(
                 required_capabilities=required_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=list(skill_plan_entry.get("reference_files") or []),
+                skill_local_references=list(skill_plan_entry.get("skill_local_references") or skill_plan_entry.get("reference_files") or []),
+                creator_internal_references=list(skill_plan_entry.get("creator_internal_references") or []),
                 language=language,  # type: ignore[arg-type]
                 runtime=runtime,  # type: ignore[arg-type]
                 entrypoint=str(skill_plan_entry.get("entrypoint") or (file_path if file_type == "script" else "")),
@@ -383,6 +385,8 @@ def _skill_plan_entry_for_file(
                 required_capabilities=required_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=entry.reference_files,
+                skill_local_references=entry.skill_local_references,
+                creator_internal_references=entry.creator_internal_references,
                 language=entry.language,
                 runtime=entry.runtime,
                 entrypoint=entry.entrypoint,
@@ -707,6 +711,17 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     return "\n".join(lines)
 
 
+
+def _declared_skill_paths_from_blueprint(blueprint_text: str) -> set[str]:
+    paths: set[str] = set()
+    for prefix in ("scripts/", "references/", "assets/"):
+        paths.update(_paths_requiring_skill_md_mentions(blueprint_text, prefix=prefix))
+    return paths
+
+
+def _skill_local_paths_in_markdown(content: str) -> set[str]:
+    return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
+
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Return structured SKILL.md contract checks for generation and repair."""
     stripped = content.strip()
@@ -749,6 +764,22 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         ),
         expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
         minimal_edit="删除 Creator UI/确认清单/点击开始创建相关文案，只保留 Skill 使用说明。",
+    ))
+
+    mentioned_skill_paths = _skill_local_paths_in_markdown(content)
+    declared_skill_paths = _declared_skill_paths_from_blueprint(blueprint_text)
+    undeclared_paths = sorted(path for path in mentioned_skill_paths if path not in declared_skill_paths)
+    results.append(ContractCheckResult(
+        id="skill_md.resource.local_declared",
+        passed=not undeclared_paths,
+        target="SKILL.md",
+        message=(
+            "SKILL.md 只引用本轮声明/已存在的 skill-local resources。"
+            if not undeclared_paths
+            else "SKILL.md 引用了未在本轮生成或当前 Skill 中不存在的资源：" + ", ".join(undeclared_paths)
+        ),
+        expected="SKILL.md 中的 scripts/references/assets 路径必须是当前 Skill 内真实存在或本轮生成的资源；kernel references 只能作为 Creator 内部上下文，禁止写入最终 SKILL.md。",
+        minimal_edit="删除未声明/不存在的 references/assets/scripts 引用；如果确实需要该资源，请先在蓝图中加入并生成对应文件。",
     ))
 
     for script_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/"):
@@ -1452,6 +1483,22 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         )
     )
 
+    missing_capabilities = _script_required_capability_failures(stripped, list(plan_entry.required_capabilities or []))
+    results.append(
+        ContractCheckResult(
+            id="script.required_capabilities.called",
+            passed=not missing_capabilities,
+            target=file_path,
+            message=(
+                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
+                if not missing_capabilities
+                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+            ),
+            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
+            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+        )
+    )
+
     has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
     results.append(
         ContractCheckResult(
@@ -1553,7 +1600,7 @@ def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> 
     if not skill_dir.exists():
         return
     declared_paths: list[str] = []
-    for folder in ("scripts", "references"):
+    for folder in ("scripts", "references", "assets"):
         folder_path = skill_dir / folder
         if not folder_path.is_dir():
             continue
@@ -2216,6 +2263,14 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             return (
                 "删除 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等 UI 文案；"
                 "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
+            )
+
+        if "skill_md.resource.local_declared" in deterministic_error or "未在本轮生成或当前 Skill 中不存在" in deterministic_error:
+            return (
+                "删除最终 SKILL.md 中未声明/不存在的 references/assets/scripts 引用，尤其是 Creator 内部 kernel references "
+                "（references/workflows.md、references/output-patterns.md、references/best-practices.md 等）。"
+                "这些 kernel 资料只能作为生成上下文，不能出现在 Skill 的资源列表或运行说明中；"
+                "保留合法脚本命令块和合法 text/image helper 说明，不要删除 generate_text_with_llm 或 generate_stable_diffusion_image 相关合法调用。"
             )
 
     if file_path.startswith("scripts/"):
@@ -2931,7 +2986,7 @@ def _creator_kernel_reference_context() -> str:
             continue
         if text:
             rel = path.relative_to(kernel_dir.parent)
-            chunks.append(f"### {rel}\n{text[:1800]}")
+            chunks.append(f"### INTERNAL-ONLY {rel}\n{text[:1800]}")
     return "\n\n".join(chunks)
 
 def _build_generate_file_prompt(
@@ -3027,7 +3082,7 @@ def _build_generate_file_prompt(
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
-            f"Creator kernel references（作为脚本生成上下文，可用于 workflow/output pattern/reference/assets 读取策略；不得照抄为占位内容）：\n{kernel_reference_context}\n\n"
+            f"Creator internal-only kernel guidance（只可指导生成，禁止把以下 kernel 路径、文件名或组织结构复制到最终业务 SKILL.md / references / assets）：\n{kernel_reference_context}\n\n"
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（scripts/ 生成不会追加聊天历史，只使用本蓝图）：\n\n{clean_blueprint_text}"
         )

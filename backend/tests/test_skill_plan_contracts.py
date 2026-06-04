@@ -535,8 +535,8 @@ def test_creator_prompt_injects_kernel_references_for_scripts():
     )
     prompt = messages[-1]["content"]
 
-    assert "Creator kernel references" in prompt
-    assert "kernel/references/best-practices.md" in prompt
+    assert "Creator internal-only kernel guidance" in prompt
+    assert "INTERNAL-ONLY kernel/references/best-practices.md" in prompt
     assert "kernel/references/output-patterns.md" in prompt
 
 
@@ -576,3 +576,60 @@ JSON argv keys 必须与 SkillPlan inputs 对齐，text 输出可作为 image pr
     failed = {result.id for result in results if not result.passed}
 
     assert "reference.required_capabilities.mentioned" not in failed
+
+
+def test_skill_md_rejects_kernel_reference_leak_not_declared_in_blueprint():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: no-kernel-leak
+- scripts/: `scripts/run.py`
+  scripts/run.py role: text_generator inputs: topic outputs: text
+"""
+    skill_md = """---
+name: no-kernel-leak
+description: demo
+---
+# Demo
+
+## 执行
+```bash
+python scripts/run.py '{"topic":"{{topic}}"}'
+```
+
+## 参考资料
+- `references/workflows.md`: 内部 workflow 参考。
+- `references/output-patterns.md`: 内部输出模式。
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.local_declared" in failed
+
+
+def test_skill_md_allows_declared_local_reference_and_script():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: local-ok
+- scripts/: `scripts/run.py`
+  scripts/run.py role: text_generator inputs: topic outputs: text
+- references/: `references/guide.md`
+"""
+    skill_md = """---
+name: local-ok
+description: demo
+---
+# Demo
+
+读取 `references/guide.md` 中的执行步骤。
+
+```bash
+python scripts/run.py '{"topic":"{{topic}}"}'
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.local_declared" not in failed
+    assert "skill_md.reference.mentioned" not in failed

@@ -847,6 +847,7 @@ def test_runtime_planner_prompt_requires_fenced_block_trigger():
     assert "显式可执行 fenced code block 触发" in prompt
     assert "不要因为磁盘上存在脚本就直接规划 run_command" in prompt
     assert "禁止的 action：run_command、write_file、create_directory" in prompt
+    assert "mode=execute_workflow" in prompt
     assert "Creator" not in prompt
 
 

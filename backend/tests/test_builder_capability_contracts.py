@@ -228,3 +228,52 @@ if __name__ == "__main__":
                 "required_capabilities": ["image_generation"],
             },
         )
+
+
+def test_combine_to_pdf_path_is_pdf_builder_without_explicit_role_or_model_call():
+    skill_md = '''
+# Combine PDF Skill
+
+全局说明：前置步骤可使用 LLM/TEXT_MODEL 和 IMAGE_MODEL 生成内容。
+required_capabilities: [text_generation, image_generation]
+
+### 使用方式
+先由其他脚本生成文本与图片，然后执行 PDF 合并脚本：
+```bash
+python scripts/combine_to_pdf.py '{"story_text":"{{story_text}}","image_paths":"{{image_paths}}"}'
+```
+'''
+    entry = build_skill_plan_entry(file_path="scripts/combine_to_pdf.py", blueprint_summary=skill_md)
+    assert entry.role == "pdf_builder"
+    assert entry.required_capabilities == ["pdf_generation", "file_output"]
+
+    _validate_script_contract_static(
+        file_path="scripts/combine_to_pdf.py",
+        content=PDF_BUILDER_SOURCE,
+        skill_md=skill_md,
+    )
+
+
+def test_global_required_capabilities_after_command_block_do_not_leak_to_pdf_builder():
+    skill_md = '''
+# PDF Export Skill
+
+### SkillPlan / 文件职责计划
+- scripts/build_pdf.py
+  role: pdf_builder
+  inputs: [story_text, image_paths]
+  outputs: [pdf_path, file_paths]
+
+```bash
+python scripts/build_pdf.py '{"story_text":"{{story_text}}","image_paths":"{{image_paths}}"}'
+```
+
+## 全局模型说明
+required_capabilities: [text_generation, image_generation]
+需要由前置生成脚本调用 LLM/TEXT_MODEL 与 IMAGE_MODEL。
+'''
+    entry = build_skill_plan_entry(file_path="scripts/build_pdf.py", blueprint_summary=skill_md)
+    assert entry.role == "pdf_builder"
+    assert entry.required_capabilities == ["pdf_generation", "file_output"]
+    assert "text_generation" not in entry.required_capabilities
+    assert "image_generation" not in entry.required_capabilities

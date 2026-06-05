@@ -112,6 +112,7 @@ _PDF_RE = re.compile(r"pdf|报告|排版|layout|document|report", re.I)
 _TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|text|story|tale|fairy|riddle|summary|copy", re.I)
 _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
 _IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
+_PDF_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(?:build|export|create|make|render|combine|merge)?_?pdf(?:[_.-]|$)|(?:^|[_/-])(?:pdf_builder|build_pdf|export_pdf|combine_to_pdf|merge_to_pdf)(?:[_.-]|$)|合并.*pdf|pdf.*合并", re.I)
 _CUSTOM_CHARACTER_RE = re.compile(r"custom_character|character|角色|主角", re.I)
 
 
@@ -215,7 +216,7 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
     now limited to the explicit per-file ``purpose`` text passed by the caller
     (the first argument), never to the full blueprint/SKILL.md summary.
     """
-    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)"
+    next_path_re = r"(?m)^\s*(?:(?:[-*]\s*)?(?:(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)|`{3,}|~{3,}|#{1,6}\s+)"
     best = ""
     saw_path = False
     for text in texts:
@@ -291,7 +292,7 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
     appears on one line and ``role: ...`` appears in the following indented
     contract lines.
     """
-    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:scripts|references|assets)/[A-Za-z0-9_./-]+|^\s*SKILL\.md"
+    next_path_re = r"(?m)^\s*(?:(?:[-*]\s*)?(?:(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)|`{3,}|~{3,}|#{1,6}\s+)"
 
     def segment_after_path(text: str) -> str:
         if file_path not in text:
@@ -332,6 +333,24 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
 
 
 
+def _should_promote_pdf_builder_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
+    """Return True for deterministic scripts whose local responsibility is PDF output.
+
+    PDF merge/export scripts are file builders, not model generators.  The path
+    must identify a PDF builder/exporter (for example build_pdf.py,
+    export_pdf.py, or combine_to_pdf.py); global SKILL.md model prose is ignored.
+    """
+    if file_type_for_path(file_path) != "script":
+        return False
+    if not _PDF_SCRIPT_NAME_RE.search(file_path):
+        return False
+    local_segment = _segment_for_file(file_path, purpose, blueprint_summary)
+    local_text = f"{file_path}\n{local_segment or purpose}"
+    if _IMAGE_SCRIPT_NAME_RE.search(file_path):
+        return False
+    return bool(_PDF_RE.search(local_text) or _PDF_SCRIPT_NAME_RE.search(file_path))
+
+
 def _should_promote_image_script_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
     """Return True for scripts whose local contract clearly names image generation.
 
@@ -366,9 +385,11 @@ def file_role_classifier(
     """Classify one file into a Creator role from the plan/model contract.
 
     Domain keyword/regex matches are collected as heuristic_signals only.  They
-    do not directly select skeletons, contracts, capabilities, or specialized
-    roles.  Specialized script roles require an explicit plan/model role such
-    as ``role: image_generator``.  Ambiguous scripts fall back to conservative
+    do not directly select model capabilities.  Model-generating roles require
+    an explicit plan/model role such as ``role: image_generator``; deterministic
+    PDF exporter paths such as ``build_pdf.py``/``combine_to_pdf.py`` can be
+    inferred as ``pdf_builder`` because that role only grants file-output
+    capabilities.  Ambiguous scripts fall back to conservative
     ``generic_script`` so high-impact capabilities are not enabled by accident.
     """
     file_type = file_type_for_path(file_path)
@@ -388,6 +409,16 @@ def file_role_classifier(
     )
     if explicit_role in SCRIPT_ROLES:
         return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan/blueprint", signals)
+
+    if _should_promote_pdf_builder_role(file_path, purpose, blueprint_summary):
+        if "inferred_pdf_builder_role" not in signals:
+            signals.append("inferred_pdf_builder_role")
+        return RoleClassification(
+            "pdf_builder",
+            0.82,
+            "pdf-oriented script path/local responsibility builds or combines PDF files",
+            signals,
+        )
 
     if _should_promote_image_script_role(file_path, purpose, blueprint_summary):
         if "inferred_image_script_role" not in signals:

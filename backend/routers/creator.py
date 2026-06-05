@@ -1904,7 +1904,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 image_generation，但脚本调用了图片生成 helper。"
                 ),
                 expected="只有 required_capabilities 包含 image_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_stable_diffusion_image。",
-                minimal_edit="若脚本确实需要图片能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除图片 helper 调用。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：移除图片 helper 调用，只保留与当前 role/required_capabilities 一致的逻辑。",
             )
         )
 
@@ -1921,7 +1921,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 text_generation，但脚本调用了文本生成 helper/LLM。"
                 ),
                 expected="只有 required_capabilities 包含 text_generation 且未被 forbidden_capabilities 禁止时，脚本才可调用 generate_text_with_llm 或平台文本模型。",
-                minimal_edit="若脚本确实需要文本生成能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除文本模型调用。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：移除文本模型调用，只保留与当前 role/required_capabilities 一致的逻辑。",
             )
         )
 
@@ -1938,7 +1938,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                     else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 pdf_generation，但源码包含 PDF 生成/输出逻辑。"
                 ),
                 expected="只有 required_capabilities 包含 pdf_generation 且未被 forbidden_capabilities 禁止时，脚本才可构建 PDF。",
-                minimal_edit="若脚本确实需要 PDF 能力，请修正 SkillPlan required_capabilities/forbidden_capabilities；否则移除 PDF 生成逻辑。",
+                minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：若当前脚本禁止 PDF 能力则移除 PDF 生成逻辑。",
             )
         )
 
@@ -2149,11 +2149,11 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
         return
 
     # Backward compatibility for existing SKILL.md files that predate explicit
-    # SkillPlan inputs: keep generic_script conservative capabilities, but treat
+    # SkillPlan inputs: when the local file block did not declare inputs, treat
     # the JSON argv command itself as the declared interface for static script
-    # validation.  New Creator generation still emits command blocks from
-    # SkillPlan inputs via _check_skill_md_contract.
-    if plan_entry.role == "generic_script" and plan_entry.inputs == ["payload"]:
+    # validation.  This remains local to the current script command and does not
+    # mine global SKILL.md prose for capabilities.
+    if plan_entry.inputs == ["payload"]:
         command_keys: set[str] = set()
         for command in commands:
             keys = _command_payload_keys(command, file_path)

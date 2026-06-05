@@ -544,6 +544,8 @@ def test_multi_script_skill_forces_execute_workflow(tmp_path):
     )
 
     assert result["mode"] == "execute_workflow"
+    assert result["workflow_actions"][0]["action"] == "run_command"
+    assert result["workflow_actions"][0]["script_path"] == "scripts/generate_story.py"
     assert result["final_instruction"] == ""
 
 
@@ -591,3 +593,95 @@ def test_render_command_template_reports_dataflow_mismatch():
             "python scripts/build_pdf.py '{\"image_paths\":\"{{image_paths}}\"}'",
             {},
         )
+
+
+def _write_initial_context_workflow_skill(root: Path) -> tuple[Path, dict]:
+    from backend.routers.sandbox_chat import _extract_skill_command_contract
+
+    skill_dir = root / "initial-context-skill"
+    scripts = skill_dir / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "generate_story.py").write_text(
+        """
+import json, sys
+payload = json.loads(sys.argv[1])
+chapters = [{"title": str(i + 1), "content": payload["story_theme"] + str(i + 1)} for i in range(int(payload["chapter_count"]))]
+print(json.dumps({"story_text": payload["story_theme"], "chapters": chapters, "audience": payload["target_audience"]}, ensure_ascii=False))
+""".strip(),
+        encoding="utf-8",
+    )
+    (scripts / "build_pdf.py").write_text(
+        """
+import json, pathlib, sys
+payload = json.loads(sys.argv[1])
+path = pathlib.Path("outputs/initial.pdf")
+path.parent.mkdir(exist_ok=True)
+path.write_bytes(b"%PDF-1.4\\n%%EOF")
+print(json.dumps({"pdf_path": "outputs/initial.pdf", "chapter_total": len(payload["chapters"])}, ensure_ascii=False))
+""".strip(),
+        encoding="utf-8",
+    )
+    skill_md = """---
+name: initial-context-skill
+description: demo
+---
+role: text_generator
+inputs: story_theme, chapter_count, target_audience
+outputs: story_text, chapters
+```bash
+python scripts/generate_story.py '{"story_theme":"{{story_theme}}","chapter_count":"{{chapter_count}}","target_audience":"{{target_audience}}"}'
+```
+
+role: pdf_builder
+inputs: story_text, chapters
+outputs: pdf_path
+required_capabilities: pdf_generation
+```bash
+python scripts/build_pdf.py '{"story_text":"{{story_text}}","chapters":"{{chapters}}"}'
+```
+"""
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    return skill_dir, _extract_skill_command_contract(skill_md, execution_root=skill_dir)
+
+
+def test_execute_skill_workflow_infers_first_step_context_from_user_input(tmp_path):
+    import asyncio
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _execute_skill_workflow
+
+    skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
+    request_text = "请以海底冒险为主题，写3章，面向小学生，并生成PDF。"
+
+    result = asyncio.run(_execute_skill_workflow(
+        execution_root=skill_dir,
+        action_schema=contract["action_schema"],
+        user_context={"user_request": request_text},
+        request=ChatRequest(messages=[Message(role="user", content=request_text)]),
+        skill_name="initial-context-skill",
+    ))
+
+    assert result["results"][0]["action"] == "run_command"
+    assert "scripts/generate_story.py" in result["results"][0]["command"]
+    assert result["context"]["story_theme"] == "海底冒险"
+    assert result["context"]["chapter_count"] == 3
+    assert result["context"]["target_audience"] == "小学生"
+    assert len(result["context"]["chapters"]) == 3
+    assert any(item["path"] == "outputs/initial.pdf" for item in result["output_files"])
+
+
+def test_execute_skill_workflow_reports_initial_input_parse_failure(tmp_path):
+    import asyncio
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _execute_skill_workflow
+
+    skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
+    request_text = "请生成图文PDF。"
+
+    with pytest.raises(ValueError, match="初始输入解析失败"):
+        asyncio.run(_execute_skill_workflow(
+            execution_root=skill_dir,
+            action_schema=contract["action_schema"],
+            user_context={"user_request": request_text},
+            request=ChatRequest(messages=[Message(role="user", content=request_text)]),
+            skill_name="initial-context-skill",
+        ))

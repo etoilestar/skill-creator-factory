@@ -1696,10 +1696,26 @@ def _normalize_skill_runtime_plan(
             "hint": "请在当前 SKILL.md 中用普通 Markdown 写入具体 ```bash 命令示例，并让脚本接口与示例一致。",
         })
 
+    workflow_actions = []
+    if mode == "execute_workflow":
+        for entry in command_entries:
+            if not isinstance(entry, dict):
+                continue
+            script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
+            if not script_path.startswith("scripts/"):
+                continue
+            workflow_actions.append({
+                "action": "run_command",
+                "script_path": script_path,
+                "command_template": str(entry.get("command") or ""),
+                "reason": "execute_workflow Action schema step",
+            })
+
     return {
         "mode": mode,
         "tasks": normalized_actions,
         "actions": normalized_actions,
+        "workflow_actions": workflow_actions,
         "missing": missing,
         "errors": errors,
         "planner_inconsistent": planner_inconsistent,
@@ -2444,6 +2460,134 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
     return output_files
 
 
+_CHINESE_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+
+
+def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
+    """Infer initial placeholders needed by the first workflow script from user text."""
+    context: dict = {}
+    text = (user_text or "").strip()
+    if not text:
+        return context
+
+    context.update({"user_request": text, "input": text, "topic": text})
+    context.update(_extract_inline_workflow_values(text))
+
+    first_keys = set(first_entry.get("placeholder_keys") or []) | set(first_entry.get("inputs") or [])
+    for key in sorted(first_keys):
+        if key in context:
+            context[key] = _coerce_workflow_value_for_key(key, context[key])
+            continue
+        inferred = _infer_workflow_value_for_key(key, text)
+        if inferred is not None:
+            context[key] = _coerce_workflow_value_for_key(key, inferred)
+    return context
+
+
+def _extract_inline_workflow_values(user_text: str) -> dict:
+    values: dict = {}
+    # Accept direct user-supplied key/value pairs such as
+    # ``story_theme: ...`` or JSON snippets without asking the LLM to parse them.
+    try:
+        maybe_json = json.loads(user_text)
+    except json.JSONDecodeError:
+        maybe_json = None
+    if isinstance(maybe_json, dict):
+        values.update(maybe_json)
+
+    for match in re.finditer(
+        r"(?P<key>[A-Za-z_][\w-]*)\s*[：:=]\s*(?P<value>[^，。\n,;；]+)",
+        user_text,
+    ):
+        values[match.group("key")] = match.group("value").strip()
+    return values
+
+
+def _coerce_workflow_value_for_key(key: str, value: object) -> object:
+    lowered = key.lower()
+    if any(token in lowered for token in ("count", "num", "number", "total")):
+        if isinstance(value, int):
+            return value
+        match = re.search(r"\d+", str(value))
+        if match:
+            return int(match.group(0))
+    return value
+
+
+def _infer_workflow_value_for_key(key: str, user_text: str) -> object | None:
+    lowered = key.lower()
+    if any(token in lowered for token in ("count", "num", "number", "total")):
+        return _extract_count_from_user_text(user_text)
+    if "audience" in lowered or "reader" in lowered or "target" in lowered or "受众" in key:
+        return _extract_target_audience_from_user_text(user_text)
+    if any(token in lowered for token in ("theme", "topic", "subject", "title", "prompt")) or "主题" in key:
+        return _extract_theme_from_user_text(user_text) or user_text
+    if lowered in {"input", "request", "user_request", "text"}:
+        return user_text
+    return None
+
+
+def _extract_count_from_user_text(user_text: str) -> int | None:
+    patterns = (
+        r"(?:chapter_count|章节数|章数|章节|共)\s*[：:=]?\s*(\d+)",
+        r"(\d+)\s*(?:章|章节|节|个章节|部分|段)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            return int(match.group(1))
+    match = re.search(r"([一二两三四五六七八九十])\s*(?:章|章节|节|个章节|部分|段)", user_text)
+    if match:
+        return _CHINESE_DIGITS.get(match.group(1))
+    return None
+
+
+def _extract_target_audience_from_user_text(user_text: str) -> str | None:
+    patterns = (
+        r"(?:target_audience|受众|目标读者|读者对象|面向对象)\s*[：:=]\s*([^，。\n,;；]+)",
+        r"(?:面向|适合|给)\s*([^，。\n,;；的]{1,24})(?:的)?(?:读者|受众|观众|儿童|孩子|小朋友|学生)?",
+        r"为\s*([^，。\n,;；的]{1,24})(?:读者|受众|观众|儿童|孩子|小朋友|学生)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _extract_theme_from_user_text(user_text: str) -> str | None:
+    patterns = (
+        r"(?:story_theme|主题|题材)\s*[：:=]\s*([^，。\n,;；]+)",
+        r"以\s*([^，。\n,;；]{1,60})\s*为(?:主题|题材|主线)",
+        r"关于\s*([^，。\n,;；]{1,60})(?:的|，|。|,|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _missing_workflow_placeholders(entry: dict, context: dict) -> list[str]:
+    return sorted(key for key in (entry.get("placeholder_keys") or []) if key not in context)
+
 
 def _json_arg_index(parts: list[str], script_path: str) -> int | None:
     for idx, part in enumerate(parts):
@@ -2614,19 +2758,26 @@ async def _execute_skill_workflow(
 
     root = execution_root.resolve()
     available_scripts = set(_available_scripts_for_root(root))
-    context = dict(user_context or {})
     req = request or ChatRequest(messages=[])
+    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
+    context = _workflow_context_from_request_text(user_text, entries[0])
+    context.update(user_context or {})
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
     results: list[dict] = []
     touched: list[Path] = []
     output_files: list[dict] = []
-    for entry in entries:
+    for entry_index, entry in enumerate(entries):
         script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
         if script_path not in available_scripts:
             raise ValueError(f"workflow_mismatch: {script_path} 不在 available_scripts 中：{sorted(available_scripts)}")
         command_template = str(entry.get("command") or "").strip()
         if not command_template:
             raise ValueError(f"workflow_mismatch: {script_path} 缺少 command template")
+        if entry_index == 0:
+            missing_initial = _missing_workflow_placeholders(entry, context)
+            if missing_initial:
+                needed = ", ".join(f"{{{{{key}}}}}" for key in missing_initial)
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。")
         step_contexts = _workflow_step_contexts(entry, context)
         step_payloads: list[dict] = []
         for step_context in step_contexts:
@@ -2634,6 +2785,8 @@ async def _execute_skill_workflow(
                 command = render_command_template(command_template, step_context)
             except ValueError as exc:
                 needed = ", ".join(f"{{{{{key}}}}}" for key in (entry.get("placeholder_keys") or []))
+                if entry_index == 0:
+                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。{exc}") from exc
                 raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，但前序步骤没有产生对应变量。{exc}") from exc
             result, task_touched = await asyncio.to_thread(
                 functools.partial(

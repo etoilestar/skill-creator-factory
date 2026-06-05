@@ -206,12 +206,22 @@ def _normalize_role(value: str) -> FileRole | None:
 
 
 def _segment_for_file(file_path: str, *texts: str) -> str:
-    """Return nearby plan text for a file path, stopping before the next file block."""
-    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:scripts|references|assets)/[A-Za-z0-9_./-]+|^\s*SKILL\.md"
+    """Return nearby plan text for a file path, stopping before the next file block.
+
+    Capability fields must be scoped to the concrete file block.  Earlier
+    versions fell back to the whole blueprint when a field was not found near
+    ``file_path``; that allowed global model notes in SKILL.md to leak into
+    deterministic builders such as ``scripts/build_pdf.py``.  The fallback is
+    now limited to the explicit per-file ``purpose`` text passed by the caller
+    (the first argument), never to the full blueprint/SKILL.md summary.
+    """
+    next_path_re = r"(?m)^\s*(?:[-*]\s*)?(?:(?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)"
     best = ""
+    saw_path = False
     for text in texts:
         text = text or ""
         for occurrence in re.finditer(re.escape(file_path), text):
+            saw_path = True
             after = text[occurrence.end():]
             next_match = re.search(next_path_re, after)
             segment = after[: next_match.start()] if next_match else after
@@ -221,7 +231,12 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
                 return segment
             if len(segment) > len(best):
                 best = segment
-    return best or "\n".join(texts)
+    if saw_path:
+        return best
+    # The first text is the caller-provided purpose, which is already a local
+    # per-file description.  Do not mine the full blueprint/SKILL.md for fields
+    # when it does not contain this file path.
+    return texts[0] if texts else ""
 
 
 def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
@@ -465,7 +480,12 @@ def build_skill_plan_entry(
     explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     role = classification.role
     role_reason = classification.reason
-    if file_type == "script" and explicit_required_capabilities and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities)):
+    if (
+        file_type == "script"
+        and explicit_required_capabilities
+        and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities))
+        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
+    ):
         role = "composite_generator"
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
@@ -484,7 +504,11 @@ def build_skill_plan_entry(
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
     required_capabilities = explicit_required_capabilities or default_required_capabilities
-    if file_type == "script" and {"text_generation", "image_generation"}.issubset(set(required_capabilities)):
+    if (
+        file_type == "script"
+        and {"text_generation", "image_generation"}.issubset(set(required_capabilities))
+        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
+    ):
         role = "composite_generator"
         default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
         if not explicit_required_capabilities:

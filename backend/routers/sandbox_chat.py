@@ -903,7 +903,32 @@ def _parse_schema_list_field(text: str, field: str) -> list[str]:
     if not match:
         return []
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
-    return [re.sub(r"[^A-Za-z0-9_./-]", "", item) for item in values if re.sub(r"[^A-Za-z0-9_./-]", "", item)]
+    cleaned: list[str] = []
+    for item in values:
+        # Keep only the JSON key.  Runtime contracts may annotate optional
+        # inputs as ``custom_character?`` or ``style (optional)``; those
+        # annotations must not become part of the argv key.
+        item = re.split(r"\s*(?:：|:|=|（|\(|\s)\s*", item, maxsplit=1)[0]
+        item = item.rstrip("?")
+        item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
+        if item:
+            cleaned.append(item)
+    return cleaned
+
+
+def _parse_optional_schema_inputs(text: str) -> list[str]:
+    """Extract optional JSON argv keys declared near an Action schema block."""
+    optional = set(_parse_schema_list_field(text, "optional_inputs"))
+    optional.update(_parse_schema_list_field(text, "optional inputs"))
+    inputs_match = re.search(_ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape("inputs")), text or "", re.I)
+    if inputs_match:
+        for raw_item in re.split(r"[,，、]\s*", inputs_match.group(1)):
+            if re.search(r"(?:\?|optional|可选|选填)", raw_item, re.I):
+                key = re.split(r"\s*(?:：|:|=|（|\(|\s)\s*", raw_item.strip().strip("'\""), maxsplit=1)[0].rstrip("?")
+                key = re.sub(r"[^A-Za-z0-9_./-]", "", key)
+                if key:
+                    optional.add(key)
+    return sorted(optional)
 
 
 def _block_context(text: str, block: MarkdownBlock) -> str:
@@ -932,6 +957,7 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
         role = role_match.group(1).lower() if role_match else "generic_script"
         inputs = _parse_schema_list_field(context, "inputs")
         outputs = _parse_schema_list_field(context, "outputs")
+        optional_inputs = _parse_optional_schema_inputs(context)
         required_capabilities = _parse_schema_list_field(context, "required_capabilities")
         forbidden_capabilities = _parse_schema_list_field(context, "forbidden_capabilities")
         command_keys = _command_json_argv_keys(command, script_path)
@@ -942,6 +968,7 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
             "source_path": source_path,
             "role": role,
             "inputs": inputs,
+            "optional_inputs": optional_inputs,
             "outputs": outputs,
             "required_capabilities": required_capabilities,
             "forbidden_capabilities": forbidden_capabilities,
@@ -979,12 +1006,16 @@ def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], li
             errors.append({"error": "未知 script role", "entry": entry})
         command_keys = set(entry.get("command_keys") or [])
         inputs = set(entry.get("inputs") or [])
-        if inputs and command_keys != inputs:
+        optional_inputs = set(entry.get("optional_inputs") or [])
+        required_inputs = inputs - optional_inputs
+        if inputs and not (required_inputs <= command_keys <= inputs):
             errors.append({
                 "error": "命令块 JSON keys 与 Action schema inputs 不一致",
                 "script_path": entry.get("script_path"),
                 "source_path": entry.get("source_path"),
                 "inputs": sorted(inputs),
+                "optional_inputs": sorted(optional_inputs),
+                "required_inputs": sorted(required_inputs),
                 "command_keys": sorted(command_keys),
             })
         if role == "generic_script" and set(entry.get("required_capabilities") or []) & _HIGH_IMPACT_CAPABILITIES:
@@ -1074,13 +1105,15 @@ def _validate_runtime_command_against_action_schema(command: str, *, execution_r
     if entry is None:
         raise ValueError(f"命令调用 {script_path}，但 SKILL.md/references 中没有唯一声明的执行入口")
     expected_keys = set(entry.get("inputs") or entry.get("command_keys") or [])
+    optional_keys = set(entry.get("optional_inputs") or [])
+    required_keys = expected_keys - optional_keys
     actual_keys = _command_json_argv_keys(command, script_path)
     if actual_keys is None:
         raise ValueError(f"命令 {script_path} 必须使用可解析 JSON argv")
-    if expected_keys and actual_keys != expected_keys:
+    if expected_keys and not (required_keys <= actual_keys <= expected_keys):
         raise ValueError(
             f"命令 {script_path} JSON keys 与 Action schema inputs 不一致："
-            f"expected={sorted(expected_keys)} actual={sorted(actual_keys)}"
+            f"expected={sorted(expected_keys)} optional={sorted(optional_keys)} actual={sorted(actual_keys)}"
         )
     return entry
 
@@ -1105,7 +1138,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder"}:
+        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator"}:
             raise ValueError("角色脚本 stdout 必须是 JSON object")
         return
     if not isinstance(payload, dict):
@@ -1115,7 +1148,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     required_capabilities = set(entry.get("required_capabilities") or [])
     outputs = set(entry.get("outputs") or [])
     if role == "composite_generator":
-        if ("text_generation" in required_capabilities or "text" in outputs) and not str(payload.get("text") or payload.get("markdown") or "").strip():
+        if ("text_generation" in required_capabilities or "text" in outputs or "story_text" in outputs) and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
             raise ValueError("composite_generator stdout JSON 缺少声明的 text/markdown 输出")
         if ("image_generation" in required_capabilities or {"image_path", "image_paths", "images"} & outputs) and not _payload_image_paths(payload):
             raise ValueError("composite_generator stdout JSON 缺少声明的 image_path/image_paths/images 输出")
@@ -1123,7 +1156,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
             raise ValueError("composite_generator stdout JSON 缺少声明的 pdf_path/file_paths 输出")
         if ("html_generation" in required_capabilities or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
-    if role == "text_generator" and not str(payload.get("text") or payload.get("markdown") or "").strip():
+    if role == "text_generator" and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
         raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
     if role == "image_generator" and not _payload_image_paths(payload):
         raise ValueError("image_generator stdout JSON 必须包含 image_path/image_paths/images")
@@ -1276,23 +1309,44 @@ def _final_instruction_requests_host_command(final_instruction: str) -> bool:
 
 
 def _extract_executable_command_blocks_from_text(text: str) -> list[str]:
-    """Extract host-executable script commands from shell fenced blocks.
+    """Extract host-executable script commands from final_instruction text.
 
-    The runtime planner may use ``final_instruction`` to tell the main response
-    path which concrete SKILL.md command block should be executed.  In execute
-    mode that instruction is not a final answer; if it already contains a
-    shell fenced block, the backend must execute it and use the real stdout
-    observation instead of allowing the LLM to claim success.
+    Prefer shell fenced blocks, but also accept a bare single-line command when
+    the planner returned ``final_instruction`` as plain text.  Every returned
+    command is still validated later against the current Skill's
+    ``available_scripts`` and Action schema before execution.
     """
     commands: list[str] = []
+    seen: set[str] = set()
+
+    def add(command: str) -> None:
+        command = (command or "").strip()
+        if not command or command in seen:
+            return
+        if not _COMMAND_BLOCK_CODE_RE.search(command):
+            return
+        seen.add(command)
+        commands.append(command)
+
     for block in _extract_all_fenced_blocks(text or ""):
         lang = (block.lang or "").lower()
         command = (block.code or "").strip()
         if lang not in _COMMAND_BLOCK_LANGS or not command:
             continue
-        if not _COMMAND_BLOCK_CODE_RE.search(command):
+        add(command)
+
+    # Some planners put the SKILL.md command example directly in
+    # final_instruction instead of wrapping it in a fenced block.  Only accept
+    # self-contained command-looking lines; prose remains ignored.
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        line = re.sub(r"^(?:[-*]\s+|\$\s+)", "", line)
+        if not line or line.startswith("```"):
             continue
-        commands.append(command)
+        if not re.match(r"^(?:python(?:3)?|node|bash|sh)\s+", line):
+            continue
+        add(line)
+
     return commands
 
 
@@ -1324,10 +1378,11 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
         "2. resource_catalog 和 available_scripts 只包含当前业务 Skill 目录内真实存在的 skill-local resources；kernel references 不会暴露给运行时，不能读取或引用。\n"
         "不能用它们推导、补全或发明命令参数。\n"
-        "3. 是否执行命令，必须由后续主模型回复里的显式可执行 fenced code block 触发；"
-        "不要因为磁盘上存在脚本就直接规划 run_command，也不要让主模型临时拼接 Skill.md 中没有声明的命令。\n"
+        "3. 是否执行命令，必须由 SKILL.md/references Action schema 中的显式 shell fenced 命令示例触发；"
+        "不要因为磁盘上存在脚本就直接规划 run_command，也不要临时拼接 Skill.md 中没有声明的命令。\n"
         "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
-        "但不要在本轮规划 run_command、write_file 或 create_directory。\n"
+        "需要执行脚本时，把替换真实参数后的完整命令放入 final_instruction 的 shell fenced block；"
+        "不要在 actions 中规划 run_command、write_file 或 create_directory。\n"
         "5. 如果任务需要运行 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求调用脚本，"
         "只有在 SKILL.md 或其明确引用的 references 中已经包含具体 shell fenced 命令示例、且宿主 Action schema 校验通过时，才可使用 mode=direct_answer 并让主模型按该示例替换真实参数。\n"
         "6. 如果 Skill.md/reference 只写了 `scripts/...` 行内路径、‘调用脚本’等自然语言，但没有具体 fenced 命令示例，"
@@ -1346,15 +1401,15 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- read_resource：读取 resource_catalog 中的资源，只能传 resource_handle。\n"
         "- display / ignore：展示或忽略。\n"
         "禁止的 action：run_command、write_file、create_directory；这些只能由后续主模型显式 fenced block 触发。\n\n"
-        "显式可执行块触发规则（给 final_instruction 使用）：\n"
+        "显式可执行 fenced code block 触发规则（给 final_instruction 使用）：\n"
         "- 需要执行命令时，只能要求主模型复用 Action schema 中来自 SKILL.md/references 的具体 shell fenced 命令示例，"
         "替换用户真实参数后输出；禁止从 available_scripts 或脚本文件名临时发明 CLI 参数。\n"
         "- 需要写文件时，要求主模型在代码块前写 `写入文件：<path>` 或 `保存到：<path>`，"
         "文件内容必须放在紧随其后的 fenced code block 内。\n"
-        "- 后端只执行主模型回复中已经出现的 fenced block；资源存在性只做安全校验，不做触发条件。\n\n"
+        "- 后端只执行 final_instruction 或主模型回复中已经出现、且通过 available_scripts 与 Action schema 校验的命令；资源存在性只做安全校验，不做触发条件。\n\n"
         "mode 选择规则：\n"
         "- direct_answer：主模型继续生成最终回复；如果需要动作，也必须在该回复中输出显式 fenced block 供后端识别执行。\n"
-        "- execute：只用于 read_resource/display/ignore 这类宿主受控动作；不得包含 run_command/write_file/create_directory。\n"
+        "- execute：用于 read_resource/display/ignore 这类宿主受控动作；若 final_instruction 含合法命令，宿主会在前置动作后执行该命令。\n"
         "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "输出格式：\n"
@@ -1369,7 +1424,7 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "  ],\n"
         "  \"missing\": [],\n"
         "  \"errors\": [],\n"
-        "  \"final_instruction\": \"direct_answer 时给主模型的执行提示；需要动作时只能引用 SKILL.md 中已有 Markdown 命令示例\"\n"
+        "  \"final_instruction\": \"需要执行脚本时放入替换真实参数后的 shell fenced 命令；只能引用 SKILL.md/references 中已有命令示例\"\n"
         "}\n"
     )
 
@@ -2819,6 +2874,9 @@ def _validate_structured_stdout_payload(payload: dict) -> None:
     if "text" in payload and not isinstance(payload.get("text"), str):
         raise ValueError("stdout JSON 字段 text 必须是字符串")
 
+    if "story_text" in payload and not isinstance(payload.get("story_text"), str):
+        raise ValueError("stdout JSON 字段 story_text 必须是字符串")
+
     if "image_paths" in payload:
         image_paths = payload.get("image_paths")
         if not isinstance(image_paths, list):
@@ -2862,7 +2920,7 @@ def _validate_success_stdout_json_if_structured(stdout: str) -> None:
         return
     if "error" in payload:
         raise ValueError("stdout JSON 不得包含 error 字段")
-    if any(key in payload for key in ("text", "image_paths", "images")):
+    if any(key in payload for key in ("text", "story_text", "image_paths", "images")):
         _validate_structured_stdout_payload(payload)
 
 
@@ -2914,7 +2972,7 @@ def _render_success_stdout_payload(result: dict) -> str | None:
             _validate_structured_stdout_payload(payload)
         except ValueError:
             continue
-        text = str(payload.get("text") or payload.get("markdown") or "").strip()
+        text = str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip()
         image_paths = _payload_image_paths(payload)
         parts: list[str] = []
         if text:
@@ -3311,7 +3369,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         },
                     )
 
-                    if mode == "execute" and tasks:
+                    _planned_followup_commands = _extract_executable_command_blocks_from_text(
+                        str(runtime_plan.get("final_instruction") or "")
+                    )
+
+                    if mode == "execute" and (tasks or _planned_followup_commands):
                         # Set up shared execution context for the per-task loop.
                         _exec_inferred_root = _infer_skill_root_from_tasks(
                             runtime_plan, execution_root=execution_root
@@ -3429,9 +3491,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         # If the planner's final_instruction already contains a
                         # concrete SKILL.md command block, execute it now and use
                         # its real stdout JSON as the final observation.
-                        _followup_commands = _extract_executable_command_blocks_from_text(
-                            str(runtime_plan.get("final_instruction") or "")
-                        )
+                        _followup_commands = list(_planned_followup_commands)
                         for command in _followup_commands:
                             script_path = _extract_script_path_from_command(command) or ""
                             available_scripts = set(_available_scripts_for_root(execution_root))

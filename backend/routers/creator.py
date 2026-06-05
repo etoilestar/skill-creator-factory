@@ -321,7 +321,7 @@ def _skill_plan_entry_for_file(
     """
     if skill_plan_entry and skill_plan_entry.get("path") == file_path:
         explicit_role = str(skill_plan_entry.get("role") or role or "").strip()
-        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
+        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
         if explicit_role in allowed_roles:
             required_capabilities = list(
                 skill_plan_entry.get("required_capabilities") or capabilities_for_role(explicit_role)[0]
@@ -372,7 +372,7 @@ def _skill_plan_entry_for_file(
             purpose=purpose,
             blueprint_summary=blueprint_text[:4000],
         )
-        if role in {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
+        if role in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
             inputs, outputs = default_io_for_role(role)
             required_capabilities, forbidden_capabilities = capabilities_for_role(role)
             forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
@@ -1181,7 +1181,7 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         "execution": bool(re.search(r"(?im)^#{1,3}.*(执行|命令|步骤|Execution|Commands?)", stripped)) or "```bash" in stripped,
         "role_constraints": bool(re.search(r"(?im)^#{1,3}.*(角色|能力|禁止|Role|Capabilities?)", stripped)),
     }
-    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
+    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
     role_sections_ok = (not role_section_required) or all(role_sections.values())
     missing_role_sections = [name for name, present in role_sections.items() if not present]
     results.append(ContractCheckResult(
@@ -1269,7 +1269,7 @@ def _declared_list_in_text(field_name: str, content: str) -> list[str] | None:
 
 
 def _declared_role_in_text(content: str) -> str | None:
-    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|generic_script)", content or "", re.I | re.M)
+    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)", content or "", re.I | re.M)
     return match.group(1) if match else None
 
 
@@ -1506,6 +1506,8 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
         return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
+    if capability == "html_generation":
+        return bool(re.search(r"html_path|asset_paths|<html|<!DOCTYPE html|assets/generated", content, re.IGNORECASE))
     if capability == "file_output":
         return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf_path|file_paths", content, re.IGNORECASE))
     return True
@@ -2121,6 +2123,46 @@ def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
     return False
 
 
+
+def _html_output_candidates(payload: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    html_path = payload.get("html_path")
+    if isinstance(html_path, str) and html_path.strip():
+        candidates.append(html_path.strip())
+    asset_paths = payload.get("asset_paths")
+    if isinstance(asset_paths, list):
+        candidates.extend(path.strip() for path in asset_paths if isinstance(path, str) and path.strip())
+    return candidates
+
+
+def _validate_html_trial_outputs(payload: dict[str, Any], *, skill_dir: Path | None, args: list[str], stdout: str) -> None:
+    checked: list[Path] = []
+    for candidate in _html_output_candidates(payload):
+        candidate_path = Path(candidate)
+        if not candidate_path.is_absolute() and skill_dir is not None:
+            if candidate.startswith("assets/"):
+                candidate_path = (skill_dir / candidate_path).resolve()
+            else:
+                candidate_path = (skill_dir / "scripts" / candidate_path).resolve()
+        checked.append(candidate_path)
+        if skill_dir is not None:
+            generated_root = (skill_dir / "assets" / "generated").resolve()
+            try:
+                candidate_path.relative_to(generated_root)
+            except ValueError:
+                raise ValueError(
+                    "html_asset_builder 输出路径必须位于当前 Skill 的 assets/generated/ 下："
+                    f"argv={args!r} stdout={stdout[-4000:]} checked={candidate_path}"
+                )
+        if candidate_path.is_file() and candidate_path.suffix.lower() in {".html", ".htm"}:
+            text = candidate_path.read_text(encoding="utf-8", errors="replace").lower()
+            if "<html" in text or "<!doctype html" in text:
+                return
+    raise ValueError(
+        "html_asset_builder 试运行必须输出 html_path 或 asset_paths，并生成真实 HTML 文件："
+        f"argv={args!r} stdout={stdout[-4000:]} checked={[str(p) for p in checked]}"
+    )
+
 def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
     pdf_path = payload.get("pdf_path")
     if isinstance(pdf_path, str) and pdf_path.strip():
@@ -2187,6 +2229,9 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         if not _validate_file_payload_shape(payload):
             raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
         _validate_pdf_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
+
+    if plan_entry and (plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or [])):
+        _validate_html_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
 
     if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
         raise ValueError(
@@ -3060,6 +3105,44 @@ def _script_generation_skeleton(
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
             f"python -c {shlex.quote(helper)} \"$payload_json\""
+        )
+
+
+    if plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or []):
+        return (
+            "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 assets/generated/ 下写入 HTML，并在 stdout JSON 返回 html_path 与 asset_paths：\n"
+            "import html\n"
+            "import json\n"
+            "import re\n"
+            "import sys\n"
+            "from pathlib import Path\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def slugify(value: str) -> str:\n"
+            "    slug = re.sub(r'[^A-Za-z0-9_-]+', '-', value).strip('-').lower()\n"
+            "    return slug or 'generated'\n\n"
+            "def build_html(payload: dict) -> str:\n"
+            f"    text = str({py_value_expr} or 'Generated HTML').strip()\n"
+            "    safe = html.escape(text)\n"
+            "    return '<!doctype html><html><head><meta charset=\"utf-8\"><title>Generated</title></head><body><main><h1>Generated Asset</h1><p>' + safe + '</p></main></body></html>'\n\n"
+            "def run(payload: dict) -> dict:\n"
+            f"    title = str({py_value_expr} or 'generated').strip()\n"
+            "    skill_root = Path(__file__).resolve().parents[1]\n"
+            "    out_dir = (skill_root / 'assets' / 'generated').resolve()\n"
+            "    required_root = (skill_root / 'assets' / 'generated').resolve()\n"
+            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
+            "    html_path = (out_dir / (slugify(title) + '.html')).resolve()\n"
+            "    html_path.relative_to(required_root)\n"
+            "    html_path.write_text(build_html(payload), encoding='utf-8')\n"
+            "    rel = html_path.relative_to(skill_root).as_posix()\n"
+            "    return {'html_path': rel, 'asset_paths': [rel]}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
         )
 
     if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):

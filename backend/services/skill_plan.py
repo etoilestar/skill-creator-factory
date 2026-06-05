@@ -16,7 +16,7 @@ from typing import Literal
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script"]
+ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
 
@@ -24,6 +24,8 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "text_generator",
     "image_generator",
     "pdf_builder",
+    "html_asset_builder",
+    "asset_builder",
     "composite_generator",
     "generic_script",
 })
@@ -162,7 +164,7 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|generic_script)",
+    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)",
     re.I,
 )
 
@@ -379,6 +381,8 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["topic", "prompt", "text"], ["text", "image_paths", "images", "text_with_image_prompts"]
     if role == "pdf_builder":
         return ["text", "image_paths", "template_path"], ["pdf_path", "file_paths"]
+    if role in {"html_asset_builder", "asset_builder"}:
+        return ["topic", "text", "html"], ["html_path", "asset_paths"]
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
@@ -397,6 +401,8 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
         return ["pdf_generation", "file_output"], ["image_generation"]
+    if role in {"html_asset_builder", "asset_builder"}:
+        return ["html_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role == "reference":
         return ["reference_guidance"], ["runtime_execution", "image_generation"]
     if role == "asset":

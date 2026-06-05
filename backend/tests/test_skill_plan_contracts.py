@@ -856,3 +856,32 @@ description: demo
     failed = {result.id for result in _check_skill_md_contract(skill_md, skill_md) if not result.passed}
 
     assert "skill_md.resource.no_kernel_leak" in failed
+
+
+def test_html_asset_builder_plan_skeleton_and_trial_validation(tmp_path):
+    from backend.routers.creator import _script_generation_skeleton, _validate_trial_stdout_json
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/build_html.py",
+        purpose="role: html_asset_builder inputs: topic outputs: html_path, asset_paths required_capabilities: html_generation, file_output",
+    )
+    skeleton = _script_generation_skeleton("scripts/build_html.py", "", "", skill_plan_entry=entry.__dict__)
+
+    assert entry.role == "html_asset_builder"
+    assert entry.outputs == ["html_path", "asset_paths"]
+    assert "assets/generated" in skeleton
+    assert "html_path" in skeleton
+
+    skill_dir = tmp_path / "html-skill"
+    html_file = skill_dir / "assets" / "generated" / "demo.html"
+    html_file.parent.mkdir(parents=True)
+    html_file.write_text("<!doctype html><html><body>demo</body></html>", encoding="utf-8")
+    _validate_trial_stdout_json(
+        stdout=__import__("json").dumps({"html_path": "assets/generated/demo.html", "asset_paths": ["assets/generated/demo.html"]}),
+        content="html_path = 'assets/generated/demo.html'\nPath('assets/generated/demo.html').write_text('<html></html>')",
+        args=['{"topic":"demo"}'],
+        role="html_asset_builder",
+        skill_plan_entry=entry.__dict__,
+        skill_dir=skill_dir,
+    )

@@ -33,6 +33,22 @@ from ..services.model_router import (
     route_model,
 )
 from ..services.skill_manager import get_execution_skill_dir
+from ..services.skill_dataflow import (
+    LoopExpansionError,
+    MissingVariablesError,
+    collect_loop_outputs,
+    expand_step_contexts,
+    extract_inline_context_values,
+    extract_placeholders,
+    initial_context_from_entries,
+    merge_step_output as merge_dataflow_step_output,
+    missing_placeholders,
+    parse_schema_default_values,
+    parse_stdout_context,
+    parse_schema_input_item,
+    placeholder_pattern,
+    replace_placeholders_in_value,
+)
 from ..services.artifact_validator import FileOutputValidationError, declared_artifact_paths, validate_stdout_file_outputs
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
@@ -853,7 +869,7 @@ _HOST_COMMAND_INSTRUCTION_RE = re.compile(
 _SKILL_LOCAL_RESOURCE_RE = re.compile(r"(?<![\w./-])(?P<path>(?:scripts|references|assets)/[A-Za-z0-9_./-]+)")
 _ACTION_SCHEMA_FIELD_RE = re.compile(r"(?<![A-Za-z0-9_])(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
 _ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", re.I)
-_RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
+_RUNTIME_PLACEHOLDER_RE = placeholder_pattern()
 _SCRIPT_ROLES = {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"}
 _HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "docx_generation", "pptx_generation", "html_generation", "html_asset_generation"}
 
@@ -909,83 +925,11 @@ def _parse_schema_list_field(text: str, field: str) -> list[str]:
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
     cleaned: list[str] = []
     for item in values:
-        key, _default = _parse_schema_input_item(item)
+        key, _default = parse_schema_input_item(item)
         if key:
             cleaned.append(key)
     return cleaned
 
-
-def _parse_schema_input_item(item: str) -> tuple[str, object | None]:
-    """Return the normalized input key and any inline default value.
-
-    Supported Action schema forms include ``chapter_count=3``,
-    ``chapter_count: 3``, ``chapter_count (default: 3)`` and
-    ``target_audience（默认：小学生）``.
-    """
-    raw = (item or "").strip().strip("'\"")
-    if not raw:
-        return "", None
-
-    default: object | None = None
-    default_match = re.search(
-        r"(?:\(|（)\s*(?:default|默认值?|缺省值?)\s*(?:[:：=])\s*([^()（）]+?)\s*(?:\)|）)",
-        raw,
-        re.I,
-    )
-    if default_match:
-        default = _coerce_workflow_default_value(default_match.group(1).strip())
-        raw = (raw[:default_match.start()] + raw[default_match.end():]).strip()
-
-    inline_match = re.match(
-        r"^\s*([A-Za-z_][\w./-]*)\??\s*(?:[:：=])\s*(.+?)\s*$",
-        raw,
-    )
-    if inline_match:
-        key = inline_match.group(1).rstrip("?")
-        if default is None:
-            default = _coerce_workflow_default_value(inline_match.group(2).strip())
-        return re.sub(r"[^A-Za-z0-9_./-]", "", key), default
-
-    key = re.split(r"\s*(?:：|:|=|（|\(|\s)\s*", raw, maxsplit=1)[0]
-    key = re.sub(r"[^A-Za-z0-9_./-]", "", key.rstrip("?"))
-    return key, default
-
-
-def _coerce_workflow_default_value(value: str) -> object:
-    cleaned = (value or "").strip().strip("'\"")
-    if cleaned == "":
-        return ""
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    if re.fullmatch(r"-?\d+", cleaned):
-        return int(cleaned)
-    if re.fullmatch(r"-?\d+\.\d+", cleaned):
-        return float(cleaned)
-    lowered = cleaned.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    return cleaned
-
-
-def _parse_schema_default_values(text: str) -> dict[str, object]:
-    defaults: dict[str, object] = {}
-    inputs_match = re.search(_ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape("inputs")), text or "", re.I)
-    if inputs_match:
-        for raw_item in re.split(r"[,，、]\s*", inputs_match.group(1)):
-            key, default = _parse_schema_input_item(raw_item)
-            if key and default is not None:
-                defaults[key] = _coerce_workflow_value_for_key(key, default)
-
-    for field in ("defaults", "default_values", "默认值", "默认参数"):
-        pattern = _ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape(field))
-        for match in re.finditer(pattern, text or "", re.I):
-            for raw_item in re.split(r"[,，、]\s*", match.group(1)):
-                key, default = _parse_schema_input_item(raw_item)
-                if key and default is not None:
-                    defaults[key] = _coerce_workflow_value_for_key(key, default)
-    return defaults
 
 
 def _parse_optional_schema_inputs(text: str) -> list[str]:
@@ -1036,7 +980,7 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
         inputs = _parse_schema_list_field(context, "inputs")
         outputs = _parse_schema_list_field(context, "outputs")
         optional_inputs = _parse_optional_schema_inputs(context)
-        default_values = _parse_schema_default_values(context)
+        default_values = parse_schema_default_values(context, field_pattern_factory=lambda field: _ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape(field)))
         required_capabilities = _parse_schema_list_field(context, "required_capabilities")
         forbidden_capabilities = _parse_schema_list_field(context, "forbidden_capabilities")
         command_keys = _command_json_argv_keys(command, script_path)
@@ -1465,7 +1409,7 @@ def _should_force_skill_workflow(*, command_contract: dict, user_text: str = "")
     artifact_declared = bool(
         roles & artifact_roles
         or re.search(
-            r"(?i)(image_paths?|pdf_path|docx_path|pptx_path|html_path|file_paths?|asset_paths?|\.pdf|\.png|\.jpg|\.docx|\.pptx)",
+            r"(?i)(\.pdf|\.png|\.jpe?g|\.gif|\.webp|\.docx|\.pptx|\.xlsx|\.html?)",
             output_text + "\n" + commands_text,
         )
     )
@@ -2530,148 +2474,19 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
     return output_files
 
 
-_CHINESE_DIGITS = {
-    "零": 0,
-    "一": 1,
-    "二": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-    "十": 10,
-}
-
-
-
-
-def _workflow_default_context_from_entries(entries: list[dict]) -> dict:
-    """Collect SKILL.md-declared default input values for workflow execution."""
-    defaults: dict = {}
-    for entry in entries:
-        entry_defaults = entry.get("default_values") or {}
-        if not isinstance(entry_defaults, dict):
-            continue
-        for key, value in entry_defaults.items():
-            key_text = str(key or "").strip()
-            if key_text:
-                defaults[key_text] = _coerce_workflow_value_for_key(key_text, value)
-    return defaults
 
 def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
-    """Infer initial placeholders needed by the first workflow script from user text."""
-    context: dict = {}
+    """Build generic user-provided context without business field inference."""
     text = (user_text or "").strip()
     if not text:
-        return context
-
-    context.update({"user_request": text, "input": text, "topic": text})
-    context.update(_extract_inline_workflow_values(text))
-
-    first_keys = set(first_entry.get("placeholder_keys") or []) | set(first_entry.get("inputs") or [])
-    for key in sorted(first_keys):
-        if key in context:
-            context[key] = _coerce_workflow_value_for_key(key, context[key])
-            continue
-        inferred = _infer_workflow_value_for_key(key, text)
-        if inferred is not None:
-            context[key] = _coerce_workflow_value_for_key(key, inferred)
+        return {}
+    context = {"user_request": text, "input": text, "text": text}
+    context.update(extract_inline_context_values(text))
     return context
 
 
-def _extract_inline_workflow_values(user_text: str) -> dict:
-    values: dict = {}
-    # Accept direct user-supplied key/value pairs such as
-    # ``story_theme: ...`` or JSON snippets without asking the LLM to parse them.
-    try:
-        maybe_json = json.loads(user_text)
-    except json.JSONDecodeError:
-        maybe_json = None
-    if isinstance(maybe_json, dict):
-        values.update(maybe_json)
-
-    for match in re.finditer(
-        r"(?P<key>[A-Za-z_][\w-]*)\s*[：:=]\s*(?P<value>[^，。\n,;；]+)",
-        user_text,
-    ):
-        values[match.group("key")] = match.group("value").strip()
-    return values
-
-
-def _coerce_workflow_value_for_key(key: str, value: object) -> object:
-    lowered = key.lower()
-    if any(token in lowered for token in ("count", "num", "number", "total")):
-        if isinstance(value, int):
-            return value
-        match = re.search(r"\d+", str(value))
-        if match:
-            return int(match.group(0))
-    return value
-
-
-def _infer_workflow_value_for_key(key: str, user_text: str) -> object | None:
-    lowered = key.lower()
-    if any(token in lowered for token in ("count", "num", "number", "total")):
-        return _extract_count_from_user_text(user_text)
-    if "audience" in lowered or "reader" in lowered or "target" in lowered or "受众" in key:
-        return _extract_target_audience_from_user_text(user_text)
-    if any(token in lowered for token in ("theme", "topic", "subject", "title", "prompt")) or "主题" in key:
-        return _extract_theme_from_user_text(user_text) or user_text
-    if lowered in {"input", "request", "user_request", "text"}:
-        return user_text
-    return None
-
-
-def _extract_count_from_user_text(user_text: str) -> int | None:
-    patterns = (
-        r"(?:chapter_count|章节数|章数|章节|共)\s*[：:=]?\s*(\d+)",
-        r"(\d+)\s*(?:章|章节|节|个章节|部分|段)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, user_text, re.I)
-        if match:
-            return int(match.group(1))
-    match = re.search(r"([一二两三四五六七八九十])\s*(?:章|章节|节|个章节|部分|段)", user_text)
-    if match:
-        return _CHINESE_DIGITS.get(match.group(1))
-    return None
-
-
-def _extract_target_audience_from_user_text(user_text: str) -> str | None:
-    patterns = (
-        r"(?:target_audience|受众|目标读者|读者对象|面向对象)\s*[：:=]\s*([^，。\n,;；]+)",
-        r"(?:面向|适合|给)\s*([^，。\n,;；的]{1,24})(?:的)?(?:读者|受众|观众|儿童|孩子|小朋友|学生)?",
-        r"为\s*([^，。\n,;；的]{1,24})(?:读者|受众|观众|儿童|孩子|小朋友|学生)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, user_text, re.I)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                return value
-    return None
-
-
-def _extract_theme_from_user_text(user_text: str) -> str | None:
-    patterns = (
-        r"(?:story_theme|主题|题材)\s*[：:=]\s*([^，。\n,;；]+)",
-        r"以\s*([^，。\n,;；]{1,60})\s*为(?:主题|题材|主线)",
-        r"关于\s*([^，。\n,;；]{1,60})(?:的|，|。|,|$)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, user_text, re.I)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                return value
-    return None
-
-
 def _missing_workflow_placeholders(entry: dict, context: dict) -> list[str]:
-    return sorted(key for key in (entry.get("placeholder_keys") or []) if key not in context)
+    return missing_placeholders(entry.get("placeholder_keys") or [], context)
 
 
 def _json_arg_index(parts: list[str], script_path: str) -> int | None:
@@ -2683,46 +2498,16 @@ def _json_arg_index(parts: list[str], script_path: str) -> int | None:
 
 
 def _placeholder_keys_in_value(value: object) -> set[str]:
-    keys: set[str] = set()
-    if isinstance(value, str):
-        keys.update(_RUNTIME_PLACEHOLDER_RE.findall(value))
-    elif isinstance(value, list):
-        for item in value:
-            keys.update(_placeholder_keys_in_value(item))
-    elif isinstance(value, dict):
-        for item in value.values():
-            keys.update(_placeholder_keys_in_value(item))
-    return keys
+    return extract_placeholders(value)
 
 
 def _missing_placeholder_keys(keys: set[str], context: dict) -> list[str]:
-    return sorted(key for key in keys if key not in context)
+    return missing_placeholders(keys, context)
 
 
 def _replace_placeholders_in_value(value: object, context: dict) -> object:
-    if isinstance(value, str):
-        exact = _RUNTIME_PLACEHOLDER_RE.fullmatch(value.strip())
-        if exact:
-            key = exact.group(1)
-            if key not in context:
-                raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
-            return context[key]
+    return replace_placeholders_in_value(value, context)
 
-        def repl(match: re.Match) -> str:
-            key = match.group(1)
-            if key not in context:
-                raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
-            replacement = context[key]
-            if isinstance(replacement, (dict, list)):
-                return json.dumps(replacement, ensure_ascii=False)
-            return str(replacement)
-
-        return _RUNTIME_PLACEHOLDER_RE.sub(repl, value)
-    if isinstance(value, list):
-        return [_replace_placeholders_in_value(item, context) for item in value]
-    if isinstance(value, dict):
-        return {key: _replace_placeholders_in_value(item, context) for key, item in value.items()}
-    return value
 
 
 def render_command_template(command: str, context: dict) -> str:
@@ -2773,80 +2558,19 @@ def _parse_stdout_json(stdout: str) -> dict:
 
 
 def merge_step_output(context: dict, script_path: str, stdout_json: dict) -> dict:
-    """Merge one script stdout JSON into flat and script-name namespaced context."""
-    if not isinstance(stdout_json, dict):
-        return context
-    context.update(stdout_json)
-    namespace = Path(script_path).stem
-    if namespace:
-        context[namespace] = stdout_json
-    return context
+    """Merge one script stdout JSON into workflow context."""
+    return merge_dataflow_step_output(context, script_path, stdout_json)
 
-
-def _chapter_text_from_item(item: object) -> str:
-    if isinstance(item, dict):
-        for key in ("content", "text", "story_text", "chapter_text", "body"):
-            value = item.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-        return json.dumps(item, ensure_ascii=False)
-    return str(item)
-
-
-def _collect_path_values(payload: dict) -> list[str]:
-    paths: list[str] = []
-    def walk(value: object) -> None:
-        if isinstance(value, str) and Path(value).suffix.lower() in {
-            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".docx", ".pptx", ".html", ".htm"
-        }:
-            paths.append(value)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                walk(item)
-    walk(payload)
-    return paths
 
 
 def _workflow_step_contexts(entry: dict, context: dict) -> list[dict]:
-    placeholders = set(entry.get("placeholder_keys") or [])
-    if "chapter_text" not in placeholders:
-        return [context]
-    chapters = context.get("chapter_list")
-    if not isinstance(chapters, list) or not chapters:
-        chapters = context.get("chapters")
-    if not isinstance(chapters, list) or not chapters:
-        raise ValueError(
-            f"dataflow_mismatch: {entry.get('script_path')} 需要 {{chapter_text}}，但前序步骤没有产生 chapter_list/chapters list"
-        )
-    contexts: list[dict] = []
-    for idx, chapter in enumerate(chapters, start=1):
-        child_context = dict(context)
-        child_context["chapter"] = chapter
-        child_context["chapter_index"] = idx
-        child_context["chapter_text"] = _chapter_text_from_item(chapter)
-        if isinstance(chapter, dict) and isinstance(chapter.get("title"), str):
-            child_context["chapter_title"] = chapter["title"]
-        contexts.append(child_context)
-    return contexts
+    return expand_step_contexts(entry, context)
+
 
 
 def _workflow_output_summary(results: list[dict], output_files: list[dict]) -> str:
     successful = [r for r in results if r.get("success", True)]
-    image_count = 0
-    pdf_paths: list[str] = []
-    for result in results:
-        payload = _parse_stdout_json(str(result.get("stdout") or ""))
-        paths = _collect_path_values(payload)
-        image_count += len([p for p in paths if Path(p).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}])
-        pdf_paths.extend(p for p in paths if Path(p).suffix.lower() == ".pdf")
     lines = [f"workflow 执行成功：{len(successful)} 个步骤"]
-    if image_count:
-        lines.append(f"插图生成成功：{image_count} 张")
-    if pdf_paths:
-        lines.append("PDF 生成成功：" + ", ".join(pdf_paths))
     if output_files:
         lines.append("产物路径：" + ", ".join(item.get("path", "") for item in output_files if item.get("path")))
     return "\n".join(lines)
@@ -2873,9 +2597,7 @@ async def _execute_skill_workflow(
     available_scripts = set(_available_scripts_for_root(root))
     req = request or ChatRequest(messages=[])
     user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
-    context = _workflow_default_context_from_entries(entries)
-    context.update(_workflow_context_from_request_text(user_text, entries[0]))
-    context.update(user_context or {})
+    context = initial_context_from_entries(entries, user_text=user_text, user_context=user_context or {})
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
     results: list[dict] = []
     touched: list[Path] = []
@@ -2892,15 +2614,25 @@ async def _execute_skill_workflow(
             if missing_initial:
                 needed = ", ".join(f"{{{{{key}}}}}" for key in missing_initial)
                 raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。")
-        step_contexts = _workflow_step_contexts(entry, context)
+        try:
+            step_contexts = _workflow_step_contexts(entry, context)
+        except LoopExpansionError as exc:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
+            raise ValueError(f"循环变量无法展开：{script_path} 需要 {needed}，但 context 中没有可展开的列表变量。") from exc
+        except MissingVariablesError as exc:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
+            if entry_index == 0:
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入或 SKILL.md 默认值中没有对应变量。") from exc
+            raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，但前序步骤没有产生对应变量。") from exc
         step_payloads: list[dict] = []
         for step_context in step_contexts:
             try:
                 command = render_command_template(command_template, step_context)
             except ValueError as exc:
-                needed = ", ".join(f"{{{{{key}}}}}" for key in (entry.get("placeholder_keys") or []))
+                missing = getattr(exc, "missing", None) or (entry.get("placeholder_keys") or [])
+                needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
                 if entry_index == 0:
-                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。{exc}") from exc
+                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入或 SKILL.md 默认值中没有对应变量。{exc}") from exc
                 raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，但前序步骤没有产生对应变量。{exc}") from exc
             result, task_touched = await asyncio.to_thread(
                 functools.partial(
@@ -2921,20 +2653,14 @@ async def _execute_skill_workflow(
                 raise ValueError(
                     f"workflow_step_failed: {script_path} returncode={result.get('returncode')} stderr={(result.get('stderr') or '').strip()}"
                 )
-            payload = _parse_stdout_json(str(result.get("stdout") or ""))
+            try:
+                payload = parse_stdout_context(str(result.get("stdout") or ""))
+            except ValueError as exc:
+                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout 必须是 JSON object。{exc}") from exc
             step_payloads.append(payload)
             merge_step_output(context, script_path, payload)
         if len(step_contexts) > 1:
-            collected_image_paths: list[str] = []
-            for payload in step_payloads:
-                image_paths = payload.get("image_paths")
-                if isinstance(image_paths, list):
-                    collected_image_paths.extend(path for path in image_paths if isinstance(path, str))
-                image_path = payload.get("image_path")
-                if isinstance(image_path, str):
-                    collected_image_paths.append(image_path)
-            if collected_image_paths:
-                context["image_paths"] = collected_image_paths
+            merge_step_output(context, script_path, collect_loop_outputs(step_payloads, entry))
 
     dedup_output_files: list[dict] = []
     seen_outputs: set[str] = set()

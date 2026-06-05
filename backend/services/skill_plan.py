@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Literal
+from .skill_dataflow import parse_schema_input_item
+
 
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
@@ -79,6 +81,7 @@ class SkillPlanEntry:
     purpose: str
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
+    default_values: dict[str, object] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)
@@ -270,6 +273,26 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
             cleaned.append(item)
     return cleaned
 
+
+
+def _explicit_default_values(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> dict[str, object]:
+    """Extract structured input defaults from local plan text without role heuristics."""
+    segment = _segment_for_file(file_path, purpose, blueprint_summary)
+    defaults: dict[str, object] = {}
+    inputs_match = re.search(r"(?:inputs|inputs)\s*[：:=]\s*\[?([^\]\n;]+)\]?", segment, re.I)
+    if inputs_match:
+        for raw_item in re.split(r"[,，、]\s*", inputs_match.group(1)):
+            key, default = parse_schema_input_item(raw_item)
+            if key and default is not None:
+                defaults[key] = default
+    for field_name in ("defaults", "default_values", "默认值", "默认参数"):
+        pattern = re.compile(rf"(?:{re.escape(field_name)}|{re.escape(field_name.replace('_', ' '))})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
+        for match in pattern.finditer(segment):
+            for raw_item in re.split(r"[,，、]\s*", match.group(1)):
+                key, default = parse_schema_input_item(raw_item)
+                if key and default is not None:
+                    defaults[key] = default
+    return defaults
 
 
 
@@ -521,6 +544,7 @@ def build_skill_plan_entry(
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     default_inputs, default_outputs = default_io_for_role(role)
     inputs = explicit_inputs or default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
@@ -573,6 +597,7 @@ def build_skill_plan_entry(
         purpose=purpose,
         inputs=inputs,
         outputs=outputs,
+        default_values=explicit_default_values,
         dependencies=dependencies,
         required_capabilities=required_capabilities,
         optional_capabilities=optional_capabilities,

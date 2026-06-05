@@ -272,3 +272,88 @@ python scripts/generate.py '{"topic":"狐狸"}'
 
     assert "Story about 狐狸" in answer
     assert "/api/skills/story-skill/files/assets/generated/story.png" in answer
+
+
+def test_final_instruction_accepts_plain_single_line_command():
+    from backend.routers.sandbox_chat import _extract_executable_command_blocks_from_text
+
+    final_instruction = "请执行下面命令：\npython scripts/generate.py '{\"topic\":\"狐狸\"}'\n完成后使用 stdout JSON。"
+
+    assert _extract_executable_command_blocks_from_text(final_instruction) == [
+        "python scripts/generate.py '{\"topic\":\"狐狸\"}'"
+    ]
+
+
+def test_runtime_optional_inputs_may_be_omitted_or_empty(tmp_path):
+    from backend.routers.sandbox_chat import _validate_runtime_command_against_action_schema
+
+    skill_md = """---
+name: optional-skill
+description: demo
+---
+role: composite_generator
+inputs: topic, style, custom_character?
+optional_inputs: custom_character
+outputs: text, image_paths
+required_capabilities: text_generation, image_generation
+```bash
+python scripts/run.py '{"topic":"{{topic}}","style":"{{style}}"}'
+```
+"""
+    skill_dir = _write_skill(tmp_path, skill_md)
+
+    entry = _validate_runtime_command_against_action_schema(
+        "python scripts/run.py '{\"topic\":\"cats\",\"style\":\"ink\"}'",
+        execution_root=skill_dir,
+    )
+    assert entry["optional_inputs"] == ["custom_character"]
+
+    _validate_runtime_command_against_action_schema(
+        "python scripts/run.py '{\"topic\":\"cats\",\"style\":\"ink\",\"custom_character\":\"\"}'",
+        execution_root=skill_dir,
+    )
+
+    with pytest.raises(ValueError, match="JSON keys"):
+        _validate_runtime_command_against_action_schema(
+            "python scripts/run.py '{\"topic\":\"cats\",\"style\":\"ink\",\"extra\":\"no\"}'",
+            execution_root=skill_dir,
+        )
+
+
+def test_planner_missing_available_script_is_corrected(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_dir = tmp_path / "available-skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "run.py").write_text("print('{}')", encoding="utf-8")
+
+    plan = _normalize_skill_runtime_plan(
+        {
+            "mode": "ask_user",
+            "actions": [],
+            "missing": [{"path": "scripts/run.py", "reason": "planner says missing"}],
+            "errors": [],
+        },
+        resource_catalog=[],
+        execution_root=skill_dir,
+        command_contract={"has_executable_command_block": True, "action_schema": {"entries": []}},
+        available_scripts=["scripts/run.py"],
+    )
+
+    assert plan["missing"] == []
+    assert plan["mode"] == "direct_answer"
+    assert plan["planner_inconsistent"][0]["missing_type"] == "planner_inconsistent"
+
+
+def test_structured_stdout_accepts_story_text_alias():
+    from backend.routers.sandbox_chat import _render_success_stdout_payload, _validate_stdout_against_action_entry
+
+    entry = {
+        "role": "composite_generator",
+        "required_capabilities": ["text_generation", "image_generation"],
+        "outputs": ["story_text", "image_paths"],
+    }
+    stdout = json.dumps({"story_text": "A real story", "image_paths": ["outputs/a.png"]})
+
+    _validate_stdout_against_action_entry(stdout, entry)
+    assert "A real story" in _render_success_stdout_payload({"results": [{"success": True, "stdout": stdout}]})

@@ -909,15 +909,83 @@ def _parse_schema_list_field(text: str, field: str) -> list[str]:
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
     cleaned: list[str] = []
     for item in values:
-        # Keep only the JSON key.  Runtime contracts may annotate optional
-        # inputs as ``custom_character?`` or ``style (optional)``; those
-        # annotations must not become part of the argv key.
-        item = re.split(r"\s*(?:：|:|=|（|\(|\s)\s*", item, maxsplit=1)[0]
-        item = item.rstrip("?")
-        item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
-        if item:
-            cleaned.append(item)
+        key, _default = _parse_schema_input_item(item)
+        if key:
+            cleaned.append(key)
     return cleaned
+
+
+def _parse_schema_input_item(item: str) -> tuple[str, object | None]:
+    """Return the normalized input key and any inline default value.
+
+    Supported Action schema forms include ``chapter_count=3``,
+    ``chapter_count: 3``, ``chapter_count (default: 3)`` and
+    ``target_audience（默认：小学生）``.
+    """
+    raw = (item or "").strip().strip("'\"")
+    if not raw:
+        return "", None
+
+    default: object | None = None
+    default_match = re.search(
+        r"(?:\(|（)\s*(?:default|默认值?|缺省值?)\s*(?:[:：=])\s*([^()（）]+?)\s*(?:\)|）)",
+        raw,
+        re.I,
+    )
+    if default_match:
+        default = _coerce_workflow_default_value(default_match.group(1).strip())
+        raw = (raw[:default_match.start()] + raw[default_match.end():]).strip()
+
+    inline_match = re.match(
+        r"^\s*([A-Za-z_][\w./-]*)\??\s*(?:[:：=])\s*(.+?)\s*$",
+        raw,
+    )
+    if inline_match:
+        key = inline_match.group(1).rstrip("?")
+        if default is None:
+            default = _coerce_workflow_default_value(inline_match.group(2).strip())
+        return re.sub(r"[^A-Za-z0-9_./-]", "", key), default
+
+    key = re.split(r"\s*(?:：|:|=|（|\(|\s)\s*", raw, maxsplit=1)[0]
+    key = re.sub(r"[^A-Za-z0-9_./-]", "", key.rstrip("?"))
+    return key, default
+
+
+def _coerce_workflow_default_value(value: str) -> object:
+    cleaned = (value or "").strip().strip("'\"")
+    if cleaned == "":
+        return ""
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    if re.fullmatch(r"-?\d+", cleaned):
+        return int(cleaned)
+    if re.fullmatch(r"-?\d+\.\d+", cleaned):
+        return float(cleaned)
+    lowered = cleaned.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    return cleaned
+
+
+def _parse_schema_default_values(text: str) -> dict[str, object]:
+    defaults: dict[str, object] = {}
+    inputs_match = re.search(_ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape("inputs")), text or "", re.I)
+    if inputs_match:
+        for raw_item in re.split(r"[,，、]\s*", inputs_match.group(1)):
+            key, default = _parse_schema_input_item(raw_item)
+            if key and default is not None:
+                defaults[key] = _coerce_workflow_value_for_key(key, default)
+
+    for field in ("defaults", "default_values", "默认值", "默认参数"):
+        pattern = _ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape(field))
+        for match in re.finditer(pattern, text or "", re.I):
+            for raw_item in re.split(r"[,，、]\s*", match.group(1)):
+                key, default = _parse_schema_input_item(raw_item)
+                if key and default is not None:
+                    defaults[key] = _coerce_workflow_value_for_key(key, default)
+    return defaults
 
 
 def _parse_optional_schema_inputs(text: str) -> list[str]:
@@ -968,6 +1036,7 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
         inputs = _parse_schema_list_field(context, "inputs")
         outputs = _parse_schema_list_field(context, "outputs")
         optional_inputs = _parse_optional_schema_inputs(context)
+        default_values = _parse_schema_default_values(context)
         required_capabilities = _parse_schema_list_field(context, "required_capabilities")
         forbidden_capabilities = _parse_schema_list_field(context, "forbidden_capabilities")
         command_keys = _command_json_argv_keys(command, script_path)
@@ -979,6 +1048,7 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
             "role": role,
             "inputs": inputs,
             "optional_inputs": optional_inputs,
+            "default_values": default_values,
             "outputs": outputs,
             "required_capabilities": required_capabilities,
             "forbidden_capabilities": forbidden_capabilities,
@@ -1400,10 +1470,10 @@ def _should_force_skill_workflow(*, command_contract: dict, user_text: str = "")
         )
     )
 
-    if len(script_entries) >= 2 and (artifact_requested or artifact_declared):
-        return "Action schema 声明了多个 scripts/*.py 执行入口，且任务/输出涉及文件类产物，必须由后端按 schema 顺序执行 workflow"
-    if len(script_entries) >= 3:
-        return "Action schema 声明了三个及以上脚本步骤，必须由后端按 schema 顺序执行 workflow"
+    if len(script_entries) >= 2:
+        if artifact_requested or artifact_declared:
+            return "Action schema 声明了多个 scripts/*.py 执行入口，且任务/输出涉及文件类产物，必须由后端按 schema 顺序执行 workflow"
+        return "Action schema 声明了多个 scripts/*.py 执行入口，属于复合 Skill，必须由后端按 schema 顺序执行 workflow"
     return ""
 
 def _compose_skill_runtime_planner_prompt() -> str:
@@ -2476,6 +2546,21 @@ _CHINESE_DIGITS = {
 }
 
 
+
+
+def _workflow_default_context_from_entries(entries: list[dict]) -> dict:
+    """Collect SKILL.md-declared default input values for workflow execution."""
+    defaults: dict = {}
+    for entry in entries:
+        entry_defaults = entry.get("default_values") or {}
+        if not isinstance(entry_defaults, dict):
+            continue
+        for key, value in entry_defaults.items():
+            key_text = str(key or "").strip()
+            if key_text:
+                defaults[key_text] = _coerce_workflow_value_for_key(key_text, value)
+    return defaults
+
 def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
     """Infer initial placeholders needed by the first workflow script from user text."""
     context: dict = {}
@@ -2597,6 +2682,23 @@ def _json_arg_index(parts: list[str], script_path: str) -> int | None:
     return None
 
 
+def _placeholder_keys_in_value(value: object) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(value, str):
+        keys.update(_RUNTIME_PLACEHOLDER_RE.findall(value))
+    elif isinstance(value, list):
+        for item in value:
+            keys.update(_placeholder_keys_in_value(item))
+    elif isinstance(value, dict):
+        for item in value.values():
+            keys.update(_placeholder_keys_in_value(item))
+    return keys
+
+
+def _missing_placeholder_keys(keys: set[str], context: dict) -> list[str]:
+    return sorted(key for key in keys if key not in context)
+
+
 def _replace_placeholders_in_value(value: object, context: dict) -> object:
     if isinstance(value, str):
         exact = _RUNTIME_PLACEHOLDER_RE.fullmatch(value.strip())
@@ -2638,8 +2740,17 @@ def render_command_template(command: str, context: dict) -> str:
             raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 无法解析") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 必须是 object")
+        missing = _missing_placeholder_keys(_placeholder_keys_in_value(payload), context)
+        if missing:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
+            raise ValueError(f"dataflow_mismatch: 缺少变量 {needed}")
         parts[json_idx] = json.dumps(_replace_placeholders_in_value(payload, context), ensure_ascii=False)
         return " ".join(shlex.quote(part) for part in parts)
+
+    missing = _missing_placeholder_keys(set(_RUNTIME_PLACEHOLDER_RE.findall(command)), context)
+    if missing:
+        needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
+        raise ValueError(f"dataflow_mismatch: 缺少变量 {needed}")
 
     def repl(match: re.Match) -> str:
         key = match.group(1)
@@ -2703,10 +2814,12 @@ def _workflow_step_contexts(entry: dict, context: dict) -> list[dict]:
     placeholders = set(entry.get("placeholder_keys") or [])
     if "chapter_text" not in placeholders:
         return [context]
-    chapters = context.get("chapters")
+    chapters = context.get("chapter_list")
+    if not isinstance(chapters, list) or not chapters:
+        chapters = context.get("chapters")
     if not isinstance(chapters, list) or not chapters:
         raise ValueError(
-            f"dataflow_mismatch: {entry.get('script_path')} 需要 {{chapter_text}}，但前序步骤没有产生 chapters list"
+            f"dataflow_mismatch: {entry.get('script_path')} 需要 {{chapter_text}}，但前序步骤没有产生 chapter_list/chapters list"
         )
     contexts: list[dict] = []
     for idx, chapter in enumerate(chapters, start=1):
@@ -2760,7 +2873,8 @@ async def _execute_skill_workflow(
     available_scripts = set(_available_scripts_for_root(root))
     req = request or ChatRequest(messages=[])
     user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
-    context = _workflow_context_from_request_text(user_text, entries[0])
+    context = _workflow_default_context_from_entries(entries)
+    context.update(_workflow_context_from_request_text(user_text, entries[0]))
     context.update(user_context or {})
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
     results: list[dict] = []

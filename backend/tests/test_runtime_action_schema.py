@@ -685,3 +685,116 @@ def test_execute_skill_workflow_reports_initial_input_parse_failure(tmp_path):
             request=ChatRequest(messages=[Message(role="user", content=request_text)]),
             skill_name="initial-context-skill",
         ))
+
+
+def _write_full_dataflow_workflow_skill(root: Path) -> tuple[Path, dict]:
+    from backend.routers.sandbox_chat import _extract_skill_command_contract
+
+    skill_dir = root / "full-dataflow-skill"
+    scripts = skill_dir / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "story_step.py").write_text(
+        """
+import json, sys
+payload = json.loads(sys.argv[1])
+chapters = [
+    {"title": f"Chapter {i + 1}", "content": f"{payload['story_theme']} #{i + 1} for {payload['target_audience']}"}
+    for i in range(int(payload["chapter_count"]))
+]
+print(json.dumps({"story_text": payload["story_theme"], "chapter_list": chapters}, ensure_ascii=False))
+""".strip(),
+        encoding="utf-8",
+    )
+    (scripts / "image_step.py").write_text(
+        """
+import hashlib, json, pathlib, sys
+payload = json.loads(sys.argv[1])
+name = hashlib.sha1(payload["chapter_text"].encode()).hexdigest()[:8] + ".png"
+path = pathlib.Path("outputs") / name
+path.parent.mkdir(exist_ok=True)
+path.write_bytes(b"png")
+print(json.dumps({"image_path": path.as_posix()}, ensure_ascii=False))
+""".strip(),
+        encoding="utf-8",
+    )
+    (scripts / "pdf_step.py").write_text(
+        """
+import json, pathlib, sys
+payload = json.loads(sys.argv[1])
+path = pathlib.Path("outputs/full-dataflow.pdf")
+path.parent.mkdir(exist_ok=True)
+path.write_bytes(b"%PDF-1.4\\n%%EOF")
+print(json.dumps({"pdf_path": path.as_posix(), "image_count": len(payload["image_paths"])}, ensure_ascii=False))
+""".strip(),
+        encoding="utf-8",
+    )
+    skill_md = """---
+name: full-dataflow-skill
+description: demo
+---
+role: text_generator
+inputs: story_theme, chapter_count=2, target_audience=小学生
+outputs: story_text, chapter_list
+```bash
+python scripts/story_step.py '{"story_theme":"{{story_theme}}","chapter_count":"{{chapter_count}}","target_audience":"{{target_audience}}"}'
+```
+
+role: image_generator
+inputs: chapter_text
+outputs: image_path
+required_capabilities: image_generation
+```bash
+python scripts/image_step.py '{"chapter_text":"{{chapter_text}}"}'
+```
+
+role: pdf_builder
+inputs: story_text, image_paths
+outputs: pdf_path
+required_capabilities: pdf_generation
+```bash
+python scripts/pdf_step.py '{"story_text":"{{story_text}}","image_paths":"{{image_paths}}"}'
+```
+"""
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    return skill_dir, _extract_skill_command_contract(skill_md, execution_root=skill_dir)
+
+
+def test_execute_skill_workflow_full_variable_chain_from_input_defaults_to_final_file(tmp_path):
+    import asyncio
+    import shlex
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _execute_skill_workflow, _normalize_skill_runtime_plan
+
+    skill_dir, contract = _write_full_dataflow_workflow_skill(tmp_path)
+    runtime_plan = _normalize_skill_runtime_plan(
+        {"mode": "direct_answer", "actions": [], "errors": [], "missing": [], "final_instruction": "ignored"},
+        execution_root=skill_dir,
+        available_scripts=["scripts/story_step.py", "scripts/image_step.py", "scripts/pdf_step.py"],
+        command_contract=contract,
+        user_text="请以月球种菜为主题生成图文 PDF。",
+    )
+    assert runtime_plan["mode"] == "execute_workflow"
+    assert [item["script_path"] for item in runtime_plan["workflow_actions"]] == [
+        "scripts/story_step.py",
+        "scripts/image_step.py",
+        "scripts/pdf_step.py",
+    ]
+
+    result = asyncio.run(_execute_skill_workflow(
+        execution_root=skill_dir,
+        action_schema=contract["action_schema"],
+        user_context={"user_request": "请以月球种菜为主题生成图文 PDF。"},
+        request=ChatRequest(messages=[Message(role="user", content="请以月球种菜为主题生成图文 PDF。")]),
+        skill_name="full-dataflow-skill",
+    ))
+
+    first_payload = json.loads(shlex.split(result["results"][0]["command"])[2])
+    assert first_payload == {"story_theme": "月球种菜", "chapter_count": 2, "target_audience": "小学生"}
+    assert len([r for r in result["results"] if r["action"] == "run_command"]) == 4
+    assert len(result["context"]["chapter_list"]) == 2
+    assert len(result["context"]["image_paths"]) == 2
+    third_payload = json.loads(shlex.split(result["results"][-1]["command"])[2])
+    assert third_payload["story_text"] == "月球种菜"
+    assert third_payload["image_paths"] == result["context"]["image_paths"]
+    assert any(item["path"] == "outputs/full-dataflow.pdf" for item in result["output_files"])
+    assert (skill_dir / "outputs" / "full-dataflow.pdf").is_file()

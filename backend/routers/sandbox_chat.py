@@ -1055,6 +1055,15 @@ def _validate_runtime_command_against_action_schema(command: str, *, execution_r
     script_path = _extract_script_path_from_command(command)
     if not script_path:
         return None
+    if execution_root is not None:
+        root = execution_root.resolve()
+        available_scripts = set(_available_scripts_for_root(root))
+        script_file = (root / script_path).resolve()
+        if script_path not in available_scripts or not _is_within_sandbox(script_file, root) or not script_file.is_file():
+            raise ValueError(
+                f"命令调用 {script_path}，但该脚本不在当前 Skill available_scripts 中："
+                f"available={sorted(available_scripts)}"
+            )
     skill_md = ""
     if execution_root is not None and (execution_root / "SKILL.md").is_file():
         skill_md = (execution_root / "SKILL.md").read_text(encoding="utf-8", errors="replace")
@@ -1266,6 +1275,44 @@ def _final_instruction_requests_host_command(final_instruction: str) -> bool:
     return bool(_HOST_COMMAND_INSTRUCTION_RE.search(final_instruction or ""))
 
 
+def _extract_executable_command_blocks_from_text(text: str) -> list[str]:
+    """Extract host-executable script commands from shell fenced blocks.
+
+    The runtime planner may use ``final_instruction`` to tell the main response
+    path which concrete SKILL.md command block should be executed.  In execute
+    mode that instruction is not a final answer; if it already contains a
+    shell fenced block, the backend must execute it and use the real stdout
+    observation instead of allowing the LLM to claim success.
+    """
+    commands: list[str] = []
+    for block in _extract_all_fenced_blocks(text or ""):
+        lang = (block.lang or "").lower()
+        command = (block.code or "").strip()
+        if lang not in _COMMAND_BLOCK_LANGS or not command:
+            continue
+        if not _COMMAND_BLOCK_CODE_RE.search(command):
+            continue
+        commands.append(command)
+    return commands
+
+
+def _has_successful_run_command_observation(results: list[dict]) -> bool:
+    return any(
+        isinstance(item, dict)
+        and item.get("action") == "run_command"
+        and item.get("success", True)
+        for item in results
+    )
+
+
+def _execution_requires_run_command_observation(runtime_plan: dict) -> bool:
+    final_instruction = str(runtime_plan.get("final_instruction") or "")
+    return bool(
+        _extract_executable_command_blocks_from_text(final_instruction)
+        or _final_instruction_requests_host_command(final_instruction)
+    )
+
+
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
         "你是 Skill Agent 运行时动作意图判断器。\n\n"
@@ -1402,15 +1449,6 @@ def _normalize_skill_runtime_plan(
                 if not rel_path:
                     rel_path = _normalize_skill_resource_path(str(resolved_resource.get("path") or ""))
                     normalized_item["path"] = rel_path
-
-        if rel_path in available_script_set:
-            planner_inconsistent.append({
-                "missing_type": "planner_inconsistent",
-                "resource_handle": resource_handle,
-                "path": rel_path,
-                "reason": "planner reported a script as missing, but backend available_scripts shows it exists",
-            })
-            continue
 
         if rel_path in available_script_set:
             planner_inconsistent.append({
@@ -2258,14 +2296,21 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
     if not isinstance(payload, dict):
         return []
     raw_paths: list[str] = []
-    for key in ("html_path", "asset_path"):
+    for key in ("html_path", "asset_path", "image_path", "image"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             raw_paths.append(value.strip())
-    for key in ("asset_paths", "html_paths"):
+    for key in ("asset_paths", "html_paths", "image_paths"):
         value = payload.get(key)
         if isinstance(value, list):
             raw_paths.extend(item.strip() for item in value if isinstance(item, str) and item.strip())
+    images = payload.get("images")
+    if isinstance(images, list):
+        for image in images:
+            if isinstance(image, dict):
+                image_path = image.get("image_path")
+                if isinstance(image_path, str) and image_path.strip():
+                    raw_paths.append(image_path.strip())
     root = cwd.resolve()
     generated_root = (root / "assets" / "generated").resolve()
     output_files: list[dict] = []
@@ -3380,6 +3425,80 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                     _safe_result,
                                 )
 
+                        # read_resource actions are only pre-actions in execute mode.
+                        # If the planner's final_instruction already contains a
+                        # concrete SKILL.md command block, execute it now and use
+                        # its real stdout JSON as the final observation.
+                        _followup_commands = _extract_executable_command_blocks_from_text(
+                            str(runtime_plan.get("final_instruction") or "")
+                        )
+                        for command in _followup_commands:
+                            script_path = _extract_script_path_from_command(command) or ""
+                            available_scripts = set(_available_scripts_for_root(execution_root))
+                            if not script_path or script_path not in available_scripts:
+                                raise ValueError(
+                                    "final_instruction 命令未通过 available_scripts 校验："
+                                    f"script_path={script_path!r} available={sorted(available_scripts)}"
+                                )
+
+                            short_cmd = command[:_MAX_CMD_DISPLAY_LENGTH] + (
+                                "…" if len(command) > _MAX_CMD_DISPLAY_LENGTH else ""
+                            )
+                            yield _sse({"status": {"phase": "executing", "message": f"执行命令：{short_cmd}"}})
+                            yield _thought(
+                                "action_start",
+                                "执行 final_instruction 命令",
+                                short_cmd,
+                                {
+                                    "action": "run_command",
+                                    "command": command[:200],
+                                    "script_path": script_path,
+                                    "source": "runtime_plan.final_instruction",
+                                },
+                            )
+                            task_result, task_touched = await asyncio.to_thread(
+                                functools.partial(
+                                    _execute_single_task,
+                                    {
+                                        "action": "run_command",
+                                        "command": command,
+                                        "reason": "runtime_plan.final_instruction 中声明的脚本命令",
+                                    },
+                                    [],
+                                    request,
+                                    execution_root=execution_root,
+                                    inferred_skill_root=_exec_inferred_root,
+                                    skill_name=parent_skill_name,
+                                    session_input_dir=_exec_session_dir,
+                                )
+                            )
+                            _exec_all_results.append(task_result)
+                            _exec_all_touched.extend(task_touched)
+                            _safe_result = {
+                                k: (v[:1000] if isinstance(v, str) else v)
+                                for k, v in task_result.items()
+                            }
+                            yield _thought(
+                                "action_result",
+                                "执行结果",
+                                f"{'成功' if task_result.get('success', True) else '失败'} exit={task_result.get('returncode', 0)}",
+                                _safe_result,
+                            )
+
+                        if (
+                            _execution_requires_run_command_observation(runtime_plan)
+                            and not _has_successful_run_command_observation(_exec_all_results)
+                        ):
+                            yield _sse({"status": None})
+                            yield _sse({
+                                "content": (
+                                    "已完成前置资源读取，但本轮没有获得成功的 run_command observation；"
+                                    "因此不能声称脚本已执行、故事已生成或图片已生成。"
+                                )
+                            })
+                            yield "data: [DONE]\n\n"
+                            return
+
                         # Post-loop: validate any newly created Skill roots.
                         for root in _find_created_skill_roots(_exec_all_touched):
                             skill_md = root / "SKILL.md"
@@ -3401,13 +3520,15 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         }
 
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
-                        final_answer = await _generate_final_answer_from_observation(
-                            body_prompt=body_prompt,
-                            request=request,
-                            model=response_model,
-                            plan=runtime_plan,
-                            execution_result=exec_result,
-                        )
+                        final_answer = _render_success_stdout_payload(exec_result)
+                        if final_answer is None:
+                            final_answer = await _generate_final_answer_from_observation(
+                                body_prompt=body_prompt,
+                                request=request,
+                                model=response_model,
+                                plan=runtime_plan,
+                                execution_result=exec_result,
+                            )
                         final_answer = _finalize_answer_output_file_links(final_answer, _exec_all_output_files)
                         yield _thought(
                             "final_answer",

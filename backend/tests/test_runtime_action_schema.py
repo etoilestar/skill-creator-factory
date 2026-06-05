@@ -112,13 +112,13 @@ python scripts/run.py '{"topic":"{{topic}}"}'
     assert entry["role"] == "text_generator"
 
 
-def test_runtime_stdout_validation_is_role_aware():
+def test_runtime_stdout_validation_is_field_name_agnostic():
     from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
 
-    with pytest.raises(ValueError, match="非空 text"):
-        _validate_stdout_against_action_entry(json.dumps({"file_paths": ["x.pdf"]}), {"role": "text_generator"})
+    _validate_stdout_against_action_entry(json.dumps({"draft_copy": "done"}), {"role": "text_generator"})
 
-    _validate_stdout_against_action_entry(json.dumps({"text": "done"}), {"role": "text_generator"})
+    with pytest.raises(ValueError, match="至少需要一个非空字段"):
+        _validate_stdout_against_action_entry(json.dumps({"draft_copy": ""}), {"role": "text_generator"})
 
 
 def test_runtime_action_schema_validates_referenced_assets(tmp_path):
@@ -144,7 +144,7 @@ python scripts/run.py '{"topic":"{{topic}}"}'
     assert any("assets/config.json" in item.get("asset_path", "") for item in schema["errors"])
 
 
-def test_composite_generator_stdout_validates_required_capability_outputs():
+def test_composite_generator_stdout_uses_field_name_agnostic_runtime_validation():
     from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
 
     entry = {
@@ -153,10 +153,10 @@ def test_composite_generator_stdout_validates_required_capability_outputs():
         "outputs": ["text", "image_paths"],
     }
 
-    with pytest.raises(ValueError, match="image_path"):
-        _validate_stdout_against_action_entry(json.dumps({"text": "story"}), entry)
+    _validate_stdout_against_action_entry(json.dumps({"draft": "story"}), entry)
 
-    _validate_stdout_against_action_entry(json.dumps({"text": "story", "image_paths": ["assets/generated/a.png"]}), entry)
+    with pytest.raises(ValueError, match="至少需要一个非空字段"):
+        _validate_stdout_against_action_entry(json.dumps({"draft": ""}), entry)
 
 
 def test_generic_script_high_impact_capability_error_mentions_explicit_roles():
@@ -412,3 +412,47 @@ def test_output_files_from_stdout_json_collects_all_artifact_fields(tmp_path):
         "assets/generated/story.html",
         "outputs/img.png",
     }
+
+def test_file_output_validation_accepts_arbitrary_field_names(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+    from backend.services.artifact_validator import validate_stdout_file_outputs
+
+    skill_dir = tmp_path / "schema-skill"
+    generated = skill_dir / "assets" / "generated"
+    generated.mkdir(parents=True)
+    report = generated / "custom-report.pdf"
+    report.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+
+    stdout = json.dumps({"business_report": "assets/generated/custom-report.pdf"})
+
+    assert validate_stdout_file_outputs(stdout, skill_dir=skill_dir, cwd=skill_dir / "scripts") == [
+        {"path": "assets/generated/custom-report.pdf"}
+    ]
+    assert _output_files_from_stdout_json(stdout, cwd=skill_dir, skill_name="schema-skill") == [
+        {"path": "assets/generated/custom-report.pdf", "url": "/api/skills/schema-skill/files/assets/generated/custom-report.pdf"}
+    ]
+
+
+def test_skill_dataflow_validates_stdout_fields_against_skill_placeholders():
+    from backend.services.skill_dataflow import extract_skill_commands, validate_dataflow_closed
+
+    skill_md = """---
+name: flow-skill
+description: demo
+---
+```bash
+python scripts/write.py '{"topic":"{{topic}}"}'
+```
+```bash
+python scripts/render.py '{"draft":"{{draft}}"}'
+```
+"""
+
+    commands = extract_skill_commands(skill_md)
+    final_context = validate_dataflow_closed(
+        commands,
+        initial_context={"topic": "cats"},
+        stdout_by_script={"scripts/write.py": json.dumps({"draft": "a cat tale"})},
+    )
+
+    assert final_context["draft"] == "a cat tale"

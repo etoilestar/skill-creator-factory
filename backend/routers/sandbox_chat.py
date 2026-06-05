@@ -33,7 +33,7 @@ from ..services.model_router import (
     route_model,
 )
 from ..services.skill_manager import get_execution_skill_dir
-from ..services.artifact_validator import FileOutputValidationError, validate_stdout_file_outputs
+from ..services.artifact_validator import FileOutputValidationError, declared_artifact_paths, validate_stdout_file_outputs
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
     _MAX_DEP_RETRY,
@@ -1129,57 +1129,37 @@ def _payload_has_file_field(payload: dict, *keys: str) -> bool:
             return True
     return False
 
+def _json_value_non_empty(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_json_value_non_empty(item) for item in value)
+    if isinstance(value, dict):
+        return any(_json_value_non_empty(item) for item in value.values())
+    return True
+
+
 def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> None:
-    if not entry:
-        _validate_success_stdout_json_if_structured(stdout)
-        return
     stripped = (stdout or "").strip()
     if not stripped:
         return
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        if str(entry.get("role")) in {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
+        if entry:
             raise ValueError("角色脚本 stdout 必须是 JSON object")
         return
     if not isinstance(payload, dict):
-        raise ValueError("角色脚本 stdout 必须是 JSON object")
+        if entry:
+            raise ValueError("角色脚本 stdout 必须是 JSON object")
+        return
+    if "error" in payload:
+        raise ValueError("stdout JSON 不得包含 error 字段")
+    if entry and not any(_json_value_non_empty(value) for value in payload.values()):
+        raise ValueError("角色脚本 stdout JSON 至少需要一个非空字段")
     _validate_structured_stdout_payload(payload)
-    role = str(entry.get("role") or "generic_script")
-    required_capabilities = set(entry.get("required_capabilities") or [])
-    outputs = set(entry.get("outputs") or [])
-    if role == "composite_generator":
-        if ("text_generation" in required_capabilities or "text" in outputs or "story_text" in outputs) and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
-            raise ValueError("composite_generator stdout JSON 缺少声明的 text/markdown 输出")
-        if ("image_generation" in required_capabilities or {"image_path", "image_paths", "images"} & outputs) and not _payload_image_paths(payload):
-            raise ValueError("composite_generator stdout JSON 缺少声明的 image_path/image_paths/images 输出")
-        if ("pdf_generation" in required_capabilities or {"pdf_path", "file_paths"} & outputs) and not _payload_has_file_field(payload, "pdf_path", "file_paths"):
-            raise ValueError("composite_generator stdout JSON 缺少声明的 pdf_path/file_paths 输出")
-        if ("docx_generation" in required_capabilities or {"docx_path"} & outputs) and not _payload_has_file_field(payload, "docx_path", "file_paths"):
-            raise ValueError("composite_generator stdout JSON 缺少声明的 docx_path/file_paths 输出")
-        if ("pptx_generation" in required_capabilities or {"pptx_path"} & outputs) and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
-            raise ValueError("composite_generator stdout JSON 缺少声明的 pptx_path/file_paths 输出")
-        if (({"html_generation", "html_asset_generation"} & required_capabilities) or {"html_path", "asset_paths", "file_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths", "file_paths"):
-            raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
-    if role == "text_generator" and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
-        raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
-    if role == "image_generator" and not _payload_image_paths(payload):
-        raise ValueError("image_generator stdout JSON 必须包含 image_path/image_paths/images")
-    if role == "pdf_builder" and not _payload_has_file_field(payload, "pdf_path", "file_paths"):
-        raise ValueError("pdf_builder stdout JSON 必须包含 pdf_path 或 file_paths")
-    if role == "docx_builder" and not _payload_has_file_field(payload, "docx_path", "file_paths"):
-        raise ValueError("docx_builder stdout JSON 必须包含 docx_path 或 file_paths")
-    if role == "pptx_builder" and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
-        raise ValueError("pptx_builder stdout JSON 必须包含 pptx_path 或 file_paths")
-    if role in {"html_asset_builder", "asset_builder"}:
-        html_path = payload.get("html_path")
-        asset_paths = payload.get("asset_paths")
-        file_paths = payload.get("file_paths")
-        has_html = isinstance(html_path, str) and html_path.strip()
-        has_html = has_html or (isinstance(asset_paths, list) and any(isinstance(p, str) and p.strip() for p in asset_paths))
-        has_html = has_html or (isinstance(file_paths, list) and any(isinstance(p, str) and p.strip() for p in file_paths))
-        if not has_html:
-            raise ValueError("html_asset_builder stdout JSON 必须包含 html_path 或 asset_paths")
 
 
 
@@ -2356,22 +2336,7 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
         return []
     if not isinstance(payload, dict):
         return []
-    raw_paths: list[str] = []
-    for key in ("html_path", "asset_path", "image_path", "image", "pdf_path", "docx_path", "pptx_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            raw_paths.append(value.strip())
-    for key in ("asset_paths", "html_paths", "image_paths", "file_paths"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            raw_paths.extend(item.strip() for item in value if isinstance(item, str) and item.strip())
-    images = payload.get("images")
-    if isinstance(images, list):
-        for image in images:
-            if isinstance(image, dict):
-                image_path = image.get("image_path")
-                if isinstance(image_path, str) and image_path.strip():
-                    raw_paths.append(image_path.strip())
+    raw_paths = [raw_path for _, raw_path in declared_artifact_paths(payload)]
     try:
         validated = validate_stdout_file_outputs(stdout, skill_dir=cwd, cwd=cwd / "scripts")
     except FileOutputValidationError:

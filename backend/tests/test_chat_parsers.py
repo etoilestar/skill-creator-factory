@@ -1370,21 +1370,21 @@ def test_creator_trial_stdout_requires_json_object_for_scripts():
         _validate_trial_stdout_json(stdout=json.dumps({"error": "bad"}), content="print('{}')", args=[])
 
 
-def test_creator_trial_stdout_requires_image_path_for_image_helper():
+def test_creator_trial_stdout_accepts_arbitrary_non_empty_fields_for_image_helper():
     from backend.routers.creator import _validate_trial_stdout_json
 
-    with pytest.raises(ValueError, match="缺少可消费的图片路径字段"):
-        _validate_trial_stdout_json(
-            stdout=json.dumps({"text": "ok", "image_paths": []}),
-            content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
-            args=[],
-        )
-
     _validate_trial_stdout_json(
-        stdout=json.dumps({"text": "ok", "image_paths": ["outputs/demo.png"], "images": [{"image_path": "outputs/demo.png"}]}),
+        stdout=json.dumps({"picture_result": "ok"}),
         content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
         args=[],
     )
+
+    with pytest.raises(ValueError, match="至少需要一个非空字段"):
+        _validate_trial_stdout_json(
+            stdout=json.dumps({"picture_result": ""}),
+            content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+            args=[],
+        )
 
 
 def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
@@ -1407,7 +1407,7 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
         prepared["argv"] = argv
         prepared["cwd"] = kwargs.get("cwd")
         prepared["env"] = kwargs.get("env")
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
 
     monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
     monkeypatch.setattr(creator, "_scan_and_install_python_deps", fake_scan_and_install)
@@ -3000,3 +3000,21 @@ def test_creator_validator_filters_model_invented_failed_checks():
         {"id": "skill_md.frontmatter", "target": "SKILL.md"}
     ]
     assert _filter_validator_failed_checks(model_checks, "") == []
+
+def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    skill_dir = tmp_path / "skill"
+    out = skill_dir / "assets" / "generated"
+    out.mkdir(parents=True)
+    pdf = out / "business.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+
+    _validate_trial_stdout_json(
+        stdout=json.dumps({"contract_document": "assets/generated/business.pdf"}),
+        content="",
+        args=[],
+        role="pdf_builder",
+        skill_dir=skill_dir,
+        skill_plan_entry={"role": "pdf_builder", "outputs": ["pdf_path"], "required_capabilities": ["pdf_generation"]},
+    )

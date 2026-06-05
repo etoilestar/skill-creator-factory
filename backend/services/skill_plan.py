@@ -402,27 +402,21 @@ def file_role_classifier(
 
 
 def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    if role == "text_generator":
-        return ["topic", "prompt", "text"], ["story_text"]
-    if role == "image_generator":
-        return ["topic", "prompt", "story_text"], ["image_paths", "images", "text_with_image_prompts"]
-    if role == "composite_generator":
-        return ["topic", "prompt", "text"], ["story_text", "image_paths", "images", "text_with_image_prompts"]
-    if role == "pdf_builder":
-        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["pdf_path"]
-    if role == "docx_builder":
-        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["docx_path"]
-    if role == "pptx_builder":
-        return ["story_text", "image_paths", "previous_stdout", "template_path"], ["pptx_path"]
-    if role in {"html_asset_builder", "asset_builder"}:
-        return ["story_text", "image_paths", "previous_stdout", "html"], ["html_path"]
+    """Return permissive blueprint hints for a role.
+
+    These defaults are intentionally not a runtime contract.  Runtime dataflow is
+    determined by the concrete SKILL.md command placeholders and each script's
+    JSON stdout, so business Skills can choose domain-specific field names.
+    """
+    if role in SCRIPT_ROLES:
+        return ["payload"], []
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
         return [], ["existing_parseable_file"]
     if role == "skill_overview":
         return ["user_request"], ["workflow", "script_order", "resource_references"]
-    return ["payload"], ["text", "file_paths"]
+    return ["payload"], []
 
 
 def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:

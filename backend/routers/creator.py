@@ -1092,24 +1092,25 @@ def _build_script_file_contract_text(
     ]
     if entry.role == "text_generator":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 story_text 或 text 字段为非空字符串。",
+            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定，不强制 text/story_text。",
             "- 能力边界由 required_capabilities/forbidden_capabilities 决定；若 required_capabilities 额外包含 image_generation，则必须调用图片 helper。",
         ])
     elif entry.role == "composite_generator":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 story_text 或 text 字段非空，同时 image_paths 或 images 至少一个非空。",
+            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定。",
             "- 必须同时调用 generate_text_with_llm 与 generate_stable_diffusion_image；不得用固定 f-string/template-only 文本或占位图片替代。",
-            "- 上一步 text 可作为 image prompt，输出 text_with_image_prompts 说明 text → image 的跨能力数据流。",
+            "- 保证 stdout 字段能被 SKILL.md 后续命令的 {{变量}} 消费，形成闭环。",
         ])
     elif entry.role == "image_generator":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 image_paths 或 images 至少一个非空。",
+            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定，不强制 image_paths/images。",
             "- 必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
-            "- 必须保留 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get('image_path'))、images.append(result) 的骨架结构；禁止 image_path = generate_stable_diffusion_image(...)。",
+            "- 不要在脚本里写中文 prompt 翻译逻辑；平台 helper 会处理 Stable Diffusion prompt 适配。",
+            "- 必须保留 result = generate_stable_diffusion_image(desc) 的调用骨架；禁止 image_path = generate_stable_diffusion_image(...)。",
         ])
     elif entry.role == "pdf_builder":
         lines.extend([
-            "- stdout 必须输出 JSON object，且 pdf_path 或 file_paths 至少一个指向真实生成文件。",
+            "- stdout 必须输出 JSON object，并在任意业务字段中返回真实生成文件路径。",
             "- forbidden_capabilities 生效：PDF 构建脚本不得生成图片或调用 generate_stable_diffusion_image。",
             "- 只能消费已有 story_text/text/image_paths/previous_stdout/template/assets 并构建 PDF/文件。",
         ])
@@ -1851,6 +1852,21 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
     )
 
     uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+    if plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
+        results.append(
+            ContractCheckResult(
+                id="script.capability.forbidden_image_generation",
+                passed=not uses_image_helper,
+                target=file_path,
+                message=(
+                    "文件构建脚本未调用图片生成 helper。"
+                    if not uses_image_helper
+                    else f"{file_path} 是文件构建脚本，但调用了图片生成 helper。"
+                ),
+                expected="文件构建脚本只能消费已有数据并真实创建文件；不得调用 generate_stable_diffusion_image。",
+                minimal_edit="移除图片 helper 调用，只保留文件构建逻辑。",
+            )
+        )
     if "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -2023,7 +2039,10 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
             "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
         )
 
-    if not _requires_configured_model_call(plan_entry=plan_entry):
+    if plan_entry and plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"} and not ({"text_generation", "image_generation"} & set(plan_entry.required_capabilities or [])):
+        return
+    skill_md_declares_model = bool(re.search(r"宿主|内置|配置模型|LLM|大语言|文本模型|图像模型|vision|TEXT_MODEL|IMAGE_MODEL", skill_md or "", re.IGNORECASE))
+    if not _requires_configured_model_call(plan_entry=plan_entry) and not skill_md_declares_model:
         return
     if _script_uses_configured_model(content):
         return
@@ -2338,7 +2357,26 @@ def _payload_output_value(payload: dict[str, Any], output_key: str) -> Any:
             return payload.get(alias)
     return None
 
+def _json_value_non_empty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_json_value_non_empty(item) for item in value)
+    if isinstance(value, dict):
+        return any(_json_value_non_empty(item) for item in value.values())
+    return True
+
+
 def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+    """Validate trial stdout with dynamic, field-name-agnostic rules.
+
+    SkillPlan.outputs is a blueprint hint, not the sole runtime contract.  The
+    hard requirements here are: stdout is a JSON object, it has at least one
+    non-empty value, it does not report an error, and any file-looking values it
+    declares point at real files.
+    """
     stripped = (stdout or "").strip()
     if not stripped:
         raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
@@ -2350,40 +2388,14 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         raise ValueError(f"脚本试运行 stdout 必须是 JSON object：argv={args!r} stdout={stripped[-4000:]}")
     if "error" in payload:
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
-
-    plan_entry = _skill_plan_entry_for_file(file_path="scripts/trial.py", role=role, skill_plan_entry=skill_plan_entry) if (role or skill_plan_entry) else None
-    if skill_plan_entry:
-        declared_outputs = [str(key) for key in skill_plan_entry.get("outputs") or []]
-        missing_outputs = [key for key in declared_outputs if not _payload_has_declared_output(payload, key)]
-        if missing_outputs:
-            raise ValueError(
-                "脚本试运行 stdout JSON 缺少 SkillPlan.outputs 声明字段（仅允许有限 legacy alias 兼容旧 Skill；新生成 Skill 必须使用声明字段）："
-                f"missing={missing_outputs} argv={args!r} stdout={stripped[-4000:]}"
-            )
-
-    if plan_entry and plan_entry.role == "text_generator" and not str(_payload_output_value(payload, "text") or "").strip():
-        raise ValueError(f"text_generator stdout JSON 必须包含非空 text 字段：argv={args!r} stdout={stripped[-4000:]}")
-
-    if plan_entry and (plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or [])):
-        if not _validate_file_payload_shape(payload):
-            raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
-        _validate_pdf_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
-
-    if plan_entry and (plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(plan_entry.required_capabilities or []))):
-        _validate_html_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
+    if not any(_json_value_non_empty(value) for value in payload.values()):
+        raise ValueError(f"脚本试运行 stdout JSON 至少需要一个非空字段：argv={args!r} stdout={stripped[-4000:]}")
 
     try:
         if skill_dir is not None:
             validate_stdout_file_outputs(stripped, skill_dir=skill_dir, cwd=skill_dir / "scripts")
     except FileOutputValidationError as exc:
         raise ValueError(str(exc)) from exc
-
-    if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
-        raise ValueError(
-            "图片脚本调用了 generate_stable_diffusion_image，但 stdout JSON 缺少可消费的图片路径字段："
-            "必须包含 image_path(str) 或 image_paths(list[str]) 或 images(list[dict] 且每项含 image_path)。"
-            f" argv={args!r} stdout={stripped[-4000:]}"
-        )
 
 
 
@@ -2513,7 +2525,7 @@ async def _repair_generated_file_with_feedback(
         "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
-        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys exactly with SkillPlan inputs. {runtime_rule}"
+        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys with the existing SKILL.md command placeholders; do not change the blueprint or SKILL.md. {runtime_rule}"
         if is_script
         else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
     )
@@ -2526,19 +2538,19 @@ async def _repair_generated_file_with_feedback(
         role_rule = ""
         if plan_entry is not None and plan_entry.role == "composite_generator":
             caps = set(plan_entry.required_capabilities or [])
-            role_rule = "role=composite_generator：表示多能力组合脚本；具体 helper 和 stdout 字段由 SkillPlan.required_capabilities 与 outputs 决定，不要把 composite 固定理解为 text+image。"
+            role_rule = "role=composite_generator：表示多能力组合脚本；具体 helper 由 SkillPlan.required_capabilities 决定；stdout 字段名由现有 SKILL.md 后续变量引用/业务语义决定，不要把 composite 固定理解为 text+image。"
             if {"text_generation", "image_generation"} <= caps:
                 role_rule += " 当前合同同时要求文本和图片能力，必须保留 generate_text_with_llm 与 generate_stable_diffusion_image。"
         elif plan_entry is not None and plan_entry.role == "image_generator":
-            role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image，stdout 输出 image_paths/images；禁止占位图片或删除真实 helper。"
+            role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image；stdout 输出非空 JSON，并使用现有 SKILL.md/脚本链路会消费的字段名；禁止占位图片或删除真实 helper。"
         elif plan_entry is not None and plan_entry.role == "text_generator":
             role_rule = "role=text_generator：必须调用 generate_text_with_llm 或平台 LLM，禁止调用图片 helper 或输出固定 template-only 文本。"
         elif plan_entry is not None and plan_entry.role == "pdf_builder":
-            role_rule = "role=pdf_builder：必须真实构建 PDF/file_paths，禁止调用图片 helper。"
+            role_rule = "role=pdf_builder：必须真实构建文件，并在 stdout JSON 的任意业务字段中返回实际存在的路径；禁止调用图片 helper。"
         elif plan_entry is not None and plan_entry.role == "generic_script":
-            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若需要文本+图片，必须将 role/required_capabilities 修正为 composite_generator + text_generation/image_generation。"
+            role_rule = "role=generic_script：只能调用 SkillPlan.required_capabilities 声明的能力；若现有 SkillPlan.required_capabilities 已要求文本+图片，只能修当前脚本实现以匹配，禁止修改蓝图或 SKILL.md。"
         extra_rules = (
-            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys = SkillPlan inputs；"
+            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
             "禁止生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
             f"{role_rule}"
             "不要直接调用 /v1/images/generations，不要用 VISION_MODEL 生成图片，不要写 placeholder/模拟图片。"
@@ -2720,19 +2732,18 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
         if "forbidden_image_generation" in deterministic_error or "调用了图片生成 helper" in deterministic_error:
             return (
                 "当前脚本的 SkillPlan forbidden_capabilities 禁止 image_generation，因此 validator 禁止调用 generate_stable_diffusion_image。"
-                "如果该脚本确实负责生成图片，不要删除真实图片 helper；应修正 Blueprint/SkillPlan 为 role=image_generator 或 role=composite_generator，"
-                "并设置 required_capabilities 包含 image_generation（若同时生成文本，也包含 text_generation），输出 image_paths/images。"
+                "蓝图和 SKILL.md 确定后不能由后台修复流程修改；只能修当前脚本，使其与既有 role、required_capabilities 和 SKILL.md 数据流一致。"
             )
         if "script.required_capabilities.called" in deterministic_error or "未调用这些 required_capabilities" in deterministic_error or "没有调用这些 required_capabilities" in deterministic_error:
             return (
                 "按 SkillPlan role + required_capabilities 补齐真实平台能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
-                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder 必须真实构建 PDF/file_paths。"
+                "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；文件构建脚本必须真实创建文件，并在 stdout JSON 任意业务字段中返回路径。"
                 "禁止返回固定 f-string/template-only 文本或 placeholder。"
             )
         if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
             return (
                 "按脚本合同修复：保持单文件源码，修正语法/参数解析/运行错误；"
-                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON。"
+                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON，至少包含一个非空字段；字段名由现有 SKILL.md 变量消费关系决定，不要修改蓝图或 SKILL.md。"
             )
 
     if file_path.startswith("assets/"):

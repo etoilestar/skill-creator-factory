@@ -373,7 +373,7 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     assert "text_generation" not in entry.forbidden_capabilities
     assert "pdf_generation" in entry.forbidden_capabilities
     assert "custom_character" in entry.inputs
-    assert "text_with_image_prompts" in entry.outputs
+    assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
 
 
@@ -448,8 +448,8 @@ if __name__ == '__main__':
     )
 
     assert "script.capability.forbidden_image_generation" in failed
-    assert "不要删除真实图片 helper" in guidance
-    assert "role=image_generator" in guidance or "role=composite_generator" in guidance
+    assert "禁止修改蓝图或 SKILL.md" in guidance or "蓝图和 SKILL.md 确定后不能" in guidance
+    assert "只能修当前脚本" in guidance
 
 
 def test_composite_generator_can_call_text_and_image_helpers():
@@ -901,8 +901,8 @@ def test_multifunction_roles_have_unified_optional_output_contracts():
 
     assert composite.outputs == ["story_text", "image_paths"]
     assert {"text_generation", "image_generation"} <= set(composite.required_capabilities)
-    assert text.outputs == ["story_text"]
-    assert "image_paths" in image.outputs
+    assert text.outputs == []
+    assert image.outputs == []
     assert docx.outputs == ["docx_path"]
     assert pptx.outputs == ["pptx_path"]
     assert docx.command_template == 'python scripts/export_docx.py \'{"previous_stdout":"{{previous_stdout}}"}\''

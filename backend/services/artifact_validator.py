@@ -14,6 +14,8 @@ _ARTIFACT_FIELD_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "html_path": (".html", ".htm"),
 }
 _ARTIFACT_KEYS = ("pdf_path", "docx_path", "pptx_path", "html_path", "file_paths")
+_ARTIFACT_SUFFIXES = (".pdf", ".docx", ".pptx", ".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".webp")
+_PATH_PREFIXES = ("assets/", "outputs/", "scripts/")
 
 
 class FileOutputValidationError(ValueError):
@@ -33,15 +35,43 @@ def parse_stdout_json(stdout: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def declared_artifact_paths(payload: dict[str, Any]) -> list[tuple[str, str]]:
+def _looks_like_artifact_path(value: str) -> bool:
+    normalized = value.strip().replace("\\", "/")
+    if not normalized or normalized.startswith(("http://", "https://", "data:")):
+        return False
+    suffix = Path(normalized).suffix.lower()
+    return normalized.startswith(_PATH_PREFIXES) or suffix in _ARTIFACT_SUFFIXES
+
+
+def _walk_artifact_values(value: Any, *, field: str) -> list[tuple[str, str]]:
     declared: list[tuple[str, str]] = []
-    for key in ("pdf_path", "docx_path", "pptx_path", "html_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            declared.append((key, value.strip()))
-    value = payload.get("file_paths")
-    if isinstance(value, list):
-        declared.extend(("file_paths", item.strip()) for item in value if isinstance(item, str) and item.strip())
+    if isinstance(value, str) and _looks_like_artifact_path(value):
+        declared.append((field, value.strip()))
+    elif isinstance(value, list):
+        for item in value:
+            declared.extend(_walk_artifact_values(item, field=field))
+    elif isinstance(value, dict):
+        for child_key, child_value in value.items():
+            declared.extend(_walk_artifact_values(child_value, field=str(child_key)))
+    return declared
+
+
+def declared_artifact_paths(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return all file-looking stdout values, independent of field names.
+
+    Field names are metadata only.  A business Skill may call its output
+    ``cover``, ``report``, ``poster_files`` or anything else; if the value looks
+    like a skill-local artifact path, runtime validation checks the file exists.
+    """
+    declared: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, value in payload.items():
+        for field, raw_path in _walk_artifact_values(value, field=str(key)):
+            marker = (field, raw_path)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            declared.append(marker)
     return declared
 
 

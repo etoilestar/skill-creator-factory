@@ -142,3 +142,133 @@ python scripts/run.py '{"topic":"{{topic}}"}'
     schema = _build_runtime_action_schema(skill_md, execution_root=skill_dir)
 
     assert any("assets/config.json" in item.get("asset_path", "") for item in schema["errors"])
+
+
+def test_composite_generator_stdout_validates_required_capability_outputs():
+    from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
+
+    entry = {
+        "role": "composite_generator",
+        "required_capabilities": ["text_generation", "image_generation"],
+        "outputs": ["text", "image_paths"],
+    }
+
+    with pytest.raises(ValueError, match="image_path"):
+        _validate_stdout_against_action_entry(json.dumps({"text": "story"}), entry)
+
+    _validate_stdout_against_action_entry(json.dumps({"text": "story", "image_paths": ["assets/generated/a.png"]}), entry)
+
+
+def test_generic_script_high_impact_capability_error_mentions_explicit_roles():
+    from backend.routers.sandbox_chat import _build_runtime_action_schema
+
+    skill_md = """---
+name: schema-skill
+description: demo
+---
+role: generic_script
+inputs: topic
+outputs: html_path
+required_capabilities: html_generation
+```bash
+python scripts/build.py '{"topic":"{{topic}}"}'
+```
+"""
+    schema = _build_runtime_action_schema(skill_md)
+
+    assert any("html_asset_builder" in item.get("error", "") for item in schema["errors"])
+
+
+def test_execute_plan_read_resource_then_final_instruction_run_command_uses_stdout(tmp_path):
+    from backend.routers.sandbox_chat import (
+        _execute_single_task,
+        _extract_executable_command_blocks_from_text,
+        _finalize_answer_output_file_links,
+        _render_success_stdout_payload,
+    )
+    from backend.routers.chat_models import ChatRequest, Message
+
+    skill_dir = tmp_path / "story-skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "references").mkdir()
+    (skill_dir / "assets" / "generated").mkdir(parents=True)
+    (skill_dir / "references" / "story_templates.md").write_text(
+        "Use a short fable style.", encoding="utf-8"
+    )
+    (skill_dir / "scripts" / "generate.py").write_text(
+        """
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(sys.argv[1])
+out = Path('assets/generated/story.png')
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_bytes(b'fake-png')
+print(json.dumps({
+    'text': f"Story about {payload['topic']}",
+    'image_paths': [str(out)],
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text(
+        """---
+name: story-skill
+description: demo
+---
+Read `references/story_templates.md`, then run the declared command.
+role: composite_generator
+inputs: topic
+outputs: text, image_paths
+required_capabilities: text_generation, image_generation
+forbidden_capabilities: pdf_generation
+```bash
+python scripts/generate.py '{"topic":"{{topic}}"}'
+```
+""",
+        encoding="utf-8",
+    )
+
+    request = ChatRequest(messages=[Message(role="user", content="写一个狐狸故事")])
+    read_result, _ = _execute_single_task(
+        {"action": "read_resource", "path": "references/story_templates.md", "reason": "style"},
+        [],
+        request,
+        execution_root=skill_dir,
+        skill_name="story-skill",
+    )
+    assert read_result["success"] is True
+    assert "short fable" in read_result["content"]
+
+    final_instruction = """Use the loaded reference and execute:
+```bash
+python scripts/generate.py '{"topic":"狐狸"}'
+```
+"""
+    commands = _extract_executable_command_blocks_from_text(final_instruction)
+    assert commands == ["python scripts/generate.py '{\"topic\":\"狐狸\"}'"]
+
+    run_result, _ = _execute_single_task(
+        {"action": "run_command", "command": commands[0], "reason": "final_instruction"},
+        [],
+        request,
+        execution_root=skill_dir,
+        skill_name="story-skill",
+    )
+    assert run_result["success"] is True
+    assert run_result["action"] == "run_command"
+    assert json.loads(run_result["stdout"])["image_paths"] == ["assets/generated/story.png"]
+    assert run_result["output_files"] == [
+        {
+            "path": "assets/generated/story.png",
+            "url": "/api/skills/story-skill/files/assets/generated/story.png",
+        }
+    ]
+
+    exec_result = {"results": [read_result, run_result], "output_files": run_result["output_files"]}
+    answer = _render_success_stdout_payload(exec_result)
+    answer = _finalize_answer_output_file_links(answer, exec_result["output_files"])
+
+    assert "Story about 狐狸" in answer
+    assert "/api/skills/story-skill/files/assets/generated/story.png" in answer

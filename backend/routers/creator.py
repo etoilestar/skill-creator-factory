@@ -321,13 +321,15 @@ def _skill_plan_entry_for_file(
     """
     if skill_plan_entry and skill_plan_entry.get("path") == file_path:
         explicit_role = str(skill_plan_entry.get("role") or role or "").strip()
-        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
+        allowed_roles = {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}
         if explicit_role in allowed_roles:
-            inputs = list(skill_plan_entry.get("inputs") or default_io_for_role(explicit_role)[0])
-            outputs = list(skill_plan_entry.get("outputs") or default_io_for_role(explicit_role)[1])
             required_capabilities = list(
                 skill_plan_entry.get("required_capabilities") or capabilities_for_role(explicit_role)[0]
             )
+            if {"text_generation", "image_generation"}.issubset(set(required_capabilities)) and file_type_for_path(file_path) == "script":
+                explicit_role = "composite_generator"
+            inputs = list(skill_plan_entry.get("inputs") or default_io_for_role(explicit_role)[0])
+            outputs = list(skill_plan_entry.get("outputs") or default_io_for_role(explicit_role)[1])
             forbidden_capabilities = list(
                 skill_plan_entry.get("forbidden_capabilities") or capabilities_for_role(explicit_role)[1]
             )
@@ -370,7 +372,7 @@ def _skill_plan_entry_for_file(
             purpose=purpose,
             blueprint_summary=blueprint_text[:4000],
         )
-        if role in {"text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
+        if role in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script", "skill_overview", "reference", "asset"}:
             inputs, outputs = default_io_for_role(role)
             required_capabilities, forbidden_capabilities = capabilities_for_role(role)
             forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
@@ -482,6 +484,11 @@ _CREATOR_FLOW_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 _SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)(?![\w./-])")
+_KERNEL_RESOURCE_LEAK_RE = re.compile(
+    r"kernel/references/(?:workflows|output-patterns|best-practices)\.md|"
+    r"(?<![\w./-])references/(?:workflows|output-patterns)\.md(?![\w./-])",
+    re.IGNORECASE,
+)
 
 _IMAGE_MODEL_USAGE_RE = re.compile(r"IMAGE_MODEL|IMAGE_BASE_URL|/v1/images/generations|images/generations|generate_stable_diffusion_image", re.IGNORECASE)
 _DIRECT_IMAGE_API_RE = re.compile(r"IMAGE_BASE_URL|/v1/images/generations|images/generations", re.IGNORECASE)
@@ -554,13 +561,9 @@ def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: st
 
 
 def _script_command_template(script_path: str, blueprint_text: str, entry: SkillPlanEntry | None = None) -> str:
-    """Render a JSON argv command template from the SkillPlan inputs.
-
-    Blueprint keywords are used only as a legacy fallback when no SkillPlan
-    entry is available.  The mainstream Skill contract is that commands are
-    derived from the declared inputs and emit placeholders with exactly those
-    keys, avoiding natural-language/script-name guessing at runtime.
-    """
+    """Render the command template from SkillPlanEntry, the sole execution contract."""
+    if entry is not None and entry.command_template:
+        return entry.command_template
     keys = list(entry.inputs) if entry is not None else _infer_script_input_keys_from_blueprint(script_path, blueprint_text)
     if not keys:
         keys = ["payload"]
@@ -576,6 +579,60 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
         return f"python {script_path} '{payload}'"
     return f"{script_path} '{payload}'"
 
+
+
+def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
+    """Normalize a command block into runner/script/JSON-argv placeholder contract."""
+    try:
+        parts = shlex.split((command or "").strip())
+    except ValueError:
+        return None
+    expected_script = script_path.replace("\\", "/")
+    for idx, part in enumerate(parts):
+        normalized_script = part.replace("\\", "/")
+        if normalized_script == expected_script or normalized_script.endswith("/" + expected_script):
+            if idx + 1 >= len(parts):
+                return {
+                    "runner": Path(parts[idx - 1]).name if idx > 0 else "",
+                    "script_path": expected_script,
+                    "keys": set(),
+                    "placeholders": {},
+                }
+            try:
+                payload = json.loads(parts[idx + 1])
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            placeholders: dict[str, str] = {}
+            for key, value in payload.items():
+                if isinstance(value, str):
+                    match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}", value.strip())
+                    placeholders[str(key)] = match.group(1) if match else value.strip()
+                else:
+                    placeholders[str(key)] = ""
+            return {
+                "runner": Path(parts[idx - 1]).name if idx > 0 else "",
+                "script_path": expected_script,
+                "keys": set(str(key) for key in payload.keys()),
+                "placeholders": placeholders,
+            }
+    return None
+
+
+def _command_template_equivalent(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
+    """Compare command blocks by normalized execution contract, not raw bytes."""
+    command_sig = _command_signature(command, script_path)
+    template_sig = _command_signature(_script_command_template(script_path, "", entry), script_path)
+    if not command_sig or not template_sig:
+        return False
+    if command_sig["runner"] != template_sig["runner"]:
+        return False
+    if command_sig["script_path"] != template_sig["script_path"]:
+        return False
+    if command_sig["keys"] != template_sig["keys"]:
+        return False
+    return command_sig["placeholders"] == template_sig["placeholders"]
 
 def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
     """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
@@ -624,8 +681,21 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
     required = set(entry.inputs or ["payload"])
     results: list[ContractCheckResult] = []
     for idx, command in enumerate(commands, start=1):
+        command = command.strip()
         keys = _command_payload_keys(command, script_path)
         target = f"{script_path}#command-{idx}"
+        template_matches = _command_template_equivalent(command, script_path, entry)
+        results.append(ContractCheckResult(
+            id="command_block.command_template.equivalent",
+            passed=template_matches,
+            target=target,
+            message=(
+                "命令块与 SkillPlan.command_template 规范化等价。" if template_matches
+                else "命令块必须复用 SkillPlan.command_template 的执行合同：runner、script path、JSON argv keys 和 placeholder 映射必须一致。"
+            ),
+            expected=f"command_template: {_script_command_template(script_path, '', entry)}",
+            minimal_edit=f"将命令调整为与模板等价，推荐整行替换为：{_script_command_template(script_path, '', entry)}",
+        ))
         runtime_matches = _command_runtime_matches(command, script_path, entry)
         results.append(ContractCheckResult(
             id="command_block.runtime.matches_skillplan",
@@ -769,6 +839,19 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
     mentioned_skill_paths = _skill_local_paths_in_markdown(content)
     declared_skill_paths = _declared_skill_paths_from_blueprint(blueprint_text)
     undeclared_paths = sorted(path for path in mentioned_skill_paths if path not in declared_skill_paths)
+    kernel_leak = bool(_KERNEL_RESOURCE_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.resource.no_kernel_leak",
+        passed=not kernel_leak,
+        target="SKILL.md",
+        message=(
+            "SKILL.md 未引用 Creator 内部 kernel resources。"
+            if not kernel_leak
+            else "SKILL.md 引用了 Creator 内部 kernel references/workflows/output-patterns 资源；这些只能作为 Creator 内部上下文。"
+        ),
+        expected="最终业务 SKILL.md 只能引用本轮生成或当前 skill 目录真实存在的 resources；kernel/references/workflows.md、kernel/references/output-patterns.md 等不得写入最终 Skill。",
+        minimal_edit="删除 kernel references/workflows.md、references/workflows.md、references/output-patterns.md 等内部 Creator 资源引用。",
+    ))
     results.append(ContractCheckResult(
         id="skill_md.resource.local_declared",
         passed=not undeclared_paths,
@@ -796,7 +879,7 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
                         command_keys.update(keys)
                 if command_keys:
                     inferred_inputs = sorted(command_keys)
-            entry = replace(entry, inputs=inferred_inputs)
+            entry = replace(entry, inputs=inferred_inputs, command_template=commands[0].strip() if commands else command_template_for_entry(script_path, entry.runtime, inferred_inputs))
         template = _script_command_template(script_path, blueprint_text, entry)
         reference_delegates_execution = bool(reference_path_candidates := _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")) and any(ref in content for ref in reference_path_candidates) and bool(re.search(r"命令|执行|步骤|command|execute|steps", content, re.I))
         results.append(ContractCheckResult(
@@ -963,10 +1046,10 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
         if file_path in entry.reference_files or not entry.reference_files:
             script_lines.extend([
-                f"- 如本 reference 负责 {script_path} 子任务，必须写明 SkillPlanEntry：role={entry.role}; inputs={', '.join(entry.inputs) or 'payload'}; outputs={', '.join(entry.outputs)}; dependencies={', '.join(entry.dependencies) or 'none'}。",
-                f"- 若 SKILL.md 没有直接命令块，本 reference 必须提供 validated command block，推荐：```bash\n{_script_command_template(script_path, blueprint_text, entry)}\n```",
-                f"- 命令 JSON keys 必须且只能是：{', '.join(entry.inputs or ['payload'])}。",
-                f"- 角色边界：required_capabilities={', '.join(entry.required_capabilities) or 'none'}; forbidden_capabilities={', '.join(entry.forbidden_capabilities) or 'none'}。",
+                f"- 本 reference 默认只写规范、风格、正例、反例和质量标准；不要重新定义 {script_path} 的 role/inputs/outputs/capabilities/command_template。",
+                f"- 如果 SKILL.md 已包含 {script_path} 的可执行命令块，本 reference 不要再写命令块。",
+                f"- 若 reference 必须提供命令块，只能复用 SkillPlan.command_template 的等价执行合同：```bash\n{_script_command_template(script_path, blueprint_text, entry)}\n```",
+                f"- 禁止把上述正确命令、JSON keys（{', '.join(entry.inputs or ['payload'])}）或 role={entry.role} 写成反例。",
             ])
     if not script_lines:
         script_lines.append("- 本 reference 对应一个独立子任务/模块；必须写清 inputs、outputs、执行步骤、约束和示例。")
@@ -978,7 +1061,8 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         "B. 内容职责:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
         "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
-        "- 必须包含 inputs/outputs、执行步骤或命令模板、角色约束/禁止能力、示例、反例、最佳实践。",
+        "- 默认只写写作规范、风格要求、正例、反例、质量标准；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
+        "- 不要重新定义 role / inputs / outputs / capabilities / command_template。",
         *script_lines,
         "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
         "- 必须包含任务规范/步骤、示例、反例、约束/禁止项等章节，且正文长度足以指导子任务。",
@@ -1097,7 +1181,7 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         "execution": bool(re.search(r"(?im)^#{1,3}.*(执行|命令|步骤|Execution|Commands?)", stripped)) or "```bash" in stripped,
         "role_constraints": bool(re.search(r"(?im)^#{1,3}.*(角色|能力|禁止|Role|Capabilities?)", stripped)),
     }
-    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
+    role_section_required = bool(re.search(r"子任务|脚本|script|SkillPlan|text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script|命令模板|执行参考", purpose, re.I))
     role_sections_ok = (not role_section_required) or all(role_sections.values())
     missing_role_sections = [name for name, present in role_sections.items() if not present]
     results.append(ContractCheckResult(
@@ -1114,8 +1198,26 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
     ))
 
     reference_commands = _reference_script_commands(stripped)
+    script_paths_to_check = {script_path for script_path, _ in reference_commands}
+    script_paths_to_check.update(_paths_requiring_skill_md_mentions(purpose, prefix="scripts/"))
+    for script_path in sorted(script_paths_to_check):
+        entry = _skill_plan_entry_for_file(file_path=script_path, purpose=purpose, blueprint_text=purpose)
+        results.extend(_check_reference_skillplan_redefinitions(file_path, stripped, entry))
     for script_path, command in reference_commands:
-        entry = _skill_plan_entry_for_file(file_path=script_path, purpose=purpose, blueprint_text=f"{purpose}\n{content}")
+        entry = _skill_plan_entry_for_file(file_path=script_path, purpose=purpose, blueprint_text=purpose)
+        skill_md_commands = _extract_script_command_templates(purpose, script_path)
+        results.append(ContractCheckResult(
+            id="reference.command_block.not_duplicate_skill_md",
+            passed=not skill_md_commands,
+            target=f"{file_path}#{script_path}",
+            message=(
+                "SKILL.md 未提供该脚本命令，reference 可承担必要命令块。"
+                if not skill_md_commands
+                else "SKILL.md 已包含该脚本可执行命令块；reference 默认应只写规范/风格/示例/质量标准，不要重复写命令块。"
+            ),
+            expected="如果 SKILL.md 已有命令块，reference 不再写命令块；只有 SKILL.md 委托 reference 定义命令时才写。",
+            minimal_edit="删除 reference 中重复的命令块，保留写作规范、风格要求、正例、反例和质量标准。",
+        ))
         results.extend(_check_command_block_contract(script_path, [command], entry))
         required_capabilities = list(entry.required_capabilities or [])
         missing_capability_mentions = [capability for capability in required_capabilities if capability not in stripped]
@@ -1156,6 +1258,77 @@ def _reference_script_commands(content: str) -> list[tuple[str, str]]:
         for script_match in re.finditer(r"scripts/[A-Za-z0-9_./-]+", command):
             commands.append((script_match.group(0), command))
     return commands
+
+
+def _declared_list_in_text(field_name: str, content: str) -> list[str] | None:
+    pattern = re.compile(rf"(?:^|\b){re.escape(field_name)}\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I | re.M)
+    match = pattern.search(content or "")
+    if not match:
+        return None
+    return [re.sub(r"[^A-Za-z0-9_./-]", "", item.strip().strip("'\"")) for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
+
+
+def _declared_role_in_text(content: str) -> str | None:
+    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)", content or "", re.I | re.M)
+    return match.group(1) if match else None
+
+
+def _anti_example_sections(content: str) -> str:
+    chunks: list[str] = []
+    matches = list(re.finditer(r"(?im)^#{1,3}.*(?:反例|错误示例|Anti[- ]?examples?).*$", content or ""))
+    for idx, match in enumerate(matches):
+        start = match.end()
+        next_heading = re.search(r"(?m)^#{1,3}\s+", content[start:])
+        end = start + next_heading.start() if next_heading else len(content)
+        chunks.append(content[start:end])
+    return "\n".join(chunks)
+
+
+def _check_reference_skillplan_redefinitions(file_path: str, content: str, entry: SkillPlanEntry) -> list[ContractCheckResult]:
+    """Ensure references do not invent a second script interface contract."""
+    results: list[ContractCheckResult] = []
+    declared_role = _declared_role_in_text(content)
+    role_ok = declared_role is None or declared_role == entry.role
+    results.append(ContractCheckResult(
+        id="reference.role.matches_skillplan",
+        passed=role_ok,
+        target=f"{file_path}#{entry.path}",
+        message=("reference 未重新定义冲突 role。" if role_ok else f"reference 重新定义 role={declared_role}，与 SkillPlan.role={entry.role} 冲突。"),
+        expected=f"reference 默认不要定义 role；如提及只能是 role={entry.role}。",
+        minimal_edit="删除 reference 中的 role/能力合同定义，改写为写作规范、风格要求、示例和质量标准。",
+    ))
+    for field_name, expected_values in (
+        ("inputs", entry.inputs or ["payload"]),
+        ("outputs", entry.outputs),
+        ("required_capabilities", entry.required_capabilities),
+        ("forbidden_capabilities", entry.forbidden_capabilities),
+    ):
+        declared = _declared_list_in_text(field_name, content)
+        ok = declared is None or declared == expected_values
+        results.append(ContractCheckResult(
+            id=f"reference.{field_name}.matches_skillplan",
+            passed=ok,
+            target=f"{file_path}#{entry.path}",
+            message=(f"reference 未重新定义冲突 {field_name}。" if ok else f"reference {field_name}={declared} 与 SkillPlan {field_name}={expected_values} 冲突。"),
+            expected=f"reference 默认不要定义 {field_name}；如提及必须逐字等于 SkillPlan: {expected_values}。",
+            minimal_edit=f"删除或修正 {field_name} 小节，避免产生第二套接口合同。",
+        ))
+    anti = _anti_example_sections(content)
+    correct_command_in_anti = bool(anti and entry.command_template and entry.command_template in anti)
+    correct_keys_in_anti = False
+    for command in re.findall(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", anti, flags=re.I):
+        keys = _command_payload_keys(command.strip(), entry.path)
+        if keys == set(entry.inputs or ["payload"]):
+            correct_keys_in_anti = True
+    results.append(ContractCheckResult(
+        id="reference.anti_example.not_skillplan_command",
+        passed=not correct_command_in_anti and not correct_keys_in_anti,
+        target=f"{file_path}#anti-examples",
+        message=("reference 未把 SkillPlan 正确命令/JSON keys 写成反例。" if not correct_command_in_anti and not correct_keys_in_anti else "reference 把 SkillPlan.command_template 或正确 JSON keys 写入反例，导致合同冲突。"),
+        expected="反例只能展示 extra key、缺失 key、错误 runner 或非 JSON argv；不得否定 SkillPlan.command_template。",
+        minimal_edit="从反例中移除正确命令，改为错误示例例如 extra 参数或 payload 包装。",
+    ))
+    return results
 
 def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
     results = _check_reference_file_contract(file_path, content, purpose)
@@ -1333,6 +1506,8 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
         return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
+    if capability == "html_generation":
+        return bool(re.search(r"html_path|asset_paths|<html|<!DOCTYPE html|assets/generated", content, re.IGNORECASE))
     if capability == "file_output":
         return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf_path|file_paths", content, re.IGNORECASE))
     return True
@@ -1800,7 +1975,7 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
             if keys:
                 command_keys.update(keys)
         if command_keys:
-            plan_entry = replace(plan_entry, inputs=sorted(command_keys))
+            plan_entry = replace(plan_entry, inputs=sorted(command_keys), command_template=commands[0].strip())
     command_results: list[ContractCheckResult] = []
     command_results.extend(_check_command_block_contract(file_path, commands, plan_entry))
     failed_command_results = [result for result in command_results if not result.passed]
@@ -1948,6 +2123,46 @@ def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
     return False
 
 
+
+def _html_output_candidates(payload: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    html_path = payload.get("html_path")
+    if isinstance(html_path, str) and html_path.strip():
+        candidates.append(html_path.strip())
+    asset_paths = payload.get("asset_paths")
+    if isinstance(asset_paths, list):
+        candidates.extend(path.strip() for path in asset_paths if isinstance(path, str) and path.strip())
+    return candidates
+
+
+def _validate_html_trial_outputs(payload: dict[str, Any], *, skill_dir: Path | None, args: list[str], stdout: str) -> None:
+    checked: list[Path] = []
+    for candidate in _html_output_candidates(payload):
+        candidate_path = Path(candidate)
+        if not candidate_path.is_absolute() and skill_dir is not None:
+            if candidate.startswith("assets/"):
+                candidate_path = (skill_dir / candidate_path).resolve()
+            else:
+                candidate_path = (skill_dir / "scripts" / candidate_path).resolve()
+        checked.append(candidate_path)
+        if skill_dir is not None:
+            generated_root = (skill_dir / "assets" / "generated").resolve()
+            try:
+                candidate_path.relative_to(generated_root)
+            except ValueError:
+                raise ValueError(
+                    "html_asset_builder 输出路径必须位于当前 Skill 的 assets/generated/ 下："
+                    f"argv={args!r} stdout={stdout[-4000:]} checked={candidate_path}"
+                )
+        if candidate_path.is_file() and candidate_path.suffix.lower() in {".html", ".htm"}:
+            text = candidate_path.read_text(encoding="utf-8", errors="replace").lower()
+            if "<html" in text or "<!doctype html" in text:
+                return
+    raise ValueError(
+        "html_asset_builder 试运行必须输出 html_path 或 asset_paths，并生成真实 HTML 文件："
+        f"argv={args!r} stdout={stdout[-4000:]} checked={[str(p) for p in checked]}"
+    )
+
 def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
     pdf_path = payload.get("pdf_path")
     if isinstance(pdf_path, str) and pdf_path.strip():
@@ -1960,7 +2175,31 @@ def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None) -> None:
+
+_LEGACY_OUTPUT_ALIASES: dict[str, tuple[str, ...]] = {
+    "text": ("text_content", "story_text", "content"),
+    "image_paths": ("image_path", "images"),
+    "images": ("image_path", "image_paths"),
+    "pdf_path": ("file_path", "file_paths"),
+    "file_paths": ("file_path", "pdf_path"),
+}
+
+
+def _payload_has_declared_output(payload: dict[str, Any], output_key: str) -> bool:
+    if output_key in payload:
+        return True
+    return any(alias in payload for alias in _LEGACY_OUTPUT_ALIASES.get(output_key, ()))
+
+
+def _payload_output_value(payload: dict[str, Any], output_key: str) -> Any:
+    if output_key in payload:
+        return payload.get(output_key)
+    for alias in _LEGACY_OUTPUT_ALIASES.get(output_key, ()):
+        if alias in payload:
+            return payload.get(alias)
+    return None
+
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
     stripped = (stdout or "").strip()
     if not stripped:
         raise ValueError(f"脚本试运行 stdout 为空：argv={args!r}")
@@ -1973,15 +2212,26 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
     if "error" in payload:
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
 
-    plan_entry = _skill_plan_entry_for_file(file_path="scripts/trial.py", role=role) if role else None
+    plan_entry = _skill_plan_entry_for_file(file_path="scripts/trial.py", role=role, skill_plan_entry=skill_plan_entry) if (role or skill_plan_entry) else None
+    if skill_plan_entry:
+        declared_outputs = [str(key) for key in skill_plan_entry.get("outputs") or []]
+        missing_outputs = [key for key in declared_outputs if not _payload_has_declared_output(payload, key)]
+        if missing_outputs:
+            raise ValueError(
+                "脚本试运行 stdout JSON 缺少 SkillPlan.outputs 声明字段（仅允许有限 legacy alias 兼容旧 Skill；新生成 Skill 必须使用声明字段）："
+                f"missing={missing_outputs} argv={args!r} stdout={stripped[-4000:]}"
+            )
 
-    if plan_entry and plan_entry.role == "text_generator" and not str(payload.get("text") or "").strip():
+    if plan_entry and plan_entry.role == "text_generator" and not str(_payload_output_value(payload, "text") or "").strip():
         raise ValueError(f"text_generator stdout JSON 必须包含非空 text 字段：argv={args!r} stdout={stripped[-4000:]}")
 
-    if plan_entry and plan_entry.role == "pdf_builder":
+    if plan_entry and (plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or [])):
         if not _validate_file_payload_shape(payload):
             raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
         _validate_pdf_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
+
+    if plan_entry and (plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or [])):
+        _validate_html_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
 
     if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
         raise ValueError(
@@ -2069,17 +2319,19 @@ def _trial_run_generated_script(
                     stdout=proc.stdout,
                     stderr=proc.stderr,
                 ))
-            inferred_role = role or _skill_plan_entry_for_file(
+            inferred_entry = _skill_plan_entry_for_file(
                 file_path=file_path,
                 blueprint_text=skill_md,
                 skill_plan_entry=skill_plan_entry,
-            ).role
+            )
+            inferred_role = role or inferred_entry.role
             _validate_trial_stdout_json(
                 stdout=proc.stdout,
                 content=content,
                 args=args,
                 role=inferred_role,
                 skill_dir=skill_dir,
+                skill_plan_entry=skill_plan_entry,
             )
 
 
@@ -2128,7 +2380,10 @@ async def _repair_generated_file_with_feedback(
     if is_script:
         role_rule = ""
         if plan_entry is not None and plan_entry.role == "composite_generator":
-            role_rule = "role=composite_generator：必须保留并调用 generate_text_with_llm 与 generate_stable_diffusion_image，stdout 同时输出 text 与 image_paths/images；禁止删除任何合法 helper。"
+            caps = set(plan_entry.required_capabilities or [])
+            role_rule = "role=composite_generator：表示多能力组合脚本；具体 helper 和 stdout 字段由 SkillPlan.required_capabilities 与 outputs 决定，不要把 composite 固定理解为 text+image。"
+            if {"text_generation", "image_generation"} <= caps:
+                role_rule += " 当前合同同时要求文本和图片能力，必须保留 generate_text_with_llm 与 generate_stable_diffusion_image。"
         elif plan_entry is not None and plan_entry.role == "image_generator":
             role_rule = "role=image_generator：必须保留并调用 generate_stable_diffusion_image，stdout 输出 image_paths/images；禁止占位图片或删除真实 helper。"
         elif plan_entry is not None and plan_entry.role == "text_generator":
@@ -2750,7 +3005,7 @@ def _script_generation_skeleton(
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
 
     if plan_entry.runtime == "node":
-        if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+        if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
             return (
                 "必须使用下面的 node composite_generator skeleton；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout 只能 console.log JSON 字符串：\n"
                 "const { spawnSync } = require('child_process');\n"
@@ -2790,7 +3045,7 @@ def _script_generation_skeleton(
                 "}\n"
                 "console.log(JSON.stringify(run(payload)));"
             )
-        if plan_entry.role == "pdf_builder":
+        if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
             return (
                 "必须使用下面的 node pdf_builder skeleton；消费 text/image_paths/template/assets 构建 PDF，不生成图片：\n"
                 "const fs = require('fs');\n"
@@ -2834,11 +3089,11 @@ def _script_generation_skeleton(
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+        if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
             helper = "from backend.services.skill_runtime import generate_text_with_llm, generate_stable_diffusion_image; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); text=generate_text_with_llm(prompt); result=generate_stable_diffusion_image(text or prompt, filename_prefix='generated'); print(json.dumps({'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "image_generator":
             helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
-        elif plan_entry.role == "pdf_builder":
+        elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
             helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or '.').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
         elif plan_entry.role == "text_generator":
             helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
@@ -2852,7 +3107,45 @@ def _script_generation_skeleton(
             f"python -c {shlex.quote(helper)} \"$payload_json\""
         )
 
-    if plan_entry.role == "composite_generator" or ({"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or [])):
+
+    if plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or []):
+        return (
+            "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 assets/generated/ 下写入 HTML，并在 stdout JSON 返回 html_path 与 asset_paths：\n"
+            "import html\n"
+            "import json\n"
+            "import re\n"
+            "import sys\n"
+            "from pathlib import Path\n\n"
+            "def parse_args() -> dict:\n"
+            "    if len(sys.argv) < 2:\n"
+            "        return {}\n"
+            "    return json.loads(sys.argv[1])\n\n"
+            "def slugify(value: str) -> str:\n"
+            "    slug = re.sub(r'[^A-Za-z0-9_-]+', '-', value).strip('-').lower()\n"
+            "    return slug or 'generated'\n\n"
+            "def build_html(payload: dict) -> str:\n"
+            f"    text = str({py_value_expr} or 'Generated HTML').strip()\n"
+            "    safe = html.escape(text)\n"
+            "    return '<!doctype html><html><head><meta charset=\"utf-8\"><title>Generated</title></head><body><main><h1>Generated Asset</h1><p>' + safe + '</p></main></body></html>'\n\n"
+            "def run(payload: dict) -> dict:\n"
+            f"    title = str({py_value_expr} or 'generated').strip()\n"
+            "    skill_root = Path(__file__).resolve().parents[1]\n"
+            "    out_dir = (skill_root / 'assets' / 'generated').resolve()\n"
+            "    required_root = (skill_root / 'assets' / 'generated').resolve()\n"
+            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
+            "    html_path = (out_dir / (slugify(title) + '.html')).resolve()\n"
+            "    html_path.relative_to(required_root)\n"
+            "    html_path.write_text(build_html(payload), encoding='utf-8')\n"
+            "    rel = html_path.relative_to(skill_root).as_posix()\n"
+            "    return {'html_path': rel, 'asset_paths': [rel]}\n\n"
+            "def main() -> None:\n"
+            "    payload = parse_args()\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()"
+        )
+
+    if {"text_generation", "image_generation"} <= set(plan_entry.required_capabilities or []):
         return (
             "必须使用下面的 composite_generator 脚本骨架；先调用平台 generate_text_with_llm，再调用 generate_stable_diffusion_image，stdout JSON 包含 text 与 image_paths/images：\n"
             "import json\n"
@@ -2908,7 +3201,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if plan_entry.role == "pdf_builder":
+    if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
         return (
             "必须使用下面的 pdf_builder 脚本骨架；该角色只负责 PDF/文件构建，禁止生成图片：\n"
             "import json\n"
@@ -3091,7 +3384,7 @@ def _build_generate_file_prompt(
             "7. 是否允许生成图片由 SkillPlan.required_capabilities 决定：只要 required_capabilities 包含 image_generation，就必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；不要在脚本里写中文 prompt 翻译逻辑；如果同时包含 text_generation 和 image_generation，使用 composite_generator 或等价合并脚本同时保留文本和图片 helper。\n"
             "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 输出结构化 JSON，字段必须根据 SkillPlan role/capability contract 输出：text_generator 返回 text；image_generator 返回 image_paths/images；composite_generator 返回 text 与 image_paths/images；pdf_builder 返回 pdf_path/file_paths；generic_script 返回与职责匹配的 text/file_paths 等明确字段；不要混入调试说明。\n"
+            "10. stdout 输出结构化 JSON，字段必须以 SkillPlan.outputs 为准；允许极少数 legacy alias 仅用于兼容旧 Skill，新生成 Skill 必须统一字段命名，不要混用 text/text_content/story_text 等别名；composite_generator 只表示多能力组合，具体输出由 outputs/required_capabilities 决定。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
@@ -3472,6 +3765,78 @@ async def write_file(request: WriteFileRequest):
     )
 
 
+
+def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
+    """End-to-end dry-run for the final Skill package across docs and scripts.
+
+    ``mode=trial`` uses deterministic helper behavior through the existing
+    script trial runner so validation does not spend expensive model/image
+    calls.  ``mode=sandbox`` currently exercises the same sandbox execution
+    path with trial-run helpers enabled, while still validating the real docs,
+    command templates, script paths, JSON argv, stdout outputs, and helper call
+    wiring.
+    """
+    skill_dir = settings.skills_path / skill_name
+    errors: list[str] = []
+    skill_md_path = skill_dir / "SKILL.md"
+    if not skill_md_path.is_file():
+        return ["SKILL.md 合同错误：无法加载 SKILL.md。"]
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    try:
+        _validate_skill_md_contract(skill_md, skill_md)
+    except ValueError as exc:
+        errors.append(f"SKILL.md 合同错误：{exc}")
+
+    script_paths = sorted(set(_skill_local_paths_in_markdown(skill_md)) | {f"scripts/{p.name}" for p in (skill_dir / "scripts").glob("*.py")})
+    script_paths = [path for path in script_paths if path.startswith("scripts/")]
+    reference_paths = sorted(path for path in _skill_local_paths_in_markdown(skill_md) if path.startswith("references/"))
+
+    for ref_path in reference_paths:
+        ref_file = skill_dir / ref_path
+        if not ref_file.is_file():
+            errors.append(f"resource 不存在：{ref_path}")
+            continue
+        try:
+            _validate_reference_file_contract(ref_path, ref_file.read_text(encoding="utf-8"), skill_md)
+        except ValueError as exc:
+            errors.append(f"reference 合同冲突：{ref_path}: {exc}")
+
+    for script_path in script_paths:
+        source_path = skill_dir / script_path
+        if not source_path.is_file():
+            errors.append(f"script 参数不匹配：找不到脚本 {script_path}")
+            continue
+        commands = _extract_script_command_templates(skill_md, script_path)
+        for ref_path in reference_paths:
+            ref_file = skill_dir / ref_path
+            if ref_file.is_file():
+                commands.extend(cmd for ref_script, cmd in _reference_script_commands(ref_file.read_text(encoding="utf-8")) if ref_script == script_path)
+        if not commands:
+            errors.append(f"SKILL.md 合同错误：无法识别 {script_path} 的命令块。")
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=skill_md)
+        failed_command_checks = [r for r in _check_command_block_contract(script_path, commands, entry) if not r.passed]
+        if failed_command_checks:
+            errors.append(f"command_template 不一致：{_format_contract_checks(failed_command_checks, passed=False)}")
+        content = source_path.read_text(encoding="utf-8")
+        failed_script_checks = [
+            r for r in _check_script_file_contract(script_path, content, role=entry.role, skill_plan_entry=entry.__dict__)
+            if not r.passed
+        ]
+        if failed_script_checks:
+            errors.append(f"helper 未调用或调用失败：{script_path}: {_format_contract_checks(failed_script_checks, passed=False)}")
+        try:
+            _trial_run_generated_script(skill_name, script_path, content, entry.role, entry.__dict__)
+        except ValueError as exc:
+            msg = str(exc)
+            if "stdout" in msg and "JSON" in msg:
+                layer = "stdout JSON 不符合 outputs"
+            elif "required_capabilities" in msg or "helper" in msg:
+                layer = "helper 未调用或调用失败"
+            else:
+                layer = "sandbox 无法执行"
+            errors.append(f"{layer}：{script_path}: {exc}")
+    return errors
+
 @router.post("/validate-skill", response_model=SkillActionResponse)
 async def validate_skill(request: SkillActionRequest):
     """Validate SKILL.md format for a Skill package."""
@@ -3491,6 +3856,13 @@ async def validate_skill(request: SkillActionRequest):
                 success=False,
                 path=None,
                 message="SKILL.md 格式校验通过，但脚本试运行失败：\n" + "\n\n".join(trial_errors),
+            )
+        smoke_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        if smoke_errors:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message="端到端 sandbox dry-run / smoke test 失败：\n" + "\n\n".join(smoke_errors),
             )
     return SkillActionResponse(
         success=result["success"],

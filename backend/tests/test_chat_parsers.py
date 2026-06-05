@@ -2705,3 +2705,105 @@ def test_normalize_runtime_plan_distinguishes_load_failed_from_file_missing(tmp_
     missing_by_path = {item["path"]: item for item in result["missing"]}
     assert missing_by_path["references/load-failed.md"]["missing_type"] == "load_failed"
     assert missing_by_path["references/file-missing.md"]["missing_type"] == "file_missing"
+
+
+def test_normalize_skill_runtime_plan_removes_planner_missing_when_script_exists(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "scripts" / "generate_fable.py").write_text("print('{}')", encoding="utf-8")
+    plan = {
+        "mode": "ask_user",
+        "actions": [],
+        "missing": [{"path": "scripts/generate_fable.py", "missing_type": "file_missing", "reason": "planner says missing"}],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        execution_root=skill_root,
+        available_scripts=["scripts/generate_fable.py"],
+        command_contract={"has_executable_command_block": True, "action_schema": {"entries": [{"script_path": "scripts/generate_fable.py"}]}},
+    )
+
+    assert result["missing"] == []
+    assert result["mode"] == "direct_answer"
+    assert result["planner_inconsistent"][0]["missing_type"] == "planner_inconsistent"
+    assert result["planner_inconsistent"][0]["path"] == "scripts/generate_fable.py"
+
+
+def test_available_scripts_scans_only_execution_root_not_kernel(tmp_path):
+    from backend.routers.sandbox_chat import _available_scripts_for_root
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    kernel_root = tmp_path / "kernel"
+    (skill_root / "scripts").mkdir(parents=True)
+    (kernel_root / "scripts").mkdir(parents=True)
+    (skill_root / "scripts" / "generate_fable.py").write_text("print('{}')", encoding="utf-8")
+    (kernel_root / "scripts" / "kernel_tool.py").write_text("print('{}')", encoding="utf-8")
+
+    assert _available_scripts_for_root(skill_root) == ["scripts/generate_fable.py"]
+
+
+def test_stdout_html_and_asset_paths_become_output_files(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+
+    skill_root = tmp_path / "skills" / "html-skill"
+    out = skill_root / "assets" / "generated" / "page.html"
+    out.parent.mkdir(parents=True)
+    out.write_text("<!doctype html><html></html>", encoding="utf-8")
+    stdout = __import__("json").dumps({"html_path": "assets/generated/page.html", "asset_paths": ["assets/generated/page.html"]})
+
+    files = _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="html-skill")
+
+    assert files == [{"path": "assets/generated/page.html", "url": "/api/skills/html-skill/files/assets/generated/page.html"}]
+
+
+def test_resource_catalog_for_planner_includes_display_path_and_selector_prompt_has_no_creator_semantics():
+    from backend.routers.sandbox_chat import _compose_resource_selection_prompt, _resource_catalog_for_planner
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    planner_catalog = _resource_catalog_for_planner(catalog)
+    prompt = _compose_resource_selection_prompt()
+
+    assert planner_catalog[0]["display_path"] == "references/story_templates.md"
+    assert "resource:<filename>" in prompt
+    assert "resource:<path>" in prompt
+    assert "creator" not in prompt.lower()
+    assert "Creator" not in prompt
+
+
+def test_resource_selection_resolves_path_like_pseudo_handle_to_catalog_handle():
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    text = __import__("json").dumps({"need_resources": True, "resource_handles": ["resource:story_templates.md"], "reason": "need template"})
+
+    result = _parse_resource_selection_decision(text, resource_catalog=catalog)
+
+    assert result["need_resources"] is True
+    assert result["resource_handles"] == ["resource:0"]
+
+
+def test_normalize_skill_runtime_plan_resolves_path_like_read_resource_handle(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    ref = skill_root / "references" / "story_templates.md"
+    ref.parent.mkdir(parents=True)
+    ref.write_text("template", encoding="utf-8")
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "read_resource", "resource_handle": "resource:story_templates.md"}],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan, resource_catalog=catalog, execution_root=skill_root)
+
+    assert result["mode"] == "execute"
+    assert result["tasks"][0]["resource_handle"] == "resource:0"
+    assert result["tasks"][0]["path"] == "references/story_templates.md"
+    assert result["planner_inconsistent"][0]["resolved_resource_handle"] == "resource:0"

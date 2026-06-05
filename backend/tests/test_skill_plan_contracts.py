@@ -633,3 +633,255 @@ python scripts/run.py '{"topic":"{{topic}}"}'
 
     assert "skill_md.resource.local_declared" not in failed
     assert "skill_md.reference.mentioned" not in failed
+
+
+def test_reference_command_payload_conflict_is_rejected_against_skillplan():
+    from backend.routers.creator import _check_reference_file_contract
+
+    purpose = "scripts/generate_fable.py role: text_generator inputs: topic outputs: text required_capabilities: text_generation"
+    content = """
+## 规范
+围绕 topic 写寓言，语言清晰。
+
+## 示例
+输入 topic=狐狸，输出有寓意的短文。
+
+## 反例
+不要忽略主题，不要输出空文本。
+
+## 约束
+必须使用 SkillPlan 的命令模板。
+
+## 执行命令
+```bash
+python scripts/generate_fable.py '{"payload":{"topic":"{{topic}}"}}'
+```
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
+
+    assert "command_block.command_template.equivalent" in failed
+    assert "command_block.skillplan_inputs.exact" in failed
+
+
+def test_reference_redefined_role_is_rejected_against_skillplan():
+    from backend.routers.creator import _check_reference_file_contract
+
+    purpose = "scripts/generate_fable.py role: text_generator inputs: topic outputs: text required_capabilities: text_generation"
+    content = """
+## 规范
+按照 topic 写完整寓言，保持温和风格。
+
+## 示例
+输入 topic=诚实，输出一个儿童能理解的故事。
+
+## 反例
+不要写成说明文，不要忽略寓意。
+
+## 约束
+role: generic_script
+inputs: topic
+outputs: text
+required_capabilities: text_generation
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
+
+    assert "reference.role.matches_skillplan" in failed
+
+
+def test_reference_cannot_put_skillplan_command_in_anti_example():
+    from backend.routers.creator import _check_reference_file_contract
+
+    purpose = "scripts/generate_fable.py role: text_generator inputs: topic outputs: text required_capabilities: text_generation"
+    content = """
+## 规范
+按照 topic 生成寓言，正文需要自然、有结尾寓意。
+
+## 示例
+正确做法是读取用户主题并组织成完整故事。
+
+## 反例
+以下写法不要使用：
+```bash
+python scripts/generate_fable.py '{"topic":"{{topic}}"}'
+```
+
+## 约束
+反例只能展示缺失参数或多余参数，不能否定正确命令。
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
+
+    assert "reference.anti_example.not_skillplan_command" in failed
+
+
+def test_required_text_and_image_capabilities_normalize_to_composite_generator():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/main.py",
+        purpose="role: generic_script inputs: topic outputs: text, image_paths required_capabilities: text_generation, image_generation",
+    )
+
+    assert entry.role == "composite_generator"
+    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert "image_generation" not in entry.forbidden_capabilities
+    assert entry.command_template == 'python scripts/main.py \'{"topic":"{{topic}}"}\''
+
+
+def test_command_template_can_be_parsed_for_sandbox_trial_args():
+    from backend.routers.creator import _render_trial_command_args
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(file_path="scripts/generate_fable.py", purpose="inputs: topic")
+    args = _render_trial_command_args(entry.command_template, "scripts/generate_fable.py")
+
+    assert args is not None
+    assert len(args) == 1
+    assert set(__import__("json").loads(args[0]).keys()) == {"topic"}
+
+
+def test_composite_trial_stdout_accepts_text_and_image_paths(tmp_path):
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    image_path = tmp_path / "image.png"
+    image_path.write_bytes(b"fake")
+    payload = {"text": "story", "image_paths": [str(image_path)], "images": [{"image_path": str(image_path)}]}
+
+    _validate_trial_stdout_json(
+        stdout=__import__("json").dumps(payload),
+        content="generate_text_with_llm(); generate_stable_diffusion_image()",
+        args=['{"topic":"cat"}'],
+        role="composite_generator",
+        skill_dir=tmp_path,
+    )
+
+
+
+def test_command_template_normalized_equivalence_allows_json_key_order_and_spaces():
+    from backend.routers.creator import _check_command_block_contract
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(file_path="scripts/write.py", purpose="inputs: topic, tone")
+    command = "python scripts/write.py '{\"tone\": \"{{ tone }}\", \"topic\": \"{{topic}}\"}'"
+    failed = {r.id for r in _check_command_block_contract("scripts/write.py", [command], entry) if not r.passed}
+
+    assert "command_block.command_template.equivalent" not in failed
+    assert "command_block.skillplan_inputs.exact" not in failed
+
+
+def test_reference_command_is_rejected_when_skill_md_already_has_command():
+    from backend.routers.creator import _check_reference_file_contract
+
+    skill_md = """---
+name: fable
+description: demo
+---
+```bash
+python scripts/generate_fable.py '{"topic":"{{topic}}"}'
+```
+"""
+    content = """
+## 规范
+保持寓言结构清晰，结尾给出寓意。
+
+## 示例
+输入诚实，输出角色行动和寓意。
+
+## 反例
+不要输出空泛口号。
+
+## 约束
+如果 SKILL.md 已有命令，本 reference 不重复命令。
+```bash
+python scripts/generate_fable.py '{"topic":"{{topic}}"}'
+```
+"""
+    failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=skill_md) if not r.passed}
+
+    assert "reference.command_block.not_duplicate_skill_md" in failed
+
+
+def test_trial_stdout_outputs_allow_limited_legacy_aliases():
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    entry = {
+        "path": "scripts/write.py",
+        "role": "text_generator",
+        "inputs": ["topic"],
+        "outputs": ["text"],
+        "required_capabilities": ["text_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+
+    _validate_trial_stdout_json(
+        stdout=__import__("json").dumps({"story_text": "legacy story"}),
+        content="generate_text_with_llm('x')",
+        args=['{"topic":"cat"}'],
+        role="text_generator",
+        skill_plan_entry=entry,
+    )
+
+
+def test_composite_generator_skeleton_uses_required_capabilities_not_role_name():
+    from backend.routers.creator import _script_generation_skeleton
+
+    entry = {
+        "path": "scripts/composite_pdf.py",
+        "role": "composite_generator",
+        "inputs": ["text"],
+        "outputs": ["pdf_path", "file_paths"],
+        "required_capabilities": ["pdf_generation", "file_output"],
+        "forbidden_capabilities": ["image_generation"],
+        "language": "python",
+        "runtime": "python",
+    }
+
+    skeleton = _script_generation_skeleton("scripts/composite_pdf.py", "", "", skill_plan_entry=entry)
+
+    assert "generate_stable_diffusion_image" not in skeleton
+    assert "generate_text_with_llm" not in skeleton
+    assert "PDF" in skeleton or "pdf_path" in skeleton
+
+
+def test_skill_md_rejects_explicit_kernel_reference_leak_even_if_self_declared():
+    from backend.routers.creator import _check_skill_md_contract
+
+    skill_md = """---
+name: leak
+description: demo
+---
+请读取 kernel/references/workflows.md 和 references/output-patterns.md 作为运行规范。
+"""
+
+    failed = {result.id for result in _check_skill_md_contract(skill_md, skill_md) if not result.passed}
+
+    assert "skill_md.resource.no_kernel_leak" in failed
+
+
+def test_html_asset_builder_plan_skeleton_and_trial_validation(tmp_path):
+    from backend.routers.creator import _script_generation_skeleton, _validate_trial_stdout_json
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/build_html.py",
+        purpose="role: html_asset_builder inputs: topic outputs: html_path, asset_paths required_capabilities: html_generation, file_output",
+    )
+    skeleton = _script_generation_skeleton("scripts/build_html.py", "", "", skill_plan_entry=entry.__dict__)
+
+    assert entry.role == "html_asset_builder"
+    assert entry.outputs == ["html_path", "asset_paths"]
+    assert "assets/generated" in skeleton
+    assert "html_path" in skeleton
+
+    skill_dir = tmp_path / "html-skill"
+    html_file = skill_dir / "assets" / "generated" / "demo.html"
+    html_file.parent.mkdir(parents=True)
+    html_file.write_text("<!doctype html><html><body>demo</body></html>", encoding="utf-8")
+    _validate_trial_stdout_json(
+        stdout=__import__("json").dumps({"html_path": "assets/generated/demo.html", "asset_paths": ["assets/generated/demo.html"]}),
+        content="html_path = 'assets/generated/demo.html'\nPath('assets/generated/demo.html').write_text('<html></html>')",
+        args=['{"topic":"demo"}'],
+        role="html_asset_builder",
+        skill_plan_entry=entry.__dict__,
+        skill_dir=skill_dir,
+    )

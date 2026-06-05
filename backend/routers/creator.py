@@ -349,6 +349,8 @@ def _skill_plan_entry_for_file(
                 outputs=outputs,
                 dependencies=list(skill_plan_entry.get("dependencies") or []),
                 required_capabilities=required_capabilities,
+                optional_capabilities=list(skill_plan_entry.get("optional_capabilities") or []),
+                allowed_capabilities=list(skill_plan_entry.get("allowed_capabilities") or []),
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=[ref for ref in list(skill_plan_entry.get("reference_files") or []) if str(ref).startswith(("references/", "assets/", "scripts/"))],
                 skill_local_references=[ref for ref in list(skill_plan_entry.get("skill_local_references") or skill_plan_entry.get("reference_files") or []) if str(ref).startswith(("references/", "assets/", "scripts/"))],
@@ -388,6 +390,8 @@ def _skill_plan_entry_for_file(
                 outputs=outputs,
                 dependencies=entry.dependencies,
                 required_capabilities=required_capabilities,
+                optional_capabilities=entry.optional_capabilities,
+                allowed_capabilities=entry.allowed_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
                 reference_files=entry.reference_files,
                 skill_local_references=entry.skill_local_references,
@@ -1598,7 +1602,7 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         # instead of a generic "missing required_capabilities" message.
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
-        return bool(re.search(r"FPDF|reportlab|PdfWriter|pdf\.output|canvas\.Canvas|build_pdf", content, re.IGNORECASE))
+        return bool(re.search(r"FPDF|reportlab|PdfWriter|pdf\.output|canvas\.Canvas|build_pdf|%PDF-|pdf_path|\.pdf[\"\']", content, re.IGNORECASE))
     if capability == "docx_generation":
         return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
     if capability == "pptx_generation":
@@ -1966,19 +1970,17 @@ def _reject_fake_script_implementation(file_path: str, content: str) -> None:
         )
 
 
-def _requires_configured_model_call(*, skill_md: str, file_path: str) -> bool:
-    """Return whether SKILL.md declares host-model-powered behavior for a script.
+def _requires_configured_model_call(*, plan_entry: SkillPlanEntry | None) -> bool:
+    """Return whether the current script contract requires host model use.
 
-    This intentionally keys off model-capability wording (host/built-in/
-    configured models, LLM, multimodal, image/vision models) rather than a
-    finite list of Skill domains.
+    Model-call requirements are scoped to this script's SkillPlanEntry.
+    Whole-SKILL.md wording about LLM/image models can describe earlier or later
+    steps, but must not force deterministic exporter/builder scripts to call a
+    model unless their own required_capabilities declare text/image generation.
     """
-    if not skill_md:
+    if plan_entry is None:
         return False
-    commands = _extract_script_command_templates(skill_md, file_path)
-    if not commands:
-        return False
-    return bool(_HOST_MODEL_CAPABILITY_RE.search(skill_md))
+    return bool({"text_generation", "image_generation"} & set(plan_entry.required_capabilities or []))
 
 
 def _script_uses_configured_model(content: str) -> bool:
@@ -1986,8 +1988,8 @@ def _script_uses_configured_model(content: str) -> bool:
     return bool(_CONFIGURED_MODEL_CALL_RE.search(content))
 
 
-def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str) -> None:
-    """Reject scripts that claim host-model behavior but do not call models."""
+def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str, plan_entry: SkillPlanEntry | None = None) -> None:
+    """Reject scripts whose own SkillPlanEntry requires host-model behavior but do not call models."""
     if _DIRECT_IMAGE_API_RE.search(content) and "VISION_MODEL" in content:
         raise ValueError(
             f"{file_path} 将 VISION_MODEL 与图片生成接口混用。"
@@ -2021,7 +2023,7 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
             "再执行 image_paths.append(result.get(\"image_path\")) 和 images.append(result)。"
         )
 
-    if not _requires_configured_model_call(skill_md=skill_md, file_path=file_path):
+    if not _requires_configured_model_call(plan_entry=plan_entry):
         return
     if _script_uses_configured_model(content):
         return
@@ -2091,12 +2093,12 @@ def _script_has_main_entry(content: str, runtime: str) -> bool:
 def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
     """Validate script source against existing SKILL.md command examples."""
     _reject_fake_script_implementation(file_path, content)
-    _validate_configured_model_usage_static(file_path=file_path, content=content, skill_md=skill_md)
+    plan_entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+    _validate_configured_model_usage_static(file_path=file_path, content=content, skill_md=skill_md, plan_entry=plan_entry)
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
 
-    plan_entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
     # Backward compatibility for existing SKILL.md files that predate explicit
     # SkillPlan inputs: keep generic_script conservative capabilities, but treat
     # the JSON argv command itself as the declared interface for static script
@@ -2836,15 +2838,53 @@ async def _run_generated_file_validator_round(
     failed_checks = _filter_validator_failed_checks(raw_failed_checks, failed_checks_text)
     preserve = data.get("preserve") if isinstance(data.get("preserve"), list) else []
     instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
+    filtered_issues, instructions = _filter_validator_model_call_misjudgements(
+        file_path=file_path,
+        deterministic_error=deterministic_error,
+        failed_checks_text=failed_checks_text,
+        issues=issues,
+        instructions=instructions,
+    )
     return {
-        "passed": bool(data.get("passed", data.get("valid", False))) and not issues and not failed_checks,
-        "issues": [str(item) for item in issues],
+        "passed": bool(data.get("passed", data.get("valid", False))) and not filtered_issues and not failed_checks,
+        "issues": filtered_issues,
         "failed_checks": failed_checks,
         "preserve": [str(item) for item in preserve],
         "repair_instructions": instructions,
         "model": route.model,
     }
 
+
+
+def _filter_validator_model_call_misjudgements(
+    *,
+    file_path: str,
+    deterministic_error: str,
+    failed_checks_text: str,
+    issues: list[Any],
+    instructions: str,
+) -> tuple[list[str], str]:
+    """Remove validator feedback that invents model-call requirements.
+
+    The validator model may over-generalize from SKILL.md prose. Only the
+    deterministic contract for this script may introduce required model calls.
+    """
+    issue_strings = [str(item) for item in issues]
+    if not file_path.startswith("scripts/"):
+        return issue_strings, instructions
+    deterministic_scope = f"{deterministic_error}\n{failed_checks_text}"
+    deterministic_mentions_model_requirement = bool(re.search(
+        r"text_generation|image_generation|generate_text_with_llm|generate_stable_diffusion_image|LLM|TEXT_MODEL|IMAGE_MODEL|模型",
+        deterministic_scope,
+        re.IGNORECASE,
+    ))
+    if deterministic_mentions_model_requirement:
+        return issue_strings, instructions
+    model_error_re = re.compile(r"必须.*(?:模型|LLM|TEXT_MODEL|IMAGE_MODEL|generate_text_with_llm|generate_stable_diffusion_image)|(?:未|没有)调用.*(?:模型|LLM|TEXT_MODEL|IMAGE_MODEL)", re.IGNORECASE)
+    filtered_issues = [item for item in issue_strings if not model_error_re.search(item)]
+    if model_error_re.search(instructions or ""):
+        instructions = deterministic_error
+    return filtered_issues, instructions
 
 def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
     issues = validator_report.get("issues") or []
@@ -3276,7 +3316,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "docx_builder" or "docx_generation" in set(plan_entry.required_capabilities or []):
         return (
-            "必须使用下面的 docx_builder 脚本骨架；只消费上一步 stdout JSON/text/image_paths，按需生成 Word，不生成文本或图片：\n"
+            "必须使用下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from pathlib import Path\n"
@@ -3315,7 +3355,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pptx_builder" or "pptx_generation" in set(plan_entry.required_capabilities or []):
         return (
-            "必须使用下面的 pptx_builder 脚本骨架；只消费上一步 stdout JSON/text/image_paths，按需生成 PPT，不生成文本或图片：\n"
+            "必须使用下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from pathlib import Path\n\n"
@@ -3441,7 +3481,7 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pdf_builder" or "pdf_generation" in set(plan_entry.required_capabilities or []):
         return (
-            "必须使用下面的 pdf_builder 脚本骨架；该角色只负责 PDF/Word/PPT/HTML 文件构建，禁止生成图片：\n"
+            "必须使用下面的 pdf_builder 脚本骨架；默认只负责读取已有内容并构建 PDF/Word/PPT/HTML 文件；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
             "from pathlib import Path\n\n"
@@ -3621,7 +3661,7 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 是否允许生成图片由 SkillPlan.required_capabilities 决定：只要 required_capabilities 包含 image_generation，就必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；不要在脚本里写中文 prompt 翻译逻辑；如果同时包含 text_generation 和 image_generation，使用 composite_generator 或等价合并脚本同时保留文本和图片 helper。\n"
+            "7. 是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
             "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths/images；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\"))、images.append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 输出结构化 JSON，字段必须以 SkillPlan.outputs 为准；允许极少数 legacy alias 仅用于兼容旧 Skill，新生成 Skill 必须统一字段命名，不要混用 text/text_content/story_text 等别名；composite_generator 只表示多能力组合，具体输出由 outputs/required_capabilities 决定。\n"

@@ -1,0 +1,128 @@
+import pytest
+
+from backend.routers.creator import (
+    ContractValidationError,
+    _validate_script_contract_static,
+    _validate_script_file_source_contract,
+)
+from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
+from backend.services.skill_plan import build_skill_plan_entry, capabilities_for_role
+
+
+PDF_BUILDER_SOURCE = r'''
+import json
+import sys
+from pathlib import Path
+
+
+def main():
+    payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+    story_text = str(payload.get("story_text") or "export text")
+    image_paths = payload.get("image_paths") or []
+    previous_stdout = payload.get("previous_stdout") or ""
+    template_path = payload.get("template_path") or ""
+    out_dir = Path("assets/generated")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "export.pdf"
+    body = (story_text + "\n" + str(image_paths) + "\n" + previous_stdout + "\n" + template_path).encode("latin1", "ignore")
+    pdf_path.write_bytes(b"%PDF-1.4\n" + body + (b"x" * 160) + b"\n%%EOF\n")
+    print(json.dumps({"pdf_path": str(pdf_path), "file_paths": [str(pdf_path)]}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+PDF_BUILDER_WITH_OPTIONAL_TEXT_SOURCE = PDF_BUILDER_SOURCE.replace(
+    "def main():",
+    "from backend.services.skill_runtime import generate_text_with_llm\n\ndef main():",
+).replace(
+    'story_text = str(payload.get("story_text") or "export text")',
+    'story_text = generate_text_with_llm(str(payload.get("story_text") or "export text"))',
+)
+
+
+def test_builder_defaults_do_not_require_or_forbid_model_generation():
+    required, forbidden = capabilities_for_role("pdf_builder")
+    assert required == ["pdf_generation", "file_output"]
+    assert "text_generation" not in required
+    assert "image_generation" not in forbidden
+    assert "text_generation" not in forbidden
+
+    entry = build_skill_plan_entry(file_path="scripts/build_pdf.py", purpose="role: pdf_builder")
+    assert entry.required_capabilities == ["pdf_generation", "file_output"]
+    assert "text_generation" not in entry.required_capabilities
+    assert "text_generation" not in entry.forbidden_capabilities
+    assert "image_generation" not in entry.forbidden_capabilities
+
+
+def test_pdf_builder_without_model_call_passes_source_contract():
+    _validate_script_file_source_contract("scripts/build_pdf.py", PDF_BUILDER_SOURCE, role="pdf_builder")
+
+
+def test_pdf_builder_optional_model_call_passes_when_not_forbidden():
+    entry = {
+        "path": "scripts/build_pdf.py",
+        "role": "pdf_builder",
+        "inputs": ["story_text", "image_paths", "previous_stdout", "template_path"],
+        "outputs": ["pdf_path", "file_paths"],
+        "required_capabilities": ["pdf_generation", "file_output"],
+        "optional_capabilities": ["text_generation"],
+        "forbidden_capabilities": [],
+    }
+    _validate_script_file_source_contract(
+        "scripts/build_pdf.py",
+        PDF_BUILDER_WITH_OPTIONAL_TEXT_SOURCE,
+        role="pdf_builder",
+        skill_plan_entry=entry,
+    )
+
+
+def test_pdf_builder_forbidden_text_generation_blocks_text_model_call():
+    entry = {
+        "path": "scripts/build_pdf.py",
+        "role": "pdf_builder",
+        "inputs": ["story_text", "image_paths", "previous_stdout", "template_path"],
+        "outputs": ["pdf_path", "file_paths"],
+        "required_capabilities": ["pdf_generation", "file_output"],
+        "forbidden_capabilities": ["text_generation"],
+    }
+    with pytest.raises(ContractValidationError, match="forbidden_text_generation"):
+        _validate_script_file_source_contract(
+            "scripts/build_pdf.py",
+            PDF_BUILDER_WITH_OPTIONAL_TEXT_SOURCE,
+            role="pdf_builder",
+            skill_plan_entry=entry,
+        )
+
+
+def test_skill_md_model_step_does_not_force_export_script_to_call_model():
+    skill_md = '''
+# Mixed Skill
+
+前置脚本会调用 LLM/TEXT_MODEL 生成故事；导出脚本只读取已有文本并构建 PDF。
+
+### SkillPlan / 文件职责计划
+- scripts/build_pdf.py
+  role: pdf_builder
+  inputs: [story_text, image_paths, previous_stdout, template_path]
+  outputs: [pdf_path, file_paths]
+  required_capabilities: [pdf_generation, file_output]
+
+```bash
+python scripts/build_pdf.py '{"story_text":"{{story_text}}","image_paths":"{{image_paths}}","previous_stdout":"{{previous_stdout}}","template_path":"{{template_path}}"}'
+```
+'''
+    _validate_script_contract_static(
+        file_path="scripts/build_pdf.py",
+        content=PDF_BUILDER_SOURCE,
+        skill_md=skill_md,
+    )
+
+
+def test_sandbox_html_builder_accepts_file_paths_field():
+    _validate_stdout_against_action_entry(
+        '{"file_paths": ["assets/generated/page.html"]}',
+        {"role": "html_asset_builder", "outputs": ["file_paths"], "required_capabilities": ["html_asset_generation", "file_output"]},
+    )

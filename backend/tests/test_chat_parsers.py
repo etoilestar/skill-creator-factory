@@ -2807,3 +2807,85 @@ def test_normalize_skill_runtime_plan_resolves_path_like_read_resource_handle(tm
     assert result["tasks"][0]["resource_handle"] == "resource:0"
     assert result["tasks"][0]["path"] == "references/story_templates.md"
     assert result["planner_inconsistent"][0]["resolved_resource_handle"] == "resource:0"
+
+
+def _minimal_docx(path):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", "<w:document xmlns:w='urn:test'/>")
+
+
+def _minimal_pptx(path):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", ZIP_DEFLATED) as zf:
+        zf.writestr("ppt/presentation.xml", "<p:presentation xmlns:p='urn:test'/>")
+
+
+def test_creator_rejects_script_that_only_returns_pdf_path():
+    from backend.routers.creator import _validate_script_file_source_contract, ContractValidationError
+
+    content = "import json, sys\npayload=json.loads(sys.argv[1])\nprint(json.dumps({'pdf_path': 'comic_sketch.pdf'}))\n"
+    entry = {
+        "path": "scripts/export_pdf.py",
+        "role": "pdf_builder",
+        "inputs": ["payload"],
+        "outputs": ["pdf_path"],
+        "required_capabilities": ["pdf_generation", "file_output"],
+        "runtime": "python",
+        "language": "python",
+    }
+
+    with pytest.raises(ContractValidationError) as exc:
+        _validate_script_file_source_contract("scripts/export_pdf.py", content, skill_plan_entry=entry)
+
+    assert "真实创建对应文件" in str(exc.value)
+
+
+def test_creator_trial_stdout_accepts_real_document_outputs(tmp_path):
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    skill_dir = tmp_path / "skill"
+    scripts = skill_dir / "scripts"
+    out = skill_dir / "assets" / "generated"
+    scripts.mkdir(parents=True)
+    pdf = out / "real.pdf"
+    docx = out / "real.docx"
+    pptx = out / "real.pptx"
+    html = out / "real.html"
+    out.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+    _minimal_docx(docx)
+    _minimal_pptx(pptx)
+    html.write_text("<!doctype html><html></html>", encoding="utf-8")
+
+    _validate_trial_stdout_json(stdout=json.dumps({"pdf_path": "assets/generated/real.pdf"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"docx_path": "assets/generated/real.docx"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"pptx_path": "assets/generated/real.pptx"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"html_path": "assets/generated/real.html"}), content="", args=[], skill_dir=skill_dir)
+
+
+def test_exporter_plan_is_optional_by_default_and_composite_can_handle_text_images():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    exporter = build_skill_plan_entry(file_path="scripts/export_pdf.py", purpose="role: pdf_builder outputs: [pdf_path]")
+    composite = build_skill_plan_entry(
+        file_path="scripts/composite.py",
+        purpose="role: composite_generator required_capabilities: [text_generation, image_generation]",
+    )
+
+    assert exporter.required is False
+    assert exporter.can_skip is True
+    assert composite.role == "composite_generator"
+    assert set(composite.required_capabilities) >= {"text_generation", "image_generation"}
+
+
+def test_runtime_output_metadata_ignores_unrequested_export(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+
+    skill_root = tmp_path / "skills" / "story-skill"
+    skill_root.mkdir(parents=True)
+    stdout = json.dumps({"text": "story only", "image_paths": []})
+
+    assert _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="story-skill") == []

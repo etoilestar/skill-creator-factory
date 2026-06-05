@@ -287,3 +287,45 @@ def test_skill_runtime_trial_image_helper_writes_output_file(monkeypatch, tmp_pa
     assert image_path.is_file()
     assert image_path.parent == tmp_path
     assert image_path.suffix == ".png"
+
+
+def test_run_script_rejects_fake_pdf_path(tmp_path):
+    from backend.services import skill_executor
+
+    skills_path = tmp_path / "skills"
+    skill_dir = _prepare_skill(skills_path, "fake-pdf")
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "main.py").write_text(
+        "import json\nprint(json.dumps({'pdf_path': 'comic_sketch.pdf'}))\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(skill_executor.settings, "skills_path", skills_path):
+        result = skill_executor.run_action({"action": "run_script", "name": "fake-pdf", "filename": "main.py"})
+
+    assert result["success"] is False
+    assert result["error"] == "file_output_missing"
+    assert "不存在" in result["message"]
+
+
+def test_run_script_accepts_real_html_output(tmp_path):
+    from backend.services import skill_executor
+
+    skills_path = tmp_path / "skills"
+    skill_dir = _prepare_skill(skills_path, "real-html")
+    scripts = skill_dir / "scripts"
+    scripts.mkdir()
+    (scripts / "main.py").write_text(
+        "import json\nfrom pathlib import Path\n"
+        "out=Path('../assets/generated/page.html').resolve(); out.parent.mkdir(parents=True, exist_ok=True)\n"
+        "out.write_text('<!doctype html><html></html>', encoding='utf-8')\n"
+        "print(json.dumps({'html_path': str(out)}))\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(skill_executor.settings, "skills_path", skills_path):
+        result = skill_executor.run_action({"action": "run_script", "name": "real-html", "filename": "main.py"})
+
+    assert result["success"] is True
+    assert {item["path"] for item in result["output_files"]} == {"assets/generated/page.html"}

@@ -412,7 +412,7 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "pptx_builder":
         return ["pptx_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role in {"html_asset_builder", "asset_builder"}:
-        return ["html_generation", "file_output"], ["image_generation", "pdf_generation"]
+        return ["html_asset_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role == "reference":
         return ["reference_guidance"], ["runtime_execution", "image_generation"]
     if role == "asset":
@@ -463,6 +463,14 @@ def build_skill_plan_entry(
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
     forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
+    if role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder"}:
+        # Document exporters are optional by default so text/image generation can
+        # be run on demand without forcing export.  An explicit blueprint/UI
+        # required=true still overrides this default by passing required=True
+        # with purpose text that says the user requested one-step export.
+        if not re.search(r"一步|一次性|直接导出|必须导出|必需导出|one[- ]?step|single[- ]?step|required", purpose or "", re.I):
+            required = False
+            can_skip = True
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language

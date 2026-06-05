@@ -36,6 +36,7 @@ from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabi
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
+from ..services.artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
 from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
 
 logger = logging.getLogger(__name__)
@@ -1515,17 +1516,39 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         # instead of a generic "missing required_capabilities" message.
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
-        return bool(re.search(r"FPDF|reportlab|PdfWriter|%PDF-|pdf_path|file_paths|build_pdf", content, re.IGNORECASE))
+        return bool(re.search(r"FPDF|reportlab|PdfWriter|pdf\.output|canvas\.Canvas|build_pdf", content, re.IGNORECASE))
     if capability == "docx_generation":
-        return bool(re.search(r"docx_path|Document\(|python-docx|word/document.xml|build_docx", content, re.IGNORECASE))
+        return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
     if capability == "pptx_generation":
-        return bool(re.search(r"pptx_path|Presentation\(|python-pptx|ppt/presentation.xml|build_pptx", content, re.IGNORECASE))
-    if capability == "html_generation":
-        return bool(re.search(r"html_path|asset_paths|<html|<!DOCTYPE html|assets/generated", content, re.IGNORECASE))
+        return bool(re.search(r"Presentation\(|python-pptx|ppt/presentation.xml|ZipFile\(|build_pptx", content, re.IGNORECASE))
+    if capability in {"html_generation", "html_asset_generation"}:
+        return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|assets/generated|build_html", content, re.IGNORECASE))
     if capability == "file_output":
-        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf_path|file_paths", content, re.IGNORECASE))
+        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)", content, re.IGNORECASE))
     return True
 
+
+
+_ARTIFACT_OUTPUT_KEYS = {"pdf_path", "docx_path", "pptx_path", "html_path", "file_paths"}
+_ARTIFACT_CAPABILITIES = {"pdf_generation", "docx_generation", "pptx_generation", "html_generation", "html_asset_generation", "file_output"}
+
+
+def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], capabilities: list[str]) -> bool:
+    declared_artifacts = _ARTIFACT_OUTPUT_KEYS & set(outputs or [])
+    required_artifacts = _ARTIFACT_CAPABILITIES & set(capabilities or [])
+    if not declared_artifacts and not required_artifacts:
+        return True
+    has_writer = bool(re.search(
+        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)",
+        content,
+        re.IGNORECASE,
+    ))
+    returns_only_paths = bool(re.search(
+        r"return\s*\{[^}]*['\"](?:pdf_path|docx_path|pptx_path|html_path|file_paths)['\"][^}]*\}",
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )) and not has_writer
+    return has_writer and not returns_only_paths
 
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
@@ -1701,6 +1724,27 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             ),
             expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
             minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+        )
+    )
+
+    enforce_artifact_outputs = strict_interface or bool(_ARTIFACT_CAPABILITIES & set(plan_entry.required_capabilities or []))
+    has_real_file_output = _script_has_real_file_creation_logic(
+        stripped,
+        outputs=list(plan_entry.outputs or []) if enforce_artifact_outputs else [],
+        capabilities=list(plan_entry.required_capabilities or []) if enforce_artifact_outputs else [],
+    )
+    results.append(
+        ContractCheckResult(
+            id="script.file_outputs.real_creation_logic",
+            passed=has_real_file_output,
+            target=file_path,
+            message=(
+                "脚本声明文件输出时包含真实文件创建逻辑。"
+                if has_real_file_output
+                else f"{file_path} 声明 pdf/docx/pptx/html/file_paths 输出或文件生成能力，但只返回路径字符串或缺少真实写文件逻辑。"
+            ),
+            expected="声明 pdf_path/docx_path/pptx_path/html_path/file_paths 或文件生成 required_capabilities 时，必须真实创建对应文件，禁止只返回路径占位。",
+            minimal_edit="拆出 build_pdf/build_docx/build_pptx/build_html 等函数，在其中写入真实文件并只返回已创建文件路径。",
         )
     )
 
@@ -2247,8 +2291,14 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
             raise ValueError(f"pdf_builder stdout JSON 必须包含 pdf_path 或非空 file_paths 字段：argv={args!r} stdout={stripped[-4000:]}")
         _validate_pdf_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
 
-    if plan_entry and (plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or [])):
+    if plan_entry and (plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(plan_entry.required_capabilities or []))):
         _validate_html_trial_outputs(payload, skill_dir=skill_dir, args=args, stdout=stripped)
+
+    try:
+        if skill_dir is not None:
+            validate_stdout_file_outputs(stripped, skill_dir=skill_dir, cwd=skill_dir / "scripts")
+    except FileOutputValidationError as exc:
+        raise ValueError(str(exc)) from exc
 
     if ((plan_entry and plan_entry.role == "image_generator") or "generate_stable_diffusion_image" in content) and not _validate_image_payload_shape(payload):
         raise ValueError(
@@ -3192,7 +3242,7 @@ def _script_generation_skeleton(
             "    main()"
         )
 
-    if plan_entry.role in {"html_asset_builder", "asset_builder"} or "html_generation" in set(plan_entry.required_capabilities or []):
+    if plan_entry.role in {"html_asset_builder", "asset_builder"} or ({"html_generation", "html_asset_generation"} & set(plan_entry.required_capabilities or [])):
         return (
             "必须使用下面的 html_asset_builder Python 脚本骨架；只能在当前 Skill 的 assets/generated/ 下写入 HTML，并在 stdout JSON 返回 html_path 与 asset_paths：\n"
             "import html\n"
@@ -3241,14 +3291,19 @@ def _script_generation_skeleton(
             "    return json.loads(sys.argv[1])\n\n"
             "def build_prompt(payload: dict) -> str:\n"
             f"    return str({py_value_expr}).strip()\n\n"
-            "def run(payload: dict) -> dict:\n"
-            "    prompt = build_prompt(payload)\n"
-            "    text = generate_text_with_llm(prompt).strip()\n"
+            "def generate_text(prompt: str) -> str:\n"
+            "    return generate_text_with_llm(prompt).strip()\n\n"
+            "def generate_images(text: str, prompt: str) -> tuple[list[str], list[dict]]:\n"
             "    image_prompt = text or prompt\n"
             "    result = generate_stable_diffusion_image(image_prompt, filename_prefix='generated')\n"
             "    image_paths = [result.get('image_path')]\n"
             "    image_paths = [p for p in image_paths if isinstance(p, str) and p]\n"
-            "    return {'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': image_prompt}], 'image_paths': image_paths, 'images': [result]}\n\n"
+            "    return image_paths, [result]\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    prompt = build_prompt(payload)\n"
+            "    text = generate_text(prompt)\n"
+            "    image_paths, images = generate_images(text, prompt)\n"
+            "    return {'story_text': text, 'text': text, 'text_with_image_prompts': [{'text': text, 'image_prompt': text or prompt}], 'image_paths': image_paths, 'images': images}\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
             "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
@@ -3307,9 +3362,11 @@ def _script_generation_skeleton(
             "    pdf.multi_cell(0, 10, text[:2000])\n"
             "    pdf.output(str(pdf_path))\n"
             "    return {'pdf_path': str(pdf_path), 'file_paths': [str(pdf_path)]}\n\n"
+            "def run(payload: dict) -> dict:\n"
+            "    return build_pdf(payload)\n\n"
             "def main() -> None:\n"
             "    payload = parse_args()\n"
-            "    print(json.dumps(build_pdf(payload), ensure_ascii=False))\n\n"
+            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
             "if __name__ == '__main__':\n"
             "    main()"
         )

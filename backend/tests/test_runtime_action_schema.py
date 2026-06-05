@@ -384,10 +384,14 @@ def test_output_files_from_stdout_json_collects_all_artifact_fields(tmp_path):
     outputs = skill_dir / "outputs"
     generated.mkdir(parents=True)
     outputs.mkdir(parents=True)
-    for rel in ("assets/generated/story.pdf", "assets/generated/story.docx", "assets/generated/story.pptx", "assets/generated/story.html", "outputs/img.png"):
-        path = skill_dir / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"data")
+    from zipfile import ZipFile, ZIP_DEFLATED
+    (skill_dir / "assets/generated/story.pdf").write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+    with ZipFile(skill_dir / "assets/generated/story.docx", "w", ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", "<w:document/>")
+    with ZipFile(skill_dir / "assets/generated/story.pptx", "w", ZIP_DEFLATED) as zf:
+        zf.writestr("ppt/presentation.xml", "<p:presentation/>")
+    (skill_dir / "assets/generated/story.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+    (skill_dir / "outputs/img.png").write_bytes(b"data")
 
     files = _output_files_from_stdout_json(
         json.dumps({

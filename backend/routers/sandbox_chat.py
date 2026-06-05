@@ -33,6 +33,7 @@ from ..services.model_router import (
     route_model,
 )
 from ..services.skill_manager import get_execution_skill_dir
+from ..services.artifact_validator import FileOutputValidationError, validate_stdout_file_outputs
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
     _MAX_DEP_RETRY,
@@ -854,7 +855,7 @@ _ACTION_SCHEMA_FIELD_RE = re.compile(r"(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?
 _ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", re.I)
 _RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
 _SCRIPT_ROLES = {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"}
-_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "docx_generation", "pptx_generation", "html_generation"}
+_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "docx_generation", "pptx_generation", "html_generation", "html_asset_generation"}
 
 
 def _extract_script_path_from_command(command: str) -> str | None:
@@ -1158,7 +1159,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
             raise ValueError("composite_generator stdout JSON 缺少声明的 docx_path/file_paths 输出")
         if ("pptx_generation" in required_capabilities or {"pptx_path"} & outputs) and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 pptx_path/file_paths 输出")
-        if ("html_generation" in required_capabilities or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
+        if (({"html_generation", "html_asset_generation"} & required_capabilities) or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
     if role == "text_generator" and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
         raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
@@ -2369,22 +2370,36 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
                 image_path = image.get("image_path")
                 if isinstance(image_path, str) and image_path.strip():
                     raw_paths.append(image_path.strip())
-    root = cwd.resolve()
-    allowed_roots = [(root / "assets" / "generated").resolve(), (root / "outputs").resolve()]
+    try:
+        validated = validate_stdout_file_outputs(stdout, skill_dir=cwd, cwd=cwd / "scripts")
+    except FileOutputValidationError:
+        # This helper is used only to attach download metadata.  The executor
+        # path performs hard validation and returns file_output_missing.
+        validated = []
     output_files: list[dict] = []
     seen: set[str] = set()
+    for item in validated:
+        rel = item["path"]
+        if rel in seen:
+            continue
+        seen.add(rel)
+        output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
+
+    # Image outputs are still metadata-only here; runtime image helpers already
+    # validate image payload shape separately, and image files may be ordinary
+    # PNG/JPEG assets under outputs/ or assets/generated/.
+    root = cwd.resolve()
     for raw in raw_paths:
         candidate = Path(raw)
         normalized_raw = raw.replace("\\", "/")
+        if Path(raw).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            continue
         if not candidate.is_absolute():
-            if normalized_raw.startswith(("assets/", "outputs/")):
-                candidate = (root / candidate).resolve()
-            else:
-                candidate = (root / "scripts" / candidate).resolve()
-        if not any(_is_within_sandbox(candidate, allowed_root) for allowed_root in allowed_roots):
+            candidate = (root / candidate).resolve() if normalized_raw.startswith(("assets/", "outputs/")) else (root / "scripts" / candidate).resolve()
+        if not _is_within_sandbox(candidate, root) or not candidate.is_file():
             continue
         rel = candidate.relative_to(root).as_posix()
-        if rel in seen or not candidate.is_file():
+        if rel in seen:
             continue
         seen.add(rel)
         output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
@@ -2660,10 +2675,22 @@ def _execute_single_task(
 
         assert completed is not None  # noqa: S101 — loop always runs at least once (range >= 1)
         success = completed.returncode == 0
+        validation_error = ""
+        validation_code = ""
         if success:
-            _validate_stdout_against_action_entry(completed.stdout, action_entry)
-            if action_entry and str(action_entry.get("role") or "") in {"html_asset_builder", "asset_builder"}:
-                _validate_html_asset_outputs_in_generated_dir(completed.stdout, cwd=cwd)
+            try:
+                _validate_stdout_against_action_entry(completed.stdout, action_entry)
+                if cwd is not None:
+                    validate_stdout_file_outputs(completed.stdout, skill_dir=cwd, cwd=cwd / "scripts")
+                if action_entry and str(action_entry.get("role") or "") in {"html_asset_builder", "asset_builder"}:
+                    _validate_html_asset_outputs_in_generated_dir(completed.stdout, cwd=cwd)
+            except FileOutputValidationError as exc:
+                success = False
+                validation_error = str(exc)
+                validation_code = exc.code
+            except ValueError as exc:
+                success = False
+                validation_error = str(exc)
 
         result: dict = {
             "action": action,
@@ -2672,9 +2699,13 @@ def _execute_single_task(
             "success": success,
             "returncode": completed.returncode,
             "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stderr": (completed.stderr + ("\n" if completed.stderr and validation_error else "") + validation_error),
             "reason": reason,
         }
+        if validation_error:
+            result["message"] = validation_error
+        if validation_code:
+            result["error"] = validation_code
 
         # Detect newly created files and attach download metadata.
         effective_skill_name = skill_name or (cwd.name if cwd else "")

@@ -458,72 +458,69 @@ python scripts/render.py '{"draft":"{{draft}}"}'
     assert final_context["draft"] == "a cat tale"
 
 
+
 def _write_workflow_skill(root: Path) -> tuple[Path, dict]:
     from backend.routers.sandbox_chat import _extract_skill_command_contract
 
     skill_dir = root / "workflow-skill"
     scripts = skill_dir / "scripts"
     scripts.mkdir(parents=True)
-    (scripts / "generate_story.py").write_text(
+    (scripts / "produce_batch.py").write_text(
         """
 import json, sys
 payload = json.loads(sys.argv[1])
-print(json.dumps({"story_text": "story about " + payload["topic"], "chapters": [{"title":"A", "content":"one"}, {"title":"B", "content":"two"}]}))
+items = [{"unit_text": f"{payload['seed']}-{i + 1}-{payload['label']}"} for i in range(int(payload["item_count"]))]
+print(json.dumps({"batch": items, "document_text": payload["seed"]}, ensure_ascii=False))
 """.strip(),
         encoding="utf-8",
     )
-    (scripts / "generate_illustration.py").write_text(
+    (scripts / "render_unit.py").write_text(
         """
-import hashlib, json, sys
+import hashlib, json, pathlib, sys
 payload = json.loads(sys.argv[1])
-name = hashlib.sha1(payload["chapter_text"].encode()).hexdigest()[:8] + ".png"
-path = "outputs/" + name
-import pathlib
-(pathlib.Path("outputs")).mkdir(exist_ok=True)
-pathlib.Path(path).write_bytes(b"png")
-print(json.dumps({"image_path": path}))
+name = hashlib.sha1(payload["unit_text"].encode()).hexdigest()[:8] + ".dat"
+path = pathlib.Path("outputs") / name
+path.parent.mkdir(exist_ok=True)
+path.write_text(payload["unit_text"], encoding="utf-8")
+print(json.dumps({"artifact_path": path.as_posix()}, ensure_ascii=False))
 """.strip(),
         encoding="utf-8",
     )
-    (scripts / "build_pdf.py").write_text(
+    (scripts / "assemble_file.py").write_text(
         """
 import json, pathlib, sys
 payload = json.loads(sys.argv[1])
-path = pathlib.Path("outputs/story.pdf")
+path = pathlib.Path("outputs/bundle.pdf")
 path.parent.mkdir(exist_ok=True)
 path.write_bytes(b"%PDF-1.4\\n%%EOF")
-print(json.dumps({"pdf_path": "outputs/story.pdf", "used_images": payload.get("image_paths", [])}))
+print(json.dumps({"final_file": path.as_posix(), "received_count": len(payload["artifact_paths"])}, ensure_ascii=False))
 """.strip(),
         encoding="utf-8",
     )
     skill_md = """---
 name: workflow-skill
-description: demo
+description: generic dataflow demo
 ---
-步骤1 生成故事。
 role: text_generator
-inputs: topic
-outputs: story_text, chapters
+inputs: seed=default-seed, item_count=2, label=default-label
+outputs: document_text, batch
 ```bash
-python scripts/generate_story.py '{"topic":"{{topic}}"}'
+python scripts/produce_batch.py '{"seed":"{{seed}}","item_count":"{{item_count}}","label":"{{label}}"}'
 ```
 
-步骤2 遍历 chapters 中的每一章 chapter 生成插图。
-role: image_generator
-inputs: chapter_text
-outputs: image_path
-required_capabilities: image_generation
+role: text_generator
+inputs: unit_text
+outputs: artifact_path
 ```bash
-python scripts/generate_illustration.py '{"chapter_text":"{{chapter_text}}"}'
+python scripts/render_unit.py '{"unit_text":"{{unit_text}}"}'
 ```
 
-步骤3 构建 PDF。
 role: pdf_builder
-inputs: story_text, image_paths
-outputs: pdf_path
+inputs: document_text, artifact_paths
+outputs: final_file
 required_capabilities: pdf_generation
 ```bash
-python scripts/build_pdf.py '{"story_text":"{{story_text}}","image_paths":"{{image_paths}}"}'
+python scripts/assemble_file.py '{"document_text":"{{document_text}}","artifact_paths":"{{artifact_paths}}"}'
 ```
 """
     (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
@@ -538,51 +535,61 @@ def test_multi_script_skill_forces_execute_workflow(tmp_path):
     result = _normalize_skill_runtime_plan(
         {"mode": "direct_answer", "actions": [], "errors": [], "missing": []},
         execution_root=skill_dir,
-        available_scripts=["scripts/generate_story.py", "scripts/generate_illustration.py", "scripts/build_pdf.py"],
+        available_scripts=["scripts/produce_batch.py", "scripts/render_unit.py", "scripts/assemble_file.py"],
         command_contract=contract,
-        user_text="生成一个带插图的 PDF 故事",
+        user_text="生成一个文件",
     )
 
     assert result["mode"] == "execute_workflow"
-    assert result["workflow_actions"][0]["action"] == "run_command"
-    assert result["workflow_actions"][0]["script_path"] == "scripts/generate_story.py"
+    assert [item["script_path"] for item in result["workflow_actions"]] == [
+        "scripts/produce_batch.py",
+        "scripts/render_unit.py",
+        "scripts/assemble_file.py",
+    ]
     assert result["final_instruction"] == ""
 
 
 def test_render_command_template_uses_previous_stdout_context():
     from backend.routers.sandbox_chat import merge_step_output, render_command_template
 
-    context = {"topic": "狐狸"}
-    merge_step_output(context, "scripts/generate_story.py", {"story_text": "狐狸故事", "chapters": []})
+    context = {"seed": "alpha"}
+    merge_step_output(context, "scripts/produce_batch.py", {"document_text": "merged text"})
 
     rendered = render_command_template(
-        "python scripts/build_pdf.py '{\"story_text\":\"{{story_text}}\"}'",
+        "python scripts/assemble_file.py '{\"document_text\":\"{{document_text}}\"}'",
         context,
     )
 
     import shlex
-    assert json.loads(shlex.split(rendered)[2])["story_text"] == "狐狸故事"
+    assert json.loads(shlex.split(rendered)[2])["document_text"] == "merged text"
 
 
-def test_execute_skill_workflow_foreach_collects_images_and_pdf(tmp_path):
+def test_execute_skill_workflow_generic_foreach_collects_outputs_and_final_file(tmp_path):
     import asyncio
+    import shlex
     from backend.routers.chat_models import ChatRequest, Message
     from backend.routers.sandbox_chat import _execute_skill_workflow
 
     skill_dir, contract = _write_workflow_skill(tmp_path)
+    request_text = "seed: user-seed"
     result = asyncio.run(_execute_skill_workflow(
         execution_root=skill_dir,
         action_schema=contract["action_schema"],
-        user_context={"topic": "狐狸", "user_request": "生成 PDF"},
-        request=ChatRequest(messages=[Message(role="user", content="生成 PDF")]),
+        user_context={"user_request": request_text},
+        request=ChatRequest(messages=[Message(role="user", content=request_text)]),
         skill_name="workflow-skill",
     ))
 
+    first_payload = json.loads(shlex.split(result["results"][0]["command"])[2])
+    assert first_payload == {"seed": "user-seed", "item_count": 2, "label": "default-label"}
     assert result["executed"] is True
     assert len([r for r in result["results"] if r["action"] == "run_command"]) == 4
-    assert len(result["context"]["image_paths"]) == 2
-    assert any(item["path"] == "outputs/story.pdf" for item in result["output_files"])
-    assert (skill_dir / "outputs" / "story.pdf").is_file()
+    assert len(result["context"]["batch"]) == 2
+    assert len(result["context"]["artifact_paths"]) == 2
+    final_payload = json.loads(shlex.split(result["results"][-1]["command"])[2])
+    assert final_payload["artifact_paths"] == result["context"]["artifact_paths"]
+    assert any(item["path"] == "outputs/bundle.pdf" for item in result["output_files"])
+    assert (skill_dir / "outputs" / "bundle.pdf").is_file()
 
 
 def test_render_command_template_reports_dataflow_mismatch():
@@ -590,7 +597,7 @@ def test_render_command_template_reports_dataflow_mismatch():
 
     with pytest.raises(ValueError, match="dataflow_mismatch"):
         render_command_template(
-            "python scripts/build_pdf.py '{\"image_paths\":\"{{image_paths}}\"}'",
+            "python scripts/assemble_file.py '{\"artifact_paths\":\"{{artifact_paths}}\"}'",
             {},
         )
 
@@ -601,56 +608,56 @@ def _write_initial_context_workflow_skill(root: Path) -> tuple[Path, dict]:
     skill_dir = root / "initial-context-skill"
     scripts = skill_dir / "scripts"
     scripts.mkdir(parents=True)
-    (scripts / "generate_story.py").write_text(
+    (scripts / "first.py").write_text(
         """
 import json, sys
 payload = json.loads(sys.argv[1])
-chapters = [{"title": str(i + 1), "content": payload["story_theme"] + str(i + 1)} for i in range(int(payload["chapter_count"]))]
-print(json.dumps({"story_text": payload["story_theme"], "chapters": chapters, "audience": payload["target_audience"]}, ensure_ascii=False))
+print(json.dumps({"first_output": payload["required_value"], "default_seen": payload["optional_value"]}, ensure_ascii=False))
 """.strip(),
         encoding="utf-8",
     )
-    (scripts / "build_pdf.py").write_text(
+    (scripts / "second.py").write_text(
         """
 import json, pathlib, sys
 payload = json.loads(sys.argv[1])
 path = pathlib.Path("outputs/initial.pdf")
 path.parent.mkdir(exist_ok=True)
 path.write_bytes(b"%PDF-1.4\\n%%EOF")
-print(json.dumps({"pdf_path": "outputs/initial.pdf", "chapter_total": len(payload["chapters"])}, ensure_ascii=False))
+print(json.dumps({"result_file": path.as_posix(), "used": payload["first_output"]}, ensure_ascii=False))
 """.strip(),
         encoding="utf-8",
     )
     skill_md = """---
 name: initial-context-skill
-description: demo
+description: generic defaults demo
 ---
 role: text_generator
-inputs: story_theme, chapter_count, target_audience
-outputs: story_text, chapters
+inputs: required_value, optional_value=from-default
+outputs: first_output, default_seen
 ```bash
-python scripts/generate_story.py '{"story_theme":"{{story_theme}}","chapter_count":"{{chapter_count}}","target_audience":"{{target_audience}}"}'
+python scripts/first.py '{"required_value":"{{required_value}}","optional_value":"{{optional_value}}"}'
 ```
 
 role: pdf_builder
-inputs: story_text, chapters
-outputs: pdf_path
+inputs: first_output
+outputs: result_file
 required_capabilities: pdf_generation
 ```bash
-python scripts/build_pdf.py '{"story_text":"{{story_text}}","chapters":"{{chapters}}"}'
+python scripts/second.py '{"first_output":"{{first_output}}"}'
 ```
 """
     (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
     return skill_dir, _extract_skill_command_contract(skill_md, execution_root=skill_dir)
 
 
-def test_execute_skill_workflow_infers_first_step_context_from_user_input(tmp_path):
+def test_execute_skill_workflow_injects_defaults_and_user_overrides(tmp_path):
     import asyncio
+    import shlex
     from backend.routers.chat_models import ChatRequest, Message
     from backend.routers.sandbox_chat import _execute_skill_workflow
 
     skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
-    request_text = "请以海底冒险为主题，写3章，面向小学生，并生成PDF。"
+    request_text = "required_value: from-user, optional_value: from-user-too"
 
     result = asyncio.run(_execute_skill_workflow(
         execution_root=skill_dir,
@@ -660,12 +667,9 @@ def test_execute_skill_workflow_infers_first_step_context_from_user_input(tmp_pa
         skill_name="initial-context-skill",
     ))
 
-    assert result["results"][0]["action"] == "run_command"
-    assert "scripts/generate_story.py" in result["results"][0]["command"]
-    assert result["context"]["story_theme"] == "海底冒险"
-    assert result["context"]["chapter_count"] == 3
-    assert result["context"]["target_audience"] == "小学生"
-    assert len(result["context"]["chapters"]) == 3
+    first_payload = json.loads(shlex.split(result["results"][0]["command"])[2])
+    assert first_payload == {"required_value": "from-user", "optional_value": "from-user-too"}
+    assert result["context"]["first_output"] == "from-user"
     assert any(item["path"] == "outputs/initial.pdf" for item in result["output_files"])
 
 
@@ -675,7 +679,7 @@ def test_execute_skill_workflow_reports_initial_input_parse_failure(tmp_path):
     from backend.routers.sandbox_chat import _execute_skill_workflow
 
     skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
-    request_text = "请生成图文PDF。"
+    request_text = "请执行。"
 
     with pytest.raises(ValueError, match="初始输入解析失败"):
         asyncio.run(_execute_skill_workflow(

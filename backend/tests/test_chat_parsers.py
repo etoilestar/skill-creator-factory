@@ -2758,3 +2758,52 @@ def test_stdout_html_and_asset_paths_become_output_files(tmp_path):
     files = _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="html-skill")
 
     assert files == [{"path": "assets/generated/page.html", "url": "/api/skills/html-skill/files/assets/generated/page.html"}]
+
+
+def test_resource_catalog_for_planner_includes_display_path_and_selector_prompt_has_no_creator_semantics():
+    from backend.routers.sandbox_chat import _compose_resource_selection_prompt, _resource_catalog_for_planner
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    planner_catalog = _resource_catalog_for_planner(catalog)
+    prompt = _compose_resource_selection_prompt()
+
+    assert planner_catalog[0]["display_path"] == "references/story_templates.md"
+    assert "resource:<filename>" in prompt
+    assert "resource:<path>" in prompt
+    assert "creator" not in prompt.lower()
+    assert "Creator" not in prompt
+
+
+def test_resource_selection_resolves_path_like_pseudo_handle_to_catalog_handle():
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    text = __import__("json").dumps({"need_resources": True, "resource_handles": ["resource:story_templates.md"], "reason": "need template"})
+
+    result = _parse_resource_selection_decision(text, resource_catalog=catalog)
+
+    assert result["need_resources"] is True
+    assert result["resource_handles"] == ["resource:0"]
+
+
+def test_normalize_skill_runtime_plan_resolves_path_like_read_resource_handle(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    ref = skill_root / "references" / "story_templates.md"
+    ref.parent.mkdir(parents=True)
+    ref.write_text("template", encoding="utf-8")
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "read_resource", "resource_handle": "resource:story_templates.md"}],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan, resource_catalog=catalog, execution_root=skill_root)
+
+    assert result["mode"] == "execute"
+    assert result["tasks"][0]["resource_handle"] == "resource:0"
+    assert result["tasks"][0]["path"] == "references/story_templates.md"
+    assert result["planner_inconsistent"][0]["resolved_resource_handle"] == "resource:0"

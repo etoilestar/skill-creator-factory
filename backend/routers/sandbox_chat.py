@@ -1412,6 +1412,15 @@ def _normalize_skill_runtime_plan(
             })
             continue
 
+        if rel_path in available_script_set:
+            planner_inconsistent.append({
+                "missing_type": "planner_inconsistent",
+                "resource_handle": resource_handle,
+                "path": rel_path,
+                "reason": "planner reported a script as missing, but backend available_scripts shows it exists",
+            })
+            continue
+
         if rel_path in loaded_path_set:
             planner_inconsistent.append({
                 "missing_type": "planner_inconsistent",

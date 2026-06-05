@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from ..config import PROJECT_ROOT, settings
+from .artifact_validator import FileOutputValidationError, validate_stdout_file_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -424,13 +425,35 @@ def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Pat
 
         # Detect newly created files and attach download metadata.
         if success:
+            try:
+                declared_output_files = validate_stdout_file_outputs(
+                    stdout,
+                    skill_dir=skill_dir,
+                    cwd=skill_dir / "scripts",
+                )
+            except FileOutputValidationError as exc:
+                result.update({
+                    "success": False,
+                    "message": str(exc),
+                    "error": exc.code,
+                })
+                return result
+
             post_snapshot = _snapshot_skill_files(skill_dir)
             new_files = sorted(post_snapshot - pre_snapshot)
-            if new_files:
-                result["output_files"] = [
-                    {"path": f, "url": f"/api/skills/{name}/files/{f}"}
-                    for f in new_files
-                ]
+            output_files = [
+                {"path": f, "url": f"/api/skills/{name}/files/{f}"}
+                for f in new_files
+            ]
+            if declared_output_files:
+                by_path = {item["path"]: item for item in output_files}
+                by_path.update({
+                    item["path"]: {"path": item["path"], "url": f"/api/skills/{name}/files/{item['path']}"}
+                    for item in declared_output_files
+                })
+                output_files = list(by_path.values())
+            if output_files:
+                result["output_files"] = output_files
 
         return result
     except subprocess.TimeoutExpired:

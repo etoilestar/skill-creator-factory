@@ -926,3 +926,17 @@ def test_export_builder_skeletons_consume_previous_stdout_without_generation_hel
     assert "generate_stable_diffusion_image" not in docx_skeleton
     assert "generate_text_with_llm" not in pptx_skeleton
     assert "generate_stable_diffusion_image" not in pptx_skeleton
+
+
+def test_skill_plan_separates_creator_internal_from_skill_local_references():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="SKILL.md",
+        reference_files=["references/workflows.md", "kernel/references/workflows.md"],
+    )
+
+    assert entry.reference_files == ["references/workflows.md"]
+    assert entry.skill_local_references == ["references/workflows.md"]
+    assert "kernel/references/workflows.md" in entry.creator_internal_references
+    assert "kernel/references/workflows.md" not in entry.dependencies

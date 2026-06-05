@@ -16,7 +16,7 @@ import base64
 import csv
 import io
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import logging
 import re
 import shlex
@@ -165,6 +165,8 @@ class FileSpecOut(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)
     reference_files: list[str] = Field(default_factory=list)
+    skill_local_references: list[str] = Field(default_factory=list)
+    creator_internal_references: list[str] = Field(default_factory=list)
     language: str = "text"
     runtime: str = "none"
     entrypoint: str = ""
@@ -348,8 +350,8 @@ def _skill_plan_entry_for_file(
                 dependencies=list(skill_plan_entry.get("dependencies") or []),
                 required_capabilities=required_capabilities,
                 forbidden_capabilities=forbidden_capabilities,
-                reference_files=list(skill_plan_entry.get("reference_files") or []),
-                skill_local_references=list(skill_plan_entry.get("skill_local_references") or skill_plan_entry.get("reference_files") or []),
+                reference_files=[ref for ref in list(skill_plan_entry.get("reference_files") or []) if str(ref).startswith(("references/", "assets/", "scripts/"))],
+                skill_local_references=[ref for ref in list(skill_plan_entry.get("skill_local_references") or skill_plan_entry.get("reference_files") or []) if str(ref).startswith(("references/", "assets/", "scripts/"))],
                 creator_internal_references=list(skill_plan_entry.get("creator_internal_references") or []),
                 language=language,  # type: ignore[arg-type]
                 runtime=runtime,  # type: ignore[arg-type]
@@ -486,8 +488,7 @@ _CREATOR_FLOW_LEAK_RE = re.compile(
 )
 _SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)(?![\w./-])")
 _KERNEL_RESOURCE_LEAK_RE = re.compile(
-    r"kernel/references/(?:workflows|output-patterns|best-practices)\.md|"
-    r"(?<![\w./-])references/(?:workflows|output-patterns)\.md(?![\w./-])",
+    r"(?<![\w./-])(kernel/references/[A-Za-z0-9_./-]+)(?![\w./-])",
     re.IGNORECASE,
 )
 
@@ -541,6 +542,7 @@ class ContractCheckResult:
     message: str
     expected: str
     minimal_edit: str
+    matched_paths: list[str] = field(default_factory=list)
 
 
 class ContractValidationError(ValueError):
@@ -793,6 +795,66 @@ def _declared_skill_paths_from_blueprint(blueprint_text: str) -> set[str]:
 def _skill_local_paths_in_markdown(content: str) -> set[str]:
     return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
 
+
+def _kernel_resource_leak_paths(content: str) -> list[str]:
+    """Return explicit kernel/references paths mentioned in final Skill text."""
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in _KERNEL_RESOURCE_LEAK_RE.finditer(content or ""):
+        path = match.group(1).rstrip("`，,。；;:)）]")
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _normalize_similarity_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+def _kernel_reference_content_copy_paths(content: str) -> list[str]:
+    """Detect large verbatim copying from kernel references without banning same names."""
+    import difflib
+
+    candidate = _normalize_similarity_text(content)
+    if len(candidate) < 500:
+        return []
+    matches: list[str] = []
+    kernel_refs = settings.kernel_path / "references"
+    if not kernel_refs.is_dir():
+        return []
+    for ref in sorted(kernel_refs.glob("*.md")):
+        try:
+            kernel_text = _normalize_similarity_text(ref.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if len(kernel_text) < 500:
+            continue
+        matcher = difflib.SequenceMatcher(None, candidate, kernel_text, autojunk=False)
+        longest = max((block.size for block in matcher.get_matching_blocks()), default=0)
+        # A contiguous 500+ char copy is almost certainly a leaked reference;
+        # for shorter kernel refs, also catch near-whole-file copies.
+        copied_ratio = longest / max(1, min(len(candidate), len(kernel_text)))
+        if longest >= 500 or (longest >= 300 and copied_ratio >= 0.60):
+            matches.append(f"kernel/references/{ref.name}")
+    return matches
+
+
+def _existing_skill_local_paths_for_skill(skill_name: str) -> set[str]:
+    skill_dir = settings.skills_path / skill_name
+    paths: set[str] = set()
+    if not skill_dir.exists():
+        return paths
+    for folder in ("scripts", "references", "assets"):
+        folder_path = skill_dir / folder
+        if not folder_path.is_dir():
+            continue
+        for child in folder_path.rglob("*"):
+            if child.is_file():
+                paths.add(child.relative_to(skill_dir).as_posix())
+    return paths
+
+
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Return structured SKILL.md contract checks for generation and repair."""
     stripped = content.strip()
@@ -839,31 +901,47 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
 
     mentioned_skill_paths = _skill_local_paths_in_markdown(content)
     declared_skill_paths = _declared_skill_paths_from_blueprint(blueprint_text)
-    undeclared_paths = sorted(path for path in mentioned_skill_paths if path not in declared_skill_paths)
-    kernel_leak = bool(_KERNEL_RESOURCE_LEAK_RE.search(content))
+    missing_local_paths = sorted(path for path in mentioned_skill_paths if path not in declared_skill_paths)
+    kernel_leak_paths = _kernel_resource_leak_paths(content)
     results.append(ContractCheckResult(
         id="skill_md.resource.no_kernel_leak",
-        passed=not kernel_leak,
+        passed=not kernel_leak_paths,
         target="SKILL.md",
         message=(
             "SKILL.md 未引用 Creator 内部 kernel resources。"
-            if not kernel_leak
-            else "SKILL.md 引用了 Creator 内部 kernel references/workflows/output-patterns 资源；这些只能作为 Creator 内部上下文。"
+            if not kernel_leak_paths
+            else "SKILL.md 显式引用了 Creator 内部 kernel resources：" + ", ".join(kernel_leak_paths)
         ),
-        expected="最终业务 SKILL.md 只能引用本轮生成或当前 skill 目录真实存在的 resources；kernel/references/workflows.md、kernel/references/output-patterns.md 等不得写入最终 Skill。",
-        minimal_edit="删除 kernel references/workflows.md、references/workflows.md、references/output-patterns.md 等内部 Creator 资源引用。",
+        expected="最终业务 SKILL.md 只能引用本轮生成或当前 skill 目录真实存在的 resources；只有显式 kernel/references/... 路径会被判定为 kernel 路径泄露。",
+        minimal_edit="删除 kernel/references/... 内部 Creator 资源引用；如果业务 Skill 需要同名 reference，请创建并引用 skill-local references/*.md。",
+        matched_paths=kernel_leak_paths,
+    ))
+    kernel_copy_paths = _kernel_reference_content_copy_paths(content)
+    results.append(ContractCheckResult(
+        id="skill_md.resource.no_kernel_content_copy",
+        passed=not kernel_copy_paths,
+        target="SKILL.md",
+        message=(
+            "SKILL.md 未大段复制 Creator kernel reference 内容。"
+            if not kernel_copy_paths
+            else "SKILL.md 大段复制了 Creator kernel reference 内容：" + ", ".join(kernel_copy_paths)
+        ),
+        expected="最终业务 SKILL.md 不得大段复制 kernel/references 中的 Creator 内部说明；同名本地资源可引用，但内容应是业务 Skill 自有说明。",
+        minimal_edit="删除复制的 kernel 内部说明，改写为面向该业务 Skill 的简洁使用说明和本地资源引用。",
+        matched_paths=kernel_copy_paths,
     ))
     results.append(ContractCheckResult(
         id="skill_md.resource.local_declared",
-        passed=not undeclared_paths,
+        passed=not missing_local_paths,
         target="SKILL.md",
         message=(
             "SKILL.md 只引用本轮声明/已存在的 skill-local resources。"
-            if not undeclared_paths
-            else "SKILL.md 引用了未在本轮生成或当前 Skill 中不存在的资源：" + ", ".join(undeclared_paths)
+            if not missing_local_paths
+            else "SKILL.md 引用了未在本轮生成或当前 Skill 中不存在的资源：" + ", ".join(missing_local_paths)
         ),
-        expected="SKILL.md 中的 scripts/references/assets 路径必须是当前 Skill 内真实存在或本轮生成的资源；kernel references 只能作为 Creator 内部上下文，禁止写入最终 SKILL.md。",
+        expected="SKILL.md 中的 scripts/references/assets 路径必须是当前 Skill 内真实存在或本轮生成的资源；裸 references/*.md 只做本地资源存在性校验，不因文件名与 kernel reference 同名而失败。",
         minimal_edit="删除未声明/不存在的 references/assets/scripts 引用；如果确实需要该资源，请先在蓝图中加入并生成对应文件。",
+        matched_paths=missing_local_paths,
     ))
 
     for script_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/"):
@@ -918,12 +996,16 @@ def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool)
     selected = [result for result in results if result.passed is passed]
     if not selected:
         return "- 无"
-    return "\n".join(
-        f"- {result.id} target={result.target}: {result.message}\n"
-        f"  expected: {result.expected}\n"
-        f"  minimal_edit: {result.minimal_edit}"
-        for result in selected
-    )
+    lines: list[str] = []
+    for result in selected:
+        matched = f"\n  matched_paths: {', '.join(result.matched_paths)}" if result.matched_paths else ""
+        lines.append(
+            f"- {result.id} target={result.target}: {result.message}\n"
+            f"  expected: {result.expected}\n"
+            f"  minimal_edit: {result.minimal_edit}"
+            f"{matched}"
+        )
+    return "\n".join(lines)
 
 
 def _format_contract_failures(results: list[ContractCheckResult]) -> str:
@@ -1848,13 +1930,7 @@ def _validate_skill_md_against_existing_files(skill_name: str, content: str) -> 
     skill_dir = settings.skills_path / skill_name
     if not skill_dir.exists():
         return
-    declared_paths: list[str] = []
-    for folder in ("scripts", "references", "assets"):
-        folder_path = skill_dir / folder
-        if not folder_path.is_dir():
-            continue
-        for child in sorted(path for path in folder_path.iterdir() if path.is_file()):
-            declared_paths.append(f"{folder}/{child.name}")
+    declared_paths = sorted(_existing_skill_local_paths_for_skill(skill_name))
     if declared_paths:
         _validate_skill_md_contract(content, "\n".join(declared_paths))
     else:
@@ -2564,6 +2640,28 @@ def _parse_validator_json_object(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _deterministic_failed_check_ids(failed_checks_text: str) -> set[str]:
+    ids: set[str] = set()
+    for match in re.finditer(r"^-\s+([^\s]+)\s+target=", failed_checks_text or "", re.M):
+        ids.add(match.group(1))
+    return ids
+
+
+def _filter_validator_failed_checks(failed_checks: list[Any], failed_checks_text: str) -> list[Any]:
+    """Keep only model failed_checks backed by deterministic failed checks."""
+    allowed_ids = _deterministic_failed_check_ids(failed_checks_text)
+    if not allowed_ids:
+        return []
+    filtered: list[Any] = []
+    for check in failed_checks:
+        if not isinstance(check, dict):
+            continue
+        check_id = str(check.get("id") or "")
+        if check_id in allowed_ids:
+            filtered.append(check)
+    return filtered
+
+
 _MISSING_SKILL_SCRIPT_BLOCK_RE = re.compile(
     r"SKILL\.md 缺少调用 (?P<script>scripts/[A-Za-z0-9_./-]+) 的可执行 Markdown 命令块"
 )
@@ -2734,7 +2832,8 @@ async def _run_generated_file_validator_round(
         }
 
     issues = data.get("issues") if isinstance(data.get("issues"), list) else []
-    failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
+    raw_failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
+    failed_checks = _filter_validator_failed_checks(raw_failed_checks, failed_checks_text)
     preserve = data.get("preserve") if isinstance(data.get("preserve"), list) else []
     instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
     return {
@@ -3625,6 +3724,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required_capabilities=entries_by_path[f.path].required_capabilities if f.path in entries_by_path else [],
                 forbidden_capabilities=entries_by_path[f.path].forbidden_capabilities if f.path in entries_by_path else [],
                 reference_files=entries_by_path[f.path].reference_files if f.path in entries_by_path else [],
+                skill_local_references=entries_by_path[f.path].skill_local_references if f.path in entries_by_path else [],
+                creator_internal_references=entries_by_path[f.path].creator_internal_references if f.path in entries_by_path else [],
                 language=entries_by_path[f.path].language if f.path in entries_by_path else "text",
                 runtime=entries_by_path[f.path].runtime if f.path in entries_by_path else "none",
                 entrypoint=entries_by_path[f.path].entrypoint if f.path in entries_by_path else "",

@@ -51,6 +51,7 @@ from ..services.skill_dataflow import (
     parse_schema_input_item,
     placeholder_pattern,
     replace_placeholders_in_value,
+    resolve_context_value,
     materialize_step_contexts_from_plan,
     validate_workflow_dataflow_plan,
 )
@@ -2526,18 +2527,24 @@ def render_command_template(command: str, context: dict) -> str:
     script_path = _extract_script_path_from_command(command) or ""
     json_idx = _json_arg_index(parts, script_path) if script_path else None
     if json_idx is not None:
-        try:
-            payload = json.loads(parts[json_idx])
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 无法解析") from exc
-        if not isinstance(payload, dict):
-            raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 必须是 object")
-        missing = _missing_placeholder_keys(_placeholder_keys_in_value(payload), context)
-        if missing:
-            needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
-            raise ValueError(f"dataflow_mismatch: 缺少变量 {needed}")
-        parts[json_idx] = json.dumps(_replace_placeholders_in_value(payload, context), ensure_ascii=False)
-        return " ".join(shlex.quote(part) for part in parts)
+        json_candidate = parts[json_idx].strip()
+        # Action schema commands commonly pass one JSON argv immediately after
+        # scripts/*.py, but generic scripts may use flags/positional args.  Only
+        # enter JSON-argv mode for object-looking tokens; otherwise render the
+        # whole command with the generic placeholder path resolver below.
+        if json_candidate.startswith("{"):
+            try:
+                payload = json.loads(json_candidate)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 无法解析") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 必须是 object")
+            missing = _missing_placeholder_keys(_placeholder_keys_in_value(payload), context)
+            if missing:
+                needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
+                raise ValueError(f"dataflow_mismatch: 缺少变量 {needed}")
+            parts[json_idx] = json.dumps(_replace_placeholders_in_value(payload, context), ensure_ascii=False)
+            return " ".join(shlex.quote(part) for part in parts)
 
     missing = _missing_placeholder_keys(set(_RUNTIME_PLACEHOLDER_RE.findall(command)), context)
     if missing:
@@ -2546,9 +2553,10 @@ def render_command_template(command: str, context: dict) -> str:
 
     def repl(match: re.Match) -> str:
         key = match.group(1)
-        if key not in context:
-            raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
-        value = context[key]
+        try:
+            value = resolve_context_value(context, key)
+        except KeyError as exc:
+            raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}") from exc
         if isinstance(value, (dict, list)):
             return json.dumps(value, ensure_ascii=False)
         return str(value)

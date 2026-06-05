@@ -592,6 +592,18 @@ def test_execute_skill_workflow_generic_foreach_collects_outputs_and_final_file(
     assert (skill_dir / "outputs" / "bundle.pdf").is_file()
 
 
+def test_render_command_template_supports_dotted_context_in_plain_commands():
+    from backend.routers.sandbox_chat import render_command_template
+
+    rendered = render_command_template(
+        "python scripts/plain.py --value={{loop_item.value}} --items={{collection}}",
+        {"loop_item": {"value": "alpha"}, "collection": ["one", "two"]},
+    )
+
+    assert "--value=alpha" in rendered
+    assert '--items=["one", "two"]' in rendered
+
+
 def test_render_command_template_reports_dataflow_mismatch():
     from backend.routers.sandbox_chat import render_command_template
 

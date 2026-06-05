@@ -851,7 +851,7 @@ _HOST_COMMAND_INSTRUCTION_RE = re.compile(
 )
 
 _SKILL_LOCAL_RESOURCE_RE = re.compile(r"(?<![\w./-])(?P<path>(?:scripts|references|assets)/[A-Za-z0-9_./-]+)")
-_ACTION_SCHEMA_FIELD_RE = re.compile(r"(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
+_ACTION_SCHEMA_FIELD_RE = re.compile(r"(?<![A-Za-z0-9_])(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
 _ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", re.I)
 _RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
 _SCRIPT_ROLES = {"text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"}
@@ -900,9 +900,12 @@ def _command_json_argv_keys(command: str, script_path: str | None = None) -> set
 
 def _parse_schema_list_field(text: str, field: str) -> list[str]:
     pattern = _ACTION_SCHEMA_FIELD_RE.pattern.format(field=re.escape(field))
-    match = re.search(pattern, text or "", re.I)
-    if not match:
+    matches = list(re.finditer(pattern, text or "", re.I))
+    if not matches:
         return []
+    # Use the nearest declaration before the command block.  A multi-step
+    # SKILL.md may contain several Action schema snippets in one file.
+    match = matches[-1]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
     cleaned: list[str] = []
     for item in values:
@@ -953,9 +956,15 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
         script_path = _extract_script_path_from_command(command)
         if not script_path:
             continue
-        context = _block_context(text, block)
-        role_match = _ACTION_SCHEMA_ROLE_RE.search(context)
-        role = role_match.group(1).lower() if role_match else "generic_script"
+        context = (block.before_context or "")[-800:]
+        if not (
+            _ACTION_SCHEMA_ROLE_RE.search(context)
+            or _parse_schema_list_field(context, "inputs")
+            or _parse_schema_list_field(context, "outputs")
+        ):
+            context = _block_context(text, block)
+        role_matches = list(_ACTION_SCHEMA_ROLE_RE.finditer(context))
+        role = role_matches[-1].group(1).lower() if role_matches else "generic_script"
         inputs = _parse_schema_list_field(context, "inputs")
         outputs = _parse_schema_list_field(context, "outputs")
         optional_inputs = _parse_optional_schema_inputs(context)
@@ -1353,13 +1362,57 @@ def _execution_requires_run_command_observation(runtime_plan: dict) -> bool:
     )
 
 
+def _should_force_skill_workflow(*, command_contract: dict, user_text: str = "") -> str:
+    """Return a reason when a declared multi-script Skill must run deterministically."""
+    action_schema = (command_contract or {}).get("action_schema") or {}
+    entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
+    script_entries = [
+        entry for entry in entries
+        if _normalize_skill_resource_path(str(entry.get("script_path") or "")).startswith("scripts/")
+    ]
+    if not script_entries:
+        return ""
+
+    roles = {str(entry.get("role") or "") for entry in script_entries}
+    commands_text = "\n".join(str(entry.get("command") or "") for entry in script_entries)
+    output_text = " ".join(
+        " ".join(str(item) for item in (entry.get("outputs") or []))
+        for entry in script_entries
+    )
+    artifact_requested = bool(re.search(
+        r"(?i)(生成|创建|导出|制作|文件|图片|插图|PDF|Word|PPT|docx|pptx|pdf|image|illustration|file)",
+        user_text or "",
+    ))
+    artifact_roles = {
+        "image_generator",
+        "pdf_builder",
+        "docx_builder",
+        "pptx_builder",
+        "html_asset_builder",
+        "asset_builder",
+        "composite_generator",
+    }
+    artifact_declared = bool(
+        roles & artifact_roles
+        or re.search(
+            r"(?i)(image_paths?|pdf_path|docx_path|pptx_path|html_path|file_paths?|asset_paths?|\.pdf|\.png|\.jpg|\.docx|\.pptx)",
+            output_text + "\n" + commands_text,
+        )
+    )
+
+    if len(script_entries) >= 2 and (artifact_requested or artifact_declared):
+        return "Action schema 声明了多个 scripts/*.py 执行入口，且任务/输出涉及文件类产物，必须由后端按 schema 顺序执行 workflow"
+    if len(script_entries) >= 3:
+        return "Action schema 声明了三个及以上脚本步骤，必须由后端按 schema 顺序执行 workflow"
+    return ""
+
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
         "你是 Skill Agent 运行时动作意图判断器。\n\n"
         "【重要】你只能输出一个严格的 JSON 对象，绝对不能输出任何自然语言、解释、思考过程或 Markdown 文本。"
         "你的全部输出必须是可直接被 json.loads() 解析的 JSON，不得有任何前缀或后缀。\n\n"
         "你的任务不是回答用户问题，也不是凭空创建命令；你的任务是根据 Loaded SKILL.md、"
-        "resource_catalog、available_scripts 和用户请求判断本轮是否需要先让主模型输出显式可执行块。\n\n"
+        "resource_catalog、available_scripts 和用户请求判断本轮应直接回答、读取资源，还是进入后端 deterministic workflow。\n\n"
         "核心原则：\n"
         "1. Loaded SKILL.md 是当前 Skill 的执行规范。\n"
         "2. resource_catalog 和 available_scripts 只包含当前业务 Skill 目录内真实存在的 skill-local resources；kernel references 不会暴露给运行时，不能读取或引用。\n"
@@ -1367,10 +1420,11 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "3. 是否执行命令，必须由 SKILL.md/references Action schema 中的显式 shell fenced 命令示例触发；"
         "不要因为磁盘上存在脚本就直接规划 run_command，也不要临时拼接 Skill.md 中没有声明的命令。\n"
         "4. 你可以规划 read_resource，因为读取 reference/asset 是宿主受控动作；"
-        "需要执行脚本时，把替换真实参数后的完整命令放入 final_instruction 的 shell fenced block；"
+        "单步脚本可把替换真实参数后的完整命令放入 final_instruction 的 shell fenced block；"
+        "复合脚本 Skill 必须使用 mode=execute_workflow，让后端根据 Action schema 顺序执行；"
         "不要在 actions 中规划 run_command、write_file 或 create_directory。\n"
-        "5. 如果任务需要运行 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求调用脚本，"
-        "只有在 SKILL.md 或其明确引用的 references 中已经包含具体 shell fenced 命令示例、且宿主 Action schema 校验通过时，才可使用 mode=direct_answer 并让主模型按该示例替换真实参数。\n"
+        "5. 如果任务需要运行多个 scripts、生成 PPT/Excel/Word/PDF/图片等文件，或 Loaded SKILL.md 明确要求多个脚本步骤，"
+        "必须使用 mode=execute_workflow；不要让主模型重新输出多条 bash 命令。单步命令才可使用 direct_answer/final_instruction 兜底。\n"
         "6. 如果 Skill.md/reference 只写了 `scripts/...` 行内路径、‘调用脚本’等自然语言，但没有具体 fenced 命令示例，"
         "必须使用 mode=ask_user，说明该 Skill 缺少可执行命令 block 示例，不能让主模型临时拼命令。\n"
         "7. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
@@ -1394,13 +1448,14 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "文件内容必须放在紧随其后的 fenced code block 内。\n"
         "- 后端只执行 final_instruction 或主模型回复中已经出现、且通过 available_scripts 与 Action schema 校验的命令；资源存在性只做安全校验，不做触发条件。\n\n"
         "mode 选择规则：\n"
-        "- direct_answer：主模型继续生成最终回复；如果需要动作，也必须在该回复中输出显式 fenced block 供后端识别执行。\n"
-        "- execute：用于 read_resource/display/ignore 这类宿主受控动作；若 final_instruction 含合法命令，宿主会在前置动作后执行该命令。\n"
+        "- direct_answer：主模型继续生成最终回复；仅适用于无需脚本或单步脚本兜底。\n"
+        "- execute_workflow：用于包含多个 scripts/*.py 命令、章节循环或文件产物链路的复合 Skill；后端将按 Action schema 顺序执行，不依赖主模型输出 bash。\n"
+        "- execute：用于 read_resource/display/ignore 这类宿主受控动作；若 final_instruction 含合法单步命令，宿主会在前置动作后执行该命令。\n"
         "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "输出格式：\n"
         "{\n"
-        "  \"mode\": \"execute | direct_answer | ask_user | not_applicable\",\n"
+        "  \"mode\": \"execute_workflow | execute | direct_answer | ask_user | not_applicable\",\n"
         "  \"actions\": [\n"
         "    {\n"
         "      \"action\": \"read_resource | display | ignore\",\n"
@@ -1424,6 +1479,7 @@ def _normalize_skill_runtime_plan(
     loaded_paths: list[str] | None = None,
     failed_paths: list[dict] | None = None,
     available_scripts: list[str] | None = None,
+    user_text: str = "",
 ) -> dict:
     """Normalize planner JSON into executor-compatible plan.
 
@@ -1449,7 +1505,7 @@ def _normalize_skill_runtime_plan(
     command_script_set = {_normalize_skill_resource_path(str(entry.get("script_path") or "")) for entry in command_entries if isinstance(entry, dict)}
 
     mode = str(plan.get("mode") or "").strip()
-    if mode not in {"execute", "direct_answer", "ask_user", "not_applicable"}:
+    if mode not in {"execute", "execute_workflow", "direct_answer", "ask_user", "not_applicable"}:
         mode = "ask_user"
 
     actions = plan.get("actions", [])
@@ -1608,6 +1664,18 @@ def _normalize_skill_runtime_plan(
         action_item["block_index"] = int(action_item.get("block_index", -1))
         normalized_actions.append(action_item)
 
+    workflow_reason = _should_force_skill_workflow(
+        command_contract=command_contract or {},
+        user_text=user_text,
+    )
+    if workflow_reason:
+        mode = "execute_workflow"
+        normalized_actions = [item for item in normalized_actions if str(item.get("action") or "") == "read_resource"]
+        planner_inconsistent.append({
+            "missing_type": "workflow_forced",
+            "reason": workflow_reason,
+        })
+
     # 如果 planner 要 execute，但所有 action 都被宿主校验拦掉，
     # 不要继续进入 executor，改为 ask_user，让前端看到可解释错误。
     if mode == "execute" and not normalized_actions and errors:
@@ -1628,14 +1696,31 @@ def _normalize_skill_runtime_plan(
             "hint": "请在当前 SKILL.md 中用普通 Markdown 写入具体 ```bash 命令示例，并让脚本接口与示例一致。",
         })
 
+    workflow_actions = []
+    if mode == "execute_workflow":
+        for entry in command_entries:
+            if not isinstance(entry, dict):
+                continue
+            script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
+            if not script_path.startswith("scripts/"):
+                continue
+            workflow_actions.append({
+                "action": "run_command",
+                "script_path": script_path,
+                "command_template": str(entry.get("command") or ""),
+                "reason": "execute_workflow Action schema step",
+            })
+
     return {
         "mode": mode,
         "tasks": normalized_actions,
         "actions": normalized_actions,
+        "workflow_actions": workflow_actions,
         "missing": missing,
         "errors": errors,
         "planner_inconsistent": planner_inconsistent,
         "final_instruction": final_instruction,
+        "command_contract": command_contract or {},
     }
 
 async def _run_skill_runtime_planner_round(
@@ -1686,7 +1771,8 @@ async def _run_skill_runtime_planner_round(
             "planner_must_not_generate_resource_paths": True,
             "read_resource_uses_resource_handle_only": True,
             "resource_path_resolution_is_host_owned": True,
-            "execution_requires_main_model_fenced_block": True,
+            "execution_requires_main_model_fenced_block": False,
+            "multi_script_skills_use_execute_workflow": True,
             "action_observation_loop": True,
             "command_generation_requires_skill_md_markdown_example": True,
             "fenced_blocks_are_normalized_to_action_schema": True,
@@ -1753,6 +1839,7 @@ async def _run_skill_runtime_planner_round(
             loaded_paths=loaded_paths,
             failed_paths=failed_paths,
             available_scripts=available_scripts,
+            user_text=_last_user_text(request),
         )
     )
 
@@ -2371,6 +2458,388 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
         seen.add(rel)
         output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
     return output_files
+
+
+_CHINESE_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+
+
+def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
+    """Infer initial placeholders needed by the first workflow script from user text."""
+    context: dict = {}
+    text = (user_text or "").strip()
+    if not text:
+        return context
+
+    context.update({"user_request": text, "input": text, "topic": text})
+    context.update(_extract_inline_workflow_values(text))
+
+    first_keys = set(first_entry.get("placeholder_keys") or []) | set(first_entry.get("inputs") or [])
+    for key in sorted(first_keys):
+        if key in context:
+            context[key] = _coerce_workflow_value_for_key(key, context[key])
+            continue
+        inferred = _infer_workflow_value_for_key(key, text)
+        if inferred is not None:
+            context[key] = _coerce_workflow_value_for_key(key, inferred)
+    return context
+
+
+def _extract_inline_workflow_values(user_text: str) -> dict:
+    values: dict = {}
+    # Accept direct user-supplied key/value pairs such as
+    # ``story_theme: ...`` or JSON snippets without asking the LLM to parse them.
+    try:
+        maybe_json = json.loads(user_text)
+    except json.JSONDecodeError:
+        maybe_json = None
+    if isinstance(maybe_json, dict):
+        values.update(maybe_json)
+
+    for match in re.finditer(
+        r"(?P<key>[A-Za-z_][\w-]*)\s*[：:=]\s*(?P<value>[^，。\n,;；]+)",
+        user_text,
+    ):
+        values[match.group("key")] = match.group("value").strip()
+    return values
+
+
+def _coerce_workflow_value_for_key(key: str, value: object) -> object:
+    lowered = key.lower()
+    if any(token in lowered for token in ("count", "num", "number", "total")):
+        if isinstance(value, int):
+            return value
+        match = re.search(r"\d+", str(value))
+        if match:
+            return int(match.group(0))
+    return value
+
+
+def _infer_workflow_value_for_key(key: str, user_text: str) -> object | None:
+    lowered = key.lower()
+    if any(token in lowered for token in ("count", "num", "number", "total")):
+        return _extract_count_from_user_text(user_text)
+    if "audience" in lowered or "reader" in lowered or "target" in lowered or "受众" in key:
+        return _extract_target_audience_from_user_text(user_text)
+    if any(token in lowered for token in ("theme", "topic", "subject", "title", "prompt")) or "主题" in key:
+        return _extract_theme_from_user_text(user_text) or user_text
+    if lowered in {"input", "request", "user_request", "text"}:
+        return user_text
+    return None
+
+
+def _extract_count_from_user_text(user_text: str) -> int | None:
+    patterns = (
+        r"(?:chapter_count|章节数|章数|章节|共)\s*[：:=]?\s*(\d+)",
+        r"(\d+)\s*(?:章|章节|节|个章节|部分|段)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            return int(match.group(1))
+    match = re.search(r"([一二两三四五六七八九十])\s*(?:章|章节|节|个章节|部分|段)", user_text)
+    if match:
+        return _CHINESE_DIGITS.get(match.group(1))
+    return None
+
+
+def _extract_target_audience_from_user_text(user_text: str) -> str | None:
+    patterns = (
+        r"(?:target_audience|受众|目标读者|读者对象|面向对象)\s*[：:=]\s*([^，。\n,;；]+)",
+        r"(?:面向|适合|给)\s*([^，。\n,;；的]{1,24})(?:的)?(?:读者|受众|观众|儿童|孩子|小朋友|学生)?",
+        r"为\s*([^，。\n,;；的]{1,24})(?:读者|受众|观众|儿童|孩子|小朋友|学生)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _extract_theme_from_user_text(user_text: str) -> str | None:
+    patterns = (
+        r"(?:story_theme|主题|题材)\s*[：:=]\s*([^，。\n,;；]+)",
+        r"以\s*([^，。\n,;；]{1,60})\s*为(?:主题|题材|主线)",
+        r"关于\s*([^，。\n,;；]{1,60})(?:的|，|。|,|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, user_text, re.I)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def _missing_workflow_placeholders(entry: dict, context: dict) -> list[str]:
+    return sorted(key for key in (entry.get("placeholder_keys") or []) if key not in context)
+
+
+def _json_arg_index(parts: list[str], script_path: str) -> int | None:
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/").lstrip("./")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            return idx + 1 if idx + 1 < len(parts) else None
+    return None
+
+
+def _replace_placeholders_in_value(value: object, context: dict) -> object:
+    if isinstance(value, str):
+        exact = _RUNTIME_PLACEHOLDER_RE.fullmatch(value.strip())
+        if exact:
+            key = exact.group(1)
+            if key not in context:
+                raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
+            return context[key]
+
+        def repl(match: re.Match) -> str:
+            key = match.group(1)
+            if key not in context:
+                raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
+            replacement = context[key]
+            if isinstance(replacement, (dict, list)):
+                return json.dumps(replacement, ensure_ascii=False)
+            return str(replacement)
+
+        return _RUNTIME_PLACEHOLDER_RE.sub(repl, value)
+    if isinstance(value, list):
+        return [_replace_placeholders_in_value(item, context) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_placeholders_in_value(item, context) for key, item in value.items()}
+    return value
+
+
+def render_command_template(command: str, context: dict) -> str:
+    """Render Action schema command placeholders without asking the LLM to re-emit bash."""
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"dataflow_mismatch: 命令模板无法解析: {command}") from exc
+    script_path = _extract_script_path_from_command(command) or ""
+    json_idx = _json_arg_index(parts, script_path) if script_path else None
+    if json_idx is not None:
+        try:
+            payload = json.loads(parts[json_idx])
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 无法解析") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"dataflow_mismatch: {script_path} 的 JSON argv 必须是 object")
+        parts[json_idx] = json.dumps(_replace_placeholders_in_value(payload, context), ensure_ascii=False)
+        return " ".join(shlex.quote(part) for part in parts)
+
+    def repl(match: re.Match) -> str:
+        key = match.group(1)
+        if key not in context:
+            raise ValueError(f"dataflow_mismatch: 缺少变量 {{{{{key}}}}}")
+        value = context[key]
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    return _RUNTIME_PLACEHOLDER_RE.sub(repl, command)
+
+
+def _parse_stdout_json(stdout: str) -> dict:
+    try:
+        payload = json.loads((stdout or "").strip())
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def merge_step_output(context: dict, script_path: str, stdout_json: dict) -> dict:
+    """Merge one script stdout JSON into flat and script-name namespaced context."""
+    if not isinstance(stdout_json, dict):
+        return context
+    context.update(stdout_json)
+    namespace = Path(script_path).stem
+    if namespace:
+        context[namespace] = stdout_json
+    return context
+
+
+def _chapter_text_from_item(item: object) -> str:
+    if isinstance(item, dict):
+        for key in ("content", "text", "story_text", "chapter_text", "body"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return json.dumps(item, ensure_ascii=False)
+    return str(item)
+
+
+def _collect_path_values(payload: dict) -> list[str]:
+    paths: list[str] = []
+    def walk(value: object) -> None:
+        if isinstance(value, str) and Path(value).suffix.lower() in {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".docx", ".pptx", ".html", ".htm"
+        }:
+            paths.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+    walk(payload)
+    return paths
+
+
+def _workflow_step_contexts(entry: dict, context: dict) -> list[dict]:
+    placeholders = set(entry.get("placeholder_keys") or [])
+    if "chapter_text" not in placeholders:
+        return [context]
+    chapters = context.get("chapters")
+    if not isinstance(chapters, list) or not chapters:
+        raise ValueError(
+            f"dataflow_mismatch: {entry.get('script_path')} 需要 {{chapter_text}}，但前序步骤没有产生 chapters list"
+        )
+    contexts: list[dict] = []
+    for idx, chapter in enumerate(chapters, start=1):
+        child_context = dict(context)
+        child_context["chapter"] = chapter
+        child_context["chapter_index"] = idx
+        child_context["chapter_text"] = _chapter_text_from_item(chapter)
+        if isinstance(chapter, dict) and isinstance(chapter.get("title"), str):
+            child_context["chapter_title"] = chapter["title"]
+        contexts.append(child_context)
+    return contexts
+
+
+def _workflow_output_summary(results: list[dict], output_files: list[dict]) -> str:
+    successful = [r for r in results if r.get("success", True)]
+    image_count = 0
+    pdf_paths: list[str] = []
+    for result in results:
+        payload = _parse_stdout_json(str(result.get("stdout") or ""))
+        paths = _collect_path_values(payload)
+        image_count += len([p for p in paths if Path(p).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}])
+        pdf_paths.extend(p for p in paths if Path(p).suffix.lower() == ".pdf")
+    lines = [f"workflow 执行成功：{len(successful)} 个步骤"]
+    if image_count:
+        lines.append(f"插图生成成功：{image_count} 张")
+    if pdf_paths:
+        lines.append("PDF 生成成功：" + ", ".join(pdf_paths))
+    if output_files:
+        lines.append("产物路径：" + ", ".join(item.get("path", "") for item in output_files if item.get("path")))
+    return "\n".join(lines)
+
+
+async def _execute_skill_workflow(
+    *,
+    execution_root: Path,
+    action_schema: dict,
+    user_context: dict,
+    request: ChatRequest | None = None,
+    skill_name: str = "",
+) -> dict:
+    """Execute declared Action schema script entries in order with stdout JSON dataflow."""
+    entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
+    entries = [
+        entry for entry in entries
+        if _normalize_skill_resource_path(str(entry.get("script_path") or "")).startswith("scripts/")
+    ]
+    if not entries:
+        raise ValueError("execute_workflow 需要至少一个 scripts/* Action schema entry")
+
+    root = execution_root.resolve()
+    available_scripts = set(_available_scripts_for_root(root))
+    req = request or ChatRequest(messages=[])
+    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
+    context = _workflow_context_from_request_text(user_text, entries[0])
+    context.update(user_context or {})
+    session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
+    results: list[dict] = []
+    touched: list[Path] = []
+    output_files: list[dict] = []
+    for entry_index, entry in enumerate(entries):
+        script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
+        if script_path not in available_scripts:
+            raise ValueError(f"workflow_mismatch: {script_path} 不在 available_scripts 中：{sorted(available_scripts)}")
+        command_template = str(entry.get("command") or "").strip()
+        if not command_template:
+            raise ValueError(f"workflow_mismatch: {script_path} 缺少 command template")
+        if entry_index == 0:
+            missing_initial = _missing_workflow_placeholders(entry, context)
+            if missing_initial:
+                needed = ", ".join(f"{{{{{key}}}}}" for key in missing_initial)
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。")
+        step_contexts = _workflow_step_contexts(entry, context)
+        step_payloads: list[dict] = []
+        for step_context in step_contexts:
+            try:
+                command = render_command_template(command_template, step_context)
+            except ValueError as exc:
+                needed = ", ".join(f"{{{{{key}}}}}" for key in (entry.get("placeholder_keys") or []))
+                if entry_index == 0:
+                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但用户输入中没有解析出对应变量。{exc}") from exc
+                raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，但前序步骤没有产生对应变量。{exc}") from exc
+            result, task_touched = await asyncio.to_thread(
+                functools.partial(
+                    _execute_single_task,
+                    {"action": "run_command", "command": command, "reason": "execute_workflow Action schema step"},
+                    [],
+                    req,
+                    execution_root=root,
+                    inferred_skill_root=root,
+                    skill_name=skill_name or root.name,
+                    session_input_dir=session_input_dir,
+                )
+            )
+            results.append(result)
+            touched.extend(task_touched)
+            output_files.extend(result.get("output_files") or [])
+            if not result.get("success", True):
+                raise ValueError(
+                    f"workflow_step_failed: {script_path} returncode={result.get('returncode')} stderr={(result.get('stderr') or '').strip()}"
+                )
+            payload = _parse_stdout_json(str(result.get("stdout") or ""))
+            step_payloads.append(payload)
+            merge_step_output(context, script_path, payload)
+        if len(step_contexts) > 1:
+            collected_image_paths: list[str] = []
+            for payload in step_payloads:
+                image_paths = payload.get("image_paths")
+                if isinstance(image_paths, list):
+                    collected_image_paths.extend(path for path in image_paths if isinstance(path, str))
+                image_path = payload.get("image_path")
+                if isinstance(image_path, str):
+                    collected_image_paths.append(image_path)
+            if collected_image_paths:
+                context["image_paths"] = collected_image_paths
+
+    dedup_output_files: list[dict] = []
+    seen_outputs: set[str] = set()
+    for item in output_files:
+        path = str(item.get("path") or "")
+        if not path or path in seen_outputs:
+            continue
+        seen_outputs.add(path)
+        dedup_output_files.append(item)
+
+    return {
+        "executed": True,
+        "reason": "已根据 Action schema 确定性执行 workflow。",
+        "results": results,
+        "context": context,
+        "output_files": dedup_output_files,
+        "touched_paths": [str(path) for path in touched],
+        "logs": [_workflow_output_summary(results, dedup_output_files)],
+    }
 
 def _execute_single_task(
     task: dict,
@@ -3373,6 +3842,69 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     _planned_followup_commands = _extract_executable_command_blocks_from_text(
                         str(runtime_plan.get("final_instruction") or "")
                     )
+
+                    if mode == "execute_workflow":
+                        action_schema = ((runtime_plan.get("command_contract") or {}).get("action_schema") or {})
+                        if not action_schema:
+                            action_schema = _build_runtime_action_schema(body_prompt, execution_root=execution_root)
+                        if action_schema.get("errors"):
+                            raise ValueError("Skill Action schema 校验失败: " + json.dumps(action_schema["errors"], ensure_ascii=False))
+
+                        user_context = {
+                            "user_request": _last_user_text(request),
+                            "input": _last_user_text(request),
+                            "topic": _last_user_text(request),
+                        }
+                        yield _sse({"status": {"phase": "executing", "message": "按 Action schema 执行 workflow…"}})
+                        workflow_result = await _execute_skill_workflow(
+                            execution_root=execution_root,
+                            action_schema=action_schema,
+                            user_context=user_context,
+                            request=request,
+                            skill_name=parent_skill_name,
+                        )
+                        runtime_plan["workflow_result"] = {
+                            "result_count": len(workflow_result.get("results") or []),
+                            "output_file_count": len(workflow_result.get("output_files") or []),
+                        }
+                        for step_result in workflow_result.get("results") or []:
+                            script_path = _extract_script_path_from_command(str(step_result.get("command") or "")) or ""
+                            yield _thought(
+                                "action_result",
+                                "workflow 步骤结果",
+                                f"{script_path or 'script'} {'成功' if step_result.get('success', True) else '失败'} exit={step_result.get('returncode', 0)}",
+                                {
+                                    k: (v[:1000] if isinstance(v, str) else v)
+                                    for k, v in step_result.items()
+                                    if k not in {"content"}
+                                },
+                            )
+
+                        _workflow_output_files = workflow_result.get("output_files") or []
+                        final_answer = _render_success_stdout_payload(workflow_result)
+                        if final_answer is None:
+                            final_answer = "\n".join(workflow_result.get("logs") or []) or "workflow 执行完成。"
+                        final_answer = _finalize_answer_output_file_links(final_answer, _workflow_output_files)
+                        yield _thought(
+                            "final_answer",
+                            "生成回答",
+                            f"workflow 真实执行完成，包含 {len(_workflow_output_files)} 个输出文件",
+                            {"output_file_count": len(_workflow_output_files)},
+                        )
+                        yield _sse({"status": None})
+                        if _workflow_output_files:
+                            yield _sse({
+                                "action_result": {
+                                    "action": "output_files",
+                                    "name": parent_skill_name,
+                                    "success": True,
+                                    "message": f"生成了 {len(_workflow_output_files)} 个文件",
+                                    "output_files": _workflow_output_files,
+                                }
+                            })
+                        yield _sse({"content": final_answer})
+                        yield "data: [DONE]\n\n"
+                        return
 
                     if mode == "execute" and (tasks or _planned_followup_commands):
                         # Set up shared execution context for the per-task loop.

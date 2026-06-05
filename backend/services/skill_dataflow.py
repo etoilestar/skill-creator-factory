@@ -419,3 +419,239 @@ def _pluralize_key(key: str) -> str:
     if key.endswith("y") and len(key) > 1 and key[-2].lower() not in "aeiou":
         return key[:-1] + "ies"
     return key + "s"
+
+
+# ---- Model-planned workflow dataflow -------------------------------------
+
+def entry_default_context(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Return Action schema defaults without reading business-specific names."""
+    context: dict[str, Any] = {}
+    for entry in entries:
+        defaults = entry.get("default_values") or {}
+        if isinstance(defaults, dict):
+            context.update(defaults)
+    return context
+
+
+def deterministic_dataflow_plan_from_schema(
+    entries: Iterable[dict[str, Any]],
+    *,
+    user_text: str = "",
+    user_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a conservative schema-derived plan used for validation fallback/tests.
+
+    The runtime planner should normally be model-produced.  This helper is still
+    generic and field-name agnostic: it only copies defaults, explicit user
+    key/value data, command placeholders, and schema order.
+    """
+    entry_list = [entry for entry in entries if isinstance(entry, dict)]
+    initial_context = initial_context_from_entries(entry_list, user_text=user_text, user_context=user_context or {})
+    planned_steps: list[dict[str, Any]] = []
+    known_outputs: set[str] = set(initial_context.keys())
+    for entry in entry_list:
+        placeholders = list(entry.get("placeholder_keys") or [])
+        missing_now = [key for key in placeholders if key not in known_outputs]
+        loop = None
+        # If a placeholder is not known before the step, allow runtime loop item
+        # expansion to satisfy it from a previous list value.  The validator will
+        # still reject it when no such list exists at execution time.
+        if missing_now:
+            loop = {"collection": "auto", "item_name": "loop_item"}
+        planned_steps.append({
+            "script_path": entry.get("script_path"),
+            "command": entry.get("command"),
+            "input_mapping": {key: f"{{{{{key}}}}}" for key in placeholders},
+            "loop": loop,
+            "output_policy": "merge_stdout",
+        })
+        for key in entry.get("outputs") or []:
+            if str(key).strip():
+                known_outputs.add(str(key).strip())
+                known_outputs.add(_pluralize_key(str(key).strip()))
+                known_outputs.add(f"{str(key).strip()}_list")
+    return {"initial_context": initial_context, "steps": planned_steps, "collections": [], "missing": [], "errors": []}
+
+
+def validate_workflow_dataflow_plan(plan: dict[str, Any], entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Validate and normalize a model-produced workflow dataflow plan.
+
+    Validation is intentionally structural and schema based.  It never trusts the
+    model to execute anything, and it rejects unknown scripts, missing steps, and
+    input mappings that do not cover command placeholders.
+    """
+    if not isinstance(plan, dict):
+        raise DataflowError("workflow dataflow plan 必须是 JSON object")
+    missing = plan.get("missing") or []
+    errors = plan.get("errors") or []
+    if missing or errors:
+        raise MissingVariablesError([str(item) for item in missing] or [str(item) for item in errors], message="workflow dataflow planner 报告缺失或错误: " + json.dumps({"missing": missing, "errors": errors}, ensure_ascii=False))
+
+    entry_list = [entry for entry in entries if isinstance(entry, dict)]
+    expected_scripts = [_normalize_script_path(str(entry.get("script_path") or "")) for entry in entry_list]
+    steps = plan.get("steps")
+    if not isinstance(steps, list):
+        raise DataflowError("workflow dataflow plan 缺少 steps 数组")
+    if len(steps) != len(expected_scripts):
+        raise DataflowError(f"workflow dataflow plan steps 数量不匹配: expected={len(expected_scripts)} actual={len(steps)}")
+
+    normalized_steps: list[dict[str, Any]] = []
+    for index, (step, entry, expected_script) in enumerate(zip(steps, entry_list, expected_scripts, strict=False)):
+        if not isinstance(step, dict):
+            raise DataflowError(f"workflow dataflow plan step[{index}] 必须是 object")
+        script_path = _normalize_script_path(str(step.get("script_path") or ""))
+        if script_path != expected_script:
+            raise DataflowError(f"workflow dataflow plan step[{index}] script_path 不匹配: expected={expected_script} actual={script_path}")
+        mapping = step.get("input_mapping") or {}
+        if not isinstance(mapping, dict):
+            raise DataflowError(f"workflow dataflow plan step[{index}] input_mapping 必须是 object")
+        placeholders = set(entry.get("placeholder_keys") or [])
+        missing_mapping = sorted(key for key in placeholders if key not in mapping)
+        if missing_mapping:
+            raise MissingVariablesError(missing_mapping, message=f"workflow dataflow plan step[{index}] 缺少 input_mapping: {', '.join(missing_mapping)}")
+        loop = step.get("loop")
+        if loop is not None and not isinstance(loop, dict):
+            raise DataflowError(f"workflow dataflow plan step[{index}] loop 必须是 object 或 null")
+        normalized = dict(step)
+        normalized["script_path"] = script_path
+        normalized["input_mapping"] = dict(mapping)
+        normalized["output_policy"] = str(step.get("output_policy") or "merge_stdout")
+        normalized_steps.append(normalized)
+
+    initial_context = plan.get("initial_context") or {}
+    if not isinstance(initial_context, dict):
+        raise DataflowError("workflow dataflow plan initial_context 必须是 object")
+    return {
+        "initial_context": initial_context,
+        "steps": normalized_steps,
+        "collections": plan.get("collections") if isinstance(plan.get("collections"), list) else [],
+        "missing": [],
+        "errors": [],
+    }
+
+
+def context_from_dataflow_plan(
+    plan: dict[str, Any],
+    entries: Iterable[dict[str, Any]],
+    *,
+    user_text: str = "",
+    user_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge defaults, user-provided context, and planner initial_context."""
+    base = initial_context_from_entries(entries, user_text=user_text, user_context=user_context or {})
+    planner_context = plan.get("initial_context") if isinstance(plan, dict) else {}
+    return merge_context(base, planner_context if isinstance(planner_context, dict) else {})
+
+
+def materialize_step_contexts_from_plan(step_plan: dict[str, Any], entry: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve a plan step's input_mapping into one or more executable contexts."""
+    loop = step_plan.get("loop")
+    if isinstance(loop, dict) and loop and str(loop.get("collection") or "") not in {"", "auto"}:
+        collection_path = str(loop.get("collection") or loop.get("source") or loop.get("list") or "")
+        try:
+            collection = resolve_context_value(context, _strip_braces(collection_path))
+        except KeyError as exc:
+            raise LoopExpansionError([collection_path], message=f"循环集合不存在: {collection_path}") from exc
+        if not isinstance(collection, list) or not collection:
+            raise LoopExpansionError([collection_path], message=f"循环集合不是非空列表: {collection_path}")
+        item_name = str(loop.get("item_name") or "loop_item")
+        contexts: list[dict[str, Any]] = []
+        for index, item in enumerate(collection):
+            child = dict(context)
+            child[item_name] = item
+            child["loop_item"] = item
+            child["loop_index"] = index
+            if isinstance(item, dict):
+                child.update(item)
+            child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
+            contexts.append(child)
+        return contexts
+
+    try:
+        mapped = resolve_input_mapping(step_plan.get("input_mapping") or {}, context)
+        return [merge_context(context, mapped)]
+    except MissingVariablesError:
+        # Preserve the existing generic foreach support when the model marks a
+        # step as loop:auto or when mappings depend on fields supplied by items.
+        expanded = expand_step_contexts(entry, context)
+        contexts = []
+        for child in expanded:
+            child = dict(child)
+            child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
+            contexts.append(child)
+        return contexts
+
+
+def resolve_input_mapping(mapping: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """Resolve model input_mapping values against the current context."""
+    resolved: dict[str, Any] = {}
+    missing: list[str] = []
+    for key, source in mapping.items():
+        try:
+            resolved[str(key)] = resolve_dataflow_source(source, context)
+        except KeyError:
+            missing.append(_source_path_for_error(source) or str(key))
+        except MissingVariablesError as exc:
+            missing.extend(exc.missing)
+    if missing:
+        raise MissingVariablesError(missing)
+    return resolved
+
+
+def resolve_dataflow_source(source: Any, context: dict[str, Any]) -> Any:
+    """Resolve one planner source value. Supports placeholders and source objects."""
+    if isinstance(source, str):
+        stripped = source.strip()
+        placeholder = _PLACEHOLDER_RE.fullmatch(stripped)
+        if placeholder:
+            return resolve_context_value(context, placeholder.group(1))
+        if re.fullmatch(r"[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*|\.[0-9]+)*", stripped):
+            return resolve_context_value(context, stripped)
+        return replace_placeholders_in_value(source, context)
+    if isinstance(source, dict):
+        if "value" in source:
+            return source["value"]
+        path = source.get("path") or source.get("key") or source.get("name") or source.get("from") or source.get("source")
+        if path:
+            return resolve_context_value(context, _strip_braces(str(path)))
+        return replace_placeholders_in_value(source, context)
+    return replace_placeholders_in_value(source, context)
+
+
+def apply_dataflow_collections(collections: list[Any], context: dict[str, Any], step_payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply optional model-declared loop aggregations to context."""
+    if not isinstance(collections, list):
+        return {}
+    updates: dict[str, Any] = {}
+    last_payloads = [payload for payload in step_payloads if isinstance(payload, dict)]
+    for collection in collections:
+        if not isinstance(collection, dict):
+            continue
+        target = str(collection.get("target") or collection.get("name") or "").strip()
+        source = str(collection.get("source") or collection.get("field") or "").strip()
+        if not target or not source:
+            continue
+        values = [payload[source] for payload in last_payloads if source in payload]
+        if values:
+            updates[target] = values
+    context.update(updates)
+    return updates
+
+
+def _normalize_script_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def _strip_braces(path: str) -> str:
+    match = _PLACEHOLDER_RE.fullmatch((path or "").strip())
+    return match.group(1) if match else (path or "").strip()
+
+
+def _source_path_for_error(source: Any) -> str:
+    if isinstance(source, str):
+        return _strip_braces(source)
+    if isinstance(source, dict):
+        for key in ("path", "key", "name", "from", "source"):
+            if source.get(key):
+                return _strip_braces(str(source[key]))
+    return ""

@@ -1159,7 +1159,7 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
             raise ValueError("composite_generator stdout JSON 缺少声明的 docx_path/file_paths 输出")
         if ("pptx_generation" in required_capabilities or {"pptx_path"} & outputs) and not _payload_has_file_field(payload, "pptx_path", "file_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 pptx_path/file_paths 输出")
-        if (({"html_generation", "html_asset_generation"} & required_capabilities) or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
+        if (({"html_generation", "html_asset_generation"} & required_capabilities) or {"html_path", "asset_paths", "file_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths", "file_paths"):
             raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
     if role == "text_generator" and not str(payload.get("text") or payload.get("story_text") or payload.get("markdown") or "").strip():
         raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
@@ -1174,8 +1174,10 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     if role in {"html_asset_builder", "asset_builder"}:
         html_path = payload.get("html_path")
         asset_paths = payload.get("asset_paths")
+        file_paths = payload.get("file_paths")
         has_html = isinstance(html_path, str) and html_path.strip()
         has_html = has_html or (isinstance(asset_paths, list) and any(isinstance(p, str) and p.strip() for p in asset_paths))
+        has_html = has_html or (isinstance(file_paths, list) and any(isinstance(p, str) and p.strip() for p in file_paths))
         if not has_html:
             raise ValueError("html_asset_builder stdout JSON 必须包含 html_path 或 asset_paths")
 

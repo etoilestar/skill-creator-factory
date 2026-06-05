@@ -81,6 +81,8 @@ class SkillPlanEntry:
     outputs: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
+    optional_capabilities: list[str] = field(default_factory=list)
+    allowed_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
     reference_files: list[str] = field(default_factory=list)
     skill_local_references: list[str] = field(default_factory=list)
@@ -215,7 +217,7 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
             segment = after[: next_match.start()] if next_match else after
             # Prefer block-style segments that actually contain contract fields;
             # inline path mentions in section summaries often have no local data.
-            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
+            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
                 return segment
             if len(segment) > len(best):
                 best = segment
@@ -235,7 +237,7 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
     if not match:
         return None
     raw = match.group(1)
-    raw = re.split(r"\s+(?:role|inputs|outputs|dependencies|required_capabilities|forbidden_capabilities|language|runtime)\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
+    raw = re.split(r"\s+(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime)\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
     cleaned: list[str] = []
     for item in values:
@@ -431,13 +433,15 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "composite_generator":
         return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
-        return ["pdf_generation", "file_output"], ["image_generation"]
+        return ["pdf_generation", "file_output"], []
     if role == "docx_builder":
-        return ["docx_generation", "file_output"], ["image_generation", "pdf_generation"]
+        return ["docx_generation", "file_output"], []
     if role == "pptx_builder":
-        return ["pptx_generation", "file_output"], ["image_generation", "pdf_generation"]
-    if role in {"html_asset_builder", "asset_builder"}:
-        return ["html_asset_generation", "file_output"], ["image_generation", "pdf_generation"]
+        return ["pptx_generation", "file_output"], []
+    if role == "html_asset_builder":
+        return ["html_asset_generation", "file_output"], []
+    if role == "asset_builder":
+        return ["asset_generation", "file_output"], []
     if role == "reference":
         return ["reference_guidance"], ["runtime_execution", "image_generation"]
     if role == "asset":
@@ -463,6 +467,8 @@ def build_skill_plan_entry(
     )
     file_type = file_type_for_path(file_path)
     explicit_required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    explicit_optional_capabilities = _explicit_list_field("optional_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     role = classification.role
     role_reason = classification.reason
     if file_type == "script" and explicit_required_capabilities and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities)):
@@ -493,6 +499,8 @@ def build_skill_plan_entry(
         inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
         outputs = explicit_outputs or default_io_for_role(role)[1]
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
+    optional_capabilities = explicit_optional_capabilities or []
+    allowed_capabilities = explicit_allowed_capabilities or []
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
     forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
     if role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder"}:
@@ -518,6 +526,8 @@ def build_skill_plan_entry(
         outputs=outputs,
         dependencies=dependencies,
         required_capabilities=required_capabilities,
+        optional_capabilities=optional_capabilities,
+        allowed_capabilities=allowed_capabilities,
         forbidden_capabilities=forbidden_capabilities,
         # Public/final SKILL.md references are skill-local only.  Creator
         # kernel references remain separate internal context and must never be

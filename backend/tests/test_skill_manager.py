@@ -349,3 +349,40 @@ def test_import_zip_only_allowed_subdirs_extracted(tmp_path):
     skill_dir = skills_path / "clean"
     assert (skill_dir / "scripts" / "run.py").exists()
     assert not (skill_dir / "secrets").exists()
+
+
+def test_get_execution_skill_dir_returns_managed_skill_root(tmp_path):
+    from backend.services import skill_manager
+    from backend.services import skill_governance
+
+    skills_path = tmp_path / "skills"
+    skill_dir = _create_skill_dir(skills_path, "fable-generator")
+    (tmp_path / "kernel").mkdir()
+
+    patches = [
+        patch.object(skill_manager.settings, "skills_path", skills_path),
+        patch.object(skill_manager.settings, "managed_skills_path", skills_path),
+        patch.object(skill_manager.settings, "workspace_skills_path", tmp_path / "workspace-skills"),
+        patch.object(skill_manager.settings, "shared_skills_path", tmp_path / "shared-skills"),
+        patch.object(skill_manager.settings, "bundled_skills_path", tmp_path / "bundled-skills"),
+        patch.object(skill_manager.settings, "governance_path", tmp_path / "governance"),
+        patch.object(skill_manager.settings, "kernel_path", tmp_path / "kernel"),
+        patch.object(skill_governance.settings, "skills_path", skills_path),
+        patch.object(skill_governance.settings, "managed_skills_path", skills_path),
+        patch.object(skill_governance.settings, "workspace_skills_path", tmp_path / "workspace-skills"),
+        patch.object(skill_governance.settings, "shared_skills_path", tmp_path / "shared-skills"),
+        patch.object(skill_governance.settings, "bundled_skills_path", tmp_path / "bundled-skills"),
+        patch.object(skill_governance.settings, "governance_path", tmp_path / "governance"),
+        patch.object(skill_governance.settings, "kernel_path", tmp_path / "kernel"),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        root = skill_manager.get_execution_skill_dir("fable-generator", mode="sandbox")
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert root == skill_dir.resolve()
+    assert root.name == "fable-generator"
+    assert root != (tmp_path / "kernel").resolve()

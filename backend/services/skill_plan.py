@@ -32,6 +32,31 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "generic_script",
 })
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
+_CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
+    "kernel/references/best-practices.md",
+    "kernel/references/workflows.md",
+    "kernel/references/output-patterns.md",
+)
+
+
+def _is_skill_local_reference(path: str) -> bool:
+    return path.startswith(("references/", "assets/", "scripts/"))
+
+
+def _is_creator_internal_reference(path: str) -> bool:
+    return path.startswith("kernel/references/")
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in paths:
+        path = str(raw).strip().replace("\\", "/")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
 
 
 @dataclass(frozen=True)
@@ -449,7 +474,14 @@ def build_skill_plan_entry(
     inputs = explicit_inputs or default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
     outputs = explicit_outputs or default_outputs
-    dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or list(reference_files or [])
+    all_reference_files = _dedupe_paths(list(reference_files or []))
+    skill_local_references = [ref for ref in all_reference_files if _is_skill_local_reference(ref)]
+    creator_internal_references = [ref for ref in all_reference_files if _is_creator_internal_reference(ref)]
+    for ref in _CREATOR_INTERNAL_REFERENCE_PATHS:
+        if ref not in creator_internal_references:
+            creator_internal_references.append(ref)
+    explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
     required_capabilities = explicit_required_capabilities or default_required_capabilities
     if file_type == "script" and {"text_generation", "image_generation"}.issubset(set(required_capabilities)):
@@ -487,9 +519,12 @@ def build_skill_plan_entry(
         dependencies=dependencies,
         required_capabilities=required_capabilities,
         forbidden_capabilities=forbidden_capabilities,
-        reference_files=list(reference_files or []),
-        skill_local_references=[ref for ref in list(reference_files or []) if ref.startswith(("references/", "assets/", "scripts/"))],
-        creator_internal_references=["kernel/references/best-practices.md", "kernel/references/workflows.md", "kernel/references/output-patterns.md"],
+        # Public/final SKILL.md references are skill-local only.  Creator
+        # kernel references remain separate internal context and must never be
+        # merged into reference_files/skill_local_references.
+        reference_files=skill_local_references,
+        skill_local_references=skill_local_references,
+        creator_internal_references=creator_internal_references,
         language=language,
         runtime=runtime,
         entrypoint=file_path if file_type == "script" else "",

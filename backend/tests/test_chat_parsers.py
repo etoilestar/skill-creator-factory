@@ -2889,3 +2889,114 @@ def test_runtime_output_metadata_ignores_unrequested_export(tmp_path):
     stdout = json.dumps({"text": "story only", "image_paths": []})
 
     assert _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="story-skill") == []
+
+
+def test_creator_allows_skill_local_references_with_kernel_like_names():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- references/: `references/output-patterns.md`, `references/workflows.md`
+"""
+    skill_md = """---
+name: local-patterns
+description: uses local same-name references
+---
+# local-patterns
+
+读取 `references/output-patterns.md` 获取本业务 Skill 的输出模板。
+读取 `references/workflows.md` 获取本业务 Skill 的处理流程。
+"""
+
+    failed = {result.id: result for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.no_kernel_leak" not in failed
+    assert "skill_md.resource.local_declared" not in failed
+
+
+def test_creator_rejects_explicit_kernel_reference_path_with_matched_paths():
+    from backend.routers.creator import _check_skill_md_contract
+
+    skill_md = """---
+name: bad-kernel
+description: leaks explicit kernel path
+---
+# bad-kernel
+
+请读取 `kernel/references/output-patterns.md` 后再回答。
+"""
+
+    results = _check_skill_md_contract(skill_md, "")
+    leak = next(result for result in results if result.id == "skill_md.resource.no_kernel_leak")
+
+    assert not leak.passed
+    assert leak.matched_paths == ["kernel/references/output-patterns.md"]
+
+
+def test_creator_rejects_missing_bare_skill_local_reference_without_kernel_leak():
+    from backend.routers.creator import _check_skill_md_contract
+
+    skill_md = """---
+name: missing-local
+description: mentions missing local reference
+---
+# missing-local
+
+读取 `references/workflows.md` 中的业务流程说明。
+"""
+
+    results = _check_skill_md_contract(skill_md, "")
+    no_kernel = next(result for result in results if result.id == "skill_md.resource.no_kernel_leak")
+    local_exists = next(result for result in results if result.id == "skill_md.resource.local_declared")
+
+    assert no_kernel.passed
+    assert no_kernel.matched_paths == []
+    assert not local_exists.passed
+    assert local_exists.matched_paths == ["references/workflows.md"]
+
+
+def test_creator_rejects_large_kernel_reference_content_copy(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers.creator import _check_skill_md_contract
+
+    kernel_root = tmp_path / "kernel"
+    refs = kernel_root / "references"
+    refs.mkdir(parents=True)
+    copied = "\n".join(f"Creator-only workflow sentence number {i} with unique internal guidance." for i in range(80))
+    (refs / "workflows.md").write_text(copied, encoding="utf-8")
+    monkeypatch.setattr(settings, "kernel_path", kernel_root)
+    skill_md = f"""---
+name: copied-kernel
+description: copies internal kernel content
+---
+# copied-kernel
+
+{copied}
+"""
+
+    copy_check = next(
+        result
+        for result in _check_skill_md_contract(skill_md, "")
+        if result.id == "skill_md.resource.no_kernel_content_copy"
+    )
+
+    assert not copy_check.passed
+    assert copy_check.matched_paths == ["kernel/references/workflows.md"]
+
+
+def test_creator_validator_filters_model_invented_failed_checks():
+    from backend.routers.creator import _filter_validator_failed_checks
+
+    deterministic_failed = """- skill_md.frontmatter target=SKILL.md: frontmatter bad
+  expected: frontmatter
+  minimal_edit: add frontmatter
+"""
+    model_checks = [
+        {"id": "skill_md.frontmatter", "target": "SKILL.md"},
+        {"id": "skill_md.resource.no_kernel_leak", "target": "SKILL.md"},
+    ]
+
+    assert _filter_validator_failed_checks(model_checks, deterministic_failed) == [
+        {"id": "skill_md.frontmatter", "target": "SKILL.md"}
+    ]
+    assert _filter_validator_failed_checks(model_checks, "") == []

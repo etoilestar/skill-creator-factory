@@ -76,6 +76,25 @@ def _skill_root_for_name(skill_name: str) -> Path:
         raise ValueError(f"非法 skill_name: {skill_name}")
     return get_execution_skill_dir(skill_name, mode="sandbox").resolve()
 
+
+
+def _available_scripts_for_root(execution_root: Path | None) -> list[str]:
+    """Return real scripts under the current business Skill root only."""
+    if execution_root is None:
+        return []
+    root = execution_root.resolve()
+    scripts_dir = root / "scripts"
+    if not scripts_dir.is_dir() or not _is_within_sandbox(scripts_dir, root):
+        return []
+    scripts: list[str] = []
+    for entry in sorted(scripts_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        resolved = entry.resolve()
+        if _is_within_sandbox(resolved, root):
+            scripts.append(f"scripts/{entry.name}")
+    return scripts
+
 def _resolve_safe_path(raw_path: str, base_dir: Path | None = None) -> Path:
     """Resolve file paths and ensure they stay within allowed directories.
 
@@ -282,6 +301,7 @@ def _resource_catalog_for_planner(catalog: list[dict]) -> list[dict]:
     return [
         {
             "resource_handle": item["resource_handle"],
+            "display_path": item.get("path", ""),
             "kind": item["kind"],
             "title": item.get("title", ""),
             "allowed_actions": item.get("allowed_actions", []),
@@ -293,16 +313,54 @@ def _resource_catalog_for_planner(catalog: list[dict]) -> list[dict]:
 def _resource_catalog_by_handle(catalog: list[dict]) -> dict[str, dict]:
     return {str(item["resource_handle"]): item for item in catalog}
 
+
+def _resolve_resource_handle_alias(value: str, resource_catalog: list[dict]) -> tuple[str | None, dict | None, bool]:
+    """Resolve real resource handles and path-like pseudo handles deterministically.
+
+    Returns (canonical_handle, catalog_item, was_alias).  The resolver accepts
+    model mistakes such as ``resource:story_templates.md`` only when they map
+    uniquely to a catalog path/basename.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None, None, False
+    by_handle = _resource_catalog_by_handle(resource_catalog)
+    if raw in by_handle:
+        return raw, by_handle[raw], False
+
+    alias = raw.replace("\\", "/").strip().strip("`'\"").lstrip("./")
+    if alias.startswith("resource:"):
+        suffix = alias.split(":", 1)[1].strip().lstrip("./")
+        # resource:0 is a real handle shape; if it was not found above, do not
+        # reinterpret it as a path-like alias.
+        if suffix.isdigit():
+            return None, None, False
+        alias = suffix
+
+    if not alias:
+        return None, None, False
+    candidates: list[dict] = []
+    for item in resource_catalog:
+        path = _normalize_skill_resource_path(str(item.get("path") or ""))
+        basename = Path(path).name
+        if alias == path or alias == basename or alias.endswith("/" + basename):
+            candidates.append(item)
+    if len(candidates) != 1:
+        return None, None, False
+    item = candidates[0]
+    handle = str(item.get("resource_handle") or "")
+    return (handle, item, True) if handle else (None, None, False)
+
 def _compose_resource_selection_prompt() -> str:
     return (
         "你是 Skill 资源按需加载选择器。\n\n"
         "你会看到 Loaded SKILL.md、resource_catalog 和用户请求。"
         "你的任务是判断当前阶段是否需要读取 references/assets/scripts 中的资源正文。\n\n"
         "重要规则：\n"
-        "1. 只能从 resource_catalog 中选择 resource_handle。\n"
-        "2. 禁止生成、拼接、改写资源 path。\n"
-        "3. references 通常用于方法论、规范、示例，creator 生成 Skill 文件前应优先考虑。\n"
-        "4. scripts 在 creator 阶段可以读取源码作为实现参考，但不要执行。\n"
+        "1. 只能从 resource_catalog 中选择真实存在的 resource_handle，例如 resource:0。\n"
+        "2. 禁止生成、拼接、改写资源 path；禁止输出 resource:<filename> 或 resource:<path> 这种伪 handle。\n"
+        "3. display_path 只帮助你理解 resource:0 对应哪个文件，action 中仍只能输出 resource_handle。\n"
+        "4. references 通常用于方法论、规范、示例；scripts 默认用于执行，不要读取源码，除非用户明确要求查看脚本内容。\n"
         "5. assets 在需要模板或配置时读取。\n"
         "6. 如果 SKILL.md body 已经足够完成任务，可以不读取资源。\n"
         "7. 最多选择 5 个资源，避免一次加载过多。\n"
@@ -343,7 +401,6 @@ def _parse_resource_selection_decision(
     else:
         need_resources = bool(need_resources)
 
-    resource_by_handle = _resource_catalog_by_handle(resource_catalog)
     raw_handles = data.get("resource_handles", [])
 
     if not isinstance(raw_handles, list):
@@ -354,10 +411,11 @@ def _parse_resource_selection_decision(
         handle = str(item or "").strip()
         if not handle:
             continue
-        if handle not in resource_by_handle:
+        canonical, _resource, _was_alias = _resolve_resource_handle_alias(handle, resource_catalog)
+        if not canonical:
             continue
-        if handle not in selected:
-            selected.append(handle)
+        if canonical not in selected:
+            selected.append(canonical)
         if len(selected) >= 5:
             break
 
@@ -793,10 +851,10 @@ _HOST_COMMAND_INSTRUCTION_RE = re.compile(
 
 _SKILL_LOCAL_RESOURCE_RE = re.compile(r"(?<![\w./-])(?P<path>(?:scripts|references|assets)/[A-Za-z0-9_./-]+)")
 _ACTION_SCHEMA_FIELD_RE = re.compile(r"(?:{field})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
-_ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|generic_script)", re.I)
+_ACTION_SCHEMA_ROLE_RE = re.compile(r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|html_asset_builder|asset_builder|generic_script)", re.I)
 _RUNTIME_PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*)\s*}}")
-_SCRIPT_ROLES = {"text_generator", "image_generator", "pdf_builder", "generic_script"}
-_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation"}
+_SCRIPT_ROLES = {"text_generator", "image_generator", "pdf_builder", "composite_generator", "html_asset_builder", "asset_builder", "generic_script"}
+_HIGH_IMPACT_CAPABILITIES = {"image_generation", "pdf_generation", "html_generation"}
 
 
 def _extract_script_path_from_command(command: str) -> str | None:
@@ -931,13 +989,13 @@ def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], li
             })
         if role == "generic_script" and set(entry.get("required_capabilities") or []) & _HIGH_IMPACT_CAPABILITIES:
             errors.append({
-                "error": "generic_script 不允许声明高风险能力，必须显式声明 image_generator 或 pdf_builder role",
+                "error": "generic_script 不允许声明高风险能力，必须显式声明 image_generator、pdf_builder、html_asset_builder 或 composite_generator role",
                 "script_path": entry.get("script_path"),
                 "required_capabilities": entry.get("required_capabilities"),
             })
         if role == "generic_script":
             warnings.append({
-                "warning": "低置信度/未显式 role 的 generic_script runtime fallback；不会自动启用图片/PDF能力",
+                "warning": "低置信度/未显式 role 的 generic_script runtime fallback；不会自动启用图片/PDF/HTML 等高风险能力",
                 "script_path": entry.get("script_path"),
                 "source_path": entry.get("source_path"),
             })
@@ -1018,6 +1076,16 @@ def _validate_runtime_command_against_action_schema(command: str, *, execution_r
     return entry
 
 
+
+def _payload_has_file_field(payload: dict, *keys: str) -> bool:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, list) and any(isinstance(item, str) and item.strip() for item in value):
+            return True
+    return False
+
 def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> None:
     if not entry:
         _validate_success_stdout_json_if_structured(stdout)
@@ -1028,13 +1096,24 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder"}:
+        if str(entry.get("role")) in {"text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder"}:
             raise ValueError("角色脚本 stdout 必须是 JSON object")
         return
     if not isinstance(payload, dict):
         raise ValueError("角色脚本 stdout 必须是 JSON object")
     _validate_structured_stdout_payload(payload)
     role = str(entry.get("role") or "generic_script")
+    required_capabilities = set(entry.get("required_capabilities") or [])
+    outputs = set(entry.get("outputs") or [])
+    if role == "composite_generator":
+        if ("text_generation" in required_capabilities or "text" in outputs) and not str(payload.get("text") or payload.get("markdown") or "").strip():
+            raise ValueError("composite_generator stdout JSON 缺少声明的 text/markdown 输出")
+        if ("image_generation" in required_capabilities or {"image_path", "image_paths", "images"} & outputs) and not _payload_image_paths(payload):
+            raise ValueError("composite_generator stdout JSON 缺少声明的 image_path/image_paths/images 输出")
+        if ("pdf_generation" in required_capabilities or {"pdf_path", "file_paths"} & outputs) and not _payload_has_file_field(payload, "pdf_path", "file_paths"):
+            raise ValueError("composite_generator stdout JSON 缺少声明的 pdf_path/file_paths 输出")
+        if ("html_generation" in required_capabilities or {"html_path", "asset_paths"} & outputs) and not _payload_has_file_field(payload, "html_path", "asset_paths"):
+            raise ValueError("composite_generator stdout JSON 缺少声明的 html_path/asset_paths 输出")
     if role == "text_generator" and not str(payload.get("text") or payload.get("markdown") or "").strip():
         raise ValueError("text_generator stdout JSON 必须包含非空 text/markdown")
     if role == "image_generator" and not _payload_image_paths(payload):
@@ -1046,6 +1125,13 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
         has_file = has_file or (isinstance(file_paths, list) and any(isinstance(p, str) and p.strip() for p in file_paths))
         if not has_file:
             raise ValueError("pdf_builder stdout JSON 必须包含 pdf_path 或 file_paths")
+    if role in {"html_asset_builder", "asset_builder"}:
+        html_path = payload.get("html_path")
+        asset_paths = payload.get("asset_paths")
+        has_html = isinstance(html_path, str) and html_path.strip()
+        has_html = has_html or (isinstance(asset_paths, list) and any(isinstance(p, str) and p.strip() for p in asset_paths))
+        if not has_html:
+            raise ValueError("html_asset_builder stdout JSON 必须包含 html_path 或 asset_paths")
 
 
 
@@ -1249,6 +1335,7 @@ def _normalize_skill_runtime_plan(
     command_contract: dict | None = None,
     loaded_paths: list[str] | None = None,
     failed_paths: list[dict] | None = None,
+    available_scripts: list[str] | None = None,
 ) -> dict:
     """Normalize planner JSON into executor-compatible plan.
 
@@ -1269,6 +1356,9 @@ def _normalize_skill_runtime_plan(
         failed_path = _normalize_skill_resource_path(str(item.get("path") or ""))
         if failed_path:
             failed_by_path[failed_path] = item
+    available_script_set = {_normalize_skill_resource_path(path) for path in (available_scripts or [])}
+    command_entries = (((command_contract or {}).get("action_schema") or {}).get("entries") or [])
+    command_script_set = {_normalize_skill_resource_path(str(entry.get("script_path") or "")) for entry in command_entries if isinstance(entry, dict)}
 
     mode = str(plan.get("mode") or "").strip()
     if mode not in {"execute", "direct_answer", "ask_user", "not_applicable"}:
@@ -1296,9 +1386,31 @@ def _normalize_skill_runtime_plan(
         normalized_item = dict(missing_item)
         rel_path = _normalize_skill_resource_path(str(normalized_item.get("path") or ""))
         resource_handle = str(normalized_item.get("resource_handle") or "").strip()
-        if not rel_path and resource_handle and resource_handle in resource_by_handle:
-            rel_path = _normalize_skill_resource_path(str(resource_by_handle[resource_handle].get("path") or ""))
-            normalized_item["path"] = rel_path
+        if resource_handle:
+            canonical_handle, resolved_resource, was_alias = _resolve_resource_handle_alias(resource_handle, resource_catalog or [])
+            if canonical_handle and resolved_resource:
+                if was_alias:
+                    planner_inconsistent.append({
+                        "missing_type": "planner_inconsistent",
+                        "resource_handle": resource_handle,
+                        "resolved_resource_handle": canonical_handle,
+                        "path": _normalize_skill_resource_path(str(resolved_resource.get("path") or "")),
+                        "reason": "planner used a path-like pseudo resource_handle; backend resolved it from resource_catalog",
+                    })
+                resource_handle = canonical_handle
+                normalized_item["resource_handle"] = canonical_handle
+                if not rel_path:
+                    rel_path = _normalize_skill_resource_path(str(resolved_resource.get("path") or ""))
+                    normalized_item["path"] = rel_path
+
+        if rel_path in available_script_set:
+            planner_inconsistent.append({
+                "missing_type": "planner_inconsistent",
+                "resource_handle": resource_handle,
+                "path": rel_path,
+                "reason": "planner reported a script as missing, but backend available_scripts shows it exists",
+            })
+            continue
 
         if rel_path in loaded_path_set:
             planner_inconsistent.append({
@@ -1308,6 +1420,10 @@ def _normalize_skill_runtime_plan(
                 "reason": "planner reported an already loaded resource as missing",
             })
             continue
+
+        if rel_path.startswith("scripts/") and rel_path not in command_script_set and (command_contract or {}).get("has_executable_command_block") is False:
+            normalized_item["missing_type"] = "command_block_missing"
+            normalized_item["reason"] = normalized_item.get("reason") or "script exists/mentioned but SKILL.md/references has no executable command block"
 
         if rel_path in failed_by_path:
             failed = failed_by_path[rel_path]
@@ -1344,8 +1460,8 @@ def _normalize_skill_runtime_plan(
                 errors.append({"error": "read_resource 缺少 resource_handle", "action_item": action_item})
                 continue
 
-            resource = resource_by_handle.get(resource_handle)
-            if not resource:
+            canonical_handle, resource, was_alias = _resolve_resource_handle_alias(resource_handle, resource_catalog or [])
+            if not resource or not canonical_handle:
                 errors.append({
                     "error": "read_resource 使用了不存在的 resource_handle",
                     "resource_handle": resource_handle,
@@ -1353,6 +1469,15 @@ def _normalize_skill_runtime_plan(
                     "available_resource_handles": sorted(resource_by_handle.keys()),
                 })
                 continue
+            if was_alias:
+                planner_inconsistent.append({
+                    "missing_type": "planner_inconsistent",
+                    "resource_handle": resource_handle,
+                    "resolved_resource_handle": canonical_handle,
+                    "path": _normalize_skill_resource_path(str(resource.get("path") or "")),
+                    "reason": "planner used a path-like pseudo resource_handle; backend resolved it from resource_catalog",
+                })
+                resource_handle = canonical_handle
 
             rel_path = _normalize_skill_resource_path(str(resource.get("path") or ""))
             if rel_path in failed_by_path:
@@ -1400,6 +1525,9 @@ def _normalize_skill_runtime_plan(
     if mode == "execute" and not normalized_actions and errors:
         mode = "ask_user"
 
+    if mode == "ask_user" and planner_inconsistent and not missing and not errors:
+        mode = "direct_answer"
+
     final_instruction = str(plan.get("final_instruction") or "").strip()
     if (
         mode == "direct_answer"
@@ -1444,19 +1572,14 @@ async def _run_skill_runtime_planner_round(
     planner_body_prompt = _strip_runtime_resource_manifest(body_prompt)
     command_contract = _extract_skill_command_contract(planner_body_prompt, execution_root=execution_root)
 
-    # 扫描磁盘上真实存在的脚本文件，注入给 planner 以便直接规划 run_command
-    available_scripts: list[str] = []
-    if execution_root is not None:
-        execution_root_resolved = execution_root.resolve()
-        scripts_dir = execution_root_resolved / "scripts"
-        if scripts_dir.is_dir() and _is_within_sandbox(scripts_dir, execution_root_resolved):
-            available_scripts = sorted(
-                "scripts/" + entry.name
-                for entry in scripts_dir.iterdir()
-                if entry.is_file()
-                # Reject symlinks that escape the skill sandbox
-                and _is_within_sandbox(entry, execution_root_resolved)
-            )
+    # Deterministically scan only the current business Skill root. Never scan kernel.
+    available_scripts = _available_scripts_for_root(execution_root)
+    logger.info(
+        "sandbox runtime planner context skill_name=%s execution_root=%s available_scripts=%s",
+        skill_name,
+        str(execution_root.resolve()) if execution_root else "",
+        available_scripts,
+    )
 
     planner_payload = {
         "loaded_skill_prompt": planner_body_prompt,
@@ -1541,6 +1664,7 @@ async def _run_skill_runtime_planner_round(
             command_contract=command_contract,
             loaded_paths=loaded_paths,
             failed_paths=failed_paths,
+            available_scripts=available_scripts,
         )
     )
 
@@ -2075,6 +2199,87 @@ def _safe_command_argv(command: str, *, base_dir: Path | None = None) -> list[st
 
     return argv
 
+
+
+def _stdout_json_payload(stdout: str) -> dict | None:
+    try:
+        payload = json.loads((stdout or "").strip())
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _validate_html_asset_outputs_in_generated_dir(stdout: str, *, cwd: Path | None) -> None:
+    payload = _stdout_json_payload(stdout)
+    if payload is None or cwd is None:
+        raise ValueError("html_asset_builder stdout 必须是 JSON object，并包含 html_path 或 asset_paths")
+    declared = []
+    for key in ("html_path", "asset_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            declared.append(value.strip())
+    for key in ("asset_paths", "html_paths"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            declared.extend(item.strip() for item in value if isinstance(item, str) and item.strip())
+    if not declared:
+        raise ValueError("html_asset_builder stdout JSON 必须包含 html_path 或 asset_paths")
+    root = cwd.resolve()
+    generated_root = (root / "assets" / "generated").resolve()
+    for raw in declared:
+        candidate = Path(raw)
+        normalized_raw = raw.replace("\\", "/")
+        if not candidate.is_absolute():
+            candidate = (root / candidate).resolve() if normalized_raw.startswith("assets/") else (root / "scripts" / candidate).resolve()
+        try:
+            candidate.relative_to(generated_root)
+        except ValueError as exc:
+            raise ValueError("html_asset_builder 输出路径必须位于当前 Skill 的 assets/generated/ 下") from exc
+        if not candidate.is_file():
+            raise ValueError(f"html_asset_builder 声明的输出文件不存在: {raw}")
+
+def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name: str) -> list[dict]:
+    """Extract generated artifact paths declared by script stdout JSON."""
+    if cwd is None or not skill_name or not (stdout or "").strip():
+        return []
+    try:
+        payload = json.loads(stdout.strip())
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw_paths: list[str] = []
+    for key in ("html_path", "asset_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            raw_paths.append(value.strip())
+    for key in ("asset_paths", "html_paths"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            raw_paths.extend(item.strip() for item in value if isinstance(item, str) and item.strip())
+    root = cwd.resolve()
+    generated_root = (root / "assets" / "generated").resolve()
+    output_files: list[dict] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        candidate = Path(raw)
+        normalized_raw = raw.replace("\\", "/")
+        if not candidate.is_absolute():
+            if normalized_raw.startswith("assets/"):
+                candidate = (root / candidate).resolve()
+            else:
+                candidate = (root / "scripts" / candidate).resolve()
+        try:
+            candidate.relative_to(generated_root)
+            rel = candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if rel in seen or not candidate.is_file():
+            continue
+        seen.add(rel)
+        output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
+    return output_files
+
 def _execute_single_task(
     task: dict,
     blocks: "list[MarkdownBlock]",
@@ -2347,6 +2552,8 @@ def _execute_single_task(
         success = completed.returncode == 0
         if success:
             _validate_stdout_against_action_entry(completed.stdout, action_entry)
+            if action_entry and str(action_entry.get("role") or "") in {"html_asset_builder", "asset_builder"}:
+                _validate_html_asset_outputs_in_generated_dir(completed.stdout, cwd=cwd)
 
         result: dict = {
             "action": action,
@@ -2372,6 +2579,11 @@ def _execute_single_task(
                     }
                     for f in new_files
                 ]
+            declared_output_files = _output_files_from_stdout_json(completed.stdout, cwd=cwd, skill_name=effective_skill_name)
+            if declared_output_files:
+                by_path = {item["path"]: item for item in result.get("output_files") or []}
+                by_path.update({item["path"]: item for item in declared_output_files})
+                result["output_files"] = list(by_path.values())
 
         return result, touched
 
@@ -2570,6 +2782,17 @@ def _validate_structured_stdout_payload(payload: dict) -> None:
                 raise ValueError("stdout JSON 字段 images 的每一项都必须是 object")
             if "image_path" in image and not isinstance(image.get("image_path"), str):
                 raise ValueError("stdout JSON 字段 images[].image_path 必须是字符串")
+
+    if "html_path" in payload and not isinstance(payload.get("html_path"), str):
+        raise ValueError("stdout JSON 字段 html_path 必须是字符串")
+
+    if "asset_paths" in payload:
+        asset_paths = payload.get("asset_paths")
+        if not isinstance(asset_paths, list):
+            raise ValueError("stdout JSON 字段 asset_paths 必须是 list[str]")
+        for path in asset_paths:
+            if not isinstance(path, str):
+                raise ValueError("stdout JSON 字段 asset_paths 的每一项都必须是字符串")
 
 
 def _validate_success_stdout_json_if_structured(stdout: str) -> None:

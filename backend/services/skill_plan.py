@@ -16,7 +16,7 @@ from typing import Literal
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "composite_generator", "generic_script"]
+ScriptRole = Literal["text_generator", "image_generator", "pdf_builder", "html_asset_builder", "asset_builder", "composite_generator", "generic_script"]
 ResourceRole = Literal["skill_overview", "reference", "asset"]
 FileRole = ScriptRole | ResourceRole
 
@@ -24,6 +24,8 @@ SCRIPT_ROLES: frozenset[str] = frozenset({
     "text_generator",
     "image_generator",
     "pdf_builder",
+    "html_asset_builder",
+    "asset_builder",
     "composite_generator",
     "generic_script",
 })
@@ -162,7 +164,7 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|composite_generator|generic_script)",
+    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|pdf_builder|html_asset_builder|asset_builder|composite_generator|generic_script)",
     re.I,
 )
 
@@ -206,6 +208,7 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
     if not match:
         return None
     raw = match.group(1)
+    raw = re.split(r"\s+(?:role|inputs|outputs|dependencies|required_capabilities|forbidden_capabilities|language|runtime)\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
     cleaned: list[str] = []
     for item in values:
@@ -378,6 +381,8 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["topic", "prompt", "text"], ["text", "image_paths", "images", "text_with_image_prompts"]
     if role == "pdf_builder":
         return ["text", "image_paths", "template_path"], ["pdf_path", "file_paths"]
+    if role in {"html_asset_builder", "asset_builder"}:
+        return ["topic", "text", "html"], ["html_path", "asset_paths"]
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
@@ -396,6 +401,8 @@ def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
         return ["text_generation", "image_generation"], ["pdf_generation"]
     if role == "pdf_builder":
         return ["pdf_generation", "file_output"], ["image_generation"]
+    if role in {"html_asset_builder", "asset_builder"}:
+        return ["html_generation", "file_output"], ["image_generation", "pdf_generation"]
     if role == "reference":
         return ["reference_guidance"], ["runtime_execution", "image_generation"]
     if role == "asset":
@@ -419,16 +426,33 @@ def build_skill_plan_entry(
         purpose=purpose,
         blueprint_summary=blueprint_summary,
     )
-    default_inputs, default_outputs = default_io_for_role(classification.role)
-    inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_inputs
-    inputs = _augment_inputs_for_role(classification.role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-    outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_outputs
+    file_type = file_type_for_path(file_path)
+    explicit_required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    role = classification.role
+    role_reason = classification.reason
+    if file_type == "script" and explicit_required_capabilities and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities)):
+        role = "composite_generator"
+        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
+    explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    default_inputs, default_outputs = default_io_for_role(role)
+    inputs = explicit_inputs or default_inputs
+    inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
+    outputs = explicit_outputs or default_outputs
     dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or list(reference_files or [])
-    default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(classification.role)
-    required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_required_capabilities
+    default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
+    required_capabilities = explicit_required_capabilities or default_required_capabilities
+    if file_type == "script" and {"text_generation", "image_generation"}.issubset(set(required_capabilities)):
+        role = "composite_generator"
+        default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
+        if not explicit_required_capabilities:
+            required_capabilities = default_required_capabilities
+        inputs = explicit_inputs or default_io_for_role(role)[0]
+        inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
+        outputs = explicit_outputs or default_io_for_role(role)[1]
+        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
     forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
-    file_type = file_type_for_path(file_path)
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
@@ -438,7 +462,7 @@ def build_skill_plan_entry(
     return SkillPlanEntry(
         path=file_path,
         file_type=file_type,
-        role=classification.role,
+        role=role,
         purpose=purpose,
         inputs=inputs,
         outputs=outputs,
@@ -455,7 +479,7 @@ def build_skill_plan_entry(
         required=required,
         can_skip=can_skip,
         confidence=classification.confidence,
-        reason=classification.reason,
+        reason=role_reason,
         heuristic_signals=classification.heuristic_signals,
     )
 

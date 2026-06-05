@@ -142,3 +142,38 @@ python scripts/run.py '{"topic":"{{topic}}"}'
     schema = _build_runtime_action_schema(skill_md, execution_root=skill_dir)
 
     assert any("assets/config.json" in item.get("asset_path", "") for item in schema["errors"])
+
+
+def test_composite_generator_stdout_validates_required_capability_outputs():
+    from backend.routers.sandbox_chat import _validate_stdout_against_action_entry
+
+    entry = {
+        "role": "composite_generator",
+        "required_capabilities": ["text_generation", "image_generation"],
+        "outputs": ["text", "image_paths"],
+    }
+
+    with pytest.raises(ValueError, match="image_path"):
+        _validate_stdout_against_action_entry(json.dumps({"text": "story"}), entry)
+
+    _validate_stdout_against_action_entry(json.dumps({"text": "story", "image_paths": ["assets/generated/a.png"]}), entry)
+
+
+def test_generic_script_high_impact_capability_error_mentions_explicit_roles():
+    from backend.routers.sandbox_chat import _build_runtime_action_schema
+
+    skill_md = """---
+name: schema-skill
+description: demo
+---
+role: generic_script
+inputs: topic
+outputs: html_path
+required_capabilities: html_generation
+```bash
+python scripts/build.py '{"topic":"{{topic}}"}'
+```
+"""
+    schema = _build_runtime_action_schema(skill_md)
+
+    assert any("html_asset_builder" in item.get("error", "") for item in schema["errors"])

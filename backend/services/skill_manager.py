@@ -338,8 +338,15 @@ def delete_asset(skill_name: str, folder: str, filename: str) -> None:
 def get_execution_skill_dir(skill_name: str, *, mode: str = "sandbox") -> Path:
     try:
         record = resolve_skill_record(skill_name, mode=mode, require_visible=True, require_executable=True)
+        root = Path(record["root_path"]).resolve()
+        kernel_root = settings.kernel_path.resolve()
+        allowed_roots = [root_path.resolve() for root_path in (settings.skills_path, settings.workspace_skills_path, settings.shared_skills_path, settings.bundled_skills_path)]
+        if root == kernel_root or root.name != skill_name or not (root / "SKILL.md").is_file():
+            raise FileNotFoundError(f"Skill '{skill_name}' execution root is invalid: {root}")
+        if not any(root == allowed or root.is_relative_to(allowed) for allowed in allowed_roots):
+            raise FileNotFoundError(f"Skill '{skill_name}' execution root is outside allowed skill roots: {root}")
         log_access_decision(skill_name, record["scope"], mode=mode, action="execute", allowed=True)
-        return Path(record["root_path"])
+        return root
     except PermissionError as exc:
         try:
             record = resolve_skill_record(skill_name, mode=mode, require_visible=False, require_executable=False)

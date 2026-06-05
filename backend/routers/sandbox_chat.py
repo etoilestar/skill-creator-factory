@@ -36,7 +36,10 @@ from ..services.skill_manager import get_execution_skill_dir
 from ..services.skill_dataflow import (
     LoopExpansionError,
     MissingVariablesError,
+    apply_dataflow_collections,
     collect_loop_outputs,
+    context_from_dataflow_plan,
+    deterministic_dataflow_plan_from_schema,
     expand_step_contexts,
     extract_inline_context_values,
     extract_placeholders,
@@ -48,6 +51,8 @@ from ..services.skill_dataflow import (
     parse_schema_input_item,
     placeholder_pattern,
     replace_placeholders_in_value,
+    materialize_step_contexts_from_plan,
+    validate_workflow_dataflow_plan,
 )
 from ..services.artifact_validator import FileOutputValidationError, declared_artifact_paths, validate_stdout_file_outputs
 from .chat_utils import (
@@ -985,10 +990,12 @@ def _extract_action_schemas_from_text(text: str, *, source_path: str) -> list[di
         forbidden_capabilities = _parse_schema_list_field(context, "forbidden_capabilities")
         command_keys = _command_json_argv_keys(command, script_path)
         placeholder_keys = set(_RUNTIME_PLACEHOLDER_RE.findall(command))
+        local_description = re.sub(r"\s+", " ", context.strip())[:1200]
         schemas.append({
             "script_path": script_path,
             "command": command,
             "source_path": source_path,
+            "local_description": local_description,
             "role": role,
             "inputs": inputs,
             "optional_inputs": optional_inputs,
@@ -2576,7 +2583,203 @@ def _workflow_output_summary(results: list[dict], output_files: list[dict]) -> s
     return "\n".join(lines)
 
 
+def _workflow_dataflow_planner_prompt() -> str:
+    return (
+        "你是 workflow dataflow planner，只负责在执行前梳理变量流转，不执行脚本。\n"
+        "输入包括用户请求、SKILL.md、Action schema、可用脚本。\n"
+        "必须只输出 JSON object，不要 Markdown。\n"
+        "输出格式：{\"initial_context\":{},\"steps\":[{\"script_path\":\"scripts/x.py\",\"input_mapping\":{},\"loop\":null,\"output_policy\":\"merge_stdout\"}],\"collections\":[],\"missing\":[],\"errors\":[]}。\n"
+        "规则：1) initial_context 合并用户明确输入与 schema 默认值；用户输入覆盖默认值。\n"
+        "2) steps 必须与 Action schema entries 顺序和 script_path 完全一致。\n"
+        "3) input_mapping 的每个 command placeholder 都必须有来源，可写成 {{变量}}、{{loop_item.field}} 或 {\"source\":\"context\",\"path\":\"变量\"}。\n"
+        "4) 如果步骤遍历列表，loop 写 {\"collection\":\"上游列表变量\",\"item_name\":\"loop_item\"}；不循环为 null。\n"
+        "5) 循环输出需要聚合给后续步骤时，在 collections 声明 target/source；不要伪造脚本输出。\n"
+        "6) 无法从用户、默认值、前序 stdout 或循环 item 解决时，填 missing/errors，后端会拒绝执行。\n"
+        "7) 不要输出 bash，不要宣称执行成功。"
+    )
+
+
+async def _plan_workflow_dataflow_with_model(
+    *,
+    execution_root: Path,
+    action_schema: dict,
+    user_context: dict,
+    request: ChatRequest | None = None,
+    skill_name: str = "",
+    model: str | None = None,
+) -> dict:
+    """Ask the planner model to build a structured dataflow plan for workflow execution."""
+    entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
+    req = request or ChatRequest(messages=[])
+    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
+    skill_md = ""
+    skill_path = execution_root / "SKILL.md"
+    if skill_path.is_file():
+        skill_md = skill_path.read_text(encoding="utf-8", errors="replace")[: settings.skill_resource_max_chars]
+    messages = [
+        {"role": "system", "content": _workflow_dataflow_planner_prompt()},
+        {"role": "user", "content": "## 用户请求\n" + user_text},
+        {"role": "user", "content": "## 已知用户上下文\n" + json.dumps(user_context or {}, ensure_ascii=False)},
+        {"role": "user", "content": "## SKILL.md\n" + skill_md},
+        {"role": "user", "content": "## Action schema\n" + json.dumps(action_schema, ensure_ascii=False)},
+        {"role": "user", "content": "## 可用脚本\n" + json.dumps(_available_scripts_for_root(execution_root), ensure_ascii=False)},
+        {"role": "user", "content": "请只输出 workflow dataflow plan JSON。"},
+    ]
+    planner_model = _planner_model_name(model or getattr(req, "model", None))
+    try:
+        planner_text = await complete_chat_once(messages, planner_model)
+        raw_plan = json.loads(_strip_markdown_json_fence(planner_text))
+    except Exception as exc:
+        logger.warning("workflow dataflow planner unavailable/invalid, using schema-derived fallback: %s", exc)
+        raw_plan = deterministic_dataflow_plan_from_schema(entries, user_text=user_text, user_context=user_context or {})
+    return _validate_workflow_dataflow_plan(raw_plan, entries)
+
+
+def _validate_workflow_dataflow_plan(plan: dict, action_schema: dict | list[dict]) -> dict:
+    if isinstance(action_schema, dict):
+        entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
+    else:
+        entries = [entry for entry in action_schema if isinstance(entry, dict)]
+    return validate_workflow_dataflow_plan(plan, entries)
+
+
+async def _execute_workflow_from_dataflow_plan(
+    *,
+    execution_root: Path,
+    action_schema: dict,
+    dataflow_plan: dict,
+    user_context: dict,
+    request: ChatRequest | None = None,
+    skill_name: str = "",
+) -> dict:
+    """Execute workflow strictly from a validated dataflow plan."""
+    entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
+    entries = [
+        entry for entry in entries
+        if _normalize_skill_resource_path(str(entry.get("script_path") or "")).startswith("scripts/")
+    ]
+    if not entries:
+        raise ValueError("execute_workflow 需要至少一个 scripts/* Action schema entry")
+
+    plan = validate_workflow_dataflow_plan(dataflow_plan, entries)
+    root = execution_root.resolve()
+    available_scripts = set(_available_scripts_for_root(root))
+    req = request or ChatRequest(messages=[])
+    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
+    context = context_from_dataflow_plan(plan, entries, user_text=user_text, user_context=user_context or {})
+    session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
+    results: list[dict] = []
+    touched: list[Path] = []
+    output_files: list[dict] = []
+    step_plans = plan.get("steps") or []
+
+    for entry_index, (entry, step_plan) in enumerate(zip(entries, step_plans, strict=False)):
+        script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
+        if script_path not in available_scripts:
+            raise ValueError(f"workflow_mismatch: {script_path} 不在 available_scripts 中：{sorted(available_scripts)}")
+        command_template = str(entry.get("command") or "").strip()
+        if not command_template:
+            raise ValueError(f"workflow_mismatch: {script_path} 缺少 command template")
+        try:
+            step_contexts = materialize_step_contexts_from_plan(step_plan, entry, context)
+        except LoopExpansionError as exc:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
+            raise ValueError(f"循环变量无法展开：{script_path} 需要 {needed}，但 dataflow plan 指定的集合不可用。") from exc
+        except MissingVariablesError as exc:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
+            if entry_index == 0:
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，dataflow plan 未能从用户输入或默认值提供。") from exc
+            raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，dataflow plan 引用的前序输出不存在。") from exc
+        step_payloads: list[dict] = []
+        for step_context in step_contexts:
+            try:
+                command = render_command_template(command_template, step_context)
+            except ValueError as exc:
+                missing = getattr(exc, "missing", None) or (entry.get("placeholder_keys") or [])
+                needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
+                if entry_index == 0:
+                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，dataflow plan 未提供可渲染变量。{exc}") from exc
+                raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，dataflow plan 未提供可渲染变量。{exc}") from exc
+            result, task_touched = await asyncio.to_thread(
+                functools.partial(
+                    _execute_single_task,
+                    {"action": "run_command", "command": command, "reason": "execute_workflow dataflow plan step"},
+                    [],
+                    req,
+                    execution_root=root,
+                    inferred_skill_root=root,
+                    skill_name=skill_name or root.name,
+                    session_input_dir=session_input_dir,
+                )
+            )
+            results.append(result)
+            touched.extend(task_touched)
+            output_files.extend(result.get("output_files") or [])
+            if not result.get("success", True):
+                raise ValueError(f"workflow_step_failed: {script_path} returncode={result.get('returncode')} stderr={(result.get('stderr') or '').strip()}")
+            try:
+                payload = parse_stdout_context(str(result.get("stdout") or ""))
+            except ValueError as exc:
+                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout 必须是 JSON object。{exc}") from exc
+            step_payloads.append(payload)
+            merge_step_output(context, script_path, payload)
+        if len(step_contexts) > 1:
+            merge_step_output(context, script_path, collect_loop_outputs(step_payloads, entry))
+        apply_dataflow_collections(plan.get("collections") or [], context, step_payloads)
+
+    dedup_output_files: list[dict] = []
+    seen_outputs: set[str] = set()
+    for item in output_files:
+        path = str(item.get("path") or "")
+        if not path or path in seen_outputs:
+            continue
+        candidate = (root / path).resolve()
+        if not _is_within_sandbox(candidate, root) or not candidate.is_file():
+            raise ValueError(f"workflow_output_missing: 最终输出文件不存在或越界: {path}")
+        seen_outputs.add(path)
+        dedup_output_files.append(item)
+
+    return {
+        "executed": True,
+        "reason": "已根据模型 dataflow plan 确定性执行 workflow。",
+        "dataflow_plan": plan,
+        "results": results,
+        "context": context,
+        "output_files": dedup_output_files,
+        "touched_paths": [str(path) for path in touched],
+        "logs": [_workflow_output_summary(results, dedup_output_files)],
+    }
+
+
 async def _execute_skill_workflow(
+    *,
+    execution_root: Path,
+    action_schema: dict,
+    user_context: dict,
+    request: ChatRequest | None = None,
+    skill_name: str = "",
+    dataflow_plan: dict | None = None,
+) -> dict:
+    """Plan workflow dataflow first, then execute scripts deterministically."""
+    if dataflow_plan is None:
+        dataflow_plan = await _plan_workflow_dataflow_with_model(
+            execution_root=execution_root,
+            action_schema=action_schema,
+            user_context=user_context,
+            request=request,
+            skill_name=skill_name,
+        )
+    return await _execute_workflow_from_dataflow_plan(
+        execution_root=execution_root,
+        action_schema=action_schema,
+        dataflow_plan=dataflow_plan,
+        user_context=user_context,
+        request=request,
+        skill_name=skill_name,
+    )
+
+
+async def _execute_skill_workflow_legacy(
     *,
     execution_root: Path,
     action_schema: dict,

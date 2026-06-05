@@ -689,3 +689,130 @@ def test_execute_skill_workflow_reports_initial_input_parse_failure(tmp_path):
             request=ChatRequest(messages=[Message(role="user", content=request_text)]),
             skill_name="initial-context-skill",
         ))
+
+
+def test_model_dataflow_plan_initial_context_overrides_defaults_without_business_fields(tmp_path):
+    import asyncio
+    import shlex
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _execute_skill_workflow, _validate_workflow_dataflow_plan
+
+    skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
+    dataflow_plan = {
+        "initial_context": {"required_value": "planned-user", "optional_value": "planned-override"},
+        "steps": [
+            {
+                "script_path": "scripts/first.py",
+                "input_mapping": {
+                    "required_value": "{{required_value}}",
+                    "optional_value": "{{optional_value}}",
+                },
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+            {
+                "script_path": "scripts/second.py",
+                "input_mapping": {"first_output": "{{first_output}}"},
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+        ],
+        "collections": [],
+        "missing": [],
+        "errors": [],
+    }
+
+    assert _validate_workflow_dataflow_plan(dataflow_plan, contract["action_schema"])["initial_context"]["required_value"] == "planned-user"
+    result = asyncio.run(_execute_skill_workflow(
+        execution_root=skill_dir,
+        action_schema=contract["action_schema"],
+        user_context={"user_request": "required_value: ignored-by-plan"},
+        request=ChatRequest(messages=[Message(role="user", content="required_value: ignored-by-plan")]),
+        skill_name="initial-context-skill",
+        dataflow_plan=dataflow_plan,
+    ))
+
+    first_payload = json.loads(shlex.split(result["results"][0]["command"])[2])
+    assert first_payload == {"required_value": "planned-user", "optional_value": "planned-override"}
+    assert result["context"]["used"] == "planned-user"
+    assert (skill_dir / "outputs" / "initial.pdf").is_file()
+
+
+def test_model_dataflow_plan_drives_loop_and_aggregates_outputs(tmp_path):
+    import asyncio
+    import shlex
+    from backend.routers.chat_models import ChatRequest, Message
+    from backend.routers.sandbox_chat import _execute_skill_workflow
+
+    skill_dir, contract = _write_workflow_skill(tmp_path)
+    dataflow_plan = {
+        "initial_context": {"seed": "planned", "item_count": 2, "label": "loop"},
+        "steps": [
+            {
+                "script_path": "scripts/produce_batch.py",
+                "input_mapping": {"seed": "{{seed}}", "item_count": "{{item_count}}", "label": "{{label}}"},
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+            {
+                "script_path": "scripts/render_unit.py",
+                "input_mapping": {"unit_text": "{{loop_item.unit_text}}"},
+                "loop": {"collection": "batch", "item_name": "loop_item"},
+                "output_policy": "merge_stdout",
+            },
+            {
+                "script_path": "scripts/assemble_file.py",
+                "input_mapping": {"document_text": "{{document_text}}", "artifact_paths": "{{artifact_paths}}"},
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+        ],
+        "collections": [{"target": "artifact_paths", "source": "artifact_path"}],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = asyncio.run(_execute_skill_workflow(
+        execution_root=skill_dir,
+        action_schema=contract["action_schema"],
+        user_context={"user_request": "do it"},
+        request=ChatRequest(messages=[Message(role="user", content="do it")]),
+        skill_name="workflow-skill",
+        dataflow_plan=dataflow_plan,
+    ))
+
+    assert len([r for r in result["results"] if r["action"] == "run_command"]) == 4
+    final_payload = json.loads(shlex.split(result["results"][-1]["command"])[2])
+    assert len(final_payload["artifact_paths"]) == 2
+    assert result["context"]["received_count"] == 2
+    assert any(item["path"] == "outputs/bundle.pdf" for item in result["output_files"])
+
+
+def test_model_dataflow_plan_missing_mapping_is_rejected_before_execution(tmp_path):
+    from backend.routers.sandbox_chat import _validate_workflow_dataflow_plan
+
+    skill_dir, contract = _write_initial_context_workflow_skill(tmp_path)
+    assert skill_dir.is_dir()
+    bad_plan = {
+        "initial_context": {"required_value": "x"},
+        "steps": [
+            {
+                "script_path": "scripts/first.py",
+                "input_mapping": {"required_value": "{{required_value}}"},
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+            {
+                "script_path": "scripts/second.py",
+                "input_mapping": {"first_output": "{{first_output}}"},
+                "loop": None,
+                "output_policy": "merge_stdout",
+            },
+        ],
+        "collections": [],
+        "missing": [],
+        "errors": [],
+    }
+
+    with pytest.raises(ValueError, match="input_mapping"):
+        _validate_workflow_dataflow_plan(bad_plan, contract["action_schema"])

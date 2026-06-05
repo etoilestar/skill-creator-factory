@@ -4,8 +4,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     ports:
-      - "58000:8000"
-      - "52222:22"  # SSH端口映射
+      - "8000:8000"
+      - "2222:22"  # SSH端口映射
     volumes:
       - ./kernel:/app/kernel:ro   # skill-creator kernel (read-only)
       - ./skills:/app/skills       # user skill library (read-write)

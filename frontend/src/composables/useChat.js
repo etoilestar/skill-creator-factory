@@ -11,6 +11,7 @@
  *   - { type: 'sop_plan', data: {...} } — SOP document generated from the plan
  *   - { type: 'task_checklist', data: {tasks, completed_indices, executing_index, ts} } — inline task checklist
  *   - { type: 'sandbox_retry', data: {attempt, max_retries, error, corrected, ts} } — sandbox retry notification
+ *   - { type: 'step_skipped', data: {step, reason, ts} } — pipeline step skipped due to cached result
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model?, execution_mode? }
@@ -70,6 +71,7 @@ export async function* streamChat(url, body) {
         else if (parsed.task_progress) yield { type: 'task_progress', data: parsed.task_progress }
         else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
         else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
+        else if (parsed.type === 'step_skipped') yield { type: 'step_skipped', data: parsed.data }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines
@@ -139,6 +141,7 @@ export async function* streamConfirmResponse(response) {
         else if (parsed.task_progress) yield { type: 'task_progress', data: parsed.task_progress }
         else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
         else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
+        else if (parsed.type === 'step_skipped') yield { type: 'step_skipped', data: parsed.data }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         if (e.message && !e.message.startsWith('JSON')) throw e

@@ -21,12 +21,15 @@ class ChatRequest(BaseModel):
     - input_files: uploaded file descriptors with path/filename
     - execution_mode: "plan" (规划模式，预览后确认再执行) or "execute" (执行模式，直接执行)
       - Backward compatible: "craft" is treated as "execute"
+    - sandbox_session_id: optional session identifier for step-skipping optimization;
+      when provided, the backend can reuse cached step outputs across turns.
     """
 
     messages: list[Message]
     model: Optional[str] = None
     input_files: list[dict] = []  # [{"path": "inputs/session/file.csv", "filename": "file.csv"}, ...]
     execution_mode: Optional[str] = "execute"  # "plan" | "execute" | "craft"(deprecated)
+    sandbox_session_id: Optional[str] = None
 
     def effective_execution_mode(self) -> str:
         """Return the normalized execution mode.

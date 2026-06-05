@@ -32,6 +32,13 @@ from ..services.model_router import (
     infer_sandbox_response_task,
     route_model,
 )
+from ..services.sandbox_session import (
+    DialogIntent,
+    SandboxSessionState,
+    StepName,
+    classify_dialog_intent,
+    get_or_create_session,
+)
 from ..services.skill_manager import get_execution_skill_dir
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
@@ -2614,6 +2621,20 @@ async def _plan_and_execute_generated_output(
         )
     )
 
+
+def _step_skipped(step: StepName, reason: str) -> str:
+    """Build a 'step_skipped' SSE event to notify the frontend that a
+    pipeline step was skipped because its output was already cached."""
+    return _sse({
+        "type": "step_skipped",
+        "data": {
+            "step": step.value,
+            "reason": reason,
+            "ts": _time_module.time(),
+        },
+    })
+
+
 def _make_stream(skill_context: dict, request: ChatRequest):
     """Staged Skill execution with shared runtime planning and action execution."""
     requested_model = request.model or settings.default_model
@@ -2644,9 +2665,43 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
     async def generate():
         try:
+            # --- Step-skipping: resolve session state & intent ---
+            session_state: SandboxSessionState | None = None
+            intent = DialogIntent.NEW_TASK
+            if request.sandbox_session_id:
+                session_state = get_or_create_session(
+                    request.sandbox_session_id, parent_skill_name
+                )
+                intent = classify_dialog_intent(request.messages)
+                logger.debug(
+                    "sandbox step-skip: session=%s intent=%s completed_steps=%s",
+                    request.sandbox_session_id,
+                    intent.value,
+                    session_state.completed_steps,
+                )
+
+                # If new files were uploaded, invalidate cached resource/body state
+                if getattr(request, "input_files", None):
+                    logger.debug("sandbox step-skip: input_files detected, invalidating cache")
+                    session_state.invalidate()
+                    intent = DialogIntent.NEW_TASK
+
             if force_body:
                 need_body = True
                 logger.debug("force_body=True, skip metadata decision and load SKILL.md body directly")
+            elif session_state and session_state.should_skip(StepName.METADATA, intent):
+                # --- SKIP: metadata round ---
+                need_body = session_state.need_body  # type: ignore[assignment]
+                yield _step_skipped(StepName.METADATA, "复用上一轮匹配度分析结果")
+                yield _thought(
+                    "metadata_decision",
+                    "分析匹配度（跳过）",
+                    f"复用缓存：{'需要加载正文' if need_body else '请求与 Skill 不匹配，跳过正文'}",
+                    {
+                        "need_body": need_body,
+                        "skipped": True,
+                    },
+                )
             else:
                 yield _sse({"status": {"phase": "analyzing", "message": "分析请求匹配度…"}})
                 need_body = await _run_metadata_round(
@@ -2663,6 +2718,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         "metadata_chars": len(skill_context.get("metadata_prompt", "")),
                     },
                 )
+                # Cache the result
+                if session_state:
+                    session_state.need_body = need_body
+                    session_state.cache_artifact(StepName.METADATA, need_body)
 
             if not need_body:
                 yield _sse({"status": None})
@@ -2683,39 +2742,82 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 yield "data: [DONE]\n\n"
                 return
 
-            yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
-            body_prompt = skill_context["body_loader"]()
-            yield _thought(
-                "body_loaded",
-                "加载 SKILL.md",
-                f"正文已加载，共 {len(body_prompt)} 字符",
-                {
-                    "body_chars": len(body_prompt),
-                    "skill_name": parent_skill_name,
-                },
-            )
-
-            if child_body_loader:
-                yield _sse({"status": {"phase": "loading_child", "message": "检查子 Skill…"}})
-                child_decision = await _run_child_skill_selection_round(
-                    parent_metadata_prompt=skill_context["metadata_prompt"],
-                    request=request,
-                    model=model,
-                )
+            if session_state and session_state.should_skip(StepName.LOAD_BODY, intent):
+                # --- SKIP: body loading ---
+                body_prompt = session_state.body_prompt or skill_context["body_loader"]()
+                yield _step_skipped(StepName.LOAD_BODY, "复用上一轮 Skill 正文")
                 yield _thought(
-                    "child_decision",
-                    "子 Skill 检查",
-                    (
-                        f"加载子 Skill：{child_decision.get('child_ref')}"
-                        if child_decision.get("need_child")
-                        else f"无需子 Skill：{child_decision.get('reason', '')}"
-                    ),
+                    "body_loaded",
+                    "加载 SKILL.md（跳过）",
+                    f"复用缓存正文，共 {len(body_prompt)} 字符",
                     {
-                        "need_child": child_decision.get("need_child"),
-                        "child_ref": child_decision.get("child_ref", ""),
-                        "reason": child_decision.get("reason", ""),
+                        "body_chars": len(body_prompt),
+                        "skill_name": parent_skill_name,
+                        "skipped": True,
                     },
                 )
+            else:
+                yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
+                body_prompt = skill_context["body_loader"]()
+                yield _thought(
+                    "body_loaded",
+                    "加载 SKILL.md",
+                    f"正文已加载，共 {len(body_prompt)} 字符",
+                    {
+                        "body_chars": len(body_prompt),
+                        "skill_name": parent_skill_name,
+                    },
+                )
+                # Cache the result
+                if session_state:
+                    session_state.body_prompt = body_prompt
+                    session_state.cache_artifact(StepName.LOAD_BODY, body_prompt)
+
+            if child_body_loader:
+                if session_state and session_state.should_skip(StepName.CHILD_SKILL, intent):
+                    # --- SKIP: child skill selection ---
+                    child_decision = session_state.child_decision or {"need_child": False, "reason": "缓存无子 Skill"}
+                    yield _step_skipped(StepName.CHILD_SKILL, "复用上一轮子 Skill 选择结果")
+                    yield _thought(
+                        "child_decision",
+                        "子 Skill 检查（跳过）",
+                        (
+                            f"复用缓存：加载子 Skill：{child_decision.get('child_ref')}"
+                            if child_decision.get("need_child")
+                            else f"复用缓存：无需子 Skill"
+                        ),
+                        {
+                            "need_child": child_decision.get("need_child"),
+                            "child_ref": child_decision.get("child_ref", ""),
+                            "reason": child_decision.get("reason", ""),
+                            "skipped": True,
+                        },
+                    )
+                else:
+                    yield _sse({"status": {"phase": "loading_child", "message": "检查子 Skill…"}})
+                    child_decision = await _run_child_skill_selection_round(
+                        parent_metadata_prompt=skill_context["metadata_prompt"],
+                        request=request,
+                        model=model,
+                    )
+                    yield _thought(
+                        "child_decision",
+                        "子 Skill 检查",
+                        (
+                            f"加载子 Skill：{child_decision.get('child_ref')}"
+                            if child_decision.get("need_child")
+                            else f"无需子 Skill：{child_decision.get('reason', '')}"
+                        ),
+                        {
+                            "need_child": child_decision.get("need_child"),
+                            "child_ref": child_decision.get("child_ref", ""),
+                            "reason": child_decision.get("reason", ""),
+                        },
+                    )
+                    # Cache the result
+                    if session_state:
+                        session_state.child_decision = child_decision
+                        session_state.cache_artifact(StepName.CHILD_SKILL, child_decision)
 
                 if child_decision.get("need_child"):
                     child_ref = child_decision.get("child_ref", "")
@@ -2746,42 +2848,71 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         )
 
             if enable_resource_preload:
-                resource_catalog = _extract_runtime_resource_catalog(body_prompt)
-                if resource_catalog:
-                    yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
-                resource_decision = await _run_resource_selection_round(
-                    body_prompt=body_prompt,
-                    request=request,
-                    model=model,
-                    resource_catalog=resource_catalog,
-                )
-                yield _thought(
-                    "resource_selection",
-                    "资源选择",
-                    (
-                        f"加载 {len(resource_decision.get('resource_handles', []))} 个资源：{', '.join(resource_decision.get('resource_handles', []))}"
-                        if resource_decision.get("need_resources")
-                        else f"无需加载额外资源：{resource_decision.get('reason', '')}"
-                    ),
-                    {
-                        "need_resources": resource_decision.get("need_resources"),
-                        "resource_handles": resource_decision.get("resource_handles", []),
-                        "catalog_size": len(resource_catalog),
-                        "reason": resource_decision.get("reason", ""),
-                    },
-                )
-
-                if resource_decision.get("need_resources"):
-                    selected = resource_decision.get("resource_handles") or []
-                    yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
-                    loaded_resources_prompt = _compose_loaded_resources_prompt(
-                        skill_name=parent_skill_name,
+                if session_state and session_state.should_skip(StepName.RESOURCES, intent):
+                    # --- SKIP: resource selection ---
+                    resource_decision = session_state.resource_decision or {"need_resources": False, "reason": "缓存无资源"}
+                    # Re-apply previously loaded resources to body_prompt
+                    if session_state.augmented_body_prompt:
+                        body_prompt = session_state.augmented_body_prompt
+                    yield _step_skipped(StepName.RESOURCES, "复用上一轮资源选择结果")
+                    yield _thought(
+                        "resource_selection",
+                        "资源选择（跳过）",
+                        (
+                            f"复用缓存：加载 {len(resource_decision.get('resource_handles', []))} 个资源"
+                            if resource_decision.get("need_resources")
+                            else "复用缓存：无需加载额外资源"
+                        ),
+                        {
+                            "need_resources": resource_decision.get("need_resources"),
+                            "resource_handles": resource_decision.get("resource_handles", []),
+                            "reason": resource_decision.get("reason", ""),
+                            "skipped": True,
+                        },
+                    )
+                else:
+                    resource_catalog = _extract_runtime_resource_catalog(body_prompt)
+                    if resource_catalog:
+                        yield _sse({"status": {"phase": "loading_resources", "message": "按需加载资源…"}})
+                    resource_decision = await _run_resource_selection_round(
+                        body_prompt=body_prompt,
+                        request=request,
+                        model=model,
                         resource_catalog=resource_catalog,
-                        selected_handles=selected,
+                    )
+                    yield _thought(
+                        "resource_selection",
+                        "资源选择",
+                        (
+                            f"加载 {len(resource_decision.get('resource_handles', []))} 个资源：{', '.join(resource_decision.get('resource_handles', []))}"
+                            if resource_decision.get("need_resources")
+                            else f"无需加载额外资源：{resource_decision.get('reason', '')}"
+                        ),
+                        {
+                            "need_resources": resource_decision.get("need_resources"),
+                            "resource_handles": resource_decision.get("resource_handles", []),
+                            "catalog_size": len(resource_catalog),
+                            "reason": resource_decision.get("reason", ""),
+                        },
                     )
 
-                    if loaded_resources_prompt:
-                        body_prompt = body_prompt + loaded_resources_prompt
+                    if resource_decision.get("need_resources"):
+                        selected = resource_decision.get("resource_handles") or []
+                        yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
+                        loaded_resources_prompt = _compose_loaded_resources_prompt(
+                            skill_name=parent_skill_name,
+                            resource_catalog=resource_catalog,
+                            selected_handles=selected,
+                        )
+
+                        if loaded_resources_prompt:
+                            body_prompt = body_prompt + loaded_resources_prompt
+
+                    # Cache the result
+                    if session_state:
+                        session_state.resource_decision = resource_decision
+                        session_state.augmented_body_prompt = body_prompt
+                        session_state.cache_artifact(StepName.RESOURCES, resource_decision)
 
             # Append uploaded input-file context to the body prompt so the LLM
             # knows which files are available. For small text files the content is

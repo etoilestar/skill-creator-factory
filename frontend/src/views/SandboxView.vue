@@ -122,6 +122,13 @@
               <span class="status-spinner" aria-hidden="true"></span>
               <span class="status-message">{{ currentStatus.message }}</span>
             </div>
+            <div v-if="skippedSteps.length && !streaming" class="skipped-bar" role="status">
+              <span class="skipped-icon">⏭️</span>
+              <span class="skipped-label">已跳过 {{ skippedSteps.length }} 个步骤：</span>
+              <span v-for="(s, idx) in skippedSteps" :key="idx" class="skipped-chip">
+                {{ s.step }}（{{ s.reason }}）
+              </span>
+            </div>
             <div v-if="streaming" class="message assistant">
               <div class="bubble">
                 <ChatBubble :content="streamBuffer" :streaming="true" />
@@ -324,6 +331,9 @@ const fileInputEl = ref(null)
 // Persistent file download bar — collects output_files from the current round
 const roundOutputFiles = ref([])  // [{ path, url, name? }]
 
+// Step-skipping state
+const skippedSteps = ref([])  // [{ step, reason, ts }] for the current round
+
 // Exclude system action-result cards from the history sent to the LLM.
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
 
@@ -379,6 +389,7 @@ function resetChat() {
   sessionId.value = newSessionId()
   roundOutputFiles.value = []
   thoughts.value = []
+  skippedSteps.value = []
   currentPlanPreview.value = null
   currentSOP.value = null
   showPlanPanel.value = false
@@ -464,6 +475,7 @@ async function send() {
   currentStatus.value = null
   roundOutputFiles.value = []
   thoughts.value = []           // clear previous round's thoughts
+  skippedSteps.value = []       // clear previous round's skipped steps
   currentPlanPreview.value = null
   currentSOP.value = null
   executingIndex.value = -1
@@ -477,6 +489,7 @@ async function send() {
     const body = {
       messages: chatHistory.value,
       execution_mode: executionMode.value,
+      sandbox_session_id: sessionId.value,
     }
     if (inputFilesSnapshot.length) body.input_files = inputFilesSnapshot
     for await (const chunk of streamChat(url, body)) {
@@ -528,6 +541,18 @@ async function send() {
           step: 'sandbox_retry',
           label: `重试 (${chunk.data.attempt}/${chunk.data.max_retries})`,
           detail: chunk.data.corrected ? '已根据错误信息调整输入' : '重试执行',
+          data: chunk.data,
+          ts: chunk.data.ts,
+        })
+        if (!showThoughts.value) showThoughts.value = true
+      } else if (chunk.type === 'step_skipped') {
+        // Track skipped steps for display
+        skippedSteps.value.push(chunk.data)
+        // Also show as a thought
+        thoughts.value.push({
+          step: `step_skipped_${chunk.data.step}`,
+          label: `跳过：${chunk.data.step}`,
+          detail: chunk.data.reason,
           data: chunk.data,
           ts: chunk.data.ts,
         })
@@ -1073,6 +1098,33 @@ async function exportSOP(format) {
   opacity: 0.7;
 }
 .status-message { flex: 1; }
+
+/* Skipped steps bar */
+.skipped-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+  animation: status-fade-in 0.2s ease;
+}
+.skipped-icon { font-size: 14px; flex-shrink: 0; }
+.skipped-label { font-weight: 600; white-space: nowrap; }
+.skipped-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: rgba(22, 101, 52, 0.08);
+  font-size: 12px;
+  font-family: monospace;
+}
 
 @keyframes spin {
   to { transform: rotate(360deg); }

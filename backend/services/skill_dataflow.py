@@ -391,6 +391,110 @@ def validate_dataflow_closed(
     return context
 
 
+def validate_and_align_step_stdout(entry: dict[str, Any], step_plan: dict[str, Any], stdout_json: dict[str, Any]) -> dict[str, Any]:
+    """Validate one step stdout against generic planned/schema outputs.
+
+    Exact stdout keys win. For singular-vs-collection naming mismatches, add
+    generic aliases such as ``name``, pluralized ``name`` and ``name_list``
+    without relying on business-specific fields.
+    """
+    if not isinstance(stdout_json, dict):
+        raise DataflowError("stdout 必须是 JSON object")
+    expected = _expected_output_specs(entry, step_plan)
+    if not expected:
+        return stdout_json
+
+    aligned = dict(stdout_json)
+    missing: list[str] = []
+    type_errors: list[str] = []
+    for spec in expected:
+        key = str(spec.get("name") or "").strip()
+        if not key:
+            continue
+        if key not in aligned:
+            alias_value = _generic_output_alias_value(key, aligned)
+            if alias_value is not _MISSING:
+                aligned[key] = alias_value
+        if key not in aligned:
+            missing.append(key)
+            continue
+        expected_type = str(spec.get("type") or spec.get("value_type") or "").strip().lower()
+        if expected_type and not _stdout_value_matches_type(aligned[key], expected_type):
+            type_errors.append(f"{key}: expected {expected_type}, actual {type(aligned[key]).__name__}")
+
+    if missing or type_errors:
+        details = {"missing_outputs": missing, "type_errors": type_errors, "stdout_keys": sorted(str(key) for key in stdout_json.keys())}
+        raise DataflowError("workflow stdout 与 plan outputs 不一致: " + json.dumps(details, ensure_ascii=False))
+    return aligned
+
+
+def _expected_output_specs(entry: dict[str, Any], step_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_outputs = step_plan.get("outputs") or step_plan.get("expected_outputs") or entry.get("outputs") or []
+    if isinstance(raw_outputs, dict):
+        raw_outputs = raw_outputs.items()
+    specs: list[dict[str, Any]] = []
+    for item in raw_outputs:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                specs.append({"name": name})
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("key") or item.get("path") or "").strip()
+            if name:
+                spec = dict(item)
+                spec["name"] = name
+                specs.append(spec)
+        elif isinstance(item, tuple) and len(item) == 2:
+            name = str(item[0]).strip()
+            if name:
+                specs.append({"name": name, "type": item[1]})
+    return specs
+
+
+_MISSING = object()
+
+
+def _generic_output_alias_value(expected_key: str, payload: dict[str, Any]) -> Any:
+    aliases = [_pluralize_key(expected_key), f"{expected_key}_list"]
+    if expected_key.endswith("_list"):
+        aliases.append(expected_key[: -len("_list")])
+    singular = _singularize_key(expected_key)
+    if singular != expected_key:
+        aliases.append(singular)
+    for alias in dict.fromkeys(alias for alias in aliases if alias):
+        if alias not in payload:
+            continue
+        value = payload[alias]
+        if alias == singular and expected_key != singular and not isinstance(value, list):
+            return [value]
+        return value
+    return _MISSING
+
+
+def _singularize_key(key: str) -> str:
+    if key.endswith("ies") and len(key) > 3:
+        return key[:-3] + "y"
+    if key.endswith("s") and not key.endswith("ss") and len(key) > 1:
+        return key[:-1]
+    return key
+
+
+def _stdout_value_matches_type(value: Any, expected_type: str) -> bool:
+    if expected_type in {"list", "array"}:
+        return isinstance(value, list)
+    if expected_type in {"dict", "object", "json"}:
+        return isinstance(value, dict)
+    if expected_type in {"str", "string", "text"}:
+        return isinstance(value, str)
+    if expected_type in {"int", "integer"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type in {"float", "number"}:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type in {"bool", "boolean"}:
+        return isinstance(value, bool)
+    return True
+
+
 def _clean_key(key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_./-]", "", key or "")
 
@@ -463,6 +567,7 @@ def deterministic_dataflow_plan_from_schema(
             "command": entry.get("command"),
             "input_mapping": {key: f"{{{{{key}}}}}" for key in placeholders},
             "loop": loop,
+            "outputs": list(entry.get("outputs") or []),
             "output_policy": "merge_stdout",
         })
         for key in entry.get("outputs") or []:
@@ -515,6 +620,7 @@ def validate_workflow_dataflow_plan(plan: dict[str, Any], entries: Iterable[dict
         normalized = dict(step)
         normalized["script_path"] = script_path
         normalized["input_mapping"] = dict(mapping)
+        normalized["outputs"] = step.get("outputs") if isinstance(step.get("outputs"), (list, dict)) else list(entry.get("outputs") or [])
         normalized["output_policy"] = str(step.get("output_policy") or "merge_stdout")
         normalized_steps.append(normalized)
 
@@ -546,10 +652,10 @@ def context_from_dataflow_plan(
 def materialize_step_contexts_from_plan(step_plan: dict[str, Any], entry: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
     """Resolve a plan step's input_mapping into one or more executable contexts."""
     loop = step_plan.get("loop")
-    if isinstance(loop, dict) and loop and str(loop.get("collection") or "") not in {"", "auto"}:
-        collection_path = str(loop.get("collection") or loop.get("source") or loop.get("list") or "")
+    collection_path = workflow_loop_collection_path(loop)
+    if isinstance(loop, dict) and loop and collection_path not in {"", "auto"}:
         try:
-            collection = resolve_context_value(context, _strip_braces(collection_path))
+            collection = resolve_context_value(context, collection_path)
         except KeyError as exc:
             raise LoopExpansionError([collection_path], message=f"循环集合不存在: {collection_path}") from exc
         if not isinstance(collection, list) or not collection:
@@ -618,24 +724,68 @@ def resolve_dataflow_source(source: Any, context: dict[str, Any]) -> Any:
     return replace_placeholders_in_value(source, context)
 
 
-def apply_dataflow_collections(collections: list[Any], context: dict[str, Any], step_payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    """Apply optional model-declared loop aggregations to context."""
+def apply_dataflow_collections(
+    collections: list[Any],
+    context: dict[str, Any],
+    step_payloads: list[dict[str, Any]],
+    *,
+    script_path: str = "",
+    step_index: int | None = None,
+) -> dict[str, Any]:
+    """Apply optional model-declared loop aggregations to context.
+
+    Collection specs are generic: ``target`` names the context key to write and
+    ``source`` may be a stdout key or dotted stdout path.  Specs can optionally
+    be scoped with ``script_path``/``step_index``/``after_step``.
+    """
     if not isinstance(collections, list):
         return {}
     updates: dict[str, Any] = {}
     last_payloads = [payload for payload in step_payloads if isinstance(payload, dict)]
     for collection in collections:
-        if not isinstance(collection, dict):
+        if not isinstance(collection, dict) or not _collection_applies_to_step(collection, script_path=script_path, step_index=step_index):
             continue
         target = str(collection.get("target") or collection.get("name") or "").strip()
         source = str(collection.get("source") or collection.get("field") or "").strip()
         if not target or not source:
             continue
-        values = [payload[source] for payload in last_payloads if source in payload]
+        values: list[Any] = []
+        for payload in last_payloads:
+            try:
+                value = resolve_context_value(payload, _strip_braces(source))
+            except KeyError:
+                continue
+            if isinstance(value, list):
+                values.extend(value)
+            else:
+                values.append(value)
         if values:
             updates[target] = values
     context.update(updates)
     return updates
+
+
+def workflow_loop_collection_path(loop: Any) -> str:
+    """Return a normalized loop collection path for diagnostics/execution."""
+    if not isinstance(loop, dict) or not loop:
+        return ""
+    raw = loop.get("collection") or loop.get("source") or loop.get("list") or ""
+    if isinstance(raw, dict):
+        return _source_path_for_error(raw)
+    return _strip_braces(str(raw))
+
+
+def _collection_applies_to_step(collection: dict[str, Any], *, script_path: str, step_index: int | None) -> bool:
+    expected_script = str(collection.get("script_path") or collection.get("step_script") or "").strip()
+    if expected_script and _normalize_script_path(expected_script) != _normalize_script_path(script_path):
+        return False
+    raw_index = collection.get("step_index", collection.get("after_step"))
+    if raw_index is None or raw_index == "":
+        return True
+    try:
+        return step_index == int(raw_index)
+    except (TypeError, ValueError):
+        return True
 
 
 def _normalize_script_path(path: str) -> str:

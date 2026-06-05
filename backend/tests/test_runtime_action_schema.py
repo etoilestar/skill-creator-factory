@@ -828,3 +828,61 @@ def test_model_dataflow_plan_missing_mapping_is_rejected_before_execution(tmp_pa
 
     with pytest.raises(ValueError, match="input_mapping"):
         _validate_workflow_dataflow_plan(bad_plan, contract["action_schema"])
+
+
+def test_skill_dataflow_aligns_generic_stdout_output_aliases():
+    from backend.services.skill_dataflow import validate_and_align_step_stdout
+
+    aligned = validate_and_align_step_stdout(
+        {"outputs": ["artifact_paths"]},
+        {"script_path": "scripts/render.py", "input_mapping": {}, "loop": None},
+        {"artifact_path": "outputs/one.dat"},
+    )
+
+    assert aligned["artifact_paths"] == ["outputs/one.dat"]
+
+
+def test_skill_dataflow_reports_missing_expected_stdout_outputs():
+    from backend.services.skill_dataflow import DataflowError, validate_and_align_step_stdout
+
+    with pytest.raises(DataflowError, match="missing_outputs"):
+        validate_and_align_step_stdout(
+            {"outputs": ["final_file"]},
+            {"script_path": "scripts/build.py", "input_mapping": {}, "loop": None},
+            {"unexpected": "outputs/final.pdf"},
+        )
+
+
+def test_skill_dataflow_loop_collection_accepts_source_object_and_dotted_paths():
+    from backend.services.skill_dataflow import materialize_step_contexts_from_plan
+
+    contexts = materialize_step_contexts_from_plan(
+        {
+            "script_path": "scripts/render.py",
+            "input_mapping": {"value": "{{loop_item.value}}"},
+            "loop": {"collection": {"path": "groups.0.items"}, "item_name": "loop_item"},
+        },
+        {"placeholder_keys": ["value"]},
+        {"groups": [{"items": [{"value": "alpha"}, {"value": "beta"}]}]},
+    )
+
+    assert [context["value"] for context in contexts] == ["alpha", "beta"]
+
+
+def test_skill_dataflow_collections_support_dotted_sources_and_step_scope():
+    from backend.services.skill_dataflow import apply_dataflow_collections
+
+    context = {}
+    updates = apply_dataflow_collections(
+        [
+            {"target": "ignored", "source": "meta.path", "script_path": "scripts/other.py"},
+            {"target": "paths", "source": "meta.path", "script_path": "scripts/render.py"},
+        ],
+        context,
+        [{"meta": {"path": "outputs/one.dat"}}, {"meta": {"path": "outputs/two.dat"}}],
+        script_path="scripts/render.py",
+        step_index=1,
+    )
+
+    assert updates == {"paths": ["outputs/one.dat", "outputs/two.dat"]}
+    assert context == updates

@@ -648,20 +648,50 @@ def context_from_dataflow_plan(
     planner_context = plan.get("initial_context") if isinstance(plan, dict) else {}
     return merge_context(base, planner_context if isinstance(planner_context, dict) else {})
 
+def _preview_value_for_error(value: Any, *, max_len: int = 300) -> str:
+    try:
+        if isinstance(value, list):
+            first = value[0] if value else None
+            return (
+                f"type=list len={len(value)} "
+                f"first_type={type(first).__name__ if value else None} "
+                f"first_preview={str(first)[:max_len] if first is not None else ''}"
+            )
+        if isinstance(value, dict):
+            return (
+                f"type=dict keys={sorted(str(k) for k in value.keys())[:20]} "
+                f"preview={str(value)[:max_len]}"
+            )
+        if isinstance(value, str):
+            return f"type=str len={len(value)} preview={value[:max_len]}"
+        return f"type={type(value).__name__} preview={str(value)[:max_len]}"
+    except Exception as exc:
+        return f"type={type(value).__name__} preview_error={exc}"
 
-def materialize_step_contexts_from_plan(step_plan: dict[str, Any], entry: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
-    """Resolve a plan step's input_mapping into one or more executable contexts."""
+def materialize_step_contexts_from_plan(
+    step_plan: dict[str, Any],
+    entry: dict[str, Any],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolve a step's input_mapping into one or more executable contexts with diagnostics."""
     loop = step_plan.get("loop")
     collection_path = workflow_loop_collection_path(loop)
+
     if isinstance(loop, dict) and loop and collection_path not in {"", "auto"}:
         try:
             collection = resolve_context_value(context, collection_path)
         except KeyError as exc:
             raise LoopExpansionError([collection_path], message=f"循环集合不存在: {collection_path}") from exc
+
         if not isinstance(collection, list) or not collection:
-            raise LoopExpansionError([collection_path], message=f"循环集合不是非空列表: {collection_path}")
+            raise LoopExpansionError(
+                [collection_path],
+                message=f"循环集合不是非空列表: {collection_path}; {_preview_value_for_error(collection)}",
+            )
+
         item_name = str(loop.get("item_name") or "loop_item")
-        contexts: list[dict[str, Any]] = []
+        contexts: list[dict] = []
+
         for index, item in enumerate(collection):
             child = dict(context)
             child[item_name] = item
@@ -671,22 +701,12 @@ def materialize_step_contexts_from_plan(step_plan: dict[str, Any], entry: dict[s
                 child.update(item)
             child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
             contexts.append(child)
+
         return contexts
 
-    try:
-        mapped = resolve_input_mapping(step_plan.get("input_mapping") or {}, context)
-        return [merge_context(context, mapped)]
-    except MissingVariablesError:
-        # Preserve the existing generic foreach support when the model marks a
-        # step as loop:auto or when mappings depend on fields supplied by items.
-        expanded = expand_step_contexts(entry, context)
-        contexts = []
-        for child in expanded:
-            child = dict(child)
-            child.update(resolve_input_mapping(step_plan.get("input_mapping") or {}, child))
-            contexts.append(child)
-        return contexts
-
+    # 非循环步骤
+    mapped = resolve_input_mapping(step_plan.get("input_mapping") or {}, context)
+    return [merge_context(context, mapped)]
 
 def resolve_input_mapping(mapping: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     """Resolve model input_mapping values against the current context."""

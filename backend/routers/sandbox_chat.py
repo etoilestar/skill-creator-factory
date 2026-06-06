@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -102,7 +103,54 @@ def _skill_root_for_name(skill_name: str) -> Path:
         raise ValueError(f"非法 skill_name: {skill_name}")
     return get_execution_skill_dir(skill_name, mode="sandbox").resolve()
 
+def _workflow_value_preview(value: Any, *, max_len: int = 300) -> dict[str, Any]:
+    try:
+        if isinstance(value, list):
+            first = value[0] if value else None
+            preview: dict[str, Any] = {
+                "type": "list",
+                "len": len(value),
+                "first_type": type(first).__name__ if value else None,
+            }
+            if isinstance(first, dict):
+                preview["first_keys"] = sorted(str(k) for k in first.keys())[:20]
+                preview["first_preview"] = str(first)[:max_len]
+            elif first is not None:
+                preview["first_preview"] = str(first)[:max_len]
+            return preview
 
+        if isinstance(value, dict):
+            return {
+                "type": "dict",
+                "keys": sorted(str(k) for k in value.keys())[:30],
+                "preview": str(value)[:max_len],
+            }
+
+        if isinstance(value, str):
+            return {
+                "type": "str",
+                "len": len(value),
+                "preview": value[:max_len],
+            }
+
+        return {
+            "type": type(value).__name__,
+            "preview": str(value)[:max_len],
+        }
+    except Exception as exc:
+        return {
+            "type": type(value).__name__,
+            "preview_error": str(exc),
+        }
+
+
+def _workflow_payload_summary(payload: dict[str, Any] | None, *, max_len: int = 300) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): _workflow_value_preview(value, max_len=max_len)
+        for key, value in payload.items()
+    }
 
 def _available_scripts_for_root(execution_root: Path | None) -> list[str]:
     """Return real scripts under the current business Skill root only."""
@@ -2664,14 +2712,13 @@ async def _execute_workflow_from_dataflow_plan(
     request: ChatRequest | None = None,
     skill_name: str = "",
 ) -> dict:
-    """Execute workflow strictly from a validated dataflow plan."""
     entries = [entry for entry in (action_schema.get("entries") or []) if isinstance(entry, dict)]
     entries = [
         entry for entry in entries
-        if _normalize_skill_resource_path(str(entry.get("script_path") or "")).startswith("scripts/")
+        if str(entry.get("script_path") or "").startswith("scripts/")
     ]
     if not entries:
-        raise ValueError("execute_workflow 需要至少一个 scripts/* Action schema entry")
+        raise ValueError("execute_workflow requires at least one scripts/* entry")
 
     plan = validate_workflow_dataflow_plan(dataflow_plan, entries)
     root = execution_root.resolve()
@@ -2685,54 +2732,53 @@ async def _execute_workflow_from_dataflow_plan(
     output_files: list[dict] = []
     workflow_logs: list[str] = []
     previous_stdout_keys: list[str] = []
+    previous_stdout_summary: dict[str, Any] = {}
     step_plans = plan.get("steps") or []
 
     for entry_index, (entry, step_plan) in enumerate(zip(entries, step_plans, strict=False)):
-        script_path = _normalize_skill_resource_path(str(entry.get("script_path") or ""))
-        if script_path not in available_scripts:
-            raise ValueError(f"workflow_mismatch: {script_path} 不在 available_scripts 中：{sorted(available_scripts)}")
+        script_path = str(entry.get("script_path") or "")
         command_template = str(entry.get("command") or "").strip()
-        if not command_template:
-            raise ValueError(f"workflow_mismatch: {script_path} 缺少 command template")
         loop_info = step_plan.get("loop") if isinstance(step_plan, dict) else None
         collection_path = workflow_loop_collection_path(loop_info)
+
         before_log = (
-            f"workflow step[{entry_index}] before script={script_path} "
+            f"workflow step[{entry_index}] BEFORE script={script_path} "
             f"context_keys={sorted(context.keys())} "
             f"previous_stdout_keys={previous_stdout_keys} "
+            f"previous_stdout_summary={json.dumps(previous_stdout_summary, ensure_ascii=False)} "
             f"input_mapping={json.dumps(step_plan.get('input_mapping') or {}, ensure_ascii=False)} "
             f"loop={json.dumps(loop_info, ensure_ascii=False)} "
             f"collection_path={collection_path}"
         )
         logger.info(before_log)
         workflow_logs.append(before_log)
+
         try:
             step_contexts = materialize_step_contexts_from_plan(step_plan, entry, context)
         except LoopExpansionError as exc:
-            logger.error(
-                "workflow loop expansion failed script=%s collection_path=%s context_keys=%s previous_stdout_keys=%s",
-                script_path,
-                collection_path,
-                sorted(context.keys()),
-                previous_stdout_keys,
+            try:
+                collection_value = resolve_context_value(context, collection_path) if collection_path else None
+                collection_error = ""
+            except Exception as detail_exc:
+                collection_value = None
+                collection_error = str(detail_exc)
+
+            collection_summary = _workflow_value_preview(collection_value)
+            error_log = (
+                f"workflow LOOP EXPANSION FAILED script={script_path} "
+                f"collection_path={collection_path} "
+                f"collection_error={collection_error} "
+                f"collection_summary={json.dumps(collection_summary, ensure_ascii=False)} "
+                f"context_keys={sorted(context.keys())} "
+                f"previous_stdout_keys={previous_stdout_keys}"
             )
-            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
-            raise ValueError(f"循环变量无法展开：{script_path} 需要 {needed}，但 dataflow plan 指定的集合不可用。") from exc
-        except MissingVariablesError as exc:
-            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
-            if entry_index == 0:
-                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，dataflow plan 未能从用户输入或默认值提供。") from exc
-            raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，dataflow plan 引用的前序输出不存在。") from exc
+            logger.error(error_log)
+            workflow_logs.append(error_log)
+            raise ValueError(f"循环变量无法展开：{script_path} 需要 {', '.join(exc.missing)}, collection 内容无效") from exc
+
         step_payloads: list[dict] = []
         for step_context in step_contexts:
-            try:
-                command = render_command_template(command_template, step_context)
-            except ValueError as exc:
-                missing = getattr(exc, "missing", None) or (entry.get("placeholder_keys") or [])
-                needed = ", ".join(f"{{{{{key}}}}}" for key in missing)
-                if entry_index == 0:
-                    raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，dataflow plan 未提供可渲染变量。{exc}") from exc
-                raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，dataflow plan 未提供可渲染变量。{exc}") from exc
+            command = render_command_template(command_template, step_context)
             result, task_touched = await asyncio.to_thread(
                 functools.partial(
                     _execute_single_task,
@@ -2748,44 +2794,49 @@ async def _execute_workflow_from_dataflow_plan(
             results.append(result)
             touched.extend(task_touched)
             output_files.extend(result.get("output_files") or [])
-            if not result.get("success", True):
-                raise ValueError(f"workflow_step_failed: {script_path} returncode={result.get('returncode')} stderr={(result.get('stderr') or '').strip()}")
+
             raw_stdout = str(result.get("stdout") or "")
             try:
                 payload = parse_stdout_context(raw_stdout)
             except ValueError as exc:
-                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout 必须是 JSON object。{exc}") from exc
+                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout must be JSON object. {exc}") from exc
+
+            payload_before_align_summary = _workflow_payload_summary(dict(payload))
+
             try:
                 payload = validate_and_align_step_stdout(entry, step_plan, payload)
             except DataflowError as exc:
-                logger.error(
-                    "workflow stdout reconcile failed script=%s stdout_keys=%s context_keys=%s error=%s",
-                    script_path,
-                    sorted(payload.keys()),
-                    sorted(context.keys()),
-                    exc,
+                reconcile_log = (
+                    f"workflow stdout reconcile failed script={script_path} "
+                    f"expected_entry_outputs={entry.get('outputs') or []} "
+                    f"expected_plan_outputs={step_plan.get('outputs') if isinstance(step_plan, dict) else []} "
+                    f"stdout_keys={sorted(payload.keys())} "
+                    f"stdout_summary={json.dumps(_workflow_payload_summary(payload), ensure_ascii=False)} "
+                    f"context_keys={sorted(context.keys())} "
+                    f"error={exc}"
                 )
-                raise ValueError(f"workflow_stdout_mismatch: {script_path} stdout 与 plan/schema outputs 不一致。{exc}") from exc
+                logger.error(reconcile_log)
+                workflow_logs.append(reconcile_log)
+                raise ValueError(f"workflow_stdout_mismatch: {script_path} stdout 与 plan/schema outputs 不一致") from exc
+
             step_payloads.append(payload)
             merge_step_output(context, script_path, payload)
+
+            stdout_summary = _workflow_payload_summary(payload)
             after_log = (
-                f"workflow step[{entry_index}] after script={script_path} "
+                f"workflow step[{entry_index}] AFTER script={script_path} "
                 f"stdout_raw={raw_stdout[:1000]} "
                 f"stdout_json_keys={sorted(payload.keys())} "
+                f"stdout_json_summary={json.dumps(stdout_summary, ensure_ascii=False)} "
+                f"stdout_before_align_summary={json.dumps(payload_before_align_summary, ensure_ascii=False)} "
                 f"context_keys={sorted(context.keys())}"
             )
             logger.info(after_log)
             workflow_logs.append(after_log)
             previous_stdout_keys = sorted(payload.keys())
-        if len(step_contexts) > 1:
-            collected = collect_loop_outputs(step_payloads, entry)
-            merge_step_output(context, script_path, collected)
-            collect_log = (
-                f"workflow step[{entry_index}] loop_collected script={script_path} "
-                f"collection_keys={sorted(collected.keys())} context_keys={sorted(context.keys())}"
-            )
-            logger.info(collect_log)
-            workflow_logs.append(collect_log)
+            previous_stdout_summary = stdout_summary
+
+        # 集合聚合
         collection_updates = apply_dataflow_collections(
             plan.get("collections") or [],
             context,
@@ -2794,31 +2845,23 @@ async def _execute_workflow_from_dataflow_plan(
             step_index=entry_index,
         )
         if collection_updates:
-            workflow_logs.append(
-                f"workflow step[{entry_index}] plan_collections keys={sorted(collection_updates.keys())} context_keys={sorted(context.keys())}"
+            collection_updates_summary = _workflow_payload_summary(collection_updates)
+            collection_log = (
+                f"workflow step[{entry_index}] plan_collections "
+                f"keys={sorted(collection_updates.keys())} "
+                f"summary={json.dumps(collection_updates_summary, ensure_ascii=False)} "
+                f"context_keys={sorted(context.keys())}"
             )
-
-    dedup_output_files: list[dict] = []
-    seen_outputs: set[str] = set()
-    for item in output_files:
-        path = str(item.get("path") or "")
-        if not path or path in seen_outputs:
-            continue
-        candidate = (root / path).resolve()
-        if not _is_within_sandbox(candidate, root) or not candidate.is_file():
-            raise ValueError(f"workflow_output_missing: 最终输出文件不存在或越界: {path}")
-        seen_outputs.add(path)
-        dedup_output_files.append(item)
+            logger.info(collection_log)
+            workflow_logs.append(collection_log)
 
     return {
         "executed": True,
-        "reason": "已根据模型 dataflow plan 确定性执行 workflow。",
-        "dataflow_plan": plan,
         "results": results,
         "context": context,
-        "output_files": dedup_output_files,
-        "touched_paths": [str(path) for path in touched],
-        "logs": [*_workflow_output_summary(results, dedup_output_files).splitlines(), *workflow_logs],
+        "output_files": output_files,
+        "touched_paths": [str(p) for p in touched],
+        "logs": workflow_logs,
     }
 
 

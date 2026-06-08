@@ -65,6 +65,7 @@ def run_action(action: dict) -> dict:
                 action.get("filename", ""),
                 action.get("content", ""),
                 skill_dir,
+                encoding=action.get("encoding", "text"),
             )
         if action_type == "validate":
             return _run_validate(name, skill_dir)
@@ -252,7 +253,7 @@ def _safe_filename(filename: str) -> str | None:
     return safe
 
 
-def _run_write_file(name: str, folder: str, filename: str, content: str, skill_dir: Path) -> dict:
+def _run_write_file(name: str, folder: str, filename: str, content: str, skill_dir: Path, *, encoding: str = "text") -> dict:
     if folder not in _ALLOWED_WRITE_FOLDERS:
         return {
             "action": "write_file",
@@ -289,7 +290,13 @@ def _run_write_file(name: str, folder: str, filename: str, content: str, skill_d
     target_dir = skill_dir / folder
     target_dir.mkdir(exist_ok=True)
     dest = target_dir / safe
-    dest.write_text(content, encoding="utf-8")
+
+    if encoding == "base64":
+        import base64
+        dest.write_bytes(base64.b64decode(content))
+    else:
+        dest.write_text(content, encoding="utf-8")
+
     return {
         "action": "write_file",
         "name": name,
@@ -330,14 +337,29 @@ def _snapshot_skill_files(skill_dir: Path) -> set[str]:
     return result
 
 
-def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
-    """Return stable environment variables injected into generated scripts.
+def build_skill_runtime_env(
+    *,
+    skill_dir: Path | None = None,
+    execution_root: Path | None = None,
+    session_input_dir: Path | None = None,
+) -> dict[str, str]:
+    """Return stable environment variables injected into skill script runtime.
 
-    The creator prompts generated scripts to use these names instead of
-    hard-coded model IDs or service URLs.  Building this map in one place keeps
-    sandbox script runs and creator validation trial runs consistent.
+    This is the single source of truth for runtime env vars, shared by both
+    skill_executor (Creator flow) and sandbox_chat (Sandbox flow).
     """
     env = {**os.environ}
+
+    # Resolve directories
+    cwd = execution_root or skill_dir
+    api_key = (
+        settings.llm_api_key
+        or settings.openai_api_key
+        or env.get("LLM_API_KEY")
+        or env.get("OPENAI_API_KEY")
+        or "ollama"
+    )
+
     env.update({
         "LLM_BASE_URL": settings.llm_base_url,
         "IMAGE_BASE_URL": settings.image_base_url,
@@ -347,17 +369,28 @@ def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
         "CODE_MODEL": settings.code_model or settings.default_model,
         "IMAGE_MODEL": settings.image_model or settings.default_model,
         "VISION_MODEL": settings.vision_model or settings.default_model,
+        "PLANNER_MODEL": settings.planner_model or settings.default_model,
+        "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
         "IMAGE_SIZE": settings.image_size,
-        "OUTPUT_DIR": str(skill_dir / "outputs"),
-        "INPUT_DIR": str(skill_dir / "inputs"),
+        "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
+        "INPUT_DIR": str(cwd / "inputs") if cwd else "",
+        "EXECUTION_ROOT": str(execution_root) if execution_root else "",
         "PYTHONPATH": os.pathsep.join(
             part for part in [str(PROJECT_ROOT), env.get("PYTHONPATH", "")] if part
         ),
+        "LLM_API_KEY": api_key,
+        "OPENAI_API_KEY": settings.openai_api_key or api_key,
     })
-    api_key = settings.llm_api_key or settings.openai_api_key or env.get("LLM_API_KEY") or env.get("OPENAI_API_KEY") or "ollama"
-    env["LLM_API_KEY"] = api_key
-    env["OPENAI_API_KEY"] = settings.openai_api_key or api_key
+
+    if session_input_dir is not None:
+        env["INPUT_SESSION_DIR"] = str(session_input_dir)
+
     return env
+
+
+def _build_script_runtime_env(skill_dir: Path) -> dict[str, str]:
+    """Backward-compatible wrapper for build_skill_runtime_env (Creator flow)."""
+    return build_skill_runtime_env(skill_dir=skill_dir)
 
 
 def _run_script(name: str, filename: str, args: list, stdin: str, skill_dir: Path) -> dict:

@@ -1,4 +1,5 @@
 import asyncio
+import mimetypes
 import re as _re
 import shutil
 import subprocess
@@ -515,8 +516,13 @@ async def download_skill_file(skill_name: str, filepath: str):
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
 
+    # Infer MIME type from file extension for proper browser preview
+    media_type, _ = mimetypes.guess_type(str(target))
+    if media_type is None:
+        media_type = "application/octet-stream"
+
     return FileResponse(
         path=str(target),
         filename=_Path(filepath).name,
-        media_type="application/octet-stream",
+        media_type=media_type,
     )

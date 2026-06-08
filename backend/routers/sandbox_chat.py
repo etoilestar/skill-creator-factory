@@ -39,6 +39,7 @@ from ..services.sandbox_session import (
     classify_dialog_intent,
     get_or_create_session,
 )
+from ..services.skill_executor import build_skill_runtime_env
 from ..services.skill_manager import get_execution_skill_dir
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
@@ -1339,12 +1340,16 @@ def _compose_block_planner_prompt() -> str:
         "14. 不允许根据用户希望、SKILL.md 用法、资源清单或常识补全缺失路径。\n"
         "15. 只输出严格 JSON，不要 Markdown，不要解释。\n\n"
         "允许的 action：display、ignore、write_file、run_command、create_directory。\n\n"
+        "write_file 的 encoding 字段：\n"
+        "- 文本文件（.py/.js/.md/.txt/.json/.yaml/.csv/.html/.css 等）：不需要指定 encoding，默认为 text。\n"
+        "- 二进制文件（.png/.jpg/.pdf/.xlsx/.docx/.zip 等）：必须设置 encoding 为 \"base64\"，此时 content 应为 base64 编码字符串。\n\n"
         "输出格式：\n"
         "{\n"
         "  \"tasks\": [\n"
         "    {\"block_index\": 0, \"action\": \"create_directory\", \"path\": \"...\", \"reason\": \"...\"},\n"
         "    {\"block_index\": 1, \"action\": \"write_file\", \"path\": \"...\", \"reason\": \"...\"},\n"
-        "    {\"block_index\": 2, \"action\": \"run_command\", \"command\": \"...\", \"reason\": \"...\"}\n"
+        "    {\"block_index\": 2, \"action\": \"write_file\", \"path\": \"assets/logo.png\", \"encoding\": \"base64\", \"reason\": \"...\"},\n"
+        "    {\"block_index\": 3, \"action\": \"run_command\", \"command\": \"...\", \"reason\": \"...\"}\n"
         "  ],\n"
         "  \"errors\": []\n"
         "}\n"
@@ -1973,6 +1978,7 @@ def _execute_single_task(
     inferred_skill_root: "Path | None" = None,
     skill_name: str = "",
     session_input_dir: "Path | None" = None,
+    previous_output_files: "list[dict] | None" = None,
 ) -> "tuple[dict, list[Path]]":
     """Execute a single planned action task and return (result_dict, touched_paths).
 
@@ -2043,13 +2049,23 @@ def _execute_single_task(
             inferred_skill_root=inferred_skill_root,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(content), encoding="utf-8")
+
+        file_encoding = str(task.get("encoding", "text")).strip().lower()
+        if file_encoding == "base64":
+            import base64
+            raw_bytes = base64.b64decode(str(content))
+            path.write_bytes(raw_bytes)
+            written_bytes = len(raw_bytes)
+        else:
+            path.write_text(str(content), encoding="utf-8")
+            written_bytes = len(str(content).encode("utf-8"))
+
         touched.append(path)
         return {
             "action": action,
             "path": str(path),
             "success": True,
-            "bytes": len(str(content).encode("utf-8")),
+            "bytes": written_bytes,
             "reason": reason,
         }, touched
 
@@ -2089,41 +2105,17 @@ def _execute_single_task(
             getattr(request, "input_files", []) or [],
             cwd,
             session_input_dir,
+            previous_output_files=previous_output_files,
         )
 
-        _run_cmd_extra_env: dict[str, str] = {
-            "EXECUTION_ROOT": str(execution_root) if execution_root else "",
-            "OUTPUT_DIR": str(cwd / "outputs") if cwd else "",
-            "INPUT_DIR": str(cwd / "inputs") if cwd else "",
-            # Expose configured model endpoints to generated skill scripts so
-            # creative/text/image tasks can use the same capability routing as
-            # the host instead of hard-coded templates or fake image stubs.
-            "LLM_BASE_URL": settings.llm_base_url,
-            "DEFAULT_MODEL": settings.default_model,
-            "IMAGE_BASE_URL": settings.image_base_url,
-            "IMAGE_API_KEY": settings.image_api_key or os.environ.get("IMAGE_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "ollama",
-            "IMAGE_SIZE": settings.image_size,
-            "TEXT_MODEL": settings.text_model or settings.default_model,
-            "CODE_MODEL": settings.code_model or settings.default_model,
-            "IMAGE_MODEL": settings.image_model or settings.default_model,
-            "VISION_MODEL": settings.vision_model or settings.default_model,
-            "PLANNER_MODEL": settings.planner_model or settings.default_model,
-            "VALIDATOR_MODEL": settings.validator_model or settings.default_model,
-            "PYTHONPATH": os.pathsep.join(
-                part for part in [str(PROJECT_ROOT), os.environ.get("PYTHONPATH", "")] if part
-            ),
-        }
-        api_key = (
-            settings.llm_api_key
-            or settings.openai_api_key
-            or os.environ.get("LLM_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or "ollama"
+        _run_cmd_extra_env: dict[str, str] = build_skill_runtime_env(
+            execution_root=execution_root,
+            session_input_dir=session_input_dir,
         )
-        _run_cmd_extra_env["LLM_API_KEY"] = api_key
-        _run_cmd_extra_env["OPENAI_API_KEY"] = settings.openai_api_key or api_key
-        if session_input_dir is not None:
-            _run_cmd_extra_env["INPUT_SESSION_DIR"] = str(session_input_dir)
+        # Also expose cwd-based OUTPUT_DIR/INPUT_DIR for run_command tasks
+        if cwd:
+            _run_cmd_extra_env["OUTPUT_DIR"] = str(cwd / "outputs")
+            _run_cmd_extra_env["INPUT_DIR"] = str(cwd / "inputs")
 
         _effective_env = {**os.environ, **_run_cmd_extra_env}
         argv = [_expand_arg_env_vars(arg, _effective_env) for arg in argv]
@@ -2135,6 +2127,7 @@ def _execute_single_task(
             input_files=getattr(request, "input_files", []) or [],
             execution_root=execution_root,
             session_input_dir=session_input_dir,
+            previous_output_files=previous_output_files,
         )
 
         # Log warnings for any remaining non-existent input paths
@@ -2299,6 +2292,7 @@ def _execute_planned_actions(
     touched: list[Path] = []
     results: list[dict] = []
     logs: list[str] = []
+    accumulated_output_files: list[dict] = []  # output_files from all prior tasks
 
     for task in plan.get("tasks", []):
         if not isinstance(task, dict):
@@ -2314,10 +2308,15 @@ def _execute_planned_actions(
             inferred_skill_root=inferred_skill_root,
             skill_name=skill_name,
             session_input_dir=session_input_dir,
+            previous_output_files=accumulated_output_files or None,
         )
 
         touched.extend(task_touched)
         results.append(result)
+
+        # Collect output files from this task for subsequent tasks to reference
+        if result.get("output_files"):
+            accumulated_output_files.extend(result["output_files"])
 
         # Build logs from the result dict.
         if action == "read_resource":
@@ -3149,6 +3148,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         _exec_all_results: list[dict] = []
                         _exec_all_touched: list[Path] = []
                         _exec_completed_indices: list[int] = []
+                        _exec_accumulated_output_files: list[dict] = []  # output_files from prior tasks
 
                         # --- Progressive Resource Disclosure (需求4: 渐进式披露) ---
                         # Resource cache: maps resource_handle/path to loaded content.
@@ -3303,6 +3303,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                         inferred_skill_root=_exec_inferred_root,
                                         skill_name=parent_skill_name,
                                         session_input_dir=_exec_session_dir,
+                                        previous_output_files=_exec_accumulated_output_files or None,
                                     )
                                 )
 
@@ -3369,6 +3370,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             _exec_all_results.append(task_result)
                             _exec_all_touched.extend(task_touched)
                             _exec_completed_indices.append(task_idx)
+
+                            # Collect output files for subsequent tasks to reference
+                            if task_result.get("output_files"):
+                                _exec_accumulated_output_files.extend(task_result["output_files"])
 
                             # Build safe result data for the thought (truncate stdout/stderr).
                             _safe_result = {

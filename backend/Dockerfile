@@ -2,10 +2,27 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system runtimes needed by Skill scripts (Node.js, npm, Ruby …)
+# Install system runtimes and common CLI tools needed by Skill scripts.
+# Grouped by category:
+#   - Language runtimes: nodejs, npm, ruby
+#   - Database clients: sqlite3, mysql-client, postgresql-client
+#   - Media processing: ffmpeg, imagemagick
+#   - Document processing: poppler-utils (pdftotext), wkhtmltopdf (html→pdf)
+#   - Network tools: curl, wget, jq
+#   - Archive tools: zip, unzip
+#   - Version control: git
+#   - Infrastructure: openssh-server
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends nodejs npm ruby openssh-server && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+      nodejs npm ruby \
+      sqlite3 default-mysql-client postgresql-client \
+      ffmpeg imagemagick \
+      poppler-utils wkhtmltopdf \
+      curl wget jq \
+      zip unzip \
+      git \
+      openssh-server \
+    && rm -rf /var/lib/apt/lists/*
 
 # 配置SSH服务
 RUN mkdir -p /var/run/sshd && \

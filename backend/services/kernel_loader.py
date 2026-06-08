@@ -64,6 +64,15 @@ _ALLOWED_READ_SUFFIXES = {
     ".py",
 }
 
+# Binary file extensions that cannot be read as text but should return metadata
+_BINARY_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".svg", ".webp", ".ico",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+    ".sqlite", ".db", ".woff", ".woff2", ".ttf", ".eot",
+}
+
 
 def _parse_simple_frontmatter(text: str) -> tuple[dict, str]:
     """Parse YAML frontmatter from a SKILL.md string.
@@ -970,7 +979,7 @@ def resolve_skill_resource(skill: SkillPackage, rel_path: str) -> Path:
 
     suffix = resolved_path.suffix.lower()
 
-    if suffix not in _ALLOWED_READ_SUFFIXES:
+    if suffix not in _ALLOWED_READ_SUFFIXES and suffix not in _BINARY_SUFFIXES:
         raise ValueError(f"不允许直接读取该类型资源: {suffix}")
 
     return resolved_path
@@ -994,10 +1003,33 @@ def read_skill_resource_text(
 ) -> dict:
     """Read a bundled Skill resource safely.
 
-    这里只提供底层能力；是否读取由上层运行时决定。
+    对于文本文件，返回文件内容；对于二进制文件，返回文件元信息（大小、类型等），
+    不返回二进制内容本身，避免乱码。
     """
+    import mimetypes
+
     skill = _select_skill_for_resource_action(skill_name)
     path = resolve_skill_resource(skill, rel_path)
+
+    suffix = path.suffix.lower()
+
+    # Binary files: return metadata only, not content
+    if suffix in _BINARY_SUFFIXES:
+        stat = path.stat()
+        media_type, _ = mimetypes.guess_type(str(path))
+        return {
+            "action": "read_skill_resource",
+            "name": skill.name,
+            "path": rel_path,
+            "success": True,
+            "content": "",
+            "binary": True,
+            "size_bytes": stat.st_size,
+            "media_type": media_type or "application/octet-stream",
+            "suffix": suffix,
+            "truncated": False,
+            "note": f"二进制文件（{suffix}），无法以文本方式读取。脚本中可通过 Python 库（如 openpyxl、pypdf、Pillow 等）读取。",
+        }
 
     text = path.read_text(encoding="utf-8", errors="replace")
     truncated = False

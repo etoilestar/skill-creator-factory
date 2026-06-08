@@ -47,7 +47,7 @@ _SCRIPT_INTERPRETERS: dict[str, str] = {
     ".ts":   "ts-node",   # 特殊处理：通过 `npx ts-node` 执行
 }
 
-# 解释器 → apt 包名映射（运行时自动安装兜底）
+# 解释器/工具 → apt 包名映射（运行时自动安装兜底）
 _INTERPRETER_APT_PACKAGES: dict[str, str] = {
     "node":    "nodejs",
     "nodejs":  "nodejs",
@@ -57,6 +57,29 @@ _INTERPRETER_APT_PACKAGES: dict[str, str] = {
     "ruby":    "ruby",
     "bash":    "bash",
     "python3": "python3",
+    # 数据库客户端
+    "mysql":         "default-mysql-client",
+    "mysqldump":     "default-mysql-client",
+    "psql":          "postgresql-client",
+    "pg_dump":       "postgresql-client",
+    "sqlite3":       "sqlite3",
+    # 媒体处理
+    "ffmpeg":        "ffmpeg",
+    "convert":       "imagemagick",
+    "magick":        "imagemagick",
+    # 文档处理
+    "pdftotext":     "poppler-utils",
+    "pdftoppm":      "poppler-utils",
+    "wkhtmltopdf":   "wkhtmltopdf",
+    # 网络工具
+    "curl":          "curl",
+    "wget":          "wget",
+    "jq":            "jq",
+    # 压缩工具
+    "zip":           "zip",
+    "unzip":         "unzip",
+    # 版本控制
+    "git":           "git",
 }
 
 # 已尝试自动安装的解释器集合（避免同一进程内重复安装）

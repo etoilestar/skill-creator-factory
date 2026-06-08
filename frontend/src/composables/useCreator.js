@@ -60,7 +60,9 @@ export async function initSkill(skillName) {
  *   purpose: string,
  *   blueprintText: string,
  *   conversationHistory: Array,
- *   model?: string|null
+ *   model?: string|null,
+ *   role?: string|null,
+ *   skillPlanEntry?: object|null
  * }} params
  * @yields {string | {done:true} | {validation:object} | {error:string}}
  */
@@ -71,6 +73,8 @@ export async function* generateFileStream({
   blueprintText,
   conversationHistory,
   model = null,
+  role = null,
+  skillPlanEntry = null,
 }) {
   const resp = await fetch('/api/creator/generate-file', {
     method: 'POST',
@@ -82,6 +86,8 @@ export async function* generateFileStream({
       blueprint_text: blueprintText,
       conversation_history: conversationHistory,
       model,
+      role,
+      skill_plan_entry: skillPlanEntry,
     }),
   })
 
@@ -137,13 +143,21 @@ export async function* generateFileStream({
  * @param {string} skillName
  * @param {string} filePath  - e.g. "SKILL.md" or "scripts/main.py"
  * @param {string} content
+ * @param {string|null} [role]
+ * @param {object|null} [skillPlanEntry]
  * @returns {Promise<{success:boolean, path:string|null, bytes:number, message:string}>}
  */
-export async function writeFile(skillName, filePath, content) {
+export async function writeFile(skillName, filePath, content, role = null, skillPlanEntry = null) {
   const resp = await fetch('/api/creator/write-file', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName, file_path: filePath, content }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      file_path: filePath,
+      content,
+      role,
+      skill_plan_entry: skillPlanEntry,
+    }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))

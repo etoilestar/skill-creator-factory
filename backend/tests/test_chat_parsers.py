@@ -1094,7 +1094,8 @@ def test_runtime_planner_prompt_requires_fenced_block_trigger():
     assert "显式可执行 fenced code block 触发" in prompt
     assert "不要因为磁盘上存在脚本就直接规划 run_command" in prompt
     assert "禁止的 action：run_command、write_file、create_directory" in prompt
-
+    assert "mode=execute_workflow" in prompt
+    assert "Creator" not in prompt
 
 
 def test_normalize_plan_rejects_direct_run_command_trigger():
@@ -1482,8 +1483,9 @@ def test_creator_script_prompt_requires_platform_image_runtime_helper():
         file_path="scripts/generate_image.py",
         skill_name="image-skill",
         purpose="调用平台 diffusion 生成图片",
-        blueprint_text="需要根据用户输入生成图片",
+        blueprint_text="需要根据用户输入生成图片；role: image_generator",
         conversation_history=[],
+        role="image_generator",
     )
     prompt = messages[0]["content"]
 
@@ -1616,21 +1618,21 @@ def test_creator_trial_stdout_requires_json_object_for_scripts():
         _validate_trial_stdout_json(stdout=json.dumps({"error": "bad"}), content="print('{}')", args=[])
 
 
-def test_creator_trial_stdout_requires_image_path_for_image_helper():
+def test_creator_trial_stdout_accepts_arbitrary_non_empty_fields_for_image_helper():
     from backend.routers.creator import _validate_trial_stdout_json
 
-    with pytest.raises(ValueError, match="缺少可消费的图片路径字段"):
-        _validate_trial_stdout_json(
-            stdout=json.dumps({"text": "ok", "image_paths": []}),
-            content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
-            args=[],
-        )
-
     _validate_trial_stdout_json(
-        stdout=json.dumps({"text": "ok", "image_paths": ["outputs/demo.png"], "images": [{"image_path": "outputs/demo.png"}]}),
+        stdout=json.dumps({"picture_result": "ok"}),
         content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
         args=[],
     )
+
+    with pytest.raises(ValueError, match="至少需要一个非空字段"):
+        _validate_trial_stdout_json(
+            stdout=json.dumps({"picture_result": ""}),
+            content="from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+            args=[],
+        )
 
 
 def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
@@ -1653,7 +1655,7 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
         prepared["argv"] = argv
         prepared["cwd"] = kwargs.get("cwd")
         prepared["env"] = kwargs.get("env")
-        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
 
     monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
     monkeypatch.setattr(creator, "_scan_and_install_python_deps", fake_scan_and_install)
@@ -1944,7 +1946,21 @@ def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
     from backend.routers.creator import GenerateFileRequest
 
     bad_reference = "若当前无误，点击开始创建：系统将自动创建 references/style.md"
-    fixed_reference = "# 写作风格参考\n\n- 使用清晰的故事结构。\n- 描写画面、角色和情绪。"
+    fixed_reference = """# 写作风格参考
+
+## 规范
+- 使用清晰的三段式故事结构：开端、冲突、回响。
+- 描写画面、角色动作和情绪变化，避免空泛形容。
+
+## 示例
+- 好：雨夜里，角色先听到窗沿水声，再发现信纸被浸湿。
+
+## 反例
+- 坏：这个故事很感人、很精彩，但没有具体场景。
+
+## 约束
+- 禁止复制 Creator 流程文案；禁止只写口号式风格词。
+"""
     repair_prompts = []
     validator_prompts = []
 
@@ -1989,7 +2005,7 @@ def test_creator_reference_repair_loop_uses_contract_feedback(monkeypatch):
     assert "必须满足以下参考资料文件合同" in validator_prompts[0]
     assert "reference.no_creator_flow" in repair_prompts[0]
     assert "本轮修复模式：minimal_edit" in repair_prompts[0]
-    assert any(event.get("content") == fixed_reference for event in events)
+    assert any(str(event.get("content", "")).strip() == fixed_reference.strip() for event in events)
 
 def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     from backend.routers.creator import _build_generate_file_prompt
@@ -2432,7 +2448,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         repair_prompts.append(messages[-1]["content"])
         return repairs.pop(0)
 
-    def fake_trial_run(_skill_name, file_path, content):
+    def fake_trial_run(_skill_name, file_path, content, role=None):
         creator._validate_script_contract_static(
             file_path=file_path,
             content=content,
@@ -2450,6 +2466,7 @@ python scripts/generate.py '{"prompt":"{{prompt}}"}'
         purpose="生成脚本",
         blueprint_text=skill_md,
         conversation_history=[],
+        role="image_generator",
     )
 
     async def collect_events():
@@ -2593,3 +2610,659 @@ def test_creator_script_strict_rewrite_uses_extracted_candidate_not_fenced_draft
     assert "```" not in previous_body
     assert "scripts/generate_love_story.py" not in previous_body
     assert "import json" in previous_body
+
+
+def test_creator_skeleton_uses_role_not_blueprint_global_image_keyword():
+    from backend.routers.creator import _script_generation_skeleton
+
+    skeleton = _script_generation_skeleton(
+        "scripts/build_pdf.py",
+        "把已有 text 和 image_paths 排版成 PDF",
+        "复合流程：先生成图片，再调用 scripts/build_pdf.py 输出 PDF。",
+        role="pdf_builder",
+    )
+
+    assert "pdf_builder" in skeleton
+    assert "generate_stable_diffusion_image" not in skeleton
+    assert "pdf_path" in skeleton
+
+
+def test_blueprint_plan_adds_per_file_roles_and_contracts():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: riddle-book
+- scripts/：创建 `scripts/generate_riddle.py` role: text_generator 写谜语，`scripts/generate_image.py` role: image_generator 生成图片，`scripts/build_pdf.py` role: pdf_builder 构建 PDF
+- references/：创建 `references/pdf-layout-guide.md`
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    roles = {entry.path: entry.role for entry in plan.skill_plan.files}
+
+    assert roles["scripts/generate_riddle.py"] == "text_generator"
+    assert roles["scripts/generate_image.py"] == "image_generator"
+    assert roles["scripts/build_pdf.py"] == "pdf_builder"
+    assert roles["references/pdf-layout-guide.md"] == "reference"
+
+
+def test_creator_asset_contract_rejects_empty_and_invalid_json():
+    import pytest
+
+    from backend.routers.creator import _validate_asset_file_contract, ContractValidationError
+
+    with pytest.raises(ContractValidationError, match="asset 内容为空"):
+        _validate_asset_file_contract("assets/template.json", "")
+
+    with pytest.raises(ContractValidationError, match="不是合法 JSON"):
+        _validate_asset_file_contract("assets/template.json", "{bad json")
+
+    _validate_asset_file_contract("assets/template.json", '{"layout":"simple"}')
+
+
+def test_skill_plan_low_confidence_script_falls_back_to_generic_with_warning():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: utility-skill
+- scripts/：创建 `scripts/process.py` 处理输入
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/process.py")
+
+    assert entry.role == "generic_script"
+    assert entry.confidence < 0.7
+    assert "mentions" in " ".join(entry.heuristic_signals) or "python_script" in entry.heuristic_signals
+    assert any("generic_script" in warning and "高影响能力" in warning for warning in plan.warnings)
+
+
+def test_creator_forbidden_capability_blocks_pdf_builder_image_helper():
+    import pytest
+
+    from backend.routers.creator import ContractValidationError, _validate_script_file_source_contract
+
+    content = """import json
+from backend.services.skill_runtime import generate_stable_diffusion_image
+result = generate_stable_diffusion_image('cat')
+print(json.dumps({'pdf_path': 'out.pdf'}))
+"""
+
+    with pytest.raises(ContractValidationError, match="forbidden_image_generation"):
+        _validate_script_file_source_contract("scripts/build_pdf.py", content, role="pdf_builder")
+
+
+def test_creator_skill_md_prompt_requires_composite_orchestration():
+    from backend.routers.creator import _build_generate_file_prompt
+
+    messages = _build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="riddle-book",
+        purpose="复合任务总览",
+        blueprint_text="scripts/a.py role: text_generator\nreferences/a.md",
+        conversation_history=[],
+    )
+    prompt = messages[0]["content"]
+
+    assert "复合任务 orchestrator" in prompt
+    assert "执行顺序" in prompt
+    assert "outputs 如何传给下一步 inputs" in prompt
+    assert "详细规则必须引用 references/*.md" in prompt
+
+
+def test_creator_asset_contract_extension_aware_formats():
+    import base64
+    import pytest
+
+    from backend.routers.creator import _validate_asset_file_contract, ContractValidationError
+
+    _validate_asset_file_contract("assets/table.csv", "name,value\na,1\nb,2\n")
+    _validate_asset_file_contract("assets/doc.pdf", "%PDF-1.4\n" + "% test body\n" * 12 + "%%EOF\n")
+    png_64_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + (64).to_bytes(4, "big")
+        + (64).to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
+    _validate_asset_file_contract(
+        "assets/pixel.png",
+        base64.b64encode(png_64_header + b"0" * 32).decode("ascii"),
+    )
+
+    with pytest.raises(ContractValidationError, match="CSV 必须包含非空表头"):
+        _validate_asset_file_contract("assets/table.csv", "onlyheader\n")
+    with pytest.raises(ContractValidationError, match="必须以 %PDF-"):
+        _validate_asset_file_contract("assets/doc.pdf", "not a pdf")
+
+
+def test_blueprint_plan_parses_multiline_skillplan_role_contract():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """📋 Skill 架构蓝图
+- **Skill 名称**: composite-demo
+- scripts/：创建 `scripts/build.py`
+
+### SkillPlan / 文件职责计划
+- path: `scripts/build.py`
+  role: pdf_builder
+  inputs: [text]
+  outputs: [pdf_path, file_paths]
+  dependencies: [references/layout.md]
+  required_capabilities: [pdf_generation, file_output]
+  forbidden_capabilities: [image_generation]
+  references: [references/layout.md]
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/build.py")
+
+    assert entry.role == "pdf_builder"
+    assert "pdf_path" in entry.outputs
+    assert "image_generation" in entry.forbidden_capabilities
+
+
+def test_creator_write_file_request_accepts_role_contract_fields():
+    from backend.routers.creator import WriteFileRequest
+
+    request = WriteFileRequest(
+        skill_name="demo",
+        file_path="scripts/build.py",
+        content="print('{}')",
+        role="pdf_builder",
+        skill_plan_entry={"path": "scripts/build.py", "role": "pdf_builder"},
+    )
+
+    assert request.role == "pdf_builder"
+    assert request.skill_plan_entry["role"] == "pdf_builder"
+
+
+def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
+    from backend.routers.creator import _script_generation_skeleton
+
+    skeleton = _script_generation_skeleton(
+        "scripts/build_pdf.py",
+        "build report PDF",
+        "scripts/build_pdf.py role: pdf_builder",
+        role="pdf_builder",
+    )
+
+    assert "from fpdf import FPDF" in skeleton
+    assert "pdf.output" in skeleton
+    assert "write_bytes(b'%PDF-1.4" not in skeleton
+
+
+def test_runtime_resource_catalog_filters_missing_kernel_references(tmp_path):
+    from backend.routers.sandbox_chat import _extract_runtime_resource_catalog
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "scripts").mkdir()
+    (skill_root / "references" / "guide.md").write_text("local guide", encoding="utf-8")
+    (skill_root / "scripts" / "run.py").write_text("print('ok')", encoding="utf-8")
+    body = """
+Use `references/guide.md`.
+Do not expose missing kernel refs like `references/workflows.md` or `references/output-patterns.md`.
+Run `scripts/run.py`.
+"""
+
+    catalog = _extract_runtime_resource_catalog(body, execution_root=skill_root)
+    paths = {item["path"] for item in catalog}
+
+    assert "references/guide.md" in paths
+    assert "scripts/run.py" in paths
+    assert "references/workflows.md" not in paths
+    assert "references/output-patterns.md" not in paths
+
+
+def test_normalize_runtime_plan_marks_stale_resource_handle_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    skill_root.mkdir()
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        }
+    ]
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "read_resource", "resource_handle": "resource:0"}],
+        "errors": [],
+        "missing": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan, resource_catalog=catalog, execution_root=skill_root)
+
+    assert result["tasks"] == []
+    assert result["missing"]
+    assert result["missing"][0]["path"] == "references/missing.md"
+
+
+def test_compose_loaded_resources_returns_loaded_and_failed_paths(tmp_path):
+    from backend.routers.sandbox_chat import _compose_loaded_resources_prompt
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "references" / "best-practices.md").write_text("real guidance", encoding="utf-8")
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/best-practices.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+        {
+            "resource_handle": "resource:1",
+            "path": "references/missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+    ]
+
+    result = _compose_loaded_resources_prompt(
+        skill_name="",
+        resource_catalog=catalog,
+        selected_handles=["resource:0", "resource:1"],
+        execution_root=skill_root,
+    )
+
+    assert result["loaded_paths"] == ["references/best-practices.md"]
+    assert result["failed_paths"][0]["path"] == "references/missing.md"
+    assert result["failed_paths"][0]["missing_type"] == "file_missing"
+    assert "real guidance" in result["prompt"]
+
+
+def test_normalize_runtime_plan_removes_loaded_resource_false_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    (skill_root / "references").mkdir(parents=True)
+    (skill_root / "references" / "best-practices.md").write_text("exists", encoding="utf-8")
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/best-practices.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        }
+    ]
+    plan = {
+        "mode": "ask_user",
+        "actions": [],
+        "missing": [{"resource_handle": "resource:0", "path": "references/best-practices.md"}],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        resource_catalog=catalog,
+        execution_root=skill_root,
+        loaded_paths=["references/best-practices.md"],
+    )
+
+    assert result["missing"] == []
+    assert result["planner_inconsistent"][0]["path"] == "references/best-practices.md"
+    assert result["planner_inconsistent"][0]["missing_type"] == "planner_inconsistent"
+
+
+def test_normalize_runtime_plan_distinguishes_load_failed_from_file_missing(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skill"
+    skill_root.mkdir()
+    catalog = [
+        {
+            "resource_handle": "resource:0",
+            "path": "references/load-failed.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+        {
+            "resource_handle": "resource:1",
+            "path": "references/file-missing.md",
+            "kind": "references",
+            "allowed_actions": ["read_resource"],
+        },
+    ]
+    plan = {
+        "mode": "execute",
+        "actions": [
+            {"action": "read_resource", "resource_handle": "resource:0"},
+            {"action": "read_resource", "resource_handle": "resource:1"},
+        ],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        resource_catalog=catalog,
+        execution_root=skill_root,
+        failed_paths=[
+            {
+                "resource_handle": "resource:0",
+                "path": "references/load-failed.md",
+                "missing_type": "load_failed",
+                "reason": "decode failed",
+            }
+        ],
+    )
+
+    missing_by_path = {item["path"]: item for item in result["missing"]}
+    assert missing_by_path["references/load-failed.md"]["missing_type"] == "load_failed"
+    assert missing_by_path["references/file-missing.md"]["missing_type"] == "file_missing"
+
+
+def test_normalize_skill_runtime_plan_removes_planner_missing_when_script_exists(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "scripts" / "generate_fable.py").write_text("print('{}')", encoding="utf-8")
+    plan = {
+        "mode": "ask_user",
+        "actions": [],
+        "missing": [{"path": "scripts/generate_fable.py", "missing_type": "file_missing", "reason": "planner says missing"}],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(
+        plan,
+        execution_root=skill_root,
+        available_scripts=["scripts/generate_fable.py"],
+        command_contract={"has_executable_command_block": True, "action_schema": {"entries": [{"script_path": "scripts/generate_fable.py"}]}},
+    )
+
+    assert result["missing"] == []
+    assert result["mode"] == "direct_answer"
+    assert result["planner_inconsistent"][0]["missing_type"] == "planner_inconsistent"
+    assert result["planner_inconsistent"][0]["path"] == "scripts/generate_fable.py"
+
+
+def test_available_scripts_scans_only_execution_root_not_kernel(tmp_path):
+    from backend.routers.sandbox_chat import _available_scripts_for_root
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    kernel_root = tmp_path / "kernel"
+    (skill_root / "scripts").mkdir(parents=True)
+    (kernel_root / "scripts").mkdir(parents=True)
+    (skill_root / "scripts" / "generate_fable.py").write_text("print('{}')", encoding="utf-8")
+    (kernel_root / "scripts" / "kernel_tool.py").write_text("print('{}')", encoding="utf-8")
+
+    assert _available_scripts_for_root(skill_root) == ["scripts/generate_fable.py"]
+
+
+def test_stdout_html_and_asset_paths_become_output_files(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+
+    skill_root = tmp_path / "skills" / "html-skill"
+    out = skill_root / "assets" / "generated" / "page.html"
+    out.parent.mkdir(parents=True)
+    out.write_text("<!doctype html><html></html>", encoding="utf-8")
+    stdout = __import__("json").dumps({"html_path": "assets/generated/page.html", "asset_paths": ["assets/generated/page.html"]})
+
+    files = _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="html-skill")
+
+    assert files == [{"path": "assets/generated/page.html", "url": "/api/skills/html-skill/files/assets/generated/page.html"}]
+
+
+def test_resource_catalog_for_planner_includes_display_path_and_selector_prompt_has_no_creator_semantics():
+    from backend.routers.sandbox_chat import _compose_resource_selection_prompt, _resource_catalog_for_planner
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    planner_catalog = _resource_catalog_for_planner(catalog)
+    prompt = _compose_resource_selection_prompt()
+
+    assert planner_catalog[0]["display_path"] == "references/story_templates.md"
+    assert "resource:<filename>" in prompt
+    assert "resource:<path>" in prompt
+    assert "creator" not in prompt.lower()
+    assert "Creator" not in prompt
+
+
+def test_resource_selection_resolves_path_like_pseudo_handle_to_catalog_handle():
+    from backend.routers.sandbox_chat import _parse_resource_selection_decision
+
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    text = __import__("json").dumps({"need_resources": True, "resource_handles": ["resource:story_templates.md"], "reason": "need template"})
+
+    result = _parse_resource_selection_decision(text, resource_catalog=catalog)
+
+    assert result["need_resources"] is True
+    assert result["resource_handles"] == ["resource:0"]
+
+
+def test_normalize_skill_runtime_plan_resolves_path_like_read_resource_handle(tmp_path):
+    from backend.routers.sandbox_chat import _normalize_skill_runtime_plan
+
+    skill_root = tmp_path / "skills" / "fable-generator"
+    ref = skill_root / "references" / "story_templates.md"
+    ref.parent.mkdir(parents=True)
+    ref.write_text("template", encoding="utf-8")
+    catalog = [{"resource_handle": "resource:0", "path": "references/story_templates.md", "kind": "references", "allowed_actions": ["read_resource"]}]
+    plan = {
+        "mode": "execute",
+        "actions": [{"action": "read_resource", "resource_handle": "resource:story_templates.md"}],
+        "missing": [],
+        "errors": [],
+    }
+
+    result = _normalize_skill_runtime_plan(plan, resource_catalog=catalog, execution_root=skill_root)
+
+    assert result["mode"] == "execute"
+    assert result["tasks"][0]["resource_handle"] == "resource:0"
+    assert result["tasks"][0]["path"] == "references/story_templates.md"
+    assert result["planner_inconsistent"][0]["resolved_resource_handle"] == "resource:0"
+
+
+def _minimal_docx(path):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", "<w:document xmlns:w='urn:test'/>")
+
+
+def _minimal_pptx(path):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", ZIP_DEFLATED) as zf:
+        zf.writestr("ppt/presentation.xml", "<p:presentation xmlns:p='urn:test'/>")
+
+
+def test_creator_rejects_script_that_only_returns_pdf_path():
+    from backend.routers.creator import _validate_script_file_source_contract, ContractValidationError
+
+    content = "import json, sys\npayload=json.loads(sys.argv[1])\nprint(json.dumps({'pdf_path': 'comic_sketch.pdf'}))\n"
+    entry = {
+        "path": "scripts/export_pdf.py",
+        "role": "pdf_builder",
+        "inputs": ["payload"],
+        "outputs": ["pdf_path"],
+        "required_capabilities": ["pdf_generation", "file_output"],
+        "runtime": "python",
+        "language": "python",
+    }
+
+    with pytest.raises(ContractValidationError) as exc:
+        _validate_script_file_source_contract("scripts/export_pdf.py", content, skill_plan_entry=entry)
+
+    assert "真实创建对应文件" in str(exc.value)
+
+
+def test_creator_trial_stdout_accepts_real_document_outputs(tmp_path):
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    skill_dir = tmp_path / "skill"
+    scripts = skill_dir / "scripts"
+    out = skill_dir / "assets" / "generated"
+    scripts.mkdir(parents=True)
+    pdf = out / "real.pdf"
+    docx = out / "real.docx"
+    pptx = out / "real.pptx"
+    html = out / "real.html"
+    out.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+    _minimal_docx(docx)
+    _minimal_pptx(pptx)
+    html.write_text("<!doctype html><html></html>", encoding="utf-8")
+
+    _validate_trial_stdout_json(stdout=json.dumps({"pdf_path": "assets/generated/real.pdf"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"docx_path": "assets/generated/real.docx"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"pptx_path": "assets/generated/real.pptx"}), content="", args=[], skill_dir=skill_dir)
+    _validate_trial_stdout_json(stdout=json.dumps({"html_path": "assets/generated/real.html"}), content="", args=[], skill_dir=skill_dir)
+
+
+def test_exporter_plan_is_optional_by_default_and_composite_can_handle_text_images():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    exporter = build_skill_plan_entry(file_path="scripts/export_pdf.py", purpose="role: pdf_builder outputs: [pdf_path]")
+    composite = build_skill_plan_entry(
+        file_path="scripts/composite.py",
+        purpose="role: composite_generator required_capabilities: [text_generation, image_generation]",
+    )
+
+    assert exporter.required is False
+    assert exporter.can_skip is True
+    assert composite.role == "composite_generator"
+    assert set(composite.required_capabilities) >= {"text_generation", "image_generation"}
+
+
+def test_runtime_output_metadata_ignores_unrequested_export(tmp_path):
+    from backend.routers.sandbox_chat import _output_files_from_stdout_json
+
+    skill_root = tmp_path / "skills" / "story-skill"
+    skill_root.mkdir(parents=True)
+    stdout = json.dumps({"text": "story only", "image_paths": []})
+
+    assert _output_files_from_stdout_json(stdout, cwd=skill_root, skill_name="story-skill") == []
+
+
+def test_creator_allows_skill_local_references_with_kernel_like_names():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- references/: `references/output-patterns.md`, `references/workflows.md`
+"""
+    skill_md = """---
+name: local-patterns
+description: uses local same-name references
+---
+# local-patterns
+
+读取 `references/output-patterns.md` 获取本业务 Skill 的输出模板。
+读取 `references/workflows.md` 获取本业务 Skill 的处理流程。
+"""
+
+    failed = {result.id: result for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.resource.no_kernel_leak" not in failed
+    assert "skill_md.resource.local_declared" not in failed
+
+
+def test_creator_rejects_explicit_kernel_reference_path_with_matched_paths():
+    from backend.routers.creator import _check_skill_md_contract
+
+    skill_md = """---
+name: bad-kernel
+description: leaks explicit kernel path
+---
+# bad-kernel
+
+请读取 `kernel/references/output-patterns.md` 后再回答。
+"""
+
+    results = _check_skill_md_contract(skill_md, "")
+    leak = next(result for result in results if result.id == "skill_md.resource.no_kernel_leak")
+
+    assert not leak.passed
+    assert leak.matched_paths == ["kernel/references/output-patterns.md"]
+
+
+def test_creator_rejects_missing_bare_skill_local_reference_without_kernel_leak():
+    from backend.routers.creator import _check_skill_md_contract
+
+    skill_md = """---
+name: missing-local
+description: mentions missing local reference
+---
+# missing-local
+
+读取 `references/workflows.md` 中的业务流程说明。
+"""
+
+    results = _check_skill_md_contract(skill_md, "")
+    no_kernel = next(result for result in results if result.id == "skill_md.resource.no_kernel_leak")
+    local_exists = next(result for result in results if result.id == "skill_md.resource.local_declared")
+
+    assert no_kernel.passed
+    assert no_kernel.matched_paths == []
+    assert not local_exists.passed
+    assert local_exists.matched_paths == ["references/workflows.md"]
+
+
+def test_creator_rejects_large_kernel_reference_content_copy(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers.creator import _check_skill_md_contract
+
+    kernel_root = tmp_path / "kernel"
+    refs = kernel_root / "references"
+    refs.mkdir(parents=True)
+    copied = "\n".join(f"Creator-only workflow sentence number {i} with unique internal guidance." for i in range(80))
+    (refs / "workflows.md").write_text(copied, encoding="utf-8")
+    monkeypatch.setattr(settings, "kernel_path", kernel_root)
+    skill_md = f"""---
+name: copied-kernel
+description: copies internal kernel content
+---
+# copied-kernel
+
+{copied}
+"""
+
+    copy_check = next(
+        result
+        for result in _check_skill_md_contract(skill_md, "")
+        if result.id == "skill_md.resource.no_kernel_content_copy"
+    )
+
+    assert not copy_check.passed
+    assert copy_check.matched_paths == ["kernel/references/workflows.md"]
+
+
+def test_creator_validator_filters_model_invented_failed_checks():
+    from backend.routers.creator import _filter_validator_failed_checks
+
+    deterministic_failed = """- skill_md.frontmatter target=SKILL.md: frontmatter bad
+  expected: frontmatter
+  minimal_edit: add frontmatter
+"""
+    model_checks = [
+        {"id": "skill_md.frontmatter", "target": "SKILL.md"},
+        {"id": "skill_md.resource.no_kernel_leak", "target": "SKILL.md"},
+    ]
+
+    assert _filter_validator_failed_checks(model_checks, deterministic_failed) == [
+        {"id": "skill_md.frontmatter", "target": "SKILL.md"}
+    ]
+    assert _filter_validator_failed_checks(model_checks, "") == []
+
+def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    skill_dir = tmp_path / "skill"
+    out = skill_dir / "assets" / "generated"
+    out.mkdir(parents=True)
+    pdf = out / "business.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+
+    _validate_trial_stdout_json(
+        stdout=json.dumps({"contract_document": "assets/generated/business.pdf"}),
+        content="",
+        args=[],
+        role="pdf_builder",
+        skill_dir=skill_dir,
+        skill_plan_entry={"role": "pdf_builder", "outputs": ["pdf_path"], "required_capabilities": ["pdf_generation"]},
+    )

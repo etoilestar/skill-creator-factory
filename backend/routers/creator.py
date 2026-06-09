@@ -1664,14 +1664,29 @@ def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> l
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
 
-def _check_script_file_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> list[ContractCheckResult]:
-    plan_entry = _skill_plan_entry_for_file(file_path=file_path, role=role, skill_plan_entry=skill_plan_entry)
+def _check_script_file_contract(
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    plan_entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
     strict_interface = skill_plan_entry is not None
     stripped = content.strip()
     effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry)
-    has_markdown_or_bundle = "```" in stripped or "~~~" in stripped or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+
+    has_markdown_or_bundle = (
+        "```" in stripped
+        or "~~~" in stripped
+        or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+    )
     raw_ok = bool(stripped) and not has_markdown_or_bundle
-    results = [
+
+    results: list[ContractCheckResult] = [
         ContractCheckResult(
             id="script.raw_source.single_file",
             passed=raw_ok,
@@ -1685,12 +1700,14 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
         )
     ]
+
     if not raw_ok:
         return results
 
     syntax_ok = True
     syntax_message = f"{plan_entry.language} 源码基础校验通过。"
     syntax_expected = "脚本源码必须符合 language/runtime 的基础语法与入口约定。"
+
     if plan_entry.language == "python":
         try:
             ast.parse(stripped)
@@ -1700,12 +1717,21 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
         syntax_expected = "Python 脚本必须能通过 ast.parse 语法检查。"
     elif plan_entry.runtime == "node":
         syntax_ok = "process.argv" in stripped and "console.log" in stripped
-        syntax_message = "Node/JS 脚本包含 process.argv 和 stdout JSON 输出。" if syntax_ok else f"{file_path} Node/JS 脚本必须使用 process.argv 读取 JSON argv 并 console.log 输出 JSON。"
+        syntax_message = (
+            "Node/JS 脚本包含 process.argv 和 stdout JSON 输出。"
+            if syntax_ok
+            else f"{file_path} Node/JS 脚本必须使用 process.argv 读取 JSON argv 并 console.log 输出 JSON。"
+        )
         syntax_expected = "Node/JS 脚本必须使用 process.argv[2] + JSON.parse，并通过 console.log(JSON.stringify(...)) 输出 JSON。"
     elif plan_entry.runtime in {"bash", "shell"}:
         syntax_ok = "$1" in stripped or "${1" in stripped
-        syntax_message = "Shell/Bash 脚本读取 $1 JSON argv。" if syntax_ok else f"{file_path} Shell/Bash 脚本必须读取 $1 JSON argv。"
+        syntax_message = (
+            "Shell/Bash 脚本读取 $1 JSON argv。"
+            if syntax_ok
+            else f"{file_path} Shell/Bash 脚本必须读取 $1 JSON argv。"
+        )
         syntax_expected = "Shell/Bash 脚本必须读取 $1 JSON argv，并向 stdout 输出 JSON 或写入声明的文件产物。"
+
     results.append(
         ContractCheckResult(
             id="script.source.syntax",
@@ -1733,7 +1759,11 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="补充 runtime 对应 JSON argv 解析入口。",
             )
         )
-        uses_keys, missing_keys = _script_uses_input_keys(stripped, list(plan_entry.inputs or ["payload"]))
+
+        uses_keys, missing_keys = _script_uses_input_keys(
+            stripped,
+            list(plan_entry.inputs or ["payload"]),
+        )
         results.append(
             ContractCheckResult(
                 id="script.skillplan_inputs.used",
@@ -1748,34 +1778,27 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="在参数解析或业务逻辑中读取并使用缺失的 payload key。",
             )
         )
+
         has_entry = _script_has_main_entry(stripped, plan_entry.runtime)
         results.append(
             ContractCheckResult(
                 id="script.runtime.entrypoint",
                 passed=has_entry,
                 target=file_path,
-                message=("脚本包含 runtime 入口与 stdout 输出。" if has_entry else f"{file_path} 缺少 {plan_entry.runtime} 入口或 stdout 输出。"),
+                message=(
+                    "脚本包含 runtime 入口与 stdout 输出。"
+                    if has_entry
+                    else f"{file_path} 缺少 {plan_entry.runtime} 入口或 stdout 输出。"
+                ),
                 expected="脚本包含对应 runtime 的入口函数/语句，并向 stdout 输出 JSON。",
                 minimal_edit="补齐 main/入口调用和 JSON stdout 输出。",
             )
         )
-        missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
-        results.append(
-            ContractCheckResult(
-                id="script.required_capabilities.called",
-                passed=not missing_capabilities,
-                target=file_path,
-                message=(
-                    "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
-                    if not missing_capabilities
-                    else f"脚本未调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
-                ),
-                expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
-                minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
-            )
-        )
 
-    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
+    missing_capabilities = _script_required_capability_failures(
+        stripped,
+        effective_required_capabilities,
+    )
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
@@ -1786,60 +1809,19 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 if not missing_capabilities
                 else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
             ),
-            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
-            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
-        )
-    )
-
-    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
-    results.append(
-        ContractCheckResult(
-            id="script.required_capabilities.called",
-            passed=not missing_capabilities,
-            target=file_path,
-            message=(
-                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
-                if not missing_capabilities
-                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
+            expected=(
+                "text_generation 调用 generate_text_with_llm/平台 LLM；"
+                "image_generation 调用 generate_stable_diffusion_image；"
+                "pdf_generation 使用支持中文/UTF-8 的 reportlab/fpdf2/PDF 构建；"
+                "file_output 写入声明文件。"
             ),
-            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
             minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
         )
     )
 
-    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
-    results.append(
-        ContractCheckResult(
-            id="script.required_capabilities.called",
-            passed=not missing_capabilities,
-            target=file_path,
-            message=(
-                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
-                if not missing_capabilities
-                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
-            ),
-            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
-            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
-        )
+    enforce_artifact_outputs = strict_interface or bool(
+        _ARTIFACT_CAPABILITIES & set(effective_required_capabilities)
     )
-
-    missing_capabilities = _script_required_capability_failures(stripped, effective_required_capabilities)
-    results.append(
-        ContractCheckResult(
-            id="script.required_capabilities.called",
-            passed=not missing_capabilities,
-            target=file_path,
-            message=(
-                "脚本调用了 role.required_capabilities 对应的平台/文件能力。"
-                if not missing_capabilities
-                else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
-            ),
-            expected="text_generation 调用 generate_text_with_llm/平台 LLM；image_generation 调用 generate_stable_diffusion_image；pdf_generation 使用 reportlab/fpdf/PDF 构建；file_output 写入声明文件。",
-            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
-        )
-    )
-
-    enforce_artifact_outputs = strict_interface or bool(_ARTIFACT_CAPABILITIES & set(effective_required_capabilities))
     has_real_file_output = _script_has_real_file_creation_logic(
         stripped,
         outputs=list(plan_entry.outputs or []) if enforce_artifact_outputs else [],
@@ -1877,7 +1859,13 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
     )
 
     uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
-    if plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
+    if plan_entry.role in {
+        "pdf_builder",
+        "docx_builder",
+        "pptx_builder",
+        "html_asset_builder",
+        "asset_builder",
+    }:
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
@@ -1892,6 +1880,7 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="移除图片 helper 调用，只保留文件构建逻辑。",
             )
         )
+
     if "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -1908,7 +1897,13 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             )
         )
 
-    uses_text_helper = bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", stripped, re.IGNORECASE))
+    uses_text_helper = bool(
+        re.search(
+            r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
     if "text_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -1925,7 +1920,13 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             )
         )
 
-    writes_pdf = bool(re.search(r"\.pdf[\"']|pdf_path|FPDF|reportlab|PdfWriter|write_bytes\s*\(\s*b?[\"']%PDF-", stripped, re.IGNORECASE))
+    writes_pdf = bool(
+        re.search(
+            r"\.pdf[\"']|pdf_path|FPDF|reportlab|PdfWriter|write_bytes\s*\(\s*b?[\"']%PDF-",
+            stripped,
+            re.IGNORECASE,
+        )
+    )
     if "pdf_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
@@ -1942,8 +1943,71 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
             )
         )
 
+    pdf_outputs_declared = bool({"pdf_path", "file_paths"} & set(plan_entry.outputs or []))
+    pdf_required = "pdf_generation" in set(effective_required_capabilities)
+    is_pdf_builder = plan_entry.role == "pdf_builder" or pdf_outputs_declared or pdf_required
+
+    if is_pdf_builder:
+        uses_fpdf = bool(
+            re.search(
+                r"\bFPDF\b|from\s+fpdf\s+import|import\s+fpdf",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
+        uses_core_font = bool(
+            re.search(
+                r"set_font\s*\(\s*['\"](?:Helvetica|Arial|Times|Courier|Symbol|ZapfDingbats)['\"]",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
+        has_unicode_pdf_support = bool(
+            re.search(
+                r"UnicodeCIDFont|TTFont|pdfmetrics\.registerFont|add_font\s*\(|uni\s*=\s*True|reportlab\.pdfbase|cidfonts|STSong-Light|NotoSans|DejaVu|SimSun|SourceHan",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
+        raw_minimal_pdf = bool(
+            re.search(
+                r"write_bytes\s*\(\s*b?[\"']%PDF-",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
+        unsafe_fpdf_core_font = uses_fpdf and uses_core_font and not has_unicode_pdf_support
+
+        results.append(
+            ContractCheckResult(
+                id="script.pdf_builder.unicode_text_supported",
+                passed=(not unsafe_fpdf_core_font) and (has_unicode_pdf_support or raw_minimal_pdf or not uses_fpdf),
+                target=file_path,
+                message=(
+                    "pdf_builder 包含中文/UTF-8 安全的 PDF 文本方案。"
+                    if (not unsafe_fpdf_core_font) and (has_unicode_pdf_support or raw_minimal_pdf or not uses_fpdf)
+                    else f"{file_path} 使用 fpdf 默认核心字体写入文本，中文会触发 latin-1 UnicodeEncodeError。"
+                ),
+                expected=(
+                    "PDF 构建脚本必须能处理中文/UTF-8 文本。"
+                    "推荐 reportlab.pdfbase.cidfonts.UnicodeCIDFont('STSong-Light')；"
+                    "或 reportlab + TTFont；"
+                    "或 fpdf2 + add_font 加载可用 TTF 字体后再 set_font。"
+                    "禁止用 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本。"
+                ),
+                minimal_edit=(
+                    "把 fpdf 默认字体方案替换为支持 Unicode 的 PDF 方案；"
+                    "不要通过 try/except 输出 error、{} 或空 pdf_path 来绕过试运行。"
+                ),
+            )
+        )
+
     if plan_entry.role == "image_generator":
-        pdf_only = ("pdf_path" in stripped or "file_paths" in stripped) and "image_paths" not in stripped and "images" not in stripped
+        pdf_only = (
+            ("pdf_path" in stripped or "file_paths" in stripped)
+            and "image_paths" not in stripped
+            and "images" not in stripped
+        )
         results.append(
             ContractCheckResult(
                 id="script.role.image_forbidden_pdf_only_outputs",
@@ -1958,8 +2022,8 @@ def _check_script_file_contract(file_path: str, content: str, role: str | None =
                 minimal_edit="返回 image_paths/images 并删除 PDF 写入逻辑；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
             )
         )
-    return results
 
+    return results
 
 def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
     # Accept otherwise-valid raw source with a dangling orphan fence marker at
@@ -2716,8 +2780,10 @@ _MISSING_SKILL_REFERENCE_RE = re.compile(
 
 def _targeted_generated_file_repair_instructions(*, file_path: str, deterministic_error: str) -> str:
     """Return deterministic, actionable instructions for recurring validation failures."""
+    error_text = deterministic_error or ""
+
     if file_path == "SKILL.md":
-        script_match = _MISSING_SKILL_SCRIPT_BLOCK_RE.search(deterministic_error)
+        script_match = _MISSING_SKILL_SCRIPT_BLOCK_RE.search(error_text)
         if script_match:
             script_path = script_match.group("script")
             return (
@@ -2731,7 +2797,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "```"
             )
 
-        reference_match = _MISSING_SKILL_REFERENCE_RE.search(deterministic_error)
+        reference_match = _MISSING_SKILL_REFERENCE_RE.search(error_text)
         if reference_match:
             reference_path = reference_match.group("reference")
             return (
@@ -2739,13 +2805,13 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "并说明何时读取该 reference；不要只泛称‘参考资料’。"
             )
 
-        if "Creator 界面流程" in deterministic_error:
+        if "Creator 界面流程" in error_text:
             return (
                 "删除 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等 UI 文案；"
                 "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
             )
 
-        if "skill_md.resource.local_declared" in deterministic_error or "未在本轮生成或当前 Skill 中不存在" in deterministic_error:
+        if "skill_md.resource.local_declared" in error_text or "未在本轮生成或当前 Skill 中不存在" in error_text:
             return (
                 "删除最终 SKILL.md 中未声明/不存在的 references/assets/scripts 引用，尤其是 Creator 内部 kernel references "
                 "（references/workflows.md、references/output-patterns.md、references/best-practices.md 等）。"
@@ -2754,37 +2820,101 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             )
 
     if file_path.startswith("scripts/"):
-        if "Markdown 代码块或多文件包" in deterministic_error or "script.raw_source.single_file" in deterministic_error:
+        lower_error = error_text.lower()
+
+        if (
+            "unicodeencodeerror" in lower_error
+            and "latin-1" in lower_error
+            and (
+                "fpdf" in lower_error
+                or "pdf.output" in lower_error
+                or "build_pdf" in lower_error
+                or file_path.endswith("build_pdf.py")
+            )
+        ):
+            return (
+                "这是 PDF 中文/UTF-8 编码根因错误，不是 stdout/ensure_ascii 问题。"
+                "当前失败来自 fpdf 默认核心字体（Helvetica/Arial/Times/Courier）只能写 latin-1，不能写中文。\n"
+                "必须修复真实 PDF 生成逻辑：\n"
+                "1. 禁止继续使用 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本；\n"
+                "2. 优先改用 reportlab.pdfgen.canvas，并注册 reportlab.pdfbase.cidfonts.UnicodeCIDFont('STSong-Light') 后 setFont('STSong-Light', size)；\n"
+                "3. 或使用 reportlab.pdfbase.ttfonts.TTFont / fpdf2 add_font 加载可用 TTF 字体后再写文本；\n"
+                "4. 保留 sys.argv[1] JSON 输入协议，继续读取现有 SkillPlan inputs，不要改 SKILL.md 或蓝图；\n"
+                "5. stdout 必须输出真实存在的 pdf_path/file_paths，且文件必须是合法 PDF；\n"
+                "6. 不允许通过 try/except 输出 {'error': ...}、{}、{'pdf_path': ''} 或空 file_paths 来绕过试运行；\n"
+                "7. 修复目标是让包含中文的 article_text/story_text/text/content 能成功写入 PDF。"
+            )
+
+        if (
+            "script.pdf_builder.unicode_text_supported" in error_text
+            or "latin-1 UnicodeEncodeError" in error_text
+            or "fpdf 默认核心字体" in error_text
+            or "PDF 构建脚本必须能处理中文" in error_text
+        ):
+            return (
+                "按 pdf_builder Unicode 合同修复："
+                "把 fpdf 默认字体方案替换为支持中文/UTF-8 的 PDF 方案。"
+                "推荐使用 reportlab + UnicodeCIDFont('STSong-Light')；"
+                "或 reportlab + TTFont；"
+                "或 fpdf2 + add_font 加载 TTF。"
+                "禁止只改 ensure_ascii、禁止吞异常输出 error/{}、禁止返回空 pdf_path。"
+            )
+
+        if (
+            "stdout JSON 不得包含 error 字段" in error_text
+            or "stdout JSON 至少需要一个非空字段" in error_text
+            or "stdout={}" in error_text
+            or '"pdf_path": ""' in error_text
+            or "'pdf_path': ''" in error_text
+        ):
+            return (
+                "不要通过 try/except 输出 error、{}、空 pdf_path 或空 file_paths 来绕过试运行。"
+                "必须修复导致异常的真实代码路径，并输出真实存在的文件路径。"
+                "如果当前脚本是 PDF 构建脚本，重点检查是否仍在用 fpdf 默认 Helvetica/Arial/Times/Courier 写中文；"
+                "需要改为支持中文/UTF-8 的 PDF 生成方案。"
+            )
+
+        if "Markdown 代码块或多文件包" in error_text or "script.raw_source.single_file" in error_text:
             return (
                 "本轮必须把上一次内容改成单个裸脚本源码：删除所有 ``` fence、```python/```text 标签、"
                 "文件路径标题、写入文件标签、解释性文字和多文件包内容；最终响应第一个字符应是脚本源码字符。"
             )
-        if "forbidden_image_generation" in deterministic_error or "调用了图片生成 helper" in deterministic_error:
+
+        if "forbidden_image_generation" in error_text or "调用了图片生成 helper" in error_text:
             return (
                 "当前脚本的 SkillPlan forbidden_capabilities 禁止 image_generation，因此 validator 禁止调用 generate_stable_diffusion_image。"
                 "蓝图和 SKILL.md 确定后不能由后台修复流程修改；只能修当前脚本，使其与既有 role、required_capabilities 和 SKILL.md 数据流一致。"
             )
-        if "script.required_capabilities.called" in deterministic_error or "未调用这些 required_capabilities" in deterministic_error or "没有调用这些 required_capabilities" in deterministic_error:
+
+        if (
+            "script.required_capabilities.called" in error_text
+            or "未调用这些 required_capabilities" in error_text
+            or "没有调用这些 required_capabilities" in error_text
+        ):
             return (
                 "按当前脚本的 SkillPlan role + 有效 required_capabilities 补齐真实能力调用：包含 image_generation 必须调用 generate_stable_diffusion_image；"
                 "包含 text_generation 必须调用 generate_text_with_llm 或平台 LLM；pdf_builder/exporter 默认只需真实创建文件，并在 stdout JSON 任意业务字段中返回路径，不要因 SKILL.md 全局模型说明而补模型调用。"
+                "PDF 构建脚本必须支持中文/UTF-8 文本，禁止用 fpdf 默认核心字体写 payload 文本。"
                 "禁止返回固定 f-string/template-only 文本或 placeholder；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
-        if "试运行" in deterministic_error or "JSON 参数" in deterministic_error or "合法 Python" in deterministic_error:
+
+        if "试运行" in error_text or "JSON 参数" in error_text or "合法 Python" in error_text:
             return (
                 "按脚本合同修复：保持单文件源码，修正语法/参数解析/运行错误；"
-                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON，至少包含一个非空字段；字段名由现有 SKILL.md 变量消费关系决定，不要修改蓝图或 SKILL.md。"
+                "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON，至少包含一个非空字段；"
+                "字段名由现有 SKILL.md 变量消费关系决定，不要修改蓝图或 SKILL.md。"
+                "不要通过 try/except 输出 error、{}、空路径来掩盖真实异常；必须修复导致试运行失败的代码。"
             )
 
     if file_path.startswith("assets/"):
-        if "contract 未通过" in deterministic_error or "asset" in deterministic_error or "JSON" in deterministic_error:
+        if "contract 未通过" in error_text or "asset" in error_text or "JSON" in error_text:
             return (
                 "按 asset 合同修复：只输出当前资源文件内容；确保非空、JSON 可解析，"
                 "删除 Creator 流程、多文件包和运行时代码。"
             )
 
     if file_path.startswith("references/"):
-        if "contract 未通过" in deterministic_error or "多文件包" in deterministic_error or "Creator" in deterministic_error:
+        if "contract 未通过" in error_text or "多文件包" in error_text or "Creator" in error_text:
             return (
                 "按 reference 合同修复：只输出当前参考资料 Markdown 正文；"
                 "删除 Creator 流程、写入文件标签、多文件包和其它文件路径标题。"

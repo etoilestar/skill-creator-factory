@@ -3159,7 +3159,17 @@ async def _execute_workflow_from_dataflow_plan(
             try:
                 payload = parse_stdout_context(raw_stdout)
             except ValueError as exc:
-                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout must be JSON object. {exc}") from exc
+                # Non-JSON stdout (e.g., progress messages, empty output) should
+                # not crash the entire workflow.  Degrade to an empty dict and
+                # log a warning so downstream steps still execute.
+                logger.warning(
+                    "workflow step %s stdout is not valid JSON, treating as empty context: %s  raw_stdout=%.300s",
+                    script_path, exc, raw_stdout,
+                )
+                workflow_logs.append(
+                    f"workflow step {script_path} stdout is not valid JSON, treating as empty context: {exc}"
+                )
+                payload = {}
 
             payload_before_align_summary = _workflow_payload_summary(dict(payload))
 
@@ -3333,7 +3343,11 @@ async def _execute_skill_workflow_legacy(
             try:
                 payload = parse_stdout_context(str(result.get("stdout") or ""))
             except ValueError as exc:
-                raise ValueError(f"workflow_stdout_invalid: {script_path} stdout 必须是 JSON object。{exc}") from exc
+                logger.warning(
+                    "workflow legacy step %s stdout is not valid JSON, treating as empty context: %s",
+                    script_path, exc,
+                )
+                payload = {}
             step_payloads.append(payload)
             merge_step_output(context, script_path, payload)
         if len(step_contexts) > 1:
@@ -3394,8 +3408,18 @@ def _execute_single_task(
         rel_path = str(task.get("path") or "").strip()
         if not rel_path:
             raise ValueError("read_resource 任务缺少 path")
-        if not skill_name:
-            raise ValueError("read_resource 任务缺少 skill_name，无法确定读取哪个 Skill 的资源")
+        if not skill_name and execution_root is None:
+            raise ValueError("read_resource 任务缺少 skill_name 或 execution_root，无法确定读取哪个 Skill 的资源")
+
+        # Validate sandbox boundary and file existence
+        if execution_root is not None:
+            resource_root = execution_root.resolve()
+            resource_path = (resource_root / rel_path).resolve()
+            if not _is_within_sandbox(resource_path, resource_root) or not resource_path.is_file():
+                raise FileNotFoundError(f"read_resource resource does not exist in current skill: {rel_path}")
+            if rel_path.startswith("assets/"):
+                _validate_runtime_asset_contract(resource_path, root=resource_root)
+
         observation = read_skill_resource_text(
             skill_name, rel_path, max_chars=settings.skill_resource_max_chars
         )
@@ -3465,6 +3489,9 @@ def _execute_single_task(
         stdin_text = task.get("stdin", None)
         if stdin_text is not None:
             stdin_text = str(stdin_text)
+
+        # Pre-execution: validate command against the Skill's declared Action schema
+        action_entry = _validate_runtime_command_against_action_schema(command, execution_root=execution_root)
 
         cwd = execution_root or inferred_skill_root
         if cwd is not None and not cwd.exists():
@@ -3587,7 +3614,7 @@ def _execute_single_task(
                     raw_deps = chinese_missing.group(1)
                     pkg_list = [
                         p.strip()
-                        for p in re.split(r"[,，、；\s]", raw_deps)
+                        for p in re.split(r"[,，、;；]\s*", raw_deps)
                         if p.strip()
                     ]
                     for dep in pkg_list:
@@ -3615,8 +3642,23 @@ def _execute_single_task(
 
         assert completed is not None  # noqa: S101 – loop always runs at least once (range >= 1)
         success = completed.returncode == 0
+        validation_error = ""
+        validation_code = ""
         if success:
-            _validate_success_stdout_json_if_structured(completed.stdout)
+            try:
+                _validate_success_stdout_json_if_structured(completed.stdout)
+                _validate_stdout_against_action_entry(completed.stdout, action_entry)
+                if cwd is not None:
+                    validate_stdout_file_outputs(completed.stdout, skill_dir=cwd, cwd=cwd / "scripts")
+                if action_entry and str(action_entry.get("role") or "") in {"html_asset_builder", "asset_builder"}:
+                    _validate_html_asset_outputs_in_generated_dir(completed.stdout, cwd=cwd)
+            except FileOutputValidationError as exc:
+                success = False
+                validation_error = str(exc)
+                validation_code = exc.code
+            except ValueError as exc:
+                success = False
+                validation_error = str(exc)
 
         result: dict = {
             "action": action,
@@ -3625,9 +3667,13 @@ def _execute_single_task(
             "success": success,
             "returncode": completed.returncode,
             "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stderr": (completed.stderr or "") + ("\n" if completed.stderr and validation_error else "") + validation_error,
             "reason": reason,
         }
+        if validation_error:
+            result["message"] = validation_error
+        if validation_code:
+            result["error"] = validation_code
 
         # Detect newly created files and attach download metadata.
         effective_skill_name = skill_name or (cwd.name if cwd else "")
@@ -3642,6 +3688,12 @@ def _execute_single_task(
                     }
                     for f in new_files
                 ]
+            # Also extract output files declared in structured JSON stdout
+            declared_output_files = _output_files_from_stdout_json(completed.stdout, cwd=cwd, skill_name=effective_skill_name)
+            if declared_output_files:
+                by_path = {item["path"]: item for item in result.get("output_files") or []}
+                by_path.update({item["path"]: item for item in declared_output_files})
+                result["output_files"] = list(by_path.values())
 
         return result, touched
 
@@ -4051,6 +4103,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
     async def generate():
         try:
+            # Track resource loading status across rounds
+            loaded_resource_paths: list[str] = []
+            failed_resource_paths: list[dict] = []
+
             # --- Step-skipping: resolve session state & intent ---
             session_state: SandboxSessionState | None = None
             intent = DialogIntent.NEW_TASK
@@ -4285,12 +4341,16 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     if resource_decision.get("need_resources"):
                         selected = resource_decision.get("resource_handles") or []
                         yield _sse({"status": {"phase": "loading_resources", "message": f"加载 {len(selected)} 个资源…"}})
-                        loaded_resources_prompt = _compose_loaded_resources_prompt(
+                        loaded_result = _compose_loaded_resources_prompt(
                             skill_name=parent_skill_name,
                             resource_catalog=resource_catalog,
                             selected_handles=selected,
+                            execution_root=execution_root,
                         )
 
+                        loaded_resource_paths = loaded_result.get("loaded_paths", [])
+                        failed_resource_paths = loaded_result.get("failed_paths", [])
+                        loaded_resources_prompt = loaded_result.get("prompt", "")
                         if loaded_resources_prompt:
                             body_prompt = body_prompt + loaded_resources_prompt
 
@@ -4403,6 +4463,9 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         request=request,
                         model=model,
                         execution_root=execution_root,
+                        skill_name=parent_skill_name,
+                        loaded_paths=loaded_resource_paths,
+                        failed_paths=failed_resource_paths,
                     )
 
                     response_route = route_model(
@@ -4526,18 +4589,20 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     if mode == "execute_workflow":
                         try:
                             yield _sse({"status": {"phase": "executing_workflow", "message": "执行工作流…"}})
-                            command_contract = _extract_skill_command_contract(
-                                body_prompt, execution_root=execution_root
-                            )
                             action_schema = _build_runtime_action_schema(body_prompt, execution_root=execution_root)
+                            if action_schema.get("errors"):
+                                raise ValueError("Skill Action schema 校验失败: " + json.dumps(action_schema["errors"], ensure_ascii=False))
+
+                            user_context = _workflow_context_from_request_text(
+                                _last_user_text(request),
+                                first_entry=(action_schema.get("entries") or [{}])[0] if action_schema.get("entries") else {},
+                            )
                             workflow_result = await _execute_skill_workflow(
-                                body_prompt=body_prompt,
-                                request=request,
-                                model=model,
                                 execution_root=execution_root,
-                                skill_name=parent_skill_name,
-                                command_contract=command_contract,
                                 action_schema=action_schema,
+                                user_context=user_context,
+                                request=request,
+                                skill_name=parent_skill_name,
                             )
 
                             _exec_all_output_files = workflow_result.get("output_files") or []
@@ -4927,14 +4992,27 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "planned_followup_commands": _planned_followup_commands,
                         }
 
+                        # Guard: if the plan expected a run_command observation but none succeeded,
+                        # skip the final LLM answer and inform the user instead.
+                        if (
+                            _execution_requires_run_command_observation(runtime_plan)
+                            and not _has_successful_run_command_observation(_exec_all_results)
+                        ):
+                            yield _sse({"content": "已完成前置资源读取，但本轮没有获得成功的 run_command observation，无法生成最终回答。请检查脚本是否正确执行。"})
+                            yield "data: [DONE]\n\n"
+                            return
+
                         yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
-                        final_answer = await _generate_final_answer_from_observation(
-                            body_prompt=body_prompt,
-                            request=request,
-                            model=response_model,
-                            plan=runtime_plan,
-                            execution_result=exec_result,
-                        )
+                        # Fast path: try rendering stdout directly without LLM call
+                        final_answer = _render_success_stdout_payload(exec_result)
+                        if final_answer is None:
+                            final_answer = await _generate_final_answer_from_observation(
+                                body_prompt=body_prompt,
+                                request=request,
+                                model=response_model,
+                                plan=runtime_plan,
+                                execution_result=exec_result,
+                            )
                         final_answer = _finalize_answer_output_file_links(final_answer, _exec_all_output_files)
                         yield _thought(
                             "final_answer",

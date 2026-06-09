@@ -94,6 +94,13 @@
           >
             跳过
           </button>
+          <button
+            v-if="canRemoveFile(file)"
+            class="btn-small btn-remove"
+            @click="removeFile(idx)"
+          >
+            移除
+          </button>
         </span>
 
         <!-- Inline editor for preview/error states -->
@@ -305,6 +312,14 @@ function canSkipFile(file) {
   )
 }
 
+function canRemoveFile(file) {
+  return (
+    file.path !== 'SKILL.md' &&
+    file.status !== 'generating' &&
+    file.status !== 'writing'
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Name editing
 // ---------------------------------------------------------------------------
@@ -347,9 +362,13 @@ function addFile() {
   }
   localFiles.value.push({
     path,
-    purpose: newFilePurpose.value.trim() || path,
-    required: true,
-    can_skip: false,
+    purpose: newFilePurpose.value.trim() || (
+        path === 'SKILL.md'
+        ? 'Skill 核心说明文件'
+        : `${path} 的职责待确认；请补充 role/inputs/outputs/capabilities 后再生成`
+    ),
+    required: path === 'SKILL.md',
+    can_skip: path !== 'SKILL.md',
     file_type: path === 'SKILL.md' ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
     role: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'generic_script')),
     inputs: [],
@@ -374,6 +393,23 @@ function addFile() {
 
 function skipFile(idx) {
   localFiles.value[idx].status = 'skipped'
+}
+
+function removeFile(idx) {
+  const file = localFiles.value[idx]
+  if (!file || file.path === 'SKILL.md') return
+
+  const hasContent =
+    file.status === 'done' ||
+    file.status === 'preview' ||
+    Boolean(file.generatedContent?.trim())
+
+  if (hasContent) {
+    const ok = window.confirm(`确认从待生成列表移除 ${file.path}？\n已写入磁盘的文件不会在这里删除。`)
+    if (!ok) return
+  }
+
+  localFiles.value.splice(idx, 1)
 }
 
 function togglePreview(idx) {

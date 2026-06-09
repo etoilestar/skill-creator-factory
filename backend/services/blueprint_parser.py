@@ -106,6 +106,95 @@ _SCRIPT_EXTENSIONS: frozenset[str] = frozenset(
     {".py", ".js", ".ts", ".sh", ".bash", ".rb", ".mjs", ".cjs"}
 )
 
+_PLACEHOLDER_SCRIPT_STEMS: frozenset[str] = frozenset({
+    "foo",
+    "bar",
+    "baz",
+    "demo",
+    "example",
+    "sample",
+    "test",
+    "tmp",
+    "temp",
+    "placeholder",
+})
+
+
+def _script_path_has_concrete_contract(path: str, blueprint_text: str, purpose: str = "") -> bool:
+    """Return True if a suspicious script path has enough local evidence.
+
+    We only allow placeholder-like names when the blueprint explicitly gives a
+    concrete contract near that path, for example role/inputs/outputs/capabilities
+    or a real workflow command using it.  This avoids prompt-leaked examples such
+    as `scripts/foo.py` entering the generation queue.
+    """
+    text = blueprint_text or ""
+    purpose_text = purpose or ""
+
+    # Strong evidence: the path appears near explicit contract fields.
+    for occurrence in re.finditer(re.escape(path), text):
+        start = max(0, occurrence.start() - 500)
+        end = min(len(text), occurrence.end() + 900)
+        nearby = text[start:end]
+        if re.search(
+            r"\b(role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities)\b\s*[：:=]",
+            nearby,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"(职责|输入|输出|依赖|能力|调用|生成|构建|读取|写入)\s*[：:=]",
+            nearby,
+            re.IGNORECASE,
+        ):
+            return True
+
+    # Purpose from parsed section is concrete enough.
+    if re.search(
+        r"(生成|构建|读取|写入|合并|导出|调用|模型|图片|图像|PDF|文档|故事|文本|报告|role|inputs|outputs|capabilities)",
+        purpose_text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # A real command line with JSON argv is concrete evidence.
+    if re.search(
+        rf"(?:python|python3|node|bash|sh)\s+{re.escape(path)}\s+['\"]?\{{",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _is_probable_prompt_leaked_script(path: str, *, purpose: str = "", blueprint_text: str = "") -> bool:
+    """Detect placeholder scripts likely leaked from prompt examples.
+
+    This is intentionally conservative:
+    - Only applies to scripts/*
+    - Only applies to generic placeholder-like file names
+    - Does not block the file if the blueprint gives a concrete local contract
+    """
+    normalized = path.strip().replace("\\", "/")
+    if not normalized.startswith("scripts/"):
+        return False
+
+    file_name = Path(normalized).name
+    stem = Path(file_name).stem.lower()
+    suffix = Path(file_name).suffix.lower()
+
+    if suffix not in _SCRIPT_EXTENSIONS:
+        return False
+
+    if stem not in _PLACEHOLDER_SCRIPT_STEMS:
+        return False
+
+    return not _script_path_has_concrete_contract(
+        normalized,
+        blueprint_text=blueprint_text,
+        purpose=purpose,
+    )
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -182,6 +271,11 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     """Extract the list of files to generate from the blueprint body.
 
     Returns (files, warnings).  All paths are relative to the skill root.
+
+    Important guard:
+    placeholder-like scripts such as scripts/foo.py are ignored unless the
+    confirmed blueprint gives them a concrete local contract.  This prevents
+    prompt-leaked example paths from entering the Creator generation queue.
     """
     files: list[FileSpec] = []
     warnings: list[str] = []
@@ -194,13 +288,29 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         required: bool = True,
         can_skip: bool = False,
     ) -> None:
+        path = path.strip().replace("\\", "/").strip("`'\"，,。.;；")
+        if not path:
+            return
+
         if _contains_path_wildcard(path):
             warning = f"忽略通配符文件路径 {path}；Creator 只能逐个生成具体文件，请在蓝图中展开为具体文件名。"
             if warning not in warnings:
                 warnings.append(warning)
             return
+
+        if _is_probable_prompt_leaked_script(path, purpose=purpose, blueprint_text=blueprint_text):
+            warning = (
+                f"已忽略疑似提示词示例/泄露脚本 {path}；"
+                "该文件名像占位示例，且蓝图附近没有明确 role/inputs/outputs/capabilities。"
+                "如果确实需要该脚本，请在蓝图中明确它的职责、输入、输出和能力后重新添加。"
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+            return
+
         if path in seen:
             return
+
         seen.add(path)
         files.append(
             FileSpec(path=path, purpose=purpose, required=required, can_skip=can_skip)
@@ -217,10 +327,11 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     if m_scripts:
         scripts_desc = m_scripts.group(1).strip()
 
-    # 3. Entry-point line (higher priority than section scan)
+    # 3. Entry-point line, higher priority than section scan
     m_entry = _ENTRY_SCRIPT_RE.search(blueprint_text)
     if m_entry:
-        raw_entry = m_entry.group(2).strip().split()[0]  # first token
+        raw_entry = m_entry.group(2).strip().split()[0]
+        raw_entry = raw_entry.strip("`'\"，,。.;；")
         if raw_entry and not _should_skip(raw_entry):
             if not raw_entry.startswith("scripts/"):
                 raw_entry = "scripts/" + Path(raw_entry).name
@@ -230,10 +341,9 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     for path in _extract_inline_paths(blueprint_text, "scripts"):
         _add(path, scripts_desc or "Skill 执行脚本")
 
-    # 4b. Tree structure paths (e.g., ├── scripts/main.py 或 ├── /path/to/scripts/main.py)
+    # 4b. Tree structure paths
     for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
-        tree_path = m_tree.group(1).strip()
-        # 提取相对路径（移除前面的绝对路径部分）
+        tree_path = m_tree.group(1).strip().strip("`'\"，,。.;；")
         for prefix in ("scripts/", "references/", "assets/"):
             idx = tree_path.find(prefix)
             if idx >= 0:
@@ -242,7 +352,7 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         if tree_path.startswith("scripts/"):
             _add(tree_path, scripts_desc or "Skill 执行脚本（从目录结构提取）")
 
-    # 5. Bare paths inside the scripts section description
+    # 5. Bare paths inside scripts section description
     if scripts_desc and not _should_skip(scripts_desc):
         for m_bare in re.finditer(r"scripts/(\S+\.\w+)", scripts_desc):
             _add("scripts/" + m_bare.group(1), scripts_desc)
@@ -255,9 +365,15 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
             m_cmd = _RUN_COMMAND_RE.search(blueprint_text)
             if m_cmd:
                 for token in m_cmd.group(1).split():
+                    token = token.strip("`'\"，,。.;；").lstrip("./")
                     if token.startswith("scripts/") and Path(token).suffix in _SCRIPT_EXTENSIONS:
-                        default = token
-                        break
+                        if not _is_probable_prompt_leaked_script(
+                            token,
+                            purpose=scripts_desc,
+                            blueprint_text=blueprint_text,
+                        ):
+                            default = token
+                            break
             _add(default, scripts_desc or "Skill 主执行脚本")
             warnings.append(
                 f"脚本文件名未在蓝图中明确指定，已默认为 {default}，请在面板中确认或修改。"
@@ -268,7 +384,7 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     if m_cmd:
         cmd_desc = scripts_desc or "Skill 主执行脚本（从运行命令推断）"
         for token in m_cmd.group(1).split():
-            token = token.lstrip("./")
+            token = token.strip("`'\"，,。.;；").lstrip("./")
             if token.startswith("scripts/") and Path(token).suffix in _SCRIPT_EXTENSIONS:
                 _add(token, cmd_desc)
 
@@ -281,10 +397,9 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         ref_files = _extract_inline_paths(blueprint_text, "references")
         for path in ref_files:
             _add(path, refs_desc, required=False, can_skip=True)
-        # Tree structure paths for references
+
         for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
-            tree_path = m_tree.group(1).strip()
-            # 提取相对路径（移除前面的绝对路径部分）
+            tree_path = m_tree.group(1).strip().strip("`'\"，,。.;；")
             for prefix in ("scripts/", "references/", "assets/"):
                 idx = tree_path.find(prefix)
                 if idx >= 0:
@@ -292,9 +407,10 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
                     break
             if tree_path.startswith("references/"):
                 _add(tree_path, refs_desc + "（从目录结构提取）", required=False, can_skip=True)
-        # Bare filenames in section description
+
         for m_bare in re.finditer(r"references/(\S+\.\w+)", refs_desc):
             _add("references/" + m_bare.group(1), refs_desc, required=False, can_skip=True)
+
         if not any(f.path.startswith("references/") for f in files):
             default_ref = "references/guide.md"
             _add(default_ref, refs_desc, required=False, can_skip=True)
@@ -311,10 +427,9 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         asset_files = _extract_inline_paths(blueprint_text, "assets")
         for path in asset_files:
             _add(path, assets_desc, required=False, can_skip=True)
-        # Tree structure paths for assets
+
         for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
-            tree_path = m_tree.group(1).strip()
-            # 提取相对路径（移除前面的绝对路径部分）
+            tree_path = m_tree.group(1).strip().strip("`'\"，,。.;；")
             for prefix in ("scripts/", "references/", "assets/"):
                 idx = tree_path.find(prefix)
                 if idx >= 0:
@@ -322,8 +437,10 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
                     break
             if tree_path.startswith("assets/"):
                 _add(tree_path, assets_desc + "（从目录结构提取）", required=False, can_skip=True)
+
         for m_bare in re.finditer(r"assets/(\S+\.\w+)", assets_desc):
             _add("assets/" + m_bare.group(1), assets_desc, required=False, can_skip=True)
+
         if not any(f.path.startswith("assets/") for f in files):
             default_asset = "assets/template.md"
             _add(default_asset, assets_desc, required=False, can_skip=True)
@@ -341,11 +458,28 @@ def build_skill_plan_from_files(
     warnings: list[str] | None = None,
     blueprint_text: str = "",
 ) -> SkillPlan:
-    """Build the role/contract plan used by Creator generation and validation."""
+    """Build the role/contract plan used by Creator generation and validation.
+
+    This is a second guard against prompt-leaked placeholder scripts.  If a
+    placeholder-like script still has no concrete contract after role resolution,
+    remove it from the plan instead of merely marking it low confidence.
+    """
     reference_files = [file.path for file in files if file.path.startswith("references/")]
     entries: list[SkillPlanEntry] = []
     plan_warnings = list(warnings or [])
+
     for file in files:
+        if _is_probable_prompt_leaked_script(
+            file.path,
+            purpose=file.purpose,
+            blueprint_text=blueprint_text,
+        ):
+            plan_warnings.append(
+                f"已从 SkillPlan 中移除疑似提示词示例/泄露脚本 {file.path}；"
+                "如确实需要，请明确 role/inputs/outputs/capabilities 后手动添加。"
+            )
+            continue
+
         refs_for_file = reference_files if file.path == "SKILL.md" or file.path.startswith("scripts/") else []
         entry = build_skill_plan_entry(
             file_path=file.path,
@@ -355,12 +489,29 @@ def build_skill_plan_from_files(
             blueprint_summary=blueprint_text[:4000],
             reference_files=refs_for_file,
         )
+
+        # If role classification still says low-confidence generic_script and the
+        # filename is placeholder-like, remove it instead of entering repair loops.
+        if (
+            file.path.startswith("scripts/")
+            and entry.role == "generic_script"
+            and entry.confidence < 0.7
+            and Path(file.path).stem.lower() in _PLACEHOLDER_SCRIPT_STEMS
+        ):
+            plan_warnings.append(
+                f"已从 SkillPlan 中移除 {file.path}：该脚本为低置信 generic_script，"
+                "且文件名像示例占位符。请先确认职责、输入、输出和能力后再添加。"
+            )
+            continue
+
         entries.append(entry)
+
         if file.path.startswith("scripts/") and entry.confidence < 0.7:
             plan_warnings.append(
                 f"{file.path} 未声明明确 role，已使用保守 generic_script；"
                 "不会自动启用图片生成/PDF 生成等高影响能力。"
             )
+
     return SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings)
 
 

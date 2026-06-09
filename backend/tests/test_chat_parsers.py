@@ -1699,6 +1699,7 @@ def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monke
 
     from backend.routers.chat_models import ChatRequest
     from backend.routers import sandbox_chat
+    from backend.routers.sandbox import task_executor
 
     skills_root = tmp_path / "skills"
     skills_root.mkdir()
@@ -1710,7 +1711,7 @@ def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monke
         captured["cwd"] = kwargs.get("cwd")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(sandbox_chat.subprocess, "run", fake_run)
+    monkeypatch.setattr(task_executor.subprocess, "run", fake_run)
 
     result, _ = sandbox_chat._execute_single_task(
         {"action": "run_command", "command": "python -c 'print(1)'"},
@@ -1729,6 +1730,7 @@ def test_block_planner_retries_invalid_json(monkeypatch):
 
     from backend.routers.chat_models import ChatRequest, MarkdownBlock
     from backend.routers import sandbox_chat
+    from backend.routers.sandbox import final_answer
 
     calls = []
 
@@ -1738,7 +1740,7 @@ def test_block_planner_retries_invalid_json(monkeypatch):
             return ""
         return json.dumps({"tasks": [], "errors": []})
 
-    monkeypatch.setattr(sandbox_chat, "complete_chat_once", fake_complete_chat_once)
+    monkeypatch.setattr(final_answer, "complete_chat_once", fake_complete_chat_once)
 
     plan = asyncio.run(sandbox_chat._run_block_planner_round(
         assistant_text="执行命令：\n```bash\necho ok\n```",

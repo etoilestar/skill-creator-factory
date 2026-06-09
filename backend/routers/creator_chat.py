@@ -33,7 +33,7 @@ from .chat_utils import (
 )
 from .creator import _trial_run_generated_script
 from .sandbox_chat import (
-    _plan_and_execute_generated_output,
+    plan_and_execute_generated_output as _plan_and_execute_generated_output,
 )
 
 logger = logging.getLogger(__name__)

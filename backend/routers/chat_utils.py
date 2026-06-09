@@ -144,6 +144,8 @@ _IMPORT_TO_PACKAGE: dict[str, str] = {
     "xlrd":          "xlrd",
     "xlwt":          "xlwt",
     "pypdf":         "pypdf",
+    "reportlab":     "reportlab",
+    "fpdf":          "fpdf2",
     "fitz":          "PyMuPDF",
     "jinja2":        "Jinja2",
     "markdown":      "Markdown",
@@ -345,7 +347,7 @@ def _get_skill_venv_python(skill_dir: Path) -> Path:
             if not venv_dir.exists():
                 logger.info("skill-env: creating venv at %s", venv_dir)
                 result = subprocess.run(
-                    ["python3", "-m", "venv", str(venv_dir)],
+                    ["python3", "-m", "venv", "--system-site-packages", str(venv_dir)],
                     timeout=60,
                     capture_output=True,
                     text=True,

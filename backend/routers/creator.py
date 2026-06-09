@@ -25,6 +25,7 @@ import tempfile
 import yaml
 from pathlib import Path
 from typing import Any, Optional
+import shutil
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -222,6 +223,9 @@ class WriteFileResponse(BaseModel):
 
 class SkillActionRequest(BaseModel):
     skill_name: str
+    model: Optional[str] = None
+    auto_repair: bool = True
+    max_e2e_repair_attempts: int = 5
 
 
 class SkillActionResponse(BaseModel):
@@ -1077,7 +1081,14 @@ def _build_script_file_contract_text(
     elif entry.role == "image_generator":
         lines.append("- stdout JSON 至少有一个非空字段；必须调用 generate_stable_diffusion_image helper；字段名由 workflow 决定。")
     elif entry.role == "pdf_builder":
-        lines.append("- stdout JSON 必须返回真实文件路径；禁止调用图片 helper；字段名由 workflow 决定。")
+        lines.append(
+            "- stdout JSON 必须返回真实存在的 PDF 文件路径；禁止调用图片 helper；字段名由 workflow 决定。"
+            "本系统面向中文/UTF-8 场景，PDF builder 必须支持中文正文。"
+            "推荐 reportlab + UnicodeCIDFont('STSong-Light')，或 reportlab + TTFont，或 fpdf2 + add_font 加载 TTF/OTF。"
+            "禁止 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本；"
+            "禁止只写 canvas.setFont('STSong-Light') 但不先 registerFont(UnicodeCIDFont('STSong-Light'))；"
+            "禁止 raw %PDF 字符串拼接、空 PDF、假路径。"
+        )
     else:
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
 
@@ -1613,6 +1624,118 @@ def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> l
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
 
+def _pdf_unicode_strategy_status(content: str) -> tuple[bool, str]:
+    """Detect whether a PDF builder has a real Chinese/UTF-8 text strategy.
+
+    This check intentionally does not require one fixed code structure.
+    It accepts:
+    - reportlab + UnicodeCIDFont('STSong-Light') registration
+    - reportlab + TTFont registration
+    - fpdf/fpdf2 + add_font
+    It rejects:
+    - FPDF core fonts for payload text
+    - reportlab setFont('STSong-Light') without registerFont
+    - raw hand-written %PDF bytes
+    """
+    stripped = content or ""
+
+    uses_fpdf = bool(re.search(
+        r"\bFPDF\b|from\s+fpdf\s+import|import\s+fpdf",
+        stripped,
+        re.I,
+    ))
+    uses_fpdf_core_font = bool(re.search(
+        r"\.set_font\s*\(\s*['\"](?:Helvetica|Arial|Times|Courier|Symbol|ZapfDingbats)['\"]",
+        stripped,
+        re.I,
+    ))
+    uses_fpdf_add_font = bool(re.search(
+        r"\.add_font\s*\(",
+        stripped,
+        re.I,
+    ))
+
+    uses_reportlab = bool(re.search(
+        r"reportlab|canvas\.Canvas",
+        stripped,
+        re.I,
+    ))
+    uses_stsong = bool(re.search(
+        r"STSong-Light",
+        stripped,
+        re.I,
+    ))
+    imports_unicode_cid_font = bool(re.search(
+        r"UnicodeCIDFont|reportlab\.pdfbase\.cidfonts",
+        stripped,
+        re.I,
+    ))
+    registers_stsong_cid = bool(re.search(
+        r"pdfmetrics\.registerFont\s*\(\s*UnicodeCIDFont\s*\(\s*['\"]STSong-Light['\"]\s*\)\s*\)",
+        stripped,
+        re.I,
+    ))
+
+    uses_ttf_registration = bool(re.search(
+        r"pdfmetrics\.registerFont\s*\(\s*TTFont\s*\(|TTFont\s*\(",
+        stripped,
+        re.I,
+    ))
+
+    raw_pdf_bytes = bool(re.search(
+        r"write_bytes\s*\(\s*b?[\"']%PDF-|open\s*\([^)]*['\"]wb['\"][^)]*\).*%PDF-",
+        stripped,
+        re.I | re.S,
+    ))
+
+    if raw_pdf_bytes:
+        return (
+            False,
+            "脚本疑似手写 raw %PDF 字节。PDF builder 必须用真实 PDF 库生成可用 PDF，不能拼接占位 PDF。",
+        )
+
+    if uses_fpdf:
+        if uses_fpdf_add_font:
+            return (
+                True,
+                "使用 fpdf/fpdf2 且调用 add_font，具备 Unicode 字体加载策略。",
+            )
+        if uses_fpdf_core_font:
+            return (
+                False,
+                "使用 FPDF 默认核心字体 Helvetica/Arial/Times/Courier 写正文，中文会触发 latin-1 UnicodeEncodeError。",
+            )
+        return (
+            False,
+            "使用 fpdf/fpdf2 但没有发现 add_font；中文/UTF-8 PDF 必须加载 TTF/OTF 字体后再 set_font。",
+        )
+
+    if uses_reportlab:
+        if uses_stsong and registers_stsong_cid and imports_unicode_cid_font:
+            return (
+                True,
+                "使用 reportlab 并注册 UnicodeCIDFont('STSong-Light')，支持中文。",
+            )
+        if uses_ttf_registration:
+            return (
+                True,
+                "使用 reportlab 并注册 TTFont，具备 Unicode 字体策略。",
+            )
+        if uses_stsong and not registers_stsong_cid:
+            return (
+                False,
+                "使用了 STSong-Light，但没有先 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))，运行时会 KeyError: 'STSong-Light'。",
+            )
+        return (
+            False,
+            "使用 reportlab 写 PDF，但没有发现 UnicodeCIDFont 或 TTFont 注册；中文正文可能无法显示或运行时报错。",
+        )
+
+    return (
+        False,
+        "未发现可靠 PDF 中文字体方案。推荐 reportlab + UnicodeCIDFont('STSong-Light')，或 reportlab + TTFont，或 fpdf2 + add_font。",
+    )
+
 def _check_script_file_contract(
     file_path: str,
     content: str,
@@ -1897,56 +2020,31 @@ def _check_script_file_contract(
     is_pdf_builder = plan_entry.role == "pdf_builder" or pdf_outputs_declared or pdf_required
 
     if is_pdf_builder:
-        uses_fpdf = bool(
-            re.search(
-                r"\bFPDF\b|from\s+fpdf\s+import|import\s+fpdf",
-                stripped,
-                re.IGNORECASE,
-            )
-        )
-        uses_core_font = bool(
-            re.search(
-                r"set_font\s*\(\s*['\"](?:Helvetica|Arial|Times|Courier|Symbol|ZapfDingbats)['\"]",
-                stripped,
-                re.IGNORECASE,
-            )
-        )
-        has_unicode_pdf_support = bool(
-            re.search(
-                r"UnicodeCIDFont|TTFont|pdfmetrics\.registerFont|add_font\s*\(|uni\s*=\s*True|reportlab\.pdfbase|cidfonts|STSong-Light|NotoSans|DejaVu|SimSun|SourceHan",
-                stripped,
-                re.IGNORECASE,
-            )
-        )
-        raw_minimal_pdf = bool(
-            re.search(
-                r"write_bytes\s*\(\s*b?[\"']%PDF-",
-                stripped,
-                re.IGNORECASE,
-            )
-        )
-        unsafe_fpdf_core_font = uses_fpdf and uses_core_font and not has_unicode_pdf_support
-
+        pdf_unicode_ok, pdf_unicode_message = _pdf_unicode_strategy_status(stripped)
         results.append(
             ContractCheckResult(
                 id="script.pdf_builder.unicode_text_supported",
-                passed=(not unsafe_fpdf_core_font) and (has_unicode_pdf_support or raw_minimal_pdf or not uses_fpdf),
+                passed=pdf_unicode_ok,
                 target=file_path,
                 message=(
-                    "pdf_builder 包含中文/UTF-8 安全的 PDF 文本方案。"
-                    if (not unsafe_fpdf_core_font) and (has_unicode_pdf_support or raw_minimal_pdf or not uses_fpdf)
-                    else f"{file_path} 使用 fpdf 默认核心字体写入文本，中文会触发 latin-1 UnicodeEncodeError。"
+                    "pdf_builder 已声明并实现可靠中文/UTF-8 PDF 字体策略。"
+                    if pdf_unicode_ok
+                    else f"{file_path} PDF 中文/UTF-8 字体方案不合格：{pdf_unicode_message}"
                 ),
                 expected=(
-                    "PDF 构建脚本必须能处理中文/UTF-8 文本。"
-                    "推荐 reportlab.pdfbase.cidfonts.UnicodeCIDFont('STSong-Light')；"
-                    "或 reportlab + TTFont；"
-                    "或 fpdf2 + add_font 加载可用 TTF 字体后再 set_font。"
-                    "禁止用 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本。"
+                    "PDF 构建脚本必须支持中文/UTF-8 文本。"
+                    "允许 reportlab + UnicodeCIDFont('STSong-Light')，"
+                    "允许 reportlab + TTFont，"
+                    "允许 fpdf2 + add_font 加载 TTF/OTF。"
+                    "禁止 FPDF 默认 Helvetica/Arial/Times/Courier 直接写正文；"
+                    "禁止 reportlab 只 setFont('STSong-Light') 但不 registerFont；"
+                    "禁止 raw %PDF 字节拼接、空 PDF、假路径。"
                 ),
                 minimal_edit=(
-                    "把 fpdf 默认字体方案替换为支持 Unicode 的 PDF 方案；"
-                    "不要通过 try/except 输出 error、{} 或空 pdf_path 来绕过试运行。"
+                    "保留脚本自由结构，但必须加入真实 Unicode 字体注册/加载逻辑；"
+                    "保持 JSON argv 输入和 stdout JSON 输出；"
+                    "stdout 返回真实存在的 pdf_path/file_paths；"
+                    "不要通过 try/except 输出 error、{} 或空路径绕过试运行。"
                 ),
             )
         )
@@ -2220,14 +2318,22 @@ def _validate_script_against_existing_skill_contract(skill_name: str, file_path:
 
 
 def _sample_value_for_placeholder(key: str) -> str:
-    """Return realistic trial input; image/diffusion prompts are already English."""
+    """Return realistic multilingual trial input.
+
+    Creator is primarily used in Chinese/UTF-8 scenarios.  Trial inputs must
+    include Chinese characters so PDF/FPDF/reportlab/font bugs are caught in the
+    first file-level validation round, instead of leaking to later E2E/runtime.
+    """
     lowered = key.lower()
+
     if any(token in lowered for token in ("prompt", "diffusion", "image", "picture", "photo", "scene")):
-        return "a cinematic watercolor cat under a warm sunset"
-    if any(token in lowered for token in ("text", "content", "input", "query")):
-        return "测试输入 text sample"
-    if any(token in lowered for token in ("topic", "theme", "subject")):
-        return "system time"
+        return "一只会飞的橘猫在暖色夕阳下看着古城，cinematic watercolor style"
+
+    if any(token in lowered for token in ("text", "content", "input", "query", "article", "story", "body", "summary")):
+        return "测试输入：这是包含中文、English words 和标点符号的正文，用于验证 UTF-8/PDF 生成。"
+
+    if any(token in lowered for token in ("topic", "theme", "subject", "title", "name")):
+        return "中文主题：会飞的猫与古代小镇"
     return f"sample {key}"
 
 
@@ -3387,22 +3493,14 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             return (
-                "必须使用下面的 node pdf_builder skeleton；消费 text/image_paths/template/assets 构建 PDF，不生成图片：\n"
-                "const fs = require('fs');\n"
-                "const path = require('path');\n"
-                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
-                "function escapePdfText(value) { return String(value).replace(/[\\\\()]/g, '\\\\$&').slice(0, 1800); }\n"
-                "function run(payload) {\n"
-                f"  const text = String({js_value_expr}).trim() || 'Generated PDF';\n"
-                "  const outputDir = path.resolve(payload.output_dir || 'assets/generated');\n"
-                "  fs.mkdirSync(outputDir, { recursive: true });\n"
-                "  const pdfPath = path.join(outputDir, 'output.pdf');\n"
-                "  const body = escapePdfText(text);\n"
-                "  const pdf = `%PDF-1.4\\n1 0 obj<<>>endobj\\n2 0 obj<< /Length 44 >>stream\\nBT /F1 12 Tf 50 760 Td (${body}) Tj ET\\nendstream endobj\\n3 0 obj<< /Type /Page /Parent 4 0 R /Contents 2 0 R /Resources << /Font << /F1 5 0 R >> >> >>endobj\\n4 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\\n5 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj\\n6 0 obj<< /Type /Catalog /Pages 4 0 R >>endobj\\ntrailer<< /Root 6 0 R >>\\n%%EOF\\n`;\n"
-                "  fs.writeFileSync(pdfPath, pdf);\n"
-                "  return { pdf_path: pdfPath, file_paths: [pdfPath] };\n"
-                "}\n"
-                "console.log(JSON.stringify(run(payload)));"
+                "PDF builder 修复提示：\n"
+                "- 脚本必须生成真实 PDF 文件，支持中文/UTF-8。\n"
+                "- 允许使用 reportlab 或 fpdf2 等库实现，但必须注册/加载可用字体（reportlab: UnicodeCIDFont/TTFont，fpdf2: add_font + TTF/OTF）。\n"
+                "- 禁止使用 FPDF 默认核心字体（Helvetica/Arial/Times/Courier）直接写正文；禁止 raw %PDF 字节拼接或输出空 PDF。\n"
+                "- 脚本必须通过 sys.argv[1] 接收 JSON object 输入，stdout 仅输出 JSON object，并包含真实存在的 pdf_path/file_paths。\n"
+                "- 保留脚本自由结构和函数命名，分页、换行、标题或图片插入由模型自由设计。\n"
+                "- 不要通过 try/except 输出 error、{} 或空路径绕过试运行。\n"
+                "- 修复关注点是：确保中文 PDF 生成能力、遵守 JSON argv/stdout 协议，不强制模板结构。"
             )
         if plan_entry.role == "text_generator":
             return (
@@ -4180,111 +4278,902 @@ async def write_file(request: WriteFileRequest):
         message=result["message"],
     )
 
+@dataclass(frozen=True)
+class E2EWorkflowCommand:
+    ordinal: int
+    source_path: str
+    script_path: str
+    raw_command: str
+    runner: str
+    argv_template: dict[str, Any]
 
 
-def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
-    """End-to-end dry-run for the final Skill package across docs and scripts.
+def _iter_markdown_shell_blocks_with_source(content: str, *, source_path: str) -> list[tuple[str, str]]:
+    """Return shell/bash fenced blocks in document order."""
+    blocks: list[tuple[str, str]] = []
+    for match in re.finditer(
+        r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```",
+        content or "",
+        flags=re.IGNORECASE,
+    ):
+        command = match.group(1).strip()
+        if "scripts/" in command:
+            blocks.append((source_path, command))
+    return blocks
 
-    ``mode=trial`` uses deterministic helper behavior through the existing
-    script trial runner so validation does not spend expensive model/image
-    calls.  ``mode=sandbox`` currently exercises the same sandbox execution
-    path with trial-run helpers enabled, while still validating the real docs,
-    command templates, script paths, JSON argv, stdout outputs, and helper call
-    wiring.
+
+def _ordered_reference_paths_in_skill_md(skill_md: str) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in _SKILL_FILE_PATH_RE.finditer(skill_md or ""):
+        path = match.group(1).strip()
+        if path.startswith("references/") and path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
+
+
+def _parse_e2e_workflow_command(
+    *,
+    command: str,
+    ordinal: int,
+    source_path: str,
+) -> E2EWorkflowCommand | None:
+    """Parse one SKILL.md/reference shell command into executable workflow contract.
+
+    Strict contract:
+    - command must contain scripts/<name>
+    - script path must be followed by exactly one JSON object argv
+    - JSON argv keys/placeholders define workflow dataflow
     """
-    skill_dir = settings.skills_path / skill_name
-    errors: list[str] = []
-    skill_md_path = skill_dir / "SKILL.md"
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_parse",
+                message=f"{source_path} 第 {ordinal} 个命令块无法被 shell 解析：{exc}\n命令：{command}",
+            )
+        ) from exc
+
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized.startswith("scripts/"):
+            script_path = normalized
+        elif "/scripts/" in normalized:
+            script_path = "scripts/" + normalized.rsplit("/scripts/", 1)[1]
+        else:
+            continue
+
+        runner = Path(parts[idx - 1]).name if idx > 0 else ""
+        if idx + 1 >= len(parts):
+            raise ValueError(
+                _e2e_error(
+                    target=source_path,
+                    layer="command_argv",
+                    message=(
+                        f"{source_path} 中调用 {script_path} 的命令缺少 JSON argv。\n"
+                        f"命令必须形如：python {script_path} '{{\"topic\":\"{{{{topic}}}}\"}}'"
+                    ),
+                )
+            )
+
+        if idx + 2 < len(parts):
+            extra = parts[idx + 2:]
+            raise ValueError(
+                _e2e_error(
+                    target=source_path,
+                    layer="command_argv",
+                    message=(
+                        f"{source_path} 中调用 {script_path} 的命令在 JSON argv 后还有额外参数：{extra!r}。\n"
+                        "当前 Creator 端到端协议要求脚本路径后只跟一个 JSON object argv。"
+                    ),
+                )
+            )
+
+        try:
+            argv_template = json.loads(parts[idx + 1])
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                _e2e_error(
+                    target=source_path,
+                    layer="command_json",
+                    message=(
+                        f"{source_path} 中调用 {script_path} 的 JSON argv 不可解析：{exc.msg}\n"
+                        f"argv={parts[idx + 1]!r}"
+                    ),
+                )
+            ) from exc
+
+        if not isinstance(argv_template, dict):
+            raise ValueError(
+                _e2e_error(
+                    target=source_path,
+                    layer="command_json",
+                    message=f"{source_path} 中调用 {script_path} 的 argv 必须是 JSON object。",
+                )
+            )
+
+        return E2EWorkflowCommand(
+            ordinal=ordinal,
+            source_path=source_path,
+            script_path=script_path,
+            raw_command=command,
+            runner=runner,
+            argv_template=argv_template,
+        )
+
+    return None
+
+
+def _extract_e2e_workflow_commands(skill_dir: Path, skill_md: str) -> list[E2EWorkflowCommand]:
+    """Extract workflow commands in SKILL.md order, then referenced docs order.
+
+    SKILL.md is the primary workflow source. If SKILL.md delegates commands to
+    references/*.md, commands in those references are appended in reference mention
+    order. Duplicate exact commands are ignored.
+    """
+    raw_blocks: list[tuple[str, str]] = []
+    raw_blocks.extend(_iter_markdown_shell_blocks_with_source(skill_md, source_path="SKILL.md"))
+
+    for ref_path in _ordered_reference_paths_in_skill_md(skill_md):
+        ref_file = skill_dir / ref_path
+        if not ref_file.is_file():
+            raise ValueError(
+                _e2e_error(
+                    target="SKILL.md",
+                    layer="reference_missing",
+                    message=f"SKILL.md 引用了 {ref_path}，但文件不存在。",
+                )
+            )
+        ref_text = ref_file.read_text(encoding="utf-8")
+        raw_blocks.extend(_iter_markdown_shell_blocks_with_source(ref_text, source_path=ref_path))
+
+    commands: list[E2EWorkflowCommand] = []
+    seen: set[tuple[str, str]] = set()
+    ordinal = 0
+    for source_path, raw_command in raw_blocks:
+        parsed = _parse_e2e_workflow_command(
+            command=raw_command,
+            ordinal=ordinal + 1,
+            source_path=source_path,
+        )
+        if parsed is None:
+            continue
+        key = (parsed.script_path, parsed.raw_command)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordinal += 1
+        commands.append(replace(parsed, ordinal=ordinal))
+
+    return commands
+
+
+def _collect_placeholders_from_value(value: Any) -> set[str]:
+    placeholders: set[str] = set()
+    if isinstance(value, str):
+        for match in re.finditer(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}", value):
+            placeholders.add(match.group(1))
+    elif isinstance(value, dict):
+        for item in value.values():
+            placeholders.update(_collect_placeholders_from_value(item))
+    elif isinstance(value, list):
+        for item in value:
+            placeholders.update(_collect_placeholders_from_value(item))
+    return placeholders
+
+
+def _collect_placeholders_from_payload_template(template: dict[str, Any]) -> set[str]:
+    placeholders: set[str] = set()
+    for value in template.values():
+        placeholders.update(_collect_placeholders_from_value(value))
+    return placeholders
+
+
+def _render_e2e_template_value(
+    value: Any,
+    *,
+    payload: dict[str, Any],
+    missing: list[str],
+) -> Any:
+    if isinstance(value, str):
+        whole = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}", value.strip())
+        if whole:
+            key = whole.group(1)
+            if key not in payload:
+                missing.append(key)
+                return ""
+            return payload[key]
+
+        def replace_match(match: re.Match[str]) -> str:
+            key = match.group(1)
+            if key not in payload:
+                missing.append(key)
+                return ""
+            rendered = payload[key]
+            if isinstance(rendered, (dict, list)):
+                return json.dumps(rendered, ensure_ascii=False)
+            return str(rendered)
+
+        return re.sub(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}", replace_match, value)
+
+    if isinstance(value, dict):
+        return {
+            str(key): _render_e2e_template_value(item, payload=payload, missing=missing)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _render_e2e_template_value(item, payload=payload, missing=missing)
+            for item in value
+        ]
+
+    return value
+
+
+def _render_e2e_command_payload(
+    command: E2EWorkflowCommand,
+    *,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    missing: list[str] = []
+    rendered = {
+        str(key): _render_e2e_template_value(value, payload=payload, missing=missing)
+        for key, value in command.argv_template.items()
+    }
+    if missing:
+        unique_missing = sorted(set(missing))
+        available = sorted(payload.keys())
+        raise ValueError(
+            _e2e_error(
+                target=command.source_path,
+                layer="dataflow_missing_input",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了上游未提供的字段："
+                    f"{', '.join(unique_missing)}。\n"
+                    f"当前可用字段：{', '.join(available) or '(无)'}。\n"
+                    f"命令来源：{command.source_path}\n"
+                    f"原始命令：{command.raw_command}\n"
+                    "这表示 SKILL.md/reference 的占位符与前序脚本 stdout JSON 没有对齐。"
+                ),
+            )
+        )
+    return rendered
+
+
+def _seed_initial_e2e_payload(commands: list[E2EWorkflowCommand]) -> dict[str, Any]:
+    """Seed only the first command's user-facing placeholders.
+
+    This simulates runtime user input extraction, but does not seed downstream
+    placeholders. Therefore if later steps require fields not produced by upstream
+    stdout, E2E validation will fail strictly.
+    """
+    if not commands:
+        return {}
+
+    seed: dict[str, Any] = {}
+    for key in sorted(_collect_placeholders_from_payload_template(commands[0].argv_template)):
+        seed[key] = _sample_value_for_placeholder(key)
+
+    # Also expose common aliases only if the first command actually uses them.
+    return seed
+
+
+def _e2e_error(*, target: str, layer: str, message: str) -> str:
+    return f"E2E_REPAIR_TARGET={target}\nE2E_LAYER={layer}\n{message}"
+
+
+def _e2e_repair_target_from_errors(errors: list[str]) -> str:
+    for error in errors:
+        match = re.search(r"^E2E_REPAIR_TARGET=([^\n]+)", error)
+        if match:
+            target = match.group(1).strip()
+            if target:
+                return target
+    return "SKILL.md"
+
+
+def _copy_skill_dir_for_e2e(skill_name: str) -> tuple[tempfile.TemporaryDirectory, Path]:
+    source_dir = settings.skills_path / skill_name
+    tmp = tempfile.TemporaryDirectory(prefix="creator-e2e-skill-")
+    tmp_root = Path(tmp.name)
+    trial_skill_dir = tmp_root / skill_name
+    shutil.copytree(
+        source_dir,
+        trial_skill_dir,
+        ignore=shutil.ignore_patterns(
+            ".venv",
+            "__pycache__",
+            "*.pyc",
+            ".pytest_cache",
+        ),
+    )
+    return tmp, trial_skill_dir
+
+
+def _runner_matches_command_runtime(command: E2EWorkflowCommand, entry: SkillPlanEntry) -> bool:
+    runner = Path(command.runner or "").name
+    if entry.runtime == "python":
+        return runner.startswith("python")
+    if entry.runtime == "node":
+        return runner == "node"
+    if entry.runtime in {"bash", "shell"}:
+        return runner in {"bash", "sh"}
+    return True
+
+
+def _execute_e2e_python_command(
+    *,
+    command: E2EWorkflowCommand,
+    trial_skill_dir: Path,
+    rendered_payload: dict[str, Any],
+    venv_python: Path,
+) -> subprocess.CompletedProcess[str]:
+    script_abs = trial_skill_dir / command.script_path
+    return subprocess.run(
+        [
+            str(venv_python),
+            str(script_abs),
+            json.dumps(rendered_payload, ensure_ascii=False),
+        ],
+        cwd=str(trial_skill_dir / "scripts"),
+        capture_output=True,
+        text=True,
+        timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
+        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+    )
+
+
+def _execute_e2e_node_command(
+    *,
+    command: E2EWorkflowCommand,
+    trial_skill_dir: Path,
+    rendered_payload: dict[str, Any],
+) -> subprocess.CompletedProcess[str]:
+    script_abs = trial_skill_dir / command.script_path
+    return subprocess.run(
+        [
+            "node",
+            str(script_abs),
+            json.dumps(rendered_payload, ensure_ascii=False),
+        ],
+        cwd=str(trial_skill_dir / "scripts"),
+        capture_output=True,
+        text=True,
+        timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
+        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+    )
+
+
+def _execute_e2e_shell_command(
+    *,
+    command: E2EWorkflowCommand,
+    trial_skill_dir: Path,
+    rendered_payload: dict[str, Any],
+) -> subprocess.CompletedProcess[str]:
+    script_abs = trial_skill_dir / command.script_path
+    runner = "sh" if Path(command.runner or "").name == "sh" else "bash"
+    return subprocess.run(
+        [
+            runner,
+            str(script_abs),
+            json.dumps(rendered_payload, ensure_ascii=False),
+        ],
+        cwd=str(trial_skill_dir / "scripts"),
+        capture_output=True,
+        text=True,
+        timeout=_SCRIPT_TRIAL_TIMEOUT_SECONDS,
+        env={**_build_script_runtime_env(trial_skill_dir), "SKILL_TRIAL_RUN": "1"},
+    )
+
+
+def _parse_e2e_stdout_json(
+    *,
+    command: E2EWorkflowCommand,
+    proc: subprocess.CompletedProcess[str],
+    trial_skill_dir: Path,
+    content: str,
+    entry: SkillPlanEntry,
+    rendered_payload: dict[str, Any],
+) -> dict[str, Any]:
+    if proc.returncode != 0:
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="script_exit",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} 执行失败。\n"
+                    f"exit_code={proc.returncode}\n"
+                    f"argv={json.dumps(rendered_payload, ensure_ascii=False)}\n"
+                    f"stdout={proc.stdout[-4000:]}\n"
+                    f"stderr={proc.stderr[-4000:]}"
+                ),
+            )
+        )
+
+    try:
+        _validate_trial_stdout_json(
+            stdout=proc.stdout,
+            content=content,
+            args=[json.dumps(rendered_payload, ensure_ascii=False)],
+            role=entry.role,
+            skill_dir=trial_skill_dir,
+            skill_plan_entry=entry.__dict__,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="stdout_contract",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} stdout JSON 不符合运行时合同。\n"
+                    f"argv={json.dumps(rendered_payload, ensure_ascii=False)}\n"
+                    f"stdout={proc.stdout[-4000:]}\n"
+                    f"stderr={proc.stderr[-4000:]}\n"
+                    f"错误={exc}"
+                ),
+            )
+        ) from exc
+
+    try:
+        parsed = json.loads((proc.stdout or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="stdout_json_parse",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} stdout 不是合法 JSON。\n"
+                    f"stdout={proc.stdout[-4000:]}"
+                ),
+            )
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="stdout_json_type",
+                message=f"第 {command.ordinal} 步 {command.script_path} stdout 必须是 JSON object。",
+            )
+        )
+
+    return parsed
+
+
+def _validate_e2e_command_static(
+    *,
+    command: E2EWorkflowCommand,
+    trial_skill_dir: Path,
+    skill_md: str,
+) -> SkillPlanEntry:
+    source_path = trial_skill_dir / command.script_path
+    if not source_path.is_file():
+        raise ValueError(
+            _e2e_error(
+                target=command.source_path,
+                layer="script_missing",
+                message=f"第 {command.ordinal} 步引用的脚本不存在：{command.script_path}",
+            )
+        )
+
+    entry = _skill_plan_entry_for_file(file_path=command.script_path, blueprint_text=skill_md)
+    if not _runner_matches_command_runtime(command, entry):
+        raise ValueError(
+            _e2e_error(
+                target=command.source_path,
+                layer="runtime_mismatch",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} 的命令 runner={command.runner!r} "
+                    f"与 SkillPlan.runtime={entry.runtime!r} 不一致。\n"
+                    f"原始命令：{command.raw_command}"
+                ),
+            )
+        )
+
+    content = source_path.read_text(encoding="utf-8")
+    try:
+        _validate_script_contract_static(
+            file_path=command.script_path,
+            content=content,
+            skill_md=skill_md,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="script_static_contract",
+                message=f"第 {command.ordinal} 步 {command.script_path} 静态合同失败：{exc}",
+            )
+        ) from exc
+
+    return entry
+
+
+def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
+    """Strictly run SKILL.md workflow with real stdout JSON dataflow.
+
+    This is the real end-to-end check:
+    - parse workflow commands from SKILL.md/reference
+    - render first command with sample user input
+    - execute step 1
+    - json.loads(stdout)
+    - payload.update(stdout_json)
+    - render step 2 from payload
+    - execute step 2
+    - repeat until final command
+    """
+    source_skill_dir = settings.skills_path / skill_name
+    skill_md_path = source_skill_dir / "SKILL.md"
     if not skill_md_path.is_file():
-        return ["SKILL.md 合同错误：无法加载 SKILL.md。"]
+        return [
+            _e2e_error(
+                target="SKILL.md",
+                layer="missing_skill_md",
+                message="无法加载 SKILL.md。",
+            )
+        ]
+
     skill_md = skill_md_path.read_text(encoding="utf-8")
+    errors: list[str] = []
+
     try:
         _validate_skill_md_contract(skill_md, skill_md)
     except ValueError as exc:
-        errors.append(f"SKILL.md 合同错误：{exc}")
+        errors.append(
+            _e2e_error(
+                target="SKILL.md",
+                layer="skill_md_contract",
+                message=f"SKILL.md 合同错误：{exc}",
+            )
+        )
+        return errors
 
-    script_paths = sorted(set(_skill_local_paths_in_markdown(skill_md)) | {f"scripts/{p.name}" for p in (skill_dir / "scripts").glob("*.py")})
-    script_paths = [path for path in script_paths if path.startswith("scripts/")]
-    reference_paths = sorted(path for path in _skill_local_paths_in_markdown(skill_md) if path.startswith("references/"))
+    try:
+        commands = _extract_e2e_workflow_commands(source_skill_dir, skill_md)
+    except ValueError as exc:
+        return [str(exc)]
 
-    for ref_path in reference_paths:
-        ref_file = skill_dir / ref_path
-        if not ref_file.is_file():
-            errors.append(f"resource 不存在：{ref_path}")
-            continue
-        try:
-            _validate_reference_file_contract(ref_path, ref_file.read_text(encoding="utf-8"), skill_md)
-        except ValueError as exc:
-            errors.append(f"reference 合同冲突：{ref_path}: {exc}")
-
-    for script_path in script_paths:
-        source_path = skill_dir / script_path
-        if not source_path.is_file():
-            errors.append(f"script 参数不匹配：找不到脚本 {script_path}")
-            continue
-        commands = _extract_script_command_templates(skill_md, script_path)
-        for ref_path in reference_paths:
-            ref_file = skill_dir / ref_path
-            if ref_file.is_file():
-                commands.extend(cmd for ref_script, cmd in _reference_script_commands(ref_file.read_text(encoding="utf-8")) if ref_script == script_path)
-        if not commands:
-            errors.append(f"SKILL.md 合同错误：无法识别 {script_path} 的命令块。")
-        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=skill_md)
-        failed_command_checks = [r for r in _check_command_block_contract(script_path, commands, entry) if not r.passed]
-        if failed_command_checks:
-            errors.append(f"command_template 不一致：{_format_contract_checks(failed_command_checks, passed=False)}")
-        content = source_path.read_text(encoding="utf-8")
-        failed_script_checks = [
-            r for r in _check_script_file_contract(script_path, content, role=entry.role, skill_plan_entry=entry.__dict__)
-            if not r.passed
+    script_files = sorted((source_skill_dir / "scripts").glob("*.py")) if (source_skill_dir / "scripts").is_dir() else []
+    if script_files and not commands:
+        return [
+            _e2e_error(
+                target="SKILL.md",
+                layer="workflow_missing",
+                message=(
+                    "Skill 包含 scripts/*.py，但 SKILL.md/reference 中没有可执行 bash/sh/shell 命令块。\n"
+                    "必须在 SKILL.md 中按真实工作流顺序写出脚本调用命令，或者明确引用包含命令的 references/*.md。"
+                ),
+            )
         ]
-        if failed_script_checks:
-            errors.append(f"helper 未调用或调用失败：{script_path}: {_format_contract_checks(failed_script_checks, passed=False)}")
-        try:
-            _trial_run_generated_script(skill_name, script_path, content, entry.role, entry.__dict__)
-        except ValueError as exc:
-            msg = str(exc)
-            if "stdout" in msg and "JSON" in msg:
-                layer = "stdout JSON 不符合 outputs"
-            elif "required_capabilities" in msg or "helper" in msg:
-                layer = "helper 未调用或调用失败"
-            else:
-                layer = "sandbox 无法执行"
-            errors.append(f"{layer}：{script_path}: {exc}")
+
+    tmp_handle: tempfile.TemporaryDirectory | None = None
+    try:
+        tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(skill_name)
+        trial_skill_md = (trial_skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+        payload: dict[str, Any] = _seed_initial_e2e_payload(commands)
+        transcript: list[str] = []
+
+        venv_python: Path | None = None
+        if any(command.script_path.endswith(".py") for command in commands):
+            try:
+                venv_python = _get_skill_venv_python(trial_skill_dir)
+                for command in commands:
+                    if command.script_path.endswith(".py"):
+                        _scan_and_install_python_deps(trial_skill_dir / command.script_path, venv_python)
+            except RuntimeError as exc:
+                return [
+                    _e2e_error(
+                        target="scripts",
+                        layer="venv_prepare",
+                        message=f"端到端试运行环境准备失败：{exc}",
+                    )
+                ]
+
+        for command in commands:
+            try:
+                entry = _validate_e2e_command_static(
+                    command=command,
+                    trial_skill_dir=trial_skill_dir,
+                    skill_md=trial_skill_md,
+                )
+                content = (trial_skill_dir / command.script_path).read_text(encoding="utf-8")
+                rendered_payload = _render_e2e_command_payload(command, payload=payload)
+
+                if entry.runtime == "python":
+                    if venv_python is None:
+                        raise ValueError("python venv 未初始化。")
+                    proc = _execute_e2e_python_command(
+                        command=command,
+                        trial_skill_dir=trial_skill_dir,
+                        rendered_payload=rendered_payload,
+                        venv_python=venv_python,
+                    )
+                elif entry.runtime == "node":
+                    proc = _execute_e2e_node_command(
+                        command=command,
+                        trial_skill_dir=trial_skill_dir,
+                        rendered_payload=rendered_payload,
+                    )
+                elif entry.runtime in {"bash", "shell"}:
+                    proc = _execute_e2e_shell_command(
+                        command=command,
+                        trial_skill_dir=trial_skill_dir,
+                        rendered_payload=rendered_payload,
+                    )
+                else:
+                    raise ValueError(
+                        _e2e_error(
+                            target=command.script_path,
+                            layer="unsupported_runtime",
+                            message=f"第 {command.ordinal} 步 {command.script_path} runtime={entry.runtime} 暂不支持端到端执行。",
+                        )
+                    )
+
+                stdout_json = _parse_e2e_stdout_json(
+                    command=command,
+                    proc=proc,
+                    trial_skill_dir=trial_skill_dir,
+                    content=content,
+                    entry=entry,
+                    rendered_payload=rendered_payload,
+                )
+
+                before_keys = set(payload.keys())
+                payload.update(stdout_json)
+                new_keys = sorted(set(payload.keys()) - before_keys)
+                transcript.append(
+                    f"step={command.ordinal} script={command.script_path} "
+                    f"input_keys={sorted(rendered_payload.keys())} "
+                    f"output_keys={sorted(stdout_json.keys())} "
+                    f"new_keys={new_keys}"
+                )
+
+            except subprocess.TimeoutExpired as exc:
+                errors.append(
+                    _e2e_error(
+                        target=command.script_path,
+                        layer="timeout",
+                        message=f"第 {command.ordinal} 步 {command.script_path} 端到端执行超时：{exc}",
+                    )
+                )
+                break
+            except ValueError as exc:
+                message = str(exc)
+                if transcript:
+                    message += "\n\n已成功执行的前序步骤：\n" + "\n".join(transcript)
+                errors.append(message)
+                break
+
+    finally:
+        if tmp_handle is not None:
+            tmp_handle.cleanup()
+
     return errors
+
+
+async def _repair_existing_file_for_e2e_failure(
+    *,
+    skill_name: str,
+    target_path: str,
+    e2e_errors: list[str],
+    requested_model: str | None = None,
+) -> str:
+    """Repair an existing SKILL.md/reference/script file using E2E feedback."""
+    _validate_file_path(target_path)
+
+    skill_dir = settings.skills_path / skill_name
+    target_file = skill_dir / target_path
+    if not target_file.is_file():
+        raise ValueError(f"端到端修复目标不存在：{target_path}")
+
+    current_content = target_file.read_text(encoding="utf-8")
+    skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8") if (skill_dir / "SKILL.md").is_file() else ""
+
+    all_file_summaries: list[str] = []
+    for path in sorted(skill_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(skill_dir).as_posix()
+        if rel.startswith(".venv/") or "__pycache__" in rel:
+            continue
+        if rel == target_path:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        all_file_summaries.append(
+            f"\n--- FILE {rel} ---\n{text[-6000:]}"
+        )
+
+    route = route_creator_file_model(
+        file_path=target_path,
+        purpose="修复最终端到端工作流校验失败；对齐 SKILL.md 命令、脚本 JSON argv、stdout JSON 字段和上下游数据流。",
+        requested_model=requested_model,
+    )
+    model = route.model
+    _log_creator_model_usage(
+        phase="e2e_repair.route",
+        skill_name=skill_name,
+        file_path=target_path,
+        route=route,
+        extra=f"errors={len(e2e_errors)}",
+    )
+
+    deterministic_error = "\n\n".join(e2e_errors)[-12000:]
+    contract_text = _build_generated_file_contract_text(
+        target_path,
+        skill_md + "\n".join(all_file_summaries)[-16000:],
+        "最终端到端数据流修复",
+        role=None,
+        skill_plan_entry=None,
+    )
+
+    if target_path == "SKILL.md" or target_path.startswith("references/"):
+        target_rule = (
+            "你正在修复 Markdown 工作流合同。必须优先修改命令块里的 JSON argv 占位符，"
+            "使每一步只引用用户初始输入或前序脚本 stdout JSON 已实际输出的字段。"
+            "不要改成自定义 Runtime Contract JSON，不要泄露 Creator 流程。"
+        )
+    elif target_path.startswith("scripts/"):
+        target_rule = (
+            "你正在修复脚本源码。必须保证脚本读取 JSON argv，执行真实逻辑，"
+            "stdout 只输出 JSON object，并且字段名能被后续 SKILL.md/reference 命令占位符消费。"
+            "不要返回 error 字段，不要输出 Markdown，不要 mock/placeholder。"
+        )
+    else:
+        target_rule = "修复该文件，使最终端到端工作流通过。"
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 superskills Creator 的最终端到端修复模型。"
+                "你只能输出目标文件的完整新内容，不能输出解释、Markdown 外壳或多文件 bundle。"
+                "修复目标是让 SKILL.md 工作流按顺序执行时，上游 stdout JSON 能真实喂给下游 JSON argv。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Skill 名称：{skill_name}\n"
+                f"当前需要修复的文件：{target_path}\n\n"
+                f"{target_rule}\n\n"
+                "端到端失败信息：\n"
+                f"{deterministic_error}\n\n"
+                "当前 SKILL.md：\n"
+                f"{skill_md[-12000:]}\n\n"
+                "其它相关文件摘要：\n"
+                f"{''.join(all_file_summaries)[-20000:]}\n\n"
+                "请只输出修复后的目标文件完整内容。"
+            ),
+        },
+    ]
+
+    repaired = await _repair_generated_file_with_feedback(
+        prompt_messages=prompt_messages,
+        model=model,
+        file_path=target_path,
+        previous_content=current_content,
+        validation_error=deterministic_error,
+        targeted_repair=target_rule,
+        contract_text=contract_text,
+        repair_mode="strict_contract_rewrite" if target_path.startswith("scripts/") else "minimal_edit",
+        skill_plan_entry=None,
+    )
+
+    sanitized = _sanitize_generated_file_content(target_path, repaired)
+
+    if target_path == "SKILL.md":
+        _validate_skill_md_against_existing_files(skill_name, sanitized)
+    elif target_path.startswith("references/"):
+        _validate_reference_file_contract(target_path, sanitized, skill_md)
+    elif target_path.startswith("assets/"):
+        _validate_asset_file_contract(target_path, sanitized)
+    elif target_path.startswith("scripts/"):
+        _validate_script_against_existing_skill_contract(skill_name, target_path, sanitized)
+        _trial_run_generated_script(skill_name, target_path, sanitized)
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(sanitized, encoding="utf-8")
+    return target_path
+
+def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
+    """Strict end-to-end workflow validation.
+
+    This replaces the old per-script smoke test with a real SKILL.md workflow run:
+    upstream stdout JSON is parsed and merged into payload, then used to render
+    downstream JSON argv placeholders.
+    """
+    return _run_skill_workflow_e2e_once(skill_name)
 
 @router.post("/validate-skill", response_model=SkillActionResponse)
 async def validate_skill(request: SkillActionRequest):
-    """Validate SKILL.md format for a Skill package."""
+    """Validate and strictly E2E-run a Skill package.
+
+    Flow:
+    1. basic SKILL.md validation
+    2. strict SKILL.md workflow E2E execution
+    3. if failed, route feedback to MD/code model and rewrite the failing file
+    4. retry until success or max attempts exhausted
+    """
     skill_name = _validate_skill_name(request.skill_name)
+
     result = run_action({"action": "validate", "name": skill_name})
-    if result["success"]:
-        skill_dir = settings.skills_path / skill_name
-        trial_errors: list[str] = []
-        for script_path in sorted((skill_dir / "scripts").glob("*.py")) if (skill_dir / "scripts").is_dir() else []:
-            rel_path = f"scripts/{script_path.name}"
-            try:
-                _trial_run_generated_script(skill_name, rel_path, script_path.read_text(encoding="utf-8"))
-            except ValueError as exc:
-                trial_errors.append(f"{rel_path}: {exc}")
-        if trial_errors:
+    if not result["success"]:
+        return SkillActionResponse(
+            success=False,
+            path=result.get("path"),
+            message=result["message"],
+        )
+
+    max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))
+    attempt = 0
+    repair_logs: list[str] = []
+
+    while True:
+        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        if not e2e_errors:
+            suffix = ""
+            if repair_logs:
+                suffix = "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+            return SkillActionResponse(
+                success=True,
+                path=result.get("path"),
+                message=result["message"] + "\n严格端到端工作流校验通过：SKILL.md 命令已按顺序执行，上游 stdout JSON 已真实喂给下游脚本。" + suffix,
+            )
+
+        if not request.auto_repair or attempt >= max_attempts:
             return SkillActionResponse(
                 success=False,
                 path=None,
-                message="SKILL.md 格式校验通过，但脚本试运行失败：\n" + "\n\n".join(trial_errors),
+                message=(
+                    "严格端到端工作流校验失败：\n"
+                    + "\n\n".join(e2e_errors)
+                    + (
+                        "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+                        if repair_logs else ""
+                    )
+                ),
             )
-        smoke_errors = _validate_skill_package_smoke(skill_name, mode="trial")
-        if smoke_errors:
+
+        target_path = _e2e_repair_target_from_errors(e2e_errors)
+        try:
+            repaired_target = await _repair_existing_file_for_e2e_failure(
+                skill_name=skill_name,
+                target_path=target_path,
+                e2e_errors=e2e_errors,
+                requested_model=request.model,
+            )
+            attempt += 1
+            repair_logs.append(
+                f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}"
+            )
+        except Exception as exc:
+            logger.exception(
+                "validate-skill e2e auto repair failed skill=%s target=%s",
+                skill_name,
+                target_path,
+            )
             return SkillActionResponse(
                 success=False,
                 path=None,
-                message="端到端 sandbox dry-run / smoke test 失败：\n" + "\n\n".join(smoke_errors),
+                message=(
+                    "严格端到端工作流校验失败，且自动修复未完成：\n"
+                    + "\n\n".join(e2e_errors)
+                    + f"\n\n自动修复目标：{target_path}"
+                    + f"\n自动修复异常：{exc}"
+                    + (
+                        "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+                        if repair_logs else ""
+                    )
+                ),
             )
-    return SkillActionResponse(
-        success=result["success"],
-        path=result.get("path"),
-        message=result["message"],
-    )
 
 
 @router.post("/package-skill", response_model=SkillActionResponse)

@@ -172,11 +172,23 @@ export async function writeFile(skillName, filePath, content, role = null, skill
  * @param {string} skillName
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function validateSkill(skillName) {
+export async function validateSkill(
+  skillName,
+  {
+    model = null,
+    autoRepair = true,
+    maxE2ERepairAttempts = 5,
+  } = {}
+) {
   const resp = await fetch('/api/creator/validate-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      model,
+      auto_repair: autoRepair,
+      max_e2e_repair_attempts: maxE2ERepairAttempts,
+    }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))

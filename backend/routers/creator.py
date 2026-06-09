@@ -688,110 +688,96 @@ def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEnt
     return False
 
 def _check_command_block_contract(script_path: str, commands: list[str], entry: SkillPlanEntry) -> list[ContractCheckResult]:
-    """Validate Markdown command examples against the SkillPlan input contract."""
-    required = set(entry.inputs or ["payload"])
+    """Validate command blocks as workflow-local execution contracts.
+
+    - Only enforce parseable JSON argv and runtime consistency.
+    - Internal workflow fields are flexible; do not force exact equality with SkillPlan inputs.
+    """
     results: list[ContractCheckResult] = []
+
     for idx, command in enumerate(commands, start=1):
         command = command.strip()
-        keys = _command_payload_keys(command, script_path)
         target = f"{script_path}#command-{idx}"
-        template_matches = _command_template_equivalent(command, script_path, entry)
+
+        command_sig = _command_signature(command, script_path)
+        parsed_ok = command_sig is not None
         results.append(ContractCheckResult(
-            id="command_block.command_template.equivalent",
-            passed=template_matches,
+            id="command_block.signature.parseable",
+            passed=parsed_ok,
             target=target,
-            message=(
-                "命令块与 SkillPlan.command_template 规范化等价。" if template_matches
-                else "命令块必须复用 SkillPlan.command_template 的执行合同：runner、script path、JSON argv keys 和 placeholder 映射必须一致。"
-            ),
-            expected=f"command_template: {_script_command_template(script_path, '', entry)}",
-            minimal_edit=f"将命令调整为与模板等价，推荐整行替换为：{_script_command_template(script_path, '', entry)}",
+            message="命令块可解析为 runner/script_path/JSON argv。" if parsed_ok else f"{script_path} 命令块无法解析为有效执行命令。",
+            expected="命令块应形如：python scripts/name.py '{\"some_key\":\"{{some_key}}\"}'。",
+            minimal_edit="保留脚本路径并确保 JSON argv 可解析；字段名可由 workflow 自由定义。",
         ))
+        if not command_sig:
+            continue
+
         runtime_matches = _command_runtime_matches(command, script_path, entry)
         results.append(ContractCheckResult(
             id="command_block.runtime.matches_skillplan",
             passed=runtime_matches,
             target=target,
-            message=(
-                "命令块 runner 与 SkillPlan runtime 一致。" if runtime_matches
-                else f"命令块必须按 SkillPlan.runtime={entry.runtime} 调用 {script_path}。"
-            ),
-            expected=f"按 runtime 调用：{_script_command_template(script_path, '', entry)}",
-            minimal_edit=f"将命令改为：{_script_command_template(script_path, '', entry)}",
+            message="命令块 runner 与脚本 runtime 一致。" if runtime_matches else f"命令块 runner 与脚本 runtime={entry.runtime} 不一致。",
+            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；内部 JSON keys 不由 SkillPlan 强制。",
+            minimal_edit="修正 runner 或脚本路径，不要改内部 workflow 字段名。",
         ))
+
+        keys = _command_payload_keys(command, script_path)
+        json_ok = keys is not None
         results.append(ContractCheckResult(
             id="command_block.json_argv.parseable",
-            passed=keys is not None,
+            passed=json_ok,
             target=target,
-            message=(
-                "命令块使用可解析 JSON argv。" if keys is not None
-                else f"{script_path} 命令块必须在脚本路径后传入一个 JSON object argv。"
-            ),
-            expected=f"命令形如：{_script_command_template(script_path, '', entry)}",
-            minimal_edit=f"将命令改为：{_script_command_template(script_path, '', entry)}",
+            message="命令块使用可解析 JSON argv。" if json_ok else f"{script_path} 命令块必须在脚本路径后传入 JSON object argv。",
+            expected="脚本路径后跟一个 JSON object argv；JSON keys 由 workflow 自行决定。",
+            minimal_edit="确保 JSON 可解析；不要强制改成 SkillPlan inputs。",
         ))
-        if keys is None:
-            continue
-        missing = sorted(required - keys)
-        extra = sorted(keys - required)
-        results.append(ContractCheckResult(
-            id="command_block.skillplan_inputs.exact",
-            passed=not missing and not extra,
-            target=target,
-            message=(
-                "命令块 JSON keys 与 SkillPlan inputs 完全一致。" if not missing and not extra
-                else f"命令块 JSON keys 与 SkillPlan inputs 不一致；missing={missing} extra={extra}。"
-            ),
-            expected=f"JSON argv keys 必须且只能是：{', '.join(sorted(required))}",
-            minimal_edit=f"将 JSON argv 调整为：{json.dumps({key: '{{' + key + '}}' for key in sorted(required)}, ensure_ascii=False)}",
-        ))
+
     return results
 
-
 def _build_skill_md_contract_text(blueprint_text: str) -> str:
-    """Build the explicit SKILL.md contract injected before generation/repair."""
+    """Generate SKILL.md contract focusing on workflow-level correctness.
+
+    Internal workflow keys are flexible; only require parseable JSON argv and
+    self-consistency among SKILL.md, reference, and scripts.
+    """
     script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
     reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
 
     lines = [
-        "必须满足以下 SKILL.md 合同，逐项覆盖：",
+        "必须满足以下 SKILL.md 合同：",
         "A. frontmatter:",
-        "- 必须以 --- 开始。",
-        "- 必须包含 name 和 description。",
-        "- 必须用 --- 关闭 frontmatter。",
+        "- 以 --- 开始并包含 name 和 description。",
+        "- 用 --- 结束 frontmatter。",
         "B. 复合任务编排:",
-        "- SKILL.md 必须作为总流程/编排说明，描述执行顺序、数据流、每步预期输出，以及何时读取 references/assets。",
-        "- 对复合任务，SKILL.md 只做流程总览，不把子任务详细规则写满；详细规范放入对应 references/*.md。",
-        "C. scripts 命令块:",
+        "- 描述 workflow 执行顺序及每步预期输出；内部字段名灵活。",
+        "- SKILL.md 只做总览；内部规范可放 references/*.md。",
+        "C. scripts 命令块:"
     ]
-    if script_paths:
-        for script_path in script_paths:
-            entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
-            keys = ", ".join(entry.inputs or ["payload"])
-            lines.extend([
-                "- SKILL.md 可以直接包含普通 Markdown ```bash fenced code block；若不直接包含，必须明确说明由对应 reference 定义命令或执行步骤。",
-                f"- 直接命令 block 内必须出现精确路径：{script_path}",
-                f"- 命令必须使用 JSON argv，JSON keys 必须且只能来自 SkillPlan inputs：{keys}。",
-                f"- 推荐命令模板：{_script_command_template(script_path, blueprint_text, entry)}",
-            ])
-    else:
-        lines.append("- 蓝图没有 scripts/，不要强行写脚本命令。")
 
-    lines.append("D. references 引用:")
+    for script_path in script_paths:
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        recommended = _script_command_template(script_path, blueprint_text, entry)
+        lines.extend([
+            "- 可包含普通 Markdown bash fenced code block；若不直接包含，需说明由 reference 定义命令。",
+            f"- 命令 block 内必须出现精确路径：{script_path}",
+            "- 命令必须使用 JSON argv；JSON keys 由 workflow 数据流决定，不强制 SkillPlan inputs。",
+            f"- 推荐命令模板：{recommended}",
+        ])
+
     if reference_paths:
+        lines.append("D. references 引用:")
         for reference_path in reference_paths:
-            lines.append(f"- 必须在正文中出现并说明用途：{reference_path}")
+            lines.append(f"- 在正文出现并说明用途：{reference_path}")
+        lines.append("- reference 可定义命令或步骤，SKILL.md 命令块可委托，不要重复或冲突。")
     else:
-        lines.append("- 蓝图没有 references/，不要强行编造参考资料。")
+        lines.append("- 蓝图无 references/，不要编造参考资料。")
 
-    lines.extend([
-        "E. 禁止项:",
-        "- 不要包含 Runtime Contract JSON。",
-        "- 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等平台流程文案。",
-    ])
+    lines.append("E. 禁止项:")
+    lines.append("- 不输出 placeholder/mock/fake API。")
+    lines.append("- 不要泄露 Creator 内部流程或 kernel references。")
+
     return "\n".join(lines)
-
-
 
 def _declared_skill_paths_from_blueprint(blueprint_text: str) -> set[str]:
     paths: set[str] = set()
@@ -1065,79 +1051,42 @@ def _build_script_file_contract_text(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    entry = _skill_plan_entry_for_file(
-        file_path=file_path,
-        purpose=purpose,
-        blueprint_text=blueprint_text,
-        role=role,
-        skill_plan_entry=skill_plan_entry,
-    )
-    keys = ", ".join(entry.inputs or ["payload"])
+    entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry)
+    recommended_command = _script_command_template(file_path, blueprint_text, entry)
+
     lines = [
-        f"必须满足以下脚本文件合同：{file_path}",
-        f"SkillPlan role: {entry.role}",
+        f"脚本合同：{file_path}",
+        f"Role: {entry.role}",
         f"file_type: {entry.file_type}",
-        f"language: {entry.language}",
         f"runtime: {entry.runtime}",
         f"entrypoint: {entry.entrypoint or file_path}",
-        f"command_template: {_script_command_template(file_path, blueprint_text, entry)}",
-        f"inputs: {', '.join(entry.inputs) or 'payload'}",
-        f"outputs: {', '.join(entry.outputs)}",
-        f"required_capabilities: {', '.join(entry.required_capabilities) or 'none'}",
-        f"forbidden_capabilities: {', '.join(entry.forbidden_capabilities) or 'none'}",
+        f"recommended_command_template: {recommended_command}",
+        f"suggested_inputs: {', '.join(entry.inputs or ['payload'])}",
+        f"declared_outputs: {', '.join(entry.outputs)}",
         "A. 输出形态:",
-        "- 只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
-        "- Python 脚本必须能通过 ast.parse 语法检查。",
+        "- 单文件源码，Python 脚本必须通过 ast.parse。",
         "B. 参数接口:",
-        "- 默认使用 JSON argv 接口：按脚本 runtime 读取 JSON argv 并解析。",
-        f"- 必须实际使用用户输入 keys：{keys}。",
-        f"- 与 SKILL.md/reference 命令模板保持一致；推荐命令：{_script_command_template(file_path, blueprint_text, entry)}",
+        "- 默认 JSON argv，字段名由 workflow 决定，不强制 SkillPlan inputs。",
+        "- 必须读取 SKILL.md/reference 命令块传入的 keys。",
+        "- 内部 workflow 字段名可用 payload/context 或上游 stdout 字段。",
         "C. 角色输出合同:",
     ]
+
     if entry.role == "text_generator":
-        lines.extend([
-            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定，不强制 text/story_text。",
-            "- 能力边界由 required_capabilities/forbidden_capabilities 决定；若 required_capabilities 额外包含 image_generation，则必须调用图片 helper。",
-        ])
-    elif entry.role == "composite_generator":
-        lines.extend([
-            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定。",
-            "- 必须同时调用 generate_text_with_llm 与 generate_stable_diffusion_image；不得用固定 f-string/template-only 文本或占位图片替代。",
-            "- 保证 stdout 字段能被 SKILL.md 后续命令的 {{变量}} 消费，形成闭环。",
-        ])
+        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；必须调用 text_generation helper。")
     elif entry.role == "image_generator":
-        lines.extend([
-            "- stdout 必须输出 JSON object，至少包含一个非空字段；字段名由 SKILL.md 数据流决定，不强制 image_paths/images。",
-            "- 必须调用平台 Stable Diffusion helper，不要直接调用 /v1/images/generations。",
-            "- 不要在脚本里写中文 prompt 翻译逻辑；平台 helper 会处理 Stable Diffusion prompt 适配。",
-            "- 必须保留 result = generate_stable_diffusion_image(desc) 的调用骨架；禁止 image_path = generate_stable_diffusion_image(...)。",
-        ])
+        lines.append("- stdout JSON 至少有一个非空字段；必须调用 generate_stable_diffusion_image helper；字段名由 workflow 决定。")
     elif entry.role == "pdf_builder":
-        lines.extend([
-            "- stdout 必须输出 JSON object，并在任意业务字段中返回真实生成文件路径。",
-            "- forbidden_capabilities 生效：PDF 构建脚本不得生成图片或调用 generate_stable_diffusion_image。",
-            "- 只能消费已有 story_text/text/image_paths/previous_stdout/template/assets 并构建 PDF/文件。",
-        ])
-    elif entry.role == "docx_builder":
-        lines.extend([
-            "- stdout 必须输出 JSON object，且 docx_path 或 file_paths 至少一个指向真实生成文件。",
-            "- 只能消费上一步 stdout JSON、story_text/text、image_paths 或模板；不得生成新文本或图片。",
-        ])
-    elif entry.role == "pptx_builder":
-        lines.extend([
-            "- stdout 必须输出 JSON object，且 pptx_path 或 file_paths 至少一个指向真实生成文件。",
-            "- 只能消费上一步 stdout JSON、story_text/text、image_paths 或模板；不得生成新文本或图片。",
-        ])
+        lines.append("- stdout JSON 必须返回真实文件路径；禁止调用图片 helper；字段名由 workflow 决定。")
     else:
-        lines.extend([
-            "- stdout 必须输出 JSON object，不要混入调试说明。",
-            "- 根据角色职责返回 text、file_paths 或其它明确结果字段。",
-        ])
-    lines.extend([
-        "E. 禁止项:",
-        "- 禁止 placeholder/mock/fake API/固定模板冒充真实能力。",
-        "- 只能实现本 role 的职责；复合任务由 SKILL.md 编排多个 scripts/references/assets 完成。",
-    ])
+        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
+
+    lines.append("D. 能力边界:")
+    lines.append("- required_capabilities 必须真实调用，forbidden_capabilities 禁止调用。")
+    lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
+    lines.append("E. 禁止项:")
+    lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
+
     return "\n".join(lines)
 
 
@@ -2204,46 +2153,59 @@ def _script_has_main_entry(content: str, runtime: str) -> bool:
 
 
 def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
-    """Validate script source against existing SKILL.md command examples."""
+    """Validate script source against SKILL.md/reference contract locally.
+
+    First stage: check file-level correctness only, do not enforce workflow-wide alignment.
+    Second stage: overall workflow dry-run will detect cross-step misalignment.
+    """
     _reject_fake_script_implementation(file_path, content)
     plan_entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
     _validate_configured_model_usage_static(file_path=file_path, content=content, skill_md=skill_md, plan_entry=plan_entry)
+
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
 
-    # Backward compatibility for existing SKILL.md files that predate explicit
-    # SkillPlan inputs: when the local file block did not declare inputs, treat
-    # the JSON argv command itself as the declared interface for static script
-    # validation.  This remains local to the current script command and does not
-    # mine global SKILL.md prose for capabilities.
-    if plan_entry.inputs == ["payload"]:
-        command_keys: set[str] = set()
-        for command in commands:
-            keys = _command_payload_keys(command, file_path)
-            if keys:
-                command_keys.update(keys)
-        if command_keys:
-            plan_entry = replace(plan_entry, inputs=sorted(command_keys), command_template=commands[0].strip())
-    command_results: list[ContractCheckResult] = []
-    command_results.extend(_check_command_block_contract(file_path, commands, plan_entry))
-    failed_command_results = [result for result in command_results if not result.passed]
+    command_results = _check_command_block_contract(file_path, commands, plan_entry)
+    failed_command_results = [r for r in command_results if not r.passed]
     if failed_command_results:
-        raise ValueError(_format_contract_checks(failed_command_results, passed=False))
-
-    json_argv_commands = [cmd for cmd in commands if _command_uses_json_argv(cmd)]
-    if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
         raise ValueError(
-            f"{file_path} 的 SKILL.md Markdown 命令示例传入 JSON 参数，但脚本没有按脚本 runtime 读取 JSON argv 并解析（Python 应读取 sys.argv[1] 并 json.loads）；"
-            "禁止保存与命令示例不一致的脚本。"
+            "SKILL.md/reference 命令块不合法，属于 workflow 局部合同问题，不要改脚本字段强制对齐 SkillPlan:\n"
+            + _format_contract_checks(failed_command_results, passed=False)
         )
 
-    for cmd in commands:
-        for key in re.findall(r"{{\s*([a-zA-Z_][\w-]*)\s*}}", cmd):
-            if key not in content:
-                raise ValueError(
-                    f"{file_path} 的 Markdown 命令示例包含参数 {{{{{key}}}}}，但脚本源码未使用该参数。"
-                )
+    # Ensure JSON argv is read
+    json_argv_commands = [c for c in commands if _command_uses_json_argv(c)]
+    if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
+        raise ValueError(
+            f"{file_path} SKILL.md 命令传入 JSON，但脚本未按 runtime 读取 JSON argv。"
+        )
+
+    # Treat command keys as workflow-local interface
+    command_keys: set[str] = set()
+    command_placeholders: set[str] = set()
+    for command in commands:
+        keys = _command_payload_keys(command, file_path)
+        if keys:
+            command_keys.update(keys)
+        sig = _command_signature(command, file_path)
+        if sig and isinstance(sig.get("placeholders"), dict):
+            command_placeholders.update(str(p) for p in sig["placeholders"].values() if p)
+
+    missing_keys = sorted(k for k in command_keys if k not in content)
+    if missing_keys:
+        raise ValueError(
+            f"{file_path} 命令块传入这些 keys，但脚本未使用：{', '.join(missing_keys)}。"
+            "请脚本读取 workflow-local JSON keys；不要强制匹配 SkillPlan inputs。"
+        )
+
+    unmapped_placeholders = sorted(
+        p for p in command_placeholders if p not in content and p not in command_keys
+    )
+    if unmapped_placeholders:
+        raise ValueError(
+            f"{file_path} 命令块 placeholder 未映射到脚本：{', '.join(unmapped_placeholders)}。"
+        )
 
 
 def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:

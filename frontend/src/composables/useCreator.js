@@ -5,6 +5,13 @@
  * backend/routers/creator.py.
  */
 
+function assertActionSuccess(payload, fallbackMessage) {
+  if (!payload || payload.success !== true) {
+    throw new Error(payload?.message || fallbackMessage)
+  }
+  return payload
+}
+
 /**
  * Analyze the conversation blueprint and extract a file-creation plan.
  * This is a pure rule-based call — no LLM is involved.
@@ -25,6 +32,7 @@ export async function analyzeBlueprintPlan(messages, model = null) {
   }
   return resp.json()
 }
+
 
 /**
  * Initialise a new Skill directory structure on the backend.
@@ -194,7 +202,8 @@ export async function validateSkill(
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
     throw new Error(err.detail || '校验请求失败')
   }
-  return resp.json()
+  const payload = await resp.json()
+  return assertActionSuccess(payload, '严格端到端校验失败')
 }
 
 /**
@@ -203,15 +212,28 @@ export async function validateSkill(
  * @param {string} skillName
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function packageSkill(skillName) {
+export async function packageSkill(
+  skillName,
+  {
+    model = null,
+    validateBeforePackage = true,
+  } = {}
+) {
   const resp = await fetch('/api/creator/package-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      model,
+      validate_before_package: validateBeforePackage,
+    }),
   })
+
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
     throw new Error(err.detail || '打包请求失败')
   }
-  return resp.json()
+
+  const payload = await resp.json()
+  return assertActionSuccess(payload, '打包失败')
 }

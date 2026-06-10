@@ -260,17 +260,15 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
     cleaned: list[str] = []
     for item in values:
-        if field_name == "inputs":
-            # Keep only the JSON argv key.  Model/blueprint prose often writes
-            # `topic: string`, `tone=humorous`, or `style (default: popular-science)`;
-            # those must remain `topic`, `tone`, and `style` instead of being
-            # concatenated into invalid keys such as `topicstring`.
+        if field_name in {"inputs", "outputs"}:
             item = re.split(r"\s*(?::|=|（|\(|\s)\s*", item, maxsplit=1)[0]
             item = re.sub(r"[^A-Za-z0-9_-]", "", item)
         else:
             item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
+
         if item:
             cleaned.append(item)
+
     return cleaned
 
 

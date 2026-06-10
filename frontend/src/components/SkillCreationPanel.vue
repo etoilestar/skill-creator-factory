@@ -177,14 +177,31 @@
     </div>
 
     <!-- Post-creation status -->
-    <div v-if="phase === 'validating' || phase === 'packaging' || phase === 'complete'" class="post-status">
-      <div class="post-item" :class="{ success: validateResult?.success, fail: validateResult && !validateResult.success }">
-        <span>{{ validateResult ? (validateResult.success ? '✅ 校验通过' : '❌ 校验失败') : '⏳ 校验中…' }}</span>
-        <span v-if="validateResult && !validateResult.success" class="post-detail">{{ validateResult.message }}</span>
+    <div
+      v-if="phase === 'validating' || phase === 'packaging' || phase === 'complete' || phase === 'failed'"
+      class="post-status"
+    >
+      <div
+        class="post-item"
+        :class="{ success: validateResult?.success, fail: validateResult && !validateResult.success }"
+      >
+        <span>
+          {{
+            validateResult
+              ? (validateResult.success ? '✅ 严格端到端校验通过' : '❌ 严格端到端校验失败')
+              : '⏳ 严格端到端校验中…'
+          }}
+        </span>
+        <pre v-if="validateResult?.message" class="post-detail">{{ validateResult.message }}</pre>
       </div>
-      <div v-if="packageResult !== null" class="post-item" :class="{ success: packageResult?.success }">
+
+      <div
+        v-if="packageResult !== null"
+        class="post-item"
+        :class="{ success: packageResult?.success, fail: packageResult && !packageResult.success }"
+      >
         <span>{{ packageResult.success ? '✅ 打包完成' : '❌ 打包失败' }}</span>
-        <span v-if="packageResult && !packageResult.success" class="post-detail">{{ packageResult.message }}</span>
+        <pre v-if="packageResult?.message" class="post-detail">{{ packageResult.message }}</pre>
       </div>
     </div>
 
@@ -199,6 +216,10 @@
       >
         下载 .skill 包
       </a>
+    </div>
+
+    <div v-if="phase === 'failed'" class="complete-actions">
+      <button class="btn-secondary" @click="phase = 'idle'">返回修改后重试</button>
     </div>
   </div>
 </template>
@@ -250,7 +271,7 @@ const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
 
-const phase = ref('idle')   // idle | running | paused | validating | packaging | complete
+const phase = ref('idle')   // idle | running | paused | validating | packaging | complete | failed
 const paused = ref(false)
 
 const validateResult = ref(null)
@@ -540,20 +561,61 @@ async function startCreation() {
     }
   }
 
-  // 3. Validate
+  // 3. Strict E2E validation.
+  // validate-skill will:
+  // - parse SKILL.md workflow commands
+  // - execute scripts in order
+  // - pipe upstream stdout JSON into downstream argv
+  // - ask the routed model to repair the failing file
+  // - retry until success or max attempts exhausted
   phase.value = 'validating'
+  packageResult.value = null
+
   try {
-    validateResult.value = await validateSkill(localSkillName.value)
+    validateResult.value = await validateSkill(localSkillName.value, {
+      model: props.model,
+      autoRepair: true,
+      maxE2ERepairAttempts: 5,
+    })
   } catch (err) {
-    validateResult.value = { success: false, message: err.message }
+    validateResult.value = {
+      success: false,
+      path: null,
+      message: err.message || '严格端到端校验请求失败',
+    }
   }
 
-  // 4. Package (even if validate failed — so users can still download)
+  if (!validateResult.value?.success) {
+    phase.value = 'failed'
+    emit(
+      'creation-error',
+      validateResult.value?.message || '严格端到端校验失败，已停止打包。'
+    )
+    return
+  }
+
+  // 4. Package only after strict E2E validation has passed.
   phase.value = 'packaging'
   try {
-    packageResult.value = await packageSkill(localSkillName.value)
+    packageResult.value = await packageSkill(localSkillName.value, {
+      model: props.model,
+      validateBeforePackage: true,
+    })
   } catch (err) {
-    packageResult.value = { success: false, message: err.message, path: null }
+    packageResult.value = {
+      success: false,
+      message: err.message || '打包请求失败',
+      path: null,
+    }
+  }
+
+  if (!packageResult.value?.success) {
+    phase.value = 'failed'
+    emit(
+      'creation-error',
+      packageResult.value?.message || '打包失败'
+    )
+    return
   }
 
   phase.value = 'complete'

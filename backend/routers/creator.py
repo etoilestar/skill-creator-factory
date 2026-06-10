@@ -227,6 +227,8 @@ class SkillActionRequest(BaseModel):
     auto_repair: bool = True
     max_e2e_repair_attempts: int = 5
 
+class PackageSkillRequest(SkillActionRequest):
+    validate_before_package: bool = True
 
 class SkillActionResponse(BaseModel):
     success: bool
@@ -763,9 +765,13 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
         recommended = _script_command_template(script_path, blueprint_text, entry)
         lines.extend([
-            "- 可包含普通 Markdown bash fenced code block；若不直接包含，需说明由 reference 定义命令。",
+            "- 必须包含标准、独立、无缩进的 Markdown bash fenced code block；不要把 ```bash 缩进在列表项内部。",
             f"- 命令 block 内必须出现精确路径：{script_path}",
-            "- 命令必须使用 JSON argv；JSON keys 由 workflow 数据流决定，不强制 SkillPlan inputs。",
+            "- 每个命令块只能包含一条命令，脚本路径后只能跟一个 JSON object argv。",
+            "- JSON argv 必须可被 json.loads 直接解析；所有 {{placeholder}} 必须作为 JSON 字符串值出现。",
+            "- 禁止裸占位符，例如禁止 {\"scene_count\":{{scene_count}}}；应使用 {\"scene_count\":\"{{scene_count}}\"} 或固定数字 {\"scene_count\":3}。",
+            "- 后续步骤 placeholder 必须来自前序 stdout JSON 字段；禁止 image_path_1/image_path_2/image_path_3 这类未声明编号字段。",
+            "- 多场景/多图片循环必须在脚本内部完成，不要在 SKILL.md 里写自然语言循环协议。",
             f"- 推荐命令模板：{recommended}",
         ])
 
@@ -780,6 +786,89 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API。")
     lines.append("- 不要泄露 Creator 内部流程或 kernel references。")
+
+    return "\n".join(lines)
+
+def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
+    """Build deterministic authoring guidance for SKILL.md workflow commands.
+
+    This is creator strategy, not artifact post-processing.  The generated
+    SKILL.md must be born as an E2E-runnable linear workflow.
+    """
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
+
+    if not script_paths:
+        return (
+            "E2E workflow authoring guide:\n"
+            "- 当前蓝图没有 scripts/ 文件；SKILL.md 不要编造脚本命令块。\n"
+            "- 若任务可直接回答，明确写“直接回答用户问题”，不要生成伪脚本流程。"
+        )
+
+    lines: list[str] = [
+        "E2E workflow authoring guide（强制生成策略，必须反映到最终 SKILL.md 正文）:",
+        "A. 命令块形态:",
+        "- 每个 scripts/ 文件必须且只能有一个主要可执行 bash fenced code block。",
+        "- 命令块使用标准 Markdown 独立 fence；不要把 ```bash 缩进在列表项内部。",
+        "- fence 内只放一条命令，不写解释、不写循环说明、不写多条命令。",
+        "- 命令必须形如：python scripts/name.py '{\"key\":\"{{key}}\"}'。",
+        "- JSON argv 必须先能被 json.loads 解析；所有 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写 {{count}}、{{scene_count}}。",
+        "- 若需要数值默认值，直接写固定 JSON 数字，例如 \"scene_count\":3，而不是 \"scene_count\":{{scene_count}}。",
+        "",
+        "B. 线性数据流:",
+        "- E2E 只按 SKILL.md/reference 中的命令块顺序逐条执行；不会理解“每幕一次/循环三次/对每个场景调用”等自然语言循环。",
+        "- 多场景、多图片、多页 PDF 等循环必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。",
+        "- 第一条命令可以使用用户输入 placeholder；后续命令只能使用之前脚本 stdout JSON 已输出的字段。",
+        "- 禁止发明 image_path_1/image_path_2/image_path_3 等编号字段，除非上游脚本 stdout 明确输出这些字段。",
+        "- 列表/对象字段必须用整值占位符传递，例如 \"image_paths\":\"{{image_paths}}\"，不要写 [\"{{image_path_1}}\", \"{{image_path_2}}\"]。",
+        "- 每个脚本说明中必须写清 stdout JSON 输出字段，且下游命令 placeholder 必须与这些字段逐字一致。",
+        "",
+        "C. 推荐线性命令顺序与接口:",
+    ]
+
+    available_after_previous: set[str] = set()
+    for idx, script_path in enumerate(script_paths, start=1):
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        command = _script_command_template(script_path, blueprint_text, entry)
+        lines.extend([
+            f"{idx}. {script_path}",
+            f"   role: {entry.role}",
+            f"   declared inputs: {', '.join(entry.inputs or ['payload'])}",
+            f"   declared outputs: {', '.join(entry.outputs or ['text'])}",
+            f"   required command block:",
+            "```bash",
+            command,
+            "```",
+        ])
+
+        if idx == 1:
+            lines.append("   placeholder rule: 第一条命令可以从用户输入提取这些 inputs。")
+        else:
+            available_text = ", ".join(sorted(available_after_previous)) or "（暂无上游字段）"
+            lines.append(
+                "   placeholder rule: 这一条命令只能使用前序 stdout 已产生字段；"
+                f"当前前序可用字段包括：{available_text}。"
+            )
+
+        available_after_previous.update(entry.outputs or [])
+
+    if reference_paths:
+        lines.extend([
+            "",
+            "D. references:",
+            "- SKILL.md 必须在参考资料/资源小节逐字引用以下本地 reference，并说明何时读取；reference 不替代主流程命令块。",
+        ])
+        for path in reference_paths:
+            lines.append(f"- {path}")
+
+    lines.extend([
+        "",
+        "E. 对多场景/多图片/PDF 任务的固定策略:",
+        "- 文本脚本一次生成完整结构化文本，并输出 script_text 或 text。",
+        "- 图片脚本一次接收完整 script_text/text，内部拆分场景并生成多张图，stdout 输出 image_paths/images。",
+        "- PDF 脚本一次接收 script_text/text 和 image_paths，内部完成排版和文件生成，stdout 输出 pdf_path/file_paths。",
+        "- SKILL.md 不写三条图片命令，不写 image_path_1/2/3，不写自然语言循环。",
+    ])
 
     return "\n".join(lines)
 
@@ -2216,10 +2305,20 @@ def _validate_generated_file_content(file_path: str, content: str, role: str | N
 def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
     """Return shell command templates in SKILL.md that invoke script_path."""
     commands: list[str] = []
-    for match in re.finditer(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", skill_md, flags=re.IGNORECASE):
-        command = match.group(1).strip()
-        if script_path in command:
+    normalized_script_path = script_path.replace("\\", "/")
+
+    for info, body in _iter_markdown_fenced_blocks(skill_md):
+        if not _is_shell_fence_info(info):
+            continue
+
+        command = body.strip()
+        if not command:
+            continue
+
+        normalized_command = command.replace("\\", "/")
+        if normalized_script_path in normalized_command:
             commands.append(command)
+
     return commands
 
 
@@ -2279,31 +2378,33 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
             f"{file_path} SKILL.md 命令传入 JSON，但脚本未按 runtime 读取 JSON argv。"
         )
 
-    # Treat command keys as workflow-local interface
+    # Treat command JSON keys as the script-local argv interface.
+    #
+    # Important:
+    # - JSON keys are what the current script must read.
+    #   Example: {"scene_text":"{{script_content}}"} means the script reads
+    #   payload["scene_text"].
+    # - Placeholder names are upstream workflow dataflow sources.
+    #   Example: script_content is produced by a previous script and is validated
+    #   only by final E2E workflow execution.
+    #
+    # Therefore single-script validation must NOT require placeholder names to appear
+    # in the script source. Requiring that causes impossible repair loops where
+    # generate_images.py is forced to mention script_content even though it correctly
+    # reads scene_text.
     command_keys: set[str] = set()
-    command_placeholders: set[str] = set()
     for command in commands:
         keys = _command_payload_keys(command, file_path)
         if keys:
             command_keys.update(keys)
-        sig = _command_signature(command, file_path)
-        if sig and isinstance(sig.get("placeholders"), dict):
-            command_placeholders.update(str(p) for p in sig["placeholders"].values() if p)
 
     missing_keys = sorted(k for k in command_keys if k not in content)
     if missing_keys:
         raise ValueError(
-            f"{file_path} 命令块传入这些 keys，但脚本未使用：{', '.join(missing_keys)}。"
+            f"{file_path} 命令块传入这些 JSON keys，但脚本未读取：{', '.join(missing_keys)}。"
             "请脚本读取 workflow-local JSON keys；不要强制匹配 SkillPlan inputs。"
         )
 
-    unmapped_placeholders = sorted(
-        p for p in command_placeholders if p not in content and p not in command_keys
-    )
-    if unmapped_placeholders:
-        raise ValueError(
-            f"{file_path} 命令块 placeholder 未映射到脚本：{', '.join(unmapped_placeholders)}。"
-        )
 
 
 def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
@@ -2851,40 +2952,57 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
     error_text = deterministic_error or ""
 
     if file_path == "SKILL.md":
-        script_match = _MISSING_SKILL_SCRIPT_BLOCK_RE.search(error_text)
-        if script_match:
-            script_path = script_match.group("script")
+        if (
+            "workflow_missing" in error_text
+            or "没有可执行 bash/sh/shell 命令块" in error_text
+            or "缺少调用" in error_text
+            or "script_command.exists" in error_text
+        ):
             return (
-                f"必须在 SKILL.md 正文中加入一个真实的 bash fenced code block，且 block 内必须逐字包含 `{script_path}`。\n"
-                "注意：‘不要在文件外层套 Markdown 代码块’不等于禁止 SKILL.md 正文内部的命令示例；"
-                "这个内部 ```bash block 是校验必需内容。\n"
-                "请使用平台占位符 `{{topic}}`，不要使用 shell 变量 `${topic}`。\n"
-                "可直接插入如下命令示例，并围绕它补充参数说明：\n"
-                "```bash\n"
-                f"python {script_path} " "'{\"topic\":\"{{topic}}\"}'" "\n"
-                "```"
+                "按 E2E 线性 workflow 策略重写 SKILL.md 的执行流程："
+                "每个 scripts/ 文件必须有且只有一个标准、独立、无缩进的 ```bash fenced code block；"
+                "不要把 ```bash 放在列表缩进里；"
+                "每个 fenced block 内只写一条命令；"
+                "命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。"
+                "禁止用自然语言代替命令块，禁止写“每幕一次/共3次/对每个场景调用”。"
             )
 
-        reference_match = _MISSING_SKILL_REFERENCE_RE.search(error_text)
-        if reference_match:
-            reference_path = reference_match.group("reference")
+        if (
+            "command_json" in error_text
+            or "JSON argv 不可解析" in error_text
+            or "json.loads" in error_text
+            or "裸占位符" in error_text
+        ):
             return (
-                f"必须在 SKILL.md 的参考资料/资源小节逐字引用 `{reference_path}`，"
-                "并说明何时读取该 reference；不要只泛称‘参考资料’。"
+                "修复 SKILL.md 命令块 JSON argv："
+                "所有动态占位符必须作为 JSON 字符串值出现，例如 \"theme\":\"{{theme}}\"；"
+                "禁止裸写 \"scene_count\":{{scene_count}}。"
+                "如果需要默认数值，直接写固定 JSON 数字，例如 \"scene_count\":3。"
+                "确保脚本路径后只有一个可被 json.loads 解析的 JSON object argv。"
             )
 
-        if "Creator 界面流程" in error_text:
+        if (
+            "dataflow_missing_input" in error_text
+            or "上游未提供的字段" in error_text
+            or "image_path_1" in error_text
+            or "image_path_2" in error_text
+            or "image_path_3" in error_text
+        ):
             return (
-                "删除 Creator 创建流程、确认清单、点击开始创建、系统将自动创建等 UI 文案；"
-                "只保留 Skill 使用说明、资源引用、参数映射和运行时命令示例。"
+                "修复 SKILL.md workflow 数据流："
+                "后续命令只能引用前序脚本 stdout JSON 已输出字段；"
+                "禁止发明 image_path_1/image_path_2/image_path_3 等编号字段。"
+                "图片脚本应一次接收 script_text/text，内部生成多张图片，并 stdout 输出 image_paths/images；"
+                "PDF 脚本应通过整值占位符接收列表，例如 \"image_paths\":\"{{image_paths}}\"。"
+                "不要写 [\"{{image_path_1}}\",\"{{image_path_2}}\",\"{{image_path_3}}\"]。"
             )
 
-        if "skill_md.resource.local_declared" in error_text or "未在本轮生成或当前 Skill 中不存在" in error_text:
+        if "contract 未通过" in error_text or "SKILL.md contract" in error_text:
             return (
-                "删除最终 SKILL.md 中未声明/不存在的 references/assets/scripts 引用，尤其是 Creator 内部 kernel references "
-                "（references/workflows.md、references/output-patterns.md、references/best-practices.md 等）。"
-                "这些 kernel 资料只能作为生成上下文，不能出现在 Skill 的资源列表或运行说明中；"
-                "保留合法脚本命令块和合法 text/image helper 说明，不要删除 generate_text_with_llm 或 generate_stable_diffusion_image 相关合法调用。"
+                "按 SKILL.md 合同做最小修复：保留 frontmatter、业务说明和已通过检查；"
+                "补齐缺失的 scripts/ 命令块与 references/ 引用。"
+                "所有命令块必须是标准独立 ```bash fenced block，JSON argv 可解析，"
+                "并且 workflow 必须是线性可 E2E 执行的数据流。"
             )
 
     if file_path.startswith("scripts/"):
@@ -3837,6 +3955,11 @@ def _build_generate_file_prompt(
         file_path, blueprint_text, purpose, role=role, skill_plan_entry=skill_plan_entry
     )
     skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
+    skill_md_e2e_authoring_guide = (
+        _build_skill_md_e2e_authoring_guide(blueprint_text)
+        if file_path == "SKILL.md"
+        else ""
+    )
     script_skeleton_text = _script_generation_skeleton(
         file_path,
         purpose,
@@ -3866,15 +3989,25 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. SKILL.md 必须作为复合任务 orchestrator：描述执行顺序、上一步 outputs 如何传给下一步 inputs、每步 expected outputs、失败/跳过条件，以及何时读取 references/assets。\n"
-            "5. SKILL.md 只写总流程和调用顺序；子任务详细规则必须引用 references/*.md，不要把 text/image/pdf/docx/pptx/html 子任务规范混在 SKILL.md 中。\n"
-            "6. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个可执行的 ```bash fenced code block，命令参数必须与脚本接口一致。\n"
-            "7. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
-            "8. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含示例 ```bash fenced code block。\n"
-            "9. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            "10. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
-            "11. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n"
+            "4. SKILL.md 必须生成成 E2E 可试运行的线性 workflow，不允许依赖后续人工修产物文件。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
+            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
+            "7. JSON argv 必须是 json.loads 可解析的模板；所有动态占位符必须是字符串值，例如 \"theme\":\"{{theme}}\"；禁止裸写 \"scene_count\":{{scene_count}}。\n"
+            "8. 若需要默认数字，直接写 JSON 数字，例如 \"scene_count\":3；不要把数字 placeholder 裸露在 JSON 中。\n"
+            "9. E2E 不理解自然语言循环；禁止写“每幕一次/共3次/对每个场景调用一次”作为执行协议。多场景循环必须由脚本内部完成，SKILL.md 只写一次脚本调用。\n"
+            "10. 后续步骤只能引用前序脚本 stdout JSON 中真实输出的字段；禁止发明 image_path_1/image_path_2/image_path_3 等编号字段。\n"
+            "11. 列表或对象字段必须通过整值占位符传递，例如 \"image_paths\":\"{{image_paths}}\"，不要写成 [\"{{image_path_1}}\",\"{{image_path_2}}\"]。\n"
+            "12. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "13. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
+            "14. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "15. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "16. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
+            "17. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
+"18. 禁止为下游脚本添加没有上游来源的额外 placeholder，例如禁止 custom_character:\"{{character}}\"，除非前序 stdout 明确输出 character。\n"
+"19. 对图片生成脚本，若上一步输出 script_content，则推荐命令为：python scripts/generate_images.py '{\"scene_text\":\"{{script_content}}\"}'，不要额外添加 custom_character。\n"
+            f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
+            "以下 E2E workflow authoring guide 是强制生成策略，最终 SKILL.md 必须按它组织命令和数据流：\n"
+            f"{skill_md_e2e_authoring_guide}\n\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
             f"{skill_md_contract_text}\n\n"
             f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
@@ -4289,16 +4422,24 @@ class E2EWorkflowCommand:
 
 
 def _iter_markdown_shell_blocks_with_source(content: str, *, source_path: str) -> list[tuple[str, str]]:
-    """Return shell/bash fenced blocks in document order."""
+    """Return shell/bash fenced blocks in document order.
+
+    Keep this parser aligned with _extract_script_command_templates(), otherwise
+    file-level validation and final E2E validation can disagree.
+    """
     blocks: list[tuple[str, str]] = []
-    for match in re.finditer(
-        r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```",
-        content or "",
-        flags=re.IGNORECASE,
-    ):
-        command = match.group(1).strip()
-        if "scripts/" in command:
+
+    for info, body in _iter_markdown_fenced_blocks(content):
+        if not _is_shell_fence_info(info):
+            continue
+
+        command = body.strip()
+        if not command:
+            continue
+
+        if "scripts/" in command.replace("\\", "/"):
             blocks.append((source_path, command))
+
     return blocks
 
 
@@ -4839,6 +4980,20 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
 
     script_files = sorted((source_skill_dir / "scripts").glob("*.py")) if (source_skill_dir / "scripts").is_dir() else []
     if script_files and not commands:
+        shell_like_blocks = [
+            body
+            for info, body in _iter_markdown_fenced_blocks(skill_md)
+            if _is_shell_fence_info(info) and "scripts/" in body.replace("\\", "/")
+        ]
+
+        hint = ""
+        if shell_like_blocks:
+            hint = (
+                "\n检测到疑似 scripts/ 命令块，但未能解析为 E2E workflow。"
+                "请检查 fenced code block 是否是标准 Markdown 形态，"
+                "以及命令是否形如：python scripts/name.py '{\"key\":\"{{key}}\"}'。"
+            )
+
         return [
             _e2e_error(
                 target="SKILL.md",
@@ -4846,6 +5001,7 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
                 message=(
                     "Skill 包含 scripts/*.py，但 SKILL.md/reference 中没有可执行 bash/sh/shell 命令块。\n"
                     "必须在 SKILL.md 中按真实工作流顺序写出脚本调用命令，或者明确引用包含命令的 references/*.md。"
+                    f"{hint}"
                 ),
             )
         ]
@@ -5083,6 +5239,72 @@ async def _repair_existing_file_for_e2e_failure(
     target_file.write_text(sanitized, encoding="utf-8")
     return target_path
 
+def _iter_markdown_fenced_blocks(content: str) -> list[tuple[str, str]]:
+    """Return fenced code blocks as (info_string, body).
+
+    This parser is intentionally line-based instead of one regex so it accepts
+    normal Markdown shapes generated by LLMs, including fences indented under
+    list items:
+
+        1. step
+           ```bash
+           python scripts/foo.py '{"topic":"{{topic}}"}'
+           ```
+
+    It also accepts CRLF, trailing spaces after fences, and ~~~ fences.
+    """
+    lines = (content or "").splitlines()
+    blocks: list[tuple[str, str]] = []
+
+    in_block = False
+    fence_char = ""
+    fence_len = 0
+    info = ""
+    body_lines: list[str] = []
+
+    open_re = re.compile(r"^\s*(`{3,}|~{3,})([^\n`]*)\s*$")
+
+    for line in lines:
+        if not in_block:
+            match = open_re.match(line)
+            if not match:
+                continue
+
+            fence = match.group(1)
+            fence_char = fence[0]
+            fence_len = len(fence)
+            info = (match.group(2) or "").strip().lower()
+            body_lines = []
+            in_block = True
+            continue
+
+        close_re = re.compile(rf"^\s*{re.escape(fence_char)}{{{fence_len},}}\s*$")
+        if close_re.match(line):
+            blocks.append((info, "\n".join(body_lines).strip()))
+            in_block = False
+            fence_char = ""
+            fence_len = 0
+            info = ""
+            body_lines = []
+            continue
+
+        body_lines.append(line)
+
+    return blocks
+
+
+def _is_shell_fence_info(info: str) -> bool:
+    """Return whether a fenced block should be treated as shell commands.
+
+    Empty info is accepted only when the block contains scripts/ later, matching
+    the previous permissive behavior.
+    """
+    normalized = (info or "").strip().lower()
+    if not normalized:
+        return True
+    first = normalized.split()[0]
+    return first in {"bash", "sh", "shell", "zsh"}
+
 def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
     """Strict end-to-end workflow validation.
 
@@ -5177,16 +5399,42 @@ async def validate_skill(request: SkillActionRequest):
 
 
 @router.post("/package-skill", response_model=SkillActionResponse)
-async def package_skill(request: SkillActionRequest):
-    """Package a Skill directory into a distributable .skill archive."""
+async def package_skill(request: PackageSkillRequest):
+    """Package a Skill directory into a distributable .skill archive.
+
+    Packaging is intentionally gated by strict E2E validation so the frontend
+    or any direct API caller cannot download a package that failed the real
+    workflow trial run.
+    """
     skill_name = _validate_skill_name(request.skill_name)
+
+    if request.validate_before_package:
+        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        if e2e_errors:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "打包已中止：严格端到端工作流校验未通过。\n"
+                    "请先调用 /api/creator/validate-skill 完成自动修复，"
+                    "或根据以下错误手动修改后重试：\n"
+                    + "\n\n".join(e2e_errors)
+                ),
+            )
+
     result = run_action({"action": "package", "name": skill_name})
+    if not result["success"]:
+        return SkillActionResponse(
+            success=False,
+            path=result.get("path"),
+            message=result["message"],
+        )
+
     return SkillActionResponse(
-        success=result["success"],
+        success=True,
         path=result.get("path"),
         message=result["message"],
     )
-
 
 @router.post("/init-from-blueprint", response_model=InitFromBlueprintResponse)
 async def init_from_blueprint(request: InitFromBlueprintRequest):

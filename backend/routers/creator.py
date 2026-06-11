@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -687,7 +687,9 @@ _CREATOR_FLOW_LEAK_RE = re.compile(
     r"点击\s*(?:\*\*)?[‘'\"“”]?开始创建[’'\"“”]?(?:\*\*)?|开始生成文件|文件清单预览|确认无误后|"
     r"你也可以在创建后继续编辑内容|确认项列表|系统将自动创建|自动创建以下文件|"
     r"创建文件面板|文件创建面板|若当前无误|已预置|所有路径与命名与蓝图一致|"
-    r"不包含任何隐藏逻辑或隐式执行|输出格式符合 Markdown 标准，支持宿主解析",
+    r"不包含任何隐藏逻辑或隐式执行|输出格式符合 Markdown 标准，支持宿主解析|"
+    r"(?:先|首先)?输出(?:完整)?(?:架构)?蓝图|等待用户确认|用户确认后(?:再|开始)|蓝图确认后|"
+    r"Creator\s*(?:创建|阶段|确认)|Phase\s*[123]\s*(?:创建|蓝图|确认)",
     re.IGNORECASE,
 )
 _SKILL_FILE_PATH_RE = re.compile(r"(?<![\w./-])((?:scripts|references|assets)/[A-Za-z0-9_./-]+|SKILL\.md)(?![\w./-])")
@@ -1207,6 +1209,81 @@ def _has_valid_skill_md_frontmatter(content: str) -> bool:
         str(meta.get("description") or "").strip()
     )
 
+
+def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[ContractCheckResult]:
+    """Validate SKILL.md command placeholders against parsed SkillPlan dataflow."""
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        entries = [entry for entry in (parsed.skill_plan.files if parsed.skill_plan else []) if entry.file_type == "script"]
+    except Exception as exc:
+        return [ContractCheckResult(
+            id="skill_md.dataflow.plan_parseable",
+            passed=False,
+            target="SKILL.md",
+            message=f"无法解析蓝图脚本数据流：{exc}",
+            expected="蓝图应包含可解析的 SkillPlan / 文件职责计划。",
+            minimal_edit="补充每个 scripts/* 的 role、inputs、outputs。",
+        )]
+
+    results: list[ContractCheckResult] = []
+    produced: set[str] = set()
+    consumed: set[str] = set()
+
+    for idx, entry in enumerate(entries, start=1):
+        commands = _extract_script_command_templates(content, entry.path)
+        if not commands:
+            # A reference may intentionally hold command details; existing
+            # command-existence checks decide that style, so dataflow skips it.
+            continue
+        placeholders = command_payload_placeholders(commands[0].strip().splitlines()[0], entry.path)
+        if placeholders is None:
+            results.append(ContractCheckResult(
+                id="skill_md.dataflow.command_json_parseable",
+                passed=False,
+                target=entry.path,
+                message=f"{entry.path} 命令无法解析 JSON argv，无法校验输入输出链路。",
+                expected="命令必须向脚本传入 JSON object argv。",
+                minimal_edit=f"改为 python {entry.path} '{{\"payload\":\"{{{{user_request}}}}\"}}' 形态。",
+            ))
+            continue
+        for input_name in entry.inputs:
+            placeholder = placeholders.get(input_name)
+            passed = placeholder is not None
+            if input_name in produced:
+                passed = placeholder == input_name or placeholder in produced
+            results.append(ContractCheckResult(
+                id="skill_md.dataflow.input_available",
+                passed=passed,
+                target=f"{entry.path}:{input_name}",
+                message=(
+                    f"{entry.path} 输入 {input_name} 已通过 JSON argv 传递，且前序 stdout 依赖保持对齐。"
+                    if passed
+                    else f"{entry.path} 输入 {input_name} 未通过 JSON argv 或前序 stdout 字段正确传递。"
+                ),
+                expected="脚本 inputs 必须出现在命令 JSON argv 中；若 input 对应前序 stdout 字段，placeholder 必须引用该前序字段。",
+                minimal_edit=(
+                    f"为 {entry.path} 的 JSON argv 补齐 {input_name}；"
+                    "如果该字段来自前序 stdout，请直接引用对应 stdout 字段 placeholder。"
+                ),
+            ))
+            if placeholder in produced:
+                consumed.add(placeholder)
+        produced.update(entry.outputs or [])
+
+    final_outputs = set(entries[-1].outputs or []) if entries else set()
+    for output in sorted(produced - consumed - final_outputs):
+        results.append(ContractCheckResult(
+            id="skill_md.dataflow.output_consumed_or_final",
+            passed=False,
+            target=output,
+            message=f"脚本输出 {output} 既未被后续脚本引用，也不是最终输出。",
+            expected="每个脚本 outputs 必须被后续命令引用，或属于最终结果 metadata。",
+            minimal_edit="让后续脚本接收该 stdout 字段，或把它声明为最终输出。",
+        ))
+
+    return results
+
+
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Hard format checks for SKILL.md.
 
@@ -1302,6 +1379,7 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         blueprint_text=blueprint_text,
         required_script_paths=None,
     ))
+    results.extend(_check_skill_md_command_dataflow(content, blueprint_text))
 
     return results
 
@@ -3597,6 +3675,26 @@ def _validate_command_is_single_shell_json_invocation(
             exc,
         )
 
+    # Backward-compatible field-level check plus dataflow guard: JSON argv keys
+    # must cover the declared SkillPlan inputs, and extra keys are not allowed in
+    # the primary command contract.
+    declared_inputs = set(entry.inputs or [])
+    actual_keys = set(keys or []) if keys is not None else set()
+    exact_inputs = bool(declared_inputs) and actual_keys == declared_inputs
+    if declared_inputs:
+        results.append(ContractCheckResult(
+            id="command_block.skillplan_inputs.exact",
+            passed=exact_inputs,
+            target=target,
+            message=(
+                f"{script_path} 命令 JSON keys 与 SkillPlan inputs 一致。"
+                if exact_inputs
+                else f"{script_path} 命令 JSON keys 与 SkillPlan inputs 不一致。"
+            ),
+            expected="命令 JSON object 的 keys 应与该脚本 inputs 对齐；后续数据来源由 {{placeholder}} 表示。",
+            minimal_edit="删除多余 key，补齐缺失 input key，并让 value 引用用户输入或前序 stdout 字段。",
+        ))
+
     if not runtime_matches:
         logger.info(
             "[Creator][skill_md] non-blocking runtime mismatch script=%s inferred_runtime=%s command=%s",
@@ -3634,6 +3732,18 @@ def _check_skill_md_fenced_command_contracts(
     }
 
     scripts_to_check = sorted(required or mentioned)
+
+    entries_by_path: dict[str, SkillPlanEntry] = {}
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        if parsed.skill_plan:
+            entries_by_path = {
+                entry.path: entry
+                for entry in parsed.skill_plan.files
+                if entry.file_type == "script"
+            }
+    except Exception as exc:
+        logger.warning("[Creator][skill_md] failed to parse blueprint SkillPlan for command validation: %s", exc)
 
     for script_path in scripts_to_check:
         try:
@@ -3677,7 +3787,7 @@ def _check_skill_md_fenced_command_contracts(
             continue
 
         try:
-            entry = _skill_plan_entry_for_file(
+            entry = entries_by_path.get(script_path) or _skill_plan_entry_for_file(
                 file_path=script_path,
                 blueprint_text=blueprint_text,
             )
@@ -5583,6 +5693,15 @@ def _build_generate_file_prompt(
     return messages
 
 
+
+def _local_blueprint_text_for_path(path: str, blueprint_text: str, *, window: int = 600) -> str:
+    text = blueprint_text or ""
+    idx = text.find(path)
+    if idx < 0:
+        return ""
+    return text[max(0, idx - window): min(len(text), idx + len(path) + window)]
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -5607,14 +5726,17 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     candidate_paths: set[str] = set(_extract_declared_skill_paths(blueprint_text))
     candidate_paths.update(entries_by_path.keys())
 
-    extra_paths = [
-        path for path in sorted(candidate_paths)
-        if path not in base_paths
-           and (
-                   path.startswith("references/")
-                   or path.startswith("assets/")
-           )
-    ]
+    extra_paths = []
+    extra_path_warnings: list[str] = []
+    for path in sorted(candidate_paths):
+        if path in base_paths or not (path.startswith("references/") or path.startswith("assets/")):
+            continue
+        if is_runtime_artifact_semantic(path, _local_blueprint_text_for_path(path, blueprint_text)):
+            extra_path_warnings.append(
+                f"已忽略运行时产物文件计划项 {path}；运行时生成文件只能通过脚本 outputs/stdout metadata 表示。"
+            )
+            continue
+        extra_paths.append(path)
 
     def fallback_role(path: str) -> str | None:
         if path == "SKILL.md":
@@ -5733,7 +5855,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         for capability in file_spec.required_capabilities
     }
     missing_tool_configs = []
-    warnings = list(plan.warnings)
+    warnings = [*list(plan.warnings), *extra_path_warnings]
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
         if not cap or cap.category == "resource":

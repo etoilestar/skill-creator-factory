@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry
+from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, validate_skill_plan_dataflow
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -308,6 +308,12 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
                 warnings.append(warning)
             return
 
+        if is_runtime_artifact_semantic(path, purpose):
+            warning = f"已忽略运行时产物文件计划项 {path}；脚本生成的结果只能声明在 outputs/stdout metadata 中，不能作为 Creator 待创建文件。"
+            if warning not in warnings:
+                warnings.append(warning)
+            return
+
         if path in seen:
             return
 
@@ -468,6 +474,14 @@ def build_skill_plan_from_files(
     entries: list[SkillPlanEntry] = []
     plan_warnings = list(warnings or [])
 
+    for dep_match in re.finditer(r"dependencies\s*[：:=]\s*\[?([^\]\n;]+)\]?", blueprint_text or "", re.I):
+        for raw_dep in re.split(r"[,，、]\s*", dep_match.group(1)):
+            dep = raw_dep.strip().strip("'\"")
+            if dependency_is_output_semantic(dep):
+                warning = f"已从 dependencies 移除输出/动态路径 {dep}；dependencies 只能表示输入依赖。"
+                if warning not in plan_warnings:
+                    plan_warnings.append(warning)
+
     for file in files:
         if _is_probable_prompt_leaked_script(
             file.path,
@@ -512,7 +526,10 @@ def build_skill_plan_from_files(
                 "不会自动启用图片生成/PDF 生成等高影响能力。"
             )
 
-    return SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings)
+    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings))
+    semantic_issues = validate_file_plan_semantics(normalized)
+    dataflow_issues = validate_skill_plan_dataflow(normalized)
+    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues, *dataflow_issues])
 
 
 def parse_blueprint(messages: list[dict]) -> BlueprintPlan:

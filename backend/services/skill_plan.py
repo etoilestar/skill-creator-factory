@@ -8,7 +8,7 @@ resolved file role rather than by scanning the whole blueprint for domain words.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 from typing import Literal
@@ -572,7 +572,7 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
-        return [], ["existing_parseable_file"]
+        return [], []
     if role == "skill_overview":
         return ["user_request"], ["workflow", "script_order", "resource_references"]
     return ["payload"], []
@@ -707,6 +707,228 @@ def build_skill_plan_entry(
         reason=role_reason,
         heuristic_signals=classification.heuristic_signals,
     )
+
+
+_RUNTIME_OUTPUT_DIR_RE = re.compile(r"(?:^|/)(?:outputs?|output|generated|build|dist|tmp|temp|artifacts?)(?:/|$)|输出目录|产物目录|结果目录|中间目录|OUTPUT_DIR", re.I)
+_RUNTIME_OUTPUT_EXT_RE = re.compile(r"\.(?:pdf|docx|pptx|xlsx|csv|json|png|jpe?g|webp|gif|svg|zip|html)$", re.I)
+_DYNAMIC_PATH_RE = re.compile(r"\{\{|\}\}|\$\{|<[^>/]+>|\[[^\]]+\]|\*|\?|按.*(?:生成|输出)|动态|占位符|变量|runtime|运行时", re.I)
+_GENERATED_SEMANTIC_RE = re.compile(r"生成|产物|输出|导出|写入|构建|保存|最终结果|最终文件|中间文件|runtime|运行时|generated|output|artifact|export|build|result", re.I)
+_UPLOAD_ONLY_RE = re.compile(r"上传|已有|现成|预置|静态|模板|素材|upload|provided|static|bundled", re.I)
+def is_dynamic_file_path(path: str) -> bool:
+    return bool(_DYNAMIC_PATH_RE.search(path or ""))
+
+
+def is_runtime_output_path(path: str) -> bool:
+    normalized = (path or "").replace("\\", "/")
+    return bool(_RUNTIME_OUTPUT_DIR_RE.search(normalized))
+
+
+def is_runtime_artifact_semantic(path: str, text: str = "") -> bool:
+    """Return True when a file-plan item describes a runtime/generated artifact.
+
+    Static uploaded assets can have image/document extensions, so an extension is
+    not enough by itself.  We require a runtime/output directory, a dynamic path,
+    or generated/final-output semantics near the file contract.
+    """
+    normalized = (path or "").replace("\\", "/")
+    semantic_text = f"{normalized}\n{text or ''}"
+    if is_dynamic_file_path(normalized):
+        return True
+    if is_runtime_output_path(normalized):
+        return True
+    if _GENERATED_SEMANTIC_RE.search(semantic_text) and (_RUNTIME_OUTPUT_EXT_RE.search(normalized) or normalized.startswith("assets/")):
+        if normalized.startswith("assets/") and _UPLOAD_ONLY_RE.search(text or "") and not re.search(r"最终|产物|输出|导出|生成|generated|output|artifact|export", text or "", re.I):
+            return False
+        return True
+    return False
+
+
+def _is_asset_upload_only(entry: SkillPlanEntry) -> bool:
+    text = f"{entry.purpose}\n{' '.join(entry.inputs)}\n{' '.join(entry.outputs)}\n{' '.join(entry.dependencies)}"
+    if entry.inputs or entry.outputs or entry.dependencies or entry.required_capabilities:
+        return False
+    if is_dynamic_file_path(entry.path):
+        return False
+    if is_runtime_artifact_semantic(entry.path, text):
+        return False
+    return True
+
+
+def dependency_is_output_semantic(dep: str, prior_outputs: set[str] | None = None) -> bool:
+    dep = str(dep or "").strip().replace("\\", "/")
+    if not dep:
+        return False
+    if is_runtime_output_path(dep) or is_dynamic_file_path(dep):
+        return True
+    if prior_outputs and dep in prior_outputs:
+        return True
+    return False
+
+
+def _command_template_for_entry_with_values(entry: SkillPlanEntry) -> str:
+    payload_keys = list(entry.inputs or ["payload"])
+    payload: dict[str, str] = {}
+    for key in payload_keys:
+        # The placeholder name is the dataflow edge.  For downstream scripts this
+        # resolves from prior stdout JSON when the same field was produced upstream.
+        payload[key] = f"{{{{{key}}}}}"
+    rendered = "{" + ",".join(f'"{key}":"{value}"' for key, value in payload.items()) + "}"
+    if entry.runtime == "python":
+        return f"python {entry.path} '{rendered}'"
+    if entry.runtime == "node":
+        return f"node {entry.path} '{rendered}'"
+    if entry.runtime == "bash":
+        return f"bash {entry.path} '{rendered}'"
+    if entry.runtime == "shell":
+        return f"sh {entry.path} '{rendered}'"
+    return f"{entry.path} '{rendered}'"
+
+
+def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
+    """Normalize and clean a parsed SkillPlan after model/regex extraction."""
+    entries: list[SkillPlanEntry] = []
+    warnings = list(plan.warnings or [])
+    seen_skill_md = False
+    prior_outputs: set[str] = set()
+
+    for entry in plan.files:
+        path = entry.path.replace("\\", "/").strip()
+        if path == "SKILL.md":
+            if seen_skill_md:
+                warnings.append("已移除重复的 SKILL.md 文件计划项；Skill 包只能有一个 SKILL.md。")
+                continue
+            seen_skill_md = True
+
+        normalized_required = normalize_required_capabilities(
+            role=entry.role,
+            path=path,
+            required_capabilities=list(entry.required_capabilities or []),
+            user_blueprint_text=entry.purpose,
+        )
+        dependencies = [dep for dep in _dedupe_paths(list(entry.dependencies or [])) if not dependency_is_output_semantic(dep, prior_outputs)]
+        removed_deps = set(entry.dependencies or []) - set(dependencies)
+        for dep in sorted(removed_deps):
+            warnings.append(f"已从 {path} dependencies 移除输出/动态路径 {dep}；dependencies 只能表示输入依赖。")
+
+        cleaned = replace(
+            entry,
+            path=path,
+            required_capabilities=normalized_required,
+            dependencies=dependencies,
+            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required)],
+        )
+
+        if cleaned.role in RESOURCE_ROLES or cleaned.file_type in {"skill_md", "reference", "asset"}:
+            cleaned = replace(cleaned, required_capabilities=[], optional_capabilities=[], allowed_capabilities=[])
+
+        if cleaned.role == "asset" or cleaned.file_type == "asset" or path.startswith("assets/"):
+            if not _is_asset_upload_only(cleaned):
+                warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
+                continue
+            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], runtime="none", entrypoint="", command_template="")
+
+        if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
+            cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")
+
+        if cleaned.file_type == "script":
+            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned))
+            prior_outputs.update(cleaned.outputs or [])
+
+        entries.append(cleaned)
+
+    return SkillPlan(skill_name=plan.skill_name, files=entries, warnings=warnings)
+
+
+def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
+    """Return generic semantic file-plan violations after normalization."""
+    issues: list[str] = []
+    skill_md_count = sum(1 for entry in plan.files if entry.path == "SKILL.md")
+    if skill_md_count != 1:
+        issues.append(f"SKILL.md must be unique; found {skill_md_count}.")
+
+    prior_outputs: set[str] = set()
+    for entry in plan.files:
+        if entry.path == "SKILL.md" and entry.role != "skill_overview":
+            issues.append("SKILL.md role must be skill_overview.")
+        if entry.file_type == "script" and not entry.path.startswith("scripts/"):
+            issues.append(f"Script file must be under scripts/: {entry.path}")
+        if entry.file_type == "reference" and not entry.path.startswith("references/"):
+            issues.append(f"Reference file must be under references/: {entry.path}")
+        if entry.file_type == "asset" or entry.role == "asset" or entry.path.startswith("assets/"):
+            if not _is_asset_upload_only(entry):
+                issues.append(f"Asset must be upload-only static resource: {entry.path}")
+        if entry.file_type != "script" and entry.required_capabilities:
+            issues.append(f"Resource/meta file must not declare runtime capabilities: {entry.path}")
+        for dep in entry.dependencies:
+            if dependency_is_output_semantic(dep, prior_outputs):
+                issues.append(f"Dependency cannot be output/dynamic path: {entry.path} -> {dep}")
+        if entry.file_type != "script" and is_runtime_artifact_semantic(entry.path, entry.purpose):
+            issues.append(f"Runtime artifact cannot be a Creator file-plan item: {entry.path}")
+        prior_outputs.update(entry.outputs or [])
+    return issues
+
+
+def command_payload_placeholders(command: str, script_path: str) -> dict[str, str] | None:
+    import json, shlex
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        return None
+    expected = script_path.replace("\\", "/")
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == expected or normalized.endswith("/" + expected):
+            if idx + 1 >= len(parts):
+                return {}
+            try:
+                payload = json.loads(parts[idx + 1])
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            placeholders: dict[str, str] = {}
+            for key, value in payload.items():
+                if isinstance(value, str):
+                    match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*\}\}", value.strip())
+                    placeholders[str(key)] = match.group(1) if match else value.strip()
+                else:
+                    placeholders[str(key)] = ""
+            return placeholders
+    return None
+
+
+def validate_skill_plan_dataflow(plan: SkillPlan) -> list[str]:
+    """Validate linear script I/O edges without assuming business field names.
+
+    Any input may originate from the user's request, extracted runtime context,
+    or static references/assets.  The platform only enforces a stricter edge
+    when a downstream input corresponds to a field already produced by an
+    upstream script: in that case the command must pass that prior stdout JSON
+    field instead of silently falling back to unrelated raw text.
+    """
+    issues: list[str] = []
+    produced: set[str] = set()
+    scripts = [entry for entry in plan.files if entry.file_type == "script"]
+    consumed_outputs: set[str] = set()
+    for entry in scripts:
+        placeholders = command_payload_placeholders(entry.command_template, entry.path)
+        if placeholders is None:
+            issues.append(f"{entry.path} command_template must pass a JSON object argv.")
+            placeholders = {}
+        for key in entry.inputs:
+            placeholder = placeholders.get(key)
+            if placeholder is None:
+                issues.append(f"{entry.path} command_template missing input key '{key}'.")
+            elif key in produced and placeholder not in produced and placeholder != key:
+                issues.append(f"{entry.path} input '{key}' must reference prior stdout JSON field, not '{placeholder}'.")
+            elif placeholder in produced:
+                consumed_outputs.add(placeholder)
+        produced.update(entry.outputs or [])
+    final_outputs = set(scripts[-1].outputs or []) if scripts else set()
+    dangling = produced - consumed_outputs - final_outputs
+    for output in sorted(dangling):
+        issues.append(f"Script output '{output}' is neither consumed by a later script nor final output metadata.")
+    return issues
 
 
 def validate_role(role: str, file_type: FileType) -> bool:

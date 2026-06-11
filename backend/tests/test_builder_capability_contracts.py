@@ -277,3 +277,12 @@ required_capabilities: [text_generation, image_generation]
     assert entry.required_capabilities == ["pdf_generation", "file_output"]
     assert "text_generation" not in entry.required_capabilities
     assert "image_generation" not in entry.required_capabilities
+
+
+def test_registered_helper_capabilities_are_validated_from_registry():
+    from backend.routers.creator import _script_satisfies_required_capability
+
+    content = "from backend.services.skill_runtime import web_search\nweb_search('topic')"
+
+    assert _script_satisfies_required_capability(content, "web_search") is True
+    assert _script_satisfies_required_capability("print('no search')", "web_search") is False

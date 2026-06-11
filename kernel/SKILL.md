@@ -201,12 +201,21 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
   forbidden_capabilities: [hidden_runtime_protocol]
   references: []
 - path: `scripts/<name>.py`
-  role: <text_generator | image_generator | pdf_builder | generic_script>
+  role: <text_generator | image_generator | composite_generator |
+         pdf_builder | docx_builder | pptx_builder |
+         pdf_parser | docx_parser | pptx_parser |
+         vision_analyzer | search_reader | database_reader |
+         wechat_draft_creator | wechat_publisher |
+         html_asset_builder | generic_script>
   inputs: [列出 JSON argv/stdin 字段]
-  outputs: [按 role 列出：text 或 image_paths/images 或 pdf_path/file_paths]
+  outputs: [按 role 列出：text、image_paths/images、pdf_path/docx_path/pptx_path/file_paths、parsed_text、search_results、rows 或 draft_id]
   dependencies: [需要读取的 references/assets 路径]
-  required_capabilities: [text_generation | image_generation | pdf_generation | deterministic_execution | file_output]
-  forbidden_capabilities: [例如 pdf_builder 禁止 image_generation；text_generator 禁止 pdf_generation/image_generation]
+  required_capabilities: [text_generation | image_generation | vision_understanding |
+                          pdf_generation | docx_generation | pptx_generation |
+                          pdf_parsing | docx_parsing | pptx_parsing |
+                          web_search | database_read |
+                          wechat_draft | wechat_publish | deterministic_execution | file_output]
+  forbidden_capabilities: [例如 pdf_builder 禁止 image_generation；text_generator 禁止 pdf_generation/image_generation；未明确直接发布时禁止 wechat_publish]
   references: [需要引用的 references/*.md]
 - path: `references/<name>.md`
   role: reference

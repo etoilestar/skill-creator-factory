@@ -12,27 +12,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Literal
+from .creator_tool_registry import get_role_pattern, get_script_roles, is_resource_role, is_script_role
+from .creator_tool_registry import capabilities_for_role as registry_capabilities_for_role
 from .skill_dataflow import parse_schema_input_item
 
 
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"]
+ScriptRole = str
 ResourceRole = Literal["skill_overview", "reference", "asset"]
-FileRole = ScriptRole | ResourceRole
+FileRole = str
 
-SCRIPT_ROLES: frozenset[str] = frozenset({
-    "text_generator",
-    "image_generator",
-    "pdf_builder",
-    "docx_builder",
-    "pptx_builder",
-    "html_asset_builder",
-    "asset_builder",
-    "composite_generator",
-    "generic_script",
-})
+SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
     "kernel/references/best-practices.md",
@@ -197,14 +189,14 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)",
+    rf"(?:role|角色|职责)\s*[：:=]\s*({get_role_pattern()})",
     re.I,
 )
 
 
 def _normalize_role(value: str) -> FileRole | None:
     lowered = (value or "").strip().lower()
-    return lowered if lowered in SCRIPT_ROLES or lowered in RESOURCE_ROLES else None  # type: ignore[return-value]
+    return lowered if is_script_role(lowered) or is_resource_role(lowered) else None  # type: ignore[return-value]
 
 
 
@@ -487,29 +479,7 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
 
 
 def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    if role == "text_generator":
-        return ["text_generation"], ["image_generation", "pdf_generation"]
-    if role == "image_generator":
-        return ["image_generation"], ["text_generation", "pdf_generation"]
-    if role == "composite_generator":
-        return ["text_generation", "image_generation"], ["pdf_generation"]
-    if role == "pdf_builder":
-        return ["pdf_generation", "file_output"], []
-    if role == "docx_builder":
-        return ["docx_generation", "file_output"], []
-    if role == "pptx_builder":
-        return ["pptx_generation", "file_output"], []
-    if role == "html_asset_builder":
-        return ["html_asset_generation", "file_output"], []
-    if role == "asset_builder":
-        return ["asset_generation", "file_output"], []
-    if role == "reference":
-        return ["reference_guidance"], ["runtime_execution", "image_generation"]
-    if role == "asset":
-        return ["static_resource"], ["runtime_execution", "image_generation"]
-    if role == "skill_overview":
-        return ["workflow_overview"], ["hidden_runtime_protocol"]
-    return ["deterministic_execution"], ["text_generation", "image_generation", "pdf_generation"]
+    return registry_capabilities_for_role(str(role))
 
 
 def build_skill_plan_entry(
@@ -621,5 +591,5 @@ def build_skill_plan_entry(
 
 def validate_role(role: str, file_type: FileType) -> bool:
     if file_type == "script":
-        return role in SCRIPT_ROLES
-    return role in RESOURCE_ROLES
+        return is_script_role(role)
+    return is_resource_role(role)

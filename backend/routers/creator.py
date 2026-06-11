@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language
+from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -195,6 +196,8 @@ class AnalyzeBlueprintResponse(BaseModel):
     skill_name: str
     files: list[FileSpecOut]
     warnings: list[str]
+    available_tools: list[dict[str, Any]] = Field(default_factory=list)
+    missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InitSkillRequest(BaseModel):
@@ -2673,8 +2676,18 @@ def _validate_asset_file_contract(file_path: str, content: str) -> None:
 
 
 
+def _script_uses_registry_helpers(content: str, capability: str) -> bool:
+    cap = get_tool_capability(capability)
+    if not cap or not cap.helper_imports:
+        return False
+    helper_pattern = "|".join(re.escape(helper) for helper in sorted(cap.helper_imports, key=len, reverse=True))
+    return bool(re.search(rf"\b(?:{helper_pattern})\b", content, re.IGNORECASE))
+
+
 def _script_satisfies_required_capability(content: str, capability: str) -> bool:
     capability = capability.lower()
+    if _script_uses_registry_helpers(content, capability):
+        return True
     if capability == "text_generation":
         return bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", content, re.IGNORECASE))
     if capability == "image_generation":
@@ -2693,6 +2706,10 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|assets/generated|build_html", content, re.IGNORECASE))
     if capability == "file_output":
         return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)", content, re.IGNORECASE))
+    cap = get_tool_capability(capability)
+    if cap and cap.helper_imports:
+        return False
+    # Unknown capabilities stay permissive so older plans are not rejected.
     return True
 
 
@@ -3129,6 +3146,49 @@ def _check_script_file_contract(
                 ),
                 expected="只有 required_capabilities 包含 pdf_generation 且未被 forbidden_capabilities 禁止时，脚本才可构建 PDF。",
                 minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：若当前脚本禁止 PDF 能力则移除 PDF 生成逻辑。",
+            )
+        )
+
+    registry_forbidden_helper_hits: list[str] = []
+    for forbidden_capability in plan_entry.forbidden_capabilities or []:
+        if forbidden_capability in {"image_generation", "text_generation", "pdf_generation"}:
+            continue
+        if _script_uses_registry_helpers(stripped, str(forbidden_capability)):
+            registry_forbidden_helper_hits.append(str(forbidden_capability))
+    results.append(
+        ContractCheckResult(
+            id="script.capability.forbidden_registry_helpers",
+            passed=not registry_forbidden_helper_hits,
+            target=file_path,
+            message=(
+                "脚本未调用 forbidden_capabilities 中禁止的 registry helper。"
+                if not registry_forbidden_helper_hits
+                else f"{file_path} 调用了这些 forbidden_capabilities 对应的 registry helper：{', '.join(registry_forbidden_helper_hits)}。"
+            ),
+            expected="脚本只能调用 SkillPlan required/optional/allowed capabilities 对应的平台 helper。",
+            minimal_edit="移除被 forbidden_capabilities 禁止的 helper 调用，或在蓝图阶段明确声明该能力。",
+        )
+    )
+
+    if "database_read" in set(effective_required_capabilities):
+        write_sql = bool(re.search(
+            r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|MERGE)\b",
+            stripped,
+            re.IGNORECASE,
+        ))
+        multi_statement_sql = bool(re.search(r";\s*(?:SELECT|WITH|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE)\b", stripped, re.IGNORECASE))
+        results.append(
+            ContractCheckResult(
+                id="script.database_read.readonly_sql",
+                passed=not write_sql and not multi_statement_sql,
+                target=file_path,
+                message=(
+                    "数据库读取脚本仅包含只读 SQL 形态。"
+                    if not write_sql and not multi_statement_sql
+                    else f"{file_path} 的 database_read 能力包含写操作或多语句 SQL 风险。"
+                ),
+                expected="database_read 只能通过 query_database_readonly 执行 SELECT/WITH 只读查询，禁止写操作和多语句。",
+                minimal_edit="将 SQL 改为单条 SELECT/WITH 查询，并通过 query_database_readonly 执行。",
             )
         )
 
@@ -5623,10 +5683,27 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         )
 
+    available_tools = [tool_status(cap) for cap in list_tool_capabilities()]
+    required_tool_names = {
+        capability
+        for file_spec in files_out
+        for capability in file_spec.required_capabilities
+    }
+    missing_tool_configs = []
+    for capability_name in sorted(required_tool_names):
+        cap = get_tool_capability(capability_name)
+        if not cap:
+            continue
+        status = tool_status(cap)
+        if not status["configured"]:
+            missing_tool_configs.append(status)
+
     return AnalyzeBlueprintResponse(
         skill_name=plan.skill_name,
         files=files_out,
         warnings=plan.warnings,
+        available_tools=available_tools,
+        missing_tool_configs=missing_tool_configs,
     )
 
 

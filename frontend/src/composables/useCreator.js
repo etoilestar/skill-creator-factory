@@ -174,6 +174,33 @@ export async function writeFile(skillName, filePath, content, role = null, skill
   return resp.json()
 }
 
+export async function uploadAsset({ skillName, filePath, file }) {
+  const form = new FormData()
+  form.append('skill_name', skillName)
+  form.append('file_path', filePath)
+  form.append('file', file)
+
+  const res = await fetch('/api/creator/upload-asset', {
+    method: 'POST',
+    body: form,
+  })
+  const data = await res.json()
+  if (!res.ok || !data.success) throw new Error(data.detail || data.message || '上传失败')
+  return data
+}
+
+export async function uploadAssetAPI({ skillName, filePath, file }) {
+  const form = new FormData()
+  form.append('skill_name', skillName)
+  form.append('file_path', filePath)
+  form.append('file', file)
+
+  const res = await fetch('/api/creator/upload-asset', { method: 'POST', body: form })
+  const data = await res.json()
+  if (!res.ok || !data.success) throw new Error(data.detail || data.message || '上传失败')
+  return data
+}
+
 /**
  * Validate the SKILL.md of a Skill package.
  *

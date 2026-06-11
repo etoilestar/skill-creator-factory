@@ -66,43 +66,85 @@
 
         <!-- Action buttons -->
         <span class="file-actions">
-          <button
-            v-if="file.status === 'preview'"
-            class="btn-small btn-write"
-            @click="writeOneFile(idx)"
-          >
-            写入
-          </button>
-          <button
-            v-if="file.status === 'error' || file.status === 'preview'"
-            class="btn-small btn-retry"
-            @click="generateOneFile(idx)"
-          >
-            重新生成
-          </button>
-          <button
-            v-if="file.status === 'done'"
-            class="btn-small btn-preview"
-            @click="togglePreview(idx)"
-          >
-            {{ file.showPreview ? '收起' : '预览' }}
-          </button>
-          <button
-            v-if="canSkipFile(file)"
-            class="btn-small btn-skip"
-            @click="skipFile(idx)"
-          >
-            跳过
-          </button>
-          <button
-            v-if="canRemoveFile(file)"
-            class="btn-small btn-remove"
-            @click="removeFile(idx)"
-          >
-            移除
-          </button>
-        </span>
+          <template v-if="looksLikeDirectoryPath(file.path)">
+              <span class="file-meta muted">目录路径，无需上传</span>
 
+              <button
+                v-if="canRemoveFile(file)"
+                class="btn-small btn-remove"
+                @click="removeFile(idx)"
+              >
+                移除
+              </button>
+            </template>
+
+            <!-- 具体 assets 文件：必须由用户上传 -->
+            <template v-else-if="isAssetFile(file)">
+              <input
+                type="file"
+                class="btn-small"
+                @change="event => handleAssetUpload(file, event)"
+              />
+
+              <span v-if="file.uploaded" class="text-green-600">已上传</span>
+              <span v-if="file.error" class="text-red-600">{{ file.error }}</span>
+
+              <button
+                v-if="canSkipFile(file)"
+                class="btn-small btn-skip"
+                @click="skipFile(idx)"
+              >
+                跳过
+              </button>
+
+              <button
+                v-if="canRemoveFile(file)"
+                class="btn-small btn-remove"
+                @click="removeFile(idx)"
+              >
+                移除
+              </button>
+          </template>
+
+          <!-- 其他文件保持生成/写入按钮 -->
+          <template v-else>
+            <button
+              v-if="file.status === 'preview'"
+              class="btn-small btn-write"
+              @click="writeOneFile(idx)"
+            >
+              写入
+            </button>
+            <button
+              v-if="file.status === 'error' || file.status === 'preview'"
+              class="btn-small btn-retry"
+              @click="generateOneFile(idx)"
+            >
+              重新生成
+            </button>
+            <button
+              v-if="file.status === 'done'"
+              class="btn-small btn-preview"
+              @click="togglePreview(idx)"
+            >
+              {{ file.showPreview ? '收起' : '预览' }}
+            </button>
+            <button
+              v-if="canSkipFile(file)"
+              class="btn-small btn-skip"
+              @click="skipFile(idx)"
+            >
+              跳过
+            </button>
+            <button
+              v-if="canRemoveFile(file)"
+              class="btn-small btn-remove"
+              @click="removeFile(idx)"
+            >
+              移除
+            </button>
+          </template>
+        </span>
         <!-- Inline editor for preview/error states -->
         <div v-if="file.status === 'preview' || (file.status === 'error' && file.generatedContent)"
           class="file-editor-wrap"
@@ -232,6 +274,7 @@ import {
   writeFile,
   validateSkill,
   packageSkill,
+  uploadAssetAPI,
 } from '../composables/useCreator.js'
 
 // ---------------------------------------------------------------------------
@@ -255,15 +298,29 @@ const emit = defineEmits(['creation-complete', 'creation-error'])
 
 // File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error'
 const localFiles = ref(
-  props.files.map(f => ({
-    ...f,
-    status: 'pending',
-    generatedContent: '',
-    bytesWritten: 0,
-    error: '',
-    showPreview: false,
-    repairMessage: '',
-  }))
+  props.files
+    .filter(f => isMaterializedSkillFilePath(f.path))
+    .map(f => ({
+      ...f,
+      role: f.role || (
+        f.path === 'SKILL.md'
+          ? 'skill_overview'
+          : f.path?.startsWith('references/')
+            ? 'reference'
+            : f.path?.startsWith('assets/')
+              ? 'asset'
+              : f.path?.startsWith('scripts/')
+                ? 'generic_script'
+                : null
+      ),
+      status: 'pending',
+      generatedContent: '',
+      bytesWritten: 0,
+      error: '',
+      showPreview: false,
+      repairMessage: '',
+      uploaded: false,
+    }))
 )
 
 const localSkillName = ref(props.skillName)
@@ -324,6 +381,67 @@ function formatBytes(n) {
   return `${(n / 1024).toFixed(1)} KB`
 }
 
+function normalizeSkillPath(path) {
+  return String(path || '').replace(/\\/g, '/').trim()
+}
+
+function pathBasename(path) {
+  const normalized = normalizeSkillPath(path).replace(/\/$/, '')
+  if (!normalized) return ''
+  return normalized.split('/').pop() || ''
+}
+
+function hasFileExtension(path) {
+  const name = pathBasename(path)
+  if (!name) return false
+
+  const dotIndex = name.lastIndexOf('.')
+  return dotIndex > 0 && dotIndex < name.length - 1
+}
+
+function looksLikeDirectoryPath(path) {
+  const normalized = normalizeSkillPath(path)
+  if (!normalized) return false
+
+  if (normalized.endsWith('/')) return true
+
+  if (
+    normalized.startsWith('scripts/') ||
+    normalized.startsWith('references/') ||
+    normalized.startsWith('assets/')
+  ) {
+    return !hasFileExtension(normalized)
+  }
+
+  return false
+}
+
+function isMaterializedSkillFilePath(path) {
+  const normalized = normalizeSkillPath(path)
+
+  if (!normalized) return false
+  if (normalized === 'SKILL.md') return true
+
+  return (
+    (
+      normalized.startsWith('scripts/') ||
+      normalized.startsWith('references/') ||
+      normalized.startsWith('assets/')
+    ) &&
+    hasFileExtension(normalized)
+  )
+}
+
+function isAssetFile(file) {
+  const path = normalizeSkillPath(file?.path)
+  return path.startsWith('assets/') && hasFileExtension(path)
+}
+
+function isReferenceFile(file) {
+  const path = normalizeSkillPath(file?.path)
+  return path.startsWith('references/') && hasFileExtension(path)
+}
+
 function canSkipFile(file) {
   return (
     file.can_skip &&
@@ -377,6 +495,10 @@ function addFile() {
     alert('路径必须是 SKILL.md 或 scripts/*、references/*、assets/* 下的文件')
     return
   }
+  if (looksLikeDirectoryPath(path)) {
+    alert('目录路径不需要加入待生成列表；请只添加具体文件，例如 assets/template.pdf')
+    return
+  }
   if (localFiles.value.some(f => f.path === path)) {
     alert('该文件路径已存在')
     return
@@ -406,6 +528,7 @@ function addFile() {
     error: '',
     showPreview: false,
     repairMessage: '',
+    uploaded: false,
   })
   newFilePath.value = ''
   newFilePurpose.value = ''
@@ -437,6 +560,30 @@ function togglePreview(idx) {
   localFiles.value[idx].showPreview = !localFiles.value[idx].showPreview
 }
 
+
+async function handleAssetUpload(fileItem, event) {
+  const selected = event.target.files?.[0]
+  if (!selected) return
+
+  fileItem.status = 'writing'
+  fileItem.error = ''
+
+  try {
+    const result = await uploadAssetAPI({
+      skillName: localSkillName.value,
+      filePath: fileItem.path,
+      file: selected,
+    })
+    fileItem.status = 'done'
+    fileItem.uploaded = true
+    fileItem.bytesWritten = result.size
+  } catch (err) {
+    fileItem.status = 'error'
+    fileItem.error = err?.message || String(err)
+  } finally {
+    event.target.value = ''
+  }
+}
 // ---------------------------------------------------------------------------
 // Per-file generation & writing
 // ---------------------------------------------------------------------------
@@ -461,6 +608,10 @@ async function generateOneFile(idx) {
     })) {
       if (typeof chunk === 'string') {
         file.generatedContent += chunk
+      } else if (typeof chunk?.content === 'string') {
+        file.generatedContent += chunk.content
+      } else if (typeof chunk?.delta === 'string') {
+        file.generatedContent += chunk.delta
       } else if (chunk?.done) {
         break
       } else if (chunk?.validation) {
@@ -479,7 +630,12 @@ async function generateOneFile(idx) {
     file.status = 'preview'
   } catch (err) {
     file.status = 'error'
-    file.error = err.message
+    file.error = err.message || String(err)
+
+    if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
+      file.showPreview = true
+      file.repairMessage = 'SKILL.md 校验失败，可在下方手动微调后点击“写入”或“重新生成”。'
+    }
   }
 }
 
@@ -507,67 +663,121 @@ async function writeOneFile(idx) {
 // Full creation flow
 // ---------------------------------------------------------------------------
 
+const currentIndex = ref(0)
+const skillInitialized = ref(false)
+
+async function ensureSkillInitialized() {
+  if (skillInitialized.value) return
+  const r = await initSkill(localSkillName.value)
+  if (!r.success) throw new Error(r.message)
+  skillInitialized.value = true
+}
+
 async function startCreation() {
   if (nameError.value) return
-  phase.value = 'running'
+  currentIndex.value = 0
+  validateResult.value = null
+  packageResult.value = null
   paused.value = false
 
-  // 1. Init skill directory
+  await runCreationFromCurrentIndex()
+}
+
+async function resumeCreation() {
+  paused.value = false
+  if (phase.value === 'paused') {
+    await runCreationFromCurrentIndex()
+  }
+}
+
+async function runCreationFromCurrentIndex() {
+  phase.value = 'running'
+
   try {
-    const r = await initSkill(localSkillName.value)
-    if (!r.success) throw new Error(r.message)
+    await ensureSkillInitialized()
   } catch (err) {
     emit('creation-error', err.message)
     phase.value = 'idle'
     return
   }
 
-  // 2. Generate + write each file sequentially
-  for (let idx = 0; idx < localFiles.value.length; idx++) {
+  for (; currentIndex.value < localFiles.value.length; currentIndex.value++) {
     if (paused.value) {
-      phase.value = 'paused'
-      // Wait until resumed
-      await new Promise(resolve => {
-        const pauseCheckInterval = setInterval(() => {
-          if (!paused.value) {
-            clearInterval(pauseCheckInterval)
-            resolve()
-          }
-        }, 200)
-      })
-      phase.value = 'running'
-    }
-
-    const file = localFiles.value[idx]
-    if (file.status === 'skipped' || file.status === 'done') continue
-
-    await generateOneFile(idx)
-
-    // If still in error state after generation, stop if required
-    if (localFiles.value[idx].status === 'error' && file.required) {
       phase.value = 'paused'
       return
     }
-    if (localFiles.value[idx].status === 'error' && !file.required) {
-      // skip optional file on error
+
+    const idx = currentIndex.value
+    const file = localFiles.value[idx]
+
+    if (file.status === 'skipped' || file.status === 'done') continue
+
+    if (file.status === 'preview' && file.generatedContent?.trim()) {
+      await writeOneFile(idx)
+
+      if (localFiles.value[idx].status === 'error') {
+        if (file.path === 'SKILL.md') {
+          file.showPreview = true
+          file.repairMessage = '写入时校验仍未通过，请继续手动微调或重新生成。'
+          phase.value = 'paused'
+          return
+        }
+
+        if (file.required) {
+          phase.value = 'paused'
+          return
+        }
+
+        localFiles.value[idx].status = 'skipped'
+        continue
+      }
+
+      continue
+    }
+
+    if (isAssetFile(file)) {
+      if (file.status === 'done' || file.uploaded) continue
+      file.status = 'error'
+      file.error = 'assets 素材文件必须先上传，不能由模型生成'
+      phase.value = 'paused'
+      return
+    }
+
+    await generateOneFile(idx)
+
+    if (localFiles.value[idx].status === 'error') {
+      if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
+        file.showPreview = true
+        file.repairMessage = 'SKILL.md 二次校验失败，可手动微调后点击“写入”或“重新生成”。'
+        phase.value = 'paused'
+        return
+      }
+
+      if (file.required) {
+        phase.value = 'paused'
+        return
+      }
+
       localFiles.value[idx].status = 'skipped'
       continue
     }
 
     await writeOneFile(idx)
-    if (localFiles.value[idx].status === 'error' && file.required) {
-      phase.value = 'paused'
-      return
+
+    if (localFiles.value[idx].status === 'error') {
+      if (file.required) {
+        phase.value = 'paused'
+        return
+      }
+      localFiles.value[idx].status = 'skipped'
+      continue
     }
   }
 
-  // 3. Strict E2E validation.
-  // validate-skill will:
-  // - parse SKILL.md workflow commands
-  // - execute scripts in order
-  // - pipe upstream stdout JSON into downstream argv
-  // - ask the routed model to repair the failing file
-  // - retry until success or max attempts exhausted
+  await runPostValidationAndPackaging()
+}
+
+async function runPostValidationAndPackaging() {
   phase.value = 'validating'
   packageResult.value = null
 
@@ -587,14 +797,10 @@ async function startCreation() {
 
   if (!validateResult.value?.success) {
     phase.value = 'failed'
-    emit(
-      'creation-error',
-      validateResult.value?.message || '严格端到端校验失败，已停止打包。'
-    )
+    emit('creation-error', validateResult.value?.message || '严格端到端校验失败，已停止打包。')
     return
   }
 
-  // 4. Package only after strict E2E validation has passed.
   phase.value = 'packaging'
   try {
     packageResult.value = await packageSkill(localSkillName.value, {
@@ -611,10 +817,7 @@ async function startCreation() {
 
   if (!packageResult.value?.success) {
     phase.value = 'failed'
-    emit(
-      'creation-error',
-      packageResult.value?.message || '打包失败'
-    )
+    emit('creation-error', packageResult.value?.message || '打包失败')
     return
   }
 
@@ -628,10 +831,6 @@ async function startCreation() {
 
 function pauseCreation() {
   paused.value = true
-}
-
-function resumeCreation() {
-  paused.value = false
 }
 
 function skipOptionalFiles() {

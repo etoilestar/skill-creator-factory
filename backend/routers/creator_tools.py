@@ -68,13 +68,25 @@ def test_creator_tool(name: str, request: ToolTestRequest | None = None) -> dict
     cap = _tool_or_404(name)
     status = tool_status(cap)
     payload_keys = sorted((request.payload if request else {}).keys())
+    configured = bool(status["configured"])
+    runtime_ready = not status["missing_runtime_helpers"]
+    creator_available = bool(status["creator_available"])
+    success = configured and runtime_ready and creator_available
+    if not creator_available:
+        message = "tool is disabled for Creator use; no external side effect was performed"
+    elif not configured:
+        message = "tool configuration is incomplete; no external side effect was performed"
+    elif not runtime_ready:
+        message = "tool configuration is complete, but runtime helpers are not implemented; no external side effect was performed"
+    else:
+        message = "tool configuration and runtime helpers look ready; no external side effect was performed"
     return {
-        "success": bool(status["configured"]),
+        "success": success,
         "tool": status,
         "trial_mode": cap.trial_mode,
         "dry_run": True,
         "side_effect_performed": False,
-        "message": "tool configuration looks ready; no external side effect was performed" if status["configured"] else "tool configuration is incomplete; no external side effect was performed",
+        "message": message,
         # Do not echo payload values: callers may pass secrets or sample PII.
         "payload_keys": payload_keys,
     }

@@ -325,9 +325,16 @@ def set_tool_capability_override(name: str, *, enabled: bool | None = None, allo
     return get_tool_capability(name)
 
 
-def capabilities_for_role(role: str) -> tuple[list[str], list[str]]:
+def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tuple[list[str], list[str]]:
     role = (role or "").strip()
-    required = [cap.name for cap in list_tool_capabilities() if role in cap.roles]
+    capabilities = list_tool_capabilities()
+    if only_creator_enabled:
+        capabilities = [
+            cap
+            for cap in capabilities
+            if cap.enabled_by_default and cap.allow_creator_use
+        ]
+    required = [cap.name for cap in capabilities if role in cap.roles]
     return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get(role, []))
 
 
@@ -367,9 +374,11 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
     helper_names = _runtime_helper_names()
     runtime_helpers_available = [name for name in capability.helper_imports if name in helper_names]
     missing_runtime_helpers = [name for name in capability.helper_imports if name not in helper_names]
+    creator_available = capability.enabled_by_default and capability.allow_creator_use
     return {
         **asdict(capability),
         "enabled": capability.enabled_by_default,
+        "creator_available": creator_available,
         "configured": not missing_env and not missing_secrets,
         "missing_env": missing_env,
         "missing_secrets": missing_secrets,

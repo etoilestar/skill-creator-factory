@@ -5288,13 +5288,27 @@ def _script_generation_skeleton(
             "    output_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
             "    output_dir.mkdir(parents=True, exist_ok=True)\n"
             "    pdf_path = output_dir / 'output.pdf'\n"
-            "    from fpdf import FPDF\n"
+            "    from reportlab.lib.pagesizes import A4\n"
+            "    from reportlab.pdfbase import pdfmetrics\n"
+            "    from reportlab.pdfbase.cidfonts import UnicodeCIDFont\n"
+            "    from reportlab.pdfgen import canvas\n"
             f"    text = str({py_value_expr} or 'Generated PDF').strip()\n"
-            "    pdf = FPDF()\n"
-            "    pdf.add_page()\n"
-            "    pdf.set_font('Helvetica', size=14)\n"
-            "    pdf.multi_cell(0, 10, text[:2000])\n"
-            "    pdf.output(str(pdf_path))\n"
+            "    pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))\n"
+            "    c = canvas.Canvas(str(pdf_path), pagesize=A4)\n"
+            "    width, height = A4\n"
+            "    c.setFont('STSong-Light', 14)\n"
+            "    y = height - 72\n"
+            "    for raw_line in text[:4000].splitlines() or ['Generated PDF']:\n"
+            "        line = raw_line or ' '\n"
+            "        while line:\n"
+            "            chunk, line = line[:42], line[42:]\n"
+            "            c.drawString(72, y, chunk)\n"
+            "            y -= 22\n"
+            "            if y < 72:\n"
+            "                c.showPage()\n"
+            "                c.setFont('STSong-Light', 14)\n"
+            "                y = height - 72\n"
+            "    c.save()\n"
             "    return {'pdf_path': str(pdf_path), 'file_paths': [str(pdf_path)]}\n\n"
             "def run(payload: dict) -> dict:\n"
             "    return build_pdf(payload)\n\n"
@@ -5690,18 +5704,28 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         for capability in file_spec.required_capabilities
     }
     missing_tool_configs = []
+    warnings = list(plan.warnings)
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
         if not cap:
             continue
         status = tool_status(cap)
-        if not status["configured"]:
+        missing_runtime_helpers = status.get("missing_runtime_helpers") or []
+        if not status["creator_available"]:
+            warnings.append(
+                f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"
+            )
+        if missing_runtime_helpers:
+            warnings.append(
+                f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"
+            )
+        if not status["configured"] or missing_runtime_helpers or not status["creator_available"]:
             missing_tool_configs.append(status)
 
     return AnalyzeBlueprintResponse(
         skill_name=plan.skill_name,
         files=files_out,
-        warnings=plan.warnings,
+        warnings=warnings,
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
     )

@@ -4066,6 +4066,60 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
 
 
 
+def _install_capability_dependencies(venv_python: Path, required_capabilities: list[str]) -> None:
+    """Install platform-owned runtime dependencies for required capabilities.
+
+    Creator trial runs execute generated scripts in a per-skill venv.  Scripts
+    commonly import only ``backend.services.skill_runtime`` while the helper
+    itself lazy-imports packages such as reportlab/docx/pptx/pypdf.  Static
+    script import scanning cannot see those helper internals, so install the
+    dependencies declared by the Creator tool registry before execution.
+    """
+    dependencies: list[str] = []
+    seen: set[str] = set()
+    for capability_name in required_capabilities or []:
+        capability = get_tool_capability(capability_name)
+        if capability is None:
+            continue
+        for dependency in capability.dependencies or []:
+            if dependency and dependency not in seen:
+                seen.add(dependency)
+                dependencies.append(dependency)
+
+    if not dependencies:
+        return
+
+    missing: list[str] = []
+    dependency_import_names = {"python-docx": "docx", "python-pptx": "pptx"}
+    for dependency in dependencies:
+        module_name = dependency_import_names.get(dependency, dependency).replace("-", "_")
+        check = subprocess.run(
+            [
+                str(venv_python),
+                "-c",
+                "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)",
+                module_name,
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        if check.returncode != 0:
+            missing.append(dependency)
+
+    if not missing:
+        return
+
+    logger.info("skill-env: pip installing capability deps into venv: %s", missing)
+    result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--quiet", *missing],
+        timeout=180,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"安装 capability 依赖失败 ({', '.join(missing)}): {result.stderr[:500]}")
+
+
 def _trial_run_generated_script_with_plan(
     skill_name: str,
     file_path: str,
@@ -4120,6 +4174,13 @@ def _trial_run_generated_script(
 
         try:
             venv_python = _get_skill_venv_python(skill_dir)
+            entry = _skill_plan_entry_for_file(
+                file_path=file_path,
+                blueprint_text=skill_md,
+                role=role,
+                skill_plan_entry=skill_plan_entry,
+            )
+            _install_capability_dependencies(venv_python, entry.required_capabilities)
             _scan_and_install_python_deps(script_path, venv_python)
         except RuntimeError as exc:
             raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc

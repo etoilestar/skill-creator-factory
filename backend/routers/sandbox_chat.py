@@ -60,6 +60,7 @@ from ..services.skill_dataflow import (
     validate_workflow_dataflow_plan,
 )
 from ..services.artifact_validator import FileOutputValidationError, declared_artifact_paths, validate_stdout_file_outputs
+from ..services.skill_creator_dry_run import build_creator_external_input_context
 from .chat_utils import (
     _ALLOWED_PLAN_ACTIONS,
     _MAX_DEP_RETRY,
@@ -2535,13 +2536,11 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
 
 
 def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
-    """Build generic user-provided context without business field inference."""
+    """Build the generic external input envelope without business inference."""
     text = (user_text or "").strip()
     if not text:
-        return {}
-    context = {"user_request": text, "input": text, "text": text}
-    context.update(extract_inline_context_values(text))
-    return context
+        return build_creator_external_input_context(messages=[])
+    return build_creator_external_input_context(messages=[{"role": "user", "content": text}])
 
 
 def _missing_workflow_placeholders(entry: dict, context: dict) -> list[str]:
@@ -2724,8 +2723,15 @@ async def _execute_workflow_from_dataflow_plan(
     root = execution_root.resolve()
     available_scripts = set(_available_scripts_for_root(root))
     req = request or ChatRequest(messages=[])
-    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
-    context = context_from_dataflow_plan(plan, entries, user_text=user_text, user_context=user_context or {})
+    external_context = build_creator_external_input_context(
+        messages=[m.model_dump() if hasattr(m, "model_dump") else m for m in (getattr(req, "messages", []) or [])],
+        input_files=getattr(req, "input_files", []) or [],
+        fields=getattr(req, "fields", {}) or {},
+        options=getattr(req, "options", {}) or {},
+    )
+    merged_user_context = {**external_context, **(user_context or {})}
+    user_text = str(merged_user_context.get("user_request") or _last_user_text(req) or "")
+    context = context_from_dataflow_plan(plan, entries, user_text=user_text, user_context=merged_user_context)
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
     results: list[dict] = []
     touched: list[Path] = []
@@ -2913,8 +2919,15 @@ async def _execute_skill_workflow_legacy(
     root = execution_root.resolve()
     available_scripts = set(_available_scripts_for_root(root))
     req = request or ChatRequest(messages=[])
-    user_text = str((user_context or {}).get("user_request") or _last_user_text(req) or "")
-    context = initial_context_from_entries(entries, user_text=user_text, user_context=user_context or {})
+    external_context = build_creator_external_input_context(
+        messages=[m.model_dump() if hasattr(m, "model_dump") else m for m in (getattr(req, "messages", []) or [])],
+        input_files=getattr(req, "input_files", []) or [],
+        fields=getattr(req, "fields", {}) or {},
+        options=getattr(req, "options", {}) or {},
+    )
+    merged_user_context = {**external_context, **(user_context or {})}
+    user_text = str(merged_user_context.get("user_request") or _last_user_text(req) or "")
+    context = initial_context_from_entries(entries, user_text=user_text, user_context=merged_user_context)
     session_input_dir = _extract_input_session_dir(getattr(req, "input_files", []) or [], root)
     results: list[dict] = []
     touched: list[Path] = []

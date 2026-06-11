@@ -2528,7 +2528,7 @@ def test_creator_write_file_request_accepts_role_contract_fields():
     assert request.skill_plan_entry["role"] == "pdf_builder"
 
 
-def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
+def test_creator_pdf_builder_skeleton_uses_reportlab_unicode_font_not_fake_pdf_bytes():
     from backend.routers.creator import _script_generation_skeleton
 
     skeleton = _script_generation_skeleton(
@@ -2538,8 +2538,11 @@ def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
         role="pdf_builder",
     )
 
-    assert "from fpdf import FPDF" in skeleton
-    assert "pdf.output" in skeleton
+    assert "from reportlab.pdfbase.cidfonts import UnicodeCIDFont" in skeleton
+    assert "pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))" in skeleton
+    assert "setFont('STSong-Light'" in skeleton
+    assert "from fpdf import FPDF" not in skeleton
+    assert "set_font('Helvetica'" not in skeleton
     assert "write_bytes(b'%PDF-1.4" not in skeleton
 
 

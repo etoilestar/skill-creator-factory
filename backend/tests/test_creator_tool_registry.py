@@ -4,6 +4,7 @@ from backend.services.creator_tool_registry import (
     get_script_roles,
     get_tool_capability,
     is_resource_role,
+    set_tool_capability_override,
     is_script_role,
     list_tool_capabilities,
     tool_status,
@@ -71,3 +72,12 @@ def test_tool_status_reports_runtime_helper_availability_without_secret_values(m
     assert "postgresql://" not in str(status)
     assert status["missing_runtime_helpers"] == ["query_database_readonly"]
     assert status["override_persistence"] == "process_memory"
+
+
+def test_role_capabilities_filter_disabled_creator_tools_by_default():
+    set_tool_capability_override("web_search", enabled=False, allow_creator_use=False)
+    try:
+        assert capabilities_for_role("search_reader") == ([], [])
+        assert capabilities_for_role("search_reader", only_creator_enabled=False) == (["web_search"], [])
+    finally:
+        set_tool_capability_override("web_search", enabled=True, allow_creator_use=True)

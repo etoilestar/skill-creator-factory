@@ -57,3 +57,39 @@ def test_creator_tool_test_is_dry_run_and_does_not_echo_payload_values():
     assert body["side_effect_performed"] is False
     assert body["payload_keys"] == ["draft_id", "secret"]
     assert "do-not-leak" not in str(body)
+
+
+def test_creator_tool_test_fails_when_runtime_helper_is_missing():
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/pdf_generation/test", json={"payload": {"title": "Demo"}})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is False
+    assert body["tool"]["configured"] is True
+    assert body["tool"]["missing_runtime_helpers"] == ["create_pdf"]
+    assert "runtime helpers are not implemented" in body["message"]
+
+
+def test_analyze_blueprint_reports_missing_runtime_helpers_for_required_tools():
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/analyze-blueprint",
+        json={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "📋 Skill 架构蓝图\n- **Skill 名称**: pdf-demo\n- scripts/: `scripts/build_pdf.py`\n  scripts/build_pdf.py\n  role: pdf_builder\n  inputs: text\n  outputs: pdf_path\n  required_capabilities: pdf_generation",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    missing = {tool["name"]: tool for tool in body["missing_tool_configs"]}
+    assert "pdf_generation" in missing
+    assert missing["pdf_generation"]["missing_runtime_helpers"] == ["create_pdf"]
+    assert any("pdf_generation" in warning and "create_pdf" in warning for warning in body["warnings"])

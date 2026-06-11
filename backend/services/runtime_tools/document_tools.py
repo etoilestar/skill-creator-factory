@@ -27,12 +27,26 @@ def _output_path(
     output_dir: str | os.PathLike[str] | None,
     filename: str,
 ) -> Path:
-    if output_path:
-        path = Path(output_path).expanduser().resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
+    """Resolve a document output path constrained to OUTPUT_DIR.
+
+    Platform helpers must not write arbitrary host paths before the later
+    artifact validator has a chance to reject unsafe stdout declarations.  The
+    caller may provide a relative subpath, or an absolute path that is already
+    inside OUTPUT_DIR, but traversal/absolute escapes are rejected up front.
+    """
     out_dir = Path(output_dir or os.environ.get("OUTPUT_DIR") or "outputs").expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if output_path:
+        raw_path = Path(output_path).expanduser()
+        candidate = raw_path.resolve() if raw_path.is_absolute() else (out_dir / raw_path).resolve()
+        try:
+            candidate.relative_to(out_dir)
+        except ValueError as exc:
+            raise ValueError("output_path must stay under OUTPUT_DIR") from exc
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        return candidate
+
     return out_dir / _safe_filename(filename, filename)
 
 
@@ -59,12 +73,13 @@ def create_pdf(
     works without bundling a TTF file.  Generated scripts should print the
     returned dict (or include its paths) as stdout JSON.
     """
+    pdf_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     from reportlab.pdfgen import canvas
 
-    pdf_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
     pdfmetrics.registerFont(UnicodeCIDFont(font_name))
     c = canvas.Canvas(str(pdf_path), pagesize=A4)
     _, height = A4
@@ -94,9 +109,10 @@ def create_docx(
     title: str | None = None,
 ) -> dict[str, Any]:
     """Create a Word document and return JSON-serializable paths."""
+    docx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+
     from docx import Document
 
-    docx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
     document = Document()
     if title:
         document.add_heading(str(title), level=1)
@@ -115,9 +131,10 @@ def create_pptx(
     title: str = "Generated Presentation",
 ) -> dict[str, Any]:
     """Create a simple PowerPoint deck and return JSON-serializable paths."""
+    pptx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+
     from pptx import Presentation
 
-    pptx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
     prs = Presentation()
     title_slide = prs.slides.add_slide(prs.slide_layouts[0])
     title_slide.shapes.title.text = str(title or "Generated Presentation")

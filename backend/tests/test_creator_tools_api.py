@@ -59,16 +59,31 @@ def test_creator_tool_test_is_dry_run_and_does_not_echo_payload_values():
     assert "do-not-leak" not in str(body)
 
 
-def test_creator_tool_test_fails_when_runtime_helper_is_missing():
+def test_creator_tool_test_passes_when_runtime_helper_is_reexported(monkeypatch):
+    monkeypatch.setattr("backend.services.creator_tool_registry._dependency_available", lambda dependency: True)
     client = TestClient(app)
 
     response = client.post("/api/creator/tools/pdf_generation/test", json={"payload": {"title": "Demo"}})
 
     assert response.status_code == 200
     body = response.json()
+    assert body["success"] is True
+    assert body["tool"]["configured"] is True
+    assert body["tool"]["runtime_helpers_available"] == ["create_pdf"]
+    assert body["tool"]["missing_runtime_helpers"] == []
+    assert "runtime helpers look ready" in body["message"]
+
+
+def test_creator_tool_test_still_fails_when_runtime_helper_is_missing():
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/docx_parsing/test", json={"payload": {"path": "demo.docx"}})
+
+    assert response.status_code == 200
+    body = response.json()
     assert body["success"] is False
     assert body["tool"]["configured"] is True
-    assert body["tool"]["missing_runtime_helpers"] == ["create_pdf"]
+    assert body["tool"]["missing_runtime_helpers"] == ["read_docx_text"]
     assert "runtime helpers are not implemented" in body["message"]
 
 
@@ -81,7 +96,7 @@ def test_analyze_blueprint_reports_missing_runtime_helpers_for_required_tools():
             "messages": [
                 {
                     "role": "assistant",
-                    "content": "📋 Skill 架构蓝图\n- **Skill 名称**: pdf-demo\n- scripts/: `scripts/build_pdf.py`\n  scripts/build_pdf.py\n  role: pdf_builder\n  inputs: text\n  outputs: pdf_path\n  required_capabilities: pdf_generation",
+                    "content": "📋 Skill 架构蓝图\n- **Skill 名称**: docx-parse-demo\n- scripts/: `scripts/read_docx.py`\n  scripts/read_docx.py\n  role: docx_parser\n  inputs: path\n  outputs: text\n  required_capabilities: docx_parsing",
                 }
             ]
         },
@@ -90,6 +105,6 @@ def test_analyze_blueprint_reports_missing_runtime_helpers_for_required_tools():
     assert response.status_code == 200
     body = response.json()
     missing = {tool["name"]: tool for tool in body["missing_tool_configs"]}
-    assert "pdf_generation" in missing
-    assert missing["pdf_generation"]["missing_runtime_helpers"] == ["create_pdf"]
-    assert any("pdf_generation" in warning and "create_pdf" in warning for warning in body["warnings"])
+    assert "docx_parsing" in missing
+    assert missing["docx_parsing"]["missing_runtime_helpers"] == ["read_docx_text"]
+    assert any("docx_parsing" in warning and "read_docx_text" in warning for warning in body["warnings"])

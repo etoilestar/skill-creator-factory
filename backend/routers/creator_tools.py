@@ -69,15 +69,17 @@ def test_creator_tool(name: str, request: ToolTestRequest | None = None) -> dict
     status = tool_status(cap)
     payload_keys = sorted((request.payload if request else {}).keys())
     configured = bool(status["configured"])
-    runtime_ready = not status["missing_runtime_helpers"]
+    runtime_ready = not status["missing_runtime_helpers"] and not status.get("missing_dependencies")
     creator_available = bool(status["creator_available"])
     success = configured and runtime_ready and creator_available
     if not creator_available:
         message = "tool is disabled for Creator use; no external side effect was performed"
     elif not configured:
         message = "tool configuration is incomplete; no external side effect was performed"
-    elif not runtime_ready:
+    elif status["missing_runtime_helpers"]:
         message = "tool configuration is complete, but runtime helpers are not implemented; no external side effect was performed"
+    elif status.get("missing_dependencies"):
+        message = "tool runtime dependencies are not installed; no external side effect was performed"
     else:
         message = "tool configuration and runtime helpers look ready; no external side effect was performed"
     return {

@@ -266,3 +266,27 @@ def test_creator_artifact_outputs_must_not_be_assets(tmp_path: Path):
     assert not result.ok
     assert result.issues[0]["code"] == "file_output_missing"
     assert "OUTPUT_DIR/outputs" in result.issues[0]["message"]
+
+
+def test_skill_action_and_package_requests_build_same_external_context():
+    from backend.routers.creator import (
+        PackageSkillRequest,
+        SkillActionRequest,
+        _external_context_from_skill_action_request,
+    )
+
+    payload = {
+        "skill_name": "same-envelope-fixture",
+        "messages": [{"role": "user", "content": '{"declared":"json"}'}],
+        "input_files": [{"path": "inputs/session/data.txt", "filename": "data.txt"}],
+        "fields": {"explicit": "field"},
+        "options": {"safe_option": "value"},
+    }
+
+    validate_context = _external_context_from_skill_action_request(SkillActionRequest(**payload))
+    package_context = _external_context_from_skill_action_request(PackageSkillRequest(**payload))
+
+    assert package_context == validate_context
+    assert package_context["user_request"] == '{"declared":"json"}'
+    assert package_context["files"] == {"data.txt": "inputs/session/data.txt"}
+    assert package_context["fields"] == {"declared": "json", "explicit": "field"}

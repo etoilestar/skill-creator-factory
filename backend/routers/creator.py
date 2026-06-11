@@ -5609,23 +5609,25 @@ def _build_generate_file_prompt(
             "4. SKILL.md 必须生成成 E2E 可试运行的线性 workflow，不允许依赖后续人工修产物文件。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
-        "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
-        "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
-            "9. E2E 不理解自然语言循环；禁止写“每幕一次/共3次/对每个场景调用一次”作为执行协议。多场景循环必须由脚本内部完成，SKILL.md 只写一次脚本调用。\n"
-        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
-        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
-            "12. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
-            "13. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
-            "14. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            "15. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
-            "16. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "17. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
-            "18. 禁止为下游脚本添加没有上游来源的额外 placeholder，例如禁止 custom_character:\"{{character}}\"，除非前序 stdout 明确输出 character。\n"
-            "19. 不要在平台 prompt 中固定中间字段名；后续命令只能引用前序 stdout JSON 真实输出的字段。\n"
-            "20. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
-            "21. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
-            "22. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
-            "23. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
+            "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
+            "8. 如果 Skill 需要业务字段，第一脚本必须从 user_request/input/text 或 fields 中自行解析，并通过 stdout JSON 输出；平台不会根据自然语言猜字段。\n"
+            "9. 后续脚本命令只能引用当前 context 或前序 stdout JSON 中真实存在的字段；字段名由该 Skill 自己的 stdout 和命令决定。\n"
+            "10. JSON argv 必须是 json.loads 可解析的模板；所有动态 placeholder 必须是字符串值；禁止裸写动态数值 placeholder。\n"
+            "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
+            "12. E2E 不理解自然语言循环；批量处理、列表处理或多文件处理必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。\n"
+            "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"
+            "14. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
+            "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
+            "16. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
+            "17. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
+            "19. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是 external envelope、显式 fields/defaults/input binding、或上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
+            "20. 禁止为下游脚本添加没有上游来源的额外 placeholder；不要在平台 prompt 中固定中间字段名。\n"
+            "21. 最后一步 stdout 必须包含平台标准输出字段，例如 text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。\n"
+            "22. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
+            "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
+            "24. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
+            "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
             "以下 E2E workflow authoring guide 是强制生成策略，最终 SKILL.md 必须按它组织命令和数据流：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
@@ -7747,14 +7749,23 @@ def _is_shell_fence_info(info: str) -> bool:
     first = normalized.split()[0]
     return first in {"bash", "sh", "shell", "zsh"}
 
-def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial") -> list[str]:
+def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial", external_context: dict[str, Any] | None = None) -> list[str]:
     """Strict end-to-end workflow validation.
 
     This replaces the old per-script smoke test with a real SKILL.md workflow run:
     upstream stdout JSON is parsed and merged into payload, then used to render
     downstream JSON argv placeholders.
     """
-    return _run_skill_workflow_e2e_once(skill_name)
+    return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+
+def _external_context_from_skill_action_request(request: SkillActionRequest) -> dict[str, Any]:
+    return build_creator_external_input_context(
+        messages=request.messages,
+        input_files=request.input_files,
+        fields=request.fields,
+        options=request.options,
+    )
+
 
 @router.post("/validate-skill", response_model=SkillActionResponse)
 async def validate_skill(request: SkillActionRequest):
@@ -7781,12 +7792,7 @@ async def validate_skill(request: SkillActionRequest):
     repair_logs: list[str] = []
 
     while True:
-        external_context = build_creator_external_input_context(
-            messages=request.messages,
-            input_files=request.input_files,
-            fields=request.fields,
-            options=request.options,
-        )
+        external_context = _external_context_from_skill_action_request(request)
         e2e_errors = _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
         if not e2e_errors:
             suffix = ""
@@ -7862,7 +7868,8 @@ async def package_skill(request: PackageSkillRequest):
     skill_name = _validate_skill_name(request.skill_name)
 
     if request.validate_before_package:
-        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial")
+        external_context = _external_context_from_skill_action_request(request)
+        e2e_errors = _validate_skill_package_smoke(skill_name, mode="trial", external_context=external_context)
         if e2e_errors:
             return SkillActionResponse(
                 success=False,

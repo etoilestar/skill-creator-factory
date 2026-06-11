@@ -375,7 +375,8 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     assert entry.required_capabilities == ["text_generation", "image_generation"]
     assert "text_generation" not in entry.forbidden_capabilities
     assert "pdf_generation" in entry.forbidden_capabilities
-    assert "custom_character" in entry.inputs
+    assert entry.inputs == ["payload"]
+    assert "custom_character" not in entry.inputs
     assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
 

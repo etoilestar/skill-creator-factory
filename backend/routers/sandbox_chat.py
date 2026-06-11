@@ -2780,7 +2780,14 @@ async def _execute_workflow_from_dataflow_plan(
             )
             logger.error(error_log)
             workflow_logs.append(error_log)
-            raise ValueError(f"循环变量无法展开：{script_path} 需要 {', '.join(exc.missing)}, collection 内容无效") from exc
+            if entry_index == 0:
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {', '.join(exc.missing)}，但 external envelope 或显式字段中没有对应变量。") from exc
+            raise ValueError(f"数据流未打通：{script_path} 需要 {', '.join(exc.missing)}，但前序步骤没有产生对应变量。") from exc
+        except MissingVariablesError as exc:
+            needed = ", ".join(f"{{{{{key}}}}}" for key in exc.missing)
+            if entry_index == 0:
+                raise ValueError(f"初始输入解析失败：{script_path} 需要 {needed}，但 external envelope 或显式字段中没有对应变量。") from exc
+            raise ValueError(f"数据流未打通：{script_path} 需要 {needed}，但前序步骤没有产生对应变量。") from exc
 
         step_payloads: list[dict] = []
         for step_context in step_contexts:
@@ -2860,6 +2867,8 @@ async def _execute_workflow_from_dataflow_plan(
             )
             logger.info(collection_log)
             workflow_logs.append(collection_log)
+        if len(step_contexts) > 1:
+            merge_step_output(context, script_path, collect_loop_outputs(step_payloads, entry))
 
     return {
         "executed": True,

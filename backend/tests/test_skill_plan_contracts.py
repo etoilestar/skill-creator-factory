@@ -1013,3 +1013,153 @@ def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
     assert "web_search" in search.required_capabilities
     assert "database_read" in database.required_capabilities
     assert "vision_understanding" in vision.required_capabilities
+
+
+def test_runtime_artifact_asset_is_removed_from_file_plan_generically():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: artifact-cleanup
+- scripts/: `scripts/build_document.py`
+  scripts/build_document.py role: pdf_builder inputs: text outputs: pdf_path, file_paths required_capabilities: pdf_generation, file_output
+- assets/: `assets/final-report.pdf`
+  assets/final-report.pdf role: asset outputs: pdf_path dependencies: scripts/build_document.py 最终输出产物，由脚本运行时生成。
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    paths = {item.path for item in plan.skill_plan.files}
+    script = next(item for item in plan.skill_plan.files if item.path == "scripts/build_document.py")
+
+    assert "assets/final-report.pdf" not in paths
+    assert script.outputs == ["pdf_path", "file_paths"]
+    assert any("asset" in warning and "运行时产物" in warning for warning in plan.warnings)
+
+
+def test_asset_role_is_upload_only_and_has_no_runtime_contract_fields():
+    from backend.services.skill_plan import SkillPlan, build_skill_plan_entry, normalize_skill_plan
+
+    static_asset = build_skill_plan_entry(
+        file_path="assets/logo.png",
+        purpose="用户上传的静态素材 upload-only static logo",
+    )
+    generated_asset = build_skill_plan_entry(
+        file_path="assets/generated-image.png",
+        purpose="role: asset outputs: image_path dependencies: scripts/render.py 运行时生成的最终图片产物",
+    )
+    normalized = normalize_skill_plan(SkillPlan(skill_name="asset-check", files=[static_asset, generated_asset]))
+    paths = {entry.path for entry in normalized.files}
+    kept = next(entry for entry in normalized.files if entry.path == "assets/logo.png")
+
+    assert "assets/logo.png" in paths
+    assert "assets/generated-image.png" not in paths
+    assert kept.inputs == []
+    assert kept.outputs == []
+    assert kept.dependencies == []
+    assert kept.required_capabilities == []
+
+
+def test_creator_phase_phrases_are_rejected_from_runtime_skill_md():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: runtime-only
+- scripts/: 无需
+"""
+    skill_md = """---
+name: runtime-only
+description: demo
+---
+# 使用方式
+先输出架构蓝图，等待用户确认后开始创建文件。
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.forbidden_creator_flow" in failed
+
+
+def test_script_io_chain_command_must_reference_prior_output_not_raw_user_request():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: chained-skill
+- scripts/: `scripts/plan.py`, `scripts/export.py`
+  scripts/plan.py role: text_generator inputs: topic outputs: outline required_capabilities: text_generation
+  scripts/export.py role: docx_builder inputs: outline outputs: docx_path, file_paths required_capabilities: docx_generation, file_output
+"""
+    skill_md = """---
+name: chained-skill
+description: demo
+---
+# Workflow
+```bash
+python scripts/plan.py '{"topic":"{{topic}}"}'
+```
+```bash
+python scripts/export.py '{"outline":"{{user_request}}"}'
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.dataflow.input_available" in failed
+
+
+def test_dependency_output_directory_is_cleaned_from_skillplan():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: dep-cleanup
+- scripts/: `scripts/export.py`
+  scripts/export.py role: docx_builder inputs: text outputs: docx_path dependencies: outputs/, references/style.md required_capabilities: docx_generation, file_output
+- references/: `references/style.md`
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/export.py")
+
+    assert "outputs/" not in entry.dependencies
+    assert "references/style.md" in entry.dependencies
+    assert any("dependencies" in warning and "输出" in warning for warning in plan.warnings)
+
+
+def test_resource_capabilities_are_empty_and_role_allowlist_cleans_spread():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    reference = build_skill_plan_entry(
+        file_path="references/guide.md",
+        purpose="required_capabilities: text_generation, web_search, database_read",
+    )
+    text = build_skill_plan_entry(
+        file_path="scripts/write.py",
+        purpose="role: text_generator inputs: topic required_capabilities: text_generation, web_search, database_read, vision_understanding, wechat_publish, file_output",
+    )
+    pdf = build_skill_plan_entry(
+        file_path="scripts/export_pdf.py",
+        purpose="role: pdf_builder inputs: text outputs: pdf_path required_capabilities: text_generation, image_generation, pdf_generation, web_search, database_read, vision_understanding, file_output",
+    )
+
+    assert reference.required_capabilities == []
+    assert text.required_capabilities == ["text_generation", "file_output"]
+    assert pdf.required_capabilities == ["pdf_generation", "file_output"]
+
+
+def test_skillplan_dataflow_allows_arbitrary_business_field_names():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: arbitrary-fields
+- scripts/: `scripts/derive.py`, `scripts/render.py`
+  scripts/derive.py role: generic_script inputs: customer_brief, locale_hint outputs: structured_payload required_capabilities: deterministic_execution, file_output
+  scripts/render.py role: generic_script inputs: structured_payload, brand_palette outputs: artifact_path, file_paths required_capabilities: deterministic_execution, file_output
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    warnings = "\n".join(plan.warnings)
+    first = next(item for item in plan.skill_plan.files if item.path == "scripts/derive.py")
+    second = next(item for item in plan.skill_plan.files if item.path == "scripts/render.py")
+
+    assert "customer_brief" not in warnings
+    assert "brand_palette" not in warnings
+    assert '"customer_brief":"{{customer_brief}}"' in first.command_template
+    assert '"structured_payload":"{{structured_payload}}"' in second.command_template

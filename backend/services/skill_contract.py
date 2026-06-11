@@ -8,7 +8,7 @@ rendering, script generation prompts, trial-run validation and sandbox runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field as dataclass_field, asdict
 from pathlib import Path
 from typing import Any, Literal
 import json
@@ -26,7 +26,7 @@ class ContractIssue:
     script_path: str | None = None
     field: str | None = None
     severity: Literal["error", "warning"] = "error"
-    details: dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = dataclass_field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -64,7 +64,7 @@ class OutputSpec:
     min_length: int | None = None
     min_items: int | None = None
     item_type: JsonType | None = None
-    item_required: list[str] = field(default_factory=list)
+    item_required: list[str] = dataclass_field(default_factory=list)
     path_must_exist: bool = False
     description: str = ""
 
@@ -140,9 +140,9 @@ class ResourceSpec:
     path: str
     kind: str = "reference"
     summary: str = ""
-    keywords: list[str] = field(default_factory=list)
-    applies_to_roles: list[str] = field(default_factory=list)
-    applies_to_steps: list[str] = field(default_factory=list)
+    keywords: list[str] = dataclass_field(default_factory=list)
+    applies_to_roles: list[str] = dataclass_field(default_factory=list)
+    applies_to_steps: list[str] = dataclass_field(default_factory=list)
     when_to_read: str = ""
     load_policy: LoadPolicy = "on_demand"
 
@@ -167,16 +167,16 @@ class StepContract:
     id: str
     script_path: str
     role: str = "generic_script"
-    inputs: dict[str, InputSpec] = field(default_factory=dict)
-    outputs: dict[str, OutputSpec] = field(default_factory=dict)
-    default_values: dict[str, Any] = field(default_factory=dict)
-    required_capabilities: list[str] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)
+    inputs: dict[str, InputSpec] = dataclass_field(default_factory=dict)
+    outputs: dict[str, OutputSpec] = dataclass_field(default_factory=dict)
+    default_values: dict[str, Any] = dataclass_field(default_factory=dict)
+    required_capabilities: list[str] = dataclass_field(default_factory=list)
+    dependencies: list[str] = dataclass_field(default_factory=list)
     command_template: str = ""
     foreach: LoopSpec | None = None
-    collect: list[CollectSpec] = field(default_factory=list)
-    resources: list[ResourceSpec] = field(default_factory=list)
-    final_artifacts: list[str] = field(default_factory=list)
+    collect: list[CollectSpec] = dataclass_field(default_factory=list)
+    resources: list[ResourceSpec] = dataclass_field(default_factory=list)
+    final_artifacts: list[str] = dataclass_field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "StepContract":
@@ -227,9 +227,9 @@ class StepContract:
 @dataclass
 class WorkflowContract:
     skill_name: str
-    steps: list[StepContract] = field(default_factory=list)
-    resources: list[ResourceSpec] = field(default_factory=list)
-    final_outputs: list[str] = field(default_factory=list)
+    steps: list[StepContract] = dataclass_field(default_factory=list)
+    resources: list[ResourceSpec] = dataclass_field(default_factory=list)
+    final_outputs: list[str] = dataclass_field(default_factory=list)
     version: str = "1"
 
     @classmethod

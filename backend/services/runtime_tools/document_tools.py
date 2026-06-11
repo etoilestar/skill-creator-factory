@@ -97,7 +97,7 @@ def create_pdf(
                 c.setFont(font_name, 14)
                 y = height - 72
     c.save()
-    return {"pdf_path": str(pdf_path), "file_paths": [str(pdf_path)]}
+    return {"pdf_path": str(pdf_path), "file_paths": [str(pdf_path)], "file_outputs": [str(pdf_path)]}
 
 
 def create_docx(
@@ -119,7 +119,7 @@ def create_docx(
     for line in _coerce_lines(text):
         document.add_paragraph(str(line))
     document.save(str(docx_path))
-    return {"docx_path": str(docx_path), "file_paths": [str(docx_path)]}
+    return {"docx_path": str(docx_path), "file_paths": [str(docx_path)], "file_outputs": [str(docx_path)]}
 
 
 def create_pptx(
@@ -145,7 +145,7 @@ def create_pptx(
         slide.shapes.title.text = f"Slide {index}"
         slide.placeholders[1].text = str(line)
     prs.save(str(pptx_path))
-    return {"pptx_path": str(pptx_path), "file_paths": [str(pptx_path)]}
+    return {"pptx_path": str(pptx_path), "file_paths": [str(pptx_path)], "file_outputs": [str(pptx_path)]}
 
 
 def extract_pdf_text(path: str | os.PathLike[str], *, max_pages: int | None = None) -> dict[str, Any]:

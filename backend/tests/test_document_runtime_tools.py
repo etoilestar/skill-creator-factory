@@ -24,8 +24,14 @@ def test_document_helpers_create_valid_artifacts_and_extract_pdf_text(tmp_path):
     pptx_path = output_dir / "report.pptx"
 
     assert pdf_result["pdf_path"] == str(pdf_path)
+    assert pdf_result["file_paths"] == [str(pdf_path)]
+    assert pdf_result["file_outputs"] == [str(pdf_path)]
     assert docx_result["docx_path"] == str(docx_path)
+    assert docx_result["file_paths"] == [str(docx_path)]
+    assert docx_result["file_outputs"] == [str(docx_path)]
     assert pptx_result["pptx_path"] == str(pptx_path)
+    assert pptx_result["file_paths"] == [str(pptx_path)]
+    assert pptx_result["file_outputs"] == [str(pptx_path)]
     assert pdf_path.read_bytes().startswith(b"%PDF-")
 
     with ZipFile(docx_path) as zf:

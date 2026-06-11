@@ -245,7 +245,10 @@ def initial_context_from_entries(entries: Iterable[dict[str, Any]], *, user_text
     text = (user_text or "").strip()
     if text:
         context.update({"user_request": text, "input": text, "text": text})
-        context.update(extract_inline_context_values(text))
+        structured_fields = extract_inline_context_values(text)
+        if structured_fields:
+            context.setdefault("fields", {}).update(structured_fields)
+            context.update(structured_fields)
 
     context.update(user_context or {})
     return context

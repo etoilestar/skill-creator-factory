@@ -81,3 +81,13 @@ def test_role_capabilities_filter_disabled_creator_tools_by_default():
         assert capabilities_for_role("search_reader", only_creator_enabled=False) == (["web_search"], [])
     finally:
         set_tool_capability_override("web_search", enabled=True, allow_creator_use=True)
+
+
+def test_tool_status_reports_missing_runtime_dependencies(monkeypatch):
+    monkeypatch.setattr("backend.services.creator_tool_registry._dependency_available", lambda dependency: False)
+
+    status = tool_status(get_tool_capability("pdf_generation"))
+
+    assert status["runtime_helpers_available"] == ["create_pdf"]
+    assert status["missing_runtime_helpers"] == []
+    assert status["missing_dependencies"] == ["reportlab"]

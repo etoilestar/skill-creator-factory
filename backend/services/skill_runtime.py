@@ -19,6 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .runtime_tools import create_docx, create_pdf, create_pptx, extract_pdf_text
+
 
 logger = logging.getLogger(__name__)
 

@@ -5095,7 +5095,7 @@ def _script_generation_skeleton(
         elif plan_entry.role == "image_generator":
             helper = "from backend.services.skill_runtime import generate_stable_diffusion_image; import json,sys; result=generate_stable_diffusion_image(sys.argv[1], filename_prefix='generated'); print(json.dumps({'image_paths':[result.get('image_path')], 'images':[result]}, ensure_ascii=False))"
         elif plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
-            helper = "import json,sys; from pathlib import Path; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); out=Path(p.get('output_dir') or 'assets/generated').resolve(); out.mkdir(parents=True, exist_ok=True); pdf=out/'output.pdf'; pdf.write_text('%PDF-1.4\\nBT ('+text[:1000].replace('(',' ').replace(')',' ') +') Tj ET\\n%%EOF\\n', encoding='latin1'); print(json.dumps({'pdf_path':str(pdf),'file_paths':[str(pdf)]}, ensure_ascii=False))"
+            helper = "from backend.services.skill_runtime import create_pdf; import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + " or 'Generated PDF'); print(json.dumps(create_pdf(text, output_dir=p.get('output_dir') or 'assets/generated'), ensure_ascii=False))"
         elif plan_entry.role == "text_generator":
             helper = "from backend.services.skill_runtime import generate_text_with_llm; import json,sys; p=json.loads(sys.argv[1]); prompt=str(" + bash_py_expr + "); print(json.dumps({'text': generate_text_with_llm(prompt)}, ensure_ascii=False))"
         else:
@@ -5711,6 +5711,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             continue
         status = tool_status(cap)
         missing_runtime_helpers = status.get("missing_runtime_helpers") or []
+        missing_dependencies = status.get("missing_dependencies") or []
         if not status["creator_available"]:
             warnings.append(
                 f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"
@@ -5719,7 +5720,11 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             warnings.append(
                 f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"
             )
-        if not status["configured"] or missing_runtime_helpers or not status["creator_available"]:
+        if missing_dependencies:
+            warnings.append(
+                f"工具能力 {capability_name} 缺少 runtime dependency: {', '.join(missing_dependencies)}。"
+            )
+        if not status["configured"] or missing_runtime_helpers or missing_dependencies or not status["creator_available"]:
             missing_tool_configs.append(status)
 
     return AnalyzeBlueprintResponse(

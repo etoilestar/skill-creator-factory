@@ -5,13 +5,15 @@ and default role mappings.  The sandbox/runtime execution path is kept separate:
 this registry describes what Creator may plan, prompt and expose through
 management APIs.  Runtime helpers and deep source validators are intentionally
 implemented in follow-up modules; tool status reports whether registered helper
-names currently exist in ``backend.services.skill_runtime``.
+names are exported by ``backend.services.skill_runtime``.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 import ast
+import importlib
+import importlib.util
 import os
 import re
 from pathlib import Path
@@ -274,6 +276,16 @@ TOOL_OVERRIDE_PERSISTENCE = "process_memory"
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 _RUNTIME_HELPERS_CACHE: set[str] | None = None
 
+_DEPENDENCY_IMPORT_NAMES = {
+    "python-docx": "docx",
+    "python-pptx": "pptx",
+}
+
+
+def _dependency_available(dependency: str) -> bool:
+    module_name = _DEPENDENCY_IMPORT_NAMES.get(dependency, dependency).replace("-", "_")
+    return importlib.util.find_spec(module_name) is not None
+
 
 def _with_overrides(capability: ToolCapability) -> ToolCapability:
     override = _TOOL_OVERRIDES.get(capability.name, {})
@@ -289,6 +301,22 @@ def _runtime_helper_names() -> set[str]:
     if _RUNTIME_HELPERS_CACHE is not None:
         return set(_RUNTIME_HELPERS_CACHE)
 
+    try:
+        runtime_module = importlib.import_module("backend.services.skill_runtime")
+    except Exception:
+        runtime_module = None
+
+    if runtime_module is not None:
+        _RUNTIME_HELPERS_CACHE = {
+            helper
+            for capability in BUILTIN_TOOL_CAPABILITIES.values()
+            for helper in capability.helper_imports
+            if hasattr(runtime_module, helper)
+        }
+        return set(_RUNTIME_HELPERS_CACHE)
+
+    # Fallback for damaged import environments: keep the old static scan, but
+    # include imported/re-exported helper aliases as well as local definitions.
     runtime_path = Path(__file__).with_name("skill_runtime.py")
     try:
         tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
@@ -296,11 +324,13 @@ def _runtime_helper_names() -> set[str]:
         _RUNTIME_HELPERS_CACHE = set()
         return set()
 
-    _RUNTIME_HELPERS_CACHE = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    helper_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            helper_names.add(node.name)
+        elif isinstance(node, ast.ImportFrom):
+            helper_names.update(alias.asname or alias.name for alias in node.names)
+    _RUNTIME_HELPERS_CACHE = helper_names
     return set(_RUNTIME_HELPERS_CACHE)
 
 
@@ -374,6 +404,7 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
     helper_names = _runtime_helper_names()
     runtime_helpers_available = [name for name in capability.helper_imports if name in helper_names]
     missing_runtime_helpers = [name for name in capability.helper_imports if name not in helper_names]
+    missing_dependencies = [name for name in capability.dependencies if not _dependency_available(name)]
     creator_available = capability.enabled_by_default and capability.allow_creator_use
     return {
         **asdict(capability),
@@ -388,4 +419,5 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "override_persistence": TOOL_OVERRIDE_PERSISTENCE,
         "runtime_helpers_available": runtime_helpers_available,
         "missing_runtime_helpers": missing_runtime_helpers,
+        "missing_dependencies": missing_dependencies,
     }

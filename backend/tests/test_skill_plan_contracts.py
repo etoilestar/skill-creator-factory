@@ -920,8 +920,10 @@ def test_export_builder_skeletons_consume_previous_stdout_without_generation_hel
     pptx_skeleton = _script_generation_skeleton("scripts/export_pptx.py", "", "", skill_plan_entry=pptx_entry.__dict__)
 
     assert "previous_stdout" in docx_skeleton
-    assert "docx_path" in docx_skeleton
-    assert "pptx_path" in pptx_skeleton
+    assert "from backend.services.skill_runtime import create_docx, print_json" in docx_skeleton
+    assert "return create_docx(text, filename='output.docx')" in docx_skeleton
+    assert "from backend.services.skill_runtime import create_pptx, print_json" in pptx_skeleton
+    assert "return create_pptx(text, filename='output.pptx')" in pptx_skeleton
     assert "generate_text_with_llm" not in docx_skeleton
     assert "generate_stable_diffusion_image" not in docx_skeleton
     assert "generate_text_with_llm" not in pptx_skeleton

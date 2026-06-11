@@ -5162,7 +5162,7 @@ def _script_generation_skeleton(
         else:
             helper = "import json,sys; p=json.loads(sys.argv[1]); text=str(" + bash_py_expr + "); print(json.dumps({'text': text, 'file_paths': []}, ensure_ascii=False))"
         return (
-            "必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON：\n"
+            "必须使用下面的 shell_skeleton；从 $1 读取 JSON argv，并向 stdout 输出 JSON（文件生成脚本必须包含 pdf_path/docx_path/pptx_path 与 file_paths/file_outputs）：\n"
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
@@ -5172,11 +5172,10 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "docx_builder" or "docx_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "必须使用下面的 docx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并通过平台 create_docx helper 生成 Word；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
-            "from pathlib import Path\n"
-            "from zipfile import ZipFile, ZIP_DEFLATED\n\n"
+            "from backend.services.skill_runtime import create_docx, print_json\n\n"
             "def parse_args() -> dict:\n"
             "    if len(sys.argv) < 2:\n"
             "        return {}\n"
@@ -5190,49 +5189,31 @@ def _script_generation_skeleton(
             "        return data if isinstance(data, dict) else {}\n"
             "    except json.JSONDecodeError:\n"
             "        return {}\n\n"
-            "def build_docx(payload: dict) -> dict:\n"
+            "def run(payload: dict) -> dict:\n"
             "    prev = previous_payload(payload)\n"
             f"    text = str(payload.get('story_text') or payload.get('text') or prev.get('story_text') or prev.get('text') or {py_value_expr} or 'Generated document').strip()\n"
-            "    out_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
-            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
-            "    docx_path = out_dir / 'output.docx'\n"
-            "    body = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')\n"
-            "    document_xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>' + body + '</w:t></w:r></w:p></w:body></w:document>'\n"
-            "    with ZipFile(docx_path, 'w', ZIP_DEFLATED) as zf:\n"
-            "        zf.writestr('[Content_Types].xml', '<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>')\n"
-            "        zf.writestr('_rels/.rels', '<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>')\n"
-            "        zf.writestr('word/document.xml', document_xml)\n"
-            "    return {'docx_path': str(docx_path), 'file_paths': [str(docx_path)]}\n\n"
+            "    return create_docx(text, filename='output.docx')\n\n"
             "def main() -> None:\n"
-            "    print(json.dumps(build_docx(parse_args()), ensure_ascii=False))\n\n"
+            "    print_json(run(parse_args()))\n\n"
             "if __name__ == '__main__':\n"
             "    main()"
         )
 
     if plan_entry.role == "pptx_builder" or "pptx_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "必须使用下面的 pptx_builder 脚本骨架；默认只消费已有 stdout JSON/text/image_paths 并通过平台 create_pptx helper 生成 PPT；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
-            "from pathlib import Path\n\n"
+            "from backend.services.skill_runtime import create_pptx, print_json\n\n"
             "def parse_args() -> dict:\n"
             "    if len(sys.argv) < 2:\n"
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
-            "def build_pptx(payload: dict) -> dict:\n"
+            "def run(payload: dict) -> dict:\n"
             f"    text = str(payload.get('story_text') or payload.get('text') or {py_value_expr} or 'Generated presentation').strip()\n"
-            "    out_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
-            "    out_dir.mkdir(parents=True, exist_ok=True)\n"
-            "    pptx_path = out_dir / 'output.pptx'\n"
-            "    from pptx import Presentation\n"
-            "    prs = Presentation()\n"
-            "    slide = prs.slides.add_slide(prs.slide_layouts[1])\n"
-            "    slide.shapes.title.text = 'Generated'\n"
-            "    slide.placeholders[1].text = text[:2000]\n"
-            "    prs.save(pptx_path)\n"
-            "    return {'pptx_path': str(pptx_path), 'file_paths': [str(pptx_path)]}\n\n"
+            "    return create_pptx(text, filename='output.pptx')\n\n"
             "def main() -> None:\n"
-            "    print(json.dumps(build_pptx(parse_args()), ensure_ascii=False))\n\n"
+            "    print_json(run(parse_args()))\n\n"
             "if __name__ == '__main__':\n"
             "    main()"
         )
@@ -5337,45 +5318,19 @@ def _script_generation_skeleton(
 
     if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
         return (
-            "必须使用下面的 pdf_builder 脚本骨架；默认只负责读取已有内容并构建 PDF/Word/PPT/HTML 文件；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
+            "必须使用下面的 pdf_builder 脚本骨架；默认只负责读取已有内容并通过平台 create_pdf helper 构建 PDF 文件；stdout JSON 由 helper 返回 pdf_path/file_paths/file_outputs；仅当当前脚本 capabilities 显式声明 text/image generation 时才调用模型：\n"
             "import json\n"
             "import sys\n"
-            "from pathlib import Path\n\n"
+            "from backend.services.skill_runtime import create_pdf, print_json\n\n"
             "def parse_args() -> dict:\n"
             "    if len(sys.argv) < 2:\n"
             "        return {}\n"
             "    return json.loads(sys.argv[1])\n\n"
-            "def build_pdf(payload: dict) -> dict:\n"
-            "    output_dir = Path(payload.get('output_dir') or 'assets/generated').resolve()\n"
-            "    output_dir.mkdir(parents=True, exist_ok=True)\n"
-            "    pdf_path = output_dir / 'output.pdf'\n"
-            "    from reportlab.lib.pagesizes import A4\n"
-            "    from reportlab.pdfbase import pdfmetrics\n"
-            "    from reportlab.pdfbase.cidfonts import UnicodeCIDFont\n"
-            "    from reportlab.pdfgen import canvas\n"
-            f"    text = str({py_value_expr} or 'Generated PDF').strip()\n"
-            "    pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))\n"
-            "    c = canvas.Canvas(str(pdf_path), pagesize=A4)\n"
-            "    width, height = A4\n"
-            "    c.setFont('STSong-Light', 14)\n"
-            "    y = height - 72\n"
-            "    for raw_line in text[:4000].splitlines() or ['Generated PDF']:\n"
-            "        line = raw_line or ' '\n"
-            "        while line:\n"
-            "            chunk, line = line[:42], line[42:]\n"
-            "            c.drawString(72, y, chunk)\n"
-            "            y -= 22\n"
-            "            if y < 72:\n"
-            "                c.showPage()\n"
-            "                c.setFont('STSong-Light', 14)\n"
-            "                y = height - 72\n"
-            "    c.save()\n"
-            "    return {'pdf_path': str(pdf_path), 'file_paths': [str(pdf_path)]}\n\n"
             "def run(payload: dict) -> dict:\n"
-            "    return build_pdf(payload)\n\n"
+            f"    text = str({py_value_expr} or payload.get('story_text') or payload.get('content') or 'Generated PDF').strip()\n"
+            "    return create_pdf(text, filename='output.pdf')\n\n"
             "def main() -> None:\n"
-            "    payload = parse_args()\n"
-            "    print(json.dumps(run(payload), ensure_ascii=False))\n\n"
+            "    print_json(run(parse_args()))\n\n"
             "if __name__ == '__main__':\n"
             "    main()"
         )
@@ -7119,6 +7074,11 @@ def _run_skill_workflow_e2e_once(skill_name: str) -> list[str]:
                 venv_python = _get_skill_venv_python(trial_skill_dir)
                 for command in commands:
                     if command.script_path.endswith(".py"):
+                        entry = _skill_plan_entry_for_file(
+                            file_path=command.script_path,
+                            blueprint_text=trial_skill_md,
+                        )
+                        _install_capability_dependencies(venv_python, entry.required_capabilities)
                         _scan_and_install_python_deps(
                             trial_skill_dir / command.script_path,
                             venv_python,

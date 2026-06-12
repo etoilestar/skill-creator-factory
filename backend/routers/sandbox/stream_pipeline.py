@@ -74,7 +74,7 @@ from .sop_planner import (
     _format_task_checklist_markdown,
 )
 from .action_schema import _build_runtime_action_schema
-from .runtime_planner import _run_skill_runtime_planner_round
+from .runtime_planner import _run_skill_runtime_planner_round, _run_supplementary_plan_round
 from .final_answer import (
     _generate_final_answer_from_observation,
     _run_block_planner_round,
@@ -119,6 +119,30 @@ def _step_skipped(step: StepName, reason: str) -> str:
             "ts": _time_module.time(),
         },
     })
+
+
+_SSE_KEEPALIVE_INTERVAL = 15  # 每 15 秒发送一次 SSE 心跳，防止 Nginx proxy_read_timeout 断开连接
+
+
+async def _await_with_keepalive(coro, *, yield_func):
+    """等待协程完成期间，定期通过 yield_func 发送 SSE 心跳保活。
+
+    用法（在 async generator 中）::
+
+        result = await _await_with_keepalive(some_async_call(), yield_func=lambda evt: _send(evt))
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=_SSE_KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                # SSE 注释行：Nginx 收到任意数据后会重置 proxy_read_timeout 计时器
+                yield_func(": keepalive\n\n")
+        return task.result()
+    except Exception:
+        task.cancel()
+        raise
 
 
 def _make_stream(skill_context: dict, request: ChatRequest):
@@ -568,10 +592,18 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
                     # --- Plan Mode: preview and await confirmation ---
-                    if execution_mode == "plan" and mode == "execute" and tasks:
+                    # Both "execute" and "execute_workflow" modes support plan preview
+                    if execution_mode == "plan" and (
+                        (mode == "execute" and tasks) or mode == "execute_workflow"
+                    ):
                         plan_id = hashlib.sha256(
                             f"{parent_skill_name}:{_time_module.time()}:{_last_user_text(request)[:100]}".encode()
                         ).hexdigest()[:16]
+
+                        # For execute_workflow, also store the action_schema to avoid recomputing
+                        _plan_action_schema = None
+                        if mode == "execute_workflow" and execution_root:
+                            _plan_action_schema = _build_runtime_action_schema(body_prompt, execution_root=execution_root)
 
                         _cleanup_expired_plans()
                         _pending_plans[plan_id] = {
@@ -580,19 +612,32 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             "sop": sop_document,
                             "skill_context": skill_context,
                             "request": request,
+                            "action_schema": _plan_action_schema,
                             "ts": _time_module.time(),
                         }
 
                         # Build task items for both plan_preview and task_checklist events
-                        plan_tasks = [
-                            {
-                                "action": t.get("action"),
-                                "command": (str(t.get("command") or ""))[:200] or None,
-                                "path": t.get("path") or t.get("resource_handle") or None,
-                                "reason": str(t.get("reason") or "")[:300],
-                            }
-                            for t in tasks
-                        ]
+                        if mode == "execute_workflow" and _plan_action_schema:
+                            # Show workflow steps from action schema entries
+                            plan_tasks = [
+                                {
+                                    "action": "run_command",
+                                    "command": (str(entry.get("command") or ""))[:200] or None,
+                                    "path": entry.get("script_path"),
+                                    "reason": str(entry.get("local_description") or "")[:300],
+                                }
+                                for entry in (_plan_action_schema.get("entries") or [])
+                            ]
+                        else:
+                            plan_tasks = [
+                                {
+                                    "action": t.get("action"),
+                                    "command": (str(t.get("command") or ""))[:200] or None,
+                                    "path": t.get("path") or t.get("resource_handle") or None,
+                                    "reason": str(t.get("reason") or "")[:300],
+                                }
+                                for t in tasks
+                            ]
 
                         yield _sse({
                             "plan_preview": {
@@ -633,7 +678,7 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                         yield "data: [DONE]\n\n"
                         return
 
-                    # --- execute_workflow mode: deterministic multi-script execution ---
+                    # --- execute_workflow mode: ReAct multi-round LLM execution ---
                     if mode == "execute_workflow":
                         try:
                             yield _sse({"status": {"phase": "executing_workflow", "message": "执行工作流…"}})
@@ -645,13 +690,41 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 _last_user_text(request),
                                 first_entry=(action_schema.get("entries") or [{}])[0] if action_schema.get("entries") else {},
                             )
-                            workflow_result = await _execute_skill_workflow(
+
+                            # 使用 asyncio.Queue 桥接 ReAct 事件到 SSE 流
+                            _react_event_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+                            async def _react_yield(event_str: str | None):
+                                """ReAct 执行过程中的 SSE 事件回调，将事件放入队列。None 表示结束。"""
+                                await _react_event_queue.put(event_str)
+
+                            # 启动 workflow 执行任务
+                            workflow_task = asyncio.ensure_future(_execute_skill_workflow(
                                 execution_root=execution_root,
                                 action_schema=action_schema,
                                 user_context=user_context,
                                 request=request,
                                 skill_name=parent_skill_name,
-                            )
+                                yield_func=_react_yield,
+                            ))
+
+                            # 从队列中读取事件并 yield 到 SSE 流
+                            last_event_time = _time_module.time()
+                            while not workflow_task.done() or not _react_event_queue.empty():
+                                try:
+                                    event = await asyncio.wait_for(_react_event_queue.get(), timeout=_SSE_KEEPALIVE_INTERVAL)
+                                except asyncio.TimeoutError:
+                                    # 超时发送心跳保活
+                                    yield ": keepalive\n\n"
+                                    continue
+                                if event is None:
+                                    # 信号：workflow 执行结束
+                                    break
+                                yield event
+                                last_event_time = _time_module.time()
+
+                            # 确保 workflow_task 完成
+                            workflow_result = workflow_task.result()
 
                             _exec_all_output_files = workflow_result.get("output_files") or []
                             _loaded_resource_paths = workflow_result.get("loaded_resource_paths") or []
@@ -673,13 +746,19 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             )
 
                             yield _sse({"status": {"phase": "generating", "message": "生成最终回答…"}})
-                            final_answer = await _generate_final_answer_from_observation(
+                            fa_task = asyncio.ensure_future(_generate_final_answer_from_observation(
                                 body_prompt=body_prompt,
                                 request=request,
                                 model=response_model,
                                 plan=runtime_plan,
                                 execution_result=workflow_result,
-                            )
+                            ))
+                            while not fa_task.done():
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(fa_task), timeout=_SSE_KEEPALIVE_INTERVAL)
+                                except asyncio.TimeoutError:
+                                    yield ": keepalive\n\n"
+                            final_answer = fa_task.result()
                             final_answer = _finalize_answer_output_file_links(final_answer, _exec_all_output_files)
                             yield _thought(
                                 "final_answer",
@@ -1023,6 +1102,88 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                             if skill_md.exists():
                                 _validate_skill_md(skill_md)
 
+                        # ── 补充规划循环：判断执行结果是否充足，不足则补充执行 ──
+                        _MAX_SUPPLEMENTARY_ROUNDS = 2
+                        for _sup_round in range(_MAX_SUPPLEMENTARY_ROUNDS):
+                            yield _sse({"status": {"phase": "planning", "message": f"评估执行结果是否充足（第{_sup_round + 1}轮）…"}})
+
+                            try:
+                                sup_task = asyncio.ensure_future(_run_supplementary_plan_round(
+                                    body_prompt=body_prompt,
+                                    user_text=_last_user_text(request),
+                                    execution_results=_exec_all_results,
+                                    loaded_resources=_loaded_resource_paths,
+                                    failed_resources=_failed_resource_paths,
+                                    model=response_model,
+                                    execution_root=execution_root,
+                                    resource_catalog=_extract_runtime_resource_catalog(body_prompt, execution_root=execution_root),
+                                ))
+                                while not sup_task.done():
+                                    try:
+                                        await asyncio.wait_for(asyncio.shield(sup_task), timeout=_SSE_KEEPALIVE_INTERVAL)
+                                    except asyncio.TimeoutError:
+                                        yield ": keepalive\n\n"
+                                supplementary_plan = sup_task.result()
+                            except Exception as sup_exc:
+                                logger.warning("Supplementary plan round failed: %s", sup_exc)
+                                supplementary_plan = {"need_more": False, "reason": str(sup_exc)}
+
+                            if not supplementary_plan.get("need_more"):
+                                yield _thought(
+                                    "supplementary_plan",
+                                    "信息充足",
+                                    supplementary_plan.get("reason", "无需补充执行"),
+                                    {"round": _sup_round + 1, "need_more": False},
+                                )
+                                break
+
+                            additional_tasks = supplementary_plan.get("additional_tasks") or []
+                            if not additional_tasks:
+                                yield _thought(
+                                    "supplementary_plan",
+                                    "模型判断需要更多信息但未提供任务",
+                                    "跳过补充执行",
+                                    {"round": _sup_round + 1},
+                                )
+                                break
+
+                            yield _thought(
+                                "supplementary_plan",
+                                f"执行 {len(additional_tasks)} 个补充任务",
+                                supplementary_plan.get("reason", ""),
+                                {"round": _sup_round + 1, "tasks": additional_tasks},
+                            )
+
+                            for sup_task in additional_tasks:
+                                sup_action = str(sup_task.get("action") or "display")
+                                # 复用现有单任务执行函数
+                                sup_task_result, sup_task_touched = _execute_single_task(
+                                    sup_task, [], request,
+                                    execution_root=execution_root,
+                                    skill_name=parent_skill_name,
+                                )
+                                _exec_all_results.append(sup_task_result)
+                                _exec_all_touched.extend(sup_task_touched)
+                                if sup_task_result.get("output_files"):
+                                    _exec_accumulated_output_files.extend(sup_task_result["output_files"])
+
+                                sup_success = sup_task_result.get("success", True)
+                                yield _thought(
+                                    "supplementary_action_result",
+                                    "补充任务执行结果",
+                                    f"{'成功' if sup_success else '失败'}",
+                                    {k: (v[:1000] if isinstance(v, str) else v) for k, v in sup_task_result.items() if k != "content"},
+                                )
+                        else:
+                            # 超过最大轮次仍未充足
+                            yield _thought(
+                                "supplementary_plan",
+                                "达到最大补充轮次",
+                                f"已执行 {_MAX_SUPPLEMENTARY_ROUNDS} 轮补充，继续生成最终答案",
+                                {"max_rounds": _MAX_SUPPLEMENTARY_ROUNDS},
+                            )
+                        # ── 补充规划循环结束 ──
+
                         # Assemble exec_result compatible with _generate_final_answer_from_observation.
                         _exec_all_output_files: list[dict] = []
                         for r in _exec_all_results:
@@ -1321,8 +1482,32 @@ async def confirm_plan_execution(skill_name: str, request: PlanConfirmRequest):
     if request.action == "cancel":
         return {"status": "cancelled", "message": "执行方案已取消。"}
 
-    # Re-execute the plan by building a new stream with execute mode
+    # Re-validate plan validity before execution
     skill_context = pending["skill_context"]
+    execution_root = skill_context.get("execution_root")
+    if execution_root:
+        try:
+            action_schema = _build_runtime_action_schema("", execution_root=execution_root)
+            if action_schema.get("errors"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="方案已失效：Action Schema 校验失败 - "
+                           + json.dumps(action_schema["errors"], ensure_ascii=False),
+                )
+            # Verify all referenced scripts still exist
+            for entry in (action_schema.get("entries") or []):
+                script_path = str(entry.get("script_path") or "")
+                if script_path and not (execution_root / script_path).is_file():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"方案已失效：脚本 {script_path} 不存在",
+                    )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"方案校验失败：{exc}")
+
+    # Re-execute the plan by building a new stream with execute mode
     original_request = pending["request"]
     # Override to execute mode for actual execution
     original_request.execution_mode = "execute"

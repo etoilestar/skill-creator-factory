@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import re
 import shlex
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Any, Iterable
 _COMMAND_BLOCK_RE = re.compile(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", re.IGNORECASE)
 _PLACEHOLDER_RE = re.compile(r"{{\s*([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*|\.[0-9]+)*)\s*}}")
 _KEY_VALUE_RE = re.compile(r"(?P<key>[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*[：:=]\s*(?P<value>[^，。\n,;；]+)")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -646,7 +649,21 @@ def context_from_dataflow_plan(
     """Merge defaults, user-provided context, and planner initial_context."""
     base = initial_context_from_entries(entries, user_text=user_text, user_context=user_context or {})
     planner_context = plan.get("initial_context") if isinstance(plan, dict) else {}
-    return merge_context(base, planner_context if isinstance(planner_context, dict) else {})
+    merged = merge_context(base, planner_context if isinstance(planner_context, dict) else {})
+
+    # Log when planner overrides schema defaults for observability
+    if isinstance(planner_context, dict) and isinstance(base, dict):
+        for key in sorted(set(planner_context.keys()) & set(base.keys())):
+            planner_val = planner_context[key]
+            schema_val = base[key]
+            if planner_val != schema_val:
+                logger.info(
+                    "dataflow plan initial_context overrides schema default: "
+                    "key=%s schema_default=%s planner_value=%s",
+                    key, schema_val, planner_val,
+                )
+
+    return merged
 
 def _preview_value_for_error(value: Any, *, max_len: int = 300) -> str:
     try:

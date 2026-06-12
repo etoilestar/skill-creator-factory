@@ -129,7 +129,7 @@ async def _get_llm_error_correction(
         "max_retries": max_retries,
     }
 
-    skill_context = body_prompt[:2000] if body_prompt else ""
+    skill_context = body_prompt[:4000] if body_prompt else ""
 
     messages = [
         {"role": "system", "content": system_prompt},

@@ -115,12 +115,19 @@ def _strip_model_text(text: str) -> str:
     return stripped.strip().strip('"').strip("'").strip()
 
 
-def translate_image_prompt_to_english(topic: str) -> str:
+def translate_image_prompt_to_english(
+    topic: str,
+    *,
+    style_context: str = "",
+    style_keywords: list[str] | None = None,
+) -> str:
     """Silently translate/rewrite an image topic into an English SD prompt.
+    Automatically supplement quality, detail, light and composition for stable-diffusion-2-1-base.
 
-    This is intentionally platform-side logic. Generated Skills should pass the
-    user's topic here; they should not contain their own Chinese-to-English
-    prompt engineering or call TEXT_MODEL directly for image prompts.
+    Args:
+        topic: 图片描述提示词（支持中文）。
+        style_context: 风格上下文描述（如从参考图通过 describe_image_with_vision 提取的风格描述）。
+        style_keywords: 风格关键词列表（如从参考图提取的 SD 英文关键词）。
     """
     topic = str(topic or "").strip()
     if not topic:
@@ -131,6 +138,18 @@ def translate_image_prompt_to_english(topic: str) -> str:
 
     url = _build_chat_completions_url(_required_env("LLM_BASE_URL"))
     model = _required_env("TEXT_MODEL")
+
+    # 构建风格增强的系统提示
+    style_section = ""
+    if style_context or style_keywords:
+        style_section = "\n\n8. The user provides a reference style description and keywords. "
+        "You MUST incorporate these style elements into the final prompt. "
+        "The style keywords should be seamlessly blended, not just appended."
+        if style_context:
+            style_section += f"\n\nReference style description: {style_context}"
+        if style_keywords:
+            style_section += f"\n\nReference style keywords: {', '.join(style_keywords)}"
+
     payload = {
         "model": model,
         "stream": False,
@@ -138,15 +157,24 @@ def translate_image_prompt_to_english(topic: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You rewrite image-generation topics for Stable Diffusion. "
-                    "Return exactly one concise English prompt. Do not explain."
+                    "You are a professional Stable Diffusion prompt engineer for stable-diffusion-2-1-base. "
+                    "Your task: rewrite user's image description into a high-quality, detailed, standard SD English prompt. "
+                    "Strict rules:\n"
+                    "1. 100% preserve the user's core subject and scene intent.\n"
+                    "2. Automatically add universal quality keywords: masterpiece, best quality, ultra-detailed, sharp focus.\n"
+                    "3. Automatically supplement reasonable visual details: texture, lighting, atmosphere, background, depth of field.\n"
+                    "4. For creatures/characters (mermaid, cat, human), add perfect anatomy, clean features, complete limbs.\n"
+                    "5. For underwater scenes, add underwater light rays, clear seawater, fine bubbles, soft water haze.\n"
+                    "6. Output ONLY one concise, fluent prompt, no explanation, no markdown, no extra text.\n"
+                    "7. Do not use overly exaggerated words, keep stable for SD 2.1-base generation."
+                    + style_section
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Rewrite this topic into an English Stable Diffusion prompt. "
-                    "Preserve the user's intent and concrete visual details.\n\n"
+                    "Rewrite this Chinese image topic into a professional Stable Diffusion English prompt. "
+                    "Enrich scene details, lighting, texture and atmosphere automatically.\n\n"
                     f"Topic: {topic}"
                 ),
             },
@@ -266,13 +294,32 @@ def generate_stable_diffusion_image(
     image_base_url = _required_env("IMAGE_BASE_URL")
     image_size = size or _required_env("IMAGE_SIZE")
     url = _build_image_generations_url(image_base_url)
+
+    # 全局默认负面提示词（适配SD2.1-base、人鱼、动物、人像）
+    negative_prompt = (
+        "lowres, blurry, worst quality, low quality, text, watermark, signature, "
+        "deformed, disfigured, distorted, ugly, bad anatomy, "
+        "extra limbs, extra arms, extra legs, extra fingers, extra heads, "
+        "multiple heads, multiple faces, multiple bodies, multiple characters, "
+        "bad hands, bad paws, bad face, bad proportions, malformed limbs, "
+        "floating limbs, disconnected limbs, disconnected head, "
+        "cropped, out of frame, cut off, border, frame, "
+        "mutated, mutation, deformed face, fused fingers, too many fingers, "
+        "long neck, huge head, giant head, disproportionate, asymmetric, "
+        "grainy, noisy, jpeg artifacts, pixelated, overexposed, underexposed, "
+        "bad tail, multiple tails, deformed tail, ugly tail, "
+        "duplicate, cloned, copy, repeat, repetition"
+    )
+
     payload = {
         "model": image_model,
         "prompt": english_prompt,
+        "negative_prompt": negative_prompt,  # 新增：默认负面词
         "n": 1,
         "size": image_size,
         "response_format": "b64_json",
     }
+
     data = _post_json(url, payload=payload, headers=_headers(_image_api_key()))
 
     image_bytes, source = _decode_image_response(data)
@@ -289,6 +336,264 @@ def generate_stable_diffusion_image(
         "image_path": str(image_path),
         "mime_type": mime_type,
         "source": source,
+    }
+
+
+def generate_stable_diffusion_image_from_reference(
+    topic: str,
+    reference_image: str | os.PathLike[str],
+    *,
+    strength: float = 0.45,
+    output_dir: str | os.PathLike[str] | None = None,
+    filename_prefix: str = "image",
+    size: str | None = None,
+    num_inference_steps: int | None = None,
+    guidance_scale: float | None = None,
+    analyze_reference: bool = True,
+) -> dict[str, Any]:
+    """基于参考图生成新图片（img2img），使用 /v1/images/generations 接口。
+
+    与文生图共用同一端点，通过额外传递 image(base64) 和 strength 字段
+    触发服务端 img2img 逻辑。服务端需在 /v1/images/generations 中检测
+    image 字段以切换到 StableDiffusionImg2ImgPipeline。
+
+    当 analyze_reference=True 时，会先调用 VISION_MODEL 分析参考图的
+    风格特征，自动提取风格关键词并融入生图提示词，提升 img2img 输出质量。
+
+    Args:
+        topic: 图片描述提示词（支持中文，内部自动翻译为英文）。
+        reference_image: 参考图文件路径。
+        strength: 参考图影响强度，0.0~1.0。默认 0.45，较小的值保留更多参考图风格，但让提示词主导主体构图。
+        output_dir: 图片输出目录。
+        filename_prefix: 输出文件名前缀。
+        size: 图片尺寸。
+        num_inference_steps: 推理步数（默认由服务端决定，建议 30-50）。
+        guidance_scale: 引导系数（默认由服务端决定，建议 7-12）。
+        analyze_reference: 是否使用 VISION_MODEL 分析参考图风格。
+
+    Returns:
+        包含 prompt, model, image_path, source 等字段的字典。
+    """
+    ref_path = Path(reference_image)
+    if not ref_path.is_file():
+        raise FileNotFoundError(f"参考图文件不存在: {reference_image}")
+
+    out_dir = Path(output_dir or _env("OUTPUT_DIR", "outputs"))
+
+    # 使用 VISION_MODEL 分析参考图风格（可选）
+    style_context = ""
+    style_keywords: list[str] = []
+    vision_result: dict[str, Any] = {}
+    if analyze_reference:
+        try:
+            vision_result = describe_image_with_vision(reference_image)
+            style_context = vision_result.get("description") or ""
+            style_keywords = vision_result.get("style_keywords") or []
+            logger.info(
+                "Reference image analysis: description=%s keywords=%s",
+                style_context[:100], style_keywords,
+            )
+        except Exception as exc:
+            logger.warning("Reference image style analysis failed (continuing without): %s", exc)
+
+    english_prompt = translate_image_prompt_to_english(
+        topic,
+        style_context=style_context,
+        style_keywords=style_keywords if style_keywords else None,
+    )
+
+    if os.environ.get("SKILL_TRIAL_RUN") == "1":
+        image_path = _write_image_bytes(
+            image_bytes=ref_path.read_bytes(),
+            output_dir=out_dir,
+            filename_prefix=filename_prefix,
+        )
+        return {
+            "prompt": english_prompt,
+            "model": _required_env("IMAGE_MODEL"),
+            "image_path": str(image_path),
+            "source": "trial",
+            "reference_image": str(ref_path),
+            "strength": strength,
+        }
+
+    image_model = _required_env("IMAGE_MODEL")
+    image_base_url = _required_env("IMAGE_BASE_URL")
+    image_size = size or _required_env("IMAGE_SIZE")
+    url = _build_image_generations_url(image_base_url)
+
+    ref_b64 = base64.b64encode(ref_path.read_bytes()).decode("utf-8")
+
+    # 全局负面提示词：显式压制多主体、畸形肢体、低质量输出
+    negative_prompt = (
+        "lowres, blurry, worst quality, low quality, text, watermark, signature, "
+        "deformed, disfigured, distorted, ugly, bad anatomy, "
+        "extra limbs, extra arms, extra legs, extra fingers, extra heads, "
+        "multiple heads, multiple faces, multiple bodies, multiple characters, "
+        "bad hands, bad paws, bad face, bad proportions, malformed limbs, "
+        "floating limbs, disconnected limbs, disconnected head, "
+        "cropped, out of frame, cut off, border, frame, "
+        "mutated, mutation, deformed face, fused fingers, too many fingers, "
+        "long neck, huge head, giant head, disproportionate, asymmetric, "
+        "grainy, noisy, jpeg artifacts, pixelated, overexposed, underexposed, "
+        "bad tail, multiple tails, deformed tail, ugly tail, "
+        "duplicate, cloned, copy, repeat, repetition"
+    )
+
+    payload: dict[str, Any] = {
+        "model": image_model,
+        "prompt": english_prompt,
+        "negative_prompt": negative_prompt,
+        "n": 1,
+        "size": image_size,
+        "response_format": "b64_json",
+        "image": ref_b64,
+        "strength": strength,
+    }
+    if num_inference_steps is not None:
+        payload["num_inference_steps"] = num_inference_steps
+    if guidance_scale is not None:
+        payload["guidance_scale"] = guidance_scale
+
+    data = _post_json(url, payload=payload, headers=_headers(_image_api_key()))
+    result_bytes, source = _decode_image_response(data)
+    image_path = _write_image_bytes(
+        image_bytes=result_bytes,
+        output_dir=out_dir,
+        filename_prefix=filename_prefix,
+    )
+    result_mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    result: dict[str, Any] = {
+        "prompt": english_prompt,
+        "model": image_model,
+        "size": image_size,
+        "image_path": str(image_path),
+        "mime_type": result_mime,
+        "source": source,
+        "reference_image": str(ref_path),
+        "strength": strength,
+    }
+    if vision_result:
+        result["vision_analysis"] = vision_result
+    return result
+
+
+def describe_image_with_vision(
+    image_path: str | os.PathLike[str],
+    *,
+    prompt: str = "请详细描述这张图片的视觉风格、色彩、构图和内容。重点关注：1) 艺术风格（如水墨、油画、卡通等）2) 色调与亮度 3) 画面主体与构图 4) 线条与笔触特点",
+) -> dict[str, Any]:
+    """使用 VISION_MODEL（如 qwen3-vl:32b）分析图片，提取风格描述和视觉特征。
+
+    典型用途：
+    - 在 img2img 之前分析参考图，自动提取风格关键词
+    - 用提取的风格描述优化生图提示词
+    - 验证生成图片是否符合预期
+
+    Args:
+        image_path: 图片文件路径。
+        prompt: 发送给视觉模型的分析提示词。
+
+    Returns:
+        包含 description（风格描述）、style_keywords（风格关键词列表）的字典。
+    """
+    img_path = Path(image_path)
+    if not img_path.is_file():
+        raise FileNotFoundError(f"图片文件不存在: {image_path}")
+
+    if os.environ.get("SKILL_TRIAL_RUN") == "1":
+        return {
+            "description": "水墨风格插画，高亮度，温暖色调，简洁线条，儿童绘本风格",
+            "style_keywords": ["ink wash", "high brightness", "warm tones", "simple lines", "children illustration"],
+            "model": _env("VISION_MODEL", "qwen3-vl:32b"),
+            "source": "trial",
+        }
+
+    vision_model = _required_env("VISION_MODEL")
+    url = _build_chat_completions_url(_required_env("LLM_BASE_URL"))
+
+    # 读取图片并 base64 编码
+    img_b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+    # 推断 MIME 类型
+    mime_type = mimetypes.guess_type(str(img_path))[0] or "image/png"
+
+    payload = {
+        "model": vision_model,
+        "stream": False,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{img_b64}",
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "system",
+                "content": (
+                    "你是一个专业的视觉风格分析师。分析图片后，请输出 JSON 格式：\n"
+                    '{"description": "对图片视觉风格的详细描述", '
+                    '"style_keywords": ["关键词1", "关键词2", ...]}\n'
+                    "style_keywords 应包含适用于 Stable Diffusion 提示词的英文关键词，"
+                    "如：ink wash, watercolor, high brightness, warm tones, soft lines, "
+                    "children illustration, storybook style 等。"
+                    "只输出 JSON，不要输出其他内容。"
+                ),
+            },
+        ],
+    }
+
+    try:
+        data = _post_json(url, payload=payload, headers=_headers(_llm_api_key()))
+    except Exception as exc:
+        logger.warning("Vision model call failed: %s", exc)
+        return {
+            "description": "",
+            "style_keywords": [],
+            "model": vision_model,
+            "source": "error",
+            "error": str(exc),
+        }
+
+    choices = data.get("choices") or []
+    if not choices:
+        return {
+            "description": "",
+            "style_keywords": [],
+            "model": vision_model,
+            "source": "empty",
+        }
+
+    message = choices[0].get("message") or {}
+    content = _strip_model_text(message.get("content") or "")
+
+    # 尝试解析 JSON 响应
+    try:
+        result = json.loads(content)
+        if isinstance(result, dict):
+            return {
+                "description": str(result.get("description") or ""),
+                "style_keywords": list(result.get("style_keywords") or []),
+                "model": vision_model,
+                "source": "vision",
+            }
+    except json.JSONDecodeError:
+        pass
+
+    # JSON 解析失败，将整个内容作为描述
+    return {
+        "description": content,
+        "style_keywords": [],
+        "model": vision_model,
+        "source": "vision_raw",
     }
 
 

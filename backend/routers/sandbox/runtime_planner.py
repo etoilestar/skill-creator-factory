@@ -476,3 +476,115 @@ async def _run_skill_runtime_planner_round(
 # Public aliases
 normalize_skill_runtime_plan = _normalize_skill_runtime_plan
 compose_skill_runtime_planner_prompt = _compose_skill_runtime_planner_prompt
+
+
+# ---------------------------------------------------------------------------
+# 补充规划：执行后判断是否需要更多任务
+# ---------------------------------------------------------------------------
+
+_SUPPLEMENTARY_PLANNER_PROMPT = """\
+你是 Skill Agent 补充规划判断器。
+
+当前已有一批任务执行完毕，你需要判断执行结果是否已足够生成用户所需的最终答案。
+
+核心原则：
+1. 如果执行结果已经包含了用户请求所需的所有信息，need_more=false。
+2. 如果执行结果缺少关键信息（如缺少某个资源的读取、某个脚本的执行），need_more=true 并提供补充任务。
+3. 补充任务只能是 read_resource 或 run_command，且必须引用当前 Skill 中已声明的脚本和资源。
+4. 不要为了"更完善"而补充不必要的任务。
+
+输出格式（严格 JSON，不要 Markdown）：
+{
+  "need_more": true | false,
+  "reason": "简短判断理由",
+  "additional_tasks": [
+    {"action": "read_resource", "resource_handle": "resource:0", "reason": "为什么需要"}
+  ] | null,
+  "final_answer_hint": "如果 need_more=false，可提供答案生成提示"
+}
+"""
+
+
+async def _run_supplementary_plan_round(
+    *,
+    body_prompt: str,
+    user_text: str,
+    execution_results: list[dict],
+    loaded_resources: list[str],
+    failed_resources: list[str],
+    model: str,
+    execution_root: Path | None = None,
+    resource_catalog: list[dict] | None = None,
+) -> dict:
+    """根据已执行结果判断是否需要补充执行。
+
+    Returns:
+        {
+            "need_more": bool,
+            "reason": str,
+            "additional_tasks": list[dict] | None,
+            "final_answer_hint": str,
+        }
+    """
+    # 构建执行结果摘要（截断避免 token 溢出）
+    result_summaries: list[str] = []
+    for r in execution_results:
+        action = r.get("action", "unknown")
+        success = r.get("success", True)
+        stdout = (r.get("stdout", "") or "")[:500]
+        stderr = (r.get("stderr", "") or "")[:200]
+        result_summaries.append(
+            f"- {action} (success={success}): stdout={stdout}"
+            + (f" stderr={stderr}" if stderr else "")
+        )
+
+    summary_text = "\n".join(result_summaries) if result_summaries else "(无执行结果)"
+
+    # 构建 resource_catalog 摘要
+    from .resource_catalog import _resource_catalog_for_planner
+    catalog_summary = _resource_catalog_for_planner(resource_catalog or [])
+
+    messages = [
+        {"role": "system", "content": _SUPPLEMENTARY_PLANNER_PROMPT},
+        {"role": "user", "content": f"## Skill 执行规范\n{body_prompt[:6000]}"},
+        {"role": "user", "content": f"## 用户请求\n{user_text}"},
+        {"role": "user", "content": f"## 已执行任务及结果摘要\n{summary_text}"},
+        {"role": "user", "content": f"## 已加载资源\n{json.dumps(loaded_resources, ensure_ascii=False)}"},
+        {"role": "user", "content": f"## 加载失败资源\n{json.dumps(failed_resources, ensure_ascii=False)}"},
+        {"role": "user", "content": f"## 可用资源目录\n{json.dumps(catalog_summary, ensure_ascii=False)[:2000]}"},
+        {"role": "user", "content": "请判断当前信息是否充足，输出严格 JSON。"},
+    ]
+
+    planner_model = _planner_model_name(model)
+    response_text = await complete_chat_once(messages, planner_model)
+
+    try:
+        stripped = _strip_markdown_json_fence(response_text)
+        plan = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("Supplementary planner returned non-JSON: %s", response_text[:300])
+        return {
+            "need_more": False,
+            "reason": "无法解析补充规划结果，直接生成最终答案",
+            "additional_tasks": None,
+            "final_answer_hint": "",
+        }
+
+    if not isinstance(plan, dict):
+        return {
+            "need_more": False,
+            "reason": "补充规划结果不是 JSON object",
+            "additional_tasks": None,
+            "final_answer_hint": "",
+        }
+
+    # 安全过滤：只允许白名单动作类型
+    allowed_actions = {"read_resource", "run_command", "display", "ignore"}
+    tasks = plan.get("additional_tasks") or []
+    filtered = [
+        t for t in tasks
+        if isinstance(t, dict) and str(t.get("action") or "") in allowed_actions
+    ]
+    plan["additional_tasks"] = filtered if filtered else None
+
+    return plan

@@ -202,14 +202,21 @@ def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], li
         by_script.setdefault(str(entry.get("script_path") or ""), []).append(entry)
         role = str(entry.get("role") or "generic_script")
         if role not in _SCRIPT_ROLES:
-            errors.append({"error": "未知 script role", "entry": entry})
+            # 宽松校验：未知 role 降级为 generic_script 并警告，不阻断执行
+            warnings.append({
+                "warning": f"未知 script role '{role}'，已降级为 generic_script",
+                "script_path": entry.get("script_path"),
+                "source_path": entry.get("source_path"),
+                "original_role": role,
+            })
         command_keys = set(entry.get("command_keys") or [])
         inputs = set(entry.get("inputs") or [])
         optional_inputs = set(entry.get("optional_inputs") or [])
         required_inputs = inputs - optional_inputs
+        # 宽松校验：inputs 与 command_keys 不一致降级为警告，不阻断执行
         if inputs and not (required_inputs <= command_keys <= inputs):
-            errors.append({
-                "error": "命令块 JSON keys 与 Action schema inputs 不一致",
+            warnings.append({
+                "warning": "命令块 JSON keys 与 Action schema inputs 不一致（已降级为警告）",
                 "script_path": entry.get("script_path"),
                 "source_path": entry.get("source_path"),
                 "inputs": sorted(inputs),
@@ -310,10 +317,17 @@ def _validate_runtime_command_against_action_schema(command: str, *, execution_r
     actual_keys = _command_json_argv_keys(command, script_path)
     if actual_keys is None:
         raise ValueError(f"命令 {script_path} 必须使用可解析 JSON argv")
-    if expected_keys and not (required_keys <= actual_keys <= expected_keys):
+    # 宽松校验：只检查必填参数是否都提供，额外参数允许（脚本自行处理或忽略）
+    missing_required = required_keys - actual_keys
+    if missing_required:
         raise ValueError(
-            f"命令 {script_path} JSON keys 与 Action schema inputs 不一致："
+            f"命令 {script_path} 缺少必填参数: {sorted(missing_required)}. "
             f"expected={sorted(expected_keys)} optional={sorted(optional_keys)} actual={sorted(actual_keys)}"
+        )
+    if required_keys and actual_keys > expected_keys:
+        logger.info(
+            "命令 %s 包含额外参数（允许）: extra=%s expected=%s actual=%s",
+            script_path, sorted(actual_keys - expected_keys), sorted(expected_keys), sorted(actual_keys),
         )
     return entry
 
@@ -347,17 +361,22 @@ def _validate_stdout_against_action_entry(stdout: str, entry: dict | None) -> No
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
+        # 只有声明了 outputs 的 entry 才强制要求 JSON 格式（数据流需要结构化输出）
+        if entry and entry.get("outputs"):
+            raise ValueError("角色脚本 stdout 必须是 JSON object（已声明 outputs）")
         if entry:
-            raise ValueError("角色脚本 stdout 必须是 JSON object")
+            logger.info("脚本 stdout 非 JSON 格式（允许，未声明 outputs）")
         return
     if not isinstance(payload, dict):
+        if entry and entry.get("outputs"):
+            raise ValueError("角色脚本 stdout 必须是 JSON object（已声明 outputs）")
         if entry:
-            raise ValueError("角色脚本 stdout 必须是 JSON object")
+            logger.info("脚本 stdout 非 JSON object（允许，未声明 outputs）")
         return
     if "error" in payload:
         raise ValueError("stdout JSON 不得包含 error 字段")
-    if entry and not any(_json_value_non_empty(value) for value in payload.values()):
-        raise ValueError("角色脚本 stdout JSON 至少需要一个非空字段")
+    if entry and entry.get("outputs") and not any(_json_value_non_empty(value) for value in payload.values()):
+        logger.warning("stdout JSON 没有非空字段，但允许继续执行")
     _validate_structured_stdout_payload(payload)
 
 

@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     skill_resource_max_chars: int = Field(20000, validation_alias=AliasChoices("SKILL_RESOURCE_MAX_CHARS", "skill_resource_max_chars"))
 
     # Maximum wall-clock seconds allowed for a single run_command subprocess.
-    skill_command_timeout: int = Field(60, validation_alias=AliasChoices("SKILL_COMMAND_TIMEOUT", "skill_command_timeout"))
+    skill_command_timeout: int = Field(300, validation_alias=AliasChoices("SKILL_COMMAND_TIMEOUT", "skill_command_timeout"))
 
     model_config = {
         "env_file": PROJECT_ROOT / ".env",

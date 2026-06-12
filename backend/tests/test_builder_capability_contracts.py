@@ -12,34 +12,33 @@ from backend.services.skill_plan import build_skill_plan_entry, capabilities_for
 PDF_BUILDER_SOURCE = r'''
 import json
 import sys
-from pathlib import Path
+from backend.services.skill_runtime import create_pdf, print_json
+
+
+def run(payload: dict) -> dict:
+    story_text = str(payload.get("story_text") or payload.get("text") or "export text")
+    image_paths = payload.get("image_paths") or []
+    previous_stdout = payload.get("previous_stdout") or ""
+    template_path = payload.get("template_path") or ""
+    text = "\n".join([story_text, str(image_paths), str(previous_stdout), str(template_path)])
+    return create_pdf(text, filename="export.pdf")
 
 
 def main():
     payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
-    story_text = str(payload.get("story_text") or "export text")
-    image_paths = payload.get("image_paths") or []
-    previous_stdout = payload.get("previous_stdout") or ""
-    template_path = payload.get("template_path") or ""
-    out_dir = Path("assets/generated")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = out_dir / "export.pdf"
-    body = (story_text + "\n" + str(image_paths) + "\n" + previous_stdout + "\n" + template_path).encode("latin1", "ignore")
-    pdf_path.write_bytes(b"%PDF-1.4\n" + body + (b"x" * 160) + b"\n%%EOF\n")
-    print(json.dumps({"pdf_path": str(pdf_path), "file_paths": [str(pdf_path)]}, ensure_ascii=False))
+    print_json(run(payload))
 
 
 if __name__ == "__main__":
     main()
 '''
 
-
 PDF_BUILDER_WITH_OPTIONAL_TEXT_SOURCE = PDF_BUILDER_SOURCE.replace(
-    "def main():",
-    "from backend.services.skill_runtime import generate_text_with_llm\n\ndef main():",
+    "from backend.services.skill_runtime import create_pdf, print_json",
+    "from backend.services.skill_runtime import create_pdf, print_json, generate_text_with_llm",
 ).replace(
-    'story_text = str(payload.get("story_text") or "export text")',
-    'story_text = generate_text_with_llm(str(payload.get("story_text") or "export text"))',
+    'story_text = str(payload.get("story_text") or payload.get("text") or "export text")',
+    'story_text = generate_text_with_llm(str(payload.get("story_text") or payload.get("text") or "export text"))',
 )
 
 
@@ -286,3 +285,38 @@ def test_registered_helper_capabilities_are_validated_from_registry():
 
     assert _script_satisfies_required_capability(content, "web_search") is True
     assert _script_satisfies_required_capability("print('no search')", "web_search") is False
+
+
+def test_pdf_builder_direct_reportlab_fails_tool_usage_contract():
+    direct_reportlab = '''
+import json
+import sys
+from reportlab.pdfgen import canvas
+
+
+def main():
+    payload = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+    path = "outputs/direct.pdf"
+    c = canvas.Canvas(path)
+    c.drawString(10, 10, str(payload.get("text") or "hello"))
+    c.save()
+    print(json.dumps({"pdf_path": path, "file_paths": [path]}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+    with pytest.raises(ContractValidationError, match="tool_usage_contract"):
+        _validate_script_file_source_contract(
+            "scripts/build_pdf.py",
+            direct_reportlab,
+            role="pdf_builder",
+            skill_plan_entry={
+                "path": "scripts/build_pdf.py",
+                "role": "pdf_builder",
+                "inputs": ["text"],
+                "outputs": ["pdf_path", "file_paths"],
+                "required_capabilities": ["pdf_generation", "file_output"],
+                "forbidden_capabilities": [],
+            },
+        )

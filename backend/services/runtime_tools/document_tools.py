@@ -291,7 +291,7 @@ def images_to_pdf(image_paths: list[str], output_path: str | os.PathLike[str] | 
     return {"pdf_path": str(out_path), "file_paths": [str(out_path)], "file_outputs": [str(out_path)]}
 
 
-def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | None = None) -> dict[str, Any]:
+def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | None = None, *, filename: str = "report.pdf") -> dict[str, Any]:
     """Build a simple PDF report from text sections and optional image references."""
     lines = [str(title or "Report"), ""]
     for section in sections or []:
@@ -301,4 +301,4 @@ def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | 
     if image_paths:
         lines.append("Images:")
         lines.extend(str(_safe_input_path(path, {".png", ".jpg", ".jpeg", ".webp"})) for path in image_paths[:_MAX_INPUT_FILES])
-    return create_pdf(lines, filename="report.pdf", title=title or "Report")
+    return create_pdf(lines, filename=filename or "report.pdf", title=title or "Report")

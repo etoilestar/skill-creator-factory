@@ -8,31 +8,124 @@ resolved file role rather than by scanning the whole blueprint for domain words.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+import json
 import re
 from typing import Literal
+from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
+from .creator_tool_registry import capabilities_for_role as registry_capabilities_for_role
 from .skill_dataflow import parse_schema_input_item
 
 
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
-ScriptRole = Literal["text_generator", "image_generator", "composite_generator", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "generic_script"]
+ScriptRole = str
 ResourceRole = Literal["skill_overview", "reference", "asset"]
-FileRole = ScriptRole | ResourceRole
+FileRole = str
 
-SCRIPT_ROLES: frozenset[str] = frozenset({
-    "text_generator",
-    "image_generator",
-    "pdf_builder",
-    "docx_builder",
-    "pptx_builder",
-    "html_asset_builder",
-    "asset_builder",
-    "composite_generator",
-    "generic_script",
-})
+SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
+
+ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
+    "text_generator": frozenset({"text_generation", "file_output"}),
+    "image_generator": frozenset({"image_generation", "file_output"}),
+    "composite_generator": frozenset({
+        "text_generation",
+        "image_generation",
+        "pdf_generation",
+        "docx_generation",
+        "pptx_generation",
+        "file_output",
+    }),
+    "pdf_builder": frozenset({"pdf_generation", "file_output"}),
+    "docx_builder": frozenset({"docx_generation", "file_output"}),
+    "pptx_builder": frozenset({"pptx_generation", "file_output"}),
+    "pdf_parser": frozenset({"pdf_parsing", "file_output"}),
+    "docx_parser": frozenset({"docx_parsing", "file_output"}),
+    "pptx_parser": frozenset({"pptx_parsing", "file_output"}),
+    "spreadsheet_reader": frozenset({"spreadsheet_read", "file_output"}),
+    "vision_analyzer": frozenset({"vision_understanding", "file_output"}),
+    "search_reader": frozenset({"web_search", "text_generation", "file_output"}),
+    "database_reader": frozenset({"database_read", "text_generation", "file_output"}),
+    "wechat_draft_creator": frozenset({"wechat_draft", "file_output"}),
+    "wechat_publisher": frozenset({"wechat_publish", "file_output"}),
+    "html_asset_builder": frozenset({"html_asset_generation", "file_output"}),
+    "asset_builder": frozenset({"asset_generation", "file_output"}),
+    "generic_script": frozenset({"deterministic_execution", "file_output"}),
+}
+
+_HIGH_RISK_EXPLICIT_HINTS: dict[str, re.Pattern[str]] = {
+    "web_search": re.compile(r"联网|网页搜索|网络搜索|搜索网页|web[-_ ]?search|internet|search engine|searchxng|searxng", re.I),
+    "database_read": re.compile(r"数据库|SQL|业务表|数据表|database|readonly|read[-_ ]?only|query_database", re.I),
+    "vision_understanding": re.compile(r"看图|识图|OCR|截图理解|图片内容分析|视觉理解|vision|analy[sz]e image|image understanding", re.I),
+    "wechat_publish": re.compile(r"直接发布|推送到公众号|发布到公众号|wechat_publish|publish_wechat", re.I),
+}
+
+def _dedupe_capabilities(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values or []:
+        name = re.sub(r"[^A-Za-z0-9_-]", "", str(value or "").strip())
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def normalize_required_capabilities(
+    *,
+    role: str,
+    path: str,
+    required_capabilities: list[str],
+    user_blueprint_text: str = "",
+) -> list[str]:
+    """Keep SkillPlan runtime capabilities scoped to the file's real role.
+
+    Model-written blueprints sometimes copy every platform capability into
+    ``required_capabilities``.  This normalization is intentionally stricter:
+    resource/meta files never expose runtime capabilities, resource-category
+    capabilities are dropped, and script roles only keep capabilities that the
+    role can actually use.  High-risk retrieval/vision/publish capabilities are
+    only kept when the role is their dedicated role (or the blueprint explicitly
+    asks for that operation).
+    """
+    normalized_role = (role or "").strip()
+    normalized_path = (path or "").strip().replace("\\", "/")
+    if is_resource_role(normalized_role) or normalized_path == "SKILL.md" or normalized_path.startswith(("references/", "assets/")):
+        return []
+
+    allowed = ROLE_ALLOWED_CAPABILITIES.get(normalized_role)
+    requested = _dedupe_capabilities(required_capabilities)
+    if allowed is not None:
+        requested = [capability for capability in requested if capability in allowed]
+
+    runtime_only: list[str] = []
+    for capability in requested:
+        cap = get_tool_capability(capability)
+        if cap and cap.category == "resource":
+            continue
+        runtime_only.append(capability)
+
+    blueprint_text = user_blueprint_text or ""
+    guarded_roles = {
+        "web_search": "search_reader",
+        "database_read": "database_reader",
+        "vision_understanding": "vision_analyzer",
+        "wechat_publish": "wechat_publisher",
+    }
+    guarded: list[str] = []
+    for capability in runtime_only:
+        dedicated_role = guarded_roles.get(capability)
+        if dedicated_role and normalized_role != dedicated_role:
+            pattern = _HIGH_RISK_EXPLICIT_HINTS.get(capability)
+            if not (pattern and pattern.search(blueprint_text)):
+                continue
+        guarded.append(capability)
+
+    return guarded
+
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
     "kernel/references/best-practices.md",
@@ -116,7 +209,6 @@ _TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|
 _MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
 _IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
 _PDF_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(?:build|export|create|make|render|combine|merge)?_?pdf(?:[_.-]|$)|(?:^|[_/-])(?:pdf_builder|build_pdf|export_pdf|combine_to_pdf|merge_to_pdf)(?:[_.-]|$)|合并.*pdf|pdf.*合并", re.I)
-_CUSTOM_CHARACTER_RE = re.compile(r"custom_character|character|角色|主角", re.I)
 
 
 def file_type_for_path(path: str) -> FileType:
@@ -181,30 +273,55 @@ def runtime_for_language(language: str, file_type: FileType) -> Runtime:
     return "generic"
 
 
+def _runner_for_runtime(runtime: Runtime) -> str:
+    if runtime == "python":
+        return "python"
+    if runtime == "node":
+        return "node"
+    if runtime == "bash":
+        return "bash"
+    if runtime == "shell":
+        return "sh"
+    return ""
+
+
 def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
     keys = inputs or ["payload"]
     payload = "{" + ",".join(f'"{key}":"{{{{{key}}}}}"' for key in keys) + "}"
-    if runtime == "python":
-        return f"python {path} '{payload}'"
-    if runtime == "node":
-        return f"node {path} '{payload}'"
-    if runtime == "bash":
-        return f"bash {path} '{payload}'"
-    if runtime == "shell":
-        return f"sh {path} '{payload}'"
+    runner = _runner_for_runtime(runtime)
+    if runner:
+        return f"{runner} {path} '{payload}'"
     return f"{path} '{payload}'"
+
+
+def render_script_command_from_skill_plan(entry: SkillPlanEntry, values: dict[str, str] | None = None) -> str:
+    """Render a SKILL.md script command directly from one SkillPlan entry.
+
+    The JSON argv key set is determined solely by ``entry.inputs``.  ``values``
+    may provide placeholder/value expressions for those keys, but it cannot add
+    extra keys.  Missing values fall back to the same-named placeholder so the
+    command remains a generic, self-consistent contract rather than a
+    business-specific guess.
+    """
+    payload_keys = list(entry.inputs or ["payload"])
+    payload = {key: (values or {}).get(key, f"{{{{{key}}}}}") for key in payload_keys}
+    rendered_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    runner = _runner_for_runtime(entry.runtime)
+    if runner:
+        return f"{runner} {entry.path} '{rendered_payload}'"
+    return f"{entry.path} '{rendered_payload}'"
 
 
 
 _EXPLICIT_ROLE_RE = re.compile(
-    r"(?:role|角色|职责)\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)",
+    rf"(?:role|角色|职责)\s*[：:=]\s*({get_role_pattern()})",
     re.I,
 )
 
 
 def _normalize_role(value: str) -> FileRole | None:
     lowered = (value or "").strip().lower()
-    return lowered if lowered in SCRIPT_ROLES or lowered in RESOURCE_ROLES else None  # type: ignore[return-value]
+    return lowered if is_script_role(lowered) or is_resource_role(lowered) else None  # type: ignore[return-value]
 
 
 
@@ -243,35 +360,102 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
     return texts[0] if texts else ""
 
 
-def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
-    """Extract SkillPlan list fields such as inputs/outputs/dependencies.
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_FIELD_ANNOTATION_RE = re.compile(r"\s*(?::|=|（|\()\s*", re.I)
+_FIELD_AMBIGUOUS_RE = re.compile(
+    r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
+    re.I,
+)
+_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime"
 
-    Accepted syntaxes include `inputs: topic, prompt`, `inputs=[topic,prompt]`,
-    and Chinese full-width separators.  The extraction is deliberately local to
-    the file's plan segment so domain prose elsewhere cannot enable contracts.
+
+def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
+    """Return a concrete SkillPlan field name, or mark ambiguous declarations.
+
+    ``inputs``/``outputs`` are a declaration contract, not a place for
+    alternatives.  Keep type/default annotations such as ``field: string`` or
+    ``field (default: value)``, but never silently remove candidate separators
+    and concatenate multiple possible field names into a synthetic one.
     """
+    item = str(raw_item or "").strip().strip("'\"`")
+    if not item:
+        return None, False
+    if _FIELD_AMBIGUOUS_RE.search(item):
+        return None, True
+
+    head = _FIELD_ANNOTATION_RE.split(item, maxsplit=1)[0].strip().strip("'\"`")
+    if not head:
+        return None, False
+    if not _FIELD_NAME_RE.fullmatch(head):
+        # Invalid punctuation/whitespace would previously be stripped and could
+        # merge candidate tokens. Surface it as an ambiguous field declaration
+        # instead of guessing which token should survive.
+        return None, True
+    return head, False
+
+
+def _parse_explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> tuple[list[str] | None, list[str]]:
+    """Extract SkillPlan list fields and declaration-format warnings."""
     segment = _segment_for_file(file_path, purpose, blueprint_summary)
     pattern = re.compile(rf"(?:{re.escape(field_name)}|{re.escape(field_name.replace('_', ' '))})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
     match = pattern.search(segment)
     if not match:
-        return None
+        return None, []
     raw = match.group(1)
-    raw = re.split(r"\s+(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime)\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
+    raw = re.split(rf"\s+(?:{_FIELD_LIST_NAMES_RE})\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
     cleaned: list[str] = []
+    warnings: list[str] = []
+    ambiguous_seen = False
     for item in values:
-        if field_name == "inputs":
-            # Keep only the JSON argv key.  Model/blueprint prose often writes
-            # `topic: string`, `tone=humorous`, or `style (default: popular-science)`;
-            # those must remain `topic`, `tone`, and `style` instead of being
-            # concatenated into invalid keys such as `topicstring`.
-            item = re.split(r"\s*(?::|=|（|\(|\s)\s*", item, maxsplit=1)[0]
-            item = re.sub(r"[^A-Za-z0-9_-]", "", item)
+        if field_name in {"inputs", "outputs"}:
+            cleaned_item, ambiguous = _clean_concrete_field_name(item)
+            ambiguous_seen = ambiguous_seen or ambiguous
         else:
-            item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
-        if item:
-            cleaned.append(item)
-    return cleaned
+            cleaned_item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
+            ambiguous = False
+
+        if cleaned_item:
+            cleaned.append(cleaned_item)
+
+    if ambiguous_seen and field_name in {"inputs", "outputs"}:
+        warnings.append(
+            f"skill_plan.field_ambiguous: {file_path} {field_name} contains ambiguous alternatives. "
+            "SkillPlan inputs/outputs must use concrete field names; ambiguous alternatives are not allowed."
+        )
+
+    return cleaned, warnings
+
+
+def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
+    """Extract SkillPlan list fields such as inputs/outputs/dependencies.
+
+    Accepted syntaxes include `inputs: field, other_field`,
+    `inputs=[field,other_field]`, and Chinese full-width separators.  For
+    inputs/outputs, ambiguous alternatives are omitted instead of being
+    sanitized into a synthetic concatenated field name.
+    """
+    values, _warnings = _parse_explicit_list_field(
+        field_name,
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
+    )
+    return values
+
+
+def skill_plan_field_declaration_warnings(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
+    """Return user-visible warnings for invalid SkillPlan field declarations."""
+    warnings: list[str] = []
+    for field_name in ("inputs", "outputs"):
+        _values, field_warnings = _parse_explicit_list_field(
+            field_name,
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+        warnings.extend(field_warnings)
+    return warnings
 
 
 
@@ -392,11 +576,8 @@ def _should_promote_image_script_role(file_path: str, purpose: str = "", bluepri
 
 
 def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
-    augmented = list(inputs)
-    text = f"{purpose}\n{blueprint_summary}"
-    if role in {"image_generator", "composite_generator"} and _CUSTOM_CHARACTER_RE.search(text) and "custom_character" not in augmented:
-        augmented.append("custom_character")
-    return augmented
+    """Return declared inputs without platform-invented business fields."""
+    return list(inputs)
 
 def file_role_classifier(
     *,
@@ -482,36 +663,22 @@ def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
     if role == "reference":
         return [], ["non_empty_markdown", "required_sections"]
     if role == "asset":
-        return [], ["existing_parseable_file"]
+        return [], []
     if role == "skill_overview":
         return ["user_request"], ["workflow", "script_order", "resource_references"]
     return ["payload"], []
 
 
 def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    if role == "text_generator":
-        return ["text_generation"], ["image_generation", "pdf_generation"]
-    if role == "image_generator":
-        return ["image_generation"], ["text_generation", "pdf_generation"]
-    if role == "composite_generator":
-        return ["text_generation", "image_generation"], ["pdf_generation"]
-    if role == "pdf_builder":
-        return ["pdf_generation", "file_output"], []
-    if role == "docx_builder":
-        return ["docx_generation", "file_output"], []
-    if role == "pptx_builder":
-        return ["pptx_generation", "file_output"], []
-    if role == "html_asset_builder":
-        return ["html_asset_generation", "file_output"], []
-    if role == "asset_builder":
-        return ["asset_generation", "file_output"], []
-    if role == "reference":
-        return ["reference_guidance"], ["runtime_execution", "image_generation"]
-    if role == "asset":
-        return ["static_resource"], ["runtime_execution", "image_generation"]
-    if role == "skill_overview":
-        return ["workflow_overview"], ["hidden_runtime_protocol"]
-    return ["deterministic_execution"], ["text_generation", "image_generation", "pdf_generation"]
+    required, forbidden = registry_capabilities_for_role(str(role))
+    required = normalize_required_capabilities(
+        role=str(role),
+        path="",
+        required_capabilities=list(required or []),
+        user_blueprint_text="",
+    )
+    forbidden = [capability for capability in list(forbidden or []) if capability not in set(required)]
+    return required, forbidden
 
 
 def build_skill_plan_entry(
@@ -546,9 +713,9 @@ def build_skill_plan_entry(
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     default_inputs, default_outputs = default_io_for_role(role)
-    inputs = explicit_inputs or default_inputs
+    inputs = explicit_inputs if explicit_inputs is not None else default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-    outputs = explicit_outputs or default_outputs
+    outputs = explicit_outputs if explicit_outputs is not None else default_outputs
     all_reference_files = _dedupe_paths(list(reference_files or []))
     skill_local_references = [ref for ref in all_reference_files if _is_skill_local_reference(ref)]
     creator_internal_references = [ref for ref in all_reference_files if _is_creator_internal_reference(ref)]
@@ -559,6 +726,12 @@ def build_skill_plan_entry(
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
     required_capabilities = explicit_required_capabilities or default_required_capabilities
+    required_capabilities = normalize_required_capabilities(
+        role=role,
+        path=file_path,
+        required_capabilities=required_capabilities,
+        user_blueprint_text=f"{purpose}\n{blueprint_summary}",
+    )
     if (
         file_type == "script"
         and {"text_generation", "image_generation"}.issubset(set(required_capabilities))
@@ -568,9 +741,15 @@ def build_skill_plan_entry(
         default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
         if not explicit_required_capabilities:
             required_capabilities = default_required_capabilities
-        inputs = explicit_inputs or default_io_for_role(role)[0]
+        required_capabilities = normalize_required_capabilities(
+            role=role,
+            path=file_path,
+            required_capabilities=required_capabilities,
+            user_blueprint_text=f"{purpose}\n{blueprint_summary}",
+        )
+        inputs = explicit_inputs if explicit_inputs is not None else default_io_for_role(role)[0]
         inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-        outputs = explicit_outputs or default_io_for_role(role)[1]
+        outputs = explicit_outputs if explicit_outputs is not None else default_io_for_role(role)[1]
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     optional_capabilities = explicit_optional_capabilities or []
     allowed_capabilities = explicit_allowed_capabilities or []
@@ -621,7 +800,214 @@ def build_skill_plan_entry(
     )
 
 
+_RUNTIME_OUTPUT_DIR_RE = re.compile(r"(?:^|/)(?:outputs?|output|generated|build|dist|tmp|temp|artifacts?)(?:/|$)|输出目录|产物目录|结果目录|中间目录|OUTPUT_DIR", re.I)
+_RUNTIME_OUTPUT_EXT_RE = re.compile(r"\.(?:pdf|docx|pptx|xlsx|csv|json|png|jpe?g|webp|gif|svg|zip|html)$", re.I)
+_DYNAMIC_PATH_RE = re.compile(r"\{\{|\}\}|\$\{|<[^>/]+>|\[[^\]]+\]|\*|\?|按.*(?:生成|输出)|动态|占位符|变量|runtime|运行时", re.I)
+_GENERATED_SEMANTIC_RE = re.compile(r"生成|产物|输出|导出|写入|构建|保存|最终结果|最终文件|中间文件|runtime|运行时|generated|output|artifact|export|build|result", re.I)
+_UPLOAD_ONLY_RE = re.compile(r"上传|已有|现成|预置|静态|模板|素材|upload|provided|static|bundled", re.I)
+def is_dynamic_file_path(path: str) -> bool:
+    return bool(_DYNAMIC_PATH_RE.search(path or ""))
+
+
+def is_runtime_output_path(path: str) -> bool:
+    normalized = (path or "").replace("\\", "/")
+    return bool(_RUNTIME_OUTPUT_DIR_RE.search(normalized))
+
+
+def is_runtime_artifact_semantic(path: str, text: str = "") -> bool:
+    """Return True when a file-plan item describes a runtime/generated artifact.
+
+    Static uploaded assets can have image/document extensions, so an extension is
+    not enough by itself.  We require a runtime/output directory, a dynamic path,
+    or generated/final-output semantics near the file contract.
+    """
+    normalized = (path or "").replace("\\", "/")
+    semantic_text = f"{normalized}\n{text or ''}"
+    if is_dynamic_file_path(normalized):
+        return True
+    if is_runtime_output_path(normalized):
+        return True
+    if _GENERATED_SEMANTIC_RE.search(semantic_text) and (_RUNTIME_OUTPUT_EXT_RE.search(normalized) or normalized.startswith("assets/")):
+        if normalized.startswith("assets/") and _UPLOAD_ONLY_RE.search(text or "") and not re.search(r"最终|产物|输出|导出|生成|generated|output|artifact|export", text or "", re.I):
+            return False
+        return True
+    return False
+
+
+def _is_asset_upload_only(entry: SkillPlanEntry) -> bool:
+    text = f"{entry.purpose}\n{' '.join(entry.inputs)}\n{' '.join(entry.outputs)}\n{' '.join(entry.dependencies)}"
+    if entry.inputs or entry.outputs or entry.dependencies or entry.required_capabilities:
+        return False
+    if is_dynamic_file_path(entry.path):
+        return False
+    if is_runtime_artifact_semantic(entry.path, text):
+        return False
+    return True
+
+
+def dependency_is_output_semantic(dep: str, prior_outputs: set[str] | None = None) -> bool:
+    dep = str(dep or "").strip().replace("\\", "/")
+    if not dep:
+        return False
+    if is_runtime_output_path(dep) or is_dynamic_file_path(dep):
+        return True
+    if prior_outputs and dep in prior_outputs:
+        return True
+    return False
+
+
+def _command_template_for_entry_with_values(entry: SkillPlanEntry) -> str:
+    return render_script_command_from_skill_plan(entry)
+
+
+def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
+    """Normalize and clean a parsed SkillPlan after model/regex extraction."""
+    entries: list[SkillPlanEntry] = []
+    warnings = list(plan.warnings or [])
+    seen_skill_md = False
+    prior_outputs: set[str] = set()
+
+    for entry in plan.files:
+        path = entry.path.replace("\\", "/").strip()
+        if path == "SKILL.md":
+            if seen_skill_md:
+                warnings.append("已移除重复的 SKILL.md 文件计划项；Skill 包只能有一个 SKILL.md。")
+                continue
+            seen_skill_md = True
+
+        normalized_required = normalize_required_capabilities(
+            role=entry.role,
+            path=path,
+            required_capabilities=list(entry.required_capabilities or []),
+            user_blueprint_text=entry.purpose,
+        )
+        dependencies = [dep for dep in _dedupe_paths(list(entry.dependencies or [])) if not dependency_is_output_semantic(dep, prior_outputs)]
+        removed_deps = set(entry.dependencies or []) - set(dependencies)
+        for dep in sorted(removed_deps):
+            warnings.append(f"已从 {path} dependencies 移除输出/动态路径 {dep}；dependencies 只能表示输入依赖。")
+
+        cleaned = replace(
+            entry,
+            path=path,
+            required_capabilities=normalized_required,
+            dependencies=dependencies,
+            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required)],
+        )
+
+        if cleaned.role in RESOURCE_ROLES or cleaned.file_type in {"skill_md", "reference", "asset"}:
+            cleaned = replace(cleaned, required_capabilities=[], optional_capabilities=[], allowed_capabilities=[])
+
+        if cleaned.role == "asset" or cleaned.file_type == "asset" or path.startswith("assets/"):
+            if not _is_asset_upload_only(cleaned):
+                warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
+                continue
+            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], runtime="none", entrypoint="", command_template="")
+
+        if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
+            cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")
+
+        if cleaned.file_type == "script":
+            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned))
+            prior_outputs.update(cleaned.outputs or [])
+
+        entries.append(cleaned)
+
+    return SkillPlan(skill_name=plan.skill_name, files=entries, warnings=warnings)
+
+
+def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:
+    """Return generic semantic file-plan violations after normalization."""
+    issues: list[str] = []
+    skill_md_count = sum(1 for entry in plan.files if entry.path == "SKILL.md")
+    if skill_md_count != 1:
+        issues.append(f"SKILL.md must be unique; found {skill_md_count}.")
+
+    prior_outputs: set[str] = set()
+    for entry in plan.files:
+        if entry.path == "SKILL.md" and entry.role != "skill_overview":
+            issues.append("SKILL.md role must be skill_overview.")
+        if entry.file_type == "script" and not entry.path.startswith("scripts/"):
+            issues.append(f"Script file must be under scripts/: {entry.path}")
+        if entry.file_type == "reference" and not entry.path.startswith("references/"):
+            issues.append(f"Reference file must be under references/: {entry.path}")
+        if entry.file_type == "asset" or entry.role == "asset" or entry.path.startswith("assets/"):
+            if not _is_asset_upload_only(entry):
+                issues.append(f"Asset must be upload-only static resource: {entry.path}")
+        if entry.file_type != "script" and entry.required_capabilities:
+            issues.append(f"Resource/meta file must not declare runtime capabilities: {entry.path}")
+        for dep in entry.dependencies:
+            if dependency_is_output_semantic(dep, prior_outputs):
+                issues.append(f"Dependency cannot be output/dynamic path: {entry.path} -> {dep}")
+        if entry.file_type != "script" and is_runtime_artifact_semantic(entry.path, entry.purpose):
+            issues.append(f"Runtime artifact cannot be a Creator file-plan item: {entry.path}")
+        prior_outputs.update(entry.outputs or [])
+    return issues
+
+
+def command_payload_placeholders(command: str, script_path: str) -> dict[str, str] | None:
+    import json, shlex
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        return None
+    expected = script_path.replace("\\", "/")
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == expected or normalized.endswith("/" + expected):
+            if idx + 1 >= len(parts):
+                return {}
+            try:
+                payload = json.loads(parts[idx + 1])
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            placeholders: dict[str, str] = {}
+            for key, value in payload.items():
+                if isinstance(value, str):
+                    match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*\}\}", value.strip())
+                    placeholders[str(key)] = match.group(1) if match else value.strip()
+                else:
+                    placeholders[str(key)] = ""
+            return placeholders
+    return None
+
+
+def validate_skill_plan_dataflow(plan: SkillPlan) -> list[str]:
+    """Validate linear script I/O edges without assuming business field names.
+
+    Any input may originate from the user's request, extracted runtime context,
+    or static references/assets.  The platform only enforces a stricter edge
+    when a downstream input corresponds to a field already produced by an
+    upstream script: in that case the command must pass that prior stdout JSON
+    field instead of silently falling back to unrelated raw text.
+    """
+    issues: list[str] = []
+    produced: set[str] = set()
+    scripts = [entry for entry in plan.files if entry.file_type == "script"]
+    consumed_outputs: set[str] = set()
+    for entry in scripts:
+        placeholders = command_payload_placeholders(entry.command_template, entry.path)
+        if placeholders is None:
+            issues.append(f"{entry.path} command_template must pass a JSON object argv.")
+            placeholders = {}
+        for key in entry.inputs:
+            placeholder = placeholders.get(key)
+            if placeholder is None:
+                issues.append(f"{entry.path} command_template missing input key '{key}'.")
+            elif key in produced and placeholder not in produced and placeholder != key:
+                issues.append(f"{entry.path} input '{key}' must reference prior stdout JSON field, not '{placeholder}'.")
+            elif placeholder in produced:
+                consumed_outputs.add(placeholder)
+        produced.update(entry.outputs or [])
+    final_outputs = set(scripts[-1].outputs or []) if scripts else set()
+    dangling = produced - consumed_outputs - final_outputs
+    for output in sorted(dangling):
+        issues.append(f"Script output '{output}' is neither consumed by a later script nor final output metadata.")
+    return issues
+
+
 def validate_role(role: str, file_type: FileType) -> bool:
     if file_type == "script":
-        return role in SCRIPT_ROLES
-    return role in RESOURCE_ROLES
+        return is_script_role(role)
+    return is_resource_role(role)

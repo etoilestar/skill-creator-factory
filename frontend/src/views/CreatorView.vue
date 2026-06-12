@@ -317,17 +317,21 @@ async function send() {
 // Creation panel handlers
 // ---------------------------------------------------------------------------
 
-function onCreationComplete({ skillName }) {
+function onCreationComplete({ skillName, validateResult, packageResult }) {
   messages.value.push({
     role: 'assistant',
-    content: `✅ Skill **${skillName}** 已创建完成！可以在沙盒模式下测试。`,
+    content:
+      `✅ Skill **${skillName}** 已创建完成！\n\n` +
+      `- 严格端到端校验：${validateResult?.success ? '通过' : '未知'}\n` +
+      `- 打包结果：${packageResult?.success ? '完成' : '未知'}\n\n` +
+      `现在可以在沙盒模式下测试。`,
   })
   showCreationPanel.value = false
   scrollBottom()
 }
 
 function onCreationError(errMsg) {
-  error.value = `Skill 创建失败：${errMsg}`
+  error.value = `Skill 创建未完成：${errMsg}`
 }
 
 // ---------------------------------------------------------------------------

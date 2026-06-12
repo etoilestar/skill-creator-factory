@@ -842,3 +842,4 @@ def _source_path_for_error(source: Any) -> str:
             if source.get(key):
                 return _strip_braces(str(source[key]))
     return ""
+

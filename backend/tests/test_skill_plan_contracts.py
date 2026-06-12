@@ -50,7 +50,7 @@ def test_low_confidence_script_falls_back_to_generic_with_warning():
     assert "image_generation" not in entry.required_capabilities
 
 
-def test_skill_md_command_block_must_match_skillplan_inputs():
+def test_first_round_skill_md_command_block_allows_non_exact_skillplan_inputs():
     from backend.routers.creator import _check_skill_md_contract
 
     blueprint = """
@@ -73,7 +73,8 @@ python scripts/write.py '{"topic":"{{topic}}","extra":"{{extra}}"}'
     results = _check_skill_md_contract(skill_md, blueprint)
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "command_block.skillplan_inputs.exact" in failed_ids
+    assert "skill_md.command_block.json_argv_object" not in failed_ids
+    assert "command_block.skillplan_inputs.exact" not in failed_ids
 
 
 def test_skill_md_can_delegate_script_command_to_reference():
@@ -100,9 +101,10 @@ description: delegated
 - `references/text-generation.md`: 定义 text_generator 的命令、输入输出和约束。
 """
     results = _check_skill_md_contract(skill_md, blueprint)
-    execution_result = next(result for result in results if result.id == "skill_md.script_command.exists")
+    execution_result = next(result for result in results if result.id == "skill_md.command_block.fenced_exists")
 
-    assert execution_result.passed
+    assert not execution_result.passed
+    assert execution_result.target == "scripts/write.py"
 
 
 def test_reference_contract_requires_subtask_contract_sections():
@@ -124,7 +126,7 @@ def test_reference_contract_requires_subtask_contract_sections():
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="text_generator 子任务执行参考")
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "reference.subtask_contract_sections" in failed_ids
+    assert "reference.role_sections" in failed_ids
 
 
 def test_skill_plan_runtime_defaults_python_and_supports_node_bash():
@@ -253,12 +255,13 @@ role: text_generator runtime: python，禁止生成图片或 PDF。
 不要使用 extra 参数，不要输出图片。
 
 ## 约束
-JSON argv keys 必须与 SkillPlan inputs 对齐，文档内容足够长，可直接指导执行。
+JSON argv keys 可由 workflow 自定义，文档内容足够长，可直接指导执行。
 """
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="scripts/write.py role: text_generator runtime: python inputs: topic outputs: text")
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "command_block.runtime.matches_skillplan" in failed_ids
+    assert "reference.no_executable_script_blocks" in failed_ids
+    assert "command_block.runtime.matches_skillplan" not in failed_ids
 
 
 def test_asset_contract_validates_yaml_and_markdown_placeholders():
@@ -291,7 +294,7 @@ def test_role_skeletons_inject_platform_calls_for_python_node_bash():
     assert "pdf_path" in pdf_skeleton
 
 
-def test_required_capability_contract_rejects_empty_text_generator_shell():
+def test_required_capability_contract_allows_helper_preferred_text_self_implementation():
     from backend.routers.creator import _check_script_file_contract
 
     entry = {
@@ -326,11 +329,11 @@ if __name__ == '__main__':
     main()
 """
 
-    bad_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
-    good_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
+    self_impl_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
+    helper_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
 
-    assert "script.required_capabilities.called" in bad_failed
-    assert "script.required_capabilities.called" not in good_failed
+    assert "script.required_capabilities.called" not in self_impl_failed
+    assert "script.required_capabilities.called" not in helper_failed
 
 
 def test_sanitize_trims_prose_from_node_entrypoint_to_stdout():
@@ -372,7 +375,8 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     assert entry.required_capabilities == ["text_generation", "image_generation"]
     assert "text_generation" not in entry.forbidden_capabilities
     assert "pdf_generation" in entry.forbidden_capabilities
-    assert "custom_character" in entry.inputs
+    assert entry.inputs == ["payload"]
+    assert "custom_character" not in entry.inputs
     assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
 
@@ -392,7 +396,7 @@ def test_main_script_with_ambiguous_image_pdf_wording_stays_generic():
     assert "image_generation" not in entry.required_capabilities
 
 
-def test_image_generator_contract_requires_helper_without_strict_skillplan_entry():
+def test_image_generator_contract_allows_self_implementation_without_helper():
     from backend.routers.creator import _check_script_file_contract
 
     no_helper = """import json
@@ -411,7 +415,7 @@ if __name__ == '__main__':
         if not result.passed
     }
 
-    assert "script.required_capabilities.called" in failed
+    assert "script.required_capabilities.called" not in failed
 
 
 def test_generic_script_forbids_image_helper_and_repair_guidance_keeps_role_context():
@@ -566,7 +570,7 @@ role: composite_generator，required_capabilities: text_generation, image_genera
 不要输出固定模板，不要省略 image_generation。
 
 ## 约束
-JSON argv keys 必须与 SkillPlan inputs 对齐，text 输出可作为 image prompt 跨能力传递。
+JSON argv keys 可由 workflow 自定义，text 输出可作为 image prompt 跨能力传递。
 """
     results = _check_reference_file_contract(
         "references/composite.md",
@@ -604,7 +608,7 @@ python scripts/run.py '{"topic":"{{topic}}"}'
 """
     failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
 
-    assert "skill_md.resource.local_declared" in failed
+    assert "skill_md.resource.local_declared" not in failed
 
 
 def test_skill_md_allows_declared_local_reference_and_script():
@@ -659,8 +663,9 @@ python scripts/generate_fable.py '{"payload":{"topic":"{{topic}}"}}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "command_block.command_template.equivalent" in failed
-    assert "command_block.skillplan_inputs.exact" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "command_block.command_template.equivalent" not in failed
+    assert "command_block.skillplan_inputs.exact" not in failed
 
 
 def test_reference_redefined_role_is_rejected_against_skillplan():
@@ -685,7 +690,8 @@ required_capabilities: text_generation
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "reference.role.matches_skillplan" in failed
+    assert "reference.role_sections" in failed
+    assert "reference.role.matches_skillplan" not in failed
 
 
 def test_reference_cannot_put_skillplan_command_in_anti_example():
@@ -710,7 +716,8 @@ python scripts/generate_fable.py '{"topic":"{{topic}}"}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "reference.anti_example.not_skillplan_command" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "reference.anti_example.not_skillplan_command" not in failed
 
 
 def test_required_text_and_image_capabilities_normalize_to_composite_generator():
@@ -742,9 +749,10 @@ def test_command_template_can_be_parsed_for_sandbox_trial_args():
 def test_composite_trial_stdout_accepts_text_and_image_paths(tmp_path):
     from backend.routers.creator import _validate_trial_stdout_json
 
-    image_path = tmp_path / "image.png"
+    image_path = tmp_path / "outputs" / "image.png"
+    image_path.parent.mkdir(parents=True)
     image_path.write_bytes(b"fake")
-    payload = {"text": "story", "image_paths": [str(image_path)], "images": [{"image_path": str(image_path)}]}
+    payload = {"text": "story", "image_paths": ["outputs/image.png"]}
 
     _validate_trial_stdout_json(
         stdout=__import__("json").dumps(payload),
@@ -797,7 +805,8 @@ python scripts/generate_fable.py '{"topic":"{{topic}}"}'
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=skill_md) if not r.passed}
 
-    assert "reference.command_block.not_duplicate_skill_md" in failed
+    assert "reference.no_executable_script_blocks" in failed
+    assert "reference.command_block.not_duplicate_skill_md" not in failed
 
 
 def test_trial_stdout_outputs_allow_limited_legacy_aliases():
@@ -864,22 +873,23 @@ def test_html_asset_builder_plan_skeleton_and_trial_validation(tmp_path):
 
     entry = build_skill_plan_entry(
         file_path="scripts/build_html.py",
-        purpose="role: html_asset_builder inputs: topic outputs: html_path, asset_paths required_capabilities: html_generation, file_output",
+        purpose="role: html_asset_builder inputs: topic outputs: html_path, file_paths, file_outputs required_capabilities: html_generation, file_output",
     )
     skeleton = _script_generation_skeleton("scripts/build_html.py", "", "", skill_plan_entry=entry.__dict__)
 
     assert entry.role == "html_asset_builder"
-    assert entry.outputs == ["html_path", "asset_paths"]
-    assert "assets/generated" in skeleton
+    assert entry.outputs == ["html_path", "file_paths", "file_outputs"]
+    assert "outputs" in skeleton
+    assert "assets/generated" not in skeleton
     assert "html_path" in skeleton
 
     skill_dir = tmp_path / "html-skill"
-    html_file = skill_dir / "assets" / "generated" / "demo.html"
+    html_file = skill_dir / "outputs" / "demo.html"
     html_file.parent.mkdir(parents=True)
     html_file.write_text("<!doctype html><html><body>demo</body></html>", encoding="utf-8")
     _validate_trial_stdout_json(
-        stdout=__import__("json").dumps({"html_path": "assets/generated/demo.html", "asset_paths": ["assets/generated/demo.html"]}),
-        content="html_path = 'assets/generated/demo.html'\nPath('assets/generated/demo.html').write_text('<html></html>')",
+        stdout=__import__("json").dumps({"html_path": "outputs/demo.html", "file_paths": ["outputs/demo.html"], "file_outputs": ["outputs/demo.html"]}),
+        content="html_path = 'outputs/demo.html'\nPath('outputs/demo.html').write_text('<html></html>')",
         args=['{"topic":"demo"}'],
         role="html_asset_builder",
         skill_plan_entry=entry.__dict__,
@@ -920,8 +930,10 @@ def test_export_builder_skeletons_consume_previous_stdout_without_generation_hel
     pptx_skeleton = _script_generation_skeleton("scripts/export_pptx.py", "", "", skill_plan_entry=pptx_entry.__dict__)
 
     assert "previous_stdout" in docx_skeleton
-    assert "docx_path" in docx_skeleton
-    assert "pptx_path" in pptx_skeleton
+    assert "from backend.services.skill_runtime import create_docx, print_json" in docx_skeleton
+    assert "return create_docx(text, filename='output.docx')" in docx_skeleton
+    assert "from backend.services.skill_runtime import create_pptx, print_json" in pptx_skeleton
+    assert "return create_pptx(text, filename='output.pptx')" in pptx_skeleton
     assert "generate_text_with_llm" not in docx_skeleton
     assert "generate_stable_diffusion_image" not in docx_skeleton
     assert "generate_text_with_llm" not in pptx_skeleton
@@ -940,3 +952,507 @@ def test_skill_plan_separates_creator_internal_from_skill_local_references():
     assert entry.skill_local_references == ["references/workflows.md"]
     assert "kernel/references/workflows.md" in entry.creator_internal_references
     assert "kernel/references/workflows.md" not in entry.dependencies
+
+
+def test_social_card_blueprint_capabilities_are_normalized_to_runtime_needs():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: topic-social-card
+- path: `SKILL.md`
+  role: skill_overview
+  required_capabilities: [workflow_overview]
+- path: `scripts/analyze_topic.py`
+  role: text_generator
+  inputs: [topic_name]
+  outputs: [structured_topic_data]
+  dependencies: [references/topic_sources.md]
+  required_capabilities: [text_generation, web_search, database_read]
+- path: `scripts/generate_illustrated_story.py`
+  role: image_generator
+  inputs: [topic_data]
+  outputs: [story_text, image_paths]
+  required_capabilities: [text_generation, image_generation, vision_understanding]
+- references/: `references/topic_sources.md`
+  references/topic_sources.md
+  role: reference
+  required_capabilities: [reference_guidance]
+- assets/: `assets/placeholder.jpg`
+  assets/placeholder.jpg
+  role: asset
+  required_capabilities: [static_resource]
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entries = {entry.path: entry for entry in plan.skill_plan.files}
+
+    assert entries["SKILL.md"].required_capabilities == []
+    assert entries["references/topic_sources.md"].required_capabilities == []
+    assert entries["assets/placeholder.jpg"].required_capabilities == []
+    assert entries["scripts/analyze_topic.py"].required_capabilities == ["text_generation"]
+    assert entries["scripts/generate_illustrated_story.py"].role == "composite_generator"
+    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == ["text_generation", "image_generation"]
+
+
+def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    text = build_skill_plan_entry(
+        file_path="scripts/write.py",
+        purpose="role: text_generator required_capabilities: [text_generation, web_search, database_read]",
+    )
+    image = build_skill_plan_entry(
+        file_path="scripts/render.py",
+        purpose="role: image_generator required_capabilities: [image_generation, vision_understanding]",
+    )
+    search = build_skill_plan_entry(
+        file_path="scripts/search.py",
+        purpose="role: search_reader required_capabilities: [web_search, text_generation]",
+    )
+    database = build_skill_plan_entry(
+        file_path="scripts/db.py",
+        purpose="role: database_reader required_capabilities: [database_read, text_generation]",
+    )
+    vision = build_skill_plan_entry(
+        file_path="scripts/vision.py",
+        purpose="role: vision_analyzer required_capabilities: [vision_understanding]",
+    )
+
+    assert text.required_capabilities == ["text_generation"]
+    assert image.required_capabilities == ["image_generation"]
+    assert "web_search" in search.required_capabilities
+    assert "database_read" in database.required_capabilities
+    assert "vision_understanding" in vision.required_capabilities
+
+
+def test_runtime_artifact_asset_is_removed_from_file_plan_generically():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: artifact-cleanup
+- scripts/: `scripts/build_document.py`
+  scripts/build_document.py role: pdf_builder inputs: text outputs: pdf_path, file_paths required_capabilities: pdf_generation, file_output
+- assets/: `assets/final-report.pdf`
+  assets/final-report.pdf role: asset outputs: pdf_path dependencies: scripts/build_document.py 最终输出产物，由脚本运行时生成。
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    paths = {item.path for item in plan.skill_plan.files}
+    script = next(item for item in plan.skill_plan.files if item.path == "scripts/build_document.py")
+
+    assert "assets/final-report.pdf" not in paths
+    assert script.outputs == ["pdf_path", "file_paths"]
+    assert any("asset" in warning and "运行时产物" in warning for warning in plan.warnings)
+
+
+def test_asset_role_is_upload_only_and_has_no_runtime_contract_fields():
+    from backend.services.skill_plan import SkillPlan, build_skill_plan_entry, normalize_skill_plan
+
+    static_asset = build_skill_plan_entry(
+        file_path="assets/logo.png",
+        purpose="用户上传的静态素材 upload-only static logo",
+    )
+    generated_asset = build_skill_plan_entry(
+        file_path="assets/generated-image.png",
+        purpose="role: asset outputs: image_path dependencies: scripts/render.py 运行时生成的最终图片产物",
+    )
+    normalized = normalize_skill_plan(SkillPlan(skill_name="asset-check", files=[static_asset, generated_asset]))
+    paths = {entry.path for entry in normalized.files}
+    kept = next(entry for entry in normalized.files if entry.path == "assets/logo.png")
+
+    assert "assets/logo.png" in paths
+    assert "assets/generated-image.png" not in paths
+    assert kept.inputs == []
+    assert kept.outputs == []
+    assert kept.dependencies == []
+    assert kept.required_capabilities == []
+
+
+def test_creator_phase_phrases_are_rejected_from_runtime_skill_md():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: runtime-only
+- scripts/: 无需
+"""
+    skill_md = """---
+name: runtime-only
+description: demo
+---
+# 使用方式
+先输出架构蓝图，等待用户确认后开始创建文件。
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.forbidden_creator_flow" in failed
+
+
+def test_script_io_chain_command_must_reference_prior_output_not_raw_user_request():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: chained-skill
+- scripts/: `scripts/plan.py`, `scripts/export.py`
+  scripts/plan.py role: text_generator inputs: topic outputs: outline required_capabilities: text_generation
+  scripts/export.py role: docx_builder inputs: outline outputs: docx_path, file_paths required_capabilities: docx_generation, file_output
+"""
+    skill_md = """---
+name: chained-skill
+description: demo
+---
+# Workflow
+```bash
+python scripts/plan.py '{"topic":"{{topic}}"}'
+```
+```bash
+python scripts/export.py '{"outline":"{{user_request}}"}'
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.dataflow.input_available" not in failed
+
+
+def test_dependency_output_directory_is_cleaned_from_skillplan():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: dep-cleanup
+- scripts/: `scripts/export.py`
+  scripts/export.py role: docx_builder inputs: text outputs: docx_path dependencies: outputs/, references/style.md required_capabilities: docx_generation, file_output
+- references/: `references/style.md`
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/export.py")
+
+    assert "outputs/" not in entry.dependencies
+    assert "references/style.md" in entry.dependencies
+    assert any("dependencies" in warning and "输出" in warning for warning in plan.warnings)
+
+
+def test_resource_capabilities_are_empty_and_role_allowlist_cleans_spread():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    reference = build_skill_plan_entry(
+        file_path="references/guide.md",
+        purpose="required_capabilities: text_generation, web_search, database_read",
+    )
+    text = build_skill_plan_entry(
+        file_path="scripts/write.py",
+        purpose="role: text_generator inputs: topic required_capabilities: text_generation, web_search, database_read, vision_understanding, wechat_publish, file_output",
+    )
+    pdf = build_skill_plan_entry(
+        file_path="scripts/export_pdf.py",
+        purpose="role: pdf_builder inputs: text outputs: pdf_path required_capabilities: text_generation, image_generation, pdf_generation, web_search, database_read, vision_understanding, file_output",
+    )
+
+    assert reference.required_capabilities == []
+    assert text.required_capabilities == ["text_generation", "file_output"]
+    assert pdf.required_capabilities == ["pdf_generation", "file_output"]
+
+
+def test_skillplan_dataflow_allows_arbitrary_business_field_names():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: arbitrary-fields
+- scripts/: `scripts/derive.py`, `scripts/render.py`
+  scripts/derive.py role: generic_script inputs: customer_brief, locale_hint outputs: structured_payload required_capabilities: deterministic_execution, file_output
+  scripts/render.py role: generic_script inputs: structured_payload, brand_palette outputs: artifact_path, file_paths required_capabilities: deterministic_execution, file_output
+"""
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    warnings = "\n".join(plan.warnings)
+    first = next(item for item in plan.skill_plan.files if item.path == "scripts/derive.py")
+    second = next(item for item in plan.skill_plan.files if item.path == "scripts/render.py")
+
+    assert "customer_brief" not in warnings
+    assert "brand_palette" not in warnings
+    assert '"customer_brief":"{{customer_brief}}"' in first.command_template
+    assert '"structured_payload":"{{structured_payload}}"' in second.command_template
+
+
+def test_second_round_e2e_command_key_mismatch_does_not_block_on_skillplan_inputs(tmp_path):
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_e2e_command_static
+
+    skill_md = """---
+name: generic-skill
+description: generic
+---
+# generic-skill
+
+- scripts/: `scripts/step.py`
+  scripts/step.py role: generic_script inputs: source_value, desired_value outputs: result_value
+
+```bash
+python scripts/step.py '{"source_value":"{{source_value}}","unexpected_value":"{{unexpected_value}}"}'
+```
+"""
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "step.py").write_text(
+        "import json, sys\n"
+        "def main():\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    print(json.dumps({'result_value': payload.get('source_value', '')}))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    command = _parse_e2e_workflow_command(
+        command="python scripts/step.py '{\"source_value\":\"{{source_value}}\",\"unexpected_value\":\"{{unexpected_value}}\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
+
+    entry = _validate_e2e_command_static(
+        command=command,
+        trial_skill_dir=tmp_path,
+        skill_md=skill_md,
+        available_payload_keys={"source_value"},
+    )
+
+    assert entry.path == "scripts/step.py"
+
+
+def test_e2e_static_preflight_allows_helper_preferred_self_implementation(tmp_path):
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_e2e_command_static
+
+    skill_md = """---
+name: image-skill
+description: generic
+---
+# image-skill
+
+- scripts/: `scripts/image.py`
+  scripts/image.py role: image_generator inputs: topic outputs: image_paths required_capabilities: image_generation
+
+```bash
+python scripts/image.py '{"topic":"{{topic}}"}'
+```
+"""
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "image.py").write_text(
+        "import json, sys\n"
+        "def main():\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    print(json.dumps({'image_paths': [payload.get('topic', '')]}))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    command = _parse_e2e_workflow_command(
+        command="python scripts/image.py '{\"topic\":\"{{topic}}\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
+
+    entry = _validate_e2e_command_static(
+        command=command,
+        trial_skill_dir=tmp_path,
+        skill_md=skill_md,
+        available_payload_keys={"topic"},
+    )
+
+    assert entry.path == "scripts/image.py"
+
+
+def test_final_platform_output_value_invalid_reports_shape_and_types():
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_final_platform_output_contract
+
+    command = _parse_e2e_workflow_command(
+        command="python scripts/final.py '{}'",
+        ordinal=2,
+        source_path="SKILL.md",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _validate_final_platform_output_contract(
+            command=command,
+            stdout_json={"file_paths": "outputs/result.pdf", "text": ""},
+            traces=[],
+        )
+
+    message = str(excinfo.value)
+    assert "E2E_LAYER=final_platform_output_value_invalid" in message
+    assert "stdout_shape=" in message
+    assert "invalid_terminal_keys" in message
+    assert "expected_type" in message
+    assert "actual_type" in message
+
+
+def test_deterministic_patch_noops_instead_of_rewriting_to_skillplan_inputs():
+    from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: generic-skill
+- scripts/: `scripts/step.py`
+  scripts/step.py role: generic_script inputs: alpha, beta outputs: gamma
+"""
+    skill_md = """---
+name: generic-skill
+description: generic
+---
+# generic-skill
+
+```bash
+python scripts/step.py '{"alpha":"{{alpha}}","legacy":"{{legacy}}"}'
+```
+"""
+
+    patched, details = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
+
+    assert patched == skill_md
+    assert details == []
+    assert "legacy" in patched
+
+
+
+def test_deterministic_patch_preserves_existing_upstream_payload():
+    from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
+    from backend.services.skill_plan import command_payload_placeholders
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: chain-skill
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: seed_value outputs: shared_value
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: shared_value outputs: final_value
+"""
+    skill_md = """---
+name: chain-skill
+description: chain
+---
+# chain-skill
+
+```bash
+python scripts/first.py '{"seed_value":"{{seed_value}}"}'
+```
+
+```bash
+python scripts/second.py '{"wrong_key":"{{seed_value}}"}'
+```
+"""
+
+    patched, details = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
+    commands = [line.strip() for line in patched.splitlines() if line.strip().startswith("python scripts/second.py")]
+
+    assert details == []
+    assert commands
+    assert command_payload_placeholders(commands[0], "scripts/second.py") == {"wrong_key": "seed_value"}
+
+
+def test_skill_plan_dataflow_unresolved_reports_plan_not_skill_md_loop():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: broken-chain
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: seed_value outputs: produced_value
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: missing_value outputs: final_value
+"""
+    skill_md = """---
+name: broken-chain
+description: broken
+---
+# broken-chain
+
+```bash
+python scripts/first.py '{"seed_value":"{{seed_value}}"}'
+```
+
+```bash
+python scripts/second.py '{"missing_value":"{{missing_value}}"}'
+```
+"""
+
+    failed = {r.id for r in _check_skill_md_contract(skill_md, blueprint) if not r.passed}
+
+    assert "skill_plan.dataflow_unresolved" not in failed
+    assert "command_block.skillplan_inputs.exact" not in failed
+
+
+def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
+    from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_skill_plan, command_payload_placeholders
+
+    entry = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["free_name", "another_name"],
+        outputs=["result_name"],
+    )
+
+    command = render_script_command_from_skill_plan(entry, {"free_name": "{{free_name}}", "ignored": "{{ignored}}"})
+
+    assert command.startswith("python scripts/run.py")
+    assert command_payload_placeholders(command, "scripts/run.py") == {
+        "free_name": "free_name",
+        "another_name": "another_name",
+    }
+
+
+def test_skill_md_markdown_execution_guide_uses_external_envelope_example():
+    from backend.routers.creator import _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+
+    assert "{{user_request}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{input_files}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{fields}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{options}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{topic}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{keywords}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "keywords" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE.lower()
+
+def test_blueprint_warnings_exclude_static_internal_dataflow_dangling_outputs():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: abstract-chain
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: external_value outputs: internal_alpha
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: different_internal outputs: final_result
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+
+    serialized_warnings = "\n".join(plan.skill_plan.warnings + plan.warnings)
+    assert "neither consumed" not in serialized_warnings
+    assert "must reference prior stdout" not in serialized_warnings
+    assert "command_template missing input key" not in serialized_warnings
+    assert any(entry.path == "scripts/second.py" for entry in plan.skill_plan.files)
+
+
+def test_skill_plan_ambiguous_inputs_outputs_are_not_concatenated_and_warn():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: abstract-fields
+- scripts/: `scripts/transform.py`
+  scripts/transform.py
+  role: generic_script
+  inputs: stable_input, candidate_one/candidate_two, alias_one | alias_two
+  outputs: stable_output, result_one+result_two
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/transform.py")
+
+    assert entry.inputs == ["stable_input"]
+    assert entry.outputs == ["stable_output"]
+    assert "candidate_onecandidate_two" not in entry.inputs
+    assert "alias_onealias_two" not in entry.inputs
+    assert "result_oneresult_two" not in entry.outputs
+    assert any("skill_plan.field_ambiguous" in warning for warning in plan.skill_plan.warnings)

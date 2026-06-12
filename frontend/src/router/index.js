@@ -3,6 +3,7 @@ import CreatorView from '../views/CreatorView.vue'
 import SkillsView from '../views/SkillsView.vue'
 import SandboxView from '../views/SandboxView.vue'
 import PublishView from '../views/PublishView.vue'
+import ToolRegistryView from '../views/ToolRegistryView.vue'
 
 const routes = [
   { path: '/', redirect: '/creator' },
@@ -10,6 +11,7 @@ const routes = [
   { path: '/skills', component: SkillsView },
   { path: '/sandbox', component: SandboxView },
   { path: '/publish', component: PublishView },
+  { path: '/creator/tools', component: ToolRegistryView },
 ]
 
 export default createRouter({

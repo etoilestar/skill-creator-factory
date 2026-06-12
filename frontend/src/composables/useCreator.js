@@ -5,6 +5,13 @@
  * backend/routers/creator.py.
  */
 
+function assertActionSuccess(payload, fallbackMessage) {
+  if (!payload || payload.success !== true) {
+    throw new Error(payload?.message || fallbackMessage)
+  }
+  return payload
+}
+
 /**
  * Analyze the conversation blueprint and extract a file-creation plan.
  * This is a pure rule-based call — no LLM is involved.
@@ -25,6 +32,7 @@ export async function analyzeBlueprintPlan(messages, model = null) {
   }
   return resp.json()
 }
+
 
 /**
  * Initialise a new Skill directory structure on the backend.
@@ -166,23 +174,63 @@ export async function writeFile(skillName, filePath, content, role = null, skill
   return resp.json()
 }
 
+export async function uploadAsset({ skillName, filePath, file }) {
+  const form = new FormData()
+  form.append('skill_name', skillName)
+  form.append('file_path', filePath)
+  form.append('file', file)
+
+  const res = await fetch('/api/creator/upload-asset', {
+    method: 'POST',
+    body: form,
+  })
+  const data = await res.json()
+  if (!res.ok || !data.success) throw new Error(data.detail || data.message || '上传失败')
+  return data
+}
+
+export async function uploadAssetAPI({ skillName, filePath, file }) {
+  const form = new FormData()
+  form.append('skill_name', skillName)
+  form.append('file_path', filePath)
+  form.append('file', file)
+
+  const res = await fetch('/api/creator/upload-asset', { method: 'POST', body: form })
+  const data = await res.json()
+  if (!res.ok || !data.success) throw new Error(data.detail || data.message || '上传失败')
+  return data
+}
+
 /**
  * Validate the SKILL.md of a Skill package.
  *
  * @param {string} skillName
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function validateSkill(skillName) {
+export async function validateSkill(
+  skillName,
+  {
+    model = null,
+    autoRepair = true,
+    maxE2ERepairAttempts = 5,
+  } = {}
+) {
   const resp = await fetch('/api/creator/validate-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      model,
+      auto_repair: autoRepair,
+      max_e2e_repair_attempts: maxE2ERepairAttempts,
+    }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
     throw new Error(err.detail || '校验请求失败')
   }
-  return resp.json()
+  const payload = await resp.json()
+  return assertActionSuccess(payload, '严格端到端校验失败')
 }
 
 /**
@@ -191,15 +239,107 @@ export async function validateSkill(skillName) {
  * @param {string} skillName
  * @returns {Promise<{success:boolean, path:string|null, message:string}>}
  */
-export async function packageSkill(skillName) {
+export async function packageSkill(
+  skillName,
+  {
+    model = null,
+    validateBeforePackage = true,
+  } = {}
+) {
   const resp = await fetch('/api/creator/package-skill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ skill_name: skillName }),
+    body: JSON.stringify({
+      skill_name: skillName,
+      model,
+      validate_before_package: validateBeforePackage,
+    }),
   })
+
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
     throw new Error(err.detail || '打包请求失败')
   }
+
+  const payload = await resp.json()
+  return assertActionSuccess(payload, '打包失败')
+}
+
+export async function listCreatorTools() {
+  const resp = await fetch('/api/creator/tools')
+  if (!resp.ok) throw new Error('工具列表加载失败')
   return resp.json()
+}
+
+async function postCreatorTool(path, payload) {
+  const resp = await fetch(`/api/creator/tools/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '工具请求失败')
+  return data
+}
+
+export function draftCreatorTool(payload) {
+  return postCreatorTool('draft', payload)
+}
+
+export function generateCreatorToolCode(payload) {
+  return postCreatorTool('generate-code', payload)
+}
+
+export function validateCreatorTool(payload) {
+  return postCreatorTool('validate', payload)
+}
+
+export function registerCreatorTool(payload) {
+  return postCreatorTool('register', payload)
+}
+
+export function enableCreatorTool(name) {
+  return postCreatorTool(`${encodeURIComponent(name)}/enable`, {})
+}
+
+export function disableCreatorTool(name) {
+  return postCreatorTool(`${encodeURIComponent(name)}/disable`, {})
+}
+
+
+export async function listCreatorToolSnippets(name) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets`)
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail || data.message || 'Snippet 加载失败')
+  return data
+}
+
+export function createCreatorToolSnippet(name, snippet) {
+  return postCreatorTool(`${encodeURIComponent(name)}/snippets`, { snippet })
+}
+
+export async function updateCreatorToolSnippet(name, snippetId, snippet) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ snippet }),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || 'Snippet 更新失败')
+  return data
+}
+
+export async function deleteCreatorToolSnippet(name, snippetId) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}`, { method: 'DELETE' })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail || data.message || 'Snippet 删除失败')
+  return data
+}
+
+export function resolveCreatorToolSnippets(payload) {
+  return postCreatorTool('resolve-snippets', payload)
+}
+
+export function testCreatorToolSnippet(name, snippetId) {
+  return postCreatorTool(`${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}/test`, {})
 }

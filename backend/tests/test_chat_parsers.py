@@ -1674,6 +1674,74 @@ def test_creator_trial_run_prepares_python_deps_before_execution(monkeypatch):
     assert prepared["env"]["SKILL_TRIAL_RUN"] == "1"
     assert "PYTHONPATH" in prepared["env"]
 
+def test_creator_trial_run_installs_capability_dependencies_before_script_scan(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from backend.routers import creator
+
+    calls = []
+
+    def fake_get_venv_python(skill_dir):
+        return Path("/tmp/fake-skill-venv/bin/python")
+
+    def fake_install_capability_dependencies(venv_python, required_capabilities):
+        calls.append(("capability_deps", venv_python, list(required_capabilities)))
+
+    def fake_scan_and_install(script_path, venv_python):
+        calls.append(("script_scan", venv_python, script_path.name))
+
+    def fake_run(argv, **kwargs):
+        calls.append(("script_run", argv))
+        return SimpleNamespace(returncode=0, stdout='{ "pdf_path": "outputs/report.pdf" }', stderr="")
+
+    monkeypatch.setattr(creator, "_get_skill_venv_python", fake_get_venv_python)
+    monkeypatch.setattr(creator, "_install_capability_dependencies", fake_install_capability_dependencies)
+    monkeypatch.setattr(creator, "_scan_and_install_python_deps", fake_scan_and_install)
+    monkeypatch.setattr(creator.subprocess, "run", fake_run)
+    monkeypatch.setattr(creator, "validate_stdout_file_outputs", lambda *args, **kwargs: [])
+
+    creator._trial_run_generated_script(
+        "pdf-skill",
+        "scripts/build_pdf.py",
+        "from backend.services.skill_runtime import create_pdf\nprint('{\"pdf_path\": \"outputs/report.pdf\"}')\n",
+        role="pdf_builder",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "pdf_builder",
+            "required_capabilities": ["pdf_generation", "file_output"],
+        },
+    )
+
+    assert calls[0] == ("capability_deps", Path("/tmp/fake-skill-venv/bin/python"), ["pdf_generation", "file_output"])
+    assert calls[1] == ("script_scan", Path("/tmp/fake-skill-venv/bin/python"), "build_pdf.py")
+
+
+def test_install_capability_dependencies_uses_registry_dependencies(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from backend.routers import creator
+
+    commands = []
+
+    def fake_run(argv, **kwargs):
+        commands.append(argv)
+        if any("find_spec(sys.argv[1])" in str(part) for part in argv):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(creator.subprocess, "run", fake_run)
+
+    creator._install_capability_dependencies(
+        Path("/tmp/fake-skill-venv/bin/python"),
+        ["pdf_generation", "docx_generation", "pptx_generation", "pdf_parsing", "spreadsheet_read", "file_output"],
+    )
+
+    assert [command[-1] for command in commands[:5]] == ["reportlab", "docx", "pptx", "pypdf", "openpyxl"]
+    assert commands[-1][-5:] == ["reportlab", "python-docx", "python-pptx", "pypdf", "openpyxl"]
+
+
 def test_creator_trial_args_render_skill_md_template():
     from backend.routers.creator import _trial_args_for_script
 
@@ -2040,7 +2108,13 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     assert "```bash fenced code block" in prompt
     assert "必须满足以下 SKILL.md 合同" in prompt
     assert "scripts/generate_nursery_rhyme.py" in prompt
-    assert "推荐命令模板：python scripts/generate_nursery_rhyme.py" in prompt
+    assert "static command shape example" in prompt
+    assert "python scripts/generate_nursery_rhyme.py" in prompt
+    assert "first-round static authoring guide" in prompt
+    assert "强制生成策略" not in prompt
+    assert "每个脚本说明中必须写清 stdout JSON 输出字段" not in prompt
+    assert "不要固定特定中间字段" in prompt
+    assert "script_text" not in prompt
     assert "references/best-practices.md" in prompt
     assert "明确引用每个 references/ 路径" in prompt
     assert "禁止复制 Creator 界面流程" in prompt
@@ -2055,7 +2129,7 @@ def test_creator_skill_md_contract_rejects_flow_leak_missing_bash_and_reference(
 
     from backend.routers.creator import _validate_skill_md_contract
 
-    blueprint = "scripts/generate_nursery_rhyme.py\nreferences/best-practices.md"
+    blueprint = "scripts/generate_nursery_rhyme.py\nreferences/style.md"
     leaked = """---
 name: nursery-rhyme-story
 description: demo
@@ -2076,7 +2150,7 @@ description: demo
 # 使用
 运行 scripts/generate_nursery_rhyme.py。
 
-参考资料：references/best-practices.md
+参考资料：references/style.md
 """
     with pytest.raises(ValueError, match="可执行 Markdown 命令块"):
         _validate_skill_md_contract(missing_bash, blueprint)
@@ -2094,7 +2168,7 @@ python scripts/generate_nursery_rhyme.py '{"topic":"{{topic}}"}'
     with pytest.raises(ValueError, match="缺少对参考资料"):
         _validate_skill_md_contract(missing_reference, blueprint)
 
-    valid = missing_reference + "\n参考资料：`references/best-practices.md` 用于童谣写作规范。\n"
+    valid = missing_reference + "\n参考资料：`references/style.md` 用于童谣写作规范。\n"
     _validate_skill_md_contract(valid, blueprint)
 
 
@@ -2777,7 +2851,7 @@ def test_creator_write_file_request_accepts_role_contract_fields():
     assert request.skill_plan_entry["role"] == "pdf_builder"
 
 
-def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
+def test_creator_pdf_builder_skeleton_uses_platform_pdf_helper_not_inline_pdf_bytes():
     from backend.routers.creator import _script_generation_skeleton
 
     skeleton = _script_generation_skeleton(
@@ -2787,8 +2861,11 @@ def test_creator_pdf_builder_skeleton_uses_real_fpdf_not_fake_pdf_bytes():
         role="pdf_builder",
     )
 
-    assert "from fpdf import FPDF" in skeleton
-    assert "pdf.output" in skeleton
+    assert "from backend.services.skill_runtime import create_pdf, print_json" in skeleton
+    assert "return create_pdf(text, filename='output.pdf')" in skeleton
+    assert "from reportlab.pdfbase.cidfonts import UnicodeCIDFont" not in skeleton
+    assert "from fpdf import FPDF" not in skeleton
+    assert "set_font('Helvetica'" not in skeleton
     assert "write_bytes(b'%PDF-1.4" not in skeleton
 
 

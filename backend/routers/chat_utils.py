@@ -92,6 +92,7 @@ _IMPORT_TO_PACKAGE: dict[str, str] = {
     "cv2":           "opencv-python",
     "PIL":           "Pillow",
     "pptx":          "python-pptx",
+    "docx":          "python-docx",
     "sklearn":       "scikit-learn",
     "bs4":           "beautifulsoup4",
     "yaml":          "pyyaml",

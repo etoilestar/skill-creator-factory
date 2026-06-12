@@ -13,7 +13,10 @@ logging.basicConfig(
 logging.getLogger().setLevel(logging.INFO)
 for _handler in logging.getLogger().handlers:
     _handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-from .routers import chat, creator, creator_chat, health, sandbox_chat, skills, skills_chat, publish, publish_gateway
+
+
+from .routers import chat, creator, creator_chat, creator_tools, health, sandbox_chat, skills, skills_chat, publish, publish_gateway
+
 
 app = FastAPI(title="Skill Creator Factory", version="0.1.0")
 
@@ -32,5 +35,9 @@ app.include_router(sandbox_chat.router)
 app.include_router(skills_chat.router)
 app.include_router(skills.router)
 app.include_router(creator.router)
+
 app.include_router(publish.router)
 app.include_router(publish_gateway.router)
+
+app.include_router(creator_tools.router)
+

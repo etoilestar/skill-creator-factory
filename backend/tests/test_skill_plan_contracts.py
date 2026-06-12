@@ -255,7 +255,7 @@ role: text_generator runtime: python，禁止生成图片或 PDF。
 不要使用 extra 参数，不要输出图片。
 
 ## 约束
-JSON argv keys 必须与 SkillPlan inputs 对齐，文档内容足够长，可直接指导执行。
+JSON argv keys 可由 workflow 自定义，文档内容足够长，可直接指导执行。
 """
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="scripts/write.py role: text_generator runtime: python inputs: topic outputs: text")
     failed_ids = {result.id for result in results if not result.passed}
@@ -294,7 +294,7 @@ def test_role_skeletons_inject_platform_calls_for_python_node_bash():
     assert "pdf_path" in pdf_skeleton
 
 
-def test_required_capability_contract_rejects_empty_text_generator_shell():
+def test_required_capability_contract_allows_helper_preferred_text_self_implementation():
     from backend.routers.creator import _check_script_file_contract
 
     entry = {
@@ -329,11 +329,11 @@ if __name__ == '__main__':
     main()
 """
 
-    bad_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
-    good_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
+    self_impl_failed = {result.id for result in _check_script_file_contract("scripts/write.py", fixed_template, skill_plan_entry=entry) if not result.passed}
+    helper_failed = {result.id for result in _check_script_file_contract("scripts/write.py", real_call, skill_plan_entry=entry) if not result.passed}
 
-    assert "script.required_capabilities.called" in bad_failed
-    assert "script.required_capabilities.called" not in good_failed
+    assert "script.required_capabilities.called" not in self_impl_failed
+    assert "script.required_capabilities.called" not in helper_failed
 
 
 def test_sanitize_trims_prose_from_node_entrypoint_to_stdout():
@@ -396,7 +396,7 @@ def test_main_script_with_ambiguous_image_pdf_wording_stays_generic():
     assert "image_generation" not in entry.required_capabilities
 
 
-def test_image_generator_contract_requires_helper_without_strict_skillplan_entry():
+def test_image_generator_contract_allows_self_implementation_without_helper():
     from backend.routers.creator import _check_script_file_contract
 
     no_helper = """import json
@@ -415,7 +415,7 @@ if __name__ == '__main__':
         if not result.passed
     }
 
-    assert "script.required_capabilities.called" in failed
+    assert "script.required_capabilities.called" not in failed
 
 
 def test_generic_script_forbids_image_helper_and_repair_guidance_keeps_role_context():
@@ -570,7 +570,7 @@ role: composite_generator，required_capabilities: text_generation, image_genera
 不要输出固定模板，不要省略 image_generation。
 
 ## 约束
-JSON argv keys 必须与 SkillPlan inputs 对齐，text 输出可作为 image prompt 跨能力传递。
+JSON argv keys 可由 workflow 自定义，text 输出可作为 image prompt 跨能力传递。
 """
     results = _check_reference_file_contract(
         "references/composite.md",
@@ -1175,7 +1175,7 @@ def test_skillplan_dataflow_allows_arbitrary_business_field_names():
     assert '"structured_payload":"{{structured_payload}}"' in second.command_template
 
 
-def test_second_round_e2e_command_key_mismatch_exposes_structured_diff(tmp_path):
+def test_second_round_e2e_command_key_mismatch_does_not_block_on_skillplan_inputs(tmp_path):
     from backend.routers.creator import _parse_e2e_workflow_command, _validate_e2e_command_static
 
     skill_md = """---
@@ -1193,33 +1193,99 @@ python scripts/step.py '{"source_value":"{{source_value}}","unexpected_value":"{
 """
     script_dir = tmp_path / "scripts"
     script_dir.mkdir()
-    (script_dir / "step.py").write_text("print('{}')", encoding="utf-8")
+    (script_dir / "step.py").write_text(
+        "import json, sys\n"
+        "def main():\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    print(json.dumps({'result_value': payload.get('source_value', '')}))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
     command = _parse_e2e_workflow_command(
         command="python scripts/step.py '{\"source_value\":\"{{source_value}}\",\"unexpected_value\":\"{{unexpected_value}}\"}'",
         ordinal=1,
         source_path="SKILL.md",
     )
 
+    entry = _validate_e2e_command_static(
+        command=command,
+        trial_skill_dir=tmp_path,
+        skill_md=skill_md,
+        available_payload_keys={"source_value"},
+    )
+
+    assert entry.path == "scripts/step.py"
+
+
+def test_e2e_static_preflight_allows_helper_preferred_self_implementation(tmp_path):
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_e2e_command_static
+
+    skill_md = """---
+name: image-skill
+description: generic
+---
+# image-skill
+
+- scripts/: `scripts/image.py`
+  scripts/image.py role: image_generator inputs: topic outputs: image_paths required_capabilities: image_generation
+
+```bash
+python scripts/image.py '{"topic":"{{topic}}"}'
+```
+"""
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "image.py").write_text(
+        "import json, sys\n"
+        "def main():\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    print(json.dumps({'image_paths': [payload.get('topic', '')]}))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    command = _parse_e2e_workflow_command(
+        command="python scripts/image.py '{\"topic\":\"{{topic}}\"}'",
+        ordinal=1,
+        source_path="SKILL.md",
+    )
+
+    entry = _validate_e2e_command_static(
+        command=command,
+        trial_skill_dir=tmp_path,
+        skill_md=skill_md,
+        available_payload_keys={"topic"},
+    )
+
+    assert entry.path == "scripts/image.py"
+
+
+def test_final_platform_output_value_invalid_reports_shape_and_types():
+    from backend.routers.creator import _parse_e2e_workflow_command, _validate_final_platform_output_contract
+
+    command = _parse_e2e_workflow_command(
+        command="python scripts/final.py '{}'",
+        ordinal=2,
+        source_path="SKILL.md",
+    )
+
     with pytest.raises(ValueError) as excinfo:
-        _validate_e2e_command_static(
+        _validate_final_platform_output_contract(
             command=command,
-            trial_skill_dir=tmp_path,
-            skill_md=skill_md,
-            available_payload_keys={"source_value"},
+            stdout_json={"file_paths": "outputs/result.pdf", "text": ""},
+            traces=[],
         )
 
     message = str(excinfo.value)
-    assert "E2E_LAYER=e2e_dataflow" in message
-    assert "command_block.skillplan_inputs.exact" in message
-    assert '"target_script": "scripts/step.py"' in message
-    assert '"expected_inputs": ["payload"]' in message
-    assert '"actual_payload_keys": ["source_value", "unexpected_value"]' in message
-    assert '"missing_keys": ["payload"]' in message
-    assert '"extra_keys": ["source_value", "unexpected_value"]' in message
-    assert '"available_upstream_outputs": ["source_value"]' in message
+    assert "E2E_LAYER=final_platform_output_value_invalid" in message
+    assert "stdout_shape=" in message
+    assert "invalid_terminal_keys" in message
+    assert "expected_type" in message
+    assert "actual_type" in message
 
 
-def test_deterministic_patch_replaces_command_json_keys_and_preserves_invocation():
+def test_deterministic_patch_noops_instead_of_rewriting_to_skillplan_inputs():
     from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
 
     blueprint = """
@@ -1241,14 +1307,13 @@ python scripts/step.py '{"alpha":"{{alpha}}","legacy":"{{legacy}}"}'
 
     patched, details = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
 
-    assert details
-    assert "python scripts/step.py" in patched
-    assert "legacy" not in patched
-    assert "'" in patched
-    assert '{"alpha":"{{alpha}}","beta":"{{beta}}"}' in patched
+    assert patched == skill_md
+    assert details == []
+    assert "legacy" in patched
 
 
-def test_deterministic_patch_uses_upstream_output_placeholder_for_downstream_input():
+
+def test_deterministic_patch_preserves_existing_upstream_payload():
     from backend.routers.creator import _patch_skill_md_command_payloads_from_skill_plan
     from backend.services.skill_plan import command_payload_placeholders
 
@@ -1275,11 +1340,12 @@ python scripts/second.py '{"wrong_key":"{{seed_value}}"}'
 ```
 """
 
-    patched, _ = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
+    patched, details = _patch_skill_md_command_payloads_from_skill_plan(skill_md, blueprint)
     commands = [line.strip() for line in patched.splitlines() if line.strip().startswith("python scripts/second.py")]
 
+    assert details == []
     assert commands
-    assert command_payload_placeholders(commands[0], "scripts/second.py") == {"shared_value": "shared_value"}
+    assert command_payload_placeholders(commands[0], "scripts/second.py") == {"wrong_key": "seed_value"}
 
 
 def test_skill_plan_dataflow_unresolved_reports_plan_not_skill_md_loop():

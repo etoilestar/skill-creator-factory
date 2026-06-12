@@ -40,6 +40,7 @@ from .runtime_tools import (
     read_docx_text,
     read_pptx_text,
     read_spreadsheet,
+    registered_tool_call,
     upload_wechat_media,
     web_search,
 )

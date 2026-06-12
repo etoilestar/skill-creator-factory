@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
-from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
+from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -2825,7 +2825,9 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         # instead of a generic "missing required_capabilities" message.
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
-        return bool(re.search(r"FPDF|reportlab|PdfWriter|pdf\.output|canvas\.Canvas|build_pdf|%PDF-|pdf_path|\.pdf[\"\']", content, re.IGNORECASE))
+        # PDF generation must be satisfied through the platform registry helper
+        # contract, not by hand-written reportlab/fpdf/PyPDF/PDF byte logic.
+        return _script_uses_registry_helpers(content, "pdf_generation")
     if capability == "docx_generation":
         return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
     if capability == "pptx_generation":
@@ -2833,7 +2835,7 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
     if capability in {"html_generation", "html_asset_generation"}:
         return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|outputs|build_html", content, re.IGNORECASE))
     if capability == "file_output":
-        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)", content, re.IGNORECASE))
+        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx", content, re.IGNORECASE))
     cap = get_tool_capability(capability)
     if cap and cap.helper_imports:
         return False
@@ -2852,7 +2854,7 @@ def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], ca
     if not declared_artifacts and not required_artifacts:
         return True
     has_writer = bool(re.search(
-        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)",
+        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx",
         content,
         re.IGNORECASE,
     ))
@@ -3129,6 +3131,8 @@ def _check_script_file_contract(
             )
         )
 
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+
     missing_capabilities = _script_required_capability_failures(
         stripped,
         effective_required_capabilities,
@@ -3144,12 +3148,12 @@ def _check_script_file_contract(
                 else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
             ),
             expected=(
-                "text_generation 调用 generate_text_with_llm/平台 LLM；"
+                "text_generation 调用 generate_text_with_llm；"
                 "image_generation 调用 generate_stable_diffusion_image；"
-                "pdf_generation 使用支持中文/UTF-8 的 reportlab/fpdf2/PDF 构建；"
+                "pdf_generation 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 平台 helper；"
                 "file_output 写入声明文件。"
             ),
-            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+            minimal_edit="按 Tool Resolve 结果注入对应平台 helper；PDF 不要手写 reportlab/fpdf/PyPDF/raw %PDF。",
         )
     )
 
@@ -3298,6 +3302,45 @@ def _check_script_file_contract(
         )
     )
 
+    forbidden_direct_hits = [
+        item for item in tool_resolve.forbidden_imports
+        if re.search(rf"\b{re.escape(item)}\b", stripped, re.IGNORECASE)
+    ]
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.forbidden_direct_imports",
+            passed=not forbidden_direct_hits,
+            target=file_path,
+            message=(
+                "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
+                if not forbidden_direct_hits
+                else f"{file_path} 直接调用了 Tool Resolve 禁止的底层工具/库：{', '.join(forbidden_direct_hits)}。"
+            ),
+            expected="脚本只能调用工具注册表允许的 backend.services.skill_runtime helper；不得手写底层 PDF/外部 API/数据库实现。",
+            minimal_edit="修当前脚本：删除底层 import/调用，保留 parse_args/run/main/print_json，改为调用平台 helper 并返回 helper stdout JSON。",
+        )
+    )
+
+    undeclared_helper_hits: list[str] = []
+    declared_caps = set(effective_required_capabilities) | set(plan_entry.optional_capabilities or []) | set(plan_entry.allowed_capabilities or [])
+    for capability in [cap.name for cap in list_tool_capabilities() if cap.helper_imports]:
+        if capability not in declared_caps and _script_uses_registry_helpers(stripped, capability):
+            undeclared_helper_hits.append(capability)
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.undeclared_helper",
+            passed=not undeclared_helper_hits,
+            target=file_path,
+            message=(
+                "脚本调用的 registry helper 均有 SkillPlan capability 声明。"
+                if not undeclared_helper_hits
+                else f"{file_path} 调用了未在 required/optional/allowed_capabilities 声明的工具能力：{', '.join(undeclared_helper_hits)}。"
+            ),
+            expected="required_capabilities/allowed_capabilities 必须与实际 helper 调用一致。",
+            minimal_edit="若能力确实需要，应修 SkillPlan；若蓝图已确定，则修脚本删除未声明 helper。",
+        )
+    )
+
     if "database_read" in set(effective_required_capabilities):
         write_sql = bool(re.search(
             r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|MERGE)\b",
@@ -3325,31 +3368,22 @@ def _check_script_file_contract(
     is_pdf_builder = plan_entry.role == "pdf_builder" or pdf_outputs_declared or pdf_required
 
     if is_pdf_builder:
-        pdf_unicode_ok, pdf_unicode_message = _pdf_unicode_strategy_status(stripped)
+        uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
         results.append(
             ContractCheckResult(
-                id="script.pdf_builder.unicode_text_supported",
-                passed=pdf_unicode_ok,
+                id="tool_usage_contract.pdf_helper_required",
+                passed=uses_pdf_helper,
                 target=file_path,
                 message=(
-                    "pdf_builder 已声明并实现可靠中文/UTF-8 PDF 字体策略。"
-                    if pdf_unicode_ok
-                    else f"{file_path} PDF 中文/UTF-8 字体方案不合格：{pdf_unicode_message}"
+                    "pdf_builder 已调用工具注册表允许的 PDF helper。"
+                    if uses_pdf_helper
+                    else f"{file_path} 是 pdf_builder 或声明 pdf_generation，但未调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs。"
                 ),
-                expected=(
-                    "PDF 构建脚本必须支持中文/UTF-8 文本。"
-                    "允许 reportlab + UnicodeCIDFont('STSong-Light')，"
-                    "允许 reportlab + TTFont，"
-                    "允许 fpdf2 + add_font 加载 TTF/OTF。"
-                    "禁止 FPDF 默认 Helvetica/Arial/Times/Courier 直接写正文；"
-                    "禁止 reportlab 只 setFont('STSong-Light') 但不 registerFont；"
-                    "禁止 raw %PDF 字节拼接、空 PDF、假路径。"
-                ),
+                expected="PDF builder 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 之一；底层 reportlab/fpdf/PyPDF 只允许存在于平台 helper 内部。",
                 minimal_edit=(
-                    "保留脚本自由结构，但必须加入真实 Unicode 字体注册/加载逻辑；"
-                    "保持 JSON argv 输入和 stdout JSON 输出；"
-                    "stdout 返回真实存在的 pdf_path/file_paths；"
-                    "不要通过 try/except 输出 error、{} 或空路径绕过试运行。"
+                    "修当前脚本：删除底层 PDF 实现；保留 parse_args/run/main/print_json；"
+                    "改为 from backend.services.skill_runtime import create_pdf 或 build_pdf_report；"
+                    "stdout 直接返回 helper 结果，且包含 pdf_path/file_paths/file_outputs。"
                 ),
             )
         )
@@ -5261,14 +5295,17 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             return (
-                "PDF builder 修复提示：\n"
-                "- 脚本必须生成真实 PDF 文件，支持中文/UTF-8。\n"
-                "- 允许使用 reportlab 或 fpdf2 等库实现，但必须注册/加载可用字体（reportlab: UnicodeCIDFont/TTFont，fpdf2: add_font + TTF/OTF）。\n"
-                "- 禁止使用 FPDF 默认核心字体（Helvetica/Arial/Times/Courier）直接写正文；禁止 raw %PDF 字节拼接或输出空 PDF。\n"
-                "- 脚本必须通过 sys.argv[1] 接收 JSON object 输入，stdout 仅输出 JSON object，并包含真实存在的 pdf_path/file_paths。\n"
-                "- 保留脚本自由结构和函数命名，分页、换行、标题或图片插入由模型自由设计。\n"
-                "- 不要通过 try/except 输出 error、{} 或空路径绕过试运行。\n"
-                "- 修复关注点是：确保中文 PDF 生成能力、遵守 JSON argv/stdout 协议，不强制模板结构。"
+                "必须使用下面的 node pdf_builder skeleton；通过 Python 平台 PDF helper 生成文件，stdout 只能 console.log JSON 字符串：\n"
+                "const { spawnSync } = require('child_process');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function run(payload) {\n"
+                f"  const text = String({js_value_expr} || payload.content || payload.text || 'Generated PDF');\n"
+                "  const helper = `from backend.services.skill_runtime import create_pdf\\nimport json,sys\\ntext=sys.argv[1] or 'Generated PDF'\\nresult=create_pdf(text, filename='output.pdf')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
+                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, text], { encoding: 'utf8' });\n"
+                "  if (proc.status !== 0) throw new Error(proc.stderr || 'create_pdf failed');\n"
+                "  return JSON.parse(proc.stdout);\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
             )
         if plan_entry.role == "text_generator":
             return (
@@ -5577,6 +5614,8 @@ def _build_generate_file_prompt(
         if file_path == "SKILL.md"
         else ""
     )
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry) if file_path.startswith("scripts/") else None
+    tool_usage_prompt = tool_resolve.tool_usage_prompt if tool_resolve is not None else ""
     script_skeleton_text = _script_generation_skeleton(
         file_path,
         purpose,
@@ -5649,13 +5688,15 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
+            "7. 生成脚本前必须遵守 Tool Resolve 结果：只能调用下方允许的 backend.services.skill_runtime helper；不要自己发明工具、猜 API 地址、绕过 helper 写底层库。是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
             "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
+            "生成前请先隐式检查以下 Tool Resolve 合同；最终脚本只能使用这些 helper/工具，禁止直接调用 forbidden imports：\n"
+            f"{tool_usage_prompt}\n\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"

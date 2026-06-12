@@ -69,42 +69,48 @@ def test_creator_tool_test_passes_when_runtime_helper_is_reexported(monkeypatch)
     body = response.json()
     assert body["success"] is True
     assert body["tool"]["configured"] is True
-    assert body["tool"]["runtime_helpers_available"] == ["create_pdf"]
+    assert set(body["tool"]["runtime_helpers_available"]) >= {"create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"}
     assert body["tool"]["missing_runtime_helpers"] == []
     assert "runtime helpers look ready" in body["message"]
 
 
-def test_creator_tool_test_still_fails_when_runtime_helper_is_missing():
+def test_creator_tool_test_fails_when_tool_is_disabled_for_creator():
     client = TestClient(app)
-
-    response = client.post("/api/creator/tools/docx_parsing/test", json={"payload": {"path": "demo.docx"}})
+    client.patch("/api/creator/tools/docx_parsing", json={"enabled": False, "allow_creator_use": False})
+    try:
+        response = client.post("/api/creator/tools/docx_parsing/test", json={"payload": {"path": "demo.docx"}})
+    finally:
+        client.patch("/api/creator/tools/docx_parsing", json={"enabled": True, "allow_creator_use": True})
 
     assert response.status_code == 200
     body = response.json()
     assert body["success"] is False
     assert body["tool"]["configured"] is True
-    assert body["tool"]["missing_runtime_helpers"] == ["read_docx_text"]
-    assert "runtime helpers are not implemented" in body["message"]
+    assert body["tool"]["missing_runtime_helpers"] == []
+    assert "disabled for Creator use" in body["message"]
 
 
-def test_analyze_blueprint_reports_missing_runtime_helpers_for_required_tools():
+def test_analyze_blueprint_reports_disabled_required_tools():
     client = TestClient(app)
-
-    response = client.post(
-        "/api/creator/analyze-blueprint",
-        json={
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": "📋 Skill 架构蓝图\n- **Skill 名称**: docx-parse-demo\n- scripts/: `scripts/read_docx.py`\n  scripts/read_docx.py\n  role: docx_parser\n  inputs: path\n  outputs: text\n  required_capabilities: docx_parsing",
-                }
-            ]
-        },
-    )
+    client.patch("/api/creator/tools/docx_parsing", json={"enabled": False, "allow_creator_use": False})
+    try:
+        response = client.post(
+            "/api/creator/analyze-blueprint",
+            json={
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "📋 Skill 架构蓝图\n- **Skill 名称**: docx-parse-demo\n- scripts/: `scripts/read_docx.py`\n  scripts/read_docx.py\n  role: docx_parser\n  inputs: path\n  outputs: text\n  required_capabilities: docx_parsing",
+                    }
+                ]
+            },
+        )
+    finally:
+        client.patch("/api/creator/tools/docx_parsing", json={"enabled": True, "allow_creator_use": True})
 
     assert response.status_code == 200
     body = response.json()
     missing = {tool["name"]: tool for tool in body["missing_tool_configs"]}
     assert "docx_parsing" in missing
-    assert missing["docx_parsing"]["missing_runtime_helpers"] == ["read_docx_text"]
-    assert any("docx_parsing" in warning and "read_docx_text" in warning for warning in body["warnings"])
+    assert missing["docx_parsing"]["enabled"] is False
+    assert any("docx_parsing" in warning and "禁用" in warning for warning in body["warnings"])

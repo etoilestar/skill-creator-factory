@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+import json
+
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..services.creator_tool_registry import (
@@ -29,6 +32,7 @@ from ..services.creator_tool_registry import (
     resolve_tool_snippets_for_context,
     validate_tool_manifest,
     validate_tool_snippet,
+    stream_author_tool,
     tool_status,
     write_registered_adapter,
     _capability_from_dict,
@@ -87,7 +91,14 @@ class ToolAuthorRequest(BaseModel):
     generates_file: bool = False
     high_risk: bool = False
     validation: dict[str, Any] | None = None
-    stage: str = "draft"
+    stage: str | None = None
+    action: Literal["clarify", "configure", "live_test", "generate", "finalize"] = "clarify"
+    clarification_answers: list[dict[str, str]] = Field(default_factory=list)
+    tool_kind: str | None = None
+    operation: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    live_test_result: dict[str, Any] | None = None
+    allow_external_network: bool = False
 
 
 class ToolRegisterRequest(ToolManifestRequest):
@@ -150,6 +161,14 @@ async def author_creator_tool(request: ToolAuthorRequest) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+@router.post("/tools/author/stream")
+async def stream_author_creator_tool(request: ToolAuthorRequest):
+    async def event_source():
+        async for event in stream_author_tool(request.model_dump(exclude_none=True)):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")
 
 @router.post("/tools/validate")
 def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:

@@ -275,6 +275,50 @@ def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch
         assert forbidden not in rendered_questions
 
 
+
+def test_planner_model_judges_non_keyword_capability_ambiguity(monkeypatch):
+    from backend.services import llm_proxy
+
+    calls = {"count": 0}
+
+    async def fake_complete_chat_once(messages, model):
+        calls["count"] += 1
+        if "capability ambiguity judge" in messages[0]["content"]:
+            return json.dumps({"needs_capability_clarification": True, "question": "你希望这个工具具体完成哪一种业务动作？"})
+        return json.dumps({
+            "needs_clarification": False,
+            "clarification_questions": [],
+            "tool_kind": "external_api",
+            "requires_config": True,
+            "config_required_fields": ["base_url", "auth_type"],
+            "config_form_schema": {"type": "object", "ui": "authorization_modal"},
+            "requires_external_network": True,
+            "requires_live_test": True,
+            "ready_for_live_test": False,
+            "ready_for_code_generation": False,
+            "requires_authoring_tools": True,
+            "authoring_tool_plan": [],
+            "manifest": {},
+        })
+
+    monkeypatch.setattr(llm_proxy, "complete_chat_once", fake_complete_chat_once)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={"action": "clarify", "needs_external_network": True, "description": "帮我对接那边系统，把事情办一下"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls["count"] == 2
+    assert body["needs_clarification"] is True
+    assert body["clarification_questions"] == ["你希望这个工具具体完成哪一种业务动作？"]
+    assert body["requires_config"] is True
+    rendered_questions = json.dumps(body["clarification_questions"], ensure_ascii=False).lower()
+    for forbidden in ["endpoint", "密钥", "token", "认证", "headers", "schema"]:
+        assert forbidden not in rendered_questions
+
 def test_creator_tool_author_uses_mocked_model_path(monkeypatch, tmp_path):
     from backend.services import creator_tool_registry as registry
     from backend.services import llm_proxy

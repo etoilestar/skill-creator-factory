@@ -2355,6 +2355,46 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "requires_human_confirmation": True,
     }
 
+
+
+async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> list[str]:
+    """Ask planner_model to catch capability ambiguity that deterministic heuristics may miss."""
+    judge_payload = {
+        key: request.get(key)
+        for key in [
+            "description",
+            "operation",
+            "input_description",
+            "output_description",
+            "tool_kind",
+            "needs_external_network",
+            "clarification_answers",
+        ]
+    }
+    judge_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the planner_model capability ambiguity judge for Tool Authoring. "
+                "Return strict JSON: {needs_capability_clarification: boolean, question: string}. "
+                "Set needs_capability_clarification=true only when the user's desired business capability or operation is genuinely unclear. "
+                "The question must be Chinese, short, and ask only what the tool should do. "
+                "Do not ask for service address, endpoint, IP, key, token, auth method, connection-test permission, method, headers/body/query templates, schemas, sample input, or expected output fields."
+            ),
+        },
+        {"role": "user", "content": json.dumps(judge_payload, ensure_ascii=False)},
+    ]
+    judge, ack, err = await _complete_author_model("planner", judge_messages, reason="creator_tool_author_capability_ambiguity")
+    if ack:
+        model_notes.append(f"capability_ambiguity_judge={ack['model']}")
+    if err:
+        warnings.append(f"capability ambiguity judge unavailable, used deterministic ambiguity heuristic only: {err}")
+        return []
+    if not bool(judge.get("needs_capability_clarification") or judge.get("capability_ambiguous")):
+        return []
+    question = str(judge.get("question") or judge.get("clarification_question") or "你希望这个工具完成哪一种具体能力？请用一句话说明。")
+    return _safe_clarification_questions([question], [])
+
 async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
     planner_payload = {
         key: request.get(key)
@@ -2408,6 +2448,13 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
     if not isinstance(plan.get("manifest"), dict):
         plan = _author_fallback_plan(request)
     normalized = _normalize_author_plan(plan, request)
+    if ack and normalized.get("tool_kind") == "external_api" and not normalized.get("clarification_questions"):
+        judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
+        if judged_questions:
+            normalized["clarification_questions"] = judged_questions
+            normalized["questions"] = judged_questions
+            normalized["needs_clarification"] = True
+            normalized["ready_for_code_generation"] = False
     model_notes.extend(normalized.get("model_notes") or [])
     return normalized
 

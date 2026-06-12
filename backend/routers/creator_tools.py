@@ -12,6 +12,7 @@ from ..services.creator_tool_registry import (
     TOOL_OVERRIDE_PERSISTENCE,
     ToolCapability,
     ToolSnippet,
+    author_tool,
     build_tool_manifest_draft,
     capabilities_for_role,
     generate_adapter_code,
@@ -29,6 +30,7 @@ from ..services.creator_tool_registry import (
     validate_tool_manifest,
     validate_tool_snippet,
     tool_status,
+    write_registered_adapter,
     _capability_from_dict,
     _snippet_from_dict,
 )
@@ -67,6 +69,25 @@ class ToolManifestRequest(BaseModel):
     adapter_code: str | None = None
     sample_input: dict[str, Any] = Field(default_factory=dict)
     dynamic: bool = True
+
+
+class ToolAuthorRequest(BaseModel):
+    description: str = ""
+    tool_name: str = ""
+    tool_type: str = "python_helper"
+    code_block: str | None = None
+    adapter_code: str | None = None
+    input_description: str = ""
+    output_description: str = ""
+    manifest: dict[str, Any] | None = None
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    allowed_roles: list[str] = Field(default_factory=list)
+    needs_secret: bool = False
+    needs_external_network: bool = False
+    generates_file: bool = False
+    high_risk: bool = False
+    validation: dict[str, Any] | None = None
+    stage: str = "draft"
 
 
 class ToolRegisterRequest(ToolManifestRequest):
@@ -122,6 +143,14 @@ def generate_creator_tool_code(request: ToolManifestRequest) -> dict[str, Any]:
     return {"adapter_code": code, "adapter_path": request.manifest.get("adapter_path"), "requires_validation": True}
 
 
+@router.post("/tools/author")
+async def author_creator_tool(request: ToolAuthorRequest) -> dict[str, Any]:
+    try:
+        return await author_tool(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/tools/validate")
 def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:
     return validate_tool_manifest(
@@ -142,7 +171,7 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
     )
     if not validation["success"]:
         raise HTTPException(status_code=400, detail={"message": "tool validation failed", "validation": validation})
-    payload = dict(request.manifest)
+    payload = write_registered_adapter(request.manifest, request.adapter_code)
     payload["enabled"] = bool(request.enable)
     payload["enabled_by_default"] = bool(request.enable)
     payload["allow_creator_use"] = bool(request.enable)

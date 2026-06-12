@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from backend.main import app
@@ -120,6 +122,7 @@ def test_tool_registration_flow_creates_function_card_and_registered_tool(tmp_pa
     from backend.services import creator_tool_registry as registry
 
     monkeypatch.setattr(registry, "CUSTOM_TOOL_REGISTRY_PATH", tmp_path / "tool_registry.custom.json")
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path / "custom_tools")
     client = TestClient(app)
 
     draft_response = client.post(
@@ -201,3 +204,135 @@ def test_creator_tool_snippet_api_resolves_and_smoke_tests():
     assert test_response.status_code == 200
     assert test_response.json()["success"] is True
     assert test_response.json()["side_effect_performed"] is False
+
+
+def test_creator_tool_author_draft_generates_valid_adapter(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path)
+    monkeypatch.setattr(registry, "_adapter_module_path", lambda cap: tmp_path / f"{cap.name}.py")
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={
+            "stage": "draft",
+            "tool_name": "markdown_file_writer",
+            "description": "帮我做一个把 markdown 文本保存成 md 文件并返回路径的小工具",
+            "generates_file": True,
+            "sample_input": {"title": "Demo", "content": "# Demo", "extension": "md"},
+            "allowed_roles": ["generic_script"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needs_clarification"] is False
+    assert body["manifest"]["name"] == "markdown_file_writer"
+    assert "def run(payload" in body["adapter_code"]
+    assert body["validation"]["success"] is True
+    assert body["requires_human_confirmation"] is True
+
+
+def test_creator_tool_author_finalize_generates_snippet(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path)
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    manifest = registry.build_tool_manifest_draft({"tool_name": "echo_author_tool", "description": "Echo payload", "allowed_roles": ["generic_script"]})
+    adapter_code = registry.generate_adapter_code(manifest)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={"stage": "finalize", "manifest": manifest, "adapter_code": adapter_code, "sample_input": {"payload": {"q": "demo"}}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["validation"]["success"] is True
+    assert body["snippet"]["id"] == "echo_author_tool.minimal_usage"
+    assert "echo_author_tool" in body["snippet"]["code"]
+
+
+def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch):
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/author", json={"stage": "draft", "description": "帮我做一个调用接口的小工具"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["needs_clarification"] is True
+    assert body["adapter_code"] == ""
+    assert body["questions"]
+
+
+def test_creator_tool_author_uses_mocked_model_path(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+    from backend.services import llm_proxy
+
+    manifest = registry.build_tool_manifest_draft({"tool_name": "model_authored_tool", "description": "Echo via model", "allowed_roles": ["generic_script"]})
+    adapter_code = """
+from __future__ import annotations
+import json
+import sys
+
+def run(payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    return {"result": {"source": "model", "keys": sorted(payload.keys())}}
+
+def model_authored_tool(payload: dict | None = None) -> dict:
+    return run(payload)
+
+def main() -> None:
+    print(json.dumps(run(json.loads(sys.stdin.read() or "{}"))))
+"""
+
+    async def fake_complete_chat_once(messages, model):
+        if "code_model" in messages[0]["content"]:
+            return json.dumps({"code": adapter_code})
+        return json.dumps({"needs_clarification": False, "questions": [], "manifest": manifest, "implementation_plan": "Use model adapter", "sample_input": {"payload": {"q": "demo"}}, "risk_notes": []})
+
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", tmp_path)
+    monkeypatch.setattr(llm_proxy, "complete_chat_once", fake_complete_chat_once)
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/author", json={"stage": "draft", "tool_name": "model_authored_tool", "description": "Echo via model"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["validation"]["success"] is True
+    assert "deterministic fallback planner used" not in body["model_notes"]
+    assert "source" in body["adapter_code"]
+    assert "model" in body["adapter_code"]
+
+
+def test_validate_uses_temp_adapter_and_register_normalizes_adapter_path(monkeypatch, tmp_path):
+    from backend.services import creator_tool_registry as registry
+
+    adapter_dir = tmp_path / "safe_adapters"
+    registry_path = tmp_path / "registry.json"
+    evil_path = tmp_path / "evil.py"
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_ADAPTER_DIR", adapter_dir)
+    monkeypatch.setattr(registry, "CUSTOM_TOOL_REGISTRY_PATH", registry_path)
+    client = TestClient(app)
+
+    manifest = registry.build_tool_manifest_draft({"tool_name": "path_safe_tool", "description": "Path safety", "allowed_roles": ["generic_script"]})
+    manifest["adapter_path"] = str(evil_path)
+    adapter_code = registry.generate_adapter_code(manifest)
+
+    validate_response = client.post("/api/creator/tools/validate", json={"manifest": manifest, "adapter_code": adapter_code, "sample_input": {"payload": {}}})
+    assert validate_response.status_code == 200
+    assert validate_response.json()["success"] is True
+    assert not evil_path.exists()
+
+    register_response = client.post("/api/creator/tools/register", json={"manifest": manifest, "adapter_code": adapter_code, "sample_input": {"payload": {}}, "enable": True})
+    assert register_response.status_code == 200
+    tool = register_response.json()["tool"]
+    assert tool["adapter_path"].endswith("backend/services/runtime_tools/custom_tools/path_safe_tool.py") or tool["adapter_path"].endswith("safe_adapters/path_safe_tool.py")
+    assert (adapter_dir / "path_safe_tool.py").exists()
+    assert not evil_path.exists()
+
+    registry.clear_registered_tool_capabilities()

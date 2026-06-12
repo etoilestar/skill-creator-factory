@@ -72,15 +72,61 @@
       </div>
     </section>
 
+    <section class="grid two">
+      <div class="card step-card">
+        <div class="step-title"><span>6</span><h2>Tool Usage Snippets</h2></div>
+        <p class="muted small">编辑模型会看到的 import、最小调用、返回规则和反例；可预览 Creator 注入格式并做静态 smoke test。</p>
+        <div class="form-row">
+          <label>选择工具<select v-model="selectedToolName" @change="loadSnippets"><option value="">选择工具</option><option v-for="tool in tools" :key="tool.name" :value="tool.name">{{ tool.name }}</option></select></label>
+          <label>Snippet 类型<select v-model="snippetForm.kind"><option v-for="kind in snippetKinds" :key="kind" :value="kind">{{ kind }}</option></select></label>
+        </div>
+        <div class="form-row">
+          <label>ID<input v-model="snippetForm.id" placeholder="create_pdf.minimal_text_pdf" /></label>
+          <label>标题<input v-model="snippetForm.title" placeholder="Create a simple PDF" /></label>
+        </div>
+        <label>适用 roles（逗号分隔）<input v-model="snippetRolesText" placeholder="pdf_builder,document_generator" /></label>
+        <label>适用 capabilities（逗号分隔）<input v-model="snippetCapabilitiesText" placeholder="pdf_generation" /></label>
+        <label>failure layers（逗号分隔）<input v-model="snippetFailuresText" placeholder="final_platform_output_value_invalid,artifact_missing" /></label>
+        <label>描述<textarea v-model="snippetForm.description" rows="2" /></label>
+        <label>正确调用代码<textarea v-model="snippetForm.code" class="code" rows="10" spellcheck="false" /></label>
+        <div class="form-row">
+          <label>期望输入 shape(JSON)<textarea v-model="snippetInputShapeText" class="code" rows="5" spellcheck="false" /></label>
+          <label>期望输出 shape(JSON)<textarea v-model="snippetOutputShapeText" class="code" rows="5" spellcheck="false" /></label>
+        </div>
+        <label>return rule<textarea v-model="snippetForm.return_rule" rows="2" /></label>
+        <label>anti patterns（每行一条）<textarea v-model="snippetAntiPatternsText" rows="4" /></label>
+        <div class="form-row">
+          <label>usage policy<select v-model="snippetForm.usage_policy"><option>helper_preferred</option><option>helper_required</option><option>self_implementation_allowed</option></select></label>
+          <label>priority<input v-model.number="snippetForm.priority" type="number" /></label>
+        </div>
+        <div class="actions">
+          <button class="btn-primary" :disabled="busy || !selectedToolName" @click="saveSnippet">新增 / 保存 snippet</button>
+          <button class="btn-ghost" :disabled="busy || !selectedToolName || !snippetForm.id" @click="runSnippetSmokeTest">运行 smoke test</button>
+        </div>
+        <p v-if="snippetTestResult" class="small" :class="snippetTestResult.success ? 'green' : 'error'">Smoke test: {{ snippetTestResult.success ? 'passed' : 'failed' }} {{ snippetTestResult.message || '' }}</p>
+      </div>
+
+      <div class="card step-card">
+        <div class="step-title"><span>7</span><h2>Creator Snippet 预览</h2></div>
+        <div class="snippets-list">
+          <button v-for="snippet in snippets" :key="snippet.id" class="snippet-item" @click="editSnippet(snippet)">
+            <strong>{{ snippet.id }}</strong><small>{{ snippet.kind }} · priority {{ snippet.priority }}</small>
+          </button>
+        </div>
+        <pre class="tool-card">{{ snippetPreview }}</pre>
+      </div>
+    </section>
+
     <p v-if="error" class="error">{{ error }}</p>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { draftCreatorTool, generateCreatorToolCode, listCreatorTools, registerCreatorTool, validateCreatorTool } from '../composables/useCreator.js'
+import { createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
 
 const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
+const snippetKinds = ['minimal_usage', 'multi_input_usage', 'file_output_usage', 'batch_usage', 'error_repair_usage', 'anti_pattern', 'trial_run_usage']
 const busy = ref(false)
 const error = ref('')
 const tools = ref([])
@@ -89,11 +135,22 @@ const manifestText = ref('')
 const adapterCode = ref('')
 const sampleInputText = ref('{\n  "payload": {}\n}')
 const lastValidation = ref(null)
+const selectedToolName = ref('')
+const snippets = ref([])
+const snippetRolesText = ref('')
+const snippetCapabilitiesText = ref('')
+const snippetFailuresText = ref('')
+const snippetInputShapeText = ref('{}')
+const snippetOutputShapeText = ref('{}')
+const snippetAntiPatternsText = ref('')
+const snippetTestResult = ref(null)
+const snippetForm = reactive({ id: '', title: '', kind: 'minimal_usage', description: '', code: '', return_rule: '', usage_policy: 'helper_preferred', priority: 80 })
 
 const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
 const cardPreview = computed(() => (lastValidation.value?.tool_card_preview || []).join('\n\n---\n\n') || '验证后展示 Creator prompt 注入的 function card。')
+const snippetPreview = computed(() => snippets.value.map(snippet => snippet.formatted || '').join('\n\n---\n\n') || '选择工具后展示 Creator 会看到的 Tool Snippet。')
 
 async function run(task) { busy.value = true; error.value = ''; try { await task() } catch (e) { error.value = e.message || String(e) } finally { busy.value = false } }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
@@ -102,6 +159,14 @@ function draftManifest() { return run(async () => { const data = await draftCrea
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code }) }
 function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }) }) }
 function registerTool() { return run(async () => { await registerCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true, enable: true }); await loadTools() }) }
+function parseJsonText(text) { try { return text ? JSON.parse(text) : {} } catch { return {} } }
+function splitLines(text) { return text.split('\n').map(s => s.trim()).filter(Boolean) }
+function splitCsv(text) { return text.split(',').map(s => s.trim()).filter(Boolean) }
+function buildSnippetPayload() { return { ...snippetForm, applies_to: { roles: splitCsv(snippetRolesText.value), capabilities: splitCsv(snippetCapabilitiesText.value), failure_layers: splitCsv(snippetFailuresText.value) }, expected_input_shape: parseJsonText(snippetInputShapeText.value), expected_output_shape: parseJsonText(snippetOutputShapeText.value), anti_patterns: splitLines(snippetAntiPatternsText.value), requires: splitCsv(snippetCapabilitiesText.value) } }
+function loadSnippets() { return run(async () => { if (!selectedToolName.value) { snippets.value = []; return } const data = await listCreatorToolSnippets(selectedToolName.value); snippets.value = data.snippets || []; snippetTestResult.value = null }) }
+function editSnippet(snippet) { snippetForm.id = snippet.id; snippetForm.title = snippet.title; snippetForm.kind = snippet.kind || 'minimal_usage'; snippetForm.description = snippet.description || ''; snippetForm.code = snippet.code || ''; snippetForm.return_rule = snippet.return_rule || ''; snippetForm.usage_policy = snippet.usage_policy || 'helper_preferred'; snippetForm.priority = snippet.priority || 0; snippetRolesText.value = (snippet.applies_to?.roles || []).join(','); snippetCapabilitiesText.value = (snippet.applies_to?.capabilities || snippet.requires || []).join(','); snippetFailuresText.value = (snippet.applies_to?.failure_layers || []).join(','); snippetInputShapeText.value = JSON.stringify(snippet.expected_input_shape || {}, null, 2); snippetOutputShapeText.value = JSON.stringify(snippet.expected_output_shape || {}, null, 2); snippetAntiPatternsText.value = (snippet.anti_patterns || []).join('\n'); snippetTestResult.value = null }
+function saveSnippet() { return run(async () => { const payload = buildSnippetPayload(); const exists = snippets.value.some(item => item.id === payload.id); if (exists) await updateCreatorToolSnippet(selectedToolName.value, payload.id, payload); else await createCreatorToolSnippet(selectedToolName.value, payload); await loadSnippets() }) }
+function runSnippetSmokeTest() { return run(async () => { if (!snippets.value.some(item => item.id === snippetForm.id)) await saveSnippet(); snippetTestResult.value = await testCreatorToolSnippet(selectedToolName.value, snippetForm.id) }) }
 
 onMounted(loadTools)
 </script>
@@ -126,7 +191,7 @@ label { display: flex; flex-direction: column; gap: 6px; color: var(--text-muted
 .validation.ok { border-color: var(--success); } .validation.bad { border-color: var(--danger); }
 .warn { color: #f6c177; }
 .tool-card { white-space: pre-wrap; overflow: auto; max-height: 360px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
-.tools-table { display: grid; gap: 6px; } .row { display: grid; grid-template-columns: 1.1fr .8fr .6fr 1.4fr; gap: 12px; padding: 10px; border-bottom: 1px solid var(--border); }
+.tools-table, .snippets-list { display: grid; gap: 6px; } .snippet-item { text-align: left; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; color: var(--text); cursor: pointer; } .row { display: grid; grid-template-columns: 1.1fr .8fr .6fr 1.4fr; gap: 12px; padding: 10px; border-bottom: 1px solid var(--border); }
 .row.head { color: var(--text-muted); font-size: 12px; text-transform: uppercase; } small { display: block; color: var(--text-muted); } .green { color: var(--success); }
 @media (max-width: 1100px) { .grid.two { grid-template-columns: 1fr; } }
 </style>

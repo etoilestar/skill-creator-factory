@@ -24,6 +24,32 @@ from typing import Any, Literal
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
 
+SnippetKind = Literal[
+    "minimal_usage",
+    "multi_input_usage",
+    "file_output_usage",
+    "batch_usage",
+    "error_repair_usage",
+    "anti_pattern",
+    "trial_run_usage",
+]
+
+
+@dataclass(frozen=True)
+class ToolSnippet:
+    id: str
+    title: str
+    kind: SnippetKind = "minimal_usage"
+    applies_to: dict[str, list[str]] = field(default_factory=dict)
+    description: str = ""
+    code: str = ""
+    expected_input_shape: dict[str, Any] = field(default_factory=dict)
+    expected_output_shape: dict[str, Any] = field(default_factory=dict)
+    return_rule: str = ""
+    anti_patterns: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+    usage_policy: UsagePolicy = "self_implementation_allowed"
+    priority: int = 0
 
 @dataclass(frozen=True)
 class ToolFunctionManifest:
@@ -82,6 +108,7 @@ class ToolCapability:
     prompt_guidance: str = ""
     tool_type: str = "python_helper"
     functions: list[ToolFunctionManifest] = field(default_factory=list)
+    snippets: list[ToolSnippet] = field(default_factory=list)
     adapter_path: str = ""
     version: str = "1.0.0"
     approval_status: str = "approved"
@@ -344,6 +371,7 @@ _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 _RUNTIME_HELPERS_CACHE: set[str] | None = None
 
 _ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
+_ALLOWED_SNIPPET_KINDS = {"minimal_usage", "multi_input_usage", "file_output_usage", "batch_usage", "error_repair_usage", "anti_pattern", "trial_run_usage"}
 _ALLOWED_TOOL_TYPES = {
     "python_helper", "http_api", "local_command", "database_query",
     "file_converter", "document_generator", "image_generator", "custom_adapter",
@@ -395,9 +423,38 @@ def _function_from_dict(data: dict[str, Any]) -> ToolFunctionManifest:
     return ToolFunctionManifest(**payload)
 
 
+def _snippet_from_dict(data: dict[str, Any]) -> ToolSnippet:
+    known = {field.name for field in dataclasses_fields(ToolSnippet)}
+    payload = {key: value for key, value in (data or {}).items() if key in known}
+    if not payload.get("id"):
+        payload["id"] = _slug(str(payload.get("title") or "snippet"), fallback="snippet")
+    if not payload.get("title"):
+        payload["title"] = str(payload["id"]).replace("_", " ").title()
+    if payload.get("kind") not in _ALLOWED_SNIPPET_KINDS:
+        payload["kind"] = "minimal_usage"
+    if not isinstance(payload.get("applies_to"), dict):
+        payload["applies_to"] = {}
+    for key in ("roles", "capabilities", "failure_layers"):
+        values = payload["applies_to"].get(key, [])
+        payload["applies_to"][key] = [str(item) for item in values if item] if isinstance(values, list) else []
+    for key in ("expected_input_shape", "expected_output_shape"):
+        if not isinstance(payload.get(key), dict):
+            payload[key] = {}
+    for key in ("anti_patterns", "requires"):
+        payload[key] = [str(item) for item in payload.get(key, []) if item] if isinstance(payload.get(key), list) else []
+    if payload.get("usage_policy") not in _ALLOWED_USAGE_POLICIES:
+        payload["usage_policy"] = "self_implementation_allowed"
+    try:
+        payload["priority"] = int(payload.get("priority") or 0)
+    except (TypeError, ValueError):
+        payload["priority"] = 0
+    return ToolSnippet(**payload)
+
+
 def _capability_from_dict(data: dict[str, Any]) -> ToolCapability:
     payload = dict(data or {})
     functions = payload.pop("functions", []) or []
+    snippets = payload.pop("snippets", []) or []
     if "enabled" in payload and "enabled_by_default" not in payload:
         payload["enabled_by_default"] = bool(payload.pop("enabled"))
     if "allowed_roles" in payload and "roles" not in payload:
@@ -405,6 +462,7 @@ def _capability_from_dict(data: dict[str, Any]) -> ToolCapability:
     known = {field.name for field in dataclasses_fields(ToolCapability)}
     payload = {key: value for key, value in payload.items() if key in known}
     payload["functions"] = [_function_from_dict(item) for item in functions if isinstance(item, dict)]
+    payload["snippets"] = [_snippet_from_dict(item) for item in snippets if isinstance(item, dict)]
     return ToolCapability(**payload)
 
 
@@ -491,6 +549,7 @@ class ToolResolveResult:
     required_dependencies: list[str] = field(default_factory=list)
     forbidden_imports: list[str] = field(default_factory=list)
     tool_function_cards: list[str] = field(default_factory=list)
+    tool_snippets: list[dict[str, Any]] = field(default_factory=list)
     tool_usage_prompt: str = ""
     warnings: list[str] = field(default_factory=list)
 
@@ -500,6 +559,204 @@ def _schema_summary(schema: dict[str, Any]) -> str:
     if not schema:
         return "{}"
     return json.dumps(schema, ensure_ascii=False, sort_keys=True)
+
+
+
+def _default_snippet_for_function(capability: ToolCapability, fn: ToolFunctionManifest) -> ToolSnippet:
+    import_stmt = f"from {fn.import_path} import {fn.function_name}" if fn.import_path else f"import {fn.function_name}"
+    return ToolSnippet(
+        id=f"{fn.function_name}.minimal_usage",
+        title=f"Use {fn.function_name}",
+        kind="minimal_usage",
+        applies_to={
+            "roles": fn.allowed_roles or capability.allowed_roles or capability.roles,
+            "capabilities": fn.required_capabilities or capability.required_capabilities or [capability.name],
+            "failure_layers": ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing"],
+        },
+        description=fn.when_to_use or fn.short_description,
+        code=f"{import_stmt}\n\nresult = {fn.function_name}(... )\nreturn result",
+        expected_input_shape=fn.input_schema or capability.input_schema,
+        expected_output_shape=fn.output_schema or capability.output_schema,
+        return_rule=fn.return_contract or "Return the helper result directly if it is already a platform stdout dict.",
+        anti_patterns=fn.common_mistakes or ["Do not guess parameters.", "Do not wrap a platform stdout dict inside the wrong field."],
+        requires=fn.required_capabilities or capability.required_capabilities or [capability.name],
+        usage_policy=fn.usage_policy or capability.usage_policy,
+        priority=10,
+    )
+
+
+def snippets_for_tool(capability: ToolCapability) -> list[ToolSnippet]:
+    snippets = list(capability.snippets)
+    if snippets:
+        return snippets
+    functions = list(capability.functions)
+    if not functions:
+        functions = [
+            ToolFunctionManifest(
+                function_name=helper,
+                import_path=capability.helper_module,
+                short_description=capability.prompt_guidance or capability.display_name,
+                when_to_use=f"Use for capability {capability.name} when role/capability resolution allows it.",
+                signature=f"{helper}(...) -> dict",
+                input_schema=capability.input_schema,
+                output_schema=capability.output_schema,
+                return_contract="Return the helper result directly when it already contains platform stdout fields; do not wrap helper result in the wrong key.",
+                usage_policy=capability.usage_policy,
+                allowed_roles=capability.allowed_roles or capability.roles,
+                required_capabilities=capability.required_capabilities or [capability.name],
+            )
+            for helper in capability.helper_imports
+        ]
+    return [_default_snippet_for_function(capability, fn) for fn in functions]
+
+
+def format_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> str:
+    anti = "\n".join(f"- {item}" for item in snippet.anti_patterns) or "- Follow the helper contract; do not guess parameters or return shape."
+    return "\n".join([
+        "[Tool Snippet]",
+        f"Tool: {capability.name}",
+        f"Snippet: {snippet.id} ({snippet.kind}, priority={snippet.priority})",
+        f"Use when: {snippet.description or snippet.title}",
+        "Correct usage:",
+        snippet.code.strip(),
+        "Expected input shape:",
+        _schema_summary(snippet.expected_input_shape),
+        "Expected return:",
+        _schema_summary(snippet.expected_output_shape),
+        f"Return rule: {snippet.return_rule or 'Return a JSON-serializable dict that matches the expected return.'}",
+        f"Usage policy: {snippet.usage_policy}",
+        "Do not:",
+        anti,
+    ])
+
+
+def validate_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", snippet.id or ""):
+        errors.append("snippet id must be 1-128 chars of letters, numbers, '_', '.', ':', or '-'")
+    if snippet.kind not in _ALLOWED_SNIPPET_KINDS:
+        errors.append(f"snippet kind must be one of {sorted(_ALLOWED_SNIPPET_KINDS)}")
+    if not (snippet.code or "").strip():
+        errors.append("snippet code is required")
+    if snippet.usage_policy not in _ALLOWED_USAGE_POLICIES:
+        errors.append("snippet usage_policy is invalid")
+    code = snippet.code or ""
+    imported_names: set[str] = set()
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imported_names.update(alias.asname or alias.name for alias in node.names)
+                root = (node.module or "").split(".")[0]
+                if root in _DANGEROUS_IMPORTS:
+                    errors.append(f"dangerous import is forbidden in snippet: {root}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    imported_names.add(alias.asname or alias.name.split(".")[-1])
+                    if root in _DANGEROUS_IMPORTS:
+                        errors.append(f"dangerous import is forbidden in snippet: {root}")
+    except SyntaxError as exc:
+        warnings.append(f"snippet is not a complete executable Python block: {exc}")
+    helpers = set(capability.helper_imports) | {fn.function_name for fn in capability.functions}
+    if helpers and not any(helper in code for helper in helpers):
+        errors.append("snippet code must reference at least one manifest helper/function name")
+    if imported_names and helpers and not (imported_names & helpers):
+        warnings.append("snippet imports do not include a declared manifest helper/function")
+    if re.search(r"(?:/tmp|/var|/etc|~[/\\]|[A-Za-z]:\\\\)", code):
+        errors.append("snippet must not write or direct outputs to dangerous absolute paths")
+    if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code):
+        errors.append("snippet appears to contain a hard-coded secret")
+    declared_outputs = set((capability.output_schema or {}).get("properties", {}).keys())
+    for fn in capability.functions:
+        declared_outputs.update((fn.output_schema or {}).keys())
+    snippet_outputs = set(snippet.expected_output_shape.keys())
+    if declared_outputs and snippet_outputs and not (declared_outputs & snippet_outputs):
+        warnings.append("snippet expected_output_shape has no overlap with manifest output_schema")
+    return {"success": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings))}
+
+
+def _snippet_score(*, capability: ToolCapability, snippet: ToolSnippet, role: str, capabilities: list[str], tool_names: list[str], failure_layer: str | None, error_text: str | None) -> tuple[int, int, int, int, int, int]:
+    applies = snippet.applies_to or {}
+    snippet_caps = set(applies.get("capabilities") or snippet.requires or [])
+    snippet_roles = set(applies.get("roles") or [])
+    snippet_failures = set(applies.get("failure_layers") or [])
+    haystack = (error_text or "").lower()
+    helper_names = set(capability.helper_imports) | {fn.function_name for fn in capability.functions} | {capability.name}
+    capability_match = len(snippet_caps & set(capabilities))
+    role_match = 1 if role and role in snippet_roles else 0
+    failure_match = 1 if failure_layer and failure_layer in snippet_failures else 0
+    error_match = 1 if any(name.lower() in haystack for name in helper_names) else 0
+    minimal = 1 if snippet.kind in {"minimal_usage", "error_repair_usage"} else 0
+    tool_match = 1 if capability.name in tool_names or any(name in tool_names for name in helper_names) else 0
+    return (capability_match + tool_match, role_match, failure_match, error_match, int(snippet.priority or 0), minimal)
+
+
+def resolve_tool_snippets_for_context(
+    *,
+    role: str,
+    capabilities: list[str],
+    tool_names: list[str],
+    file_path: str,
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+    max_snippets: int = 5,
+) -> list[dict[str, Any]]:
+    max_snippets = max(1, min(int(max_snippets or 5), 10))
+    candidates: list[tuple[tuple[int, int, int, int, int, int], ToolCapability, ToolSnippet]] = []
+    requested_tools = set(tool_names or [])
+    requested_caps = set(capabilities or [])
+    for cap in list_tool_capabilities():
+        status = tool_status(cap)
+        if not status.get("creator_available"):
+            continue
+        helper_names = set(cap.helper_imports) | {fn.function_name for fn in cap.functions}
+        if requested_tools and cap.name not in requested_tools and not (helper_names & requested_tools):
+            continue
+        if not requested_tools and requested_caps and cap.name not in requested_caps and not (set(cap.required_capabilities or [cap.name]) & requested_caps):
+            continue
+        if cap.roles and role and role not in cap.roles and cap.name not in {"file_output", "deterministic_execution"}:
+            # Still allow explicit error-text matches during repair.
+            haystack = (error_text or "").lower()
+            if not any(name.lower() in haystack for name in helper_names | {cap.name}):
+                continue
+        for snippet in snippets_for_tool(cap):
+            score = _snippet_score(
+                capability=cap,
+                snippet=snippet,
+                role=role,
+                capabilities=capabilities or [],
+                tool_names=tool_names or [],
+                failure_layer=failure_layer,
+                error_text=error_text,
+            )
+            if any(score[:4]) or not requested_tools:
+                candidates.append((score, cap, snippet))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {"tool": cap.name, **asdict(snippet), "formatted": format_tool_snippet(cap, snippet)}
+        for _, cap, snippet in candidates[:max_snippets]
+    ]
+
+
+def tool_snippet_prompt(snippets: list[dict[str, Any]]) -> str:
+    if not snippets:
+        return "当前脚本可用工具 Snippets: 无"
+    return "当前脚本可用工具 Snippets（调用任何工具前必须优先参考；不要根据函数名猜参数或返回值；若 snippet 与猜测冲突，以 snippet 为准）：\n\n" + "\n\n---\n\n".join(str(item.get("formatted") or "") for item in snippets)
+
+
+def set_tool_snippets(name: str, snippets: list[ToolSnippet]) -> ToolCapability | None:
+    global BUILTIN_TOOL_CAPABILITIES
+    current = BUILTIN_TOOL_CAPABILITIES.get(name) or _REGISTERED_TOOL_CAPABILITIES.get(name)
+    if current is None:
+        return None
+    updated = replace(current, snippets=snippets, updated_at=_utc_now())
+    if name in BUILTIN_TOOL_CAPABILITIES:
+        BUILTIN_TOOL_CAPABILITIES[name] = updated
+    else:
+        _REGISTERED_TOOL_CAPABILITIES[name] = updated
+    return get_tool_capability(name)
 
 
 def function_cards_for_tool(capability: ToolCapability) -> list[str]:
@@ -670,15 +927,24 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         if forbidden_imports else
         "除 usage_policy=helper_required 的能力外，helper 是可用/推荐工具，不强制实现方式；最终以 E2E stdout/artifact 合同为准。"
     )
+    resolved_snippets = resolve_tool_snippets_for_context(
+        role=role,
+        capabilities=capabilities,
+        tool_names=allowed_tools + allowed_helper_imports,
+        file_path=str(getattr(entry, "path", "") if not isinstance(entry, dict) else entry.get("path", "")),
+        max_snippets=5,
+    ) if allowed_tools or allowed_helper_imports else []
+    snippet_prompt = tool_snippet_prompt(resolved_snippets)
     cards_text = "\n\n".join(tool_function_cards)
-    card_header = "当前脚本可用工具 Function Cards（按函数级 manifest 调用，不要只凭函数名猜参数/返回值）:" if tool_function_cards else "当前脚本可用工具 Function Cards: 无"
-    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance, card_header, cards_text])
+    card_header = "当前脚本可用工具 Function Cards（作为 schema 补充；真实调用优先模仿 Tool Snippets，不要只凭函数名猜参数/返回值）:" if tool_function_cards else "当前脚本可用工具 Function Cards: 无"
+    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance, snippet_prompt, card_header, cards_text])
     return ToolResolveResult(
         allowed_tools=allowed_tools,
         allowed_helper_imports=allowed_helper_imports,
         required_dependencies=required_dependencies,
         forbidden_imports=forbidden_imports,
         tool_function_cards=tool_function_cards,
+        tool_snippets=resolved_snippets,
         tool_usage_prompt=tool_usage_prompt,
         warnings=warnings,
     )
@@ -809,6 +1075,16 @@ def build_tool_manifest_draft(description: dict[str, Any]) -> dict[str, Any]:
             "usage_policy": usage_policy, "allowed_roles": roles, "required_capabilities": [capability],
             "forbidden_imports": sorted(_DANGEROUS_IMPORTS), "forbidden_side_effects": ["write outside OUTPUT_DIR", "leak secrets", "undeclared network access"],
         }],
+        "snippets": [{
+            "id": f"{name}.minimal_usage", "title": f"Use {display_name}", "kind": "minimal_usage",
+            "applies_to": {"roles": roles, "capabilities": [capability], "failure_layers": ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing"]},
+            "description": str(description.get("when_to_use") or f"Use when a Creator script needs {display_name}."),
+            "code": f"from {adapter_import} import {name}\n\npayload = {{...}}\nresult = {name}(payload)\nreturn result",
+            "expected_input_shape": input_schema, "expected_output_shape": output_schema,
+            "return_rule": "Return the adapter result directly when it already matches output_schema; do not wrap it in another field.",
+            "anti_patterns": ["Do not guess parameter names; pass a payload dict unless the signature says otherwise.", "Do not print or return secret values.", "Do not write files outside OUTPUT_DIR."],
+            "requires": [capability], "usage_policy": usage_policy, "priority": 80,
+        }],
     }
 
 
@@ -876,6 +1152,9 @@ def _manifest_errors(manifest: dict[str, Any]) -> list[str]:
             errors.append(f"input_schema is required for {fn.function_name}")
         if not isinstance(fn.output_schema, dict) or not fn.output_schema:
             errors.append(f"output_schema is required for {fn.function_name}")
+    for snippet in snippets_for_tool(cap):
+        result = validate_tool_snippet(cap, snippet)
+        errors.extend(f"snippet {snippet.id}: {err}" for err in result["errors"])
     if set(cap.required_capabilities) & _HIGH_RISK_CAPABILITIES and cap.approval_status not in {"approved", "validated"}:
         errors.append("high-risk tools must be validated and admin-approved before enabling")
     return errors
@@ -964,8 +1243,18 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
                 dynamic_result = {"skipped": False, "return_keys": sorted(value.keys())}
             except Exception as exc:
                 errors.append(f"dynamic trial failed: {exc}")
+    snippet_validations = [validate_tool_snippet(cap, snippet) for snippet in snippets_for_tool(cap)] if cap else []
     success = not errors
-    return {"success": success, "status": "validated" if success else "failed", "errors": errors, "warnings": warnings, "dynamic_trial": dynamic_result, "tool_card_preview": function_cards_for_tool(cap) if cap else []}
+    return {
+        "success": success,
+        "status": "validated" if success else "failed",
+        "errors": errors,
+        "warnings": warnings,
+        "dynamic_trial": dynamic_result,
+        "tool_card_preview": function_cards_for_tool(cap) if cap else [],
+        "snippet_preview": [format_tool_snippet(cap, snippet) for snippet in snippets_for_tool(cap)] if cap else [],
+        "snippet_validations": snippet_validations,
+    }
 
 
 def tool_status(capability: ToolCapability) -> dict[str, Any]:
@@ -992,5 +1281,170 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "missing_dependencies": missing_dependencies,
     }
 
+def _make_snippet(
+    tool: str,
+    helper: str,
+    title: str,
+    code: str,
+    outputs: dict[str, str],
+    *,
+    kind: SnippetKind = "minimal_usage",
+    roles: list[str] | None = None,
+    capabilities: list[str] | None = None,
+    failures: list[str] | None = None,
+    description: str = "",
+    anti_patterns: list[str] | None = None,
+    priority: int = 100,
+    usage_policy: UsagePolicy = "helper_preferred",
+) -> ToolSnippet:
+    return ToolSnippet(
+        id=f"{helper}.{kind}",
+        title=title,
+        kind=kind,
+        applies_to={"roles": roles or [], "capabilities": capabilities or [tool], "failure_layers": failures or ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing", "artifact_invalid"]},
+        description=description or title,
+        code=code.strip(),
+        expected_input_shape={},
+        expected_output_shape=outputs,
+        return_rule="If the helper returns the platform stdout dict with file_paths/file_outputs, return that dict directly; only merge with extra scalar fields using {**result, ...}.",
+        anti_patterns=anti_patterns or ["Do not guess parameter names.", "Do not wrap helper result inside an output field.", "Do not write files outside OUTPUT_DIR/outputs."],
+        requires=capabilities or [tool],
+        usage_policy=usage_policy,
+        priority=priority,
+    )
 
+
+def _install_builtin_tool_snippets() -> None:
+    specs: dict[str, list[ToolSnippet]] = {
+        "pdf_generation": [
+            _make_snippet("pdf_generation", "create_pdf", "Create a simple text PDF", """
+from backend.services.skill_runtime import create_pdf
+
+content = payload.get("text") or payload.get("content") or "Generated PDF"
+result = create_pdf(content, filename="output.pdf")
+return result
+""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder", "document_generator", "composite_generator"], capabilities=["pdf_generation"], anti_patterns=["Do not return {'pdf_path': result}; create_pdf returns a dict, not a string.", "Do not pass a dict as the text argument unless you intentionally want its string/list lines.", "Do not write outside OUTPUT_DIR; use filename or output_dir/output_path under outputs."], priority=120),
+            _make_snippet("pdf_generation", "build_pdf_report", "Create a structured PDF report", """
+from backend.services.skill_runtime import build_pdf_report
+
+sections = [
+    {"heading": "Summary", "content": payload.get("summary") or "No summary provided."},
+    {"heading": "Details", "content": payload.get("details") or []},
+]
+result = build_pdf_report("Report", sections, image_paths=payload.get("image_paths") or [], filename="report.pdf")
+return result
+""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], priority=100),
+            _make_snippet("pdf_generation", "images_to_pdf", "Convert images to one PDF", """
+from backend.services.skill_runtime import images_to_pdf
+
+image_paths = payload.get("image_paths") or []
+result = images_to_pdf(image_paths, output_path="outputs/images.pdf")
+return result
+""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], kind="file_output_usage", priority=90),
+            _make_snippet("pdf_generation", "merge_pdfs", "Merge several PDFs", """
+from backend.services.skill_runtime import merge_pdfs
+
+pdf_paths = payload.get("pdf_paths") or []
+result = merge_pdfs(pdf_paths, output_path="outputs/merged.pdf")
+return result
+""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], kind="batch_usage", priority=90),
+        ],
+        "image_generation": [
+            _make_snippet("image_generation", "generate_stable_diffusion_image", "Generate one image", """
+from backend.services.skill_runtime import generate_stable_diffusion_image
+
+prompt = payload.get("prompt") or payload.get("description") or payload.get("text") or "A clean illustration"
+result = generate_stable_diffusion_image(prompt, filename_prefix="generated")
+return {"image_path": result["image_path"], "image_paths": [result["image_path"]]}
+""", {"image_path": "string", "image_paths": "list[string]"}, roles=["image_generator", "composite_generator"], capabilities=["image_generation"], anti_patterns=["Do not call /v1/images/generations directly; use the registered helper.", "Do not use VISION_MODEL for image generation.", "During SKILL_TRIAL_RUN the helper may return a deterministic minimal file; still return image_path/image_paths."], priority=120),
+            _make_snippet("image_generation", "generate_stable_diffusion_image", "Generate multiple images in a loop", """
+from backend.services.skill_runtime import generate_stable_diffusion_image
+
+prompts = payload.get("prompts") or [payload.get("prompt") or "Generated image"]
+image_paths = []
+for index, prompt in enumerate(prompts, start=1):
+    result = generate_stable_diffusion_image(str(prompt), filename_prefix=f"generated_{index}")
+    image_paths.append(result["image_path"])
+return {"image_paths": image_paths, "image_path": image_paths[0] if image_paths else ""}
+""", {"image_path": "string", "image_paths": "list[string]"}, kind="batch_usage", roles=["image_generator", "composite_generator"], capabilities=["image_generation"], priority=80),
+        ],
+        "docx_generation": [_make_snippet("docx_generation", "create_docx", "Create a DOCX document", """
+from backend.services.skill_runtime import create_docx
+
+content = payload.get("sections") or payload.get("text") or "Generated document"
+result = create_docx(content, filename="output.docx", title=payload.get("title") or "Document")
+return result
+""", {"docx_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["docx_builder"], capabilities=["docx_generation"], priority=120)],
+        "pptx_generation": [_make_snippet("pptx_generation", "create_pptx", "Create a PPTX deck", """
+from backend.services.skill_runtime import create_pptx
+
+slides = payload.get("slides") or payload.get("sections") or [payload.get("text") or "Generated slide"]
+result = create_pptx(slides, filename="output.pptx", title=payload.get("title") or "Presentation")
+return result
+""", {"pptx_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pptx_builder"], capabilities=["pptx_generation"], priority=120)],
+        "pdf_parsing": [_make_snippet("pdf_parsing", "extract_pdf_text", "Extract text from an input PDF", """
+from backend.services.skill_runtime import extract_pdf_text
+
+input_files = payload.get("input_files") or payload.get("files") or []
+pdf_path = payload.get("pdf_path") or (input_files[0] if input_files else "")
+result = extract_pdf_text(pdf_path, max_pages=payload.get("max_pages"))
+return {"text": result["text"], "pages": result.get("pages", []), "pdf_path": result.get("pdf_path", pdf_path)}
+""", {"text": "string", "pages": "list[string]", "pdf_path": "string"}, roles=["pdf_parser"], capabilities=["pdf_parsing"], priority=110)],
+        "docx_parsing": [_make_snippet("docx_parsing", "read_docx_text", "Read text from a DOCX", """
+from backend.services.skill_runtime import read_docx_text
+
+input_files = payload.get("input_files") or payload.get("files") or []
+docx_path = payload.get("docx_path") or (input_files[0] if input_files else "")
+result = read_docx_text(docx_path)
+return {"text": result["text"], "paragraphs": result.get("paragraphs", []), "source_path": result.get("source_path", docx_path)}
+""", {"text": "string", "paragraphs": "list[string]", "source_path": "string"}, roles=["docx_parser"], capabilities=["docx_parsing"], priority=100)],
+        "pptx_parsing": [_make_snippet("pptx_parsing", "read_pptx_text", "Read text from a PPTX", """
+from backend.services.skill_runtime import read_pptx_text
+
+input_files = payload.get("input_files") or payload.get("files") or []
+pptx_path = payload.get("pptx_path") or (input_files[0] if input_files else "")
+result = read_pptx_text(pptx_path)
+return {"text": result["text"], "slides": result.get("slides", []), "source_path": result.get("source_path", pptx_path)}
+""", {"text": "string", "slides": "list[string]", "source_path": "string"}, roles=["pptx_parser"], capabilities=["pptx_parsing"], priority=100)],
+        "web_search": [_make_snippet("web_search", "web_search", "Search the web with the registered helper", """
+from backend.services.skill_runtime import web_search
+
+query = payload.get("query") or payload.get("user_request") or payload.get("text") or ""
+result = web_search(query, top_k=int(payload.get("top_k") or 5), language=payload.get("language"))
+return {"results": result.get("results", []), "query": query}
+""", {"results": "list[object]", "query": "string"}, roles=["search_reader"], capabilities=["web_search"], anti_patterns=["Do not use requests against undeclared search APIs when web_search is registered.", "Do not output secrets or raw provider credentials.", "If SEARCHXNG_BASE_URL is missing, fail clearly or use trial-run behavior."], priority=100)],
+        "database_read": [_make_snippet("database_read", "query_database_readonly", "Run a bounded readonly SQL query", """
+from backend.services.skill_runtime import query_database_readonly
+
+sql = payload.get("sql") or "SELECT 1 AS value"
+result = query_database_readonly(sql, params=payload.get("params") or {}, limit=int(payload.get("limit") or 100))
+return result
+""", {"columns": "list[string]", "rows": "list[object]", "row_count": "integer", "truncated": "boolean"}, roles=["database_reader"], capabilities=["database_read"], anti_patterns=["Only SELECT/WITH is allowed; never INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE.", "Do not read or print DATABASE_URL.", "Do not bypass query_database_readonly with a direct database driver."], priority=120, usage_policy="helper_required")],
+        "wechat_draft": [_make_snippet("wechat_draft", "create_wechat_draft", "Create a WeChat draft only", """
+from backend.services.skill_runtime import create_wechat_draft
+
+result = create_wechat_draft(
+    title=payload.get("title") or "Untitled",
+    content_html=payload.get("content_html") or payload.get("html") or "<p>Draft</p>",
+    author=payload.get("author") or "",
+    digest=payload.get("digest") or "",
+    cover_image_path=payload.get("cover_image_path"),
+)
+return result
+""", {"draft_id": "string", "media_id": "string", "url": "string|null", "status": "string"}, roles=["wechat_draft_creator"], capabilities=["wechat_draft"], anti_patterns=["Do not publish automatically from a draft creator script.", "Do not output WECHAT_APP_ID or WECHAT_APP_SECRET.", "Use upload_wechat_media only for declared local cover images."], priority=120, usage_policy="helper_required")],
+        "wechat_publish": [_make_snippet("wechat_publish", "publish_wechat_draft", "Publish an explicitly requested WeChat draft", """
+from backend.services.skill_runtime import publish_wechat_draft
+
+draft_id = payload.get("draft_id") or ""
+result = publish_wechat_draft(draft_id)
+return result
+""", {"draft_id": "string", "publish_id": "string", "status": "string"}, roles=["wechat_publisher"], capabilities=["wechat_publish"], anti_patterns=["Do not publish unless the user explicitly requested publishing and the tool is enabled.", "Do not output WeChat secrets.", "Do not create a draft and publish as a hidden side effect unless the plan says so."], priority=120, usage_policy="helper_required")],
+    }
+    for name, snippets in specs.items():
+        cap = BUILTIN_TOOL_CAPABILITIES.get(name)
+        if cap is not None and not cap.snippets:
+            BUILTIN_TOOL_CAPABILITIES[name] = replace(cap, snippets=snippets)
+
+
+_install_builtin_tool_snippets()
 _load_registered_tools_from_disk()

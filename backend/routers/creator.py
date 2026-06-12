@@ -919,8 +919,8 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
             passed=runtime_matches,
             target=target,
             message="命令块 runner 与脚本 runtime 一致。" if runtime_matches else f"命令块 runner 与脚本 runtime={entry.runtime} 不一致。",
-            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；JSON keys 由当前脚本 SkillPlan.inputs 决定。",
-            minimal_edit="修正 runner 或脚本路径；不要自行发明 JSON 参数名。",
+            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；JSON keys 只需保持 workflow/脚本自洽。",
+            minimal_edit="修正 runner 或脚本路径；不要仅因 SkillPlan.inputs 改写可运行 payload。",
         ))
 
         keys = _command_payload_keys(command, script_path)
@@ -930,8 +930,8 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
             passed=json_ok,
             target=target,
             message="命令块使用可解析 JSON argv。" if json_ok else f"{script_path} 命令块必须在脚本路径后传入 JSON object argv。",
-            expected="脚本路径后跟一个 JSON object argv；JSON keys 由当前脚本 SkillPlan.inputs 决定。",
-            minimal_edit="确保 JSON 可解析；不要自行发明参数名。",
+            expected="脚本路径后跟一个 JSON object argv；JSON keys 可由 workflow envelope 自由定义。",
+            minimal_edit="确保 JSON 可解析；字段对齐由第二轮 E2E trace 定位。",
         ))
 
         # First-round file contracts stop at command syntax/runtime/JSON shape.
@@ -3551,18 +3551,6 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
             "VISION_MODEL 只用于看图理解/OCR/多模态问答。"
         )
 
-    if _DIRECT_IMAGE_API_RE.search(content) and not _PLATFORM_IMAGE_HELPER_RE.search(content):
-        raise ValueError(
-            f"{file_path} 直接调用图片生成接口。"
-            "Creator 生成的图片脚本必须调用 backend.services.skill_runtime.generate_stable_diffusion_image，"
-            "由平台侧静默完成中文 topic 翻译、Stable Diffusion IMAGE_MODEL 选择、b64_json 解析和图片落盘。"
-        )
-
-    if _IMAGE_MODEL_USAGE_RE.search(content) and _IMAGE_URL_ONLY_RE.search(content) and "b64_json" not in content:
-        raise ValueError(
-            f"{file_path} 假设图片接口只返回 url。"
-            "平台图片运行时默认使用 b64_json，并会落盘为文件路径；请调用平台图片运行时 helper。"
-        )
 
     if _DATA_URI_RE.search(content):
         raise ValueError(
@@ -6545,32 +6533,52 @@ def _format_e2e_trace(traces: list[E2EStepTrace]) -> str:
     return "\n".join(_e2e_trace_line(trace) for trace in traces)
 
 
+def _terminal_output_expected_type(key: str) -> str:
+    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
+        return "non-empty string"
+    if key in {"image_paths", "file_paths", "file_outputs"}:
+        return "non-empty list[string]"
+    return "platform terminal field"
+
+
+def _valid_terminal_output_value(key: str, value: Any) -> bool:
+    if key in {"text", "markdown", "image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
+        return isinstance(value, str) and bool(value.strip())
+    if key in {"image_paths", "file_paths", "file_outputs"}:
+        return (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(item, str) and item.strip() for item in value)
+        )
+    return False
+
+
+def _invalid_terminal_output_values(payload: dict[str, Any]) -> list[dict[str, str]]:
+    invalid: list[dict[str, str]] = []
+    for key in sorted(_SANDBOX_TERMINAL_OUTPUT_KEYS):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if _valid_terminal_output_value(key, value):
+            continue
+        invalid.append({
+            "key": key,
+            "expected_type": _terminal_output_expected_type(key),
+            "actual_type": _json_shape(value),
+        })
+    return invalid
+
+
 def _has_sandbox_terminal_output(payload: dict[str, Any]) -> bool:
     """Return whether final stdout JSON is consumable by sandbox runtime.
 
     这里校验的是平台与 Skill 交互的最终输出协议，不校验中间步骤。
     """
-    for key in ("text", "markdown"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-
-    for key in ("image_path", "pdf_path", "docx_path", "pptx_path", "html_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-
-    for key in ("image_paths", "file_paths", "file_outputs"):
-        value = payload.get(key)
-        if (
-            isinstance(value, list)
-            and value
-            and all(isinstance(item, str) and item.strip() for item in value)
-        ):
-            return True
-
-    return False
-
+    return any(
+        _valid_terminal_output_value(key, payload.get(key))
+        for key in _SANDBOX_TERMINAL_OUTPUT_KEYS
+        if key in payload
+    )
 
 def _validate_final_platform_output_contract(
     *,
@@ -6586,6 +6594,30 @@ def _validate_final_platform_output_contract(
     if _has_sandbox_terminal_output(stdout_json):
         return
 
+    invalid_terminal_values = _invalid_terminal_output_values(stdout_json)
+    if invalid_terminal_values:
+        details = {
+            "stdout_shape": _json_object_shape(stdout_json),
+            "invalid_terminal_keys": [item["key"] for item in invalid_terminal_values],
+            "invalid_terminal_values": invalid_terminal_values,
+        }
+        raise ValueError(
+            _e2e_error(
+                target=command.script_path,
+                layer="final_platform_output_value_invalid",
+                message=(
+                    f"第 {command.ordinal} 步 {command.script_path} 是 workflow 最后一步，"
+                    "stdout JSON 包含 sandbox 平台字段，但字段值类型/内容不合法。\n"
+                    f"stdout_shape={json.dumps(details['stdout_shape'], ensure_ascii=False, sort_keys=True)}\n"
+                    f"invalid_terminal_keys={json.dumps(details['invalid_terminal_keys'], ensure_ascii=False)}\n"
+                    f"invalid_terminal_values={json.dumps(invalid_terminal_values, ensure_ascii=False, sort_keys=True)}\n"
+                    "每个 invalid_terminal_values 项均包含 expected_type 和 actual_type。\n\n"
+                    "已成功执行的前序边界 trace：\n"
+                    f"{_format_e2e_trace(traces)}"
+                ),
+            )
+        )
+
     raise ValueError(
         _e2e_error(
             target=command.script_path,
@@ -6594,6 +6626,7 @@ def _validate_final_platform_output_contract(
                 f"第 {command.ordinal} 步 {command.script_path} 是 workflow 最后一步，"
                 "但 stdout JSON 没有包含 sandbox 可消费的最终输出字段。\n"
                 f"当前 stdout 字段：{sorted(stdout_json.keys())}\n"
+                f"stdout_shape={json.dumps(_json_object_shape(stdout_json), ensure_ascii=False, sort_keys=True)}\n"
                 f"平台允许的最终输出字段：{sorted(_SANDBOX_TERMINAL_OUTPUT_KEYS)}\n\n"
                 "注意：中间步骤可以使用任意内部字段名，不需要对齐平台协议；"
                 "但最后一步必须输出平台字段，例如 text、markdown、image_paths、"
@@ -7146,6 +7179,45 @@ def _parse_e2e_stdout_json(
     return parsed
 
 
+def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill_md: str) -> None:
+    """E2E preflight for local safety/entry/JSON argv only.
+
+    This intentionally does not enforce helper_preferred implementation choices
+    or SkillPlan input key exactness. The real workflow run validates rendered
+    argv, stdout context propagation, and final artifacts.
+    """
+    _reject_fake_script_implementation(file_path, content)
+    entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+
+    if entry.language == "python":
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            raise ValueError(f"{file_path} 不是合法 Python 源码: {exc.msg}") from exc
+
+    if not _script_has_main_entry(content, entry.runtime):
+        raise ValueError(f"{file_path} 缺少 runtime={entry.runtime} 的入口或 stdout 输出。")
+
+    commands = _extract_script_command_templates(skill_md, file_path)
+    json_argv_commands = [command for command in commands if _command_uses_json_argv(command)]
+    if json_argv_commands and not _script_reads_json_argv(content, entry.runtime):
+        raise ValueError(
+            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
+        )
+
+    helper_required_capabilities = [
+        capability
+        for capability in _effective_required_capabilities_for_script(entry)
+        if (get_tool_capability(capability) and get_tool_capability(capability).usage_policy == "helper_required")
+    ]
+    missing_required_helpers = _script_required_capability_failures(content, helper_required_capabilities)
+    if missing_required_helpers:
+        raise ValueError(
+            "脚本没有调用这些 helper_required 能力对应接口："
+            + ", ".join(missing_required_helpers)
+        )
+
+
 def _validate_e2e_command_static(
     *,
     command: E2EWorkflowCommand,
@@ -7177,39 +7249,10 @@ def _validate_e2e_command_static(
             )
         )
 
-    expected_keys = set(entry.inputs or [])
-    actual_keys = {str(key) for key in command.argv_template.keys()}
-    if expected_keys and actual_keys != expected_keys:
-        missing = sorted(expected_keys - actual_keys)
-        extra = sorted(actual_keys - expected_keys)
-        details = {
-            "code": "command_block.skillplan_inputs.exact",
-            "target_script": command.script_path,
-            "expected_inputs": sorted(expected_keys),
-            "expected_runtime_fields": sorted(expected_keys),
-            "actual_payload_keys": sorted(actual_keys),
-            "missing_keys": missing,
-            "extra_keys": extra,
-            "available_upstream_outputs": sorted(available_payload_keys or set()),
-            "minimal_edit": "在第二轮 E2E 中局部修复该命令 JSON object 或目标脚本 parse_args/run 兼容字段。",
-        }
-        raise ValueError(
-            _e2e_error(
-                target=command.source_path,
-                layer="e2e_dataflow",
-                message=(
-                    "command_block.skillplan_inputs.exact\n"
-                    "第二轮 E2E 检测到命令 payload 与目标脚本运行时输入声明不一致。"
-                    "这属于 workflow dataflow 串联问题，不属于第一轮 SKILL.md 静态合同。\n"
-                    f"structured_error={json.dumps(details, ensure_ascii=False, sort_keys=True)}\n"
-                    f"原始命令：{command.raw_command}"
-                ),
-            )
-        )
 
     content = source_path.read_text(encoding="utf-8")
     try:
-        _validate_script_contract_static(
+        _validate_e2e_script_static_preflight(
             file_path=command.script_path,
             content=content,
             skill_md=skill_md,
@@ -7488,74 +7531,14 @@ def _values_for_skill_plan_command(
 
 
 def _patch_skill_md_command_payloads_from_skill_plan(content: str, blueprint_text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Deterministically align SKILL.md command JSON argv with SkillPlan inputs.
+    """Deprecated no-op.
 
-    This patcher is deliberately generic: it never maps business field names or
-    branches on script names.  The only source of truth for keys is each
-    SkillPlanEntry.inputs; outputs only update the placeholder dataflow context.
+    Command payload repair must be based on real E2E traces (argv_shape,
+    stdout_shape, missing placeholders, and script parser behavior), not by
+    rewriting JSON argv to match SkillPlan.inputs. Keep this function as a
+    compatibility shim for older callers/tests, but never mutate content.
     """
-    parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
-    entries = [entry for entry in (parsed.skill_plan.files if parsed.skill_plan else []) if entry.file_type == "script"]
-    if not entries:
-        return content, []
-
-    entry_by_path = {entry.path: entry for entry in entries}
-    available_values: set[str] = set(entries[0].inputs or [])
-    patched: list[dict[str, Any]] = []
-    lines = (content or "").splitlines(keepends=True)
-    output: list[str] = []
-    in_shell_fence = False
-    fence_char = "`"
-    fence_len = 3
-
-    for raw_line in lines:
-        stripped = raw_line.lstrip()
-        fence_open = re.match(r"(`{3,}|~{3,})([^\n`]*)\n?$", stripped.rstrip("\n"))
-        if fence_open:
-            fence = fence_open.group(1)
-            info = (fence_open.group(2) or "").strip()
-            if not in_shell_fence:
-                in_shell_fence = _is_shell_fence_info(info)
-                fence_char = fence[0]
-                fence_len = len(fence)
-            else:
-                close_match = re.match(rf"{re.escape(fence_char)}{{{fence_len},}}\s*$", stripped.rstrip("\n"))
-                if close_match:
-                    in_shell_fence = False
-            output.append(raw_line)
-            continue
-
-        line_body = raw_line.rstrip("\r\n")
-        line_ending = raw_line[len(line_body):]
-        replacement = line_body
-        if in_shell_fence and line_body.strip():
-            for script_path, entry in entry_by_path.items():
-                payload = _command_payload_object(line_body.strip(), script_path)
-                if payload is None:
-                    continue
-                actual_keys = set(payload.keys())
-                expected_keys = set(entry.inputs or [])
-                if expected_keys and actual_keys != expected_keys:
-                    values = _values_for_skill_plan_command(
-                        entry=entry,
-                        existing_payload=payload,
-                        available_values=available_values | set(entry.inputs or []),
-                    )
-                    replacement = render_script_command_from_skill_plan(entry, values)
-                    patched.append({
-                        "target_script": script_path,
-                        "expected_keys": sorted(expected_keys),
-                        "actual_keys": sorted(actual_keys),
-                        "missing_keys": sorted(expected_keys - actual_keys),
-                        "extra_keys": sorted(actual_keys - expected_keys),
-                        "expected_payload_shape": {key: values[key] for key in sorted(expected_keys)},
-                        "upstream_available_outputs": sorted(available_values),
-                    })
-                available_values.update(entry.outputs or [])
-                break
-        output.append(replacement + line_ending)
-
-    return "".join(output), patched
+    return content, []
 
 async def _repair_existing_file_for_e2e_failure(
     *,
@@ -7628,20 +7611,6 @@ async def _repair_existing_file_for_e2e_failure(
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
 
-    if target_path == "SKILL.md" and "command_block.skillplan_inputs.exact" in deterministic_error:
-        patched_content, patch_details = _patch_skill_md_command_payloads_from_skill_plan(
-            current_content,
-            skill_md or current_content,
-        )
-        if patch_details and patched_content != current_content:
-            _validate_skill_md_against_existing_files(skill_name, patched_content)
-            target_file.write_text(patched_content, encoding="utf-8")
-            logger.info(
-                "[Creator][E2E] deterministic SKILL.md command payload patch skill=%s details=%s",
-                skill_name,
-                json.dumps(patch_details, ensure_ascii=False),
-            )
-            return target_path
 
     contract_text = _build_generated_file_contract_text(
         target_path,

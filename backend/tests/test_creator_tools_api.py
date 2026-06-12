@@ -267,6 +267,12 @@ def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch
     assert body["needs_clarification"] is True
     assert body["adapter_code"] == ""
     assert body["questions"]
+    assert len(body["clarification_questions"]) <= 5
+    assert body["requires_config"] is True
+    assert body["config_form_schema"]["ui"] == "authorization_modal"
+    rendered_questions = json.dumps(body["clarification_questions"], ensure_ascii=False).lower()
+    for forbidden in ["headers", "body", "query", "schema", "method", "模板", "输出字段", "sample input"]:
+        assert forbidden not in rendered_questions
 
 
 def test_creator_tool_author_uses_mocked_model_path(monkeypatch, tmp_path):
@@ -395,3 +401,34 @@ def test_authoring_planner_uses_internal_helper_before_code_generation(monkeypat
     assert body["authoring_tool_results"][0]["requires_input"] is True
     assert body["adapter_code"] == ""
     assert body["ready_for_code_generation"] is False
+    assert body["config_required_fields"]
+    assert body["missing_fields"] == []
+
+
+def test_tool_config_save_and_status_store_only_refs(monkeypatch):
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tool-config/save",
+        json={
+            "session_id": "weather",
+            "tool_name": "weather_lookup",
+            "base_url": "https://api.example.test",
+            "auth_type": "api_key",
+            "secret_env": "WEATHER_API_KEY",
+            "secret_value": "plain-secret",
+            "extra": {"tenant_id": "demo"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["config_refs"]["api_key"] == "${ENV:WEATHER_API_KEY}"
+    assert "plain-secret" not in json.dumps(body)
+
+    status = client.get("/api/creator/tool-config/status", params={"session_id": "weather"})
+    assert status.status_code == 200
+    status_body = status.json()
+    assert status_body["configured"] is True
+    assert "WEATHER_API_KEY" in status_body["configured_secrets"]

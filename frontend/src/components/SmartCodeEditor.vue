@@ -1,6 +1,6 @@
 <template>
-  <div class="smart-editor" :class="[`lang-${language}`, { readonly }]" :style="editorStyle">
-    <div class="editor-toolbar">
+  <div class="smart-editor" :class="[`lang-${language}`, density, { readonly, fill }]" :style="editorStyle">
+    <div v-if="toolbar" class="editor-toolbar">
       <span class="language-label">{{ languageLabel }}</span>
       <span v-if="lintMessage" class="lint" :class="lintOk ? 'ok' : 'bad'">{{ lintMessage }}</span>
       <button v-if="lineWrapping" type="button" class="mini" @click="wrap = !wrap">{{ wrap ? '关闭换行' : '自动换行' }}</button>
@@ -41,10 +41,13 @@ const props = defineProps({
   lineWrapping: { type: Boolean, default: true },
   completions: { type: Array, default: () => [] },
   diagnostics: { type: Array, default: () => [] },
+  density: { type: String, default: 'comfortable' },
+  toolbar: { type: Boolean, default: true },
+  fill: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
 const editable = ref(null)
-const wrap = ref(true)
+const wrap = ref(props.lineWrapping)
 const showCompletions = ref(false)
 const internal = ref(props.modelValue || '')
 
@@ -105,13 +108,15 @@ onMounted(() => syncDom(internal.value))
 </script>
 
 <style scoped>
-.smart-editor { border: 1px solid var(--border); border-radius: var(--radius); background: #111827; overflow: hidden; }
+.smart-editor { border: 1px solid var(--border); border-radius: var(--radius); background: #111827; overflow: hidden; min-height: var(--min-height); }
+.smart-editor.fill { height: 100%; min-height: 0; display: flex; flex-direction: column; }
 .editor-toolbar { min-height: 32px; display: flex; align-items: center; gap: 8px; justify-content: space-between; padding: 6px 10px; background: rgba(255,255,255,.04); border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 12px; }
 .language-label { font-weight: 700; letter-spacing: .04em; color: var(--accent); }
 .lint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lint.ok { color: var(--success); } .lint.bad { color: var(--danger); }
 .mini { border: 1px solid var(--border); background: transparent; color: var(--text-muted); border-radius: 8px; padding: 3px 8px; cursor: pointer; }
-.editor-shell { display: grid; grid-template-columns: auto 1fr; max-height: var(--max-height); min-height: var(--min-height); overflow: auto; }
+.editor-shell { display: grid; grid-template-columns: auto 1fr; max-height: var(--max-height); min-height: var(--min-height); overflow: auto; flex: 1; }
+.smart-editor.fill .editor-shell { height: 100%; max-height: none; min-height: 0; }
 .line-numbers, .editor-surface { margin: 0; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 2; }
 .line-numbers { user-select: none; text-align: right; color: #64748b; background: rgba(255,255,255,.03); border-right: 1px solid var(--border); padding: 10px 8px; min-width: 42px; }
 .editor-surface { outline: none; color: #dbeafe; padding: 10px 12px; white-space: pre; min-width: 0; }
@@ -122,5 +127,9 @@ onMounted(() => syncDom(internal.value))
 .lang-markdown .editor-surface { color: #d1fae5; }
 .completion-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-top: 1px solid var(--border); background: rgba(15,23,42,.98); }
 .completion-bar button { border: 1px solid var(--border); border-radius: 999px; background: rgba(255,255,255,.05); color: var(--text); padding: 3px 8px; cursor: pointer; font-size: 12px; }
+
+.smart-editor.compact .editor-toolbar { min-height: 26px; padding: 4px 8px; }
+.smart-editor.compact .line-numbers, .smart-editor.compact .editor-surface { font-size: 12px; line-height: 1.45; padding-top: 8px; padding-bottom: 8px; }
+.smart-editor.compact .completion-bar { padding: 6px; }
 .readonly .editor-surface { color: var(--text-muted); }
 </style>

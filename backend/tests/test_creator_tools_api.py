@@ -271,7 +271,7 @@ def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch
     assert body["requires_config"] is True
     assert body["config_form_schema"]["ui"] == "authorization_modal"
     rendered_questions = json.dumps(body["clarification_questions"], ensure_ascii=False).lower()
-    for forbidden in ["headers", "body", "query", "schema", "method", "模板", "输出字段", "sample input"]:
+    for forbidden in ["headers", "body", "query", "schema", "method", "模板", "输出字段", "sample input", "服务地址", "密钥", "token", "认证"]:
         assert forbidden not in rendered_questions
 
 
@@ -401,6 +401,8 @@ def test_authoring_planner_uses_internal_helper_before_code_generation(monkeypat
     assert body["authoring_tool_results"][0]["requires_input"] is True
     assert body["adapter_code"] == ""
     assert body["ready_for_code_generation"] is False
+    assert body["needs_clarification"] is False
+    assert body["clarification_questions"] == []
     assert body["config_required_fields"]
     assert body["missing_fields"] == []
 

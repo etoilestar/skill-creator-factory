@@ -1656,19 +1656,24 @@ def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str,
     return missing
 
 
+def _needs_capability_clarification(request: dict[str, Any]) -> bool:
+    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "input_description", "output_description")).strip().lower()
+    if not text:
+        return True
+    vague_phrases = ("调用接口", "连接接口", "外部 api", "某个api", "某个 api", "api tool", "http tool", "小工具")
+    has_vague_api_goal = any(phrase in text for phrase in vague_phrases)
+    action_tokens = ("查询", "创建", "更新", "删除", "同步", "发送", "发布", "下载", "上传", "检索", "搜索", "分析", "转换", "生成", "通知", "query", "create", "update", "delete", "sync", "send", "search", "fetch")
+    object_tokens = ("数据", "订单", "用户", "消息", "文件", "报告", "记录", "天气", "价格", "库存", "邮件", "短信", "result", "record", "message", "file")
+    has_action = any(token in text for token in action_tokens)
+    has_object = any(token in text for token in object_tokens)
+    return has_vague_api_goal and not (has_action and has_object)
+
+
 def _external_api_clarification_questions(request: dict[str, Any], config: dict[str, Any]) -> list[str]:
+    """Ask only about real capability ambiguity; connection/key fields belong to config_form_schema."""
     questions: list[str] = []
-    if not (request.get("description") or request.get("operation")):
-        questions.append("你希望这个工具完成哪一种能力？请用一句话说明。")
-    if request.get("needs_external_network") is None and not config:
-        questions.append("这个工具是否需要连接外部服务？")
-    if request.get("allow_external_network") is not True and config.get("allow_external_network") is not True:
-        questions.append("是否允许本次进行一次连接测试？")
-    if not _has_config_value(config, "url", "endpoint", "base_url"):
-        questions.append("你是否已有连接地址 / 服务地址？如果有，稍后请在配置弹窗中填写。")
-    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
-    if not auth_type:
-        questions.append("你是否已有密钥 / token / 账号等认证信息？")
+    if _needs_capability_clarification(request):
+        questions.append("你希望这个工具完成哪一种具体能力？请用一句话说明，例如查询数据、创建记录或发送通知。")
     return questions[:5]
 
 
@@ -1768,7 +1773,7 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _safe_clarification_questions(questions: list[Any], fallback: list[str]) -> list[str]:
-    banned = ("headers", "body", "query", "schema", "expected output", "输出字段", "输入输出", "method", "模板", "sample input")
+    banned = ("headers", "body", "query", "schema", "expected output", "输出字段", "输入输出", "method", "模板", "sample input", "服务地址", "连接地址", "endpoint", "密钥", "token", "认证", "auth", "外部网络", "连接测试")
     safe: list[str] = []
     for item in questions or []:
         text = str(item.get("question") if isinstance(item, dict) else item).strip()
@@ -2386,8 +2391,9 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
                 "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
                 "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, suggested_config_schema, sample_input_schema, manifest, "
-                "implementation_plan. clarification_questions must be Chinese, at most 5, and only ask about ambiguity or authorization: desired capability, whether an external service is needed, whether a live connection test is allowed, whether the user has a service address, and whether the user has credentials. "
-                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, saved config, and test result. Put authorization modal fields only in config_form_schema/config_required_fields, never in questions. "
+                "implementation_plan. clarification_questions must be Chinese, at most 5, and only ask about real capability ambiguity. "
+                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
+                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, saved config, and test result. "
                 "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
             ),
         },

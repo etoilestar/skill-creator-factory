@@ -84,7 +84,7 @@
             <div class="actions"><button class="btn-primary" :disabled="busy" @click="continuePlanning">继续规划</button></div>
           </div>
 
-          <div v-if="requiresConfig" class="split-layout">
+          <div v-if="requiresConfig && !clarificationQuestions.length" class="split-layout">
             <div class="pane auth-panel">
               <h3>授权 / 连接配置</h3>
               <p class="muted small">该工具需要连接配置。这里只保存 env/secret 引用；adapter、manifest、snippet 和日志不会保存明文密钥。</p>

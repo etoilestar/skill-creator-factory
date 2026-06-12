@@ -66,6 +66,7 @@
           <ul><li v-for="err in lastValidation.errors" :key="err">{{ err }}</li></ul>
           <p v-for="warn in lastValidation.warnings" :key="warn" class="warn">{{ warn }}</p>
         </div>
+        <label>生成的 Snippet<textarea v-model="snippetText" class="code" rows="10" spellcheck="false" placeholder="确认代码后生成 snippet" /></label>
         <pre class="tool-card">{{ cardPreview }}</pre>
       </div>
     </CollapsiblePanel>

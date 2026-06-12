@@ -360,33 +360,102 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
     return texts[0] if texts else ""
 
 
-def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
-    """Extract SkillPlan list fields such as inputs/outputs/dependencies.
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_FIELD_ANNOTATION_RE = re.compile(r"\s*(?::|=|（|\()\s*", re.I)
+_FIELD_AMBIGUOUS_RE = re.compile(
+    r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
+    re.I,
+)
+_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime"
 
-    Accepted syntaxes include `inputs: topic, prompt`, `inputs=[topic,prompt]`,
-    and Chinese full-width separators.  The extraction is deliberately local to
-    the file's plan segment so domain prose elsewhere cannot enable contracts.
+
+def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
+    """Return a concrete SkillPlan field name, or mark ambiguous declarations.
+
+    ``inputs``/``outputs`` are a declaration contract, not a place for
+    alternatives.  Keep type/default annotations such as ``field: string`` or
+    ``field (default: value)``, but never silently remove candidate separators
+    and concatenate multiple possible field names into a synthetic one.
     """
+    item = str(raw_item or "").strip().strip("'\"`")
+    if not item:
+        return None, False
+    if _FIELD_AMBIGUOUS_RE.search(item):
+        return None, True
+
+    head = _FIELD_ANNOTATION_RE.split(item, maxsplit=1)[0].strip().strip("'\"`")
+    if not head:
+        return None, False
+    if not _FIELD_NAME_RE.fullmatch(head):
+        # Invalid punctuation/whitespace would previously be stripped and could
+        # merge candidate tokens. Surface it as an ambiguous field declaration
+        # instead of guessing which token should survive.
+        return None, True
+    return head, False
+
+
+def _parse_explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> tuple[list[str] | None, list[str]]:
+    """Extract SkillPlan list fields and declaration-format warnings."""
     segment = _segment_for_file(file_path, purpose, blueprint_summary)
     pattern = re.compile(rf"(?:{re.escape(field_name)}|{re.escape(field_name.replace('_', ' '))})\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I)
     match = pattern.search(segment)
     if not match:
-        return None
+        return None, []
     raw = match.group(1)
-    raw = re.split(r"\s+(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime)\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
+    raw = re.split(rf"\s+(?:{_FIELD_LIST_NAMES_RE})\s*[：:=]", raw, maxsplit=1, flags=re.I)[0]
     values = [item.strip().strip("'\"") for item in re.split(r"[,，、]\s*", raw) if item.strip()]
     cleaned: list[str] = []
+    warnings: list[str] = []
+    ambiguous_seen = False
     for item in values:
         if field_name in {"inputs", "outputs"}:
-            item = re.split(r"\s*(?::|=|（|\(|\s)\s*", item, maxsplit=1)[0]
-            item = re.sub(r"[^A-Za-z0-9_-]", "", item)
+            cleaned_item, ambiguous = _clean_concrete_field_name(item)
+            ambiguous_seen = ambiguous_seen or ambiguous
         else:
-            item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
+            cleaned_item = re.sub(r"[^A-Za-z0-9_./-]", "", item)
+            ambiguous = False
 
-        if item:
-            cleaned.append(item)
+        if cleaned_item:
+            cleaned.append(cleaned_item)
 
-    return cleaned
+    if ambiguous_seen and field_name in {"inputs", "outputs"}:
+        warnings.append(
+            f"skill_plan.field_ambiguous: {file_path} {field_name} contains ambiguous alternatives. "
+            "SkillPlan inputs/outputs must use concrete field names; ambiguous alternatives are not allowed."
+        )
+
+    return cleaned, warnings
+
+
+def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str] | None:
+    """Extract SkillPlan list fields such as inputs/outputs/dependencies.
+
+    Accepted syntaxes include `inputs: field, other_field`,
+    `inputs=[field,other_field]`, and Chinese full-width separators.  For
+    inputs/outputs, ambiguous alternatives are omitted instead of being
+    sanitized into a synthetic concatenated field name.
+    """
+    values, _warnings = _parse_explicit_list_field(
+        field_name,
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
+    )
+    return values
+
+
+def skill_plan_field_declaration_warnings(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
+    """Return user-visible warnings for invalid SkillPlan field declarations."""
+    warnings: list[str] = []
+    for field_name in ("inputs", "outputs"):
+        _values, field_warnings = _parse_explicit_list_field(
+            field_name,
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+        warnings.extend(field_warnings)
+    return warnings
 
 
 
@@ -644,9 +713,9 @@ def build_skill_plan_entry(
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     default_inputs, default_outputs = default_io_for_role(role)
-    inputs = explicit_inputs or default_inputs
+    inputs = explicit_inputs if explicit_inputs is not None else default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-    outputs = explicit_outputs or default_outputs
+    outputs = explicit_outputs if explicit_outputs is not None else default_outputs
     all_reference_files = _dedupe_paths(list(reference_files or []))
     skill_local_references = [ref for ref in all_reference_files if _is_skill_local_reference(ref)]
     creator_internal_references = [ref for ref in all_reference_files if _is_creator_internal_reference(ref)]
@@ -678,9 +747,9 @@ def build_skill_plan_entry(
             required_capabilities=required_capabilities,
             user_blueprint_text=f"{purpose}\n{blueprint_summary}",
         )
-        inputs = explicit_inputs or default_io_for_role(role)[0]
+        inputs = explicit_inputs if explicit_inputs is not None else default_io_for_role(role)[0]
         inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-        outputs = explicit_outputs or default_io_for_role(role)[1]
+        outputs = explicit_outputs if explicit_outputs is not None else default_io_for_role(role)[1]
         role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     optional_capabilities = explicit_optional_capabilities or []
     allowed_capabilities = explicit_allowed_capabilities or []

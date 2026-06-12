@@ -1008,8 +1008,8 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 命令块使用标准 Markdown 独立 fence；不要把 ```bash 缩进在列表项内部。",
         "- fence 内只放一条命令，不写解释、不写循环说明、不写多条命令。",
         "- 命令必须形如：python scripts/name.py '{\"user_request\":\"{{user_request}}\"}'，或引用 external envelope / 上游 stdout 中真实存在的字段。",
-        "- JSON argv keys 必须由当前 scripts/ 文件的 SkillPlanEntry.inputs 直接决定；不要自行发明、翻译或猜测参数名。",
-        "- 字段名以当前 SkillPlan.inputs / outputs 为准；平台不固定业务字段名，但同一 Skill 内部必须自洽。",
+        "- JSON argv keys 必须是当前脚本会读取的确定字段名；不要使用候选字段、别名字段、组合表达或位置参数。",
+        "- 第一条命令使用 external input envelope 中确定存在的字段；后续命令引用前序 stdout 中真实产生的 placeholder 字段。",
         "- JSON argv 必须先能被 json.loads 解析；所有动态 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写动态数值占位符。",
         "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
         "",
@@ -5652,7 +5652,7 @@ def _build_generate_file_prompt(
             "7. 是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
             "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 输出结构化 JSON，字段必须以 SkillPlan.outputs 为准；允许极少数 legacy alias 仅用于兼容旧 Skill，新生成 Skill 必须统一字段命名，不要混用 text/text_content 等别名；composite_generator 只表示多能力组合，具体输出由 outputs/required_capabilities 决定。\n"
+            "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"

@@ -225,8 +225,10 @@ def _react_system_prompt(action_schema: dict) -> str:
         inputs = entry.get("inputs") or []
         cmd = str(entry.get("command") or "").strip()
         outputs = entry.get("outputs") or []
+        default_values = entry.get("default_values") or {}
+        role = str(entry.get("role") or "generic_script")
 
-        # 从 command 中提取 JSON argv 的 key 列表
+        # 从 command 中提取 JSON argv 的 key 列表作为实际参数名
         param_keys = list(inputs)
         try:
             import shlex
@@ -246,9 +248,18 @@ def _react_system_prompt(action_schema: dict) -> str:
         except ValueError:
             pass
 
-        param_desc = f"（参数: {', '.join(param_keys)}）" if param_keys else ""
+        # 构建参数字符串：标注有默认值的参数
+        param_parts = []
+        for pk in param_keys:
+            if pk in default_values:
+                param_parts.append(f"{pk}(默认={default_values[pk]})")
+            else:
+                param_parts.append(pk)
+        param_desc = f"（参数: {', '.join(param_parts)}）" if param_parts else ""
         output_desc = f" → 输出: {', '.join(str(o) for o in outputs)}" if outputs else ""
-        tool_lines.append(f"  - {sp}{param_desc}{output_desc}")
+        role_desc = f" [{role}]" if role and role != "generic_script" else ""
+
+        tool_lines.append(f"  - {sp}{role_desc}{param_desc}{output_desc}")
 
     tools_str = "\n".join(tool_lines) if tool_lines else "  （无可用工具）"
 
@@ -266,11 +277,13 @@ def _react_system_prompt(action_schema: dict) -> str:
         "\n"
         "规则：\n"
         "1. 根据当前步骤描述和已有上下文，选择合适的工具并构造参数。\n"
-        "2. 参数值应从上下文中获取（如前序步骤的输出、用户输入等）。\n"
-        "3. 如果当前步骤需要为多个项目分别调用工具（如为每个章节生成图片），请先输出一次工具调用，"
+        "2. params 中的 key 必须与工具声明的参数名一致（即上面「参数:」列表中的名称）。\n"
+        "3. 有默认值的参数可以不传，但建议使用合理的值。\n"
+        "4. 工具执行结果会以 stdout JSON 形式加入对话历史，后续步骤可引用其中的字段。\n"
+        "5. 如果当前步骤需要为多个项目分别调用工具（如为每个章节生成图片），请先输出一次工具调用，"
         "执行结果返回后你会看到，然后继续为下一个项目调用，直到所有项目处理完毕。\n"
-        "4. 所有项目处理完毕后，输出 {\"step_complete\": true} 表示当前步骤结束。\n"
-        "5. 只输出 JSON，不要输出其他内容。"
+        "6. 所有项目处理完毕后，输出 {\"step_complete\": true} 表示当前步骤结束。\n"
+        "7. 只输出 JSON，不要输出其他内容。"
     )
 
 
@@ -352,7 +365,14 @@ def _build_command_from_tool_call(script_path: str, params: dict, action_schema:
 
 
 def _render_command_with_params(command_template: str, script_path: str, params: dict) -> str:
-    """将 params 填入 command 模板的 JSON argv 中。"""
+    """将 params 填入 command 模板的 JSON argv 中。
+
+    只保留模板中已有的 key，不会盲目追加 LLM 输出的额外 key。
+    取值优先级：
+    1) params 中与模板 key 同名的值（如 params["chapter_text"] → JSON argv["chapter_text"]）
+    2) 模板值是 {{placeholder}} 形式时，从 params 中取 placeholder_key 对应的值
+    3) 否则保留模板原值（用于默认值，如 chapter_count=3）
+    """
     import shlex
     try:
         parts = shlex.split(command_template)
@@ -373,13 +393,15 @@ def _render_command_with_params(command_template: str, script_path: str, params:
         try:
             template_payload = json.loads(parts[json_idx])
             if isinstance(template_payload, dict):
-                # 用 params 覆盖模板中的占位符值
                 merged = dict(template_payload)
-                for key, value in params.items():
-                    merged[key] = value
-                # 替换剩余的 {{placeholder}} 为 params 中的值
+                # 只遍历模板中的 key，不从 params 盲目追加
                 for key in list(merged.keys()):
                     val = merged[key]
+                    # 优先按 key 名匹配 params
+                    if key in params:
+                        merged[key] = params[key]
+                        continue
+                    # 其次，按 {{placeholder}} 形式从 params 取值
                     if isinstance(val, str) and re.match(r"^\{\{.+\}\}$", val):
                         placeholder_key = val.strip("{}").strip()
                         if placeholder_key in params:

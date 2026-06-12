@@ -169,3 +169,23 @@ def test_registered_tool_resolve_uses_registered_helper_and_trial_dispatch(monke
         assert registered_tool_call("fake_registered_lookup", {"query": "demo"})["tool_name"] == "fake_registered_lookup"
     finally:
         clear_registered_tool_capabilities()
+
+
+def test_resolve_tool_snippets_prioritizes_error_repair_context():
+    from backend.services.creator_tool_registry import resolve_tool_snippets_for_context, tool_snippet_prompt
+
+    snippets = resolve_tool_snippets_for_context(
+        role="pdf_builder",
+        capabilities=["pdf_generation"],
+        tool_names=["create_pdf"],
+        file_path="scripts/build_pdf.py",
+        failure_layer="final_platform_output_value_invalid",
+        error_text="pdf_path exists but value is object; create_pdf result was wrapped",
+        max_snippets=3,
+    )
+
+    assert snippets
+    assert snippets[0]["tool"] == "pdf_generation"
+    assert "create_pdf" in snippets[0]["code"]
+    assert "Do not return {'pdf_path': result}" in snippets[0]["formatted"]
+    assert "Snippets" in tool_snippet_prompt(snippets)

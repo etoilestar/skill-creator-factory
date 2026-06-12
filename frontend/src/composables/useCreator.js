@@ -305,3 +305,41 @@ export function enableCreatorTool(name) {
 export function disableCreatorTool(name) {
   return postCreatorTool(`${encodeURIComponent(name)}/disable`, {})
 }
+
+
+export async function listCreatorToolSnippets(name) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets`)
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail || data.message || 'Snippet 加载失败')
+  return data
+}
+
+export function createCreatorToolSnippet(name, snippet) {
+  return postCreatorTool(`${encodeURIComponent(name)}/snippets`, { snippet })
+}
+
+export async function updateCreatorToolSnippet(name, snippetId, snippet) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ snippet }),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || 'Snippet 更新失败')
+  return data
+}
+
+export async function deleteCreatorToolSnippet(name, snippetId) {
+  const resp = await fetch(`/api/creator/tools/${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}`, { method: 'DELETE' })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail || data.message || 'Snippet 删除失败')
+  return data
+}
+
+export function resolveCreatorToolSnippets(payload) {
+  return postCreatorTool('resolve-snippets', payload)
+}
+
+export function testCreatorToolSnippet(name, snippetId) {
+  return postCreatorTool(`${encodeURIComponent(name)}/snippets/${encodeURIComponent(snippetId)}/test`, {})
+}

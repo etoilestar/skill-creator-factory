@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
-from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool
+from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -4405,6 +4405,23 @@ def _trial_run_generated_script(
             )
 
 
+
+def _failure_layer_from_error_text(error_text: str) -> str | None:
+    text = (error_text or "").lower()
+    if "stdout" in text and "json" in text:
+        return "stdout_not_json"
+    if "wrapped" in text or "value is object" in text or "expected string" in text:
+        return "final_platform_output_value_invalid"
+    if "artifact_missing" in text or "does not exist" in text or "missing artifact" in text:
+        return "artifact_missing"
+    if "artifact_invalid" in text or "invalid artifact" in text:
+        return "artifact_invalid"
+    if "helper" in text and ("failed" in text or "error" in text):
+        return "helper_call_failed"
+    if "exit" in text or "traceback" in text:
+        return "script_exit"
+    return None
+
 async def _repair_generated_file_with_feedback(
     *,
     prompt_messages: list[dict],
@@ -4476,6 +4493,18 @@ async def _repair_generated_file_with_feedback(
         )
 
     repair_messages = [*prompt_messages]
+    repair_snippet_text = ""
+    if is_script and plan_entry is not None:
+        snippets = resolve_tool_snippets_for_context(
+            role=plan_entry.role,
+            capabilities=list(plan_entry.required_capabilities or []) + list(plan_entry.optional_capabilities or []),
+            tool_names=[],
+            file_path=file_path,
+            failure_layer=_failure_layer_from_error_text(validation_error),
+            error_text=validation_error + "\n" + previous_content[-6000:],
+            max_snippets=5,
+        )
+        repair_snippet_text = tool_snippet_prompt(snippets)
     previous_for_prompt = previous_content[-16000:]
     previous_label = "待编辑草稿"
     if is_script and repair_mode == "strict_contract_rewrite":
@@ -4509,6 +4538,7 @@ async def _repair_generated_file_with_feedback(
             f"{output_contract}\n"
             f"{extra_rules}\n\n"
             f"错误信息：\n{validation_error}"
+            + ("\n\n本次失败涉及以下工具；请优先按相关 Tool Snippet 修复，不要继续猜工具调用方式：\n" + repair_snippet_text if repair_snippet_text else "")
             + (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else "")
             + (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else "")
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
@@ -5700,7 +5730,7 @@ def _build_generate_file_prompt(
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
-            "生成前请先隐式检查以下 Tool Resolve 注册表信息；helper 是可用/推荐工具，只有 usage_policy=helper_required 时才强制使用：\n"
+            "生成前必须先隐式检查以下 Tool Resolve 与 Tool Snippets；在调用任何工具前必须优先参考 Snippet，不要根据函数名猜参数，不要根据直觉猜返回值；如果 snippet 和自己的猜测冲突，以 snippet 为准；helper 返回标准 stdout dict 时，直接 return result 或 {**result, ...}：\n"
             f"{tool_usage_prompt}\n\n"
             "必须满足以下脚本文件合同：\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
@@ -7614,26 +7644,33 @@ async def _repair_existing_file_for_e2e_failure(
     e2e_tool_cards = ""
     if target_path.startswith("scripts/"):
         haystack = "\n".join([deterministic_error, current_content[-12000:], skill_md[-12000:]])
-        relevant_cards: list[str] = []
+        mentioned_tool_names: list[str] = []
         for cap in list_tool_capabilities():
-            status = tool_status(cap)
             function_names = [fn.function_name for fn in cap.functions]
             output_keys = list((cap.output_schema or {}).get("properties", {}).keys())
             for fn in cap.functions:
                 output_keys.extend((fn.output_schema or {}).keys())
-            mentioned = (
+            if (
                 cap.name in haystack
                 or any(helper in haystack for helper in cap.helper_imports)
                 or any(name in haystack for name in function_names)
                 or any(key in haystack for key in output_keys)
-            )
-            if mentioned and status.get("creator_available"):
-                relevant_cards.extend(function_cards_for_tool(cap))
-        if relevant_cards:
+            ):
+                mentioned_tool_names.append(cap.name)
+                mentioned_tool_names.extend(cap.helper_imports)
+        snippets = resolve_tool_snippets_for_context(
+            role="",
+            capabilities=[],
+            tool_names=mentioned_tool_names,
+            file_path=target_path,
+            failure_layer=_failure_layer_from_error_text(deterministic_error),
+            error_text=haystack,
+            max_snippets=6,
+        )
+        if snippets:
             e2e_tool_cards = (
-                "\n\nE2E 修复相关工具 Function Cards（按 manifest 的 import/signature/return_contract 修复，"
-                "不要猜参数、不要错误包裹 helper 返回值）：\n"
-                + "\n\n---\n\n".join(relevant_cards[:6])
+                "\n\nE2E 修复相关工具 Snippets（下面是相关工具的正确用法；请按 snippet 修复，不要猜参数和返回结构）：\n"
+                + tool_snippet_prompt(snippets)
             )
 
 

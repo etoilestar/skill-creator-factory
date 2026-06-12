@@ -170,3 +170,34 @@ def test_tool_registration_flow_creates_function_card_and_registered_tool(tmp_pa
     assert registry.CUSTOM_TOOL_REGISTRY_PATH.exists()
 
     registry.clear_registered_tool_capabilities()
+
+
+def test_creator_tool_snippet_api_resolves_and_smoke_tests():
+    client = TestClient(app)
+
+    resolve_response = client.post(
+        "/api/creator/tools/resolve-snippets",
+        json={
+            "role": "pdf_builder",
+            "capabilities": ["pdf_generation"],
+            "tool_names": ["create_pdf"],
+            "failure_layer": "final_platform_output_value_invalid",
+            "error_text": "pdf_path exists but value is object",
+            "max_snippets": 2,
+        },
+    )
+    assert resolve_response.status_code == 200
+    body = resolve_response.json()
+    assert body["snippets"]
+    assert "create_pdf" in body["prompt_preview"]
+
+    snippets_response = client.get("/api/creator/tools/pdf_generation/snippets")
+    assert snippets_response.status_code == 200
+    snippets = snippets_response.json()["snippets"]
+    snippet_id = snippets[0]["id"]
+    assert snippets[0]["validation"]["success"] is True
+
+    test_response = client.post(f"/api/creator/tools/pdf_generation/snippets/{snippet_id}/test")
+    assert test_response.status_code == 200
+    assert test_response.json()["success"] is True
+    assert test_response.json()["side_effect_performed"] is False

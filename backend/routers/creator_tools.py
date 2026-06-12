@@ -11,6 +11,7 @@ from ..services.creator_tool_registry import (
     RESOURCE_ROLES,
     TOOL_OVERRIDE_PERSISTENCE,
     ToolCapability,
+    ToolSnippet,
     build_tool_manifest_draft,
     capabilities_for_role,
     generate_adapter_code,
@@ -20,9 +21,16 @@ from ..services.creator_tool_registry import (
     persist_registered_tools,
     register_tool_capability,
     set_tool_capability_override,
-    tool_status,
+    snippets_for_tool,
+    tool_snippet_prompt,
+    set_tool_snippets,
+    format_tool_snippet,
+    resolve_tool_snippets_for_context,
     validate_tool_manifest,
+    validate_tool_snippet,
+    tool_status,
     _capability_from_dict,
+    _snippet_from_dict,
 )
 
 router = APIRouter(prefix="/api/creator", tags=["creator-tools"])
@@ -64,6 +72,24 @@ class ToolManifestRequest(BaseModel):
 class ToolRegisterRequest(ToolManifestRequest):
     created_by: str = "user"
     enable: bool = False
+
+
+class ToolSnippetRequest(BaseModel):
+    snippet: dict[str, Any]
+
+
+class ToolSnippetPatchRequest(BaseModel):
+    snippet: dict[str, Any]
+
+
+class ToolSnippetResolveRequest(BaseModel):
+    role: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+    tool_names: list[str] = Field(default_factory=list)
+    file_path: str = ""
+    failure_layer: str | None = None
+    error_text: str | None = None
+    max_snippets: int = 5
 
 
 def _tool_or_404(name: str):
@@ -144,6 +170,95 @@ def disable_creator_tool(name: str) -> dict[str, Any]:
     if cap is None:
         raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
     return {"tool": tool_status(cap)}
+
+
+@router.post("/tools/resolve-snippets")
+def resolve_creator_tool_snippets(request: ToolSnippetResolveRequest) -> dict[str, Any]:
+    snippets = resolve_tool_snippets_for_context(
+        role=request.role,
+        capabilities=request.capabilities,
+        tool_names=request.tool_names,
+        file_path=request.file_path,
+        failure_layer=request.failure_layer,
+        error_text=request.error_text,
+        max_snippets=request.max_snippets,
+    )
+    return {"snippets": snippets, "prompt_preview": tool_snippet_prompt(snippets)}
+
+
+@router.get("/tools/{name}/snippets")
+def list_creator_tool_snippets(name: str) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    snippets = snippets_for_tool(cap)
+    return {
+        "tool": name,
+        "snippets": [{**snippet.__dict__, "formatted": format_tool_snippet(cap, snippet), "validation": validate_tool_snippet(cap, snippet)} for snippet in snippets],
+        "prompt_preview": tool_snippet_prompt([{"formatted": format_tool_snippet(cap, snippet)} for snippet in snippets]),
+    }
+
+
+@router.post("/tools/{name}/snippets")
+def create_creator_tool_snippet(name: str, request: ToolSnippetRequest) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    snippet = _snippet_from_dict(request.snippet)
+    validation = validate_tool_snippet(cap, snippet)
+    if not validation["success"]:
+        raise HTTPException(status_code=400, detail={"message": "snippet validation failed", "validation": validation})
+    current = [item for item in snippets_for_tool(cap) if item.id != snippet.id]
+    updated = set_tool_snippets(name, [*current, snippet])
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
+    if name not in {cap.name for cap in list_tool_capabilities() if cap.created_by == "system"}:
+        persist_registered_tools()
+    return {"tool": tool_status(updated), "snippet": {**snippet.__dict__, "formatted": format_tool_snippet(updated, snippet)}, "validation": validation}
+
+
+@router.patch("/tools/{name}/snippets/{snippet_id}")
+def update_creator_tool_snippet(name: str, snippet_id: str, request: ToolSnippetPatchRequest) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    payload = dict(request.snippet)
+    payload["id"] = payload.get("id") or snippet_id
+    snippet = _snippet_from_dict(payload)
+    validation = validate_tool_snippet(cap, snippet)
+    if not validation["success"]:
+        raise HTTPException(status_code=400, detail={"message": "snippet validation failed", "validation": validation})
+    current = [item for item in snippets_for_tool(cap) if item.id != snippet_id and item.id != snippet.id]
+    updated = set_tool_snippets(name, [*current, snippet])
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
+    if name not in {cap.name for cap in list_tool_capabilities() if cap.created_by == "system"}:
+        persist_registered_tools()
+    return {"tool": tool_status(updated), "snippet": {**snippet.__dict__, "formatted": format_tool_snippet(updated, snippet)}, "validation": validation}
+
+
+@router.delete("/tools/{name}/snippets/{snippet_id}")
+def delete_creator_tool_snippet(name: str, snippet_id: str) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    remaining = [item for item in snippets_for_tool(cap) if item.id != snippet_id]
+    if len(remaining) == len(snippets_for_tool(cap)):
+        raise HTTPException(status_code=404, detail=f"Unknown snippet: {snippet_id}")
+    updated = set_tool_snippets(name, remaining)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
+    if name not in {cap.name for cap in list_tool_capabilities() if cap.created_by == "system"}:
+        persist_registered_tools()
+    return {"tool": tool_status(updated), "snippets": [snippet.__dict__ for snippet in snippets_for_tool(updated)]}
+
+
+@router.post("/tools/{name}/snippets/{snippet_id}/test")
+def test_creator_tool_snippet(name: str, snippet_id: str) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    snippet = next((item for item in snippets_for_tool(cap) if item.id == snippet_id), None)
+    if snippet is None:
+        raise HTTPException(status_code=404, detail=f"Unknown snippet: {snippet_id}")
+    validation = validate_tool_snippet(cap, snippet)
+    return {
+        "success": validation["success"],
+        "dry_run": True,
+        "side_effect_performed": False,
+        "validation": validation,
+        "message": "Snippet smoke test performed static import/helper/contract checks only; no external side effects were executed.",
+    }
 
 
 @router.get("/tools/{name}")

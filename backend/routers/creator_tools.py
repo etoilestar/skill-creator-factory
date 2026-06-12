@@ -99,6 +99,7 @@ class ToolAuthorRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     live_test_result: dict[str, Any] | None = None
     allow_external_network: bool = False
+    authoring_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolRegisterRequest(ToolManifestRequest):

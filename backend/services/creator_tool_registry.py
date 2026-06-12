@@ -365,9 +365,76 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         trial_mode="none",
         validator_kind="resource",
     ),
+    "authoring_config_collector": ToolCapability(
+        name="authoring_config_collector",
+        display_name="Authoring 通用配置收集",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；收集 endpoint/base_url、认证、env/secret 引用、headers/query/body 模板和 sample input，不保存明文 secret。",
+    ),
+    "authoring_schema_infer": ToolCapability(
+        name="authoring_schema_infer",
+        display_name="Authoring Schema 推断",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；根据需求、配置和 sample input 推断输入/输出 schema 草案。",
+    ),
+    "authoring_live_test": ToolCapability(
+        name="authoring_live_test",
+        display_name="Authoring Live Test",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        allow_external_side_effect=True,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；在用户确认外部网络后执行一次通用 live_test。",
+    ),
+    "authoring_dependency_check": ToolCapability(
+        name="authoring_dependency_check",
+        display_name="Authoring 依赖检测",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；检测 adapter 计划所需 Python 依赖是否可 import。",
+    ),
+    "authoring_code_protocol_check": ToolCapability(
+        name="authoring_code_protocol_check",
+        display_name="Authoring 代码协议检查",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；静态检查 adapter 是否暴露 run/manifest function、env 读取和危险调用。",
+    ),
+    "authoring_file_output_check": ToolCapability(
+        name="authoring_file_output_check",
+        display_name="Authoring 文件输出协议检查",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；检查文件输出 schema 是否声明 file_paths/file_outputs 或 OUTPUT_DIR 约束。",
+    ),
 }
 
-RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
+RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset", "tool_authoring"})
 TOOL_OVERRIDE_PERSISTENCE = "process_memory"
 CUSTOM_TOOL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "tool_registry.custom.json"
 CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
@@ -381,6 +448,7 @@ _ALLOWED_SNIPPET_KINDS = {"minimal_usage", "multi_input_usage", "file_output_usa
 _ALLOWED_TOOL_TYPES = {
     "python_helper", "http_api", "local_command", "database_query",
     "file_converter", "document_generator", "image_generator", "custom_adapter",
+    "internal_authoring_tool",
 }
 _DANGEROUS_IMPORTS = {"subprocess", "shutil", "socket", "paramiko", "ftplib", "telnetlib"}
 _DANGEROUS_CALLS = {"eval", "exec", "compile", "open"}
@@ -1475,6 +1543,9 @@ def _plan_defaults() -> dict[str, Any]:
         "sample_input": {},
         "risk_notes": [],
         "model_notes": [],
+        "requires_authoring_tools": False,
+        "authoring_tool_plan": [],
+        "authoring_context": {},
     }
 
 
@@ -1562,7 +1633,14 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
     ready_live = tool_kind == "external_api" and not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
     live_success = bool((request.get("live_test_result") or {}).get("success"))
-    ready_code = bool(manifest) and not missing_fields and (tool_kind != "external_api" or live_success or request.get("skip_live_test") is True)
+    authoring_tool_plan: list[dict[str, Any]] = []
+    if tool_kind == "external_api" and missing_fields:
+        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要补充通用连接配置、secret/env 引用、请求模板和 sample input", "input": {"missing_fields": missing_fields, "config": config, "sample_input": sample}})
+    elif tool_kind == "external_api" and ready_live and not live_success and not request.get("skip_live_test"):
+        authoring_tool_plan.append({"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}})
+    if code_block.strip():
+        authoring_tool_plan.append({"tool_name": "authoring_schema_infer", "reason": "从现有代码推断输入输出 schema", "input": {"code_block": code_block}})
+    ready_code = bool(manifest) and not missing_fields and not authoring_tool_plan and (tool_kind != "external_api" or live_success or request.get("skip_live_test") is True)
     return {
         **_plan_defaults(),
         "needs_clarification": bool(questions),
@@ -1575,6 +1653,8 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         "requires_live_test": tool_kind == "external_api",
         "ready_for_live_test": ready_live,
         "ready_for_code_generation": ready_code,
+        "requires_authoring_tools": bool(authoring_tool_plan),
+        "authoring_tool_plan": authoring_tool_plan,
         "missing_fields": missing_fields,
         "suggested_config_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
         "sample_input_schema": {"type": "object", "description": "Sample payload used for live_test and adapter dynamic validation."},
@@ -1595,6 +1675,8 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["missing_fields"] = []
     if not isinstance(normalized.get("manifest"), dict):
         normalized["manifest"] = {}
+    if not isinstance(normalized.get("authoring_tool_plan"), list):
+        normalized["authoring_tool_plan"] = []
     if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
         normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
     if normalized["tool_kind"] == "external_api":
@@ -1609,12 +1691,19 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
             normalized["needs_clarification"] = True
             normalized["questions"] = normalized.get("questions") or fallback["questions"]
             normalized["ready_for_code_generation"] = False
+            if not normalized.get("authoring_tool_plan"):
+                normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
         elif not normalized.get("manifest"):
             normalized["manifest"] = fallback.get("manifest") or {}
         live_success = bool((request.get("live_test_result") or {}).get("success"))
+        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get("ready_for_live_test") and not request.get("skip_live_test"):
+            normalized["authoring_tool_plan"] = [{"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}}]
         normalized["ready_for_code_generation"] = bool(normalized.get("ready_for_code_generation")) and (live_success or request.get("skip_live_test") is True)
     elif not normalized.get("manifest"):
         normalized["manifest"] = fallback.get("manifest") or {}
+    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan")) or bool(normalized.get("requires_authoring_tools"))
+    if normalized["requires_authoring_tools"]:
+        normalized["ready_for_code_generation"] = False
     if (
         request.get("stage") == "draft"
         and not normalized.get("needs_clarification")
@@ -1928,6 +2017,170 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         "errors": [] if success else [f"HTTP {status_code}"],
     }
 
+AUTHORING_HELPER_NAMES = {
+    "authoring_config_collector",
+    "authoring_schema_infer",
+    "authoring_live_test",
+    "authoring_dependency_check",
+    "authoring_code_protocol_check",
+    "authoring_file_output_check",
+}
+
+
+def _secret_env_name_from_key(key: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", key or "TOOL_SECRET").strip("_").upper()
+    if not cleaned:
+        cleaned = "TOOL_SECRET"
+    if not any(token in cleaned for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        cleaned += "_SECRET"
+    return cleaned[:80]
+
+
+def _sanitize_authoring_config(value: Any, *, parent_key: str = "") -> tuple[Any, set[str]]:
+    env_refs: set[str] = set()
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            child, child_refs = _sanitize_authoring_config(item, parent_key=str(key))
+            env_refs.update(child_refs)
+            sanitized[key] = child
+        return sanitized, env_refs
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            child, child_refs = _sanitize_authoring_config(item, parent_key=parent_key)
+            env_refs.update(child_refs)
+            items.append(child)
+        return items, env_refs
+    if isinstance(value, str):
+        refs = _extract_env_refs(value)
+        env_refs.update(refs)
+        lowered_key = (parent_key or "").lower()
+        is_env_reference_field = lowered_key.endswith("_env") or lowered_key in {"secret_env", "secret_env_name", "api_key_env", "token_env", "username_env", "password_env"}
+        looks_secret_key = any(token in lowered_key for token in ("api_key", "apikey", "token", "password", "secret", "authorization"))
+        if is_env_reference_field:
+            return value, env_refs | ({value} if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) else set())
+        if looks_secret_key and value and not refs:
+            env_name = _secret_env_name_from_key(parent_key)
+            env_refs.add(env_name)
+            if "authorization" in lowered_key and value.lower().startswith("bearer "):
+                return f"Bearer ${{ENV:{env_name}}}", env_refs
+            return f"${{ENV:{env_name}}}", env_refs
+        return value, env_refs
+    return value, env_refs
+
+
+def _authoring_helper_result_context(context: dict[str, Any], tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(context or {})
+    results = dict(updated.get("tool_results") or {})
+    # Store only sanitized helper outputs. Secret values are redacted/replaced before this point.
+    results[tool_name] = result
+    updated["tool_results"] = results
+    if result.get("config"):
+        updated["config"] = result["config"]
+    if result.get("sample_input"):
+        updated["sample_input"] = result["sample_input"]
+    if result.get("schemas"):
+        updated["schemas"] = result["schemas"]
+    if result.get("live_test_result"):
+        updated["live_test_result"] = result["live_test_result"]
+    return updated
+
+
+def _config_collector_schema(missing_fields: list[str] | None = None) -> dict[str, Any]:
+    schema = _external_api_config_schema()
+    schema["properties"] = {
+        **schema.get("properties", {}),
+        "ip": {"type": "string"},
+        "port": {"type": "string"},
+        "api_key_env": {"type": "string", "description": "Environment variable name only; do not enter the secret value."},
+        "token_env": {"type": "string", "description": "Environment variable name only; do not enter the token value."},
+        "username_env": {"type": "string", "description": "Optional username env var name."},
+        "password_env": {"type": "string", "description": "Optional password env var name."},
+        "sample_input": {"type": "object"},
+    }
+    if missing_fields:
+        schema["missing_fields"] = missing_fields
+    return schema
+
+
+def run_authoring_helper(tool_name: str, input: dict[str, Any] | None, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one internal Tool Authoring helper and write its output into authoring context."""
+    normalized_name = _slug(tool_name)
+    cap = get_tool_capability(normalized_name)
+    if cap is None or cap.tool_type != "internal_authoring_tool" or normalized_name not in AUTHORING_HELPER_NAMES:
+        raise ValueError(f"authoring helper is not allowed: {tool_name}")
+    payload = dict(input or {})
+    ctx = dict(context or {})
+    result: dict[str, Any]
+    if normalized_name == "authoring_config_collector":
+        config = payload.get("config") if isinstance(payload.get("config"), dict) else ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
+        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
+        missing_fields = [str(item) for item in payload.get("missing_fields") or []]
+        if missing_fields:
+            result = {"success": False, "requires_input": True, "schema": _config_collector_schema(missing_fields), "message": "等待用户填写通用连接配置。"}
+        else:
+            sanitized_config, refs = _sanitize_authoring_config(config)
+            result = {"success": True, "requires_input": False, "config": sanitized_config, "sample_input": sample_input, "secret_env_suggestions": sorted(refs), "message": "配置已保存为 env/secret 引用。"}
+    elif normalized_name == "authoring_schema_infer":
+        code = str(payload.get("code_block") or ctx.get("code_block") or "")
+        input_schema, output_schema, notes = _infer_schema_from_code(code) if code.strip() else ({}, {}, [])
+        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
+        if sample_input and not input_schema:
+            input_schema = {key: {"type": type(value).__name__, "required": False, "description": "Inferred from sample_input."} for key, value in sample_input.items()}
+        expected = payload.get("expected_output_fields") or ((ctx.get("config") or {}).get("expected_output_fields") if isinstance(ctx.get("config"), dict) else [])
+        if expected and not output_schema:
+            output_schema = {str(key): {"type": "object", "description": "Expected output field confirmed during authoring."} for key in expected}
+        result = {"success": True, "schemas": {"input_schema": input_schema, "output_schema": output_schema}, "notes": notes}
+    elif normalized_name == "authoring_live_test":
+        if payload.get("allow_external_network") is not True and ctx.get("allow_external_network") is not True:
+            result = {"success": False, "requires_input": True, "schema": {"type": "object", "required": ["allow_external_network"], "properties": {"allow_external_network": {"type": "boolean", "const": True}}}, "message": "live_test 需要用户确认允许外部网络。"}
+        else:
+            live_request = {**ctx, **payload, "allow_external_network": True}
+            result = {"success": True, "requires_input": False, "live_test_result": live_test_tool(live_request)}
+            result["success"] = bool(result["live_test_result"].get("success"))
+    elif normalized_name == "authoring_dependency_check":
+        dependencies = [str(item) for item in payload.get("dependencies") or ctx.get("dependencies") or []]
+        missing = [dep for dep in dependencies if not _dependency_available(dep)]
+        result = {"success": not missing, "dependencies": dependencies, "missing_dependencies": missing}
+    elif normalized_name == "authoring_code_protocol_check":
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
+        adapter_code = str(payload.get("adapter_code") or ctx.get("adapter_code") or "")
+        errors = _author_adapter_static_errors(adapter_code, manifest) if adapter_code and manifest else ["adapter_code and manifest are required"]
+        result = {"success": not errors, "errors": errors}
+    elif normalized_name == "authoring_file_output_check":
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
+        output_schema = ((manifest.get("functions") or [{}])[0].get("output_schema") if isinstance(manifest, dict) else {}) or {}
+        has_file_contract = any(key in output_schema for key in ("file_paths", "file_outputs", "path", "output_path"))
+        result = {"success": has_file_contract, "has_file_contract": has_file_contract, "warnings": [] if has_file_contract else ["file output tools should declare file_paths/file_outputs or path/output_path"]}
+    else:
+        raise ValueError(f"unknown authoring helper: {tool_name}")
+    return {"tool_name": normalized_name, **result, "authoring_context": _authoring_helper_result_context(ctx, normalized_name, result)}
+
+
+def _run_authoring_tool_plan(plan: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    context = dict(request.get("authoring_context") or plan.get("authoring_context") or {})
+    context.update({
+        "config": request.get("config") or context.get("config") or {},
+        "sample_input": request.get("sample_input") or context.get("sample_input") or {},
+        "allow_external_network": request.get("allow_external_network") is True,
+        "manifest": request.get("manifest") or plan.get("manifest") or context.get("manifest") or {},
+        "code_block": request.get("code_block") or context.get("code_block") or "",
+    })
+    results: list[dict[str, Any]] = []
+    for item in plan.get("authoring_tool_plan") or []:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or "")
+        helper_input = item.get("input") if isinstance(item.get("input"), dict) else {}
+        result = run_authoring_helper(tool_name, helper_input, context)
+        results.append(result)
+        context = result.get("authoring_context") or context
+        if result.get("requires_input"):
+            break
+    updated = {**plan, "authoring_context": context, "authoring_tool_results": results, "ready_for_code_generation": False}
+    return updated, results
+
 
 def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
     needs_clarification = bool(plan.get("needs_clarification"))
@@ -1943,6 +2196,10 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "requires_live_test": bool(plan.get("requires_live_test")),
         "ready_for_live_test": bool(plan.get("ready_for_live_test")),
         "ready_for_code_generation": bool(plan.get("ready_for_code_generation")),
+        "requires_authoring_tools": bool(plan.get("requires_authoring_tools")),
+        "authoring_tool_plan": plan.get("authoring_tool_plan") or [],
+        "authoring_context": plan.get("authoring_context") or {},
+        "authoring_tool_results": plan.get("authoring_tool_results") or [],
         "missing_fields": plan.get("missing_fields") or [],
         "suggested_config_schema": plan.get("suggested_config_schema") or {},
         "sample_input_schema": plan.get("sample_input_schema") or {},
@@ -1979,6 +2236,7 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "config",
             "live_test_result",
             "allow_external_network",
+            "authoring_context",
         ]
     }
     planner_messages = [
@@ -1989,10 +2247,10 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "Return strict JSON with exactly this contract where possible: needs_clarification, questions, tool_kind "
                 "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
                 "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
-                "ready_for_code_generation, missing_fields, suggested_config_schema, sample_input_schema, manifest, "
+                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, missing_fields, suggested_config_schema, sample_input_schema, manifest, "
                 "implementation_plan. If ready_for_code_generation is false, the implementation generator will not be called. For external_api, "
                 "require endpoint/base_url/url, method, auth method, secret env name when needed, headers/query/body templates, "
-                "sample input, expected output fields, and explicit external network permission. Do not invent provider details."
+                "sample input, expected output fields, and explicit external network permission. If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
             ),
         },
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
@@ -2057,7 +2315,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         if validation.get("success"):
             messages = [
                 {"role": "system", "content": "You are text_model. Generate one strict JSON ToolSnippet only after adapter dynamic validation and human code confirmation. Do not include secrets."},
-                {"role": "user", "content": json.dumps({"final_manifest": manifest, "final_adapter_code": adapter_code[:20000], "live_test_result": request.get("live_test_result"), "dynamic_validation": validation, "confirmed_io": {"sample_input": request.get("sample_input") or {}, "input_description": request.get("input_description") or "", "output_description": request.get("output_description") or ""}}, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps({"final_manifest": manifest, "final_adapter_code": adapter_code[:20000], "live_test_result": request.get("live_test_result") or (request.get("authoring_context") or {}).get("live_test_result"), "authoring_context": request.get("authoring_context") or {}, "dynamic_validation": validation, "confirmed_io": {"sample_input": request.get("sample_input") or {}, "input_description": request.get("input_description") or "", "output_description": request.get("output_description") or ""}}, ensure_ascii=False)},
             ]
             model_json, ack, err = await _complete_author_model("text", messages, reason="creator_tool_author_finalize_snippet")
             if ack:
@@ -2074,6 +2332,9 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": request.get("sample_input") or {}, "validation": validation, "snippet": snippet, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
 
     plan = await _run_planner(request, model_notes, warnings)
+    if plan.get("requires_authoring_tools") or plan.get("authoring_tool_plan"):
+        plan, _helper_results = _run_authoring_tool_plan(plan, request)
+        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
     if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get("ready_for_code_generation"):
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
@@ -2090,7 +2351,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
                 "read secrets only with os.getenv(DECLARED_ENV_NAME), never payload.get('api_key'), and never print or return secrets. Include run(payload), manifest function wrapper, and JSON main()."
             ),
         },
-        {"role": "user", "content": json.dumps({"final_requirement": request.get("description") or "", "confirmed_config": request.get("config") or {}, "sample_input": sample_input, "live_test_result": request.get("live_test_result"), "manifest": manifest, "implementation_plan": plan.get("implementation_plan"), "adapter_protocol": "Expose run(payload: dict|None)->dict and the manifest function; dynamic validation runs with SKILL_TRIAL_RUN=1 and must not access real external services.", "code_block": code_block}, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps({"final_requirement": request.get("description") or "", "confirmed_config": request.get("config") or {}, "sample_input": sample_input, "live_test_result": request.get("live_test_result") or (plan.get("authoring_context") or {}).get("live_test_result"), "authoring_context": plan.get("authoring_context") or {}, "manifest": manifest, "implementation_plan": plan.get("implementation_plan"), "adapter_protocol": "Expose run(payload: dict|None)->dict and the manifest function; dynamic validation runs with SKILL_TRIAL_RUN=1 and must not access real external services.", "code_block": code_block}, ensure_ascii=False)},
     ]
     code_json, code_ack, code_err = await _complete_author_model("code", code_messages, reason=f"creator_tool_author_{mode}")
     if code_ack:
@@ -2138,6 +2399,17 @@ async def stream_author_tool(request: dict[str, Any]):
         elif action == "finalize":
             yield {"event": "step_started", "step": "validation", "message": "正在执行动态验证"}
         result = await author_tool(request)
+        for item in result.get("authoring_tool_plan") or []:
+            if isinstance(item, dict):
+                yield {"event": "tool_call_planned", "tool": item.get("tool_name"), "reason": item.get("reason") or ""}
+        for item in result.get("authoring_tool_results") or []:
+            if not isinstance(item, dict):
+                continue
+            tool_name = item.get("tool_name")
+            yield {"event": "tool_call_started", "tool": tool_name}
+            if item.get("requires_input"):
+                yield {"event": "tool_call_requires_input", "tool": tool_name, "schema": item.get("schema") or {}}
+            yield {"event": "tool_call_result", "tool": tool_name, "success": bool(item.get("success"))}
         if result.get("needs_clarification"):
             yield {"event": "clarification_required", "questions": result.get("questions") or []}
         if result.get("live_test_result"):

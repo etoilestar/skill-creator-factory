@@ -336,3 +336,62 @@ def test_validate_uses_temp_adapter_and_register_normalizes_adapter_path(monkeyp
     assert not evil_path.exists()
 
     registry.clear_registered_tool_capabilities()
+
+
+def test_internal_authoring_tools_are_registered_but_not_creator_available():
+    client = TestClient(app)
+
+    response = client.get("/api/creator/tools")
+
+    assert response.status_code == 200
+    tools = {tool["name"]: tool for tool in response.json()["tools"]}
+    assert tools["authoring_config_collector"]["tool_type"] == "internal_authoring_tool"
+    assert tools["authoring_config_collector"]["creator_available"] is False
+    assert "tool_authoring" in tools["authoring_config_collector"]["roles"]
+
+
+def test_run_authoring_helper_only_allows_internal_tools_and_sanitizes_secrets():
+    from backend.services.creator_tool_registry import run_authoring_helper
+
+    result = run_authoring_helper(
+        "authoring_config_collector",
+        {
+            "config": {
+                "method": "GET",
+                "url": "https://example.test/data",
+                "secret_env": "EXAMPLE_API_KEY",
+                "headers_template": {"Authorization": "Bearer plaintext-secret"},
+            },
+            "sample_input": {"query": "demo"},
+        },
+        {},
+    )
+
+    assert result["success"] is True
+    assert "plaintext-secret" not in json.dumps(result)
+    assert "${ENV:AUTHORIZATION_SECRET}" in json.dumps(result)
+    assert "EXAMPLE_API_KEY" in result["secret_env_suggestions"]
+    try:
+        run_authoring_helper("web_search", {}, {})
+    except ValueError as exc:
+        assert "not allowed" in str(exc)
+    else:
+        raise AssertionError("ordinary business tools must not be callable as authoring helpers")
+
+
+def test_authoring_planner_uses_internal_helper_before_code_generation(monkeypatch):
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={"action": "clarify", "description": "帮我写一个连接某个外部 API 查询数据的工具"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["requires_authoring_tools"] is True
+    assert body["authoring_tool_plan"][0]["tool_name"] == "authoring_config_collector"
+    assert body["authoring_tool_results"][0]["requires_input"] is True
+    assert body["adapter_code"] == ""
+    assert body["ready_for_code_generation"] is False

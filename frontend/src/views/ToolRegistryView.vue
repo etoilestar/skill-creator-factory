@@ -55,7 +55,7 @@
 
           <div class="step-actions">
             <button class="btn-ghost" :disabled="busy" @click="draftManifest">旧版规则草稿</button>
-            <button class="btn-primary" :disabled="busy" @click="authorDraft">智能生成工具草稿</button>
+            <button class="btn-primary" :disabled="busy" @click="authorDraft">开始通用 Authoring 流程</button>
           </div>
         </section>
 
@@ -68,13 +68,50 @@
             </div>
             <div class="heading-actions">
               <button class="btn-ghost" @click="activeStep = 'input'">返回需求</button>
-              <button class="btn-primary" :disabled="!parsedManifest" @click="activeStep = 'adapter'">继续到 Adapter</button>
+              <button class="btn-primary" :disabled="!canGenerate" @click="generateAdapter">生成工具代码</button>
             </div>
           </div>
-          <div v-if="clarificationQuestions.length" class="validation bad">
-            <strong>需要补充信息</strong>
-            <ul><li v-for="question in clarificationQuestions" :key="question">{{ question }}</li></ul>
+          <div v-if="statusMessage" class="compact-preview">{{ statusMessage }}</div>
+          <div v-if="clarificationQuestions.length" class="validation bad clarify-card">
+            <strong>还需要补充：</strong>
+            <label v-for="(question, idx) in clarificationQuestions" :key="question">
+              {{ idx + 1 }}. {{ question }}
+              <textarea v-model="clarificationAnswers[idx]" placeholder="填写补充信息后点击继续规划"></textarea>
+            </label>
+            <div class="actions"><button class="btn-primary" :disabled="busy" @click="continuePlanning">继续规划</button></div>
           </div>
+
+          <div v-if="requiresConfig" class="split-layout">
+            <div class="pane">
+              <h3>通用配置面板</h3>
+              <p class="muted small">不针对任何服务商硬编码；只填写 endpoint、method、认证、模板、sample input 和期望输出。</p>
+              <div class="form-row relaxed">
+                <label>工具类型<input :value="planState.tool_kind || 'external_api'" readonly /></label>
+                <label>operation<input v-model="planState.operation" placeholder="查询数据 / 创建记录等" /></label>
+              </div>
+              <SmartCodeEditor v-model="configText" language="json" density="compact" min-height="260px" max-height="520px" />
+              <label class="inline-check"><input v-model="allowExternalNetwork" type="checkbox" /> 允许本次 live_test 访问外部网络</label>
+              <div v-if="planState.missing_fields?.length" class="validation bad"><strong>缺少字段</strong><ul><li v-for="field in planState.missing_fields" :key="field">{{ field }}</li></ul></div>
+              <div class="actions">
+                <button class="btn-ghost" :disabled="busy" @click="continuePlanning">保存配置并继续规划</button>
+                <button class="btn-primary" :disabled="busy || !planState.ready_for_live_test" @click="runLiveTest">测试连接 / 试用工具</button>
+              </div>
+            </div>
+            <div class="pane">
+              <h3>Live Test Preview</h3>
+              <div v-if="liveTestResult" class="validation" :class="liveTestResult.success ? 'ok' : 'bad'">
+                <strong>{{ liveTestResult.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
+                <pre class="tool-card">{{ JSON.stringify(liveTestResult.normalized_preview || liveTestResult.preview || liveTestResult.errors, null, 2) }}</pre>
+              </div>
+              <p v-else class="muted small">live_test 会真实请求外部服务；dynamic validation 之后只用 SKILL_TRIAL_RUN=1，不访问真实外部服务。</p>
+            </div>
+          </div>
+
+          <div class="stream-status">
+            <div><strong>生成进度 / 日志</strong><small>长耗时步骤会持续写入事件。</small></div>
+            <button v-if="busy" class="btn-ghost" @click="cancelAuthoring">取消当前生成</button>
+          </div>
+          <pre v-if="authorLogs.length" class="tool-card log-panel">{{ authorLogs.map(item => `${item.time} ${item.event || ''} ${item.step || ''} ${item.message || item.summary || ''}`).join('\n') }}</pre>
           <SmartCodeEditor v-model="manifestText" language="json" fill placeholder="Planner 生成的 manifest JSON" />
         </section>
 
@@ -86,7 +123,7 @@
               <p class="muted small">确认或编辑最终 Python adapter。Finalize 会重新跑 dynamic trial，通过后才生成 snippet。</p>
             </div>
             <div class="heading-actions">
-              <button class="btn-ghost" :disabled="busy || !parsedManifest" @click="generateCode">旧版生成实现</button>
+              <button class="btn-ghost" :disabled="busy || !canGenerate" @click="generateAdapter">重新生成实现</button>
               <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
             </div>
           </div>
@@ -214,13 +251,13 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import CollapsiblePanel from '../components/CollapsiblePanel.vue'
 import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
-import { authorCreatorTool, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
+import { authorCreatorTool, authorCreatorToolStream, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, liveTestCreatorTool, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
 
 const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
 const snippetKinds = ['minimal_usage', 'multi_input_usage', 'file_output_usage', 'batch_usage', 'error_repair_usage', 'anti_pattern', 'trial_run_usage']
 const steps = [
   { key: 'input', index: 1, title: '需求 / 代码', description: '描述能力' },
-  { key: 'planner', index: 2, title: 'Manifest', description: '确认定义' },
+  { key: 'planner', index: 2, title: '澄清 / 配置', description: '补齐定义' },
   { key: 'adapter', index: 3, title: 'Adapter', description: '确认代码' },
   { key: 'validation', index: 4, title: '验证', description: '试运行' },
   { key: 'snippet', index: 5, title: 'Snippet', description: '确认用法' },
@@ -234,6 +271,23 @@ const adapterCode = ref('')
 const optionalCodeBlock = ref('')
 const snippetText = ref('{}')
 const clarificationQuestions = ref([])
+const clarificationAnswers = ref([])
+const planState = ref({})
+const configText = ref(`{
+  "method": "GET",
+  "url": "",
+  "auth_type": "none",
+  "secret_env": "",
+  "headers_template": {},
+  "query_template": {},
+  "json_body_template": {},
+  "expected_output_fields": []
+}`)
+const liveTestResult = ref(null)
+const allowExternalNetwork = ref(false)
+const statusMessage = ref('')
+const authorLogs = ref([])
+const streamController = ref(null)
 const authorStage = ref('draft')
 const activeStep = ref('input')
 const codeInputOpen = ref(false)
@@ -260,25 +314,34 @@ const expandedPanels = reactive({ input: true, planner: false, adapter: false, v
 const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
+const parsedConfig = computed(() => { try { return configText.value ? JSON.parse(configText.value) : {} } catch { return {} } })
+const requiresConfig = computed(() => planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
+const canGenerate = computed(() => !busy.value && (planState.value?.ready_for_code_generation || (!requiresConfig.value && parsedManifest.value)) && (!planState.value?.requires_live_test || liveTestResult.value?.success || planState.value?.ready_for_code_generation))
 const cardPreview = computed(() => (lastValidation.value?.tool_card_preview || []).join('\n\n---\n\n') || '验证后展示 Creator prompt 注入的 function card。')
 const snippetPreview = computed(() => snippets.value.map(snippet => snippet.formatted || '').join('\n\n---\n\n') || '选择工具后展示 Creator 会看到的 Tool Snippet。')
 const snippetReady = computed(() => snippetText.value && snippetText.value.trim() !== '{}')
 const advancedBadge = computed(() => [form.tool_name && 'name', allowedRolesText.value && 'roles', form.needs_secret && 'secret', form.needs_external_network && 'network', form.generates_file && 'file', form.high_risk && 'risk'].filter(Boolean).join(' · '))
 
 function stepStatus(key) {
-  if (key === 'planner' && parsedManifest.value) return 'ok'
+  if (key === 'planner' && (parsedManifest.value || clarificationQuestions.value.length || requiresConfig.value)) return clarificationQuestions.value.length ? 'bad' : 'ok'
   if (key === 'adapter' && adapterCode.value) return 'ok'
   if (key === 'validation' && lastValidation.value) return lastValidation.value.success ? 'ok' : 'bad'
   if (key === 'snippet' && snippetReady.value) return 'ok'
   return ''
 }
-async function run(task) { busy.value = true; error.value = ''; try { await task() } catch (e) { error.value = e.message || String(e) } finally { busy.value = false } }
+async function run(task) { busy.value = true; error.value = ''; try { await task() } catch (e) { error.value = e.message || String(e) } finally { busy.value = false; statusMessage.value = '' } }
+function logAuthor(event) { const helperMessages = { tool_call_planned: `正在分析需要辅助工具：${event.tool || ''} ${event.reason || ''}`, tool_call_started: `正在调用${event.tool || '辅助工具'}...`, tool_call_requires_input: `等待用户填写${event.tool || '辅助工具'}配置...`, tool_call_result: `${event.tool || '辅助工具'}${event.success ? '完成，继续生成 adapter...' : '需要补充信息或执行失败'}` }; const message = event.message || helperMessages[event.event] || ''; authorLogs.value.push({ time: new Date().toLocaleTimeString(), ...event, message }); if (authorLogs.value.length > 80) authorLogs.value.shift(); if (message) statusMessage.value = message }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
-function authorPayload(stage) { return { ...payload(), stage, code_block: optionalCodeBlock.value || (stage === 'draft' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value } }
+function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ question, answer: clarificationAnswers.value[idx] || '' })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; clarificationQuestions.value = data.questions || []; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
-function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('draft')); authorStage.value = 'draft'; clarificationQuestions.value = data.questions || []; manifestText.value = JSON.stringify(data.manifest || {}, null, 2); sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || null; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; activeStep.value = data.needs_clarification ? 'planner' : 'adapter' }) }
-function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; lastValidation.value = data.validation || lastValidation.value; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
+function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
+function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
+function generateAdapter() { return run(async () => { adapterCode.value = ''; authorLogs.value = []; streamController.value = new AbortController(); for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) { logAuthor(event); if (event.event === 'model_delta') adapterCode.value += event.delta || ''; if (event.event === 'final_result') applyAuthorResult(event); } activeStep.value = 'adapter' }) }
+function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
+function runLiveTest() { return run(async () => { statusMessage.value = '正在测试连接'; const data = await liveTestCreatorTool(authorPayload('live_test')); applyAuthorResult(data); authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: data.live_test_result?.success }); activeStep.value = 'planner' }) }
+function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; applyAuthorResult(data); if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; activeStep.value = 'adapter' }) }
 function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }); activeStep.value = 'validation' }) }
 function buildFinalManifestForRegister() { const manifest = { ...(parsedManifest.value || {}) }; const snippet = parseJsonText(snippetText.value); if (snippet && Object.keys(snippet).length) manifest.snippets = [snippet]; return manifest }
@@ -332,14 +395,14 @@ h1 { font-size: 26px; margin: 2px 0 6px; } h2 { font-size: 20px; margin: 0 0 4px
 .form-row.relaxed { gap: 18px; }
 label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted); min-width: 0; }
 .checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-.checks label { flex-direction: row; align-items: center; } .checks input { width: auto; }
+.checks label, .inline-check { flex-direction: row; align-items: center; } .checks input, .inline-check input { width: auto; } textarea { min-height: 76px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); padding: 10px; }
 .actions, .step-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: flex-end; }
 .step-actions { margin: 8px 0 0; padding: 0; background: transparent; border: 0; position: static; }
 .small { font-size: 12px; }
 .validation, .compact-preview { padding: 12px; border-radius: var(--radius); border: 1px solid var(--border); }
 .validation.ok, .compact-preview { border-color: var(--success); } .validation.bad { border-color: var(--danger); }
 .warn { color: #f6c177; }
-.tool-card { white-space: pre-wrap; overflow: auto; max-height: 360px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.tool-card { white-space: pre-wrap; overflow: auto; max-height: 360px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; } .log-panel { max-height: 180px; } .stream-status { display: flex; justify-content: space-between; gap: 12px; align-items: center; } .clarify-card { display: grid; gap: 12px; }
 .tool-list, .snippets-list { display: grid; gap: 12px; }
 .tool-list-item { border: 1px solid var(--border); border-radius: 14px; padding: 14px; background: var(--surface2); display: grid; gap: 8px; }
 .tool-list-main { display: grid; gap: 2px; }

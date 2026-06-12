@@ -20,6 +20,9 @@ import json
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Literal
 
@@ -362,9 +365,76 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         trial_mode="none",
         validator_kind="resource",
     ),
+    "authoring_config_collector": ToolCapability(
+        name="authoring_config_collector",
+        display_name="Authoring 通用配置收集",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；收集 endpoint/base_url、认证、env/secret 引用、headers/query/body 模板和 sample input，不保存明文 secret。",
+    ),
+    "authoring_schema_infer": ToolCapability(
+        name="authoring_schema_infer",
+        display_name="Authoring Schema 推断",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；根据需求、配置和 sample input 推断输入/输出 schema 草案。",
+    ),
+    "authoring_live_test": ToolCapability(
+        name="authoring_live_test",
+        display_name="Authoring Live Test",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        allow_external_side_effect=True,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；在用户确认外部网络后执行一次通用 live_test。",
+    ),
+    "authoring_dependency_check": ToolCapability(
+        name="authoring_dependency_check",
+        display_name="Authoring 依赖检测",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；检测 adapter 计划所需 Python 依赖是否可 import。",
+    ),
+    "authoring_code_protocol_check": ToolCapability(
+        name="authoring_code_protocol_check",
+        display_name="Authoring 代码协议检查",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；静态检查 adapter 是否暴露 run/manifest function、env 读取和危险调用。",
+    ),
+    "authoring_file_output_check": ToolCapability(
+        name="authoring_file_output_check",
+        display_name="Authoring 文件输出协议检查",
+        category="authoring",
+        roles=["tool_authoring"],
+        allow_creator_use=False,
+        tool_type="internal_authoring_tool",
+        validator_kind="internal_authoring_tool",
+        usage_policy="helper_required",
+        prompt_guidance="仅 Tool Authoring 流程可调用；检查文件输出 schema 是否声明 file_paths/file_outputs 或 OUTPUT_DIR 约束。",
+    ),
 }
 
-RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
+RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset", "tool_authoring"})
 TOOL_OVERRIDE_PERSISTENCE = "process_memory"
 CUSTOM_TOOL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "tool_registry.custom.json"
 CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
@@ -378,6 +448,7 @@ _ALLOWED_SNIPPET_KINDS = {"minimal_usage", "multi_input_usage", "file_output_usa
 _ALLOWED_TOOL_TYPES = {
     "python_helper", "http_api", "local_command", "database_query",
     "file_converter", "document_generator", "image_generator", "custom_adapter",
+    "internal_authoring_tool",
 }
 _DANGEROUS_IMPORTS = {"subprocess", "shutil", "socket", "paramiko", "ftplib", "telnetlib"}
 _DANGEROUS_CALLS = {"eval", "exec", "compile", "open"}
@@ -1139,6 +1210,11 @@ def _build_file(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     \"\"\"{fn.short_description}\"\"\"
     payload = dict(payload or {{}})
+    if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\":
+        mock_result: dict[str, Any] = {{\"result\": {{\"ok\": True, \"trial_run\": True, \"payload_keys\": sorted(payload.keys())}}}}
+        for key in OUTPUT_KEYS:
+            mock_result.setdefault(key, [] if key.endswith(\"s\") else {{\"ok\": True, \"trial_run\": True}})
+        return mock_result
     result: dict[str, Any] = {{\"result\": {{\"ok\": True, \"payload_keys\": sorted(payload.keys())}}}}
     wants_file = any(key in OUTPUT_KEYS for key in (\"file_paths\", \"file_outputs\", \"path\", \"output_path\"))
     if wants_file:
@@ -1443,38 +1519,218 @@ def _first_function_name(code: str) -> str:
     return "run"
 
 
+def _has_config_value(config: dict[str, Any], *keys: str) -> bool:
+    return any(config.get(key) not in (None, "", {}, []) for key in keys)
+
+
+def _plan_defaults() -> dict[str, Any]:
+    return {
+        "needs_clarification": False,
+        "questions": [],
+        "tool_kind": "unknown",
+        "operation": "",
+        "requires_secret": False,
+        "secret_env_suggestions": [],
+        "requires_external_network": False,
+        "requires_live_test": False,
+        "ready_for_live_test": False,
+        "ready_for_code_generation": False,
+        "missing_fields": [],
+        "suggested_config_schema": {},
+        "sample_input_schema": {},
+        "manifest": {},
+        "implementation_plan": "",
+        "sample_input": {},
+        "risk_notes": [],
+        "model_notes": [],
+        "requires_authoring_tools": False,
+        "authoring_tool_plan": [],
+        "authoring_context": {},
+    }
+
+
+def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str, Any], request: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not _has_config_value(config, "url", "endpoint", "base_url"):
+        missing.append("endpoint / base_url / url")
+    if not _has_config_value(config, "method"):
+        missing.append("method")
+    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
+    has_secret_ref = bool(_extract_env_refs(config)) or _has_config_value(config, "secret_env", "secret_env_name")
+    if not auth_type:
+        missing.append("认证方式（无认证也请填写 none）")
+    elif auth_type not in {"none", "no_auth", "anonymous"} and not has_secret_ref:
+        missing.append("secret env 名称")
+    if not any(isinstance(config.get(key), dict) for key in ("headers_template", "query_template", "json_body_template", "body_template")):
+        missing.append("headers/body/query 参数模板")
+    if not sample_input:
+        missing.append("sample input")
+    if not (request.get("output_description") or config.get("expected_output_fields") or config.get("output_schema") or request.get("output_schema")):
+        missing.append("期望输出字段")
+    if request.get("allow_external_network") is not True and config.get("allow_external_network") is not True:
+        missing.append("是否允许外部网络")
+    return missing
+
+
+def _infer_tool_kind(request: dict[str, Any]) -> str:
+    explicit = str(request.get("tool_kind") or "").strip()
+    if explicit:
+        return explicit
+    text = " ".join(str(request.get(key) or "") for key in ("description", "tool_type", "operation")).lower()
+    if any(token in text for token in ("api", "http", "https://", "接口", "endpoint", "base_url")) or request.get("needs_external_network"):
+        return "external_api"
+    if request.get("generates_file"):
+        return "file_generator"
+    if any(token in text for token in ("transform", "转换", "normalize", "清洗")):
+        return "data_transform"
+    if request.get("code_block"):
+        return "local_helper"
+    return "unknown"
+
+
 def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     code_block = str(request.get("code_block") or "")
     code_input_schema, code_output_schema, notes = _infer_schema_from_code(code_block) if code_block.strip() else ({}, {}, [])
     merged = dict(request)
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else {}
     if code_input_schema and not merged.get("input_schema"):
         merged["input_schema"] = code_input_schema
     if code_output_schema and not merged.get("output_schema"):
         merged["output_schema"] = code_output_schema
+    tool_kind = _infer_tool_kind(request)
+    requires_network = tool_kind == "external_api" or bool(request.get("needs_external_network"))
+    requires_secret = bool(request.get("needs_secret") or _extract_env_refs(config) or config.get("secret_env") or config.get("secret_env_name"))
+    missing_fields: list[str] = []
+    questions: list[str] = []
+    if tool_kind == "external_api":
+        missing_fields = _external_api_missing_fields(config, sample, request)
+        if missing_fields:
+            questions = [
+                "请补充通用外部 API 配置：endpoint/base_url/url、method、认证方式、secret env 名称（如需要）、headers/query/body 模板。",
+                "请补充 sample input、期望输出字段，并确认是否允许外部网络。",
+            ]
+    elif tool_kind == "unknown" and not (request.get("tool_name") and (request.get("description") or code_block.strip())):
+        missing_fields = ["tool_name", "description or code_block"]
+        questions = ["请说明工具要完成的操作、输入字段、输出字段，以及是否需要文件/网络/密钥。"]
+
     if request.get("manifest"):
         manifest = dict(request["manifest"])
+    elif tool_kind == "external_api" and missing_fields:
+        manifest = {}
     else:
-        manifest = build_tool_manifest_draft(merged)
-    description = str(request.get("description") or "").lower()
-    ambiguous_api = ("接口" in description or "api" in description or "http" in description) and not (
-        request.get("needs_external_network") or "http://" in code_block or "https://" in code_block or request.get("required_env") or request.get("required_secrets")
-    )
-    questions = []
-    if ambiguous_api:
-        questions = ["请提供接口地址、认证方式、请求字段和期望输出字段。", "该工具是否允许外部网络访问和 secret？"]
-    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else {}
-    if not sample:
+        manifest_seed = dict(merged)
+        if tool_kind == "external_api":
+            manifest_seed["needs_external_network"] = True
+            if requires_secret:
+                refs = _extract_env_refs(config)
+                manifest_seed["required_secrets"] = sorted(refs) or [str(config.get("secret_env") or config.get("secret_env_name") or "TOOL_API_KEY")]
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed["input_schema"] = request.get("input_schema") or {"payload": {"type": "object", "required": True, "description": "Fields used to render the confirmed request templates."}}
+            manifest_seed["output_schema"] = request.get("output_schema") or {"result": {"type": "object", "description": str(request.get("output_description") or "Normalized external API response.")}}
+        manifest = build_tool_manifest_draft(manifest_seed)
+    if not sample and tool_kind != "external_api":
         sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
+    ready_live = tool_kind == "external_api" and not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
+    live_success = bool((request.get("live_test_result") or {}).get("success"))
+    authoring_tool_plan: list[dict[str, Any]] = []
+    if tool_kind == "external_api" and missing_fields:
+        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要补充通用连接配置、secret/env 引用、请求模板和 sample input", "input": {"missing_fields": missing_fields, "config": config, "sample_input": sample}})
+    elif tool_kind == "external_api" and ready_live and not live_success and not request.get("skip_live_test"):
+        authoring_tool_plan.append({"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}})
+    if code_block.strip():
+        authoring_tool_plan.append({"tool_name": "authoring_schema_infer", "reason": "从现有代码推断输入输出 schema", "input": {"code_block": code_block}})
+    ready_code = bool(manifest) and not missing_fields and not authoring_tool_plan and (tool_kind != "external_api" or live_success or request.get("skip_live_test") is True)
     return {
+        **_plan_defaults(),
         "needs_clarification": bool(questions),
         "questions": questions,
+        "tool_kind": tool_kind,
+        "operation": str(request.get("operation") or request.get("description") or ""),
+        "requires_secret": requires_secret,
+        "secret_env_suggestions": sorted(_extract_env_refs(config)) or ([str(config.get("secret_env") or config.get("secret_env_name"))] if config.get("secret_env") or config.get("secret_env_name") else []),
+        "requires_external_network": requires_network,
+        "requires_live_test": tool_kind == "external_api",
+        "ready_for_live_test": ready_live,
+        "ready_for_code_generation": ready_code,
+        "requires_authoring_tools": bool(authoring_tool_plan),
+        "authoring_tool_plan": authoring_tool_plan,
+        "missing_fields": missing_fields,
+        "suggested_config_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
+        "sample_input_schema": {"type": "object", "description": "Sample payload used for live_test and adapter dynamic validation."},
         "manifest": manifest,
-        "implementation_plan": "Normalize existing code_block while preserving business logic." if code_block.strip() else "Generate a complete Python adapter from the manifest.",
+        "implementation_plan": "Use confirmed configuration only. For external APIs, read secrets from environment variables, return a deterministic mock when SKILL_TRIAL_RUN=1, and never put secrets in payload, logs, manifest, adapter, or snippet." if tool_kind == "external_api" else ("Normalize existing code_block while preserving business logic." if code_block.strip() else "Generate a complete Python adapter from the manifest."),
         "sample_input": sample,
         "risk_notes": notes,
         "model_notes": ["deterministic fallback planner used", *notes],
     }
 
+
+def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    normalized = {**_plan_defaults(), **(plan if isinstance(plan, dict) else {})}
+    fallback = _author_fallback_plan(request)
+    if not isinstance(normalized.get("questions"), list):
+        normalized["questions"] = []
+    if not isinstance(normalized.get("missing_fields"), list):
+        normalized["missing_fields"] = []
+    if not isinstance(normalized.get("manifest"), dict):
+        normalized["manifest"] = {}
+    if not isinstance(normalized.get("authoring_tool_plan"), list):
+        normalized["authoring_tool_plan"] = []
+    if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
+        normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
+    if normalized["tool_kind"] == "external_api":
+        config = request.get("config") if isinstance(request.get("config"), dict) else {}
+        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+        missing = _external_api_missing_fields(config, sample, request)
+        normalized["requires_external_network"] = True
+        normalized["requires_live_test"] = True
+        normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
+        normalized["missing_fields"] = sorted(set(normalized.get("missing_fields") or []) | set(missing))
+        if missing:
+            normalized["needs_clarification"] = True
+            normalized["questions"] = normalized.get("questions") or fallback["questions"]
+            normalized["ready_for_code_generation"] = False
+            if not normalized.get("authoring_tool_plan"):
+                normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
+        elif not normalized.get("manifest"):
+            normalized["manifest"] = fallback.get("manifest") or {}
+        live_success = bool((request.get("live_test_result") or {}).get("success"))
+        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get("ready_for_live_test") and not request.get("skip_live_test"):
+            normalized["authoring_tool_plan"] = [{"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}}]
+        normalized["ready_for_code_generation"] = bool(normalized.get("ready_for_code_generation")) and (live_success or request.get("skip_live_test") is True)
+    elif not normalized.get("manifest"):
+        normalized["manifest"] = fallback.get("manifest") or {}
+    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan")) or bool(normalized.get("requires_authoring_tools"))
+    if normalized["requires_authoring_tools"]:
+        normalized["ready_for_code_generation"] = False
+    if (
+        request.get("stage") == "draft"
+        and not normalized.get("needs_clarification")
+        and normalized.get("manifest")
+        and normalized.get("tool_kind") != "external_api"
+        and not normalized.get("ready_for_code_generation")
+        and "ready_for_code_generation" not in (plan or {})
+    ):
+        normalized["ready_for_code_generation"] = True
+    return normalized
+
+
+def _external_api_config_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["method", "url", "auth_type", "headers_template", "query_template", "json_body_template"],
+        "properties": {
+            "method": {"type": "string", "examples": ["GET", "POST"]},
+            "url": {"type": "string", "description": "Full endpoint URL or rendered URL template."},
+            "auth_type": {"type": "string", "description": "none, bearer, api_key, basic, custom, etc."},
+            "secret_env": {"type": "string", "description": "Environment variable name for the secret, never the secret value."},
+            "headers_template": {"type": "object"},
+            "query_template": {"type": "object"},
+            "json_body_template": {"type": "object"},
+            "expected_output_fields": {"type": "array"},
+        },
+    }
 
 def _strip_code_fence(text: str) -> str:
     raw = (text or "").strip()
@@ -1628,15 +1884,425 @@ def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) ->
     }
 
 
+_ENV_REF_RE = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
+_INPUT_REF_RE = re.compile(r"\$\{(?:input|payload)\.([A-Za-z0-9_.-]+)\}")
+
+
+def _extract_env_refs(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(value, str):
+        refs.update(_ENV_REF_RE.findall(value))
+    elif isinstance(value, dict):
+        for item in value.values():
+            refs.update(_extract_env_refs(item))
+    elif isinstance(value, list):
+        for item in value:
+            refs.update(_extract_env_refs(item))
+    return refs
+
+
+def _redact_secrets(value: Any, secret_values: set[str] | None = None) -> Any:
+    secret_values = {item for item in (secret_values or set()) if item}
+    if isinstance(value, str):
+        redacted = value
+        for secret in secret_values:
+            redacted = redacted.replace(secret, "***")
+        if _ENV_REF_RE.search(redacted):
+            return _ENV_REF_RE.sub("${ENV:***}", redacted)
+        return redacted
+    if isinstance(value, dict):
+        return {key: _redact_secrets(item, secret_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(item, secret_values) for item in value]
+    return value
+
+
+def _get_by_path(payload: dict[str, Any], path: str) -> Any:
+    current: Any = payload
+    for part in path.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return ""
+    return current
+
+
+def _render_template(value: Any, sample_input: dict[str, Any], secret_values: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def env_replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            return secret_values.get(name, "")
+
+        def input_replace(match: re.Match[str]) -> str:
+            resolved = _get_by_path(sample_input, match.group(1))
+            return str(resolved if resolved is not None else "")
+
+        return _INPUT_REF_RE.sub(input_replace, _ENV_REF_RE.sub(env_replace, value))
+    if isinstance(value, dict):
+        return {key: _render_template(item, sample_input, secret_values) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_render_template(item, sample_input, secret_values) for item in value]
+    return value
+
+
+def _normalized_preview(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        keys = sorted(str(key) for key in data.keys())
+        return {"type": "object", "keys": keys[:50], "preview": {key: data[key] for key in list(data.keys())[:10]}}
+    if isinstance(data, list):
+        return {"type": "array", "length": len(data), "first_item": data[0] if data else None}
+    return {"type": type(data).__name__, "value": data}
+
+
+def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
+    """Perform one generic external API probe without generating or registering code."""
+    if request.get("allow_external_network") is not True:
+        return {"success": False, "status": "blocked", "errors": ["allow_external_network must be true for live_test"], "preview": None, "normalized_preview": None}
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+    env_refs = _extract_env_refs(config)
+    missing_env = sorted(name for name in env_refs if not os.environ.get(name))
+    if missing_env:
+        return {"success": False, "status": "missing_secret", "errors": ["missing required env secret(s): " + ", ".join(missing_env)], "missing_env": missing_env, "preview": None, "normalized_preview": None}
+    secret_values = {name: os.environ.get(name, "") for name in env_refs}
+    method = str(config.get("method") or "GET").upper()
+    url = str(config.get("url") or config.get("endpoint") or "")
+    if not url:
+        base = str(config.get("base_url") or "").rstrip("/")
+        path = str(config.get("path") or "").lstrip("/")
+        url = f"{base}/{path}" if base and path else base
+    url = _render_template(url, sample_input, secret_values)
+    if not url.startswith(("http://", "https://")):
+        return {"success": False, "status": "invalid_config", "errors": ["live_test url must start with http:// or https://"], "preview": None, "normalized_preview": None}
+    headers = _render_template(config.get("headers_template") or config.get("headers") or {}, sample_input, secret_values)
+    query = _render_template(config.get("query_template") or config.get("params_template") or {}, sample_input, secret_values)
+    body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template", {})
+    json_body = _render_template(body_template or {}, sample_input, secret_values)
+    if isinstance(query, dict) and query:
+        parsed = urllib.parse.urlsplit(url)
+        merged_query = urllib.parse.urlencode({**dict(urllib.parse.parse_qsl(parsed.query)), **query}, doseq=True)
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, merged_query, parsed.fragment))
+    data: bytes | None = None
+    if method not in {"GET", "HEAD"}:
+        data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+        headers = {**headers, "Content-Type": headers.get("Content-Type") or headers.get("content-type") or "application/json"}
+    timeout = float(config.get("timeout_seconds") or os.environ.get("TOOL_AUTHOR_LIVE_TEST_TIMEOUT_SECONDS", "20"))
+    req = urllib.request.Request(url=url, data=data, method=method, headers={str(k): str(v) for k, v in (headers or {}).items()})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(int(config.get("max_preview_bytes") or 65536))
+            status_code = int(resp.status)
+            content_type = resp.headers.get("content-type", "")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(65536)
+        status_code = int(exc.code)
+        content_type = exc.headers.get("content-type", "") if exc.headers else ""
+    except Exception as exc:
+        return {"success": False, "status": "request_failed", "errors": [str(exc)], "preview": None, "normalized_preview": None}
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        preview: Any = json.loads(text)
+    except Exception:
+        preview = text[:4000]
+    redacted_preview = _redact_secrets(preview, set(secret_values.values()))
+    success = 200 <= status_code < 400
+    return {
+        "success": success,
+        "status": "ok" if success else "http_error",
+        "status_code": status_code,
+        "content_type": content_type,
+        "preview": redacted_preview,
+        "normalized_preview": _normalized_preview(redacted_preview),
+        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None},
+        "errors": [] if success else [f"HTTP {status_code}"],
+    }
+
+AUTHORING_HELPER_NAMES = {
+    "authoring_config_collector",
+    "authoring_schema_infer",
+    "authoring_live_test",
+    "authoring_dependency_check",
+    "authoring_code_protocol_check",
+    "authoring_file_output_check",
+}
+
+
+def _secret_env_name_from_key(key: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", key or "TOOL_SECRET").strip("_").upper()
+    if not cleaned:
+        cleaned = "TOOL_SECRET"
+    if not any(token in cleaned for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        cleaned += "_SECRET"
+    return cleaned[:80]
+
+
+def _sanitize_authoring_config(value: Any, *, parent_key: str = "") -> tuple[Any, set[str]]:
+    env_refs: set[str] = set()
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            child, child_refs = _sanitize_authoring_config(item, parent_key=str(key))
+            env_refs.update(child_refs)
+            sanitized[key] = child
+        return sanitized, env_refs
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            child, child_refs = _sanitize_authoring_config(item, parent_key=parent_key)
+            env_refs.update(child_refs)
+            items.append(child)
+        return items, env_refs
+    if isinstance(value, str):
+        refs = _extract_env_refs(value)
+        env_refs.update(refs)
+        lowered_key = (parent_key or "").lower()
+        is_env_reference_field = lowered_key.endswith("_env") or lowered_key in {"secret_env", "secret_env_name", "api_key_env", "token_env", "username_env", "password_env"}
+        looks_secret_key = any(token in lowered_key for token in ("api_key", "apikey", "token", "password", "secret", "authorization"))
+        if is_env_reference_field:
+            return value, env_refs | ({value} if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) else set())
+        if looks_secret_key and value and not refs:
+            env_name = _secret_env_name_from_key(parent_key)
+            env_refs.add(env_name)
+            if "authorization" in lowered_key and value.lower().startswith("bearer "):
+                return f"Bearer ${{ENV:{env_name}}}", env_refs
+            return f"${{ENV:{env_name}}}", env_refs
+        return value, env_refs
+    return value, env_refs
+
+
+def _authoring_helper_result_context(context: dict[str, Any], tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(context or {})
+    results = dict(updated.get("tool_results") or {})
+    # Store only sanitized helper outputs. Secret values are redacted/replaced before this point.
+    results[tool_name] = result
+    updated["tool_results"] = results
+    if result.get("config"):
+        updated["config"] = result["config"]
+    if result.get("sample_input"):
+        updated["sample_input"] = result["sample_input"]
+    if result.get("schemas"):
+        updated["schemas"] = result["schemas"]
+    if result.get("live_test_result"):
+        updated["live_test_result"] = result["live_test_result"]
+    return updated
+
+
+def _config_collector_schema(missing_fields: list[str] | None = None) -> dict[str, Any]:
+    schema = _external_api_config_schema()
+    schema["properties"] = {
+        **schema.get("properties", {}),
+        "ip": {"type": "string"},
+        "port": {"type": "string"},
+        "api_key_env": {"type": "string", "description": "Environment variable name only; do not enter the secret value."},
+        "token_env": {"type": "string", "description": "Environment variable name only; do not enter the token value."},
+        "username_env": {"type": "string", "description": "Optional username env var name."},
+        "password_env": {"type": "string", "description": "Optional password env var name."},
+        "sample_input": {"type": "object"},
+    }
+    if missing_fields:
+        schema["missing_fields"] = missing_fields
+    return schema
+
+
+def run_authoring_helper(tool_name: str, input: dict[str, Any] | None, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one internal Tool Authoring helper and write its output into authoring context."""
+    normalized_name = _slug(tool_name)
+    cap = get_tool_capability(normalized_name)
+    if cap is None or cap.tool_type != "internal_authoring_tool" or normalized_name not in AUTHORING_HELPER_NAMES:
+        raise ValueError(f"authoring helper is not allowed: {tool_name}")
+    payload = dict(input or {})
+    ctx = dict(context or {})
+    result: dict[str, Any]
+    if normalized_name == "authoring_config_collector":
+        config = payload.get("config") if isinstance(payload.get("config"), dict) else ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
+        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
+        missing_fields = [str(item) for item in payload.get("missing_fields") or []]
+        if missing_fields:
+            result = {"success": False, "requires_input": True, "schema": _config_collector_schema(missing_fields), "message": "等待用户填写通用连接配置。"}
+        else:
+            sanitized_config, refs = _sanitize_authoring_config(config)
+            result = {"success": True, "requires_input": False, "config": sanitized_config, "sample_input": sample_input, "secret_env_suggestions": sorted(refs), "message": "配置已保存为 env/secret 引用。"}
+    elif normalized_name == "authoring_schema_infer":
+        code = str(payload.get("code_block") or ctx.get("code_block") or "")
+        input_schema, output_schema, notes = _infer_schema_from_code(code) if code.strip() else ({}, {}, [])
+        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
+        if sample_input and not input_schema:
+            input_schema = {key: {"type": type(value).__name__, "required": False, "description": "Inferred from sample_input."} for key, value in sample_input.items()}
+        expected = payload.get("expected_output_fields") or ((ctx.get("config") or {}).get("expected_output_fields") if isinstance(ctx.get("config"), dict) else [])
+        if expected and not output_schema:
+            output_schema = {str(key): {"type": "object", "description": "Expected output field confirmed during authoring."} for key in expected}
+        result = {"success": True, "schemas": {"input_schema": input_schema, "output_schema": output_schema}, "notes": notes}
+    elif normalized_name == "authoring_live_test":
+        if payload.get("allow_external_network") is not True and ctx.get("allow_external_network") is not True:
+            result = {"success": False, "requires_input": True, "schema": {"type": "object", "required": ["allow_external_network"], "properties": {"allow_external_network": {"type": "boolean", "const": True}}}, "message": "live_test 需要用户确认允许外部网络。"}
+        else:
+            live_request = {**ctx, **payload, "allow_external_network": True}
+            result = {"success": True, "requires_input": False, "live_test_result": live_test_tool(live_request)}
+            result["success"] = bool(result["live_test_result"].get("success"))
+    elif normalized_name == "authoring_dependency_check":
+        dependencies = [str(item) for item in payload.get("dependencies") or ctx.get("dependencies") or []]
+        missing = [dep for dep in dependencies if not _dependency_available(dep)]
+        result = {"success": not missing, "dependencies": dependencies, "missing_dependencies": missing}
+    elif normalized_name == "authoring_code_protocol_check":
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
+        adapter_code = str(payload.get("adapter_code") or ctx.get("adapter_code") or "")
+        errors = _author_adapter_static_errors(adapter_code, manifest) if adapter_code and manifest else ["adapter_code and manifest are required"]
+        result = {"success": not errors, "errors": errors}
+    elif normalized_name == "authoring_file_output_check":
+        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
+        output_schema = ((manifest.get("functions") or [{}])[0].get("output_schema") if isinstance(manifest, dict) else {}) or {}
+        has_file_contract = any(key in output_schema for key in ("file_paths", "file_outputs", "path", "output_path"))
+        result = {"success": has_file_contract, "has_file_contract": has_file_contract, "warnings": [] if has_file_contract else ["file output tools should declare file_paths/file_outputs or path/output_path"]}
+    else:
+        raise ValueError(f"unknown authoring helper: {tool_name}")
+    return {"tool_name": normalized_name, **result, "authoring_context": _authoring_helper_result_context(ctx, normalized_name, result)}
+
+
+def _run_authoring_tool_plan(plan: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    context = dict(request.get("authoring_context") or plan.get("authoring_context") or {})
+    context.update({
+        "config": request.get("config") or context.get("config") or {},
+        "sample_input": request.get("sample_input") or context.get("sample_input") or {},
+        "allow_external_network": request.get("allow_external_network") is True,
+        "manifest": request.get("manifest") or plan.get("manifest") or context.get("manifest") or {},
+        "code_block": request.get("code_block") or context.get("code_block") or "",
+    })
+    results: list[dict[str, Any]] = []
+    for item in plan.get("authoring_tool_plan") or []:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or "")
+        helper_input = item.get("input") if isinstance(item.get("input"), dict) else {}
+        result = run_authoring_helper(tool_name, helper_input, context)
+        results.append(result)
+        context = result.get("authoring_context") or context
+        if result.get("requires_input"):
+            break
+    updated = {**plan, "authoring_context": context, "authoring_tool_results": results, "ready_for_code_generation": False}
+    return updated, results
+
+
+def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    needs_clarification = bool(plan.get("needs_clarification"))
+    status = "needs_clarification" if needs_clarification else "waiting_for_user_input"
+    return {
+        "needs_clarification": needs_clarification,
+        "questions": plan.get("questions") or [],
+        "tool_kind": plan.get("tool_kind") or "unknown",
+        "operation": plan.get("operation") or "",
+        "requires_secret": bool(plan.get("requires_secret")),
+        "secret_env_suggestions": plan.get("secret_env_suggestions") or [],
+        "requires_external_network": bool(plan.get("requires_external_network")),
+        "requires_live_test": bool(plan.get("requires_live_test")),
+        "ready_for_live_test": bool(plan.get("ready_for_live_test")),
+        "ready_for_code_generation": bool(plan.get("ready_for_code_generation")),
+        "requires_authoring_tools": bool(plan.get("requires_authoring_tools")),
+        "authoring_tool_plan": plan.get("authoring_tool_plan") or [],
+        "authoring_context": plan.get("authoring_context") or {},
+        "authoring_tool_results": plan.get("authoring_tool_results") or [],
+        "missing_fields": plan.get("missing_fields") or [],
+        "suggested_config_schema": plan.get("suggested_config_schema") or {},
+        "sample_input_schema": plan.get("sample_input_schema") or {},
+        "manifest": plan.get("manifest") or {},
+        "adapter_code": "",
+        "sample_input": plan.get("sample_input") or {},
+        "validation": {"success": False, "status": status, "errors": [], "warnings": plan.get("risk_notes") or []},
+        "snippet": None,
+        "model_notes": model_notes,
+        "warnings": warnings,
+        "requires_human_confirmation": True,
+    }
+
+async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    planner_payload = {
+        key: request.get(key)
+        for key in [
+            "description",
+            "tool_name",
+            "tool_type",
+            "code_block",
+            "input_description",
+            "output_description",
+            "manifest",
+            "sample_input",
+            "allowed_roles",
+            "needs_secret",
+            "needs_external_network",
+            "generates_file",
+            "high_risk",
+            "clarification_answers",
+            "tool_kind",
+            "operation",
+            "config",
+            "live_test_result",
+            "allow_external_network",
+            "authoring_context",
+        ]
+    }
+    planner_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
+                "Return strict JSON with exactly this contract where possible: needs_clarification, questions, tool_kind "
+                "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
+                "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
+                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, missing_fields, suggested_config_schema, sample_input_schema, manifest, "
+                "implementation_plan. If ready_for_code_generation is false, the implementation generator will not be called. For external_api, "
+                "require endpoint/base_url/url, method, auth method, secret env name when needed, headers/query/body templates, "
+                "sample input, expected output fields, and explicit external network permission. If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
+            ),
+        },
+        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+    ]
+    model_plan, ack, err = await _complete_author_model("planner", planner_messages, reason="creator_tool_author_plan")
+    if ack:
+        model_notes.append(f"planner_model={ack['model']}")
+    if err:
+        warnings.append(f"planner_model unavailable, used deterministic fallback: {err}")
+    plan = model_plan if isinstance(model_plan, dict) and model_plan else _author_fallback_plan(request)
+    if not isinstance(plan.get("manifest"), dict):
+        plan = _author_fallback_plan(request)
+    normalized = _normalize_author_plan(plan, request)
+    model_notes.extend(normalized.get("model_notes") or [])
+    return normalized
+
+
 async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
-    """Unified Tool Authoring pipeline for draft/finalize stages."""
-    stage = str(request.get("stage") or "draft").strip().lower()
+    """Generic Tool Authoring pipeline driven by explicit actions."""
+    stage = str(request.get("stage") or "").strip().lower()
+    action = str(request.get("action") or "clarify").strip().lower()
+    # Backwards compatibility for older clients/tests that only send stage.
+    if stage == "finalize":
+        action = "finalize"
+    elif stage == "draft" and action == "clarify":
+        action = "generate"
     model_notes: list[str] = []
     warnings: list[str] = []
-    if stage not in {"draft", "finalize"}:
-        raise ValueError("stage must be 'draft' or 'finalize'")
+    if action not in {"clarify", "configure", "live_test", "generate", "finalize"}:
+        raise ValueError("action must be one of clarify/configure/live_test/generate/finalize")
 
-    if stage == "finalize":
+    if action == "live_test":
+        result = live_test_tool(request)
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "tool_kind": request.get("tool_kind") or "external_api",
+            "operation": request.get("operation") or "",
+            "live_test_result": result,
+            "preview": result.get("preview"),
+            "normalized_preview": result.get("normalized_preview"),
+            "manifest": request.get("manifest") or {},
+            "adapter_code": "",
+            "sample_input": request.get("sample_input") or {},
+            "validation": {"success": bool(result.get("success")), "status": "live_test", "errors": result.get("errors") or [], "warnings": []},
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    if action == "finalize":
         manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
         adapter_code = str(request.get("adapter_code") or request.get("code_block") or "")
         validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=request.get("sample_input") or {}, dynamic=True)
@@ -1647,7 +2313,10 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             validation["status"] = "failed"
         snippet = None
         if validation.get("success"):
-            messages = [{"role": "system", "content": "Generate one strict JSON ToolSnippet for the final Creator tool. No markdown."}, {"role": "user", "content": json.dumps({"manifest": manifest, "sample_input": request.get("sample_input") or {}, "validation": validation, "adapter_code_excerpt": adapter_code[:12000]}, ensure_ascii=False)}]
+            messages = [
+                {"role": "system", "content": "You are text_model. Generate one strict JSON ToolSnippet only after adapter dynamic validation and human code confirmation. Do not include secrets."},
+                {"role": "user", "content": json.dumps({"final_manifest": manifest, "final_adapter_code": adapter_code[:20000], "live_test_result": request.get("live_test_result") or (request.get("authoring_context") or {}).get("live_test_result"), "authoring_context": request.get("authoring_context") or {}, "dynamic_validation": validation, "confirmed_io": {"sample_input": request.get("sample_input") or {}, "input_description": request.get("input_description") or "", "output_description": request.get("output_description") or ""}}, ensure_ascii=False)},
+            ]
             model_json, ack, err = await _complete_author_model("text", messages, reason="creator_tool_author_finalize_snippet")
             if ack:
                 model_notes.append(f"text_model={ack['model']}")
@@ -1662,23 +2331,28 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             validation["snippet_validation"] = snippet_validation
         return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": request.get("sample_input") or {}, "validation": validation, "snippet": snippet, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
 
-    planner_payload = {key: request.get(key) for key in ["description", "tool_name", "tool_type", "code_block", "input_description", "output_description", "manifest", "sample_input", "allowed_roles", "needs_secret", "needs_external_network", "generates_file", "high_risk"]}
-    planner_messages = [{"role": "system", "content": "You are planning a Creator tool. Treat code_block as primary implementation intent when present. Return strict JSON with needs_clarification, questions, manifest, implementation_plan, sample_input, risk_notes."}, {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)}]
-    model_plan, ack, err = await _complete_author_model("planner", planner_messages, reason="creator_tool_author_draft_plan")
-    if ack:
-        model_notes.append(f"planner_model={ack['model']}")
-    if err:
-        warnings.append(f"planner_model unavailable, used deterministic fallback: {err}")
-    plan = model_plan if isinstance(model_plan.get("manifest"), dict) else _author_fallback_plan(request)
-    model_notes.extend(plan.get("model_notes") or [])
-    if plan.get("needs_clarification"):
-        return {"needs_clarification": True, "questions": plan.get("questions") or [], "manifest": plan.get("manifest") or {}, "adapter_code": "", "sample_input": plan.get("sample_input") or {}, "validation": {"success": False, "status": "needs_clarification", "errors": [], "warnings": plan.get("risk_notes") or []}, "snippet": None, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
+    plan = await _run_planner(request, model_notes, warnings)
+    if plan.get("requires_authoring_tools") or plan.get("authoring_tool_plan"):
+        plan, _helper_results = _run_authoring_tool_plan(plan, request)
+        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
+    if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get("ready_for_code_generation"):
+        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
     manifest = plan.get("manifest") or build_tool_manifest_draft(request)
     sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else plan.get("sample_input") or {}
     code_block = str(request.get("code_block") or "")
     mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
-    code_messages = [{"role": "system", "content": f"You are code_model in mode={mode}. Return Python code only. Preserve user business logic for normalize_existing_code. Include run(payload), manifest function wrapper, JSON main(), SKILL_TRIAL_RUN/OUTPUT_DIR safety."}, {"role": "user", "content": json.dumps({"manifest": manifest, "implementation_plan": plan.get("implementation_plan"), "sample_input": sample_input, "code_block": code_block}, ensure_ascii=False)}]
+    code_messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You are code_model in mode={mode}. Return Python code only. Consume only confirmed requirements/config/sample input/live_test_result/manifest/implementation_plan/protocol. "
+                "Do not guess endpoint, secret name, auth scheme, inputs, or outputs. For network/API adapters, include `if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\": return mock_result`, "
+                "read secrets only with os.getenv(DECLARED_ENV_NAME), never payload.get('api_key'), and never print or return secrets. Include run(payload), manifest function wrapper, and JSON main()."
+            ),
+        },
+        {"role": "user", "content": json.dumps({"final_requirement": request.get("description") or "", "confirmed_config": request.get("config") or {}, "sample_input": sample_input, "live_test_result": request.get("live_test_result") or (plan.get("authoring_context") or {}).get("live_test_result"), "authoring_context": plan.get("authoring_context") or {}, "manifest": manifest, "implementation_plan": plan.get("implementation_plan"), "adapter_protocol": "Expose run(payload: dict|None)->dict and the manifest function; dynamic validation runs with SKILL_TRIAL_RUN=1 and must not access real external services.", "code_block": code_block}, ensure_ascii=False)},
+    ]
     code_json, code_ack, code_err = await _complete_author_model("code", code_messages, reason=f"creator_tool_author_{mode}")
     if code_ack:
         model_notes.append(f"code_model={code_ack['model']}")
@@ -1702,7 +2376,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         if attempt >= 2:
             break
         repair_log.append({"attempt": attempt + 1, "errors": validation.get("errors", []), "warnings": validation.get("warnings", [])})
-        repair_messages = [{"role": "system", "content": "Repair the Python adapter locally. Preserve business logic. Return code only."}, {"role": "user", "content": json.dumps({"manifest": manifest, "sample_input": sample_input, "validation": validation, "adapter_code": adapter_code}, ensure_ascii=False)}]
+        repair_messages = [{"role": "system", "content": "Repair the Python adapter locally. Preserve business logic. Return code only. Keep SKILL_TRIAL_RUN mock behavior for network/API adapters."}, {"role": "user", "content": json.dumps({"manifest": manifest, "sample_input": sample_input, "validation": validation, "adapter_code": adapter_code}, ensure_ascii=False)}]
         repair_json, _repair_ack, repair_err = await _complete_author_model("code", repair_messages, reason="creator_tool_author_repair")
         repaired = _strip_code_fence(str(repair_json.get("adapter_code") or repair_json.get("code") or "")) if repair_json else ""
         if repair_err or not repaired:
@@ -1710,7 +2384,45 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             break
         adapter_code = repaired
     validation["repair_log"] = repair_log
-    return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": sample_input, "validation": validation, "snippet": None, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
+    return {"needs_clarification": False, "questions": [], "tool_kind": plan.get("tool_kind"), "operation": plan.get("operation"), "manifest": manifest, "adapter_code": adapter_code, "sample_input": sample_input, "validation": validation, "snippet": None, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
+
+
+async def stream_author_tool(request: dict[str, Any]):
+    """SSE-friendly wrapper that emits coarse progress events for long authoring actions."""
+    action = str(request.get("action") or ("finalize" if request.get("stage") == "finalize" else "clarify"))
+    try:
+        yield {"event": "step_started", "step": "planner", "message": "正在理解需求"}
+        if action == "live_test":
+            yield {"event": "step_started", "step": "live_test", "message": "正在测试连接"}
+        elif action == "generate":
+            yield {"event": "step_started", "step": "code", "message": "正在生成 adapter"}
+        elif action == "finalize":
+            yield {"event": "step_started", "step": "validation", "message": "正在执行动态验证"}
+        result = await author_tool(request)
+        for item in result.get("authoring_tool_plan") or []:
+            if isinstance(item, dict):
+                yield {"event": "tool_call_planned", "tool": item.get("tool_name"), "reason": item.get("reason") or ""}
+        for item in result.get("authoring_tool_results") or []:
+            if not isinstance(item, dict):
+                continue
+            tool_name = item.get("tool_name")
+            yield {"event": "tool_call_started", "tool": tool_name}
+            if item.get("requires_input"):
+                yield {"event": "tool_call_requires_input", "tool": tool_name, "schema": item.get("schema") or {}}
+            yield {"event": "tool_call_result", "tool": tool_name, "success": bool(item.get("success"))}
+        if result.get("needs_clarification"):
+            yield {"event": "clarification_required", "questions": result.get("questions") or []}
+        if result.get("live_test_result"):
+            yield {"event": "live_test_result", **result["live_test_result"]}
+        if result.get("adapter_code"):
+            yield {"event": "model_delta", "step": "code", "delta": result.get("adapter_code")}
+        if result.get("validation"):
+            yield {"event": "validation", "success": bool(result["validation"].get("success")), "errors": result["validation"].get("errors") or [], "warnings": result["validation"].get("warnings") or []}
+        yield {"event": "step_finished", "step": "planner", "summary": result.get("validation", {}).get("status", "done")}
+        yield {"event": "final_result", **result}
+    except Exception as exc:
+        yield {"event": "error", "message": str(exc)}
+
 
 def tool_status(capability: ToolCapability) -> dict[str, Any]:
     missing_env = [name for name in capability.required_env if not os.environ.get(name)]

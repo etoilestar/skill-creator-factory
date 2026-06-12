@@ -97,3 +97,74 @@ def test_tool_status_reports_missing_runtime_dependencies(monkeypatch):
     assert "create_pdf" in status["runtime_helpers_available"]
     assert status["missing_runtime_helpers"] == []
     assert status["missing_dependencies"] == ["reportlab"]
+
+
+def test_resolve_tools_for_pdf_builder_uses_registry_helpers_only():
+    from backend.services.creator_tool_registry import resolve_tools_for_skill_plan_entry
+
+    entry = {
+        "role": "pdf_builder",
+        "required_capabilities": ["pdf_generation", "file_output"],
+    }
+
+    resolved = resolve_tools_for_skill_plan_entry(entry)
+
+    assert "pdf_generation" in resolved.allowed_tools
+    assert "create_pdf" in resolved.allowed_helper_imports
+    assert "build_pdf_report" in resolved.allowed_helper_imports
+    assert "reportlab" in resolved.forbidden_imports
+    assert "fpdf" in resolved.forbidden_imports
+    assert "create_pdf" in resolved.tool_usage_prompt
+    assert "禁止直接" in resolved.tool_usage_prompt
+
+
+def test_resolve_tools_excludes_disabled_tool_from_prompt():
+    from backend.services.creator_tool_registry import resolve_tools_for_skill_plan_entry
+
+    set_tool_capability_override("pdf_generation", enabled=False, allow_creator_use=True)
+    try:
+        resolved = resolve_tools_for_skill_plan_entry({"role": "pdf_builder", "required_capabilities": ["pdf_generation"]})
+        assert "pdf_generation" not in resolved.allowed_tools
+        assert "create_pdf" not in resolved.allowed_helper_imports
+        assert any("disabled" in warning for warning in resolved.warnings)
+    finally:
+        set_tool_capability_override("pdf_generation", enabled=True, allow_creator_use=True)
+
+
+def test_registered_tool_resolve_uses_registered_helper_and_trial_dispatch(monkeypatch):
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        clear_registered_tool_capabilities,
+        register_tool_capability,
+        resolve_tools_for_skill_plan_entry,
+    )
+    from backend.services.skill_runtime import registered_tool_call
+
+    clear_registered_tool_capabilities()
+    monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
+    try:
+        register_tool_capability(ToolCapability(
+            name="fake_registered_lookup",
+            display_name="Fake Registered Lookup",
+            category="registered",
+            roles=["fake_lookup_reader"],
+            helper_imports=["registered_tool_call"],
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            trial_mode="mock",
+            prompt_guidance="调用 registered_tool_call('fake_registered_lookup', payload)，不要直接 requests.post 未知 API。",
+            forbidden_direct_imports=["requests.post", "urllib.request"],
+        ))
+
+        resolved = resolve_tools_for_skill_plan_entry({
+            "role": "fake_lookup_reader",
+            "required_capabilities": ["fake_registered_lookup"],
+        })
+
+        assert resolved.allowed_tools == ["fake_registered_lookup"]
+        assert resolved.allowed_helper_imports == ["registered_tool_call"]
+        assert "requests.post" in resolved.forbidden_imports
+        assert "registered_tool_call" in resolved.tool_usage_prompt
+        assert registered_tool_call("fake_registered_lookup", {"query": "demo"})["tool_name"] == "fake_registered_lookup"
+    finally:
+        clear_registered_tool_capabilities()

@@ -83,3 +83,20 @@ def api_get(url: str, headers: dict | None = None, params: dict | None = None) -
 
 def api_post(url: str, headers: dict | None = None, json_body: dict | None = None) -> dict[str, Any]:
     return _request("POST", url, headers=headers, json_body=json_body)
+
+
+def registered_tool_call(tool_name: str, payload: dict | None = None) -> dict[str, Any]:
+    """Call a user/admin registered tool through the platform boundary.
+
+    Generated scripts must not guess API URLs or credentials.  In trial mode this
+    returns a deterministic JSON object so Creator E2E can verify dataflow.
+    A production connector dispatch layer can replace this implementation
+    without changing generated Skills.
+    """
+    name = str(tool_name or "").strip()
+    if not name:
+        raise ValueError("tool_name is required")
+    keys = sorted((payload or {}).keys())
+    if _trial():
+        return {"tool_name": name, "status": "trial_ok", "result": {"mock": True}, "payload_keys": keys}
+    raise RuntimeError("registered tool dispatch is not configured in this runtime")

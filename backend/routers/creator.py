@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
-from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status
+from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..services.skill_executor import _build_script_runtime_env, run_action
@@ -95,7 +95,7 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
   python scripts/<script-name> '{"payload":{"user_request":"{{user_request}}","input_files":"{{input_files}}","fields":"{{fields}}","options":"{{options}}"}}'
   ```
 - 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
-- 参数映射用普通 Markdown 列表说明通用来源：第一步只能引用 external envelope、显式 fields/defaults/input binding；业务字段由第一脚本自行解析并通过 stdout JSON 输出；后续步骤只能引用前序 stdout 中真实存在的字段。不要使用单独的 JSON contract。
+- 参数映射用普通 Markdown 列表说明通用来源：命令示例优先引用 external envelope（user_request/input/text/input_files/files/fields/options）或显式 fields/defaults/input binding。第一轮 SKILL.md 只约束可解析命令形态，不要求证明后续 placeholder 来自前序 stdout。
 - 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
@@ -947,7 +947,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     document format and fenced block norms.
     """
     return "\n".join([
-        "必须满足以下 SKILL.md 硬格式合同：",
+        "必须满足以下 SKILL.md 合同（硬格式与平台边界）：",
         "",
         "A. YAML frontmatter:",
         "- 文件必须以 YAML frontmatter 开始。",
@@ -968,11 +968,11 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 动态占位符必须作为 JSON 字符串值出现，例如 \"theme\":\"{{theme}}\"。",
         "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
         "",
-        "D. workflow:",
-        "- SKILL.md 必须描述完整 workflow、脚本顺序、输入输出数据流和最终产物。",
-        "- 第一条命令可以使用用户输入 placeholder。",
-        "- 后续命令 placeholder 必须来自前序脚本 stdout JSON 字段；如果无法找到某个 input 的来源，不要猜字段名，应报告 SkillPlan dataflow 不完整。",
-        "- 多场景、多图片、多页 PDF 等循环必须在脚本内部完成；SKILL.md 只写一次脚本调用。",
+        "D. workflow / 平台边界:",
+        "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
+        "- 命令 placeholder 优先使用 external envelope 中确定存在的字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding 提供的字段。",
+        "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
+        "- 多场景、多图片、多页 PDF 等循环应由脚本实现；SKILL.md 第一轮只需保持命令块静态可解析。",
         "",
         "E. references/assets:",
         "- references 应在资源/参考资料小节说明用途和按需读取时机。",
@@ -986,86 +986,76 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
     ])
 
 def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
-    """Build deterministic authoring guidance for SKILL.md workflow commands.
+    """Build first-round static authoring guidance for SKILL.md.
 
-    This is creator strategy, not artifact post-processing.  The generated
-    SKILL.md must be born as an E2E-runnable linear workflow.
+    Despite the historical function name, this guide intentionally does not
+    impose internal workflow dataflow.  First-round SKILL.md generation owns
+    static Markdown/platform boundaries only; second-round E2E owns placeholder
+    provenance, stdout field closure, and downstream parser alignment.
     """
     script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
     reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
 
     if not script_paths:
         return (
-            "E2E workflow authoring guide:\n"
+            "SKILL.md first-round static authoring guide:\n"
             "- 当前蓝图没有 scripts/ 文件；SKILL.md 不要编造脚本命令块。\n"
             "- 若任务可直接回答，明确写“直接回答用户问题”，不要生成伪脚本流程。"
         )
 
     lines: list[str] = [
-        "E2E workflow authoring guide（强制生成策略，必须反映到最终 SKILL.md 正文）:",
-        "A. 命令块形态:",
-        "- 每个 scripts/ 文件必须且只能有一个主要可执行 bash fenced code block。",
-        "- 命令块使用标准 Markdown 独立 fence；不要把 ```bash 缩进在列表项内部。",
-        "- fence 内只放一条命令，不写解释、不写循环说明、不写多条命令。",
-        "- 命令必须形如：python scripts/name.py '{\"user_request\":\"{{user_request}}\"}'，或引用 external envelope / 上游 stdout 中真实存在的字段。",
-        "- JSON argv keys 必须是当前脚本会读取的确定字段名；不要使用候选字段、别名字段、组合表达或位置参数。",
-        "- 第一条命令使用 external input envelope 中确定存在的字段；后续命令引用前序 stdout 中真实产生的 placeholder 字段。",
-        "- JSON argv 必须先能被 json.loads 解析；所有动态 {{placeholder}} 都必须放在 JSON 字符串里，禁止裸写动态数值占位符。",
-        "- 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。",
+        "SKILL.md first-round static authoring guide（只约束静态格式和平台边界，不验证内部 dataflow）:",
+        "A. 命令块静态形态:",
+        "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
+        "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
+        "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
         "",
-        "B. 线性数据流:",
-        "- E2E 只按 SKILL.md/reference 中的命令块顺序逐条执行；不会把自然语言描述转换成隐式循环。",
-        "- 批量处理、列表处理或多文件处理必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。",
-        "- 第一条命令只能引用 external envelope 中确定存在的字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding 提供的字段。",
-        "- 禁止发明无来源编号字段或业务字段，除非 external envelope 或上游脚本 stdout 明确输出这些字段。",
-        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
-        "- 每个脚本说明中必须写清 stdout JSON 输出字段，且下游命令 placeholder 必须与这些字段逐字一致。",
+        "B. 资源边界:",
+        "- references/ 只在参考资料/资源小节说明用途和按需读取时机，不替代主流程命令块。",
+        "- assets/ 只能作为上传素材/静态资源引用，不能描述为模型生成。",
         "",
-        "C. 推荐线性命令顺序与接口:",
+        "C. 可用脚本路径与静态命令示例:",
     ]
 
-    available_after_previous: set[str] = set()
     for idx, script_path in enumerate(script_paths, start=1):
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
-        command = _script_command_template(script_path, blueprint_text, entry)
+        runner = {"python": "python", "node": "node", "bash": "bash", "shell": "sh"}.get(entry.runtime, "")
+        payload = json.dumps(
+            {
+                "payload": "{{user_request}}",
+                "input_files": "{{input_files}}",
+                "fields": "{{fields}}",
+                "options": "{{options}}",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        command = f"{runner} {script_path} '{payload}'" if runner else f"{script_path} '{payload}'"
         lines.extend([
             f"{idx}. {script_path}",
             f"   role: {entry.role}",
-            f"   declared inputs: {', '.join(entry.inputs or ['payload'])}",
-            f"   declared outputs: {', '.join(entry.outputs or ['text'])}",
-            f"   required command block:",
+            "   static command shape example（可按脚本实际 argv key 调整，但不要引入无来源平台外 API 或 Creator 内部路径）:",
             "```bash",
             command,
             "```",
         ])
 
-        if idx == 1:
-            lines.append("   placeholder rule: 第一条命令只能引用 external envelope 中确定存在的通用字段或显式结构化字段；如需业务字段，请第一脚本从 user_request 自行解析并在 stdout JSON 输出。")
-        else:
-            available_text = ", ".join(sorted(available_after_previous)) or "（暂无上游字段）"
-            lines.append(
-                "   placeholder rule: 这一条命令只能使用前序 stdout 已产生字段；"
-                f"当前前序可用字段包括：{available_text}。"
-            )
-
-        available_after_previous.update(entry.outputs or [])
-
     if reference_paths:
         lines.extend([
             "",
             "D. references:",
-            "- SKILL.md 必须在参考资料/资源小节逐字引用以下本地 reference，并说明何时读取；reference 不替代主流程命令块。",
+            "- SKILL.md 应在参考资料/资源小节逐字引用以下本地 reference，并说明何时读取：",
         ])
         for path in reference_paths:
             lines.append(f"- {path}")
 
     lines.extend([
         "",
-        "E. 对多场景/多图片/PDF 任务的固定策略:",
-        "- 文本脚本一次生成完整结构化文本，并输出 script_text 或 text。",
-        "- 图片脚本一次接收完整 script_text/text，内部拆分场景并生成多张图，stdout 输出 image_paths。",
-        "- PDF 脚本一次接收 script_text/text 和 image_paths，内部完成排版和文件生成，stdout 输出 pdf_path/file_paths。",
-        "- 列表/对象字段必须用整值占位符传递；不要把不存在的拆分字段拼成列表。",
+        "E. 第二轮 E2E 责任边界:",
+        "- placeholder 来源、前后脚本 stdout 字段闭环、最终 stdout 平台输出字段，不在第一轮 SKILL.md prompt 中证明。",
+        "- 如果这些内容不一致，第二轮 E2E 真实执行会基于实际 stdout/文件产物反馈修复 SKILL.md 或脚本。",
     ])
 
     return "\n".join(lines)
@@ -1410,6 +1400,36 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         matched_paths=kernel_copy_paths,
     ))
 
+    for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
+        mentioned = reference_path in content
+        results.append(ContractCheckResult(
+            id="skill_md.reference.mentioned",
+            passed=mentioned,
+            target=reference_path,
+            message=(
+                f"SKILL.md 已引用参考资料 {reference_path}。"
+                if mentioned
+                else f"SKILL.md 缺少对参考资料 {reference_path} 的引用。"
+            ),
+            expected="蓝图真实规划的 references/ 资源必须在 SKILL.md 的参考资料/资源小节中静态引用，并说明用途。",
+            minimal_edit=f"添加参考资料小节，引用 `{reference_path}` 并说明何时读取。",
+        ))
+
+    for asset_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="assets/"):
+        mentioned = asset_path in content
+        results.append(ContractCheckResult(
+            id="skill_md.asset.mentioned",
+            passed=mentioned,
+            target=asset_path,
+            message=(
+                f"SKILL.md 已引用静态资源 {asset_path}。"
+                if mentioned
+                else f"SKILL.md 缺少对静态资源 {asset_path} 的引用。"
+            ),
+            expected="蓝图真实规划的 assets/ 资源必须作为上传素材/静态资源引用，不得描述为模型生成。",
+            minimal_edit=f"在资源小节引用 `{asset_path}` 并说明它是静态/上传素材。",
+        ))
+
     results.extend(_check_skill_md_fenced_command_contracts(
         content=content,
         blueprint_text=blueprint_text,
@@ -1619,7 +1639,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "你的任务是判断 SKILL.md 是否完整覆盖蓝图规划任务，并返回严格 JSON object。\n\n"
 
         "核心原则：\n"
-        "1. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
+        "1. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本/资源引用、脚本调用顺序（如有）和最终产物类型；第一轮不审查内部 stdout/placeholder 闭环。\n"
         "2. 真实文件计划通常来自目录结构、SkillPlan path、dependencies、references 字段。\n"
         "3. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境下提到某个 scripts/*.py、references/*.md 或 assets/*，该路径只是解释性示例，不是实际文件计划。\n"
         "4. 但是，如果某个路径出现在目录结构或 SkillPlan path 字段中，则必须视为真实文件，不能误杀。\n"
@@ -1635,7 +1655,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "你必须从以下角度审查：\n"
         "- intent_reviewer: 是否覆盖业务意图、输入、输出、触发方式、最终产物。\n"
         "- file_plan_reviewer: 是否覆盖真实 scripts/references/assets；是否误用了示例/反例路径。\n"
-        "- workflow_reviewer: 脚本顺序、命令块、参数传递、stdout 数据流是否能端到端执行。\n"
+        "- workflow_reviewer: 脚本顺序、命令块静态形态、JSON argv 和 external envelope 使用是否符合平台边界；不要审查前序 stdout 字段闭环。\n"
         "- capability_reviewer: required_capabilities 是否体现，forbidden_capabilities 是否被引入。\n"
         "- resource_reviewer: references/assets 的使用方式是否正确。\n"
         "- user_facing_reviewer: 是否是最终 Skill 使用说明，而不是 Creator 创建流程。\n\n"
@@ -2825,7 +2845,9 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
         # instead of a generic "missing required_capabilities" message.
         return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
     if capability == "pdf_generation":
-        return bool(re.search(r"FPDF|reportlab|PdfWriter|pdf\.output|canvas\.Canvas|build_pdf|%PDF-|pdf_path|\.pdf[\"\']", content, re.IGNORECASE))
+        # PDF generation must be satisfied through the platform registry helper
+        # contract, not by hand-written reportlab/fpdf/PyPDF/PDF byte logic.
+        return _script_uses_registry_helpers(content, "pdf_generation")
     if capability == "docx_generation":
         return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
     if capability == "pptx_generation":
@@ -2833,7 +2855,7 @@ def _script_satisfies_required_capability(content: str, capability: str) -> bool
     if capability in {"html_generation", "html_asset_generation"}:
         return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|outputs|build_html", content, re.IGNORECASE))
     if capability == "file_output":
-        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)", content, re.IGNORECASE))
+        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx", content, re.IGNORECASE))
     cap = get_tool_capability(capability)
     if cap and cap.helper_imports:
         return False
@@ -2852,7 +2874,7 @@ def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], ca
     if not declared_artifacts and not required_artifacts:
         return True
     has_writer = bool(re.search(
-        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)",
+        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx",
         content,
         re.IGNORECASE,
     ))
@@ -3129,6 +3151,8 @@ def _check_script_file_contract(
             )
         )
 
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+
     missing_capabilities = _script_required_capability_failures(
         stripped,
         effective_required_capabilities,
@@ -3144,12 +3168,12 @@ def _check_script_file_contract(
                 else f"脚本没有调用这些 required_capabilities 对应接口：{', '.join(missing_capabilities)}。"
             ),
             expected=(
-                "text_generation 调用 generate_text_with_llm/平台 LLM；"
+                "text_generation 调用 generate_text_with_llm；"
                 "image_generation 调用 generate_stable_diffusion_image；"
-                "pdf_generation 使用支持中文/UTF-8 的 reportlab/fpdf2/PDF 构建；"
+                "pdf_generation 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 平台 helper；"
                 "file_output 写入声明文件。"
             ),
-            minimal_edit="按 role + runtime 注入对应平台 helper 或真实文件/PDF 构建逻辑，不要返回固定占位文本。",
+            minimal_edit="按 Tool Resolve 结果注入对应平台 helper；PDF 不要手写 reportlab/fpdf/PyPDF/raw %PDF。",
         )
     )
 
@@ -3298,6 +3322,45 @@ def _check_script_file_contract(
         )
     )
 
+    forbidden_direct_hits = [
+        item for item in tool_resolve.forbidden_imports
+        if re.search(rf"\b{re.escape(item)}\b", stripped, re.IGNORECASE)
+    ]
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.forbidden_direct_imports",
+            passed=not forbidden_direct_hits,
+            target=file_path,
+            message=(
+                "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
+                if not forbidden_direct_hits
+                else f"{file_path} 直接调用了 Tool Resolve 禁止的底层工具/库：{', '.join(forbidden_direct_hits)}。"
+            ),
+            expected="脚本只能调用工具注册表允许的 backend.services.skill_runtime helper；不得手写底层 PDF/外部 API/数据库实现。",
+            minimal_edit="修当前脚本：删除底层 import/调用，保留 parse_args/run/main/print_json，改为调用平台 helper 并返回 helper stdout JSON。",
+        )
+    )
+
+    undeclared_helper_hits: list[str] = []
+    declared_caps = set(effective_required_capabilities) | set(plan_entry.optional_capabilities or []) | set(plan_entry.allowed_capabilities or [])
+    for capability in [cap.name for cap in list_tool_capabilities() if cap.helper_imports]:
+        if capability not in declared_caps and _script_uses_registry_helpers(stripped, capability):
+            undeclared_helper_hits.append(capability)
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.undeclared_helper",
+            passed=not undeclared_helper_hits,
+            target=file_path,
+            message=(
+                "脚本调用的 registry helper 均有 SkillPlan capability 声明。"
+                if not undeclared_helper_hits
+                else f"{file_path} 调用了未在 required/optional/allowed_capabilities 声明的工具能力：{', '.join(undeclared_helper_hits)}。"
+            ),
+            expected="required_capabilities/allowed_capabilities 必须与实际 helper 调用一致。",
+            minimal_edit="若能力确实需要，应修 SkillPlan；若蓝图已确定，则修脚本删除未声明 helper。",
+        )
+    )
+
     if "database_read" in set(effective_required_capabilities):
         write_sql = bool(re.search(
             r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|MERGE)\b",
@@ -3325,31 +3388,22 @@ def _check_script_file_contract(
     is_pdf_builder = plan_entry.role == "pdf_builder" or pdf_outputs_declared or pdf_required
 
     if is_pdf_builder:
-        pdf_unicode_ok, pdf_unicode_message = _pdf_unicode_strategy_status(stripped)
+        uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
         results.append(
             ContractCheckResult(
-                id="script.pdf_builder.unicode_text_supported",
-                passed=pdf_unicode_ok,
+                id="tool_usage_contract.pdf_helper_required",
+                passed=uses_pdf_helper,
                 target=file_path,
                 message=(
-                    "pdf_builder 已声明并实现可靠中文/UTF-8 PDF 字体策略。"
-                    if pdf_unicode_ok
-                    else f"{file_path} PDF 中文/UTF-8 字体方案不合格：{pdf_unicode_message}"
+                    "pdf_builder 已调用工具注册表允许的 PDF helper。"
+                    if uses_pdf_helper
+                    else f"{file_path} 是 pdf_builder 或声明 pdf_generation，但未调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs。"
                 ),
-                expected=(
-                    "PDF 构建脚本必须支持中文/UTF-8 文本。"
-                    "允许 reportlab + UnicodeCIDFont('STSong-Light')，"
-                    "允许 reportlab + TTFont，"
-                    "允许 fpdf2 + add_font 加载 TTF/OTF。"
-                    "禁止 FPDF 默认 Helvetica/Arial/Times/Courier 直接写正文；"
-                    "禁止 reportlab 只 setFont('STSong-Light') 但不 registerFont；"
-                    "禁止 raw %PDF 字节拼接、空 PDF、假路径。"
-                ),
+                expected="PDF builder 必须调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs 之一；底层 reportlab/fpdf/PyPDF 只允许存在于平台 helper 内部。",
                 minimal_edit=(
-                    "保留脚本自由结构，但必须加入真实 Unicode 字体注册/加载逻辑；"
-                    "保持 JSON argv 输入和 stdout JSON 输出；"
-                    "stdout 返回真实存在的 pdf_path/file_paths；"
-                    "不要通过 try/except 输出 error、{} 或空路径绕过试运行。"
+                    "修当前脚本：删除底层 PDF 实现；保留 parse_args/run/main/print_json；"
+                    "改为 from backend.services.skill_runtime import create_pdf 或 build_pdf_report；"
+                    "stdout 直接返回 helper 结果，且包含 pdf_path/file_paths/file_outputs。"
                 ),
             )
         )
@@ -3804,7 +3858,7 @@ def _check_skill_md_fenced_command_contracts(
             message=(
                 f"{script_path} 已使用 ```bash fenced code block 表达可执行命令。"
                 if has_fenced
-                else f"{script_path} 缺少标准 ```bash fenced code block。"
+                else f"{script_path} 缺少可执行 Markdown 命令块：标准 ```bash fenced code block。"
             ),
             expected=(
                 "真实脚本必须用标准 Markdown fenced code block 表示，例如：\n"
@@ -4588,7 +4642,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
 
         if "蓝图意图不一致" in error_text or "intent" in error_text or "workflow" in error_text or "file_plan" in error_text:
             return (
-                "按模型审查意见最小修复 SKILL.md：必须覆盖蓝图真实规划任务、真实 scripts、真实 references、真实 assets、workflow 顺序、输入输出数据流和最终产物；"
+                "按模型审查意见最小修复 SKILL.md：必须覆盖蓝图真实规划任务、真实 scripts、真实 references、真实 assets、workflow 顺序和最终产物类型；第一轮不要证明内部 stdout/placeholder 闭环；"
                 "真实脚本必须使用 ```bash fenced code block；"
                 "JSON 配置或 stdout 示例必须使用 ```json fenced code block；"
                 "不要把示例/反例路径当成真实文件。"
@@ -5261,14 +5315,17 @@ def _script_generation_skeleton(
             )
         if plan_entry.role == "pdf_builder" or "pdf_generation" in set(effective_required_capabilities):
             return (
-                "PDF builder 修复提示：\n"
-                "- 脚本必须生成真实 PDF 文件，支持中文/UTF-8。\n"
-                "- 允许使用 reportlab 或 fpdf2 等库实现，但必须注册/加载可用字体（reportlab: UnicodeCIDFont/TTFont，fpdf2: add_font + TTF/OTF）。\n"
-                "- 禁止使用 FPDF 默认核心字体（Helvetica/Arial/Times/Courier）直接写正文；禁止 raw %PDF 字节拼接或输出空 PDF。\n"
-                "- 脚本必须通过 sys.argv[1] 接收 JSON object 输入，stdout 仅输出 JSON object，并包含真实存在的 pdf_path/file_paths。\n"
-                "- 保留脚本自由结构和函数命名，分页、换行、标题或图片插入由模型自由设计。\n"
-                "- 不要通过 try/except 输出 error、{} 或空路径绕过试运行。\n"
-                "- 修复关注点是：确保中文 PDF 生成能力、遵守 JSON argv/stdout 协议，不强制模板结构。"
+                "必须使用下面的 node pdf_builder skeleton；通过 Python 平台 PDF helper 生成文件，stdout 只能 console.log JSON 字符串：\n"
+                "const { spawnSync } = require('child_process');\n"
+                "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
+                "function run(payload) {\n"
+                f"  const text = String({js_value_expr} || payload.content || payload.text || 'Generated PDF');\n"
+                "  const helper = `from backend.services.skill_runtime import create_pdf\\nimport json,sys\\ntext=sys.argv[1] or 'Generated PDF'\\nresult=create_pdf(text, filename='output.pdf')\\nprint(json.dumps(result, ensure_ascii=False))`;\n"
+                "  const proc = spawnSync(process.env.PYTHON || 'python', ['-c', helper, text], { encoding: 'utf8' });\n"
+                "  if (proc.status !== 0) throw new Error(proc.stderr || 'create_pdf failed');\n"
+                "  return JSON.parse(proc.stdout);\n"
+                "}\n"
+                "console.log(JSON.stringify(run(payload)));"
             )
         if plan_entry.role == "text_generator":
             return (
@@ -5577,6 +5634,8 @@ def _build_generate_file_prompt(
         if file_path == "SKILL.md"
         else ""
     )
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry) if file_path.startswith("scripts/") else None
+    tool_usage_prompt = tool_resolve.tool_usage_prompt if tool_resolve is not None else ""
     script_skeleton_text = _script_generation_skeleton(
         file_path,
         purpose,
@@ -5606,30 +5665,30 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. SKILL.md 必须生成成 E2E 可试运行的线性 workflow，不允许依赖后续人工修产物文件。\n"
+            "4. SKILL.md 第一轮只需生成静态可解析的使用说明和命令块；内部脚本流转由第二轮 E2E 真实执行验证。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
             "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
-            "8. 如果 Skill 需要业务字段，第一脚本必须从 user_request/input/text 或 fields 中自行解析，并通过 stdout JSON 输出；平台不会根据自然语言猜字段。\n"
-            "9. 后续脚本命令只能引用当前 context 或前序 stdout JSON 中真实存在的字段；字段名由该 Skill 自己的 stdout 和命令决定。\n"
+            "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
+            "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
             "10. JSON argv 必须是 json.loads 可解析的模板；所有动态 placeholder 必须是字符串值；禁止裸写动态数值 placeholder。\n"
             "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
-            "12. E2E 不理解自然语言循环；批量处理、列表处理或多文件处理必须在对应脚本内部完成，SKILL.md 只写一次脚本调用。\n"
+            "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
             "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"
             "14. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
             "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
             "16. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
             "17. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
             "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "19. 后续脚本命令中，JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 是 external envelope、显式 fields/defaults/input binding、或上游 stdout 字段。脚本源码只需要读取 JSON key，不需要出现 placeholder 名称。\n"
-            "20. 禁止为下游脚本添加没有上游来源的额外 placeholder；不要在平台 prompt 中固定中间字段名。\n"
-            "21. 最后一步 stdout 必须包含平台标准输出字段，例如 text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。\n"
-            "22. SKILL.md 必须覆盖蓝图真实规划的任务、workflow、脚本顺序、输入输出数据流、资源使用和最终产物。\n"
+            "19. 命令中 JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 优先来自 external envelope 或显式 fields/defaults/input binding。内部上游 stdout 字段闭环只在第二轮 E2E 验证。\n"
+            "20. 不要在第一轮为下游脚本固定无来源中间字段名；placeholder 来源和修复交给第二轮 E2E。\n"
+            "21. 第一轮不要求声明最终 stdout 字段闭环；脚本 stdout 与平台标准输出字段由第二轮 E2E 真实执行验证。\n"
+            "22. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本路径、资源使用、脚本调用顺序（如有）和最终产物类型；不要固定特定中间字段。\n"
             "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
             "24. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
             "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
-            "以下 E2E workflow authoring guide 是强制生成策略，最终 SKILL.md 必须按它组织命令和数据流：\n"
+            "以下 SKILL.md first-round static authoring guide 只约束静态格式和平台边界；内部脚本流转交给第二轮 E2E 验证：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
             f"{skill_md_contract_text}\n\n"
@@ -5649,13 +5708,15 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 文本/代码/视觉理解与图片生成的模型来源必须区分：text_generation 使用 generate_text_with_llm 或 LLM_BASE_URL + TEXT_MODEL；看图/OCR/多模态理解使用 LLM_BASE_URL + VISION_MODEL；image_generation 使用平台 Stable Diffusion 图片运行时（IMAGE_BASE_URL + IMAGE_MODEL），不要把 VISION_MODEL 用于图片生成。\n"
-            "7. 是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
-            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
+            "7. 生成脚本前必须遵守 Tool Resolve 结果：只能调用下方允许的 backend.services.skill_runtime helper；不要自己发明工具、猜 API 地址、绕过 helper 写底层库。是否必须调用文本/图片模型只由当前脚本 SkillPlan.required_capabilities 决定：包含 image_generation 时必须调用 `from backend.services.skill_runtime import generate_stable_diffusion_image`；builder/exporter 默认是确定性文件构建脚本，不要因为整个 Skill.md 提到模型就强制 builder 调模型；若 builder 需要模型辅助，用 optional_capabilities/allowed_capabilities 或显式 required_capabilities 表达。\n"
+            "8. image_generation stdout 输出结构化 JSON，并返回 helper 结果里的 image_paths；必须使用 result = generate_stable_diffusion_image(desc)、image_paths.append(result.get(\"image_path\")).append(result) 的骨架，禁止 image_path = generate_stable_diffusion_image(...)；不要在脚本里写中文 prompt 翻译逻辑；禁止输出 base64 data URI，禁止假设接口只返回 url；可按需读取平台注入的 IMAGE_MODEL / IMAGE_BASE_URL / IMAGE_SIZE / IMAGE_API_KEY 等环境变量，但不要硬编码，也不需要额外校验它们是否存在。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
             "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
+            "生成前请先隐式检查以下 Tool Resolve 合同；最终脚本只能使用这些 helper/工具，禁止直接调用 forbidden imports：\n"
+            f"{tool_usage_prompt}\n\n"
             "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
             f"{generated_file_contract_text}\n\n"
             f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"

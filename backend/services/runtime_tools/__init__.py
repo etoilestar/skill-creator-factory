@@ -1,6 +1,6 @@
 """Platform runtime tool helpers used by generated Skill scripts."""
 
-from .api_tools import api_get, api_post
+from .api_tools import api_get, api_post, registered_tool_call
 from .document_tools import (
     build_pdf_report,
     create_docx,
@@ -44,6 +44,7 @@ __all__ = [
     "read_docx_text",
     "read_pptx_text",
     "read_spreadsheet",
+    "registered_tool_call",
     "upload_wechat_media",
     "web_search",
 ]

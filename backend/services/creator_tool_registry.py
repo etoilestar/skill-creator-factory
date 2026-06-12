@@ -35,6 +35,9 @@ class ToolCapability:
     required_env: list[str] = field(default_factory=list)
     required_secrets: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
+    helper_module: str = "backend.services.skill_runtime"
+    forbidden_direct_imports: list[str] = field(default_factory=list)
+    safety_level: str = "standard"
 
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
@@ -83,12 +86,16 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         display_name="PDF 生成",
         category="document",
         roles=["pdf_builder"],
-        helper_imports=["create_pdf", "merge_pdfs", "images_to_pdf", "build_pdf_report"],
+        helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
         dependencies=["reportlab"],
+        forbidden_direct_imports=["reportlab", "fpdf", "PyPDF2", "pypdf.PdfWriter", "canvas", "pdfmetrics", "UnicodeCIDFont"],
         output_schema={"type": "object", "properties": {"pdf_path": {"type": "string"}}},
         trial_mode="minimal_file",
         validator_kind="file_output",
-        prompt_guidance="PDF 生成应使用平台 helper create_pdf 或确定性文件输出，并在 stdout JSON 返回 pdf_path/file_outputs。",
+        prompt_guidance=(
+            "PDF 生成必须使用平台 helper create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；"
+            "不要在生成脚本中 import reportlab/fpdf/canvas/pdfmetrics/PyPDF2 或手写底层 PDF。"
+        ),
     ),
     "docx_generation": ToolCapability(
         name="docx_generation",
@@ -273,6 +280,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 TOOL_OVERRIDE_PERSISTENCE = "process_memory"
+_REGISTERED_TOOL_CAPABILITIES: dict[str, ToolCapability] = {}
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 _RUNTIME_HELPERS_CACHE: set[str] | None = None
 
@@ -309,7 +317,7 @@ def _runtime_helper_names() -> set[str]:
     if runtime_module is not None:
         _RUNTIME_HELPERS_CACHE = {
             helper
-            for capability in BUILTIN_TOOL_CAPABILITIES.values()
+            for capability in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]
             for helper in capability.helper_imports
             if hasattr(runtime_module, helper)
         }
@@ -334,17 +342,143 @@ def _runtime_helper_names() -> set[str]:
     return set(_RUNTIME_HELPERS_CACHE)
 
 
+
+@dataclass(frozen=True)
+class ToolResolveResult:
+    allowed_tools: list[str] = field(default_factory=list)
+    allowed_helper_imports: list[str] = field(default_factory=list)
+    required_dependencies: list[str] = field(default_factory=list)
+    forbidden_imports: list[str] = field(default_factory=list)
+    tool_usage_prompt: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+def _entry_capabilities(entry: Any) -> list[str]:
+    values: list[str] = []
+    for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
+        raw = getattr(entry, attr, None) if not isinstance(entry, dict) else entry.get(attr)
+        if isinstance(raw, list):
+            values.extend(str(item) for item in raw if item)
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _entry_role(entry: Any) -> str:
+    if isinstance(entry, dict):
+        return str(entry.get("role") or "")
+    return str(getattr(entry, "role", "") or "")
+
+
+def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
+    """Resolve Creator-usable helpers for a SkillPlan entry.
+
+    This is the pre-generation Tool Resolve step.  It is the only place that
+    converts role/capability declarations into helper names exposed to the
+    model.  Disabled tools, disallowed Creator tools, missing env/secret, and
+    missing runtime helpers are excluded before prompt construction.
+    """
+    role = _entry_role(entry)
+    capabilities = _entry_capabilities(entry)
+    allowed_tools: list[str] = []
+    allowed_helper_imports: list[str] = []
+    required_dependencies: list[str] = []
+    forbidden_imports: list[str] = []
+    guidance: list[str] = []
+    warnings: list[str] = []
+
+    for capability in capabilities:
+        cap = get_tool_capability(capability)
+        if not cap:
+            warnings.append(f"unknown capability {capability!r} has no registered tool")
+            continue
+        status = tool_status(cap)
+        if not status["enabled"]:
+            warnings.append(f"tool {cap.name} is disabled")
+            continue
+        if not status["creator_available"]:
+            warnings.append(f"tool {cap.name} is not allowed for Creator use")
+            continue
+        if cap.roles and role and role not in cap.roles and capability not in {"file_output", "deterministic_execution"}:
+            warnings.append(f"tool {cap.name} is not allowed for role {role}")
+            continue
+        if status["missing_env"] or status["missing_secrets"]:
+            warnings.append(f"tool {cap.name} is not configured: missing env/secret")
+            continue
+        if cap.helper_imports and status["missing_runtime_helpers"]:
+            warnings.append(f"tool {cap.name} missing runtime helpers: {', '.join(status['missing_runtime_helpers'])}")
+            continue
+        allowed_tools.append(cap.name)
+        allowed_helper_imports.extend(status["runtime_helpers_available"] or cap.helper_imports)
+        required_dependencies.extend(cap.dependencies)
+        forbidden_imports.extend(cap.forbidden_direct_imports)
+        if cap.prompt_guidance:
+            guidance.append(f"- {cap.name}: {cap.prompt_guidance}")
+
+    # de-duplicate preserving order
+    def dedupe(items: list[str]) -> list[str]:
+        seen: set[str] = set(); out: list[str] = []
+        for item in items:
+            if item and item not in seen:
+                seen.add(item); out.append(item)
+        return out
+
+    allowed_helper_imports = dedupe(allowed_helper_imports)
+    allowed_tools = dedupe(allowed_tools)
+    required_dependencies = dedupe(required_dependencies)
+    forbidden_imports = dedupe(forbidden_imports)
+    helper_line = (
+        "当前文件只允许从 backend.services.skill_runtime 导入这些 helper: "
+        + (", ".join(allowed_helper_imports) if allowed_helper_imports else "无")
+        + "。"
+    )
+    forbid_line = (
+        "禁止直接 import/调用底层库或绕过 helper: " + ", ".join(forbidden_imports) + "。"
+        if forbidden_imports else
+        "禁止绕过平台 helper 自行猜测外部 API 或底层实现。"
+    )
+    tool_usage_prompt = "\n".join([helper_line, forbid_line, *guidance])
+    return ToolResolveResult(
+        allowed_tools=allowed_tools,
+        allowed_helper_imports=allowed_helper_imports,
+        required_dependencies=required_dependencies,
+        forbidden_imports=forbidden_imports,
+        tool_usage_prompt=tool_usage_prompt,
+        warnings=warnings,
+    )
+
 def list_tool_capabilities() -> list[ToolCapability]:
-    return [_with_overrides(cap) for cap in BUILTIN_TOOL_CAPABILITIES.values()]
+    return [_with_overrides(cap) for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]]
 
 
 def get_tool_capability(name: str) -> ToolCapability | None:
-    cap = BUILTIN_TOOL_CAPABILITIES.get((name or "").strip())
+    key = (name or "").strip()
+    cap = BUILTIN_TOOL_CAPABILITIES.get(key) or _REGISTERED_TOOL_CAPABILITIES.get(key)
     return _with_overrides(cap) if cap else None
 
 
+def register_tool_capability(capability: ToolCapability) -> ToolCapability:
+    """Register a user/admin-provided Creator tool capability in process memory."""
+    if not capability.name:
+        raise ValueError("registered tool capability name is required")
+    _REGISTERED_TOOL_CAPABILITIES[capability.name] = capability
+    global _RUNTIME_HELPERS_CACHE
+    _RUNTIME_HELPERS_CACHE = None
+    return capability
+
+
+def clear_registered_tool_capabilities() -> None:
+    _REGISTERED_TOOL_CAPABILITIES.clear()
+    global _RUNTIME_HELPERS_CACHE
+    _RUNTIME_HELPERS_CACHE = None
+
+
 def set_tool_capability_override(name: str, *, enabled: bool | None = None, allow_creator_use: bool | None = None) -> ToolCapability | None:
-    if name not in BUILTIN_TOOL_CAPABILITIES:
+    if name not in BUILTIN_TOOL_CAPABILITIES and name not in _REGISTERED_TOOL_CAPABILITIES:
         return None
     current = dict(_TOOL_OVERRIDES.get(name, {}))
     if enabled is not None:
@@ -369,7 +503,7 @@ def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tu
 
 
 def roles() -> list[str]:
-    values = {role for cap in BUILTIN_TOOL_CAPABILITIES.values() for role in cap.roles}
+    values = {role for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()] for role in cap.roles}
     return sorted(values)
 
 
@@ -394,7 +528,7 @@ def get_role_pattern() -> str:
 
 
 def validate_capability_names(names: list[str]) -> list[str]:
-    known = set(BUILTIN_TOOL_CAPABILITIES)
+    known = set(BUILTIN_TOOL_CAPABILITIES) | set(_REGISTERED_TOOL_CAPABILITIES)
     return [name for name in names if name not in known]
 
 

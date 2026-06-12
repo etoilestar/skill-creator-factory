@@ -1859,7 +1859,13 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     assert "```bash fenced code block" in prompt
     assert "必须满足以下 SKILL.md 合同" in prompt
     assert "scripts/generate_nursery_rhyme.py" in prompt
-    assert "推荐命令模板：python scripts/generate_nursery_rhyme.py" in prompt
+    assert "static command shape example" in prompt
+    assert "python scripts/generate_nursery_rhyme.py" in prompt
+    assert "first-round static authoring guide" in prompt
+    assert "强制生成策略" not in prompt
+    assert "每个脚本说明中必须写清 stdout JSON 输出字段" not in prompt
+    assert "不要固定特定中间字段" in prompt
+    assert "script_text" not in prompt
     assert "references/best-practices.md" in prompt
     assert "明确引用每个 references/ 路径" in prompt
     assert "禁止复制 Creator 界面流程" in prompt
@@ -1874,7 +1880,7 @@ def test_creator_skill_md_contract_rejects_flow_leak_missing_bash_and_reference(
 
     from backend.routers.creator import _validate_skill_md_contract
 
-    blueprint = "scripts/generate_nursery_rhyme.py\nreferences/best-practices.md"
+    blueprint = "scripts/generate_nursery_rhyme.py\nreferences/style.md"
     leaked = """---
 name: nursery-rhyme-story
 description: demo
@@ -1895,7 +1901,7 @@ description: demo
 # 使用
 运行 scripts/generate_nursery_rhyme.py。
 
-参考资料：references/best-practices.md
+参考资料：references/style.md
 """
     with pytest.raises(ValueError, match="可执行 Markdown 命令块"):
         _validate_skill_md_contract(missing_bash, blueprint)
@@ -1913,7 +1919,7 @@ python scripts/generate_nursery_rhyme.py '{"topic":"{{topic}}"}'
     with pytest.raises(ValueError, match="缺少对参考资料"):
         _validate_skill_md_contract(missing_reference, blueprint)
 
-    valid = missing_reference + "\n参考资料：`references/best-practices.md` 用于童谣写作规范。\n"
+    valid = missing_reference + "\n参考资料：`references/style.md` 用于童谣写作规范。\n"
     _validate_skill_md_contract(valid, blueprint)
 
 

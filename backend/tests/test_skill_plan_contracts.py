@@ -1334,3 +1334,15 @@ def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
         "free_name": "free_name",
         "another_name": "another_name",
     }
+
+
+def test_skill_md_markdown_execution_guide_uses_external_envelope_example():
+    from backend.routers.creator import _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+
+    assert "{{user_request}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{input_files}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{fields}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{options}}" in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{topic}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "{{keywords}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
+    assert "keywords" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE.lower()

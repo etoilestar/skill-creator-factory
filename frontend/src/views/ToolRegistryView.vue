@@ -4,23 +4,22 @@
       <div>
         <p class="eyebrow">Creator Tool Registry</p>
         <h1>在线工具制作 / 注册</h1>
-        <p class="muted">用自然语言描述工具，生成函数级 manifest，补全 adapter，实现验证后注册到 Creator 工具库。</p>
+        <p class="muted">统一 Tool Authoring 链路：描述需求、可选粘贴代码，确认 adapter 和 snippet 后再注册。</p>
       </div>
       <button class="btn-ghost" @click="loadTools">刷新工具列表</button>
     </header>
 
-    <section class="grid two">
-      <div class="card step-card">
-        <div class="step-title"><span>1</span><h2>自然语言描述工具</h2></div>
+    <CollapsiblePanel v-model:open="expandedPanels.input" title="1 工具需求描述 / 可选代码块">
+      <div class="step-card">
         <label>工具名称<input v-model="form.tool_name" placeholder="markdown_to_pdf" /></label>
-        <label>工具用途描述<textarea v-model="form.description" rows="4" placeholder="我想注册一个工具，用来把 markdown 转成 PDF..." /></label>
-        <label>可选：粘贴已有 Python 代码<textarea v-model="optionalCodeBlock" class="code" rows="7" spellcheck="false" placeholder="def save_markdown(payload): ..." /></label>
+        <label>工具用途描述<SmartCodeEditor v-model="form.description" language="markdown" min-height="120px" placeholder="我想注册一个工具，用来把 markdown 转成 PDF..." /></label>
+        <label>可选：粘贴已有 Python 代码<SmartCodeEditor v-model="optionalCodeBlock" language="python" min-height="180px" placeholder="def save_markdown(payload): ..." /></label>
         <div class="form-row">
           <label>工具类型<select v-model="form.tool_type"><option v-for="type in toolTypes" :key="type" :value="type">{{ type }}</option></select></label>
           <label>允许角色<input v-model="allowedRolesText" placeholder="pdf_builder,document_generator" /></label>
         </div>
-        <label>输入描述<textarea v-model="form.input_description" rows="2" /></label>
-        <label>输出描述<textarea v-model="form.output_description" rows="2" /></label>
+        <label>输入描述<SmartCodeEditor v-model="form.input_description" language="text" min-height="80px" /></label>
+        <label>输出描述<SmartCodeEditor v-model="form.output_description" language="text" min-height="80px" /></label>
         <div class="checks">
           <label><input v-model="form.needs_secret" type="checkbox" /> 需要密钥</label>
           <label><input v-model="form.needs_external_network" type="checkbox" /> 需要外部网络</label>
@@ -32,34 +31,35 @@
           <button class="btn-ghost" :disabled="busy" @click="draftManifest">旧版规则草稿</button>
         </div>
       </div>
+    </CollapsiblePanel>
 
-      <div class="card step-card">
-        <div class="step-title"><span>2</span><h2>Planner 结果 / Manifest 草稿</h2></div>
+    <CollapsiblePanel v-model:open="expandedPanels.planner" title="2 Planner 结果 / Manifest 草稿">
+      <div class="step-card">
         <div v-if="clarificationQuestions.length" class="validation bad">
           <strong>需要补充信息</strong>
           <ul><li v-for="question in clarificationQuestions" :key="question">{{ question }}</li></ul>
         </div>
-        <textarea v-model="manifestText" class="code" rows="23" spellcheck="false" />
+        <SmartCodeEditor v-model="manifestText" language="json" min-height="360px" placeholder="Planner 生成的 manifest JSON" />
       </div>
-    </section>
+    </CollapsiblePanel>
 
-    <section class="grid two">
-      <div class="card step-card">
-        <div class="step-title"><span>3</span><h2>工具实现</h2></div>
+    <CollapsiblePanel v-model:open="expandedPanels.adapter" title="3 Adapter 实现">
+      <div class="step-card">
         <p class="muted small">统一 author 链路会根据可选代码块自动生成或规范化 adapter。上线前必须先确认代码，再生成 snippet。</p>
         <div class="actions">
           <button class="btn-ghost" :disabled="busy || !parsedManifest" @click="generateCode">旧版生成实现</button>
           <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
         </div>
-        <textarea v-model="adapterCode" class="code" rows="22" spellcheck="false" placeholder="Python adapter code" />
+        <SmartCodeEditor v-model="adapterCode" language="python" min-height="420px" placeholder="Python adapter code" />
       </div>
+    </CollapsiblePanel>
 
-      <div class="card step-card">
-        <div class="step-title"><span>4</span><h2>验证 / 注册 / 工具卡片预览</h2></div>
-        <label>Sample input<textarea v-model="sampleInputText" class="code" rows="7" spellcheck="false" /></label>
+    <CollapsiblePanel v-model:open="expandedPanels.validation" title="4 验证结果 / 注册准备">
+      <div class="step-card">
+        <label>Sample input<SmartCodeEditor v-model="sampleInputText" language="json" min-height="160px" /></label>
         <div class="actions">
           <button class="btn-primary" :disabled="busy || !parsedManifest" @click="validateTool">运行验证</button>
-          <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">确认 snippet 并注册</button>
+          <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">使用当前 snippet 注册工具</button>
         </div>
         <div v-if="lastValidation" class="validation" :class="lastValidation.success ? 'ok' : 'bad'">
           <strong>{{ lastValidation.success ? '验证通过' : '验证失败' }}</strong>
@@ -69,10 +69,16 @@
         <label>生成的 Snippet<textarea v-model="snippetText" class="code" rows="10" spellcheck="false" placeholder="确认代码后生成 snippet" /></label>
         <pre class="tool-card">{{ cardPreview }}</pre>
       </div>
-    </section>
+    </CollapsiblePanel>
 
-    <section class="card">
-      <div class="step-title"><span>5</span><h2>已启用 / 已注册工具</h2></div>
+    <CollapsiblePanel v-model:open="expandedPanels.snippet" title="5 Snippet 确认">
+      <div class="step-card">
+        <p class="muted small">这里展示并编辑最终注册用 snippet；注册前会从当前编辑器内容覆盖 manifest.snippets。</p>
+        <SmartCodeEditor v-model="snippetText" language="json" min-height="260px" placeholder="确认代码后生成 snippet" />
+      </div>
+    </CollapsiblePanel>
+
+    <CollapsiblePanel v-model:open="expandedPanels.registeredTools" title="6 已启用 / 已注册工具" :badge="tools.length">
       <div class="tools-table">
         <div class="row head"><span>名称</span><span>策略</span><span>状态</span><span>函数卡</span></div>
         <div v-for="tool in tools" :key="tool.name" class="row">
@@ -82,52 +88,52 @@
           <span>{{ (tool.functions || []).map(fn => fn.function_name).join(', ') || tool.helper_imports?.join(', ') }}</span>
         </div>
       </div>
-    </section>
+    </CollapsiblePanel>
 
-    <section class="grid two">
-      <div class="card step-card">
-        <div class="step-title"><span>6</span><h2>Tool Usage Snippets</h2></div>
-        <p class="muted small">编辑模型会看到的 import、最小调用、返回规则和反例；可预览 Creator 注入格式并做静态 smoke test。</p>
-        <div class="form-row">
-          <label>选择工具<select v-model="selectedToolName" @change="loadSnippets"><option value="">选择工具</option><option v-for="tool in tools" :key="tool.name" :value="tool.name">{{ tool.name }}</option></select></label>
-          <label>Snippet 类型<select v-model="snippetForm.kind"><option v-for="kind in snippetKinds" :key="kind" :value="kind">{{ kind }}</option></select></label>
+    <CollapsiblePanel v-model:open="expandedPanels.snippetManager" title="7 Tool Usage Snippets" :badge="snippets.length">
+      <div class="grid two">
+        <div class="step-card">
+          <p class="muted small">编辑模型会看到的 import、最小调用、返回规则和反例；可预览 Creator 注入格式并做静态 smoke test。</p>
+          <div class="form-row">
+            <label>选择工具<select v-model="selectedToolName" @change="loadSnippets"><option value="">选择工具</option><option v-for="tool in tools" :key="tool.name" :value="tool.name">{{ tool.name }}</option></select></label>
+            <label>Snippet 类型<select v-model="snippetForm.kind"><option v-for="kind in snippetKinds" :key="kind" :value="kind">{{ kind }}</option></select></label>
+          </div>
+          <div class="form-row">
+            <label>ID<input v-model="snippetForm.id" placeholder="create_pdf.minimal_text_pdf" /></label>
+            <label>标题<input v-model="snippetForm.title" placeholder="Create a simple PDF" /></label>
+          </div>
+          <label>适用 roles（逗号分隔）<input v-model="snippetRolesText" placeholder="pdf_builder,document_generator" /></label>
+          <label>适用 capabilities（逗号分隔）<input v-model="snippetCapabilitiesText" placeholder="pdf_generation" /></label>
+          <label>failure layers（逗号分隔）<input v-model="snippetFailuresText" placeholder="final_platform_output_value_invalid,artifact_missing" /></label>
+          <label>描述<SmartCodeEditor v-model="snippetForm.description" language="markdown" min-height="90px" /></label>
+          <label>正确调用代码<SmartCodeEditor v-model="snippetForm.code" language="python" min-height="220px" /></label>
+          <div class="form-row">
+            <label>期望输入 shape(JSON)<SmartCodeEditor v-model="snippetInputShapeText" language="json" min-height="160px" /></label>
+            <label>期望输出 shape(JSON)<SmartCodeEditor v-model="snippetOutputShapeText" language="json" min-height="160px" /></label>
+          </div>
+          <label>return rule<SmartCodeEditor v-model="snippetForm.return_rule" language="text" min-height="90px" /></label>
+          <label>anti patterns（每行一条）<SmartCodeEditor v-model="snippetAntiPatternsText" language="text" min-height="120px" /></label>
+          <div class="form-row">
+            <label>usage policy<select v-model="snippetForm.usage_policy"><option>helper_preferred</option><option>helper_required</option><option>self_implementation_allowed</option></select></label>
+            <label>priority<input v-model.number="snippetForm.priority" type="number" /></label>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" :disabled="busy || !selectedToolName" @click="saveSnippet">新增 / 保存 snippet</button>
+            <button class="btn-ghost" :disabled="busy || !selectedToolName || !snippetForm.id" @click="runSnippetSmokeTest">运行 smoke test</button>
+          </div>
+          <p v-if="snippetTestResult" class="small" :class="snippetTestResult.success ? 'green' : 'error'">Smoke test: {{ snippetTestResult.success ? 'passed' : 'failed' }} {{ snippetTestResult.message || '' }}</p>
         </div>
-        <div class="form-row">
-          <label>ID<input v-model="snippetForm.id" placeholder="create_pdf.minimal_text_pdf" /></label>
-          <label>标题<input v-model="snippetForm.title" placeholder="Create a simple PDF" /></label>
-        </div>
-        <label>适用 roles（逗号分隔）<input v-model="snippetRolesText" placeholder="pdf_builder,document_generator" /></label>
-        <label>适用 capabilities（逗号分隔）<input v-model="snippetCapabilitiesText" placeholder="pdf_generation" /></label>
-        <label>failure layers（逗号分隔）<input v-model="snippetFailuresText" placeholder="final_platform_output_value_invalid,artifact_missing" /></label>
-        <label>描述<textarea v-model="snippetForm.description" rows="2" /></label>
-        <label>正确调用代码<textarea v-model="snippetForm.code" class="code" rows="10" spellcheck="false" /></label>
-        <div class="form-row">
-          <label>期望输入 shape(JSON)<textarea v-model="snippetInputShapeText" class="code" rows="5" spellcheck="false" /></label>
-          <label>期望输出 shape(JSON)<textarea v-model="snippetOutputShapeText" class="code" rows="5" spellcheck="false" /></label>
-        </div>
-        <label>return rule<textarea v-model="snippetForm.return_rule" rows="2" /></label>
-        <label>anti patterns（每行一条）<textarea v-model="snippetAntiPatternsText" rows="4" /></label>
-        <div class="form-row">
-          <label>usage policy<select v-model="snippetForm.usage_policy"><option>helper_preferred</option><option>helper_required</option><option>self_implementation_allowed</option></select></label>
-          <label>priority<input v-model.number="snippetForm.priority" type="number" /></label>
-        </div>
-        <div class="actions">
-          <button class="btn-primary" :disabled="busy || !selectedToolName" @click="saveSnippet">新增 / 保存 snippet</button>
-          <button class="btn-ghost" :disabled="busy || !selectedToolName || !snippetForm.id" @click="runSnippetSmokeTest">运行 smoke test</button>
-        </div>
-        <p v-if="snippetTestResult" class="small" :class="snippetTestResult.success ? 'green' : 'error'">Smoke test: {{ snippetTestResult.success ? 'passed' : 'failed' }} {{ snippetTestResult.message || '' }}</p>
-      </div>
 
-      <div class="card step-card">
-        <div class="step-title"><span>7</span><h2>Creator Snippet 预览</h2></div>
-        <div class="snippets-list">
-          <button v-for="snippet in snippets" :key="snippet.id" class="snippet-item" @click="editSnippet(snippet)">
-            <strong>{{ snippet.id }}</strong><small>{{ snippet.kind }} · priority {{ snippet.priority }}</small>
-          </button>
+        <div class="step-card">
+          <div class="snippets-list">
+            <button v-for="snippet in snippets" :key="snippet.id" class="snippet-item" @click="editSnippet(snippet)">
+              <strong>{{ snippet.id }}</strong><small>{{ snippet.kind }} · priority {{ snippet.priority }}</small>
+            </button>
+          </div>
+          <pre class="tool-card">{{ snippetPreview }}</pre>
         </div>
-        <pre class="tool-card">{{ snippetPreview }}</pre>
       </div>
-    </section>
+    </CollapsiblePanel>
 
     <p v-if="error" class="error">{{ error }}</p>
   </div>
@@ -135,6 +141,8 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
+import CollapsiblePanel from '../components/CollapsiblePanel.vue'
+import SmartCodeEditor from '../components/SmartCodeEditor.vue'
 import { authorCreatorTool, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, validateCreatorTool } from '../composables/useCreator.js'
 
 const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
@@ -161,6 +169,7 @@ const snippetOutputShapeText = ref('{}')
 const snippetAntiPatternsText = ref('')
 const snippetTestResult = ref(null)
 const snippetForm = reactive({ id: '', title: '', kind: 'minimal_usage', description: '', code: '', return_rule: '', usage_policy: 'helper_preferred', priority: 80 })
+const expandedPanels = reactive({ input: true, planner: false, adapter: false, validation: false, snippet: false, registeredTools: false, snippetManager: false })
 
 const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
@@ -172,17 +181,18 @@ async function run(task) { busy.value = true; error.value = ''; try { await task
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
 function authorPayload(stage) { return { ...payload(), stage, code_block: optionalCodeBlock.value || (stage === 'draft' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value } }
-function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = [] }) }
-function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('draft')); authorStage.value = 'draft'; clarificationQuestions.value = data.questions || []; manifestText.value = JSON.stringify(data.manifest || {}, null, 2); sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || null; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }) }
-function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; lastValidation.value = data.validation || lastValidation.value; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } }) }
-function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code }) }
-function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }) }) }
-function registerTool() { return run(async () => { await registerCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true, enable: true }); await loadTools() }) }
+function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; expandedPanels.planner = true }) }
+function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('draft')); authorStage.value = 'draft'; clarificationQuestions.value = data.questions || []; manifestText.value = JSON.stringify(data.manifest || {}, null, 2); sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || null; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; expandedPanels.planner = true; expandedPanels.adapter = !data.needs_clarification; expandedPanels.validation = !data.needs_clarification }) }
+function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; lastValidation.value = data.validation || lastValidation.value; snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } expandedPanels.validation = true; expandedPanels.snippet = true }) }
+function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; expandedPanels.adapter = true }) }
+function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }); expandedPanels.validation = true }) }
+function buildFinalManifestForRegister() { const manifest = { ...(parsedManifest.value || {}) }; const snippet = parseJsonText(snippetText.value); if (snippet && Object.keys(snippet).length) manifest.snippets = [snippet]; return manifest }
+function registerTool() { return run(async () => { await registerCreatorTool({ manifest: buildFinalManifestForRegister(), adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true, enable: true }); await loadTools(); expandedPanels.registeredTools = true }) }
 function parseJsonText(text) { try { return text ? JSON.parse(text) : {} } catch { return {} } }
 function splitLines(text) { return text.split('\n').map(s => s.trim()).filter(Boolean) }
 function splitCsv(text) { return text.split(',').map(s => s.trim()).filter(Boolean) }
 function buildSnippetPayload() { return { ...snippetForm, applies_to: { roles: splitCsv(snippetRolesText.value), capabilities: splitCsv(snippetCapabilitiesText.value), failure_layers: splitCsv(snippetFailuresText.value) }, expected_input_shape: parseJsonText(snippetInputShapeText.value), expected_output_shape: parseJsonText(snippetOutputShapeText.value), anti_patterns: splitLines(snippetAntiPatternsText.value), requires: splitCsv(snippetCapabilitiesText.value) } }
-function loadSnippets() { return run(async () => { if (!selectedToolName.value) { snippets.value = []; return } const data = await listCreatorToolSnippets(selectedToolName.value); snippets.value = data.snippets || []; snippetTestResult.value = null }) }
+function loadSnippets() { return run(async () => { if (!selectedToolName.value) { snippets.value = []; return } const data = await listCreatorToolSnippets(selectedToolName.value); snippets.value = data.snippets || []; snippetTestResult.value = null; expandedPanels.snippetManager = true }) }
 function editSnippet(snippet) { snippetForm.id = snippet.id; snippetForm.title = snippet.title; snippetForm.kind = snippet.kind || 'minimal_usage'; snippetForm.description = snippet.description || ''; snippetForm.code = snippet.code || ''; snippetForm.return_rule = snippet.return_rule || ''; snippetForm.usage_policy = snippet.usage_policy || 'helper_preferred'; snippetForm.priority = snippet.priority || 0; snippetRolesText.value = (snippet.applies_to?.roles || []).join(','); snippetCapabilitiesText.value = (snippet.applies_to?.capabilities || snippet.requires || []).join(','); snippetFailuresText.value = (snippet.applies_to?.failure_layers || []).join(','); snippetInputShapeText.value = JSON.stringify(snippet.expected_input_shape || {}, null, 2); snippetOutputShapeText.value = JSON.stringify(snippet.expected_output_shape || {}, null, 2); snippetAntiPatternsText.value = (snippet.anti_patterns || []).join('\n'); snippetTestResult.value = null }
 function saveSnippet() { return run(async () => { const payload = buildSnippetPayload(); const exists = snippets.value.some(item => item.id === payload.id); if (exists) await updateCreatorToolSnippet(selectedToolName.value, payload.id, payload); else await createCreatorToolSnippet(selectedToolName.value, payload); await loadSnippets() }) }
 function runSnippetSmokeTest() { return run(async () => { if (!snippets.value.some(item => item.id === snippetForm.id)) await saveSnippet(); snippetTestResult.value = await testCreatorToolSnippet(selectedToolName.value, snippetForm.id) }) }

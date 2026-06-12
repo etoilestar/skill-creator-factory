@@ -368,6 +368,7 @@ RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asse
 TOOL_OVERRIDE_PERSISTENCE = "process_memory"
 CUSTOM_TOOL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "tool_registry.custom.json"
 CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _REGISTERED_TOOL_CAPABILITIES: dict[str, ToolCapability] = {}
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 _RUNTIME_HELPERS_CACHE: set[str] | None = None
@@ -1229,14 +1230,52 @@ def _code_security_errors(code: str) -> list[str]:
     return sorted(set(errors))
 
 
+def _safe_adapter_module_path(cap: ToolCapability) -> Path:
+    """Return the only allowed persistent adapter path for a custom tool."""
+    return (CUSTOM_TOOL_ADAPTER_DIR / f"{_slug(cap.name)}.py").resolve()
+
+
 def _adapter_module_path(cap: ToolCapability) -> Path:
-    if cap.adapter_path:
-        path = Path(cap.adapter_path)
-        if not path.is_absolute():
-            path = Path(__file__).resolve().parents[2] / path
-    else:
-        path = CUSTOM_TOOL_ADAPTER_DIR / f"{cap.name}.py"
-    return path.resolve()
+    """Resolve persisted adapters without trusting arbitrary manifest paths."""
+    return _safe_adapter_module_path(cap)
+
+
+def safe_adapter_path_for_manifest(manifest: dict[str, Any]) -> str:
+    """Return the normalized repository-relative adapter path for a manifest."""
+    cap = _capability_from_dict(manifest)
+    path = _safe_adapter_module_path(cap)
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def normalize_tool_manifest_adapter_path(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Force registered custom adapters into CUSTOM_TOOL_ADAPTER_DIR."""
+    payload = dict(manifest or {})
+    cap = _capability_from_dict(payload)
+    payload["adapter_path"] = safe_adapter_path_for_manifest(payload)
+    adapter_import = f"backend.services.runtime_tools.custom_tools.{_slug(cap.name)}"
+    functions = []
+    for item in payload.get("functions") or []:
+        if isinstance(item, dict):
+            fn = dict(item)
+            fn["import_path"] = adapter_import
+            functions.append(fn)
+    if functions:
+        payload["functions"] = functions
+    return payload
+
+
+def write_registered_adapter(manifest: dict[str, Any], adapter_code: str | None) -> dict[str, Any]:
+    """Persist confirmed adapter code and return a path-normalized manifest."""
+    payload = normalize_tool_manifest_adapter_path(manifest)
+    if adapter_code:
+        cap = _capability_from_dict(payload)
+        path = _safe_adapter_module_path(cap)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(adapter_code, encoding="utf-8")
+    return payload
 
 
 def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None = None, sample_input: dict[str, Any] | None = None, dynamic: bool = True) -> dict[str, Any]:
@@ -1247,11 +1286,13 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         errors.extend(_code_security_errors(adapter_code))
     dynamic_result: dict[str, Any] = {"skipped": not dynamic}
     if cap and dynamic and not errors:
-        path = _adapter_module_path(cap)
+        temp_code_dir: tempfile.TemporaryDirectory[str] | None = None
         if adapter_code:
-            CUSTOM_TOOL_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_code_dir = tempfile.TemporaryDirectory(prefix="creator_tool_validate_")
+            path = Path(temp_code_dir.name) / f"{_slug(cap.name)}.py"
             path.write_text(adapter_code, encoding="utf-8")
+        else:
+            path = _adapter_module_path(cap)
         if not path.exists():
             errors.append(f"adapter file does not exist: {path}")
         else:
@@ -1312,6 +1353,9 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
                 dynamic_result = {"skipped": False, "return_keys": sorted(value.keys())}
             except Exception as exc:
                 errors.append(f"dynamic trial failed: {exc}")
+            finally:
+                if temp_code_dir is not None:
+                    temp_code_dir.cleanup()
     snippet_validations = [validate_tool_snippet(cap, snippet) for snippet in snippets_for_tool(cap)] if cap else []
     success = not errors
     return {
@@ -1348,7 +1392,7 @@ async def _complete_author_model(task: str, messages: list[dict[str, str]], *, r
         from .model_router import route_model
 
         route = route_model(task, reason=reason)
-        text = await asyncio.wait_for(complete_chat_once(messages, route.model), timeout=float(os.environ.get("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "2")))
+        text = await asyncio.wait_for(complete_chat_once(messages, route.model), timeout=float(os.environ.get(f"TOOL_AUTHOR_{task.upper()}_TIMEOUT_SECONDS", os.environ.get("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "120"))))
         parsed = _json_from_model_text(text)
         if task == "code" and not parsed and (text or "").strip():
             parsed = {"code": _strip_code_fence(text)}
@@ -1595,7 +1639,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     if stage == "finalize":
         manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
         adapter_code = str(request.get("adapter_code") or request.get("code_block") or "")
-        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=request.get("sample_input") or {}, dynamic=False)
+        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=request.get("sample_input") or {}, dynamic=True)
         static_errors = _author_adapter_static_errors(adapter_code, manifest)
         if static_errors:
             validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))

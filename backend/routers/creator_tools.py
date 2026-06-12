@@ -30,6 +30,7 @@ from ..services.creator_tool_registry import (
     validate_tool_manifest,
     validate_tool_snippet,
     tool_status,
+    write_registered_adapter,
     _capability_from_dict,
     _snippet_from_dict,
 )
@@ -170,7 +171,7 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
     )
     if not validation["success"]:
         raise HTTPException(status_code=400, detail={"message": "tool validation failed", "validation": validation})
-    payload = dict(request.manifest)
+    payload = write_registered_adapter(request.manifest, request.adapter_code)
     payload["enabled"] = bool(request.enable)
     payload["enabled_by_default"] = bool(request.enable)
     payload["allow_creator_use"] = bool(request.enable)

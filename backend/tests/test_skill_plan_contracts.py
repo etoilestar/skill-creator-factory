@@ -1346,3 +1346,47 @@ def test_skill_md_markdown_execution_guide_uses_external_envelope_example():
     assert "{{topic}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
     assert "{{keywords}}" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE
     assert "keywords" not in _SKILL_MD_MARKDOWN_EXECUTION_GUIDE.lower()
+
+def test_blueprint_warnings_exclude_static_internal_dataflow_dangling_outputs():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: abstract-chain
+- scripts/: `scripts/first.py`
+  scripts/first.py role: generic_script inputs: external_value outputs: internal_alpha
+- scripts/: `scripts/second.py`
+  scripts/second.py role: generic_script inputs: different_internal outputs: final_result
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+
+    serialized_warnings = "\n".join(plan.skill_plan.warnings + plan.warnings)
+    assert "neither consumed" not in serialized_warnings
+    assert "must reference prior stdout" not in serialized_warnings
+    assert "command_template missing input key" not in serialized_warnings
+    assert any(entry.path == "scripts/second.py" for entry in plan.skill_plan.files)
+
+
+def test_skill_plan_ambiguous_inputs_outputs_are_not_concatenated_and_warn():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: abstract-fields
+- scripts/: `scripts/transform.py`
+  scripts/transform.py
+  role: generic_script
+  inputs: stable_input, candidate_one/candidate_two, alias_one | alias_two
+  outputs: stable_output, result_one+result_two
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/transform.py")
+
+    assert entry.inputs == ["stable_input"]
+    assert entry.outputs == ["stable_output"]
+    assert "candidate_onecandidate_two" not in entry.inputs
+    assert "alias_onealias_two" not in entry.inputs
+    assert "result_oneresult_two" not in entry.outputs
+    assert any("skill_plan.field_ambiguous" in warning for warning in plan.skill_plan.warnings)

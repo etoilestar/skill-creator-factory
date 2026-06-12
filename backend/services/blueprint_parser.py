@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, validate_skill_plan_dataflow
+from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -494,6 +494,14 @@ def build_skill_plan_from_files(
             )
             continue
 
+        for warning in skill_plan_field_declaration_warnings(
+            file_path=file.path,
+            purpose=file.purpose,
+            blueprint_summary=blueprint_text[:4000],
+        ):
+            if warning not in plan_warnings:
+                plan_warnings.append(warning)
+
         refs_for_file = reference_files if file.path == "SKILL.md" or file.path.startswith("scripts/") else []
         entry = build_skill_plan_entry(
             file_path=file.path,
@@ -528,8 +536,11 @@ def build_skill_plan_from_files(
 
     normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings))
     semantic_issues = validate_file_plan_semantics(normalized)
-    dataflow_issues = validate_skill_plan_dataflow(normalized)
-    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues, *dataflow_issues])
+    # SkillPlan static I/O consumption is an internal workflow dataflow hint, not
+    # a blueprint-stage user-visible warning.  First-round Creator validation
+    # only reports platform/file-boundary issues; real script-to-script field
+    # availability is checked by second-round E2E execution.
+    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues])
 
 
 def parse_blueprint(messages: list[dict]) -> BlueprintPlan:

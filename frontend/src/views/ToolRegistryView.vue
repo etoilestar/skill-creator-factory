@@ -117,6 +117,11 @@
             <div v-else-if="liveTestResult?.preview" class="live-test-section"><strong>preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.preview) }}</pre></div>
           </div>
 
+          <div v-if="liveTestResult" class="validation" :class="liveTestResult.success ? 'ok' : 'bad'">
+            <strong>{{ liveTestResult.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
+            <pre class="tool-card">{{ JSON.stringify(liveTestResult.normalized_preview || liveTestResult.preview || liveTestResult.errors, null, 2) }}</pre>
+          </div>
+
           <div class="stream-status">
             <div><strong>生成进度 / 日志</strong><small>长耗时步骤会持续写入事件。</small></div>
             <button v-if="busy" class="btn-ghost" @click="cancelAuthoring">取消当前生成</button>

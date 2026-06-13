@@ -1,0 +1,75 @@
+{
+  "sessions": {
+    "default": {
+      "config": {
+        "auth": {
+          "env": "SERPER_API_KEY",
+          "placement": "header",
+          "type": "header"
+        },
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "header",
+        "method": "GET",
+        "secret_env": "SERPER_API_KEY"
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [
+        "SERPER_API_KEY"
+      ],
+      "raw_values": {},
+      "sample_input": {
+        "query": "测试内容"
+      },
+      "tool_name": "default",
+      "updated_at": "2026-06-13T07:22:54.398191+00:00"
+    },
+    "search": {
+      "config": {
+        "api_key": "${ENV:SERPER_API_KEY}",
+        "auth": {
+          "env": "SERPER_API_KEY",
+          "header_name": "X-API-KEY",
+          "placement": "header",
+          "type": "api_key"
+        },
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "api_key",
+        "base_url": "${ENV:SEARCH_BASE_URL}",
+        "headers_template": {
+          "Content-Type": "application/json"
+        },
+        "json_body_template": {
+          "q": "apple inc"
+        },
+        "method": "POST",
+        "secret_env": "SERPER_API_KEY"
+      },
+      "config_refs": {
+        "api_key": "${ENV:SERPER_API_KEY}",
+        "base_url": "${ENV:SEARCH_BASE_URL}"
+      },
+      "configured_env": [
+        "SEARCH_BASE_URL"
+      ],
+      "configured_secrets": [
+        "SERPER_API_KEY"
+      ],
+      "raw_values": {
+        "SEARCH_BASE_URL": "https://google.serper.dev/search",
+        "SERPER_API_KEY": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
+      },
+      "sample_input": {
+        "q": "apple inc"
+      },
+      "tool_name": "search",
+      "updated_at": "2026-06-13T07:23:53.619904+00:00"
+    }
+  },
+  "updated_at": "2026-06-13T07:23:53.622668+00:00",
+  "version": 1
+}

@@ -75,6 +75,8 @@ class ToolManifestRequest(BaseModel):
     adapter_code: str | None = None
     sample_input: dict[str, Any] = Field(default_factory=dict)
     dynamic: bool = True
+    allow_external_network: bool = False
+    real_run: bool = False
 
 
 class ToolConfigSaveRequest(BaseModel):
@@ -211,6 +213,7 @@ def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
         dynamic=request.dynamic,
+        real_run=bool(request.real_run or request.allow_external_network),
     )
 
 
@@ -221,9 +224,12 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
         dynamic=request.dynamic,
+        real_run=bool(request.real_run or request.allow_external_network),
     )
+
     if not validation["success"]:
         raise HTTPException(status_code=400, detail={"message": "tool validation failed", "validation": validation})
+
     payload = write_registered_adapter(request.manifest, request.adapter_code)
     payload["enabled"] = bool(request.enable)
     payload["enabled_by_default"] = bool(request.enable)
@@ -232,9 +238,11 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
     payload["test_status"] = "passed"
     payload["last_validation_result"] = validation
     payload["created_by"] = request.created_by
+
     cap = _capability_from_dict(payload)
     register_tool_capability(cap)
     persist_registered_tools()
+
     return {"tool": tool_status(cap), "validation": validation}
 
 

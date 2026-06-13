@@ -833,9 +833,35 @@ function runLiveTest() {
 }
 function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; applyAuthorResult(data); if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; activeStep.value = 'adapter' }) }
-function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }); activeStep.value = 'validation' }) }
+function validateTool() {
+  return run(async () => {
+    lastValidation.value = await validateCreatorTool({
+      manifest: parsedManifest.value,
+      adapter_code: adapterCode.value,
+      sample_input: parsedSample.value,
+      dynamic: true,
+      allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
+      real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success)
+    })
+    activeStep.value = 'validation'
+  })
+}
 function buildFinalManifestForRegister() { const manifest = { ...(parsedManifest.value || {}) }; const snippet = parseJsonText(snippetText.value); if (snippet && Object.keys(snippet).length) manifest.snippets = [snippet]; return manifest }
-function registerTool() { return run(async () => { await registerCreatorTool({ manifest: buildFinalManifestForRegister(), adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true, enable: true }); await loadTools(); registryDrawerOpen.value = true }) }
+function registerTool() {
+  return run(async () => {
+    await registerCreatorTool({
+      manifest: buildFinalManifestForRegister(),
+      adapter_code: adapterCode.value,
+      sample_input: parsedSample.value,
+      dynamic: true,
+      allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
+      real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
+      enable: true
+    })
+    await loadTools()
+    registryDrawerOpen.value = true
+  })
+}
 function parseJsonText(text) { try { return text ? JSON.parse(text) : {} } catch { return {} } }
 function splitLines(text) { return text.split('\n').map(s => s.trim()).filter(Boolean) }
 function splitCsv(text) { return text.split(',').map(s => s.trim()).filter(Boolean) }

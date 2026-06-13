@@ -142,34 +142,44 @@
               <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
             </div>
           </div>
-          <div v-if="adapterSections.hasSections" class="split-layout">
-              <div class="pane">
-                <h3>固定 Wrapper 模板（只读）</h3>
-                <pre class="tool-card">{{ adapterSections.wrapperBefore }}</pre>
-              </div>
-
-              <div class="pane">
-                <h3>模型生成代码（可人工修改）</h3>
-                <SmartCodeEditor
-                  v-model="editableInternalCode"
-                  language="python"
-                  density="compact"
-                  min-height="260px"
-                  max-height="520px"
-                  placeholder="def normalize_response(data, payload): ..."
-                  @focus="refreshEditableInternalCode"
-                />
-                <div class="actions">
+          <div v-if="adapterSections.hasSections" class="adapter-edit-layout">
+              <div class="pane model-code-pane">
+                <div class="section-title row-title">
+                  <div>
+                    <h3>模型生成代码（可人工修改）</h3>
+                    <small>这里只允许修改 normalize_response(data, payload)，固定 wrapper 默认折叠在下方。</small>
+                  </div>
                   <button class="btn-primary" type="button" @click="applyInternalCodeEdit">
                     应用到完整 Adapter
                   </button>
                 </div>
+
+                <SmartCodeEditor
+                  v-model="editableInternalCode"
+                  language="python"
+                  density="compact"
+                  min-height="420px"
+                  max-height="680px"
+                  placeholder="def normalize_response(data, payload): ..."
+                  @focus="refreshEditableInternalCode"
+                />
               </div>
 
-              <div class="pane">
-                <h3>固定 Wrapper 后半段（只读）</h3>
-                <pre class="tool-card">{{ adapterSections.wrapperAfter }}</pre>
-              </div>
+              <details class="adapter-fixed-block">
+                <summary>
+                  <strong>固定 Wrapper 模板前半段（只读）</strong>
+                  <small>env、模板渲染、默认归一化等平台代码</small>
+                </summary>
+                <pre class="tool-card adapter-fixed-code">{{ adapterSections.wrapperBefore }}</pre>
+              </details>
+
+              <details class="adapter-fixed-block">
+                <summary>
+                  <strong>固定 Wrapper 模板后半段（只读）</strong>
+                  <small>run、manifest、main、导出函数等平台代码</small>
+                </summary>
+                <pre class="tool-card adapter-fixed-code">{{ adapterSections.wrapperAfter }}</pre>
+              </details>
           </div>
 
           <SmartCodeEditor
@@ -1209,6 +1219,78 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
 
 .auth-extra-panel .section-title small {
   color: var(--text-muted);
+}
+
+.adapter-edit-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.model-code-pane {
+  width: 100%;
+  min-width: 0;
+}
+
+.model-code-pane :deep(.editor-shell) {
+  min-height: 420px;
+}
+
+.row-title {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adapter-fixed-block {
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.adapter-fixed-block summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  list-style: none;
+}
+
+.adapter-fixed-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.adapter-fixed-block summary::before {
+  content: '▶';
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: transform .15s ease;
+}
+
+.adapter-fixed-block[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.adapter-fixed-block summary strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.adapter-fixed-block summary small {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+.adapter-fixed-code {
+  margin: 0 12px 12px;
+  max-height: 320px;
 }
 small { display: block; color: var(--text-muted); } .green { color: var(--success); }
 @media (max-width: 1100px) { .drawer-snippet-layout { grid-template-columns: 1fr; } }

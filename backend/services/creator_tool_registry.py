@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, 
 from datetime import datetime, timezone
 import asyncio
 import ast
+import base64
 import importlib
 import importlib.util
 import json
@@ -55,6 +56,43 @@ def _is_sensitive_config_key(key: str) -> bool:
     return any(token in lowered for token in _SENSITIVE_CONFIG_KEYS)
 
 
+def _build_saved_auth_config(data: dict[str, Any], raw_config: dict[str, Any], auth_type: str, secret_env: str) -> dict[str, Any]:
+    if auth_type in {"", "none", "no_auth", "anonymous"} or not secret_env:
+        return {}
+    existing = raw_config.get("auth") if isinstance(raw_config.get("auth"), dict) else {}
+    normalized_type = "token" if auth_type in {"token", "bearer"} else "api_key" if auth_type in {"api_key", "key"} else auth_type
+    placement = str(data.get("auth_placement") or raw_config.get("auth_placement") or existing.get("placement") or "").strip().lower()
+    if normalized_type == "token":
+        placement = placement or "bearer"
+    elif normalized_type == "api_key":
+        placement = placement or "header"
+    elif normalized_type == "basic":
+        placement = placement or "header"
+    auth: dict[str, Any] = {"type": normalized_type, "env": secret_env, "placement": placement}
+    header_name = str(data.get("auth_header_name") or raw_config.get("auth_header_name") or existing.get("header_name") or "").strip()
+    query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or existing.get("query_param") or "").strip()
+    if normalized_type == "api_key":
+        if placement == "query":
+            auth["query_param"] = query_param or "api_key"
+        elif placement == "bearer":
+            auth["header_name"] = "Authorization"
+            auth["scheme"] = "Bearer"
+        else:
+            auth["placement"] = "header"
+            auth["header_name"] = header_name or "X-API-KEY"
+    elif normalized_type == "token":
+        auth["placement"] = "header"
+        auth["header_name"] = header_name or "Authorization"
+        auth["scheme"] = str(existing.get("scheme") or raw_config.get("auth_scheme") or "Bearer").strip() or "Bearer"
+    elif normalized_type == "basic":
+        auth["placement"] = "header"
+        auth["header_name"] = "Authorization"
+        auth["scheme"] = "Basic"
+    elif normalized_type == "custom":
+        auth["placement"] = placement or "custom"
+    return auth
+
+
 def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     """Save authoring configuration as env/secret references without returning plaintext values."""
     data = dict(payload or {})
@@ -76,9 +114,12 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     # Normalized form fields from the authorization dialog.
     store_value("base_url", data.get("base_url") or raw_config.get("base_url") or raw_config.get("endpoint") or raw_config.get("url"), secret=False, env_name=data.get("base_url_env") or raw_config.get("base_url_env"))
     auth_type = str(data.get("auth_type") or raw_config.get("auth_type") or raw_config.get("authentication") or "none").strip().lower() or "none"
+    secret_env_name = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
     if auth_type != "none":
         secret_key = "api_key" if auth_type in {"api_key", "key"} else "token" if auth_type in {"token", "bearer"} else "password" if auth_type == "basic" else "secret"
-        store_value(secret_key, data.get("secret_value") or raw_config.get(secret_key) or raw_config.get("api_key") or raw_config.get("token") or raw_config.get("password"), secret=True, env_name=data.get("secret_env") or raw_config.get("secret_env") or raw_config.get(f"{secret_key}_env"))
+        secret_env_name = secret_env_name or str(raw_config.get(f"{secret_key}_env") or "").strip()
+        store_value(secret_key, data.get("secret_value") or raw_config.get(secret_key) or raw_config.get("api_key") or raw_config.get("token") or raw_config.get("password"), secret=True, env_name=secret_env_name or None)
+        secret_env_name = secret_env_name or _env_name_for_tool_config(tool_name, secret_key, secret=True)
 
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else raw_config.get("extra") if isinstance(raw_config.get("extra"), dict) else {}
     for key, value in extra.items():
@@ -96,9 +137,14 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     if "base_url" in config_refs:
         sanitized_config["base_url"] = config_refs["base_url"]
     sanitized_config["auth_type"] = auth_type
+    if secret_env_name:
+        sanitized_config["secret_env"] = secret_env_name
     for key, ref in config_refs.items():
         if key != "base_url":
             sanitized_config[key] = ref
+    auth_config = _build_saved_auth_config(data, raw_config, auth_type, secret_env_name)
+    if auth_config:
+        sanitized_config["auth"] = auth_config
     sanitized_config, inferred_refs = _sanitize_authoring_config(sanitized_config)
     for ref in inferred_refs:
         if ref not in configured_secrets and ref not in configured_env:
@@ -1689,7 +1735,10 @@ def _suggest_external_api_entrypoint(request: dict[str, Any], config: dict[str, 
     existing_secret = str(config.get("secret_env") or config.get("secret_env_name") or config.get("api_key_env") or config.get("token_env") or "").strip()
     secret_env = existing_secret or (f"{env_prefix}_{'TOKEN' if auth_type == 'token' else 'API_KEY'}" if auth_type not in {"none", "no_auth", "anonymous"} else "")
     confidence = "high" if base_url and (config.get("auth_type") or config.get("authentication") or existing_secret) else "medium" if base_url else "low"
-    return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "confidence": confidence}
+    auth_placement = str(config.get("auth_placement") or ((config.get("auth") or {}).get("placement") if isinstance(config.get("auth"), dict) else "") or ("header" if auth_type == "api_key" else "")).strip()
+    auth_header_name = str(config.get("auth_header_name") or ((config.get("auth") or {}).get("header_name") if isinstance(config.get("auth"), dict) else "") or ("X-API-KEY" if auth_type == "api_key" else "Authorization" if auth_type == "token" else "")).strip()
+    auth_query_param = str(config.get("auth_query_param") or ((config.get("auth") or {}).get("query_param") if isinstance(config.get("auth"), dict) else "") or "api_key").strip()
+    return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "auth_placement": auth_placement, "auth_header_name": auth_header_name, "auth_query_param": auth_query_param, "confidence": confidence}
 
 
 def _clarification_answer_texts(request_or_answers: Any) -> list[str]:
@@ -2001,6 +2050,9 @@ def _external_api_config_schema() -> dict[str, Any]:
             "auth_type": {"type": "string", "title": "认证方式", "enum": ["none", "api_key", "token", "basic", "custom"], "default": "none"},
             "secret_env": {"type": "string", "title": "密钥名称", "description": "自动生成 env 名，可修改；代码只使用 os.getenv 引用。"},
             "secret_value": {"type": "string", "title": "密钥值", "format": "password", "writeOnly": True},
+            "auth_placement": {"type": "string", "title": "密钥放置位置", "enum": ["header", "query", "bearer"], "default": "header"},
+            "auth_header_name": {"type": "string", "title": "Header 名称", "placeholder": "X-API-KEY"},
+            "auth_query_param": {"type": "string", "title": "Query 参数名", "placeholder": "api_key"},
             "extra": {"type": "object", "title": "其他字段", "additionalProperties": {"type": "string"}},
             "sample_input": {"type": "object", "title": "sample input（可选）"},
         },
@@ -2236,16 +2288,103 @@ def _normalized_preview(data: Any) -> dict[str, Any]:
     return {"type": type(data).__name__, "value": data}
 
 
+def _auth_env_refs(config: dict[str, Any]) -> set[str]:
+    refs = _extract_env_refs(config)
+    auth = config.get("auth") if isinstance(config.get("auth"), dict) else {}
+    for key in ("env", "username_env", "password_env"):
+        value = str(auth.get(key) or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            refs.add(value)
+    secret_env = str(config.get("secret_env") or "").strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
+        refs.add(secret_env)
+    return refs
+
+
+def _auth_config_for_live_test(config: dict[str, Any]) -> dict[str, Any]:
+    auth = dict(config.get("auth") or {}) if isinstance(config.get("auth"), dict) else {}
+    auth_type = str(auth.get("type") or config.get("auth_type") or config.get("authentication") or "none").strip().lower()
+    auth_type = "token" if auth_type in {"token", "bearer"} else "api_key" if auth_type in {"api_key", "key"} else auth_type
+    if auth_type in {"", "none", "no_auth", "anonymous"}:
+        return {}
+    env_name = str(auth.get("env") or config.get("secret_env") or config.get("api_key_env") or config.get("token_env") or config.get("password_env") or "").strip()
+    placement = str(auth.get("placement") or config.get("auth_placement") or "").strip().lower()
+    if auth_type == "token":
+        placement = placement or "header"
+    elif auth_type == "api_key":
+        placement = placement or "header"
+    elif auth_type == "basic":
+        placement = placement or "header"
+    normalized = {**auth, "type": auth_type, "env": env_name, "placement": placement}
+    if auth_type == "token":
+        normalized["header_name"] = str(auth.get("header_name") or config.get("auth_header_name") or "Authorization").strip() or "Authorization"
+        normalized["scheme"] = str(auth.get("scheme") or config.get("auth_scheme") or "Bearer").strip() or "Bearer"
+    elif auth_type == "api_key":
+        if placement == "query":
+            normalized["query_param"] = str(auth.get("query_param") or config.get("auth_query_param") or "api_key").strip() or "api_key"
+        elif placement == "bearer":
+            normalized["header_name"] = "Authorization"
+            normalized["scheme"] = "Bearer"
+        else:
+            normalized["placement"] = "header"
+            normalized["header_name"] = str(auth.get("header_name") or config.get("auth_header_name") or "X-API-KEY").strip() or "X-API-KEY"
+    elif auth_type == "basic":
+        normalized["header_name"] = "Authorization"
+        normalized["scheme"] = "Basic"
+    return normalized
+
+
+def _apply_auth_to_request(headers: dict[str, Any], query: dict[str, Any], config: dict[str, Any], secret_values: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any], list[str], bool]:
+    auth = _auth_config_for_live_test(config)
+    if not auth:
+        return headers, query, [], False
+    env_name = str(auth.get("env") or "").strip()
+    secret = secret_values.get(env_name, "")
+    warnings: list[str] = []
+    if not env_name or not secret:
+        return headers, query, warnings, False
+    auth_type = str(auth.get("type") or "").lower()
+    placement = str(auth.get("placement") or "").lower()
+    if auth_type == "api_key" and placement == "query":
+        query[str(auth.get("query_param") or "api_key")] = secret
+        return headers, query, warnings, True
+    if auth_type == "api_key":
+        if placement == "bearer":
+            headers["Authorization"] = f"Bearer {secret}"
+        else:
+            header_name = str(auth.get("header_name") or "").strip()
+            if not header_name:
+                warnings.append("已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。")
+                return headers, query, warnings, False
+            headers[header_name] = secret
+        return headers, query, warnings, True
+    if auth_type == "token":
+        header_name = str(auth.get("header_name") or "Authorization").strip() or "Authorization"
+        scheme = str(auth.get("scheme") or "Bearer").strip()
+        headers[header_name] = f"{scheme} {secret}".strip()
+        return headers, query, warnings, True
+    if auth_type == "basic":
+        encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+        return headers, query, warnings, True
+    if auth_type == "custom":
+        return headers, query, warnings, bool(headers)
+    return headers, query, warnings, False
+
+
 def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
     """Perform one generic external API probe without generating or registering code."""
     if request.get("allow_external_network") is not True:
         return {"success": False, "status": "blocked", "errors": ["allow_external_network must be true for live_test"], "preview": None, "normalized_preview": None}
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
     sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-    env_refs = _extract_env_refs(config)
+    env_refs = _auth_env_refs(config)
     missing_env = sorted(name for name in env_refs if not os.environ.get(name))
     if missing_env:
-        return {"success": False, "status": "missing_secret", "errors": ["missing required env secret(s): " + ", ".join(missing_env)], "missing_env": missing_env, "preview": None, "normalized_preview": None}
+        auth = _auth_config_for_live_test(config)
+        expected_header = str(auth.get("header_name") or "").strip() if auth and auth.get("placement") != "query" else ""
+        raw_url = str(config.get("url") or config.get("endpoint") or config.get("base_url") or "")
+        return {"success": False, "status": "missing_secret", "errors": ["missing required env secret(s): " + ", ".join(missing_env)], "missing_env": missing_env, "preview": None, "normalized_preview": None, "request_preview": {"method": str(config.get("method") or "GET").upper(), "url": _redact_secrets(raw_url), "header_keys": [expected_header] if expected_header else [], "has_body": False, "auth_applied": False}}
     secret_values = {name: os.environ.get(name, "") for name in env_refs}
     method = str(config.get("method") or "GET").upper()
     url = str(config.get("url") or config.get("endpoint") or "")
@@ -2258,6 +2397,12 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "status": "invalid_config", "errors": ["live_test url must start with http:// or https://"], "preview": None, "normalized_preview": None}
     headers = _render_template(config.get("headers_template") or config.get("headers") or {}, sample_input, secret_values)
     query = _render_template(config.get("query_template") or config.get("params_template") or {}, sample_input, secret_values)
+    headers = dict(headers or {}) if isinstance(headers, dict) else {}
+    query = dict(query or {}) if isinstance(query, dict) else {}
+    headers, query, auth_warnings, auth_applied = _apply_auth_to_request(headers, query, config, secret_values)
+    auth_warning = "已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。" if _auth_config_for_live_test(config) and not auth_applied else ""
+    if auth_warning and auth_warning not in auth_warnings:
+        auth_warnings.append(auth_warning)
     body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template", {})
     json_body = _render_template(body_template or {}, sample_input, secret_values)
     if isinstance(query, dict) and query:
@@ -2280,7 +2425,7 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         status_code = int(exc.code)
         content_type = exc.headers.get("content-type", "") if exc.headers else ""
     except Exception as exc:
-        return {"success": False, "status": "request_failed", "errors": [str(exc)], "preview": None, "normalized_preview": None}
+        return {"success": False, "status": "request_failed", "errors": [str(exc), *auth_warnings], "preview": None, "normalized_preview": None, "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None, "auth_applied": auth_applied}}
     text = raw.decode("utf-8", errors="replace")
     try:
         preview: Any = json.loads(text)
@@ -2295,8 +2440,8 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         "content_type": content_type,
         "preview": redacted_preview,
         "normalized_preview": _normalized_preview(redacted_preview),
-        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None},
-        "errors": [] if success else [f"HTTP {status_code}"],
+        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None, "auth_applied": auth_applied},
+        "errors": ([] if success else [f"HTTP {status_code}"]) + auth_warnings,
     }
 
 AUTHORING_HELPER_NAMES = {

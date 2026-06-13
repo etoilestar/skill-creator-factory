@@ -86,6 +86,9 @@ class ToolConfigSaveRequest(BaseModel):
     auth_type: str = "none"
     secret_env: str | None = None
     secret_value: str | None = None
+    auth_placement: str | None = None
+    auth_header_name: str | None = None
+    auth_query_param: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
     additional_fields: list[dict[str, Any]] = Field(default_factory=list)
     sample_input: dict[str, Any] = Field(default_factory=dict)

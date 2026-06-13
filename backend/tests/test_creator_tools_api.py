@@ -511,6 +511,75 @@ def test_internal_authoring_tools_are_registered_but_not_creator_available():
     assert "tool_authoring" in tools["authoring_config_collector"]["roles"]
 
 
+
+def test_tool_config_save_adds_auth_metadata_for_api_key():
+    from backend.services.creator_tool_registry import save_tool_authoring_config
+
+    result = save_tool_authoring_config({
+        "session_id": "serper-auth",
+        "tool_name": "serper_search",
+        "base_url": "https://google.serper.dev/search",
+        "auth_type": "api_key",
+        "secret_env": "SERPER_API_KEY",
+        "secret_value": "secret-value",
+        "auth_placement": "header",
+        "auth_header_name": "X-API-KEY",
+    })
+
+    assert result["config"]["auth"] == {
+        "type": "api_key",
+        "env": "SERPER_API_KEY",
+        "placement": "header",
+        "header_name": "X-API-KEY",
+    }
+    assert result["config"]["api_key"] == "${ENV:SERPER_API_KEY}"
+    assert "secret-value" not in json.dumps(result)
+
+
+def test_live_test_applies_saved_api_key_header(monkeypatch):
+    from backend.services import creator_tool_registry as registry
+
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _size):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=0):
+        captured["headers"] = dict(req.header_items())
+        captured["url"] = req.full_url
+        return FakeResponse()
+
+    monkeypatch.setenv("SERPER_API_KEY", "secret-value")
+    monkeypatch.setattr(registry.urllib.request, "urlopen", fake_urlopen)
+
+    result = registry.live_test_tool({
+        "allow_external_network": True,
+        "config": {
+            "base_url": "https://google.serper.dev/search",
+            "auth_type": "api_key",
+            "secret_env": "SERPER_API_KEY",
+            "auth": {"type": "api_key", "env": "SERPER_API_KEY", "placement": "header", "header_name": "X-API-KEY"},
+        },
+    })
+
+    assert result["success"] is True
+    assert result["request_preview"]["auth_applied"] is True
+    assert "X-api-key" in captured["headers"] or "X-API-KEY" in captured["headers"]
+    assert captured["headers"].get("X-api-key") == "secret-value" or captured["headers"].get("X-API-KEY") == "secret-value"
+    assert "X-API-KEY" in result["request_preview"]["header_keys"]
+    assert "secret-value" not in json.dumps(result)
+
+
 def test_run_authoring_helper_only_allows_internal_tools_and_sanitizes_secrets():
     from backend.services.creator_tool_registry import run_authoring_helper
 

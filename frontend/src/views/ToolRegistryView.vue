@@ -94,8 +94,27 @@
             </div>
             <div class="actions">
               <button class="btn-primary" @click="authConfigOpen = true">打开配置</button>
-              <button class="btn-ghost" :disabled="busy || !canRunLiveTest" @click="runLiveTest">测试连接</button>
+              <button class="btn-ghost" :disabled="busy" @click="runLiveTest">测试连接</button>
             </div>
+          </div>
+
+          <div v-if="liveTestRunning || liveTestResult || liveTestError" ref="liveTestResultRef" class="validation live-test-card" :class="liveTestResult?.success ? 'ok' : liveTestError || liveTestResult ? 'bad' : ''">
+            <div class="live-test-heading">
+              <strong>{{ liveTestRunning ? '正在测试连接...' : liveTestResult?.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
+              <small v-if="liveTestHistory.length">历史 {{ liveTestHistory.length }} 次</small>
+            </div>
+            <p v-if="liveTestError" class="error small">{{ liveTestError }}</p>
+            <div v-if="liveTestResult" class="live-test-grid">
+              <span><strong>status</strong>{{ liveTestResult.status || (liveTestResult.success ? 'ok' : 'failed') }}</span>
+              <span v-if="liveTestResult.status_code"><strong>status_code</strong>{{ liveTestResult.status_code }}</span>
+              <span v-if="liveTestResult.content_type"><strong>content_type</strong>{{ liveTestResult.content_type }}</span>
+              <span v-if="liveTestResult.request_preview?.header_keys?.length"><strong>header_keys</strong>{{ liveTestResult.request_preview.header_keys.join(', ') }}</span>
+              <span v-if="liveTestResult.missing_env?.length"><strong>missing_env</strong>{{ liveTestResult.missing_env.join(', ') }}</span>
+            </div>
+            <div v-if="liveTestResult?.errors?.length" class="live-test-section"><strong>errors</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.errors) }}</pre></div>
+            <div v-if="liveTestResult?.request_preview" class="live-test-section"><strong>request_preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.request_preview) }}</pre></div>
+            <div v-if="liveTestResult?.normalized_preview" class="live-test-section"><strong>normalized_preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.normalized_preview) }}</pre></div>
+            <div v-else-if="liveTestResult?.preview" class="live-test-section"><strong>preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.preview) }}</pre></div>
           </div>
 
           <div v-if="liveTestResult" class="validation" :class="liveTestResult.success ? 'ok' : 'bad'">
@@ -257,6 +276,17 @@
           <label>密钥名称（env）<input v-model="configForm.secret_env" placeholder="XXX_API_KEY" /></label>
           <label>密钥值<input v-model="configForm.secret_value" type="password" autocomplete="off" placeholder="不会写入代码或日志" /></label>
         </div>
+        <div v-if="configForm.auth_type === 'api_key'" class="form-row relaxed">
+          <label>密钥放置位置
+            <select v-model="configForm.auth_placement">
+              <option value="header">Header</option>
+              <option value="query">Query 参数</option>
+              <option value="bearer">Authorization Bearer</option>
+            </select>
+          </label>
+          <label v-if="configForm.auth_placement === 'header'">Header 名称<input v-model="configForm.auth_header_name" placeholder="X-API-KEY" /></label>
+          <label v-if="configForm.auth_placement === 'query'">Query 参数名<input v-model="configForm.auth_query_param" placeholder="api_key" /></label>
+        </div>
 
         <CollapsiblePanel v-model:open="configAdvancedOpen" title="高级配置（可选）" description="需要时再添加其他字段、sample input 或开启连接测试">
           <div class="extra-fields">
@@ -274,6 +304,13 @@
         </CollapsiblePanel>
 
         <div v-if="configSaveResult" class="validation ok"><strong>配置已保存</strong><p class="small">env: {{ (configSaveResult.configured_env || []).join(', ') || '无' }} · secrets: {{ (configSaveResult.configured_secrets || []).join(', ') || '无' }}</p></div>
+        <div v-if="liveTestRunning || liveTestResult || liveTestError" class="validation live-test-card" :class="liveTestResult?.success ? 'ok' : liveTestError || liveTestResult ? 'bad' : ''">
+          <strong>{{ liveTestRunning ? '正在测试连接...' : liveTestResult?.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
+          <p v-if="liveTestError" class="error small">{{ liveTestError }}</p>
+          <div v-if="liveTestResult?.request_preview" class="live-test-section"><strong>request_preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.request_preview) }}</pre></div>
+          <div v-if="liveTestResult?.normalized_preview" class="live-test-section"><strong>normalized_preview</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.normalized_preview) }}</pre></div>
+          <div v-if="liveTestResult?.errors?.length" class="live-test-section"><strong>errors</strong><pre class="tool-card compact-json">{{ stringifyPretty(liveTestResult.errors) }}</pre></div>
+        </div>
         <div class="actions">
           <button class="btn-ghost" :disabled="busy" @click="saveConfigAndContinue">保存配置</button>
           <button class="btn-primary" :disabled="busy" @click="saveConfigAndRunLiveTest">保存并测试连接</button>
@@ -286,7 +323,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import CollapsiblePanel from '../components/CollapsiblePanel.vue'
 import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
@@ -312,10 +349,14 @@ const snippetText = ref('{}')
 const clarificationQuestions = ref([])
 const clarificationAnswers = ref([])
 const planState = ref({})
-const configForm = reactive({ base_url: '', method: 'GET', auth_type: 'none', secret_env: '', secret_value: '' })
+const configForm = reactive({ base_url: '', method: 'GET', auth_type: 'none', secret_env: '', secret_value: '', auth_placement: 'header', auth_header_name: 'X-API-KEY', auth_query_param: 'api_key' })
 const configExtraFields = ref([])
 const configSaveResult = ref(null)
+const liveTestRunning = ref(false)
 const liveTestResult = ref(null)
+const liveTestError = ref('')
+const liveTestHistory = ref([])
+const liveTestResultRef = ref(null)
 const allowExternalNetwork = ref(false)
 const statusMessage = ref('')
 const authorLogs = ref([])
@@ -350,7 +391,7 @@ const form = reactive({ tool_name: '', description: '', tool_type: 'python_helpe
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
 const configExtra = computed(() => Object.fromEntries(configExtraFields.value.filter(field => field.key).map(field => [field.key.trim(), field.value])))
-const parsedConfig = computed(() => ({ base_url: configSaveResult.value?.config_refs?.base_url || configForm.base_url, method: configForm.method, auth_type: configForm.auth_type, secret_env: configForm.secret_env, ...configExtra.value, ...(configSaveResult.value?.config || {}) }))
+const parsedConfig = computed(() => ({ base_url: configSaveResult.value?.config_refs?.base_url || configForm.base_url, method: configForm.method, auth_type: configForm.auth_type, secret_env: configForm.secret_env, auth_placement: configForm.auth_placement, auth_header_name: configForm.auth_header_name, auth_query_param: configForm.auth_query_param, ...configExtra.value, ...(configSaveResult.value?.config || {}) }))
 const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
 const entrypointConfidenceLabel = computed(() => ({ high: '高置信度', medium: '中等置信度', low: '低置信度' }[planState.value?.suggested_entrypoint?.confidence] || '待确认'))
@@ -384,28 +425,69 @@ function applySuggestedEntrypoint(entrypoint = {}) {
   if (entrypoint.method && !configForm.method) configForm.method = entrypoint.method
   if (entrypoint.auth_type && configForm.auth_type === 'none') configForm.auth_type = entrypoint.auth_type
   if (entrypoint.secret_env && !configForm.secret_env) configForm.secret_env = entrypoint.secret_env
+  if (entrypoint.auth_placement) configForm.auth_placement = entrypoint.auth_placement
+  if (entrypoint.auth_header_name) configForm.auth_header_name = entrypoint.auth_header_name
+  if (entrypoint.auth_query_param) configForm.auth_query_param = entrypoint.auth_query_param
 }
+
 function filterAnsweredQuestions(questions) {
   const answered = new Set(clarificationQuestions.value.map((question, idx) => (clarificationAnswers.value[idx] ? questionText(question) : '')).filter(Boolean))
   return questions.filter(question => !answered.has(questionText(question)))
 }
 function configSessionId() { return form.tool_name || planState.value?.operation || form.description || 'default' }
 function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ id: question?.id || '', question: questionText(question), answer: clarificationAnswers.value[idx] || '', answer_label: answerLabel(question, clarificationAnswers.value[idx] || '') })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
+function extractLiveTestResult(data) {
+  if (data?.live_test_result) return data.live_test_result
+  if (data?.authoring_context?.live_test_result) return data.authoring_context.live_test_result
+  for (const item of data?.authoring_tool_results || []) {
+    if (item?.live_test_result) return item.live_test_result
+  }
+  return null
+}
+function rememberLiveTestResult(result) {
+  if (!result) return
+  liveTestResult.value = result
+  liveTestHistory.value.unshift({ time: new Date().toISOString(), result })
+  if (liveTestHistory.value.length > 10) liveTestHistory.value.pop()
+}
+function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
+function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly() {
-  configSaveResult.value = await saveCreatorToolConfig({ session_id: configSessionId(), tool_name: form.tool_name, operation: planState.value?.operation || form.description, base_url: configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, secret_value: configForm.secret_value, extra: configExtra.value, additional_fields: configExtraFields.value.filter(field => field.key), sample_input: parsedSample.value, config: parsedConfig.value })
+  configSaveResult.value = await saveCreatorToolConfig({ session_id: configSessionId(), tool_name: form.tool_name, operation: planState.value?.operation || form.description, base_url: configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, secret_value: configForm.secret_value, auth_placement: configForm.auth_placement, auth_header_name: configForm.auth_header_name, auth_query_param: configForm.auth_query_param, extra: configExtra.value, additional_fields: configExtraFields.value.filter(field => field.key), sample_input: parsedSample.value, config: parsedConfig.value })
   configForm.secret_value = ''
   const data = await authorCreatorTool({ ...authorPayload('configure'), config: configSaveResult.value.config || parsedConfig.value })
   applyAuthorResult(data)
 }
 function saveConfigAndContinue() { return run(async () => { await saveConfigOnly(); authConfigOpen.value = false; activeStep.value = 'planner' }) }
-function saveConfigAndRunLiveTest() { return run(async () => { await saveConfigOnly(); allowExternalNetwork.value = true; const data = await liveTestCreatorTool({ ...authorPayload('live_test'), allow_external_network: true, config: configSaveResult.value.config || parsedConfig.value }); applyAuthorResult(data); authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: data.live_test_result?.success }); authConfigOpen.value = false; activeStep.value = 'planner' }) }
+async function performLiveTest({ saveFirst = false } = {}) {
+  liveTestRunning.value = true
+  liveTestError.value = ''
+  try {
+    if (saveFirst) await saveConfigOnly()
+    allowExternalNetwork.value = true
+    const data = await liveTestCreatorTool({ ...authorPayload('live_test'), allow_external_network: true, config: configSaveResult.value?.config || parsedConfig.value })
+    applyAuthorResult(data)
+    const result = extractLiveTestResult(data)
+    if (!result) liveTestError.value = 'live_test 未返回结果。'
+    authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: result?.success })
+    activeStep.value = 'planner'
+    scrollToLiveTestResult()
+  } catch (e) {
+    liveTestError.value = e.message || String(e)
+    activeStep.value = 'planner'
+    scrollToLiveTestResult()
+  } finally {
+    liveTestRunning.value = false
+  }
+}
+function saveConfigAndRunLiveTest() { return run(async () => { await performLiveTest({ saveFirst: true }); authConfigOpen.value = false; activeStep.value = 'planner'; scrollToLiveTestResult() }) }
 function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
 function generateAdapter() { return run(async () => { adapterCode.value = ''; authorLogs.value = []; streamController.value = new AbortController(); for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) { logAuthor(event); if (event.event === 'model_delta') adapterCode.value += event.delta || ''; if (event.event === 'final_result') applyAuthorResult(event); } activeStep.value = 'adapter' }) }
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
-function runLiveTest() { return run(async () => { statusMessage.value = '正在测试连接'; const data = await liveTestCreatorTool(authorPayload('live_test')); applyAuthorResult(data); authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: data.live_test_result?.success }); activeStep.value = 'planner' }) }
+function runLiveTest() { return run(async () => { if (!configSaveResult.value?.success) { authConfigOpen.value = true; return } await performLiveTest() }) }
 function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; applyAuthorResult(data); if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; activeStep.value = 'adapter' }) }
 function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }); activeStep.value = 'validation' }) }
@@ -466,6 +548,13 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
 .small { font-size: 12px; }
 .validation, .compact-preview { padding: 12px; border-radius: var(--radius); border: 1px solid var(--border); }
 .validation.ok, .compact-preview { border-color: var(--success); } .validation.bad { border-color: var(--danger); }
+.live-test-card { display: grid; gap: 12px; }
+.live-test-heading { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.live-test-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.live-test-grid span { display: grid; gap: 3px; min-width: 0; word-break: break-word; color: var(--text); }
+.live-test-grid span strong, .live-test-section strong { color: var(--text-muted); font-size: 12px; }
+.live-test-section { display: grid; gap: 6px; }
+.compact-json { max-height: 220px; margin: 0; }
 .warn { color: #f6c177; }
 .choice-row { display: flex; flex-wrap: wrap; gap: 8px; } .btn-ghost.selected { border-color: var(--accent); color: var(--accent); } .auth-panel input[type="password"], .auth-modal input[type="password"] { letter-spacing: .08em; }
 .auth-summary { display: flex; justify-content: space-between; gap: 16px; align-items: center; }

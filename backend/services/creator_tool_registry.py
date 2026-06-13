@@ -1941,6 +1941,52 @@ def validate_tool_manifest(
 ) -> dict[str, Any]:
     _load_tool_authoring_config_store_from_disk()
 
+    manifest = dict(manifest or {})
+
+    # 兼容旧产物：external_api adapter 返回的是平台归一化结构，
+    # 不能用 provider raw response schema 做 required 字段检查。
+    is_external_api = (
+        str(manifest.get("category") or "").lower() == "external_api"
+        or str(manifest.get("type") or "").lower() == "external_api"
+        or manifest.get("needs_external_network") is True
+    )
+    if is_external_api:
+        normalized_output_schema = {
+            "type": "object",
+            "properties": {
+                "success": {"type": "boolean"},
+                "results": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                },
+                "total": {"type": "integer"},
+                "error": {"type": "string"},
+                "status_code": {"type": "integer"},
+                "response_preview": {"type": "string"},
+                "knowledgeGraph": {"type": "object"},
+                "answerBox": {"type": "object"},
+                "relatedSearches": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                },
+                "raw": {"type": "object"},
+                "trial_run": {"type": "boolean"},
+            },
+            "required": ["success", "results", "total"],
+        }
+        manifest["output_schema"] = normalized_output_schema
+
+        fixed_functions = []
+        for fn in manifest.get("functions") or []:
+            if isinstance(fn, dict):
+                fixed_fn = dict(fn)
+                fixed_fn["output_schema"] = normalized_output_schema
+                fixed_functions.append(fixed_fn)
+            else:
+                fixed_functions.append(fn)
+        if fixed_functions:
+            manifest["functions"] = fixed_functions
+
     errors = _manifest_errors(manifest)
     warnings: list[str] = []
     cap = _capability_from_dict(manifest) if not errors else None
@@ -2804,7 +2850,32 @@ def _normalize_external_api_manifest_for_adapter(
         ]
 
     input_schema = _schema_from_planner_io(original, input_side=True)
-    output_schema = _schema_from_planner_io(original, input_side=False)
+
+    # external_api adapter 的最终输出不是 provider 原始响应，
+    # 而是平台 wrapper 归一化后的输出。不要沿用 planner 的 raw API output_schema。
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "success": {"type": "boolean"},
+            "results": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+            "total": {"type": "integer"},
+            "error": {"type": "string"},
+            "status_code": {"type": "integer"},
+            "response_preview": {"type": "string"},
+            "knowledgeGraph": {"type": "object"},
+            "answerBox": {"type": "object"},
+            "relatedSearches": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+            "raw": {"type": "object"},
+            "trial_run": {"type": "boolean"},
+        },
+        "required": ["success", "results", "total"],
+    }
 
     adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
 
@@ -2829,6 +2900,8 @@ def _normalize_external_api_manifest_for_adapter(
         "test_status": "untested",
         "adapter_path": f"backend/services/runtime_tools/custom_tools/{name}.py",
         "version": str(original.get("version") or "1.0.0"),
+        "input_schema": input_schema,
+        "output_schema": output_schema,
         "functions": [
             {
                 "function_name": name,
@@ -2838,13 +2911,14 @@ def _normalize_external_api_manifest_for_adapter(
                 "signature": f"{name}(payload: dict) -> dict",
                 "input_schema": input_schema,
                 "output_schema": output_schema,
-                "return_contract": "Returns a JSON-serializable dict matching output_schema. Never returns or logs secrets.",
+                "return_contract": "Returns a normalized adapter result with success/results/total. Provider raw response may be included under raw.",
                 "example_call": f"from {adapter_import} import {name}\nresult = {name}(payload)\nreturn result",
                 "example_stdout": "return result",
                 "common_mistakes": [
                     "Do not pass API keys in payload.",
                     "Do not call external network when SKILL_TRIAL_RUN=1.",
-                    "Do not write files outside OUTPUT_DIR.",
+                    "Do not require provider raw response fields as top-level adapter outputs.",
+                    "Do not write or expect files outside OUTPUT_DIR.",
                 ],
                 "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.",
                 "safety_notes": [

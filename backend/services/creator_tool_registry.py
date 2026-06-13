@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, 
 from datetime import datetime, timezone
 import asyncio
 import ast
+import base64
 import importlib
 import importlib.util
 import json
@@ -28,6 +29,147 @@ from typing import Any, Literal
 
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
+
+
+
+_TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
+_SENSITIVE_CONFIG_KEYS = ("api_key", "apikey", "token", "password", "secret", "authorization", "credential")
+
+
+def _tool_config_session_id(payload: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    seed = str(payload.get("session_id") or payload.get("tool_name") or payload.get("operation") or payload.get("description") or "default")
+    slug = _slug(seed) if "_slug" in globals() else re.sub(r"[^a-z0-9]+", "_", seed.lower()).strip("_")
+    return slug or "default"
+
+
+def _env_name_for_tool_config(tool_name: str, key: str, *, secret: bool = False) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper() or "TOOL"
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper() or ("SECRET" if secret else "CONFIG")
+    if secret and not any(token in suffix for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        suffix = f"{suffix}_SECRET"
+    return f"{prefix}_{suffix}"
+
+
+def _is_sensitive_config_key(key: str) -> bool:
+    lowered = (key or "").lower()
+    return any(token in lowered for token in _SENSITIVE_CONFIG_KEYS)
+
+
+def _build_saved_auth_config(data: dict[str, Any], raw_config: dict[str, Any], auth_type: str, secret_env: str) -> dict[str, Any]:
+    if auth_type in {"", "none", "no_auth", "anonymous"} or not secret_env:
+        return {}
+    existing = raw_config.get("auth") if isinstance(raw_config.get("auth"), dict) else {}
+    normalized_type = "token" if auth_type in {"token", "bearer"} else "api_key" if auth_type in {"api_key", "key"} else auth_type
+    placement = str(data.get("auth_placement") or raw_config.get("auth_placement") or existing.get("placement") or "").strip().lower()
+    if normalized_type == "token":
+        placement = placement or "bearer"
+    elif normalized_type == "api_key":
+        placement = placement or "header"
+    elif normalized_type == "basic":
+        placement = placement or "header"
+    auth: dict[str, Any] = {"type": normalized_type, "env": secret_env, "placement": placement}
+    header_name = str(data.get("auth_header_name") or raw_config.get("auth_header_name") or existing.get("header_name") or "").strip()
+    query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or existing.get("query_param") or "").strip()
+    if normalized_type == "api_key":
+        if placement == "query":
+            auth["query_param"] = query_param or "api_key"
+        elif placement == "bearer":
+            auth["header_name"] = "Authorization"
+            auth["scheme"] = "Bearer"
+        else:
+            auth["placement"] = "header"
+            auth["header_name"] = header_name or "X-API-KEY"
+    elif normalized_type == "token":
+        auth["placement"] = "header"
+        auth["header_name"] = header_name or "Authorization"
+        auth["scheme"] = str(existing.get("scheme") or raw_config.get("auth_scheme") or "Bearer").strip() or "Bearer"
+    elif normalized_type == "basic":
+        auth["placement"] = "header"
+        auth["header_name"] = "Authorization"
+        auth["scheme"] = "Basic"
+    elif normalized_type == "custom":
+        auth["placement"] = placement or "custom"
+    return auth
+
+
+def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Save authoring configuration as env/secret references without returning plaintext values."""
+    data = dict(payload or {})
+    session_id = _tool_config_session_id(data)
+    tool_name = str(data.get("tool_name") or data.get("operation") or session_id or "tool")
+    raw_config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    config_refs: dict[str, str] = {}
+    configured_env: list[str] = []
+    configured_secrets: list[str] = []
+
+    def store_value(key: str, value: Any, *, secret: bool = False, env_name: str | None = None) -> None:
+        if value in (None, "", {}, []):
+            return
+        name = env_name or _env_name_for_tool_config(tool_name, key, secret=secret)
+        os.environ[name] = str(value)
+        config_refs[key] = f"${{ENV:{name}}}"
+        (configured_secrets if secret else configured_env).append(name)
+
+    # Normalized form fields from the authorization dialog.
+    store_value("base_url", data.get("base_url") or raw_config.get("base_url") or raw_config.get("endpoint") or raw_config.get("url"), secret=False, env_name=data.get("base_url_env") or raw_config.get("base_url_env"))
+    auth_type = str(data.get("auth_type") or raw_config.get("auth_type") or raw_config.get("authentication") or "none").strip().lower() or "none"
+    secret_env_name = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
+    if auth_type != "none":
+        secret_key = "api_key" if auth_type in {"api_key", "key"} else "token" if auth_type in {"token", "bearer"} else "password" if auth_type == "basic" else "secret"
+        secret_env_name = secret_env_name or str(raw_config.get(f"{secret_key}_env") or "").strip()
+        store_value(secret_key, data.get("secret_value") or raw_config.get(secret_key) or raw_config.get("api_key") or raw_config.get("token") or raw_config.get("password"), secret=True, env_name=secret_env_name or None)
+        secret_env_name = secret_env_name or _env_name_for_tool_config(tool_name, secret_key, secret=True)
+
+    extra = data.get("extra") if isinstance(data.get("extra"), dict) else raw_config.get("extra") if isinstance(raw_config.get("extra"), dict) else {}
+    for key, value in extra.items():
+        store_value(str(key), value, secret=_is_sensitive_config_key(str(key)))
+    additional_fields = data.get("additional_fields") if isinstance(data.get("additional_fields"), list) else []
+    for field in additional_fields:
+        if not isinstance(field, dict):
+            continue
+        key = str(field.get("key") or "").strip()
+        if not key:
+            continue
+        store_value(key, field.get("value"), secret=bool(field.get("sensitive")) or _is_sensitive_config_key(key))
+
+    sanitized_config = dict(raw_config)
+    if "base_url" in config_refs:
+        sanitized_config["base_url"] = config_refs["base_url"]
+    sanitized_config["auth_type"] = auth_type
+    if secret_env_name:
+        sanitized_config["secret_env"] = secret_env_name
+    for key, ref in config_refs.items():
+        if key != "base_url":
+            sanitized_config[key] = ref
+    auth_config = _build_saved_auth_config(data, raw_config, auth_type, secret_env_name)
+    if auth_config:
+        sanitized_config["auth"] = auth_config
+    sanitized_config, inferred_refs = _sanitize_authoring_config(sanitized_config)
+    for ref in inferred_refs:
+        if ref not in configured_secrets and ref not in configured_env:
+            configured_secrets.append(ref)
+
+    _TOOL_AUTHORING_CONFIG_STORE[session_id] = {
+        "tool_name": tool_name,
+        "config": sanitized_config,
+        "sample_input": data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {},
+        "configured_env": sorted(set(configured_env)),
+        "configured_secrets": sorted(set(configured_secrets)),
+        "config_refs": config_refs,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return {"success": True, "session_id": session_id, "configured_env": sorted(set(configured_env)), "configured_secrets": sorted(set(configured_secrets)), "config_refs": config_refs, "config": sanitized_config}
+
+
+def tool_authoring_config_status(session_id: str = "default") -> dict[str, Any]:
+    key = _tool_config_session_id({"session_id": session_id})
+    stored = _TOOL_AUTHORING_CONFIG_STORE.get(key)
+    if not stored:
+        return {"success": True, "configured": False, "session_id": key, "configured_env": [], "configured_secrets": [], "config_refs": {}}
+    configured_env = [name for name in stored.get("configured_env", []) if os.environ.get(name) is not None]
+    configured_secrets = [name for name in stored.get("configured_secrets", []) if os.environ.get(name) is not None]
+    return {"success": True, "configured": bool(configured_env or configured_secrets), "session_id": key, "configured_env": configured_env, "configured_secrets": configured_secrets, "config_refs": stored.get("config_refs") or {}, "config": stored.get("config") or {}, "sample_input": stored.get("sample_input") or {}, "updated_at": stored.get("updated_at")}
 
 SnippetKind = Literal[
     "minimal_usage",
@@ -1527,8 +1669,16 @@ def _plan_defaults() -> dict[str, Any]:
     return {
         "needs_clarification": False,
         "questions": [],
+        "clarification_questions": [],
+        "requires_config": False,
+        "config_required_fields": [],
+        "config_form_schema": {},
+        "suggested_entrypoint": {},
+        "additional_fields_schema": [],
+        "requires_authorization": False,
         "tool_kind": "unknown",
         "operation": "",
+        "resolved_clarifications": [],
         "requires_secret": False,
         "secret_env_suggestions": [],
         "requires_external_network": False,
@@ -1550,26 +1700,149 @@ def _plan_defaults() -> dict[str, Any]:
 
 
 def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str, Any], request: dict[str, Any]) -> list[str]:
+    """Return only connection/config panel requirements, not schema/template questions."""
     missing: list[str] = []
     if not _has_config_value(config, "url", "endpoint", "base_url"):
-        missing.append("endpoint / base_url / url")
-    if not _has_config_value(config, "method"):
-        missing.append("method")
+        missing.append("base_url")
     auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
-    has_secret_ref = bool(_extract_env_refs(config)) or _has_config_value(config, "secret_env", "secret_env_name")
+    has_secret_ref = bool(_extract_env_refs(config)) or _has_config_value(config, "secret_env", "secret_env_name", "api_key_env", "token_env", "password_env")
     if not auth_type:
-        missing.append("认证方式（无认证也请填写 none）")
+        missing.append("auth_type")
     elif auth_type not in {"none", "no_auth", "anonymous"} and not has_secret_ref:
-        missing.append("secret env 名称")
-    if not any(isinstance(config.get(key), dict) for key in ("headers_template", "query_template", "json_body_template", "body_template")):
-        missing.append("headers/body/query 参数模板")
-    if not sample_input:
-        missing.append("sample input")
-    if not (request.get("output_description") or config.get("expected_output_fields") or config.get("output_schema") or request.get("output_schema")):
-        missing.append("期望输出字段")
-    if request.get("allow_external_network") is not True and config.get("allow_external_network") is not True:
-        missing.append("是否允许外部网络")
+        missing.append("secret_env")
     return missing
+
+
+def _slug_env_prefix(value: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (value or "TOOL")).strip("_").upper()
+    return prefix or "TOOL"
+
+
+def _suggest_external_api_entrypoint(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Build a best-effort prefill for the authorization modal without asking the user."""
+    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "tool_name"))
+    url_match = re.search(r"https?://[^\s，。；,;]+", text)
+    base_url = str(config.get("base_url") or config.get("endpoint") or config.get("url") or (url_match.group(0) if url_match else "")).strip()
+    method = str(config.get("method") or "").strip().upper()
+    lowered = text.lower()
+    if not method:
+        method = "POST" if any(token in lowered for token in ("创建", "新增", "提交", "发送", "发布", "上传", "create", "post", "send", "submit")) else "GET"
+    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
+    has_secret_hint = bool(request.get("needs_secret") or any(token in lowered for token in ("key", "token", "密钥", "令牌", "认证", "鉴权", "bearer")))
+    if not auth_type:
+        auth_type = "token" if "token" in lowered or "令牌" in lowered or "bearer" in lowered else "api_key" if has_secret_hint else "none"
+    env_prefix = _slug_env_prefix(str(request.get("tool_name") or request.get("operation") or request.get("description") or "TOOL"))
+    existing_secret = str(config.get("secret_env") or config.get("secret_env_name") or config.get("api_key_env") or config.get("token_env") or "").strip()
+    secret_env = existing_secret or (f"{env_prefix}_{'TOKEN' if auth_type == 'token' else 'API_KEY'}" if auth_type not in {"none", "no_auth", "anonymous"} else "")
+    confidence = "high" if base_url and (config.get("auth_type") or config.get("authentication") or existing_secret) else "medium" if base_url else "low"
+    auth_placement = str(config.get("auth_placement") or ((config.get("auth") or {}).get("placement") if isinstance(config.get("auth"), dict) else "") or ("header" if auth_type == "api_key" else "")).strip()
+    auth_header_name = str(config.get("auth_header_name") or ((config.get("auth") or {}).get("header_name") if isinstance(config.get("auth"), dict) else "") or ("X-API-KEY" if auth_type == "api_key" else "Authorization" if auth_type == "token" else "")).strip()
+    auth_query_param = str(config.get("auth_query_param") or ((config.get("auth") or {}).get("query_param") if isinstance(config.get("auth"), dict) else "") or "api_key").strip()
+    return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "auth_placement": auth_placement, "auth_header_name": auth_header_name, "auth_query_param": auth_query_param, "confidence": confidence}
+
+
+def _clarification_answer_texts(request_or_answers: Any) -> list[str]:
+    answers = request_or_answers.get("clarification_answers") if isinstance(request_or_answers, dict) else request_or_answers
+    values: list[str] = []
+    for item in answers or []:
+        if isinstance(item, dict):
+            answer = str(item.get("answer_label") or item.get("answer") or "").strip()
+        else:
+            answer = str(item or "").strip()
+        if answer:
+            values.append(answer)
+    return values
+
+
+def _apply_clarification_answers(request: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(request or {})
+    answers = [item for item in (updated.get("clarification_answers") or []) if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()]
+    capability_answers = _clarification_answer_texts(answers)
+    if capability_answers:
+        updated["operation"] = capability_answers[-1]
+    if answers:
+        updated["resolved_clarifications"] = answers
+    return updated
+
+
+def _question_text(question: Any) -> str:
+    if isinstance(question, dict):
+        return str(question.get("question") or question.get("text") or "").strip()
+    return str(question or "").strip()
+
+
+def _normalize_clarification_question(question: Any) -> dict[str, Any] | None:
+    text = _question_text(question)
+    if not text:
+        return None
+    if isinstance(question, dict):
+        normalized = {
+            "id": str(question.get("id") or _slug(text) or "capability_detail"),
+            "type": str(question.get("type") or ("single_choice" if question.get("options") else "short_text")),
+            "question": text,
+            "required": bool(question.get("required", True)),
+        }
+        options: list[dict[str, str]] = []
+        for idx, option in enumerate(question.get("options") or []):
+            if isinstance(option, dict):
+                label = str(option.get("label") or option.get("text") or option.get("value") or "").strip()
+                value = str(option.get("value") or label or idx).strip()
+            else:
+                label = str(option or "").strip()
+                value = label
+            if label:
+                options.append({"label": label, "value": value})
+        if options:
+            normalized["options"] = options
+        elif normalized["type"] in {"single_choice", "multi_choice"}:
+            normalized["type"] = "short_text"
+        return normalized
+    return {"id": _slug(text) or "capability_detail", "type": "short_text", "question": text, "required": True}
+
+
+def _filter_answered_clarification_questions(questions: list[Any], answers: list[Any]) -> list[dict[str, Any]]:
+    answered_questions = {
+        str(item.get("question") or "").strip()
+        for item in answers or []
+        if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()
+    }
+    answered_ids = {
+        str(item.get("id") or item.get("question_id") or "").strip()
+        for item in answers or []
+        if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()
+    }
+    filtered: list[dict[str, Any]] = []
+    for question in questions or []:
+        normalized = _normalize_clarification_question(question)
+        if not normalized:
+            continue
+        if normalized.get("id") in answered_ids or normalized.get("question") in answered_questions:
+            continue
+        filtered.append(normalized)
+    return filtered
+
+
+def _needs_capability_clarification(request: dict[str, Any]) -> bool:
+    if _clarification_answer_texts(request):
+        return False
+    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "input_description", "output_description")).strip().lower()
+    if not text:
+        return True
+    vague_phrases = ("调用接口", "连接接口", "外部 api", "某个api", "某个 api", "api tool", "http tool", "小工具")
+    has_vague_api_goal = any(phrase in text for phrase in vague_phrases)
+    action_tokens = ("查询", "创建", "更新", "删除", "同步", "发送", "发布", "下载", "上传", "检索", "搜索", "分析", "转换", "生成", "通知", "query", "create", "update", "delete", "sync", "send", "search", "fetch")
+    object_tokens = ("数据", "订单", "用户", "消息", "文件", "报告", "记录", "天气", "价格", "库存", "邮件", "短信", "result", "record", "message", "file")
+    has_action = any(token in text for token in action_tokens)
+    has_object = any(token in text for token in object_tokens)
+    return has_vague_api_goal and not (has_action and has_object)
+
+
+def _external_api_clarification_questions(request: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Ask only about real capability ambiguity; connection/key fields belong to config_form_schema."""
+    questions: list[dict[str, Any]] = []
+    if _needs_capability_clarification(request):
+        questions.append({"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True})
+    return questions[:3]
 
 
 def _infer_tool_kind(request: dict[str, Any]) -> str:
@@ -1602,17 +1875,13 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     requires_network = tool_kind == "external_api" or bool(request.get("needs_external_network"))
     requires_secret = bool(request.get("needs_secret") or _extract_env_refs(config) or config.get("secret_env") or config.get("secret_env_name"))
     missing_fields: list[str] = []
-    questions: list[str] = []
+    questions: list[Any] = []
     if tool_kind == "external_api":
         missing_fields = _external_api_missing_fields(config, sample, request)
-        if missing_fields:
-            questions = [
-                "请补充通用外部 API 配置：endpoint/base_url/url、method、认证方式、secret env 名称（如需要）、headers/query/body 模板。",
-                "请补充 sample input、期望输出字段，并确认是否允许外部网络。",
-            ]
+        questions = _external_api_clarification_questions(request, config)
     elif tool_kind == "unknown" and not (request.get("tool_name") and (request.get("description") or code_block.strip())):
         missing_fields = ["tool_name", "description or code_block"]
-        questions = ["请说明工具要完成的操作、输入字段、输出字段，以及是否需要文件/网络/密钥。"]
+        questions = [{"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}]
 
     if request.get("manifest"):
         manifest = dict(request["manifest"])
@@ -1635,7 +1904,7 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     live_success = bool((request.get("live_test_result") or {}).get("success"))
     authoring_tool_plan: list[dict[str, Any]] = []
     if tool_kind == "external_api" and missing_fields:
-        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要补充通用连接配置、secret/env 引用、请求模板和 sample input", "input": {"missing_fields": missing_fields, "config": config, "sample_input": sample}})
+        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要通过授权弹窗保存连接地址、认证方式和 env/secret 引用", "input": {"config_required_fields": missing_fields, "config": config, "sample_input": sample}})
     elif tool_kind == "external_api" and ready_live and not live_success and not request.get("skip_live_test"):
         authoring_tool_plan.append({"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}})
     if code_block.strip():
@@ -1644,7 +1913,14 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     return {
         **_plan_defaults(),
         "needs_clarification": bool(questions),
-        "questions": questions,
+        "questions": questions[:3],
+        "clarification_questions": questions[:3],
+        "requires_config": tool_kind == "external_api" and bool(missing_fields),
+        "config_required_fields": missing_fields,
+        "config_form_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
+        "suggested_entrypoint": _suggest_external_api_entrypoint(request, config) if tool_kind == "external_api" else {},
+        "additional_fields_schema": _external_api_additional_fields_schema() if tool_kind == "external_api" else [],
+        "requires_authorization": tool_kind == "external_api" and requires_secret,
         "tool_kind": tool_kind,
         "operation": str(request.get("operation") or request.get("description") or ""),
         "requires_secret": requires_secret,
@@ -1655,7 +1931,7 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         "ready_for_code_generation": ready_code,
         "requires_authoring_tools": bool(authoring_tool_plan),
         "authoring_tool_plan": authoring_tool_plan,
-        "missing_fields": missing_fields,
+        "missing_fields": [],
         "suggested_config_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
         "sample_input_schema": {"type": "object", "description": "Sample payload used for live_test and adapter dynamic validation."},
         "manifest": manifest,
@@ -1666,11 +1942,43 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _safe_clarification_questions(questions: list[Any], fallback: list[Any]) -> list[dict[str, Any]]:
+    banned = ("headers", "body", "query", "schema", "expected output", "输出字段", "输入输出", "method", "模板", "sample input", "服务地址", "连接地址", "endpoint", "密钥", "token", "认证", "auth", "外部网络", "连接测试")
+    safe: list[dict[str, Any]] = []
+    for item in questions or []:
+        normalized = _normalize_clarification_question(item)
+        if not normalized:
+            continue
+        text = normalized.get("question", "")
+        if any(token.lower() in text.lower() for token in banned):
+            continue
+        safe.append(normalized)
+    if not safe:
+        for item in fallback or []:
+            normalized = _normalize_clarification_question(item)
+            if not normalized:
+                continue
+            text = normalized.get("question", "")
+            if not any(token.lower() in text.lower() for token in banned):
+                safe.append(normalized)
+    return safe[:3]
+
+
 def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     normalized = {**_plan_defaults(), **(plan if isinstance(plan, dict) else {})}
     fallback = _author_fallback_plan(request)
     if not isinstance(normalized.get("questions"), list):
         normalized["questions"] = []
+    if not isinstance(normalized.get("clarification_questions"), list):
+        normalized["clarification_questions"] = normalized.get("questions") or []
+    if not isinstance(normalized.get("config_required_fields"), list):
+        normalized["config_required_fields"] = []
+    if not isinstance(normalized.get("config_form_schema"), dict):
+        normalized["config_form_schema"] = {}
+    if not isinstance(normalized.get("suggested_entrypoint"), dict):
+        normalized["suggested_entrypoint"] = {}
+    if not isinstance(normalized.get("additional_fields_schema"), list):
+        normalized["additional_fields_schema"] = []
     if not isinstance(normalized.get("missing_fields"), list):
         normalized["missing_fields"] = []
     if not isinstance(normalized.get("manifest"), dict):
@@ -1685,11 +1993,19 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         missing = _external_api_missing_fields(config, sample, request)
         normalized["requires_external_network"] = True
         normalized["requires_live_test"] = True
+        normalized["requires_config"] = bool(missing)
+        normalized["config_required_fields"] = missing
+        normalized["config_form_schema"] = _external_api_config_schema()
+        normalized["suggested_entrypoint"] = {**_suggest_external_api_entrypoint(request, config), **(normalized.get("suggested_entrypoint") or {})}
+        normalized["additional_fields_schema"] = normalized.get("additional_fields_schema") or _external_api_additional_fields_schema()
+        normalized["requires_authorization"] = bool(normalized.get("requires_secret") or any(field == "secret_env" for field in missing))
         normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
-        normalized["missing_fields"] = sorted(set(normalized.get("missing_fields") or []) | set(missing))
+        normalized["missing_fields"] = []
+        safe_questions = _safe_clarification_questions((normalized.get("clarification_questions") or normalized.get("questions") or []), fallback.get("clarification_questions") or fallback.get("questions") or [])
+        safe_questions = _filter_answered_clarification_questions(safe_questions, request.get("clarification_answers") or [])
+        normalized["clarification_questions"] = safe_questions
+        normalized["questions"] = safe_questions
         if missing:
-            normalized["needs_clarification"] = True
-            normalized["questions"] = normalized.get("questions") or fallback["questions"]
             normalized["ready_for_code_generation"] = False
             if not normalized.get("authoring_tool_plan"):
                 normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
@@ -1701,9 +2017,17 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["ready_for_code_generation"] = bool(normalized.get("ready_for_code_generation")) and (live_success or request.get("skip_live_test") is True)
     elif not normalized.get("manifest"):
         normalized["manifest"] = fallback.get("manifest") or {}
+    if request.get("operation"):
+        normalized["operation"] = request.get("operation")
+    if request.get("resolved_clarifications"):
+        normalized["resolved_clarifications"] = request.get("resolved_clarifications")
     normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan")) or bool(normalized.get("requires_authoring_tools"))
     if normalized["requires_authoring_tools"]:
         normalized["ready_for_code_generation"] = False
+    normalized["clarification_questions"] = _safe_clarification_questions(normalized.get("clarification_questions") or normalized.get("questions") or [], fallback.get("clarification_questions") or fallback.get("questions") or [])
+    normalized["clarification_questions"] = _filter_answered_clarification_questions(normalized["clarification_questions"], request.get("clarification_answers") or [])
+    normalized["questions"] = normalized["clarification_questions"]
+    normalized["needs_clarification"] = bool(normalized["clarification_questions"])
     if (
         request.get("stage") == "draft"
         and not normalized.get("needs_clarification")
@@ -1719,18 +2043,28 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
 def _external_api_config_schema() -> dict[str, Any]:
     return {
         "type": "object",
-        "required": ["method", "url", "auth_type", "headers_template", "query_template", "json_body_template"],
+        "ui": "authorization_modal",
+        "required": ["base_url", "auth_type"],
         "properties": {
-            "method": {"type": "string", "examples": ["GET", "POST"]},
-            "url": {"type": "string", "description": "Full endpoint URL or rendered URL template."},
-            "auth_type": {"type": "string", "description": "none, bearer, api_key, basic, custom, etc."},
-            "secret_env": {"type": "string", "description": "Environment variable name for the secret, never the secret value."},
-            "headers_template": {"type": "object"},
-            "query_template": {"type": "object"},
-            "json_body_template": {"type": "object"},
-            "expected_output_fields": {"type": "array"},
+            "base_url": {"type": "string", "title": "连接地址 / endpoint / IP", "placeholder": "https://api.example.com"},
+            "auth_type": {"type": "string", "title": "认证方式", "enum": ["none", "api_key", "token", "basic", "custom"], "default": "none"},
+            "secret_env": {"type": "string", "title": "密钥名称", "description": "自动生成 env 名，可修改；代码只使用 os.getenv 引用。"},
+            "secret_value": {"type": "string", "title": "密钥值", "format": "password", "writeOnly": True},
+            "auth_placement": {"type": "string", "title": "密钥放置位置", "enum": ["header", "query", "bearer"], "default": "header"},
+            "auth_header_name": {"type": "string", "title": "Header 名称", "placeholder": "X-API-KEY"},
+            "auth_query_param": {"type": "string", "title": "Query 参数名", "placeholder": "api_key"},
+            "extra": {"type": "object", "title": "其他字段", "additionalProperties": {"type": "string"}},
+            "sample_input": {"type": "object", "title": "sample input（可选）"},
         },
     }
+
+
+
+def _external_api_additional_fields_schema() -> list[dict[str, Any]]:
+    return [
+        {"key": "", "value": "", "sensitive": False, "description": "Optional extra connection field added by the user."}
+    ]
+
 
 def _strip_code_fence(text: str) -> str:
     raw = (text or "").strip()
@@ -1954,16 +2288,103 @@ def _normalized_preview(data: Any) -> dict[str, Any]:
     return {"type": type(data).__name__, "value": data}
 
 
+def _auth_env_refs(config: dict[str, Any]) -> set[str]:
+    refs = _extract_env_refs(config)
+    auth = config.get("auth") if isinstance(config.get("auth"), dict) else {}
+    for key in ("env", "username_env", "password_env"):
+        value = str(auth.get(key) or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            refs.add(value)
+    secret_env = str(config.get("secret_env") or "").strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
+        refs.add(secret_env)
+    return refs
+
+
+def _auth_config_for_live_test(config: dict[str, Any]) -> dict[str, Any]:
+    auth = dict(config.get("auth") or {}) if isinstance(config.get("auth"), dict) else {}
+    auth_type = str(auth.get("type") or config.get("auth_type") or config.get("authentication") or "none").strip().lower()
+    auth_type = "token" if auth_type in {"token", "bearer"} else "api_key" if auth_type in {"api_key", "key"} else auth_type
+    if auth_type in {"", "none", "no_auth", "anonymous"}:
+        return {}
+    env_name = str(auth.get("env") or config.get("secret_env") or config.get("api_key_env") or config.get("token_env") or config.get("password_env") or "").strip()
+    placement = str(auth.get("placement") or config.get("auth_placement") or "").strip().lower()
+    if auth_type == "token":
+        placement = placement or "header"
+    elif auth_type == "api_key":
+        placement = placement or "header"
+    elif auth_type == "basic":
+        placement = placement or "header"
+    normalized = {**auth, "type": auth_type, "env": env_name, "placement": placement}
+    if auth_type == "token":
+        normalized["header_name"] = str(auth.get("header_name") or config.get("auth_header_name") or "Authorization").strip() or "Authorization"
+        normalized["scheme"] = str(auth.get("scheme") or config.get("auth_scheme") or "Bearer").strip() or "Bearer"
+    elif auth_type == "api_key":
+        if placement == "query":
+            normalized["query_param"] = str(auth.get("query_param") or config.get("auth_query_param") or "api_key").strip() or "api_key"
+        elif placement == "bearer":
+            normalized["header_name"] = "Authorization"
+            normalized["scheme"] = "Bearer"
+        else:
+            normalized["placement"] = "header"
+            normalized["header_name"] = str(auth.get("header_name") or config.get("auth_header_name") or "X-API-KEY").strip() or "X-API-KEY"
+    elif auth_type == "basic":
+        normalized["header_name"] = "Authorization"
+        normalized["scheme"] = "Basic"
+    return normalized
+
+
+def _apply_auth_to_request(headers: dict[str, Any], query: dict[str, Any], config: dict[str, Any], secret_values: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any], list[str], bool]:
+    auth = _auth_config_for_live_test(config)
+    if not auth:
+        return headers, query, [], False
+    env_name = str(auth.get("env") or "").strip()
+    secret = secret_values.get(env_name, "")
+    warnings: list[str] = []
+    if not env_name or not secret:
+        return headers, query, warnings, False
+    auth_type = str(auth.get("type") or "").lower()
+    placement = str(auth.get("placement") or "").lower()
+    if auth_type == "api_key" and placement == "query":
+        query[str(auth.get("query_param") or "api_key")] = secret
+        return headers, query, warnings, True
+    if auth_type == "api_key":
+        if placement == "bearer":
+            headers["Authorization"] = f"Bearer {secret}"
+        else:
+            header_name = str(auth.get("header_name") or "").strip()
+            if not header_name:
+                warnings.append("已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。")
+                return headers, query, warnings, False
+            headers[header_name] = secret
+        return headers, query, warnings, True
+    if auth_type == "token":
+        header_name = str(auth.get("header_name") or "Authorization").strip() or "Authorization"
+        scheme = str(auth.get("scheme") or "Bearer").strip()
+        headers[header_name] = f"{scheme} {secret}".strip()
+        return headers, query, warnings, True
+    if auth_type == "basic":
+        encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+        return headers, query, warnings, True
+    if auth_type == "custom":
+        return headers, query, warnings, bool(headers)
+    return headers, query, warnings, False
+
+
 def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
     """Perform one generic external API probe without generating or registering code."""
     if request.get("allow_external_network") is not True:
         return {"success": False, "status": "blocked", "errors": ["allow_external_network must be true for live_test"], "preview": None, "normalized_preview": None}
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
     sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-    env_refs = _extract_env_refs(config)
+    env_refs = _auth_env_refs(config)
     missing_env = sorted(name for name in env_refs if not os.environ.get(name))
     if missing_env:
-        return {"success": False, "status": "missing_secret", "errors": ["missing required env secret(s): " + ", ".join(missing_env)], "missing_env": missing_env, "preview": None, "normalized_preview": None}
+        auth = _auth_config_for_live_test(config)
+        expected_header = str(auth.get("header_name") or "").strip() if auth and auth.get("placement") != "query" else ""
+        raw_url = str(config.get("url") or config.get("endpoint") or config.get("base_url") or "")
+        return {"success": False, "status": "missing_secret", "errors": ["missing required env secret(s): " + ", ".join(missing_env)], "missing_env": missing_env, "preview": None, "normalized_preview": None, "request_preview": {"method": str(config.get("method") or "GET").upper(), "url": _redact_secrets(raw_url), "header_keys": [expected_header] if expected_header else [], "has_body": False, "auth_applied": False}}
     secret_values = {name: os.environ.get(name, "") for name in env_refs}
     method = str(config.get("method") or "GET").upper()
     url = str(config.get("url") or config.get("endpoint") or "")
@@ -1976,6 +2397,12 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         return {"success": False, "status": "invalid_config", "errors": ["live_test url must start with http:// or https://"], "preview": None, "normalized_preview": None}
     headers = _render_template(config.get("headers_template") or config.get("headers") or {}, sample_input, secret_values)
     query = _render_template(config.get("query_template") or config.get("params_template") or {}, sample_input, secret_values)
+    headers = dict(headers or {}) if isinstance(headers, dict) else {}
+    query = dict(query or {}) if isinstance(query, dict) else {}
+    headers, query, auth_warnings, auth_applied = _apply_auth_to_request(headers, query, config, secret_values)
+    auth_warning = "已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。" if _auth_config_for_live_test(config) and not auth_applied else ""
+    if auth_warning and auth_warning not in auth_warnings:
+        auth_warnings.append(auth_warning)
     body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template", {})
     json_body = _render_template(body_template or {}, sample_input, secret_values)
     if isinstance(query, dict) and query:
@@ -1998,7 +2425,7 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         status_code = int(exc.code)
         content_type = exc.headers.get("content-type", "") if exc.headers else ""
     except Exception as exc:
-        return {"success": False, "status": "request_failed", "errors": [str(exc)], "preview": None, "normalized_preview": None}
+        return {"success": False, "status": "request_failed", "errors": [str(exc), *auth_warnings], "preview": None, "normalized_preview": None, "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None, "auth_applied": auth_applied}}
     text = raw.decode("utf-8", errors="replace")
     try:
         preview: Any = json.loads(text)
@@ -2013,8 +2440,8 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         "content_type": content_type,
         "preview": redacted_preview,
         "normalized_preview": _normalized_preview(redacted_preview),
-        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None},
-        "errors": [] if success else [f"HTTP {status_code}"],
+        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None, "auth_applied": auth_applied},
+        "errors": ([] if success else [f"HTTP {status_code}"]) + auth_warnings,
     }
 
 AUTHORING_HELPER_NAMES = {
@@ -2116,12 +2543,12 @@ def run_authoring_helper(tool_name: str, input: dict[str, Any] | None, context: 
     if normalized_name == "authoring_config_collector":
         config = payload.get("config") if isinstance(payload.get("config"), dict) else ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
         sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
-        missing_fields = [str(item) for item in payload.get("missing_fields") or []]
-        if missing_fields:
-            result = {"success": False, "requires_input": True, "schema": _config_collector_schema(missing_fields), "message": "等待用户填写通用连接配置。"}
+        required_fields = [str(item) for item in payload.get("config_required_fields") or payload.get("missing_fields") or []]
+        if required_fields:
+            result = {"success": False, "requires_input": True, "schema": _config_collector_schema(required_fields), "config_required_fields": required_fields, "message": "等待用户在授权弹窗保存连接配置。"}
         else:
-            sanitized_config, refs = _sanitize_authoring_config(config)
-            result = {"success": True, "requires_input": False, "config": sanitized_config, "sample_input": sample_input, "secret_env_suggestions": sorted(refs), "message": "配置已保存为 env/secret 引用。"}
+            saved = save_tool_authoring_config({**ctx, **payload, "config": config, "sample_input": sample_input})
+            result = {"success": True, "requires_input": False, "config": saved.get("config") or {}, "sample_input": sample_input, "configured_env": saved.get("configured_env") or [], "configured_secrets": saved.get("configured_secrets") or [], "config_refs": saved.get("config_refs") or {}, "secret_env_suggestions": saved.get("configured_secrets") or [], "message": "配置已保存为 env/secret 引用。"}
     elif normalized_name == "authoring_schema_infer":
         code = str(payload.get("code_block") or ctx.get("code_block") or "")
         input_schema, output_schema, notes = _infer_schema_from_code(code) if code.strip() else ({}, {}, [])
@@ -2187,9 +2614,17 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
     status = "needs_clarification" if needs_clarification else "waiting_for_user_input"
     return {
         "needs_clarification": needs_clarification,
-        "questions": plan.get("questions") or [],
+        "questions": plan.get("clarification_questions") or plan.get("questions") or [],
+        "clarification_questions": plan.get("clarification_questions") or plan.get("questions") or [],
+        "requires_config": bool(plan.get("requires_config")),
+        "config_required_fields": plan.get("config_required_fields") or [],
+        "config_form_schema": plan.get("config_form_schema") or plan.get("suggested_config_schema") or {},
+        "suggested_entrypoint": plan.get("suggested_entrypoint") or {},
+        "additional_fields_schema": plan.get("additional_fields_schema") or [],
+        "requires_authorization": bool(plan.get("requires_authorization")),
         "tool_kind": plan.get("tool_kind") or "unknown",
         "operation": plan.get("operation") or "",
+        "resolved_clarifications": plan.get("resolved_clarifications") or [],
         "requires_secret": bool(plan.get("requires_secret")),
         "secret_env_suggestions": plan.get("secret_env_suggestions") or [],
         "requires_external_network": bool(plan.get("requires_external_network")),
@@ -2213,7 +2648,51 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "requires_human_confirmation": True,
     }
 
+
+
+async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> list[str]:
+    """Ask planner_model to catch capability ambiguity that deterministic heuristics may miss."""
+    if _clarification_answer_texts(request):
+        return []
+    judge_payload = {
+        key: request.get(key)
+        for key in [
+            "description",
+            "operation",
+            "input_description",
+            "output_description",
+            "tool_kind",
+            "needs_external_network",
+            "clarification_answers",
+        ]
+    }
+    judge_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the planner_model capability ambiguity judge for Tool Authoring. "
+                "Return strict JSON: {needs_capability_clarification: boolean, question: {id, type, question, options, required}}. "
+                "Set needs_capability_clarification=true only when the user's desired business capability or operation is genuinely unclear. "
+                "If clarification_answers already contain a non-empty answer that resolves the requested operation, return needs_capability_clarification=false. Do not ask the same question again. "
+                "The question must be Chinese, short, structured, and ask only what the tool should do. If you provide options, generate context-specific options for this user request; do not use generic fixed options. "
+                "Do not ask for service address, endpoint, IP, key, token, auth method, connection-test permission, method, headers/body/query templates, schemas, sample input, or expected output fields."
+            ),
+        },
+        {"role": "user", "content": json.dumps(judge_payload, ensure_ascii=False)},
+    ]
+    judge, ack, err = await _complete_author_model("planner", judge_messages, reason="creator_tool_author_capability_ambiguity")
+    if ack:
+        model_notes.append(f"capability_ambiguity_judge={ack['model']}")
+    if err:
+        warnings.append(f"capability ambiguity judge unavailable, used deterministic ambiguity heuristic only: {err}")
+        return []
+    if not bool(judge.get("needs_capability_clarification") or judge.get("capability_ambiguous")):
+        return []
+    question = judge.get("question") or judge.get("clarification_question") or {"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}
+    return _safe_clarification_questions([question], [])
+
 async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    request = _apply_clarification_answers(request)
     planner_payload = {
         key: request.get(key)
         for key in [
@@ -2231,6 +2710,7 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "generates_file",
             "high_risk",
             "clarification_answers",
+            "resolved_clarifications",
             "tool_kind",
             "operation",
             "config",
@@ -2244,13 +2724,15 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "role": "system",
             "content": (
                 "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
-                "Return strict JSON with exactly this contract where possible: needs_clarification, questions, tool_kind "
+                "Return strict JSON with this layered contract where possible: needs_clarification, clarification_questions, requires_config, "
+                "suggested_entrypoint, config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind "
                 "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
                 "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
-                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, missing_fields, suggested_config_schema, sample_input_schema, manifest, "
-                "implementation_plan. If ready_for_code_generation is false, the implementation generator will not be called. For external_api, "
-                "require endpoint/base_url/url, method, auth method, secret env name when needed, headers/query/body templates, "
-                "sample input, expected output fields, and explicit external network permission. If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
+                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, suggested_config_schema, sample_input_schema, manifest, "
+                "implementation_plan. clarification_questions must be structured objects with id/type/question/options/required, Chinese, preferably 1-3 questions and never more than 5, and only ask about real capability ambiguity. Generate options dynamically from the user request when a choice is useful; do not use hardcoded generic options. "
+                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; infer and prefill suggested_entrypoint with base_url, method, auth_type, secret_env, and confidence when possible, using empty base_url with low confidence if unknown. Put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
+                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, suggested_entrypoint, saved config, and test result. "
+                "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
             ),
         },
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
@@ -2264,6 +2746,13 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
     if not isinstance(plan.get("manifest"), dict):
         plan = _author_fallback_plan(request)
     normalized = _normalize_author_plan(plan, request)
+    if ack and normalized.get("tool_kind") == "external_api" and not normalized.get("clarification_questions"):
+        judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
+        if judged_questions:
+            normalized["clarification_questions"] = judged_questions
+            normalized["questions"] = judged_questions
+            normalized["needs_clarification"] = True
+            normalized["ready_for_code_generation"] = False
     model_notes.extend(normalized.get("model_notes") or [])
     return normalized
 

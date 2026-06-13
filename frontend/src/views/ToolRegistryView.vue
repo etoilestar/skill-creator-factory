@@ -703,7 +703,13 @@ function buildCurrentUiConfig() {
     headers_template: headersTemplate
   })
 }
-
+function canonicalAuthoringConfig() {
+  const saved = configSaveResult.value?.config
+  if (saved && typeof saved === 'object' && Object.keys(saved).length) {
+    return saved
+  }
+  return buildCurrentUiConfig()
+}
 const parsedConfig = computed(() => buildCurrentUiConfig())
 const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
@@ -755,20 +761,57 @@ function optionValue(option) { return typeof option === 'string' ? option : (opt
 function answerLabel(question, answer) { const option = questionOptions(question).find(item => optionValue(item) === answer); return option ? optionLabel(option) : answer }
 function addExtraField() { configExtraFields.value.push({ key: '', value: '', sensitive: false }) }
 function removeExtraField(idx) { configExtraFields.value.splice(idx, 1) }
+function normalizeSuggestedAuthType(value) {
+  const text = String(value || '').trim().toLowerCase()
+  if (!text || ['none', 'no_auth', 'anonymous'].includes(text)) return 'none'
+  if (['header', 'api_key', 'apikey', 'key'].includes(text)) return 'api_key'
+  if (['bearer', 'token'].includes(text)) return 'token'
+  if (text === 'basic') return 'basic'
+  return 'api_key'
+}
+
 function applySuggestedEntrypoint(entrypoint = {}) {
   if (!entrypoint || typeof entrypoint !== 'object') return
 
-  if (entrypoint.base_url && !configForm.base_url) configForm.base_url = entrypoint.base_url
-  if (entrypoint.endpoint && !configForm.base_url) configForm.base_url = entrypoint.endpoint
-  if (entrypoint.url && !configForm.base_url) configForm.base_url = entrypoint.url
+  // live_test 成功后的配置是事实源，planner 后续建议不能覆盖。
+  const lockedByLiveTest = Boolean(liveTestResult.value?.success)
 
-  if (entrypoint.method) configForm.method = String(entrypoint.method).toUpperCase()
-  if (entrypoint.auth_type && configForm.auth_type === 'none') configForm.auth_type = entrypoint.auth_type
-  if (entrypoint.secret_env && !configForm.secret_env) configForm.secret_env = entrypoint.secret_env
+  // base_url 只在为空时预填。
+  if (!lockedByLiveTest) {
+    if (entrypoint.base_url && !configForm.base_url) configForm.base_url = entrypoint.base_url
+    if (entrypoint.endpoint && !configForm.base_url) configForm.base_url = entrypoint.endpoint
+    if (entrypoint.url && !configForm.base_url) configForm.base_url = entrypoint.url
+  }
 
-  if (entrypoint.auth_placement) configForm.auth_placement = entrypoint.auth_placement
-  if (entrypoint.auth_header_name) configForm.auth_header_name = entrypoint.auth_header_name
-  if (entrypoint.auth_query_param) configForm.auth_query_param = entrypoint.auth_query_param
+  // method 只在用户还没有明确配置时预填；不要用 planner 覆盖已确认 POST。
+  const suggestedMethod = normalizeRequestMethod(entrypoint.method)
+  const currentMethod = normalizeRequestMethod(configForm.method)
+  const methodLooksDefault = !configForm.method || currentMethod === 'GET'
+
+  if (!lockedByLiveTest && entrypoint.method && methodLooksDefault && !configSaveResult.value?.success) {
+    configForm.method = suggestedMethod
+  }
+
+  // auth_type 只在当前为 none 时预填，并把 planner 的 header 归一化成 api_key。
+  if (!lockedByLiveTest && entrypoint.auth_type && configForm.auth_type === 'none') {
+    configForm.auth_type = normalizeSuggestedAuthType(entrypoint.auth_type)
+  }
+
+  if (!lockedByLiveTest && entrypoint.secret_env && !configForm.secret_env) {
+    configForm.secret_env = entrypoint.secret_env
+  }
+
+  if (!lockedByLiveTest && entrypoint.auth_placement && !configForm.auth_placement) {
+    configForm.auth_placement = entrypoint.auth_placement
+  }
+
+  if (!lockedByLiveTest && entrypoint.auth_header_name && !configForm.auth_header_name) {
+    configForm.auth_header_name = entrypoint.auth_header_name
+  }
+
+  if (!lockedByLiveTest && entrypoint.auth_query_param && !configForm.auth_query_param) {
+    configForm.auth_query_param = entrypoint.auth_query_param
+  }
 
   const extra = entrypoint.extra || entrypoint.config || {}
   Object.entries(extra).forEach(([key, value]) => {
@@ -783,13 +826,36 @@ function applySuggestedEntrypoint(entrypoint = {}) {
     }
   })
 }
-
 function filterAnsweredQuestions(questions) {
   const answered = new Set(clarificationQuestions.value.map((question, idx) => (clarificationAnswers.value[idx] ? questionText(question) : '')).filter(Boolean))
   return questions.filter(question => !answered.has(questionText(question)))
 }
 function configSessionId() { return form.tool_name || planState.value?.operation || form.description || 'default' }
-function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ id: question?.id || '', question: questionText(question), answer: clarificationAnswers.value[idx] || '', answer_label: answerLabel(question, clarificationAnswers.value[idx] || '') })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
+function authorPayload(action) {
+  return {
+    ...payload(),
+    action,
+    code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined),
+    adapter_code: adapterCode.value,
+    sample_input: parsedSample.value,
+    manifest: parsedManifest.value,
+    validation: lastValidation.value,
+    clarification_answers: clarificationQuestions.value
+      .map((question, idx) => ({
+        id: question?.id || '',
+        question: questionText(question),
+        answer: clarificationAnswers.value[idx] || '',
+        answer_label: answerLabel(question, clarificationAnswers.value[idx] || '')
+      }))
+      .filter(item => item.answer),
+    tool_kind: planState.value?.tool_kind,
+    operation: planState.value?.operation,
+    config: canonicalAuthoringConfig(),
+    live_test_result: liveTestResult.value,
+    allow_external_network: allowExternalNetwork.value,
+    authoring_context: planState.value?.authoring_context || {}
+  }
+}
 function extractLiveTestResult(data) {
   if (data?.live_test_result) return data.live_test_result
   if (data?.authoring_context?.live_test_result) return data.authoring_context.live_test_result
@@ -806,7 +872,11 @@ function rememberLiveTestResult(result) {
 }
 function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
 function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.adapter_code) nextTick(refreshEditableInternalCode)}
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; if (!configSaveResult.value?.success && !liveTestResult.value?.success) {
+  applySuggestedEntrypoint(data.suggested_entrypoint)
+}; if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); if (data.adapter_code) {
+  adapterCode.value = data.adapter_code
+}; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.adapter_code) nextTick(refreshEditableInternalCode)}
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly({ configureAfterSave = true } = {}) {
@@ -834,7 +904,7 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
   if (configureAfterSave) {
     const data = await authorCreatorTool({
       ...authorPayload('configure'),
-      config: buildCurrentUiConfig()
+      config: canonicalAuthoringConfig()
     })
     applyAuthorResult(data)
   }
@@ -851,13 +921,13 @@ async function performLiveTest({ saveFirst = false } = {}) {
 
     allowExternalNetwork.value = true
 
-    const liveConfig = buildCurrentUiConfig()
+    const liveConfig = canonicalAuthoringConfig()
 
     const data = await liveTestCreatorTool({
       ...authorPayload('live_test'),
       allow_external_network: true,
       sample_input: parsedSample.value,
-      config: liveConfig,
+      config: liveConfig
     })
 
     applyAuthorResult(data)
@@ -877,14 +947,14 @@ async function performLiveTest({ saveFirst = false } = {}) {
         requires_authoring_tools: false,
         authoring_tool_plan: [],
         ready_for_live_test: true,
-        ready_for_code_generation: true,
+        ready_for_code_generation: true
       }
     }
 
     authorLogs.value.push({
       time: new Date().toLocaleTimeString(),
       event: 'live_test_result',
-      success: result?.success,
+      success: result?.success
     })
 
     activeStep.value = 'planner'
@@ -899,7 +969,89 @@ async function performLiveTest({ saveFirst = false } = {}) {
 }
 function saveConfigAndRunLiveTest() { return run(async () => { await performLiveTest({ saveFirst: true }); authConfigOpen.value = false; activeStep.value = 'planner'; scrollToLiveTestResult() }) }
 function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
-function generateAdapter() { return run(async () => { adapterCode.value = ''; authorLogs.value = []; streamController.value = new AbortController(); for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) { logAuthor(event); if (event.event === 'model_delta') adapterCode.value += event.delta || ''; if (event.event === 'final_result') applyAuthorResult(event); } activeStep.value = 'adapter' }) }
+function generateAdapter() {
+  return run(async () => {
+    const previousCode = adapterCode.value
+
+    adapterCode.value = ''
+    editableInternalCode.value = ''
+    authorLogs.value = []
+    lastValidation.value = null
+    streamController.value = new AbortController()
+
+    let finalResult = null
+    let receivedCode = false
+
+    for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) {
+      logAuthor(event)
+
+      if (event.event === 'error') {
+        throw new Error(event.message || '生成 adapter 失败')
+      }
+
+      if (event.event === 'model_delta') {
+        const delta = event.delta || ''
+        if (delta) {
+          adapterCode.value += delta
+          receivedCode = true
+        }
+      }
+
+      if (event.event === 'validation') {
+        lastValidation.value = {
+          ...(lastValidation.value || {}),
+          success: Boolean(event.success),
+          errors: event.errors || [],
+          warnings: event.warnings || []
+        }
+      }
+
+      if (event.event === 'final_result') {
+        finalResult = event
+        applyAuthorResult(event)
+
+        if (event.adapter_code) {
+          receivedCode = true
+        }
+      }
+    }
+
+    if (adapterCode.value) {
+      refreshEditableInternalCode()
+      activeStep.value = 'adapter'
+      return
+    }
+
+    // 没生成代码时，不要跳到空白 Adapter 页面。
+    if (finalResult?.needs_clarification || finalResult?.questions?.length || finalResult?.clarification_questions?.length) {
+      statusMessage.value = '还需要补充信息，暂未生成代码。'
+      activeStep.value = 'planner'
+      return
+    }
+
+    if (finalResult?.requires_config || finalResult?.requires_authoring_tools || finalResult?.authoring_tool_plan?.length) {
+      statusMessage.value = '还需要完成配置或 live_test，暂未生成代码。'
+      activeStep.value = 'planner'
+      return
+    }
+
+    if (finalResult?.validation && finalResult.validation.success === false) {
+      statusMessage.value = '生成失败或验证失败，未得到可展示的 adapter 代码。'
+      activeStep.value = 'validation'
+      return
+    }
+
+    // 避免把用户原来手动改过的代码直接丢失。
+    adapterCode.value = previousCode || ''
+    if (adapterCode.value) {
+      refreshEditableInternalCode()
+      activeStep.value = 'adapter'
+    } else {
+      statusMessage.value = '后端未返回 adapter_code，请查看生成日志。'
+      activeStep.value = 'planner'
+    }
+  })
+}
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
 function runLiveTest() {
   return run(async () => {

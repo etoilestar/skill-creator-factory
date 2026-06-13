@@ -77,7 +77,7 @@
         "headers_template_env": "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON",
         "json_body_template_env": "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON",
         "method": "${ENV:TOOLCFG_DEFAULT_METHOD}",
-        "original_secret_env": "SERPER_API_KEY",
+        "original_secret_env": "",
         "platform_env_prefix": "TOOLCFG_DEFAULT",
         "query_template_env": "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON",
         "secret_env": ""
@@ -92,7 +92,6 @@
         "query_template": "${ENV:TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON}"
       },
       "configured_env": [
-        "SERPER_API_KEY",
         "TOOLCFG_DEFAULT_AUTH_HEADER",
         "TOOLCFG_DEFAULT_AUTH_QUERY_PARAM",
         "TOOLCFG_DEFAULT_BASE_URL",
@@ -106,7 +105,7 @@
       "raw_values": {
         "TOOLCFG_DEFAULT_AUTH_HEADER": "X-API-KEY",
         "TOOLCFG_DEFAULT_AUTH_QUERY_PARAM": "api_key",
-        "TOOLCFG_DEFAULT_BASE_URL": "https://api.serper.com/v1/webSearch",
+        "TOOLCFG_DEFAULT_BASE_URL": "https://api.serper.com/v1/search",
         "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON": "{}",
         "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON": "{}",
         "TOOLCFG_DEFAULT_METHOD": "GET",
@@ -117,50 +116,143 @@
         "query": "测试内容"
       },
       "tool_name": "default",
-      "updated_at": "2026-06-13T12:45:52.612868+00:00"
+      "updated_at": "2026-06-13T16:06:37.991576+00:00"
     },
-    "search": {
+    "https_google_serper_dev_search": {
       "config": {
-        "api_key": "${ENV:SERPER_API_KEY}",
         "auth": {
-          "env": "SERPER_API_KEY",
-          "header_name": "X-API-KEY",
+          "env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET",
+          "header_name": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER}",
           "placement": "header",
           "type": "api_key"
         },
-        "auth_header_name": "X-API-KEY",
+        "auth_header_name": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER}",
         "auth_placement": "header",
-        "auth_query_param": "api_key",
+        "auth_query_param": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUERY_PARAM}",
         "auth_type": "api_key",
-        "base_url": "${ENV:SEARCH_BASE_URL}",
+        "base_url": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL}",
         "headers_template": {
           "Content-Type": "application/json"
         },
+        "headers_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON",
         "json_body_template": {
           "q": "apple inc"
         },
-        "method": "POST",
-        "secret_env": "SERPER_API_KEY"
+        "json_body_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON",
+        "method": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD}",
+        "original_secret_env": "Serper_Key",
+        "platform_env_prefix": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH",
+        "query_template_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON",
+        "secret_env": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"
       },
       "config_refs": {
-        "api_key": "${ENV:SERPER_API_KEY}",
-        "base_url": "${ENV:SEARCH_BASE_URL}"
+        "auth_header_name": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER}",
+        "auth_query_param": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUERY_PARAM}",
+        "base_url": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL}",
+        "headers_template": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON}",
+        "json_body_template": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON}",
+        "method": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD}",
+        "query_template": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON}",
+        "secret": "${ENV:TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET}"
       },
       "configured_env": [
-        "SEARCH_BASE_URL"
+        "Serper_Key",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUERY_PARAM",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON"
       ],
       "configured_secrets": [
-        "SERPER_API_KEY"
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"
       ],
+      "platform_env_prefix": "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH",
+      "raw_values": {
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER": "X-API-KEY",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_QUERY_PARAM": "api_key",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL": "https://google.serper.dev/search",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON": "{\"q\": \"apple inc\"}",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON": "{\"Content-Type\": \"application/json\"}",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD": "POST",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON": "{}",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
+      },
+      "sample_input": {
+        "q": "apple inc"
+      },
+      "tool_name": "https://google.serper.dev/search",
+      "updated_at": "2026-06-13T16:07:26.838478+00:00"
+    },
+    "search": {
+      "config": {
+        "auth": {
+          "env": "TOOLCFG_SEARCH_SECRET",
+          "header_name": "${ENV:TOOLCFG_SEARCH_AUTH_HEADER}",
+          "placement": "header",
+          "type": "api_key"
+        },
+        "auth_header_name": "${ENV:TOOLCFG_SEARCH_AUTH_HEADER}",
+        "auth_placement": "header",
+        "auth_query_param": "${ENV:TOOLCFG_SEARCH_AUTH_QUERY_PARAM}",
+        "auth_type": "api_key",
+        "base_url": "${ENV:TOOLCFG_SEARCH_BASE_URL}",
+        "headers_template": {
+          "Content-Type": "application/json"
+        },
+        "headers_template_env": "TOOLCFG_SEARCH_HEADERS_TEMPLATE_JSON",
+        "json_body_template": {
+          "q": "apple inc"
+        },
+        "json_body_template_env": "TOOLCFG_SEARCH_BODY_TEMPLATE_JSON",
+        "method": "${ENV:TOOLCFG_SEARCH_METHOD}",
+        "original_secret_env": "SEARCH_API_KEY",
+        "platform_env_prefix": "TOOLCFG_SEARCH",
+        "query_template_env": "TOOLCFG_SEARCH_QUERY_TEMPLATE_JSON",
+        "secret_env": "TOOLCFG_SEARCH_SECRET"
+      },
+      "config_refs": {
+        "auth_header_name": "${ENV:TOOLCFG_SEARCH_AUTH_HEADER}",
+        "auth_query_param": "${ENV:TOOLCFG_SEARCH_AUTH_QUERY_PARAM}",
+        "base_url": "${ENV:TOOLCFG_SEARCH_BASE_URL}",
+        "headers_template": "${ENV:TOOLCFG_SEARCH_HEADERS_TEMPLATE_JSON}",
+        "json_body_template": "${ENV:TOOLCFG_SEARCH_BODY_TEMPLATE_JSON}",
+        "method": "${ENV:TOOLCFG_SEARCH_METHOD}",
+        "query_template": "${ENV:TOOLCFG_SEARCH_QUERY_TEMPLATE_JSON}",
+        "secret": "${ENV:TOOLCFG_SEARCH_SECRET}"
+      },
+      "configured_env": [
+        "SEARCH_API_KEY",
+        "TOOLCFG_SEARCH_AUTH_HEADER",
+        "TOOLCFG_SEARCH_AUTH_QUERY_PARAM",
+        "TOOLCFG_SEARCH_BASE_URL",
+        "TOOLCFG_SEARCH_BODY_TEMPLATE_JSON",
+        "TOOLCFG_SEARCH_HEADERS_TEMPLATE_JSON",
+        "TOOLCFG_SEARCH_METHOD",
+        "TOOLCFG_SEARCH_QUERY_TEMPLATE_JSON"
+      ],
+      "configured_secrets": [
+        "TOOLCFG_SEARCH_SECRET"
+      ],
+      "platform_env_prefix": "TOOLCFG_SEARCH",
       "raw_values": {
         "SEARCH_BASE_URL": "https://google.serper.dev/search",
-        "SERPER_API_KEY": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
+        "SERPER_API_KEY": "87a99224b9c866422f4333a985ca3b4fa67ae0e5",
+        "TOOLCFG_SEARCH_AUTH_HEADER": "X-API-KEY",
+        "TOOLCFG_SEARCH_AUTH_QUERY_PARAM": "api_key",
+        "TOOLCFG_SEARCH_BASE_URL": "https://google.serper.dev/search",
+        "TOOLCFG_SEARCH_BODY_TEMPLATE_JSON": "{\"q\": \"apple inc\"}",
+        "TOOLCFG_SEARCH_HEADERS_TEMPLATE_JSON": "{\"Content-Type\": \"application/json\"}",
+        "TOOLCFG_SEARCH_METHOD": "POST",
+        "TOOLCFG_SEARCH_QUERY_TEMPLATE_JSON": "{}",
+        "TOOLCFG_SEARCH_SECRET": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
       },
       "sample_input": {
         "q": "apple inc"
       },
       "tool_name": "search",
-      "updated_at": "2026-06-13T07:23:53.619904+00:00"
+      "updated_at": "2026-06-13T15:48:24.422576+00:00"
     },
     "true": {
       "config": {
@@ -225,8 +317,75 @@
       },
       "tool_name": "True",
       "updated_at": "2026-06-13T11:38:44.313149+00:00"
+    },
+    "web": {
+      "config": {
+        "auth": {
+          "env": "TOOLCFG_WEB_SECRET",
+          "header_name": "${ENV:TOOLCFG_WEB_AUTH_HEADER}",
+          "placement": "header",
+          "type": "api_key"
+        },
+        "auth_header_name": "${ENV:TOOLCFG_WEB_AUTH_HEADER}",
+        "auth_placement": "header",
+        "auth_query_param": "${ENV:TOOLCFG_WEB_AUTH_QUERY_PARAM}",
+        "auth_type": "api_key",
+        "base_url": "${ENV:TOOLCFG_WEB_BASE_URL}",
+        "headers_template": {
+          "Content-Type": "application/json"
+        },
+        "headers_template_env": "TOOLCFG_WEB_HEADERS_TEMPLATE_JSON",
+        "json_body_template": {
+          "q": "apple inc"
+        },
+        "json_body_template_env": "TOOLCFG_WEB_BODY_TEMPLATE_JSON",
+        "method": "${ENV:TOOLCFG_WEB_METHOD}",
+        "original_secret_env": "SERPER_API_KEY",
+        "platform_env_prefix": "TOOLCFG_WEB",
+        "query_template_env": "TOOLCFG_WEB_QUERY_TEMPLATE_JSON",
+        "secret_env": "TOOLCFG_WEB_SECRET"
+      },
+      "config_refs": {
+        "auth_header_name": "${ENV:TOOLCFG_WEB_AUTH_HEADER}",
+        "auth_query_param": "${ENV:TOOLCFG_WEB_AUTH_QUERY_PARAM}",
+        "base_url": "${ENV:TOOLCFG_WEB_BASE_URL}",
+        "headers_template": "${ENV:TOOLCFG_WEB_HEADERS_TEMPLATE_JSON}",
+        "json_body_template": "${ENV:TOOLCFG_WEB_BODY_TEMPLATE_JSON}",
+        "method": "${ENV:TOOLCFG_WEB_METHOD}",
+        "query_template": "${ENV:TOOLCFG_WEB_QUERY_TEMPLATE_JSON}",
+        "secret": "${ENV:TOOLCFG_WEB_SECRET}"
+      },
+      "configured_env": [
+        "SERPER_API_KEY",
+        "TOOLCFG_WEB_AUTH_HEADER",
+        "TOOLCFG_WEB_AUTH_QUERY_PARAM",
+        "TOOLCFG_WEB_BASE_URL",
+        "TOOLCFG_WEB_BODY_TEMPLATE_JSON",
+        "TOOLCFG_WEB_HEADERS_TEMPLATE_JSON",
+        "TOOLCFG_WEB_METHOD",
+        "TOOLCFG_WEB_QUERY_TEMPLATE_JSON"
+      ],
+      "configured_secrets": [
+        "TOOLCFG_WEB_SECRET"
+      ],
+      "platform_env_prefix": "TOOLCFG_WEB",
+      "raw_values": {
+        "TOOLCFG_WEB_AUTH_HEADER": "X-API-KEY",
+        "TOOLCFG_WEB_AUTH_QUERY_PARAM": "api_key",
+        "TOOLCFG_WEB_BASE_URL": "https://google.serper.dev/search",
+        "TOOLCFG_WEB_BODY_TEMPLATE_JSON": "{\"q\": \"apple inc\"}",
+        "TOOLCFG_WEB_HEADERS_TEMPLATE_JSON": "{\"Content-Type\": \"application/json\"}",
+        "TOOLCFG_WEB_METHOD": "POST",
+        "TOOLCFG_WEB_QUERY_TEMPLATE_JSON": "{}",
+        "TOOLCFG_WEB_SECRET": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
+      },
+      "sample_input": {
+        "q": "apple inc"
+      },
+      "tool_name": "web",
+      "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-06-13T12:46:30.779806+00:00",
+  "updated_at": "2026-06-13T16:07:26.841186+00:00",
   "version": 1
 }

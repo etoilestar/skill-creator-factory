@@ -1809,6 +1809,34 @@ def _run_adapter_once(
 
         return value
 
+def _declared_output_field_names(output_schema: dict[str, Any] | None, *, required_only: bool = False) -> set[str]:
+    """Extract business output field names from either JSON Schema or legacy field-map schema.
+
+    JSON Schema shape:
+      {"type": "object", "properties": {"success": ...}, "required": ["success"]}
+
+    Legacy field-map shape:
+      {"success": {"type": "boolean"}, "results": {"type": "array"}}
+    """
+    if not isinstance(output_schema, dict) or not output_schema:
+        return set()
+
+    properties = output_schema.get("properties")
+    required = output_schema.get("required")
+
+    if isinstance(properties, dict):
+        if required_only and isinstance(required, list):
+            return {str(item) for item in required if isinstance(item, str) and item in properties}
+        return {str(key) for key in properties.keys()}
+
+    meta_keys = {"type", "properties", "required", "description", "title", "$schema", "additionalProperties"}
+    field_names = {str(key) for key in output_schema.keys() if key not in meta_keys}
+
+    if required_only and isinstance(required, list):
+        return {str(item) for item in required if isinstance(item, str) and item in field_names}
+
+    return field_names
+
 def validate_tool_manifest(
     manifest: dict[str, Any],
     *,
@@ -1844,24 +1872,68 @@ def validate_tool_manifest(
             else:
                 try:
                     value = _run_adapter_once(cap=cap, path=path, sample_input=sample_input or {}, trial=True)
-                    expected = set((cap.functions[0].output_schema or {}).keys())
-                    missing = [key for key in expected if key not in value]
-                    if missing:
-                        warnings.append(f"dynamic trial did not return declared optional/expected fields: {', '.join(missing)}")
-                    dynamic_result = {"skipped": False, "return_keys": sorted(value.keys()), "preview": _normalized_preview(value)}
+
+                    output_schema = cap.functions[0].output_schema if cap.functions else {}
+                    expected = _declared_output_field_names(output_schema, required_only=False)
+                    required = _declared_output_field_names(output_schema, required_only=True)
+
+                    missing_required = [key for key in sorted(required) if key not in value]
+                    missing_expected = [key for key in sorted(expected - required) if key not in value]
+
+                    if missing_required:
+                        errors.append(
+                            "dynamic trial did not return required output fields: "
+                            + ", ".join(missing_required)
+                        )
+                    elif missing_expected:
+                        warnings.append(
+                            "dynamic trial did not return optional/expected output fields: "
+                            + ", ".join(missing_expected)
+                        )
+
+                    dynamic_result = {
+                        "skipped": False,
+                        "return_keys": sorted(value.keys()),
+                        "preview": _normalized_preview(value),
+                    }
                 except Exception as exc:
                     errors.append(f"dynamic trial failed: {exc}")
 
                 if real_run and not errors:
                     try:
                         value = _run_adapter_once(cap=cap, path=path, sample_input=sample_input or {}, trial=False)
+
                         if value.get("success") is False:
-                            errors.append(f"real run returned success=false: {value.get('error') or value.get('message') or value}")
-                        expected = set((cap.functions[0].output_schema or {}).keys())
-                        missing = [key for key in expected if key not in value]
-                        if missing:
-                            warnings.append(f"real run did not return declared optional/expected fields: {', '.join(missing)}")
-                        real_result = {"skipped": False, "return_keys": sorted(value.keys()), "preview": _normalized_preview(_redact_secrets(value, set(os.environ.values())))}
+                            errors.append(
+                                f"real run returned success=false: "
+                                f"{value.get('error') or value.get('message') or value}"
+                            )
+
+                        output_schema = cap.functions[0].output_schema if cap.functions else {}
+                        expected = _declared_output_field_names(output_schema, required_only=False)
+                        required = _declared_output_field_names(output_schema, required_only=True)
+
+                        missing_required = [key for key in sorted(required) if key not in value]
+                        missing_expected = [key for key in sorted(expected - required) if key not in value]
+
+                        if missing_required:
+                            errors.append(
+                                "real run did not return required output fields: "
+                                + ", ".join(missing_required)
+                            )
+                        elif missing_expected:
+                            warnings.append(
+                                "real run did not return optional/expected output fields: "
+                                + ", ".join(missing_expected)
+                            )
+
+                        real_result = {
+                            "skipped": False,
+                            "return_keys": sorted(value.keys()),
+                            "preview": _normalized_preview(
+                                _redact_secrets(value, set(os.environ.values()))
+                            ),
+                        }
                     except Exception as exc:
                         errors.append(f"real run failed: {exc}")
         finally:

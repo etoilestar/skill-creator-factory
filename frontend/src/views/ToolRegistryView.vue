@@ -173,7 +173,7 @@
           </CollapsiblePanel>
           <div class="step-actions">
             <button class="btn-ghost" @click="activeStep = 'adapter'">返回 Adapter</button>
-            <button class="btn-primary" :disabled="!snippetReady" @click="activeStep = 'snippet'">继续确认 Snippet</button>
+            <button class="btn-primary" :disabled="!lastValidation?.success || busy" @click="finalizeAuthoring">继续确认 Snippet</button>
           </div>
         </section>
 

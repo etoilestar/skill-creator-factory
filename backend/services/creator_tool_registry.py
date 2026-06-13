@@ -125,6 +125,38 @@ def _env_name_for_tool_config(tool_name: str, key: str, *, secret: bool = False)
         suffix = f"{suffix}_SECRET"
     return f"{prefix}_{suffix}"
 
+def _tool_platform_env_prefix(tool_name: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper()
+    return f"TOOLCFG_{prefix or 'TOOL'}"
+
+
+def _tool_platform_envs(tool_name: str) -> dict[str, str]:
+    prefix = _tool_platform_env_prefix(tool_name)
+    return {
+        "prefix": prefix,
+        "base_url": f"{prefix}_BASE_URL",
+        "method": f"{prefix}_METHOD",
+        "secret": f"{prefix}_SECRET",
+        "auth_header": f"{prefix}_AUTH_HEADER",
+        "auth_query_param": f"{prefix}_AUTH_QUERY_PARAM",
+        "body_template": f"{prefix}_BODY_TEMPLATE_JSON",
+        "query_template": f"{prefix}_QUERY_TEMPLATE_JSON",
+        "headers_template": f"{prefix}_HEADERS_TEMPLATE_JSON",
+    }
+
+
+def _json_env(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
+
+
+def _load_json_env(env_name: str, default: Any = None) -> Any:
+    raw = os.environ.get(env_name, "")
+    if not raw:
+        return {} if default is None else default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {} if default is None else default
 
 def _is_sensitive_config_key(key: str) -> bool:
     lowered = (key or "").lower()
@@ -169,12 +201,12 @@ def _build_saved_auth_config(data: dict[str, Any], raw_config: dict[str, Any], a
 
 
 def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
-    """Save authoring configuration as env/secret references and persist it.
+    """Save authoring configuration and persist it.
 
-    - base_url / IP / endpoint can be overwritten by saving again.
-    - secret_value can be overwritten by saving again.
-    - if secret_value is omitted/empty, the previous persisted value is kept.
-    - persisted plaintext local secrets are restored into os.environ on reload.
+    Single-user minimal version:
+    - user-provided secret_env is treated only as source alias;
+    - generated adapters read platform env names like TOOLCFG_<TOOL>_SECRET;
+    - key/base_url/method/templates are persisted and restored into os.environ.
     """
     _load_tool_authoring_config_store_from_disk()
 
@@ -187,114 +219,141 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     existing_raw_values = existing.get("raw_values") if isinstance(existing.get("raw_values"), dict) else {}
     raw_values: dict[str, str] = dict(existing_raw_values)
 
+    envs = _tool_platform_envs(tool_name)
+
     config_refs: dict[str, str] = {}
     configured_env: list[str] = []
     configured_secrets: list[str] = []
 
-    def remember_existing_env(env_name: str | None, *, secret: bool) -> bool:
+    def put_env(env_name: str, value: Any, *, secret: bool = False, keep_old_if_empty: bool = True) -> str | None:
         name = str(env_name or "").strip()
-        if not name:
-            return False
-        if name in raw_values and raw_values[name] not in (None, ""):
-            os.environ[name] = str(raw_values[name])
-            (configured_secrets if secret else configured_env).append(name)
-            return True
-        return False
-
-    def store_value(key: str, value: Any, *, secret: bool = False, env_name: str | None = None) -> str | None:
-        name = env_name or _env_name_for_tool_config(tool_name, key, secret=secret)
-        name = str(name or "").strip()
         if not name:
             return None
 
         if value in (None, "", {}, []):
-            if remember_existing_env(name, secret=secret):
-                config_refs[key] = f"${{ENV:{name}}}"
+            if keep_old_if_empty and raw_values.get(name) not in (None, ""):
+                os.environ[name] = str(raw_values[name])
+                (configured_secrets if secret else configured_env).append(name)
                 return name
             return None
 
         raw = str(value).strip() if isinstance(value, str) else str(value)
         os.environ[name] = raw
         raw_values[name] = raw
-        config_refs[key] = f"${{ENV:{name}}}"
         (configured_secrets if secret else configured_env).append(name)
         return name
 
-    # Connection endpoint / IP. Saving again overwrites the previous persisted value.
     base_url_value = (
         data.get("base_url")
         or raw_config.get("base_url")
         or raw_config.get("endpoint")
         or raw_config.get("url")
     )
-    base_url_env_name = data.get("base_url_env") or raw_config.get("base_url_env")
-    store_value("base_url", base_url_value, secret=False, env_name=base_url_env_name)
+    if put_env(envs["base_url"], base_url_value):
+        config_refs["base_url"] = f"${{ENV:{envs['base_url']}}}"
 
-    auth_type = str(data.get("auth_type") or raw_config.get("auth_type") or raw_config.get("authentication") or "none").strip().lower() or "none"
-    secret_env_name = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
+    method_value = str(data.get("method") or raw_config.get("method") or "GET").strip().upper() or "GET"
+    if put_env(envs["method"], method_value):
+        config_refs["method"] = f"${{ENV:{envs['method']}}}"
+
+    auth_type = str(
+        data.get("auth_type")
+        or raw_config.get("auth_type")
+        or raw_config.get("authentication")
+        or "none"
+    ).strip().lower() or "none"
+
+    auth_header_name = str(
+        data.get("auth_header_name")
+        or raw_config.get("auth_header_name")
+        or ((raw_config.get("auth") or {}).get("header_name") if isinstance(raw_config.get("auth"), dict) else "")
+        or "X-API-KEY"
+    ).strip() or "X-API-KEY"
+    put_env(envs["auth_header"], auth_header_name)
+    config_refs["auth_header_name"] = f"${{ENV:{envs['auth_header']}}}"
+
+    auth_query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or "").strip()
+    if auth_query_param:
+        put_env(envs["auth_query_param"], auth_query_param)
+        config_refs["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
+
+    sample_input = data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {}
+
+    body_template = raw_config.get("json_body_template") if "json_body_template" in raw_config else raw_config.get("body_template", {})
+    if not body_template and method_value not in {"GET", "HEAD"} and sample_input:
+        body_template = sample_input
+    put_env(envs["body_template"], _json_env(body_template or {}))
+    config_refs["json_body_template"] = f"${{ENV:{envs['body_template']}}}"
+
+    query_template = raw_config.get("query_template") or raw_config.get("params_template") or {}
+    if not query_template and method_value in {"GET", "DELETE"} and sample_input:
+        query_template = sample_input
+    put_env(envs["query_template"], _json_env(query_template or {}))
+    config_refs["query_template"] = f"${{ENV:{envs['query_template']}}}"
+
+    headers_template = raw_config.get("headers_template") or raw_config.get("headers") or {}
+    put_env(envs["headers_template"], _json_env(headers_template or {}))
+    config_refs["headers_template"] = f"${{ENV:{envs['headers_template']}}}"
+
+    original_secret_env = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
+    secret_value = (
+        data.get("secret_value")
+        or raw_config.get("secret_value")
+        or raw_config.get("api_key")
+        or raw_config.get("token")
+        or raw_config.get("password")
+    )
 
     if auth_type != "none":
-        secret_key = (
-            "api_key" if auth_type in {"api_key", "key"}
-            else "token" if auth_type in {"token", "bearer"}
-            else "password" if auth_type == "basic"
-            else "secret"
-        )
-        secret_env_name = secret_env_name or str(raw_config.get(f"{secret_key}_env") or "").strip()
-        if not secret_env_name:
-            secret_env_name = _env_name_for_tool_config(tool_name, secret_key, secret=True)
-
-        store_value(
-            secret_key,
-            data.get("secret_value")
-            or raw_config.get(secret_key)
-            or raw_config.get("api_key")
-            or raw_config.get("token")
-            or raw_config.get("password"),
-            secret=True,
-            env_name=secret_env_name,
-        )
-
-    extra = data.get("extra") if isinstance(data.get("extra"), dict) else raw_config.get("extra") if isinstance(raw_config.get("extra"), dict) else {}
-    for key, value in extra.items():
-        store_value(str(key), value, secret=_is_sensitive_config_key(str(key)))
-
-    additional_fields = data.get("additional_fields") if isinstance(data.get("additional_fields"), list) else []
-    for field in additional_fields:
-        if not isinstance(field, dict):
-            continue
-        key = str(field.get("key") or "").strip()
-        if not key:
-            continue
-        store_value(key, field.get("value"), secret=bool(field.get("sensitive")) or _is_sensitive_config_key(key))
+        if secret_value in (None, "") and original_secret_env:
+            secret_value = os.environ.get(original_secret_env, "")
+        if put_env(envs["secret"], secret_value, secret=True):
+            config_refs["secret"] = f"${{ENV:{envs['secret']}}}"
 
     sanitized_config = dict(raw_config)
-    if "base_url" in config_refs:
-        sanitized_config["base_url"] = config_refs["base_url"]
+    sanitized_config.update({
+        "base_url": f"${{ENV:{envs['base_url']}}}",
+        "method": f"${{ENV:{envs['method']}}}",
+        "auth_type": auth_type,
+        "secret_env": envs["secret"] if auth_type != "none" else "",
+        "original_secret_env": original_secret_env,
+        "platform_env_prefix": envs["prefix"],
+        "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
+        "json_body_template_env": envs["body_template"],
+        "query_template_env": envs["query_template"],
+        "headers_template_env": envs["headers_template"],
+    })
 
-    sanitized_config["auth_type"] = auth_type
-    if secret_env_name:
-        sanitized_config["secret_env"] = secret_env_name
+    if auth_query_param:
+        sanitized_config["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
 
-    for key, ref in config_refs.items():
-        if key != "base_url":
-            sanitized_config[key] = ref
-
-    auth_config = _build_saved_auth_config(data, raw_config, auth_type, secret_env_name)
-    if auth_config:
-        sanitized_config["auth"] = auth_config
+    if auth_type != "none":
+        sanitized_config["auth"] = _build_saved_auth_config(
+            {
+                **data,
+                "secret_env": envs["secret"],
+                "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
+                "auth_query_param": f"${{ENV:{envs['auth_query_param']}}}" if auth_query_param else "",
+            },
+            sanitized_config,
+            auth_type,
+            envs["secret"],
+        )
 
     sanitized_config, inferred_refs = _sanitize_authoring_config(sanitized_config)
     for ref in inferred_refs:
-        if ref not in configured_secrets and ref not in configured_env:
-            if ref in raw_values:
-                os.environ[ref] = str(raw_values[ref])
+        if ref in raw_values:
+            os.environ[ref] = str(raw_values[ref])
+        if ref.endswith("_SECRET"):
             configured_secrets.append(ref)
+        else:
+            configured_env.append(ref)
 
     record = {
         "tool_name": tool_name,
+        "platform_env_prefix": envs["prefix"],
         "config": sanitized_config,
-        "sample_input": data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {},
+        "sample_input": sample_input,
         "configured_env": sorted(set(configured_env)),
         "configured_secrets": sorted(set(configured_secrets)),
         "config_refs": config_refs,
@@ -308,6 +367,7 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "success": True,
         "session_id": session_id,
+        "platform_env_prefix": envs["prefix"],
         "configured_env": sorted(set(configured_env)),
         "configured_secrets": sorted(set(configured_secrets)),
         "config_refs": config_refs,
@@ -2552,17 +2612,30 @@ def _schema_from_planner_io(manifest: dict[str, Any], *, input_side: bool) -> di
     }
 
 
-def _normalize_external_api_manifest_for_adapter(manifest: dict[str, Any], request: dict[str, Any], plan: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
+def _normalize_external_api_manifest_for_adapter(
+    manifest: dict[str, Any],
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
     original = dict(manifest or {})
     name = _slug(str(original.get("name") or request.get("tool_name") or plan.get("operation") or "external_api_tool"))
     display_name = str(original.get("display_name") or original.get("description") or name.replace("_", " ").title())
 
     secret_env = str((contract.get("auth") or {}).get("required_secret_env") or "").strip()
     required_secrets = [secret_env] if secret_env else []
-    for item in original.get("required_secrets") or []:
-        text = str(item or "").strip()
-        if text and text not in required_secrets:
-            required_secrets.append(text)
+
+    platform_env_prefix = str(contract.get("platform_env_prefix") or "").strip()
+    required_env = []
+    if platform_env_prefix:
+        required_env = [
+            f"{platform_env_prefix}_BASE_URL",
+            f"{platform_env_prefix}_METHOD",
+            f"{platform_env_prefix}_AUTH_HEADER",
+            f"{platform_env_prefix}_BODY_TEMPLATE_JSON",
+            f"{platform_env_prefix}_QUERY_TEMPLATE_JSON",
+            f"{platform_env_prefix}_HEADERS_TEMPLATE_JSON",
+        ]
 
     input_schema = _schema_from_planner_io(original, input_side=True)
     output_schema = _schema_from_planner_io(original, input_side=False)
@@ -2580,7 +2653,7 @@ def _normalize_external_api_manifest_for_adapter(manifest: dict[str, Any], reque
         "allowed_roles": original.get("allowed_roles") or original.get("roles") or ["generic_script", "search_reader"],
         "roles": original.get("roles") or original.get("allowed_roles") or ["generic_script", "search_reader"],
         "required_capabilities": original.get("required_capabilities") or [name],
-        "required_env": original.get("required_env") or [],
+        "required_env": required_env,
         "required_secrets": required_secrets,
         "dependencies": sorted(set([*(original.get("dependencies") or []), "requests"])),
         "safety_level": original.get("safety_level") or "medium",
@@ -2608,8 +2681,11 @@ def _normalize_external_api_manifest_for_adapter(manifest: dict[str, Any], reque
                     "Do not write files outside OUTPUT_DIR.",
                 ],
                 "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.",
-                "safety_notes": ["Reads API secret from environment only.", "External API network access is declared."],
-                "required_env": [],
+                "safety_notes": [
+                    "Reads API secret from platform-scoped environment only.",
+                    "External API network access is declared.",
+                ],
+                "required_env": required_env,
                 "required_secrets": required_secrets,
                 "usage_policy": "helper_preferred",
                 "allowed_roles": original.get("allowed_roles") or original.get("roles") or ["generic_script", "search_reader"],
@@ -2625,29 +2701,73 @@ def _normalize_external_api_manifest_for_adapter(manifest: dict[str, Any], reque
         "high_risk": False,
     }
 
-
-def _confirmed_external_api_code_contract(request: dict[str, Any], plan: dict[str, Any], manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
+def _confirmed_external_api_code_contract(
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+) -> dict[str, Any]:
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
-    auth = _auth_config_for_live_test(config)
 
-    url = str(config.get("url") or config.get("endpoint") or "").strip()
+    tool_name = str(
+        request.get("tool_name")
+        or manifest.get("name")
+        or plan.get("operation")
+        or "external_api_tool"
+    )
+    envs = _tool_platform_envs(tool_name)
+
+    platform_env_prefix = str(config.get("platform_env_prefix") or envs["prefix"]).strip()
+    if platform_env_prefix != envs["prefix"]:
+        envs = {
+            "prefix": platform_env_prefix,
+            "base_url": f"{platform_env_prefix}_BASE_URL",
+            "method": f"{platform_env_prefix}_METHOD",
+            "secret": f"{platform_env_prefix}_SECRET",
+            "auth_header": f"{platform_env_prefix}_AUTH_HEADER",
+            "auth_query_param": f"{platform_env_prefix}_AUTH_QUERY_PARAM",
+            "body_template": f"{platform_env_prefix}_BODY_TEMPLATE_JSON",
+            "query_template": f"{platform_env_prefix}_QUERY_TEMPLATE_JSON",
+            "headers_template": f"{platform_env_prefix}_HEADERS_TEMPLATE_JSON",
+        }
+
+    url = str(config.get("url") or config.get("endpoint") or config.get("base_url") or "").strip()
+    if url.startswith("${ENV:"):
+        url = ""
     if not url:
-        base = str(config.get("base_url") or "").rstrip("/")
-        path = str(config.get("path") or "").lstrip("/")
-        url = f"{base}/{path}" if base and path else base
+        url = os.environ.get(envs["base_url"], "")
 
-    method = str(config.get("method") or "GET").upper()
+    method = str(config.get("method") or os.environ.get(envs["method"], "GET")).upper()
+
     body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template", {})
+    if isinstance(body_template, str) and body_template.startswith("${ENV:"):
+        body_template = {}
+    if not body_template:
+        body_template = _load_json_env(envs["body_template"], {})
     if method not in {"GET", "HEAD"} and not body_template and isinstance(sample_input, dict):
         body_template = sample_input
 
     query_template = config.get("query_template") or config.get("params_template") or {}
+    if isinstance(query_template, str) and query_template.startswith("${ENV:"):
+        query_template = {}
+    if not query_template:
+        query_template = _load_json_env(envs["query_template"], {})
     if method in {"GET", "DELETE"} and not query_template and isinstance(sample_input, dict):
         query_template = sample_input
 
-    headers_template = dict(config.get("headers_template") or config.get("headers") or {})
+    headers_template = config.get("headers_template") or config.get("headers") or {}
+    if isinstance(headers_template, str) and headers_template.startswith("${ENV:"):
+        headers_template = {}
+    if not headers_template:
+        headers_template = _load_json_env(envs["headers_template"], {})
+    headers_template = dict(headers_template or {})
     if method not in {"GET", "HEAD"}:
         headers_template.setdefault("Content-Type", "application/json")
+
+    auth = _auth_config_for_live_test(config)
+    auth_type = auth.get("type") or config.get("auth_type") or "none"
+    auth_header = os.environ.get(envs["auth_header"], "") or auth.get("header_name") or config.get("auth_header_name") or "X-API-KEY"
+    auth_query_param = os.environ.get(envs["auth_query_param"], "") or auth.get("query_param") or config.get("auth_query_param") or ""
 
     function_name = _slug(str(manifest.get("name") or request.get("tool_name") or plan.get("operation") or "external_api_tool"))
 
@@ -2657,15 +2777,16 @@ def _confirmed_external_api_code_contract(request: dict[str, Any], plan: dict[st
         "function_name": function_name,
         "method": method,
         "url": url,
+        "platform_env_prefix": platform_env_prefix,
         "auth": {
-            "type": auth.get("type") or config.get("auth_type") or "none",
-            "required_secret_env": str(auth.get("env") or config.get("secret_env") or "").strip(),
-            "placement": auth.get("placement") or config.get("auth_placement") or "",
-            "header_name": auth.get("header_name") or config.get("auth_header_name") or "",
-            "query_param": auth.get("query_param") or config.get("auth_query_param") or "",
+            "type": auth_type,
+            "required_secret_env": envs["secret"] if auth_type != "none" else "",
+            "placement": auth.get("placement") or config.get("auth_placement") or "header",
+            "header_name": auth_header,
+            "query_param": auth_query_param,
         },
         "headers_template": headers_template,
-        "query_template": query_template,
+        "query_template": query_template or {},
         "json_body_template": body_template or {},
         "sample_input": sample_input or {},
         "runtime_protocol": {
@@ -2677,7 +2798,6 @@ def _confirmed_external_api_code_contract(request: dict[str, Any], plan: dict[st
             "trial_env": "SKILL_TRIAL_RUN",
         },
     }
-
 
 def _default_internal_normalize_code() -> str:
     return '''
@@ -2746,6 +2866,17 @@ def _internal_code_errors(code: str) -> list[str]:
 
 
 def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, manifest: dict[str, Any]) -> str:
+    platform_env_prefix = str(contract.get("platform_env_prefix") or "").strip()
+    if not platform_env_prefix:
+        platform_env_prefix = _tool_platform_env_prefix(function_name)
+
+    endpoint_env = f"{platform_env_prefix}_BASE_URL"
+    method_env = f"{platform_env_prefix}_METHOD"
+    auth_header_env = f"{platform_env_prefix}_AUTH_HEADER"
+    body_template_env = f"{platform_env_prefix}_BODY_TEMPLATE_JSON"
+    query_template_env = f"{platform_env_prefix}_QUERY_TEMPLATE_JSON"
+    headers_template_env = f"{platform_env_prefix}_HEADERS_TEMPLATE_JSON"
+
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "external_api_tool"))
     endpoint = str(contract.get("url") or "")
     method = str(contract.get("method") or "POST").upper()
@@ -2760,10 +2891,25 @@ def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, man
     safe_internal = _strip_code_fence(internal_code or "")
     if _internal_code_errors(safe_internal):
         safe_internal = _default_internal_normalize_code()
+        internal_audit = "fallback_default_internal_normalize_code"
+    else:
+        internal_audit = "model_internal_normalize_response_only"
 
-    manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
+    # 关键修复：
+    # 不能把 json.dumps(...) 结果直接拼进 Python 源码，否则 JSON false/true/null 会变成非法 Python 名称。
+    # 正确做法是把 JSON 字符串作为 Python 字符串字面量写入，再在生成脚本运行时 json.loads(...)。
+    body_template_json_literal = repr(json.dumps(body_template, ensure_ascii=False, sort_keys=True))
+    query_template_json_literal = repr(json.dumps(query_template, ensure_ascii=False, sort_keys=True))
+    headers_template_json_literal = repr(json.dumps(headers_template, ensure_ascii=False, sort_keys=True))
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
 
     return f'''from __future__ import annotations
+
+# AUTO-GENERATED EXTERNAL API WRAPPER.
+# Only the code between MODEL_INTERNAL_CODE_START/END may come from code_model.
+# Wrapper protocol, env access, network request, manifest(), run(), and main()
+# are generated deterministically by the platform.
+# internal_audit={internal_audit}
 
 import json
 import os
@@ -2774,14 +2920,22 @@ import requests
 
 
 FUNCTION_NAME = {function_name!r}
-ENDPOINT = {endpoint!r}
-METHOD = {method!r}
+TOOL_ENV_PREFIX = {platform_env_prefix!r}
+ENDPOINT_ENV = {endpoint_env!r}
+METHOD_ENV = {method_env!r}
 SECRET_ENV = {secret_env!r}
-AUTH_HEADER_NAME = {header_name!r}
-BODY_TEMPLATE = {json.dumps(body_template, ensure_ascii=False, indent=2)}
-QUERY_TEMPLATE = {json.dumps(query_template, ensure_ascii=False, indent=2)}
-HEADERS_TEMPLATE = {json.dumps(headers_template, ensure_ascii=False, indent=2)}
-MANIFEST_DATA = {manifest_json}
+AUTH_HEADER_ENV = {auth_header_env!r}
+BODY_TEMPLATE_ENV = {body_template_env!r}
+QUERY_TEMPLATE_ENV = {query_template_env!r}
+HEADERS_TEMPLATE_ENV = {headers_template_env!r}
+
+ENDPOINT = os.getenv(ENDPOINT_ENV, {endpoint!r})
+METHOD = os.getenv(METHOD_ENV, {method!r}).upper()
+AUTH_HEADER_NAME = os.getenv(AUTH_HEADER_ENV, {header_name!r})
+BODY_TEMPLATE = json.loads(os.getenv(BODY_TEMPLATE_ENV, {body_template_json_literal}))
+QUERY_TEMPLATE = json.loads(os.getenv(QUERY_TEMPLATE_ENV, {query_template_json_literal}))
+HEADERS_TEMPLATE = json.loads(os.getenv(HEADERS_TEMPLATE_ENV, {headers_template_json_literal}))
+MANIFEST_DATA = json.loads({manifest_json_literal})
 
 
 def _flatten(prefix: str, value: Any, out: dict[str, Any]) -> None:

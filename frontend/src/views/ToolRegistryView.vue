@@ -35,15 +35,11 @@
             <SmartCodeEditor v-model="optionalCodeBlock" language="python" min-height="260px" max-height="520px" placeholder="def save_markdown(payload): ..." />
           </CollapsiblePanel>
 
-          <CollapsiblePanel v-model:open="advancedOpen" title="高级配置" description="工具名、角色、输入输出、权限风险" :badge="advancedBadge">
+          <CollapsiblePanel v-model:open="advancedOpen" title="专家模式（可选）" description="通常不用填写；IO 会由 planner、live test 和 code_model 推断" :badge="advancedBadge">
             <div class="form-row relaxed">
-              <label>工具名称<input v-model="form.tool_name" placeholder="markdown_to_pdf" /></label>
+              <label>工具名称<input v-model="form.tool_name" placeholder="可选，如 markdown_to_pdf" /></label>
               <label>工具类型<select v-model="form.tool_type"><option v-for="type in toolTypes" :key="type" :value="type">{{ type }}</option></select></label>
-              <label>允许角色<input v-model="allowedRolesText" placeholder="pdf_builder,document_generator" /></label>
-            </div>
-            <div class="form-row relaxed">
-              <label>输入描述<SmartCodeEditor v-model="form.input_description" language="text" density="compact" :toolbar="false" min-height="80px" max-height="160px" /></label>
-              <label>输出描述<SmartCodeEditor v-model="form.output_description" language="text" density="compact" :toolbar="false" min-height="80px" max-height="160px" /></label>
+              <label>允许角色<input v-model="allowedRolesText" placeholder="可选，逗号分隔" /></label>
             </div>
             <div class="checks">
               <label><input v-model="form.needs_secret" type="checkbox" /> 需要密钥</label>
@@ -51,6 +47,12 @@
               <label><input v-model="form.generates_file" type="checkbox" /> 生成文件</label>
               <label><input v-model="form.high_risk" type="checkbox" /> 高风险</label>
             </div>
+            <CollapsiblePanel v-model:open="expertIoOpen" title="专家 IO 提示（默认无需填写）" description="普通流程会自动推断输入输出，最终在 Snippet 阶段确认">
+              <div class="form-row relaxed">
+                <label>输入描述<SmartCodeEditor v-model="form.input_description" language="text" density="compact" :toolbar="false" min-height="80px" max-height="160px" /></label>
+                <label>输出描述<SmartCodeEditor v-model="form.output_description" language="text" density="compact" :toolbar="false" min-height="80px" max-height="160px" /></label>
+              </div>
+            </CollapsiblePanel>
           </CollapsiblePanel>
 
           <div class="step-actions">
@@ -84,35 +86,21 @@
             <div class="actions"><button class="btn-primary" :disabled="busy" @click="continuePlanning">继续规划</button></div>
           </div>
 
-          <div v-if="requiresConfig && !clarificationQuestions.length" class="split-layout">
-            <div class="pane auth-panel">
-              <h3>授权 / 连接配置</h3>
-              <p class="muted small">该工具需要连接配置。这里只保存 env/secret 引用；adapter、manifest、snippet 和日志不会保存明文密钥。</p>
-              <div class="form-row relaxed">
-                <label>连接地址 / endpoint / IP<input v-model="configForm.base_url" placeholder="https://api.example.com 或 10.0.0.8" /></label>
-                <label>认证方式<select v-model="configForm.auth_type"><option value="none">none</option><option value="api_key">api_key</option><option value="token">token</option><option value="basic">basic</option><option value="custom">custom</option></select></label>
-              </div>
-              <div v-if="configForm.auth_type !== 'none'" class="form-row relaxed">
-                <label>密钥名称（env）<input v-model="configForm.secret_env" placeholder="XXX_API_KEY" /></label>
-                <label>密钥值<input v-model="configForm.secret_value" type="password" autocomplete="off" placeholder="只用于保存到 secret/env，不写入代码" /></label>
-              </div>
-              <label>其他字段（可选，每行 key=value）<textarea v-model="configExtraText" placeholder="tenant_id=xxx"></textarea></label>
-              <label>sample input（可选，简化 JSON）<SmartCodeEditor v-model="sampleInputText" language="json" density="compact" min-height="120px" max-height="220px" /></label>
-              <label class="inline-check"><input v-model="allowExternalNetwork" type="checkbox" /> 允许本次连接测试访问外部网络</label>
-              <div v-if="configSaveResult" class="validation ok"><strong>配置已保存</strong><p class="small">env: {{ (configSaveResult.configured_env || []).join(', ') || '无' }} · secrets: {{ (configSaveResult.configured_secrets || []).join(', ') || '无' }}</p></div>
-              <div class="actions">
-                <button class="btn-ghost" :disabled="busy" @click="saveConfigAndContinue">保存配置</button>
-                <button class="btn-primary" :disabled="busy || !canRunLiveTest" @click="runLiveTest">测试连接 / 试用工具</button>
-              </div>
+          <div v-if="requiresConfig && !clarificationQuestions.length" class="auth-summary compact-preview">
+            <div>
+              <strong>需要授权配置</strong>
+              <p class="muted small">Planner 已预填连接入口（{{ entrypointConfidenceLabel }}）。请打开配置确认地址并输入密钥值。</p>
+              <small>服务地址：{{ configForm.base_url || '待填写' }} · 认证方式：{{ configForm.auth_type || 'none' }} · 密钥名：{{ configForm.secret_env || '无' }}</small>
             </div>
-            <div class="pane">
-              <h3>Live Test Preview</h3>
-              <div v-if="liveTestResult" class="validation" :class="liveTestResult.success ? 'ok' : 'bad'">
-                <strong>{{ liveTestResult.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
-                <pre class="tool-card">{{ JSON.stringify(liveTestResult.normalized_preview || liveTestResult.preview || liveTestResult.errors, null, 2) }}</pre>
-              </div>
-              <p v-else class="muted small">live_test 会真实请求外部服务；dynamic validation 之后只用 SKILL_TRIAL_RUN=1，不访问真实外部服务。</p>
+            <div class="actions">
+              <button class="btn-primary" @click="authConfigOpen = true">打开配置</button>
+              <button class="btn-ghost" :disabled="busy || !canRunLiveTest" @click="runLiveTest">测试连接</button>
             </div>
+          </div>
+
+          <div v-if="liveTestResult" class="validation" :class="liveTestResult.success ? 'ok' : 'bad'">
+            <strong>{{ liveTestResult.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
+            <pre class="tool-card">{{ JSON.stringify(liveTestResult.normalized_preview || liveTestResult.preview || liveTestResult.errors, null, 2) }}</pre>
           </div>
 
           <div class="stream-status">
@@ -250,6 +238,49 @@
       </CollapsiblePanel>
     </SideDrawer>
 
+    <div v-if="authConfigOpen" class="modal-backdrop" @click.self="authConfigOpen = false">
+      <section class="auth-modal">
+        <div class="card-heading with-actions">
+          <div>
+            <p class="eyebrow">Authorization</p>
+            <h2>连接配置</h2>
+            <p class="muted small">模型已尽量预填 entrypoint；你只需确认或修改，并输入密钥值。</p>
+          </div>
+          <button class="btn-ghost" @click="authConfigOpen = false">关闭</button>
+        </div>
+
+        <div class="form-row relaxed">
+          <label>服务地址 / IP / endpoint<input v-model="configForm.base_url" placeholder="待填写" /></label>
+          <label>认证方式<select v-model="configForm.auth_type"><option value="none">none</option><option value="api_key">api_key</option><option value="token">token</option><option value="basic">basic</option><option value="custom">custom</option></select></label>
+        </div>
+        <div v-if="configForm.auth_type !== 'none'" class="form-row relaxed">
+          <label>密钥名称（env）<input v-model="configForm.secret_env" placeholder="XXX_API_KEY" /></label>
+          <label>密钥值<input v-model="configForm.secret_value" type="password" autocomplete="off" placeholder="不会写入代码或日志" /></label>
+        </div>
+
+        <CollapsiblePanel v-model:open="configAdvancedOpen" title="高级配置（可选）" description="需要时再添加其他字段、sample input 或开启连接测试">
+          <div class="extra-fields">
+            <div class="extra-field-row header"><span>字段名</span><span>字段值</span><span>敏感</span><span></span></div>
+            <div v-for="(field, idx) in configExtraFields" :key="idx" class="extra-field-row">
+              <input v-model="field.key" placeholder="tenant_id" />
+              <input v-model="field.value" :type="field.sensitive ? 'password' : 'text'" placeholder="值" />
+              <label class="inline-check"><input v-model="field.sensitive" type="checkbox" /> 是</label>
+              <button class="btn-ghost" type="button" @click="removeExtraField(idx)">删除</button>
+            </div>
+            <button class="btn-ghost" type="button" @click="addExtraField">+ 添加一项</button>
+          </div>
+          <label>sample input（可选，简化 JSON）<SmartCodeEditor v-model="sampleInputText" language="json" density="compact" min-height="120px" max-height="220px" /></label>
+          <label class="inline-check"><input v-model="allowExternalNetwork" type="checkbox" /> 允许本次连接测试访问外部网络</label>
+        </CollapsiblePanel>
+
+        <div v-if="configSaveResult" class="validation ok"><strong>配置已保存</strong><p class="small">env: {{ (configSaveResult.configured_env || []).join(', ') || '无' }} · secrets: {{ (configSaveResult.configured_secrets || []).join(', ') || '无' }}</p></div>
+        <div class="actions">
+          <button class="btn-ghost" :disabled="busy" @click="saveConfigAndContinue">保存配置</button>
+          <button class="btn-primary" :disabled="busy" @click="saveConfigAndRunLiveTest">保存并测试连接</button>
+        </div>
+      </section>
+    </div>
+
     <p v-if="error" class="error">{{ error }}</p>
   </div>
 </template>
@@ -281,8 +312,8 @@ const snippetText = ref('{}')
 const clarificationQuestions = ref([])
 const clarificationAnswers = ref([])
 const planState = ref({})
-const configForm = reactive({ base_url: '', auth_type: 'none', secret_env: '', secret_value: '' })
-const configExtraText = ref('')
+const configForm = reactive({ base_url: '', method: 'GET', auth_type: 'none', secret_env: '', secret_value: '' })
+const configExtraFields = ref([])
 const configSaveResult = ref(null)
 const liveTestResult = ref(null)
 const allowExternalNetwork = ref(false)
@@ -293,7 +324,10 @@ const authorStage = ref('draft')
 const activeStep = ref('input')
 const codeInputOpen = ref(false)
 const advancedOpen = ref(false)
+const expertIoOpen = ref(false)
 const debugOpen = ref(false)
+const authConfigOpen = ref(false)
+const configAdvancedOpen = ref(false)
 const registryDrawerOpen = ref(false)
 const snippetManagerOpen = ref(false)
 const sampleInputText = ref(`{
@@ -315,10 +349,11 @@ const expandedPanels = reactive({ input: true, planner: false, adapter: false, v
 const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
-const configExtra = computed(() => Object.fromEntries(configExtraText.value.split('\n').map(line => line.trim()).filter(Boolean).map(line => { const idx = line.indexOf('='); return idx === -1 ? [line, ''] : [line.slice(0, idx).trim(), line.slice(idx + 1).trim()] })))
-const parsedConfig = computed(() => ({ base_url: configSaveResult.value?.config_refs?.base_url || configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, ...configExtra.value, ...(configSaveResult.value?.config || {}) }))
+const configExtra = computed(() => Object.fromEntries(configExtraFields.value.filter(field => field.key).map(field => [field.key.trim(), field.value])))
+const parsedConfig = computed(() => ({ base_url: configSaveResult.value?.config_refs?.base_url || configForm.base_url, method: configForm.method, auth_type: configForm.auth_type, secret_env: configForm.secret_env, ...configExtra.value, ...(configSaveResult.value?.config || {}) }))
 const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
+const entrypointConfidenceLabel = computed(() => ({ high: '高置信度', medium: '中等置信度', low: '低置信度' }[planState.value?.suggested_entrypoint?.confidence] || '待确认'))
 const canGenerate = computed(() => !busy.value && (planState.value?.ready_for_code_generation || (!requiresConfig.value && parsedManifest.value)) && (!planState.value?.requires_live_test || liveTestResult.value?.success || planState.value?.ready_for_code_generation))
 const cardPreview = computed(() => (lastValidation.value?.tool_card_preview || []).join('\n\n---\n\n') || '验证后展示 Creator prompt 注入的 function card。')
 const snippetPreview = computed(() => snippets.value.map(snippet => snippet.formatted || '').join('\n\n---\n\n') || '选择工具后展示 Creator 会看到的 Tool Snippet。')
@@ -340,16 +375,31 @@ function questionText(question) { return typeof question === 'string' ? question
 function questionOptions(question) {
   const text = questionText(question)
   if (question?.options?.length) return question.options
-  if (text.includes('测试')) return ['允许', '暂不测试']
-  if (text.includes('是否') || text.includes('需要连接')) return ['需要', '不需要']
+  if (text.includes('哪一种') || text.includes('具体')) return ['查询数据', '创建/更新记录', '发送通知']
   return []
+}
+function addExtraField() { configExtraFields.value.push({ key: '', value: '', sensitive: false }) }
+function removeExtraField(idx) { configExtraFields.value.splice(idx, 1) }
+function applySuggestedEntrypoint(entrypoint = {}) {
+  if (!entrypoint || typeof entrypoint !== 'object') return
+  if (entrypoint.base_url && !configForm.base_url) configForm.base_url = entrypoint.base_url
+  if (entrypoint.method && !configForm.method) configForm.method = entrypoint.method
+  if (entrypoint.auth_type && configForm.auth_type === 'none') configForm.auth_type = entrypoint.auth_type
+  if (entrypoint.secret_env && !configForm.secret_env) configForm.secret_env = entrypoint.secret_env
 }
 function configSessionId() { return form.tool_name || planState.value?.operation || form.description || 'default' }
 function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ question: questionText(question), answer: clarificationAnswers.value[idx] || '' })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; clarificationQuestions.value = data.clarification_questions || data.questions || []; if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; clarificationQuestions.value = (data.clarification_questions || data.questions || []).slice(0, 3); applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
-function saveConfigAndContinue() { return run(async () => { configSaveResult.value = await saveCreatorToolConfig({ session_id: configSessionId(), tool_name: form.tool_name, operation: planState.value?.operation || form.description, base_url: configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, secret_value: configForm.secret_value, extra: configExtra.value, sample_input: parsedSample.value, config: parsedConfig.value }); configForm.secret_value = ''; const data = await authorCreatorTool({ ...authorPayload('configure'), config: configSaveResult.value.config || parsedConfig.value }); applyAuthorResult(data); activeStep.value = 'planner' }) }
+async function saveConfigOnly() {
+  configSaveResult.value = await saveCreatorToolConfig({ session_id: configSessionId(), tool_name: form.tool_name, operation: planState.value?.operation || form.description, base_url: configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, secret_value: configForm.secret_value, extra: configExtra.value, additional_fields: configExtraFields.value.filter(field => field.key), sample_input: parsedSample.value, config: parsedConfig.value })
+  configForm.secret_value = ''
+  const data = await authorCreatorTool({ ...authorPayload('configure'), config: configSaveResult.value.config || parsedConfig.value })
+  applyAuthorResult(data)
+}
+function saveConfigAndContinue() { return run(async () => { await saveConfigOnly(); authConfigOpen.value = false; activeStep.value = 'planner' }) }
+function saveConfigAndRunLiveTest() { return run(async () => { await saveConfigOnly(); allowExternalNetwork.value = true; const data = await liveTestCreatorTool({ ...authorPayload('live_test'), allow_external_network: true, config: configSaveResult.value.config || parsedConfig.value }); applyAuthorResult(data); authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: data.live_test_result?.success }); authConfigOpen.value = false; activeStep.value = 'planner' }) }
 function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
 function generateAdapter() { return run(async () => { adapterCode.value = ''; authorLogs.value = []; streamController.value = new AbortController(); for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) { logAuthor(event); if (event.event === 'model_delta') adapterCode.value += event.delta || ''; if (event.event === 'final_result') applyAuthorResult(event); } activeStep.value = 'adapter' }) }
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
@@ -415,7 +465,11 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
 .validation, .compact-preview { padding: 12px; border-radius: var(--radius); border: 1px solid var(--border); }
 .validation.ok, .compact-preview { border-color: var(--success); } .validation.bad { border-color: var(--danger); }
 .warn { color: #f6c177; }
-.choice-row { display: flex; flex-wrap: wrap; gap: 8px; } .btn-ghost.selected { border-color: var(--accent); color: var(--accent); } .auth-panel input[type="password"] { letter-spacing: .08em; }
+.choice-row { display: flex; flex-wrap: wrap; gap: 8px; } .btn-ghost.selected { border-color: var(--accent); color: var(--accent); } .auth-panel input[type="password"], .auth-modal input[type="password"] { letter-spacing: .08em; }
+.auth-summary { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(0, 0, 0, .48); display: grid; place-items: center; padding: 24px; }
+.auth-modal { width: min(760px, 100%); max-height: min(86vh, 860px); overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 22px; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 22px 70px rgba(0, 0, 0, .35); }
+.extra-fields { display: grid; gap: 10px; } .extra-field-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.4fr) auto auto; gap: 8px; align-items: center; } .extra-field-row.header { color: var(--text-muted); font-size: 12px; }
 .tool-card { white-space: pre-wrap; overflow: auto; max-height: 360px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; } .log-panel { max-height: 180px; } .stream-status { display: flex; justify-content: space-between; gap: 12px; align-items: center; } .clarify-card { display: grid; gap: 12px; }
 .tool-list, .snippets-list { display: grid; gap: 12px; }
 .tool-list-item { border: 1px solid var(--border); border-radius: 14px; padding: 14px; background: var(--surface2); display: grid; gap: 8px; }

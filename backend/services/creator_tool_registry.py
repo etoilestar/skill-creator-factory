@@ -83,6 +83,14 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else raw_config.get("extra") if isinstance(raw_config.get("extra"), dict) else {}
     for key, value in extra.items():
         store_value(str(key), value, secret=_is_sensitive_config_key(str(key)))
+    additional_fields = data.get("additional_fields") if isinstance(data.get("additional_fields"), list) else []
+    for field in additional_fields:
+        if not isinstance(field, dict):
+            continue
+        key = str(field.get("key") or "").strip()
+        if not key:
+            continue
+        store_value(key, field.get("value"), secret=bool(field.get("sensitive")) or _is_sensitive_config_key(key))
 
     sanitized_config = dict(raw_config)
     if "base_url" in config_refs:
@@ -1619,6 +1627,8 @@ def _plan_defaults() -> dict[str, Any]:
         "requires_config": False,
         "config_required_fields": [],
         "config_form_schema": {},
+        "suggested_entrypoint": {},
+        "additional_fields_schema": [],
         "requires_authorization": False,
         "tool_kind": "unknown",
         "operation": "",
@@ -1656,6 +1666,31 @@ def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str,
     return missing
 
 
+def _slug_env_prefix(value: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (value or "TOOL")).strip("_").upper()
+    return prefix or "TOOL"
+
+
+def _suggest_external_api_entrypoint(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Build a best-effort prefill for the authorization modal without asking the user."""
+    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "tool_name"))
+    url_match = re.search(r"https?://[^\s，。；,;]+", text)
+    base_url = str(config.get("base_url") or config.get("endpoint") or config.get("url") or (url_match.group(0) if url_match else "")).strip()
+    method = str(config.get("method") or "").strip().upper()
+    lowered = text.lower()
+    if not method:
+        method = "POST" if any(token in lowered for token in ("创建", "新增", "提交", "发送", "发布", "上传", "create", "post", "send", "submit")) else "GET"
+    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
+    has_secret_hint = bool(request.get("needs_secret") or any(token in lowered for token in ("key", "token", "密钥", "令牌", "认证", "鉴权", "bearer")))
+    if not auth_type:
+        auth_type = "token" if "token" in lowered or "令牌" in lowered or "bearer" in lowered else "api_key" if has_secret_hint else "none"
+    env_prefix = _slug_env_prefix(str(request.get("tool_name") or request.get("operation") or request.get("description") or "TOOL"))
+    existing_secret = str(config.get("secret_env") or config.get("secret_env_name") or config.get("api_key_env") or config.get("token_env") or "").strip()
+    secret_env = existing_secret or (f"{env_prefix}_{'TOKEN' if auth_type == 'token' else 'API_KEY'}" if auth_type not in {"none", "no_auth", "anonymous"} else "")
+    confidence = "high" if base_url and (config.get("auth_type") or config.get("authentication") or existing_secret) else "medium" if base_url else "low"
+    return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "confidence": confidence}
+
+
 def _needs_capability_clarification(request: dict[str, Any]) -> bool:
     text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "input_description", "output_description")).strip().lower()
     if not text:
@@ -1674,7 +1709,7 @@ def _external_api_clarification_questions(request: dict[str, Any], config: dict[
     questions: list[str] = []
     if _needs_capability_clarification(request):
         questions.append("你希望这个工具完成哪一种具体能力？请用一句话说明，例如查询数据、创建记录或发送通知。")
-    return questions[:5]
+    return questions[:3]
 
 
 def _infer_tool_kind(request: dict[str, Any]) -> str:
@@ -1745,11 +1780,13 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     return {
         **_plan_defaults(),
         "needs_clarification": bool(questions),
-        "questions": questions[:5],
-        "clarification_questions": questions[:5],
+        "questions": questions[:3],
+        "clarification_questions": questions[:3],
         "requires_config": tool_kind == "external_api" and bool(missing_fields),
         "config_required_fields": missing_fields,
         "config_form_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
+        "suggested_entrypoint": _suggest_external_api_entrypoint(request, config) if tool_kind == "external_api" else {},
+        "additional_fields_schema": _external_api_additional_fields_schema() if tool_kind == "external_api" else [],
         "requires_authorization": tool_kind == "external_api" and requires_secret,
         "tool_kind": tool_kind,
         "operation": str(request.get("operation") or request.get("description") or ""),
@@ -1787,7 +1824,7 @@ def _safe_clarification_questions(questions: list[Any], fallback: list[str]) -> 
             text = str(item).strip()
             if text and not any(token.lower() in text.lower() for token in banned):
                 safe.append(text)
-    return safe[:5]
+    return safe[:3]
 
 
 def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
@@ -1801,6 +1838,10 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["config_required_fields"] = []
     if not isinstance(normalized.get("config_form_schema"), dict):
         normalized["config_form_schema"] = {}
+    if not isinstance(normalized.get("suggested_entrypoint"), dict):
+        normalized["suggested_entrypoint"] = {}
+    if not isinstance(normalized.get("additional_fields_schema"), list):
+        normalized["additional_fields_schema"] = []
     if not isinstance(normalized.get("missing_fields"), list):
         normalized["missing_fields"] = []
     if not isinstance(normalized.get("manifest"), dict):
@@ -1818,6 +1859,8 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["requires_config"] = bool(missing)
         normalized["config_required_fields"] = missing
         normalized["config_form_schema"] = _external_api_config_schema()
+        normalized["suggested_entrypoint"] = {**_suggest_external_api_entrypoint(request, config), **(normalized.get("suggested_entrypoint") or {})}
+        normalized["additional_fields_schema"] = normalized.get("additional_fields_schema") or _external_api_additional_fields_schema()
         normalized["requires_authorization"] = bool(normalized.get("requires_secret") or any(field == "secret_env" for field in missing))
         normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
         normalized["missing_fields"] = []
@@ -1868,6 +1911,14 @@ def _external_api_config_schema() -> dict[str, Any]:
             "sample_input": {"type": "object", "title": "sample input（可选）"},
         },
     }
+
+
+
+def _external_api_additional_fields_schema() -> list[dict[str, Any]]:
+    return [
+        {"key": "", "value": "", "sensitive": False, "description": "Optional extra connection field added by the user."}
+    ]
+
 
 def _strip_code_fence(text: str) -> str:
     raw = (text or "").strip()
@@ -2329,6 +2380,8 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "requires_config": bool(plan.get("requires_config")),
         "config_required_fields": plan.get("config_required_fields") or [],
         "config_form_schema": plan.get("config_form_schema") or plan.get("suggested_config_schema") or {},
+        "suggested_entrypoint": plan.get("suggested_entrypoint") or {},
+        "additional_fields_schema": plan.get("additional_fields_schema") or [],
         "requires_authorization": bool(plan.get("requires_authorization")),
         "tool_kind": plan.get("tool_kind") or "unknown",
         "operation": plan.get("operation") or "",
@@ -2427,13 +2480,13 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "content": (
                 "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
                 "Return strict JSON with this layered contract where possible: needs_clarification, clarification_questions, requires_config, "
-                "config_required_fields, config_form_schema, requires_authorization, tool_kind "
+                "suggested_entrypoint, config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind "
                 "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
                 "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
                 "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, suggested_config_schema, sample_input_schema, manifest, "
-                "implementation_plan. clarification_questions must be Chinese, at most 5, and only ask about real capability ambiguity. "
-                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
-                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, saved config, and test result. "
+                "implementation_plan. clarification_questions must be Chinese, preferably 1-3 questions and never more than 5, and only ask about real capability ambiguity. "
+                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; infer and prefill suggested_entrypoint with base_url, method, auth_type, secret_env, and confidence when possible, using empty base_url with low confidence if unknown. Put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
+                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, suggested_entrypoint, saved config, and test result. "
                 "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
             ),
         },

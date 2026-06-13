@@ -267,9 +267,12 @@ def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch
     assert body["needs_clarification"] is True
     assert body["adapter_code"] == ""
     assert body["questions"]
-    assert len(body["clarification_questions"]) <= 5
+    assert len(body["clarification_questions"]) <= 3
     assert body["requires_config"] is True
     assert body["config_form_schema"]["ui"] == "authorization_modal"
+    assert body["suggested_entrypoint"]["method"] in {"GET", "POST"}
+    assert body["suggested_entrypoint"]["confidence"] in {"high", "medium", "low"}
+    assert isinstance(body["additional_fields_schema"], list)
     rendered_questions = json.dumps(body["clarification_questions"], ensure_ascii=False).lower()
     for forbidden in ["headers", "body", "query", "schema", "method", "模板", "输出字段", "sample input", "服务地址", "密钥", "token", "认证"]:
         assert forbidden not in rendered_questions
@@ -464,6 +467,7 @@ def test_tool_config_save_and_status_store_only_refs(monkeypatch):
             "secret_env": "WEATHER_API_KEY",
             "secret_value": "plain-secret",
             "extra": {"tenant_id": "demo"},
+            "additional_fields": [{"key": "client_secret", "value": "extra-secret", "sensitive": True}],
         },
     )
 
@@ -472,6 +476,8 @@ def test_tool_config_save_and_status_store_only_refs(monkeypatch):
     assert body["success"] is True
     assert body["config_refs"]["api_key"] == "${ENV:WEATHER_API_KEY}"
     assert "plain-secret" not in json.dumps(body)
+    assert "extra-secret" not in json.dumps(body)
+    assert "WEATHER_LOOKUP_CLIENT_SECRET" in body["configured_secrets"]
 
     status = client.get("/api/creator/tool-config/status", params={"session_id": "weather"})
     assert status.status_code == 200

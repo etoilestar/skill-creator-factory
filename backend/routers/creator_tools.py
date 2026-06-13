@@ -87,6 +87,7 @@ class ToolConfigSaveRequest(BaseModel):
     secret_env: str | None = None
     secret_value: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+    additional_fields: list[dict[str, Any]] = Field(default_factory=list)
     sample_input: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
 

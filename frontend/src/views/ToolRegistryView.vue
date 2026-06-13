@@ -578,13 +578,28 @@ function buildRequestTemplateFromSample(method, sampleInput) {
   return {}
 }
 
-const parsedConfig = computed(() => {
+function compactObject(obj) {
+  return Object.fromEntries(
+    Object.entries(obj || {}).filter(([, value]) => {
+      if (value === undefined || value === null || value === '') return false
+      if (isPlainObject(value) && !Object.keys(value).length) return false
+      return true
+    })
+  )
+}
+
+function buildCurrentUiConfig() {
   const method = normalizeRequestMethod(configForm.method)
   const sampleTemplateConfig = buildRequestTemplateFromSample(method, parsedSample.value)
-  const savedConfig = configSaveResult.value?.config || {}
 
-  return {
-    base_url: configSaveResult.value?.config_refs?.base_url || configForm.base_url,
+  const headersTemplate = {
+    ...(sampleTemplateConfig.headers_template || {}),
+    ...(dynamicConfig.headers_template || {}),
+    ...(configExtra.value.headers_template || {})
+  }
+
+  return compactObject({
+    base_url: configForm.base_url,
     method,
     auth_type: configForm.auth_type,
     secret_env: configForm.secret_env,
@@ -592,25 +607,24 @@ const parsedConfig = computed(() => {
     auth_header_name: configForm.auth_header_name,
     auth_query_param: configForm.auth_query_param,
 
-    // POST/PUT/PATCH: sample input -> json_body_template
-    // GET/DELETE: sample input -> query_template
-    ...sampleTemplateConfig,
-
     ...dynamicConfig,
     ...configExtra.value,
-    ...savedConfig,
 
-    // 如果用户或后端已经显式给了模板，以显式模板为准
-    json_body_template: savedConfig.json_body_template || configExtra.value.json_body_template || dynamicConfig.json_body_template || sampleTemplateConfig.json_body_template,
-    query_template: savedConfig.query_template || configExtra.value.query_template || dynamicConfig.query_template || sampleTemplateConfig.query_template,
-    headers_template: {
-      ...(sampleTemplateConfig.headers_template || {}),
-      ...(dynamicConfig.headers_template || {}),
-      ...(configExtra.value.headers_template || {}),
-      ...(savedConfig.headers_template || {})
-    }
-  }
-})
+    json_body_template:
+      dynamicConfig.json_body_template ||
+      configExtra.value.json_body_template ||
+      sampleTemplateConfig.json_body_template,
+
+    query_template:
+      dynamicConfig.query_template ||
+      configExtra.value.query_template ||
+      sampleTemplateConfig.query_template,
+
+    headers_template: headersTemplate
+  })
+}
+
+const parsedConfig = computed(() => buildCurrentUiConfig())
 const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
 const entrypointConfidenceLabel = computed(() => ({ high: '高置信度', medium: '中等置信度', low: '低置信度' }[planState.value?.suggested_entrypoint?.confidence] || '待确认'))
@@ -715,33 +729,84 @@ function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scro
 function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
-async function saveConfigOnly() {
-  configSaveResult.value = await saveCreatorToolConfig({ session_id: configSessionId(), tool_name: form.tool_name, operation: planState.value?.operation || form.description, base_url: configForm.base_url, auth_type: configForm.auth_type, secret_env: configForm.secret_env, secret_value: configForm.secret_value, auth_placement: configForm.auth_placement, auth_header_name: configForm.auth_header_name, auth_query_param: configForm.auth_query_param, extra: configExtra.value, additional_fields: configExtraFields.value.filter(field => field.key), sample_input: parsedSample.value, config: parsedConfig.value })
+async function saveConfigOnly({ configureAfterSave = true } = {}) {
+  const uiConfig = buildCurrentUiConfig()
+
+  configSaveResult.value = await saveCreatorToolConfig({
+    session_id: configSessionId(),
+    tool_name: form.tool_name,
+    operation: planState.value?.operation || form.description,
+    base_url: configForm.base_url,
+    auth_type: configForm.auth_type,
+    secret_env: configForm.secret_env,
+    secret_value: configForm.secret_value,
+    auth_placement: configForm.auth_placement,
+    auth_header_name: configForm.auth_header_name,
+    auth_query_param: configForm.auth_query_param,
+    extra: configExtra.value,
+    additional_fields: configExtraFields.value.filter(field => field.key),
+    sample_input: parsedSample.value,
+    config: uiConfig
+  })
+
   configForm.secret_value = ''
-  const data = await authorCreatorTool({ ...authorPayload('configure'), config: configSaveResult.value.config || parsedConfig.value })
-  applyAuthorResult(data)
+
+  if (configureAfterSave) {
+    const data = await authorCreatorTool({
+      ...authorPayload('configure'),
+      config: buildCurrentUiConfig()
+    })
+    applyAuthorResult(data)
+  }
 }
 function saveConfigAndContinue() { return run(async () => { await saveConfigOnly(); authConfigOpen.value = false; activeStep.value = 'planner' }) }
 async function performLiveTest({ saveFirst = false } = {}) {
   liveTestRunning.value = true
   liveTestError.value = ''
+
   try {
-    if (saveFirst) await saveConfigOnly()
+    if (saveFirst || !configSaveResult.value?.success) {
+      await saveConfigOnly({ configureAfterSave: false })
+    }
+
     allowExternalNetwork.value = true
-    const data = await liveTestCreatorTool({ ...authorPayload('live_test'), allow_external_network: true, config: configSaveResult.value?.config || parsedConfig.value })
+
+    const liveConfig = buildCurrentUiConfig()
+
+    const data = await liveTestCreatorTool({
+      ...authorPayload('live_test'),
+      allow_external_network: true,
+      sample_input: parsedSample.value,
+      config: liveConfig,
+    })
+
     applyAuthorResult(data)
+
     const result = extractLiveTestResult(data)
     if (!result) {
       liveTestError.value = 'live_test 未返回结果。'
     } else if (result.success) {
       liveTestResult.value = result
+      clarificationQuestions.value = []
+      clarificationAnswers.value = []
       planState.value = {
         ...planState.value,
+        needs_clarification: false,
+        questions: [],
+        clarification_questions: [],
+        requires_authoring_tools: false,
+        authoring_tool_plan: [],
         ready_for_live_test: true,
-        ready_for_code_generation: true
+        ready_for_code_generation: true,
       }
     }
-    authorLogs.value.push({ time: new Date().toLocaleTimeString(), event: 'live_test_result', success: result?.success })
+
+    authorLogs.value.push({
+      time: new Date().toLocaleTimeString(),
+      event: 'live_test_result',
+      success: result?.success,
+    })
+
     activeStep.value = 'planner'
     scrollToLiveTestResult()
   } catch (e) {
@@ -756,7 +821,16 @@ function saveConfigAndRunLiveTest() { return run(async () => { await performLive
 function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
 function generateAdapter() { return run(async () => { adapterCode.value = ''; authorLogs.value = []; streamController.value = new AbortController(); for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) { logAuthor(event); if (event.event === 'model_delta') adapterCode.value += event.delta || ''; if (event.event === 'final_result') applyAuthorResult(event); } activeStep.value = 'adapter' }) }
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
-function runLiveTest() { return run(async () => { if (!configSaveResult.value?.success) { authConfigOpen.value = true; return } await performLiveTest() }) }
+function runLiveTest() {
+  return run(async () => {
+    if (!configForm.base_url || (configForm.auth_type !== 'none' && !configForm.secret_env)) {
+      authConfigOpen.value = true
+      return
+    }
+
+    await performLiveTest({ saveFirst: true })
+  })
+}
 function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; applyAuthorResult(data); if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; activeStep.value = 'adapter' }) }
 function validateTool() { return run(async () => { lastValidation.value = await validateCreatorTool({ manifest: parsedManifest.value, adapter_code: adapterCode.value, sample_input: parsedSample.value, dynamic: true }); activeStep.value = 'validation' }) }

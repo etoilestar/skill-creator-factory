@@ -1963,6 +1963,28 @@ def _safe_clarification_questions(questions: list[Any], fallback: list[Any]) -> 
                 safe.append(normalized)
     return safe[:3]
 
+def _live_test_success_from_request(request: dict[str, Any]) -> bool:
+    live = request.get("live_test_result")
+    if isinstance(live, dict) and live.get("success") is True:
+        return True
+    ctx = request.get("authoring_context") if isinstance(request.get("authoring_context"), dict) else {}
+    live = ctx.get("live_test_result")
+    return isinstance(live, dict) and live.get("success") is True
+
+
+def _normalizable_authoring_tool_plan(items: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in items or []:
+        if isinstance(item, dict):
+            tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
+            if not tool_name:
+                continue
+            normalized.append({**item, "tool_name": tool_name})
+        elif isinstance(item, str):
+            tool_name = item.strip()
+            if tool_name:
+                normalized.append({"tool_name": tool_name, "reason": "planner requested this internal authoring helper", "input": {}})
+    return normalized
 
 def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     normalized = {**_plan_defaults(), **(plan if isinstance(plan, dict) else {})}
@@ -2011,17 +2033,40 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
                 normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
         elif not normalized.get("manifest"):
             normalized["manifest"] = fallback.get("manifest") or {}
-        live_success = bool((request.get("live_test_result") or {}).get("success"))
-        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get("ready_for_live_test") and not request.get("skip_live_test"):
-            normalized["authoring_tool_plan"] = [{"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}}]
-        normalized["ready_for_code_generation"] = bool(normalized.get("ready_for_code_generation")) and (live_success or request.get("skip_live_test") is True)
+        live_success = _live_test_success_from_request(request)
+        normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
+            normalized.get("authoring_tool_plan") or [])
+
+        if live_success:
+            # live_test 已经通过，generate 阶段不要再被 authoring_live_test/config_collector 卡住
+            normalized["authoring_tool_plan"] = [
+                item for item in normalized["authoring_tool_plan"]
+                if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
+            ]
+
+        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get(
+                "ready_for_live_test") and not request.get("skip_live_test"):
+            normalized["authoring_tool_plan"] = [{
+                "tool_name": "authoring_live_test",
+                "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用",
+                "input": {"config": config, "sample_input": sample},
+            }]
+
+        if missing:
+            normalized["ready_for_code_generation"] = False
+        elif live_success or request.get("skip_live_test") is True:
+            normalized["ready_for_code_generation"] = bool(normalized.get("manifest") or fallback.get("manifest"))
+        else:
+            normalized["ready_for_code_generation"] = False
     elif not normalized.get("manifest"):
         normalized["manifest"] = fallback.get("manifest") or {}
     if request.get("operation"):
         normalized["operation"] = request.get("operation")
     if request.get("resolved_clarifications"):
         normalized["resolved_clarifications"] = request.get("resolved_clarifications")
-    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan")) or bool(normalized.get("requires_authoring_tools"))
+    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
+    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan"))
+
     if normalized["requires_authoring_tools"]:
         normalized["ready_for_code_generation"] = False
     normalized["clarification_questions"] = _safe_clarification_questions(normalized.get("clarification_questions") or normalized.get("questions") or [], fallback.get("clarification_questions") or fallback.get("questions") or [])
@@ -2220,6 +2265,7 @@ def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) ->
 
 _ENV_REF_RE = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
 _INPUT_REF_RE = re.compile(r"\$\{(?:input|payload)\.([A-Za-z0-9_.-]+)\}")
+_MUSTACHE_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}")
 
 
 def _extract_env_refs(value: Any) -> set[str]:
@@ -2271,7 +2317,11 @@ def _render_template(value: Any, sample_input: dict[str, Any], secret_values: di
             resolved = _get_by_path(sample_input, match.group(1))
             return str(resolved if resolved is not None else "")
 
-        return _INPUT_REF_RE.sub(input_replace, _ENV_REF_RE.sub(env_replace, value))
+        rendered = _ENV_REF_RE.sub(env_replace, value)
+        rendered = _INPUT_REF_RE.sub(input_replace, rendered)
+        rendered = _MUSTACHE_REF_RE.sub(input_replace, rendered)
+        return rendered
+
     if isinstance(value, dict):
         return {key: _render_template(item, sample_input, secret_values) for key, item in value.items() if item is not None}
     if isinstance(value, list):
@@ -2440,7 +2490,15 @@ def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
         "content_type": content_type,
         "preview": redacted_preview,
         "normalized_preview": _normalized_preview(redacted_preview),
-        "request_preview": {"method": method, "url": _redact_secrets(url, set(secret_values.values())), "header_keys": sorted((headers or {}).keys()), "has_body": data is not None, "auth_applied": auth_applied},
+        "request_preview": {
+            "method": method,
+            "url": _redact_secrets(url, set(secret_values.values())),
+            "header_keys": sorted((headers or {}).keys()),
+            "has_body": data is not None,
+            "body_preview": _redact_secrets(json_body, set(secret_values.values())) if data is not None else None,
+            "query_preview": _redact_secrets(query, set(secret_values.values())),
+            "auth_applied": auth_applied,
+        },
         "errors": ([] if success else [f"HTTP {status_code}"]) + auth_warnings,
     }
 
@@ -2746,7 +2804,16 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
     if not isinstance(plan.get("manifest"), dict):
         plan = _author_fallback_plan(request)
     normalized = _normalize_author_plan(plan, request)
-    if ack and normalized.get("tool_kind") == "external_api" and not normalized.get("clarification_questions"):
+    action = str(request.get("action") or "").strip().lower()
+    live_success = _live_test_success_from_request(request)
+
+    if (
+            action not in {"generate", "finalize"}
+            and not live_success
+            and ack
+            and normalized.get("tool_kind") == "external_api"
+            and not normalized.get("clarification_questions")
+    ):
         judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
         if judged_questions:
             normalized["clarification_questions"] = judged_questions
@@ -2821,10 +2888,21 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         return {"needs_clarification": False, "questions": [], "manifest": manifest, "adapter_code": adapter_code, "sample_input": request.get("sample_input") or {}, "validation": validation, "snippet": snippet, "model_notes": model_notes, "warnings": warnings, "requires_human_confirmation": True}
 
     plan = await _run_planner(request, model_notes, warnings)
-    if plan.get("requires_authoring_tools") or plan.get("authoring_tool_plan"):
+
+    live_success = _live_test_success_from_request(request)
+
+    if action == "generate" and live_success and plan.get("tool_kind") == "external_api":
+        plan["authoring_tool_plan"] = []
+        plan["requires_authoring_tools"] = False
+        if plan.get("manifest"):
+            plan["ready_for_code_generation"] = True
+
+    if action != "generate" and (plan.get("requires_authoring_tools") or plan.get("authoring_tool_plan")):
         plan, _helper_results = _run_authoring_tool_plan(plan, request)
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
-    if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get("ready_for_code_generation"):
+
+    if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get(
+            "ready_for_code_generation"):
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
     manifest = plan.get("manifest") or build_tool_manifest_draft(request)

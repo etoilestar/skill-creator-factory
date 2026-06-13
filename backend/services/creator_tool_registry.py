@@ -1185,16 +1185,22 @@ def format_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> str
 def validate_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", snippet.id or ""):
         errors.append("snippet id must be 1-128 chars of letters, numbers, '_', '.', ':', or '-'")
+
     if snippet.kind not in _ALLOWED_SNIPPET_KINDS:
         errors.append(f"snippet kind must be one of {sorted(_ALLOWED_SNIPPET_KINDS)}")
+
     if not (snippet.code or "").strip():
         errors.append("snippet code is required")
+
     if snippet.usage_policy not in _ALLOWED_USAGE_POLICIES:
         errors.append("snippet usage_policy is invalid")
+
     code = snippet.code or ""
     imported_names: set[str] = set()
+
     try:
         tree = ast.parse(code)
         for node in ast.walk(tree):
@@ -1203,31 +1209,93 @@ def validate_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> d
                 root = (node.module or "").split(".")[0]
                 if root in _DANGEROUS_IMPORTS:
                     errors.append(f"dangerous import is forbidden in snippet: {root}")
+
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     root = alias.name.split(".")[0]
                     imported_names.add(alias.asname or alias.name.split(".")[-1])
                     if root in _DANGEROUS_IMPORTS:
                         errors.append(f"dangerous import is forbidden in snippet: {root}")
+
     except SyntaxError as exc:
         warnings.append(f"snippet is not a complete executable Python block: {exc}")
+
     helpers = set(capability.helper_imports) | {fn.function_name for fn in capability.functions}
+
     if helpers and not any(helper in code for helper in helpers):
         errors.append("snippet code must reference at least one manifest helper/function name")
+
     if imported_names and helpers and not (imported_names & helpers):
         warnings.append("snippet imports do not include a declared manifest helper/function")
+
     if re.search(r"(?:/tmp|/var|/etc|~[/\\]|[A-Za-z]:\\\\)", code):
         errors.append("snippet must not write or direct outputs to dangerous absolute paths")
+
     if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code):
         errors.append("snippet appears to contain a hard-coded secret")
-    declared_outputs = set((capability.output_schema or {}).get("properties", {}).keys())
+
+    declared_outputs = _declared_output_field_names(capability.output_schema, required_only=False)
+    declared_required_outputs = _declared_output_field_names(capability.output_schema, required_only=True)
+
     for fn in capability.functions:
-        declared_outputs.update((fn.output_schema or {}).keys())
-    snippet_outputs = set(snippet.expected_output_shape.keys())
+        declared_outputs.update(_declared_output_field_names(fn.output_schema, required_only=False))
+        declared_required_outputs.update(_declared_output_field_names(fn.output_schema, required_only=True))
+
+    snippet_outputs = _declared_output_field_names(snippet.expected_output_shape, required_only=False)
+    snippet_required_outputs = _declared_output_field_names(snippet.expected_output_shape, required_only=True)
+
+    if declared_required_outputs and snippet_outputs:
+        missing = sorted(declared_required_outputs - snippet_outputs)
+        if missing:
+            errors.append(
+                "snippet expected_output_shape is missing required manifest output fields: "
+                + ", ".join(missing)
+            )
+
     if declared_outputs and snippet_outputs and not (declared_outputs & snippet_outputs):
         warnings.append("snippet expected_output_shape has no overlap with manifest output_schema")
-    return {"success": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings))}
 
+    declared_inputs: set[str] = set()
+    declared_required_inputs: set[str] = set()
+    if capability.input_schema:
+        props = capability.input_schema.get("properties") if isinstance(capability.input_schema, dict) else {}
+        req = capability.input_schema.get("required") if isinstance(capability.input_schema, dict) else []
+        if isinstance(props, dict):
+            declared_inputs.update(str(key) for key in props.keys())
+        if isinstance(req, list):
+            declared_required_inputs.update(str(item) for item in req if isinstance(item, str))
+
+    for fn in capability.functions:
+        schema = fn.input_schema or {}
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        req = schema.get("required") if isinstance(schema, dict) else []
+        if isinstance(props, dict):
+            declared_inputs.update(str(key) for key in props.keys())
+        if isinstance(req, list):
+            declared_required_inputs.update(str(item) for item in req if isinstance(item, str))
+
+    snippet_inputs: set[str] = set()
+    schema = snippet.expected_input_shape or {}
+    props = schema.get("properties") if isinstance(schema, dict) else {}
+    if isinstance(props, dict):
+        snippet_inputs.update(str(key) for key in props.keys())
+
+    if declared_required_inputs and snippet_inputs:
+        missing_inputs = sorted(declared_required_inputs - snippet_inputs)
+        if missing_inputs:
+            errors.append(
+                "snippet expected_input_shape is missing required manifest input fields: "
+                + ", ".join(missing_inputs)
+            )
+
+    if snippet_required_outputs - snippet_outputs:
+        warnings.append("snippet required output fields are not present in snippet properties")
+
+    return {
+        "success": not errors,
+        "errors": sorted(set(errors)),
+        "warnings": sorted(set(warnings)),
+    }
 
 def _snippet_score(*, capability: ToolCapability, snippet: ToolSnippet, role: str, capabilities: list[str], tool_names: list[str], failure_layer: str | None, error_text: str | None) -> tuple[int, int, int, int, int, int]:
     applies = snippet.applies_to or {}
@@ -1943,13 +2011,12 @@ def validate_tool_manifest(
 
     manifest = dict(manifest or {})
 
-    # 兼容旧产物：external_api adapter 返回的是平台归一化结构，
-    # 不能用 provider raw response schema 做 required 字段检查。
     is_external_api = (
         str(manifest.get("category") or "").lower() == "external_api"
         or str(manifest.get("type") or "").lower() == "external_api"
         or manifest.get("needs_external_network") is True
     )
+
     if is_external_api:
         normalized_output_schema = {
             "type": "object",
@@ -1974,6 +2041,7 @@ def validate_tool_manifest(
             },
             "required": ["success", "results", "total"],
         }
+
         manifest["output_schema"] = normalized_output_schema
 
         fixed_functions = []
@@ -1984,6 +2052,7 @@ def validate_tool_manifest(
                 fixed_functions.append(fixed_fn)
             else:
                 fixed_functions.append(fn)
+
         if fixed_functions:
             manifest["functions"] = fixed_functions
 
@@ -1999,6 +2068,7 @@ def validate_tool_manifest(
 
     if cap and dynamic and not errors:
         temp_code_dir: tempfile.TemporaryDirectory[str] | None = None
+
         try:
             if adapter_code:
                 temp_code_dir = tempfile.TemporaryDirectory(prefix="creator_tool_validate_")
@@ -2011,24 +2081,21 @@ def validate_tool_manifest(
                 errors.append(f"adapter file does not exist: {path}")
             else:
                 try:
-                    value = _run_adapter_once(cap=cap, path=path, sample_input=sample_input or {}, trial=True)
+                    value = _run_adapter_once(
+                        cap=cap,
+                        path=path,
+                        sample_input=sample_input or {},
+                        trial=True,
+                    )
 
                     output_schema = cap.functions[0].output_schema if cap.functions else {}
-                    expected = _declared_output_field_names(output_schema, required_only=False)
                     required = _declared_output_field_names(output_schema, required_only=True)
-
                     missing_required = [key for key in sorted(required) if key not in value]
-                    missing_expected = [key for key in sorted(expected - required) if key not in value]
 
                     if missing_required:
                         errors.append(
                             "dynamic trial did not return required output fields: "
                             + ", ".join(missing_required)
-                        )
-                    elif missing_expected:
-                        warnings.append(
-                            "dynamic trial did not return optional/expected output fields: "
-                            + ", ".join(missing_expected)
                         )
 
                     dynamic_result = {
@@ -2036,12 +2103,18 @@ def validate_tool_manifest(
                         "return_keys": sorted(value.keys()),
                         "preview": _normalized_preview(value),
                     }
+
                 except Exception as exc:
                     errors.append(f"dynamic trial failed: {exc}")
 
                 if real_run and not errors:
                     try:
-                        value = _run_adapter_once(cap=cap, path=path, sample_input=sample_input or {}, trial=False)
+                        value = _run_adapter_once(
+                            cap=cap,
+                            path=path,
+                            sample_input=sample_input or {},
+                            trial=False,
+                        )
 
                         if value.get("success") is False:
                             errors.append(
@@ -2050,21 +2123,13 @@ def validate_tool_manifest(
                             )
 
                         output_schema = cap.functions[0].output_schema if cap.functions else {}
-                        expected = _declared_output_field_names(output_schema, required_only=False)
                         required = _declared_output_field_names(output_schema, required_only=True)
-
                         missing_required = [key for key in sorted(required) if key not in value]
-                        missing_expected = [key for key in sorted(expected - required) if key not in value]
 
                         if missing_required:
                             errors.append(
                                 "real run did not return required output fields: "
                                 + ", ".join(missing_required)
-                            )
-                        elif missing_expected:
-                            warnings.append(
-                                "real run did not return optional/expected output fields: "
-                                + ", ".join(missing_expected)
                             )
 
                         real_result = {
@@ -2074,13 +2139,19 @@ def validate_tool_manifest(
                                 _redact_secrets(value, set(os.environ.values()))
                             ),
                         }
+
                     except Exception as exc:
                         errors.append(f"real run failed: {exc}")
+
         finally:
             if temp_code_dir is not None:
                 temp_code_dir.cleanup()
 
-    snippet_validations = [validate_tool_snippet(cap, snippet) for snippet in snippets_for_tool(cap)] if cap else []
+    snippet_validations = [
+        validate_tool_snippet(cap, snippet)
+        for snippet in snippets_for_tool(cap)
+    ] if cap else []
+
     success = not errors
 
     return {
@@ -2091,7 +2162,10 @@ def validate_tool_manifest(
         "dynamic_trial": dynamic_result,
         "real_run": real_result,
         "tool_card_preview": function_cards_for_tool(cap) if cap else [],
-        "snippet_preview": [format_tool_snippet(cap, snippet) for snippet in snippets_for_tool(cap)] if cap else [],
+        "snippet_preview": [
+            format_tool_snippet(cap, snippet)
+            for snippet in snippets_for_tool(cap)
+        ] if cap else [],
         "snippet_validations": snippet_validations,
     }
 
@@ -2689,36 +2763,93 @@ def _author_adapter_static_errors(code: str, manifest: dict[str, Any]) -> list[s
     if "main" not in function_names:
         errors.append("adapter must define a JSON stdin/stdout main() entrypoint")
 
+    def collect_top_level_string_constants(module: ast.Module) -> dict[str, str]:
+        constants: dict[str, str] = {}
+        for item in module.body:
+            if isinstance(item, ast.Assign) and len(item.targets) == 1:
+                target = item.targets[0]
+                if (
+                    isinstance(target, ast.Name)
+                    and isinstance(item.value, ast.Constant)
+                    and isinstance(item.value.value, str)
+                ):
+                    constants[target.id] = item.value.value
+            elif isinstance(item, ast.AnnAssign):
+                target = item.target
+                if (
+                    isinstance(target, ast.Name)
+                    and isinstance(item.value, ast.Constant)
+                    and isinstance(item.value.value, str)
+                ):
+                    constants[target.id] = item.value.value
+        return constants
+
+    def resolve_string(node: ast.AST, constants: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants.get(node.id)
+        return None
+
     try:
         cap = _capability_from_dict(manifest)
         if cap.functions and cap.functions[0].function_name not in function_names:
             errors.append(f"adapter must expose manifest function {cap.functions[0].function_name}")
 
+        constants = collect_top_level_string_constants(tree)
         imports: set[str] = set()
         env_keys: set[str] = set()
+        has_dynamic_env_read = False
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 imports.update(alias.name.split(".")[0] for alias in node.names)
+
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imports.add(node.module.split(".")[0])
+
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if node.func.attr == "getenv" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                    env_keys.add(node.args[0].value)
-                elif node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                    owner = ast.unparse(node.func.value) if hasattr(ast, "unparse") else ""
+                # os.getenv("KEY") / os.getenv(SECRET_ENV)
+                if node.func.attr == "getenv" and node.args:
+                    value = resolve_string(node.args[0], constants)
+                    if value:
+                        env_keys.add(value)
+                    else:
+                        has_dynamic_env_read = True
+
+                # os.environ.get("KEY") / os.environ.get(SECRET_ENV)
+                elif node.func.attr == "get" and node.args:
+                    try:
+                        owner = ast.unparse(node.func.value)
+                    except Exception:
+                        owner = ""
                     if owner.endswith("environ"):
-                        env_keys.add(node.args[0].value)
-            elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
-                key = node.slice
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    env_keys.add(key.value)
-                else:
-                    env_keys.add("<dynamic>")
+                        value = resolve_string(node.args[0], constants)
+                        if value:
+                            env_keys.add(value)
+                        else:
+                            has_dynamic_env_read = True
+
+            elif isinstance(node, ast.Subscript):
+                # os.environ["KEY"] / os.environ[SECRET_ENV]
+                try:
+                    owner = ast.unparse(node.value)
+                except Exception:
+                    owner = ""
+                if owner.endswith("environ"):
+                    value = resolve_string(node.slice, constants)
+                    if value:
+                        env_keys.add(value)
+                    else:
+                        has_dynamic_env_read = True
 
         allowed_runtime_env = {"OUTPUT_DIR", "SKILL_TRIAL_RUN"}
         declared_env = set(cap.required_env or [])
         declared_secrets = set(cap.required_secrets or [])
+
+        for fn in cap.functions or []:
+            declared_env.update(fn.required_env or [])
+            declared_secrets.update(fn.required_secrets or [])
 
         external_env_keys = env_keys - allowed_runtime_env
         declared_external = declared_env | declared_secrets
@@ -2728,10 +2859,18 @@ def _author_adapter_static_errors(code: str, manifest: dict[str, Any]) -> list[s
 
         undeclared_env_keys = external_env_keys - declared_external
         if undeclared_env_keys:
-            errors.append("adapter reads undeclared environment variables or secrets: " + ", ".join(sorted(undeclared_env_keys)))
+            errors.append(
+                "adapter reads undeclared environment variables or secrets: "
+                + ", ".join(sorted(undeclared_env_keys))
+            )
 
-        if declared_secrets and not (external_env_keys & declared_secrets):
-            errors.append("adapter does not read required declared secret env vars: " + ", ".join(sorted(declared_secrets)))
+        # 只有在完全没有读到 declared secret，且也没有动态 env 读取时才报错。
+        # 这能避免 os.getenv(SECRET_ENV) 被误判。
+        if declared_secrets and not (external_env_keys & declared_secrets) and not has_dynamic_env_read:
+            errors.append(
+                "adapter does not read required declared secret env vars: "
+                + ", ".join(sorted(declared_secrets))
+            )
 
     except Exception:
         pass
@@ -3265,10 +3404,32 @@ def _default_normalize_response(data: dict[str, Any], payload: dict[str, Any]) -
 
 def _normalize(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     fn = globals().get("normalize_response")
+    required = {"success", "results", "total"}
+
     if callable(fn):
-        value = fn(data, payload)
+        try:
+            value = fn(data, payload)
+        except Exception as exc:
+            fallback = _default_normalize_response(data, payload)
+            fallback["_normalizer_warning"] = {
+                "reason": "model_normalize_response_raised_exception",
+                "error": str(exc),
+                "required_keys": sorted(required),
+            }
+            return fallback
+
         if isinstance(value, dict):
-            return value
+            if required.issubset(value.keys()) and isinstance(value.get("results"), list):
+                return value
+
+            fallback = _default_normalize_response(data, payload)
+            fallback["_normalizer_warning"] = {
+                "reason": "model_normalize_response_did_not_match_required_contract",
+                "model_return_keys": sorted(str(key) for key in value.keys()),
+                "required_keys": sorted(required),
+            }
+            return fallback
+
     return _default_normalize_response(data, payload)
 
 
@@ -3378,17 +3539,88 @@ if __name__ == "__main__":
 def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
     cap = _capability_from_dict(manifest)
     fn = cap.functions[0]
+
+    input_schema = fn.input_schema or cap.input_schema or {}
+    output_schema = fn.output_schema or cap.output_schema or {}
+
+    props = input_schema.get("properties") if isinstance(input_schema, dict) else {}
+    required = input_schema.get("required") if isinstance(input_schema, dict) else []
+    props = props if isinstance(props, dict) else {}
+    required = [str(item) for item in required or [] if isinstance(item, str)]
+
+    sample = sample_input if isinstance(sample_input, dict) else {}
+    payload: dict[str, Any] = {}
+
+    # 先按 input_schema.properties 构造示例，避免 snippet 里出现 q 但 schema 要 query。
+    for name, spec in props.items():
+        if name in sample:
+            payload[name] = sample[name]
+            continue
+
+        if isinstance(spec, dict) and "default" in spec:
+            payload[name] = spec["default"]
+            continue
+
+        # 如果 schema 需要字段但 sample 没有，就给一个类型安全占位。
+        typ = str((spec or {}).get("type") or "string") if isinstance(spec, dict) else "string"
+        if typ in {"integer", "number"}:
+            payload[name] = 10
+        elif typ == "boolean":
+            payload[name] = True
+        elif typ == "array":
+            payload[name] = []
+        elif typ == "object":
+            payload[name] = {}
+        else:
+            payload[name] = "demo"
+
+    # 如果 schema 没有 properties，就退回 sample_input。
+    if not payload:
+        payload = dict(sample)
+
+    # required 字段必须存在。
+    for name in required:
+        payload.setdefault(name, "demo")
+
+    is_external_api = (
+        str(manifest.get("category") or "").lower() == "external_api"
+        or str(manifest.get("type") or "").lower() == "external_api"
+        or manifest.get("needs_external_network") is True
+    )
+
+    failure_layers = ["helper_call_failed", "final_platform_output_value_invalid"]
+    anti_patterns = [
+        "Do not pass API keys or secrets in payload.",
+        "Do not guess parameter names; follow expected_input_shape.",
+        "Do not expect provider raw response fields as top-level output unless expected_output_shape declares them.",
+    ]
+    return_rule = "Return the adapter result directly. It should match expected_output_shape."
+
+    if not is_external_api and manifest.get("generates_file"):
+        failure_layers.append("artifact_missing")
+        anti_patterns.append("Do not write or expect files outside OUTPUT_DIR.")
+        return_rule = "Return the adapter result directly. If it contains generated file paths, pass those exact OUTPUT_DIR paths to downstream skill steps."
+
     return {
         "id": f"{cap.name}.minimal_usage",
         "title": f"Use {cap.display_name}",
         "kind": "minimal_usage",
-        "applies_to": {"roles": cap.allowed_roles or cap.roles, "capabilities": cap.required_capabilities or [cap.name], "failure_layers": ["helper_call_failed", "artifact_missing"]},
+        "applies_to": {
+            "roles": cap.allowed_roles or cap.roles,
+            "capabilities": cap.required_capabilities or [cap.name],
+            "failure_layers": failure_layers,
+        },
         "description": fn.when_to_use or fn.short_description,
-        "code": f"from {fn.import_path} import {fn.function_name}\n\npayload = {json.dumps(sample_input or {}, ensure_ascii=False, indent=2)}\nresult = {fn.function_name}(payload)\nreturn result",
-        "expected_input_shape": fn.input_schema or cap.input_schema,
-        "expected_output_shape": fn.output_schema or cap.output_schema,
-        "return_rule": "Return the adapter result directly. If it contains generated file paths, pass those exact OUTPUT_DIR paths to downstream skill steps.",
-        "anti_patterns": ["Do not call this tool before human-confirming the adapter code.", "Do not write or expect files outside OUTPUT_DIR.", "Do not pass secrets unless the manifest explicitly declares them."],
+        "code": (
+            f"from {fn.import_path} import {fn.function_name}\n\n"
+            f"payload = {json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+            f"result = {fn.function_name}(payload)\n"
+            f"return result"
+        ),
+        "expected_input_shape": input_schema,
+        "expected_output_shape": output_schema,
+        "return_rule": return_rule,
+        "anti_patterns": anti_patterns,
         "requires": cap.required_capabilities or [cap.name],
         "usage_policy": cap.usage_policy,
         "priority": 80,
@@ -4071,42 +4303,16 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
         snippet = None
         if validation.get("success"):
-            messages = [
-                {
-                    "role": "system",
-                    "content": "You are text_model. Generate one strict JSON ToolSnippet only after adapter dynamic validation and human code confirmation. Do not include secrets.",
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "final_manifest": manifest,
-                            "final_adapter_code": adapter_code[:20000],
-                            "live_test_result": request.get("live_test_result") or (request.get("authoring_context") or {}).get("live_test_result"),
-                            "authoring_context": request.get("authoring_context") or {},
-                            "dynamic_validation": validation,
-                            "confirmed_io": {
-                                "sample_input": request.get("sample_input") or {},
-                                "input_description": request.get("input_description") or "",
-                                "output_description": request.get("output_description") or "",
-                            },
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ]
-            model_json, ack, err = await _complete_author_model("text", messages, reason="creator_tool_author_finalize_snippet")
-            if ack:
-                model_notes.append(f"text_model={ack['model']}")
-            if err:
-                warnings.append(f"text_model unavailable, used fallback snippet: {err}")
-
-            snippet = model_json if model_json else _fallback_snippet(manifest, request.get("sample_input") or {})
+            snippet = _fallback_snippet(manifest, request.get("sample_input") or {})
             snippet_validation = _validate_author_snippet(snippet, manifest)
+
             if not snippet_validation["success"]:
-                warnings.extend(snippet_validation["errors"])
-                snippet = _fallback_snippet(manifest, request.get("sample_input") or {})
-                snippet_validation = _validate_author_snippet(snippet, manifest)
+                validation["success"] = False
+                validation["status"] = "failed"
+                validation["errors"] = sorted(
+                    set(validation.get("errors", []) + snippet_validation.get("errors", []))
+                )
+
             validation["snippet_validation"] = snippet_validation
 
         return {

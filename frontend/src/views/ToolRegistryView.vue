@@ -142,7 +142,43 @@
               <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
             </div>
           </div>
-          <SmartCodeEditor v-model="adapterCode" language="python" fill placeholder="Python adapter code" />
+          <div v-if="adapterSections.hasSections" class="split-layout">
+              <div class="pane">
+                <h3>固定 Wrapper 模板（只读）</h3>
+                <pre class="tool-card">{{ adapterSections.wrapperBefore }}</pre>
+              </div>
+
+              <div class="pane">
+                <h3>模型生成代码（可人工修改）</h3>
+                <SmartCodeEditor
+                  v-model="editableInternalCode"
+                  language="python"
+                  density="compact"
+                  min-height="260px"
+                  max-height="520px"
+                  placeholder="def normalize_response(data, payload): ..."
+                  @focus="refreshEditableInternalCode"
+                />
+                <div class="actions">
+                  <button class="btn-primary" type="button" @click="applyInternalCodeEdit">
+                    应用到完整 Adapter
+                  </button>
+                </div>
+              </div>
+
+              <div class="pane">
+                <h3>固定 Wrapper 后半段（只读）</h3>
+                <pre class="tool-card">{{ adapterSections.wrapperAfter }}</pre>
+              </div>
+          </div>
+
+          <SmartCodeEditor
+              v-else
+              v-model="adapterCode"
+              language="python"
+              fill
+              placeholder="Python adapter code"
+          />
         </section>
 
         <section v-show="activeStep === 'validation'" class="workspace-card compact-card">
@@ -462,6 +498,50 @@ const configForm = reactive({
   auth_query_param: 'api_key'
 })
 
+const adapterSections = computed(() => {
+  const code = adapterCode.value || ''
+  const start = '# === MODEL_INTERNAL_CODE_START ==='
+  const end = '# === MODEL_INTERNAL_CODE_END ==='
+
+  if (!code.includes(start) || !code.includes(end)) {
+    return {
+      hasSections: false,
+      wrapperBefore: code,
+      internalCode: '',
+      wrapperAfter: ''
+    }
+  }
+
+  const [wrapperBefore, rest] = code.split(start)
+  const [internalCode, wrapperAfter] = rest.split(end)
+
+  return {
+    hasSections: true,
+    wrapperBefore: `${wrapperBefore}${start}`,
+    internalCode: internalCode.trim(),
+    wrapperAfter: `${end}${wrapperAfter}`
+  }
+})
+
+const editableInternalCode = ref('')
+
+function refreshEditableInternalCode() {
+  editableInternalCode.value = adapterSections.value.internalCode || ''
+}
+
+function applyInternalCodeEdit() {
+  const code = adapterCode.value || ''
+  const start = '# === MODEL_INTERNAL_CODE_START ==='
+  const end = '# === MODEL_INTERNAL_CODE_END ==='
+
+  if (!code.includes(start) || !code.includes(end)) return
+
+  const [before, rest] = code.split(start)
+  const [, after] = rest.split(end)
+
+  adapterCode.value = `${before}${start}\n${editableInternalCode.value.trim()}\n${end}${after}`
+}
+
 const dynamicConfig = reactive({})
 const configExtraFields = ref([])
 const configSaveResult = ref(null)
@@ -726,7 +806,7 @@ function rememberLiveTestResult(result) {
 }
 function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
 function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.adapter_code) nextTick(refreshEditableInternalCode)}
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly({ configureAfterSave = true } = {}) {

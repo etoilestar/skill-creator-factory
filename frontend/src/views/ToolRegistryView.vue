@@ -79,7 +79,7 @@
             <div v-for="(question, idx) in clarificationQuestions" :key="question" class="clarify-question">
               <p>{{ idx + 1 }}. {{ questionText(question) }}</p>
               <div v-if="questionOptions(question).length" class="choice-row">
-                <button v-for="option in questionOptions(question)" :key="option" type="button" class="btn-ghost" :class="{ selected: clarificationAnswers[idx] === option }" @click="clarificationAnswers[idx] = option">{{ option }}</button>
+                <button v-for="option in questionOptions(question)" :key="optionValue(option)" type="button" class="btn-ghost" :class="{ selected: clarificationAnswers[idx] === optionValue(option) }" @click="clarificationAnswers[idx] = optionValue(option)">{{ optionLabel(option) }}</button>
               </div>
               <input v-else v-model="clarificationAnswers[idx]" placeholder="一句话补充即可" />
             </div>
@@ -372,12 +372,10 @@ function logAuthor(event) { const helperMessages = { tool_call_planned: `正在�
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
 function questionText(question) { return typeof question === 'string' ? question : (question?.question || question?.text || '') }
-function questionOptions(question) {
-  const text = questionText(question)
-  if (question?.options?.length) return question.options
-  if (text.includes('哪一种') || text.includes('具体')) return ['查询数据', '创建/更新记录', '发送通知']
-  return []
-}
+function questionOptions(question) { return Array.isArray(question?.options) ? question.options : [] }
+function optionLabel(option) { return typeof option === 'string' ? option : (option?.label || option?.text || option?.value || '') }
+function optionValue(option) { return typeof option === 'string' ? option : (option?.value || option?.label || option?.text || '') }
+function answerLabel(question, answer) { const option = questionOptions(question).find(item => optionValue(item) === answer); return option ? optionLabel(option) : answer }
 function addExtraField() { configExtraFields.value.push({ key: '', value: '', sensitive: false }) }
 function removeExtraField(idx) { configExtraFields.value.splice(idx, 1) }
 function applySuggestedEntrypoint(entrypoint = {}) {
@@ -387,9 +385,13 @@ function applySuggestedEntrypoint(entrypoint = {}) {
   if (entrypoint.auth_type && configForm.auth_type === 'none') configForm.auth_type = entrypoint.auth_type
   if (entrypoint.secret_env && !configForm.secret_env) configForm.secret_env = entrypoint.secret_env
 }
+function filterAnsweredQuestions(questions) {
+  const answered = new Set(clarificationQuestions.value.map((question, idx) => (clarificationAnswers.value[idx] ? questionText(question) : '')).filter(Boolean))
+  return questions.filter(question => !answered.has(questionText(question)))
+}
 function configSessionId() { return form.tool_name || planState.value?.operation || form.description || 'default' }
-function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ question: questionText(question), answer: clarificationAnswers.value[idx] || '' })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; clarificationQuestions.value = (data.clarification_questions || data.questions || []).slice(0, 3); applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
+function authorPayload(action) { return { ...payload(), action, code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined), adapter_code: adapterCode.value, sample_input: parsedSample.value, manifest: parsedManifest.value, validation: lastValidation.value, clarification_answers: clarificationQuestions.value.map((question, idx) => ({ id: question?.id || '', question: questionText(question), answer: clarificationAnswers.value[idx] || '', answer_label: answerLabel(question, clarificationAnswers.value[idx] || '') })).filter(item => item.answer), tool_kind: planState.value?.tool_kind, operation: planState.value?.operation, config: parsedConfig.value, live_test_result: liveTestResult.value, allow_external_network: allowExternalNetwork.value, authoring_context: planState.value?.authoring_context || {} } }
+function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; applySuggestedEntrypoint(data.suggested_entrypoint); if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); adapterCode.value = data.adapter_code || adapterCode.value; lastValidation.value = data.validation || lastValidation.value; if (data.live_test_result) liveTestResult.value = data.live_test_result; for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value }
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly() {

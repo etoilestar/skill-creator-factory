@@ -268,6 +268,7 @@ def test_creator_tool_author_asks_for_clarification_on_ambiguous_api(monkeypatch
     assert body["adapter_code"] == ""
     assert body["questions"]
     assert len(body["clarification_questions"]) <= 3
+    assert all(isinstance(item, dict) and item.get("question") for item in body["clarification_questions"])
     assert body["requires_config"] is True
     assert body["config_form_schema"]["ui"] == "authorization_modal"
     assert body["suggested_entrypoint"]["method"] in {"GET", "POST"}
@@ -316,11 +317,118 @@ def test_planner_model_judges_non_keyword_capability_ambiguity(monkeypatch):
     body = response.json()
     assert calls["count"] == 2
     assert body["needs_clarification"] is True
-    assert body["clarification_questions"] == ["你希望这个工具具体完成哪一种业务动作？"]
+    assert body["clarification_questions"][0]["question"] == "你希望这个工具具体完成哪一种业务动作？"
+    assert body["clarification_questions"][0]["type"] == "short_text"
     assert body["requires_config"] is True
     rendered_questions = json.dumps(body["clarification_questions"], ensure_ascii=False).lower()
     for forbidden in ["endpoint", "密钥", "token", "认证", "headers", "schema"]:
         assert forbidden not in rendered_questions
+
+
+
+def test_planner_preserves_structured_dynamic_clarification_options(monkeypatch):
+    from backend.services import llm_proxy
+
+    async def fake_complete_chat_once(messages, model):
+        return json.dumps({
+            "needs_clarification": True,
+            "clarification_questions": [
+                {
+                    "id": "file_operation_choice",
+                    "type": "single_choice",
+                    "question": "你希望这个文件工具主要做哪类处理？",
+                    "options": [
+                        {"label": "合并多个文件", "value": "merge_files"},
+                        {"label": "提取文件摘要", "value": "summarize_file"},
+                    ],
+                    "required": True,
+                }
+            ],
+            "tool_kind": "file_generator",
+            "manifest": {},
+            "ready_for_code_generation": False,
+        })
+
+    monkeypatch.setattr(llm_proxy, "complete_chat_once", fake_complete_chat_once)
+    client = TestClient(app)
+
+    response = client.post("/api/creator/tools/author", json={"action": "clarify", "description": "帮我处理文件"})
+
+    assert response.status_code == 200
+    question = response.json()["clarification_questions"][0]
+    assert question["id"] == "file_operation_choice"
+    assert question["type"] == "single_choice"
+    assert question["options"] == [
+        {"label": "合并多个文件", "value": "merge_files"},
+        {"label": "提取文件摘要", "value": "summarize_file"},
+    ]
+    assert "查询数据" not in json.dumps(question, ensure_ascii=False)
+
+def test_clarification_answer_resolves_operation_and_stops_repeat(monkeypatch):
+    monkeypatch.setenv("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "0.01")
+    client = TestClient(app)
+    question = "你希望这个工具完成哪一种具体能力？请用一句话说明，例如查询数据、创建记录或发送通知。"
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={
+            "action": "configure",
+            "description": "帮我做一个调用接口的小工具",
+            "clarification_answers": [{"id": "operation_detail", "question": question, "answer": "query", "answer_label": "查询数据"}],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["operation"] == "查询数据"
+    assert body["resolved_clarifications"] == [{"id": "operation_detail", "question": question, "answer": "query", "answer_label": "查询数据"}]
+    assert body["needs_clarification"] is False
+    assert body["clarification_questions"] == []
+    assert body["requires_config"] is True
+
+
+def test_model_judge_does_not_repeat_after_clarification_answer(monkeypatch):
+    from backend.services import llm_proxy
+
+    calls = {"count": 0}
+
+    async def fake_complete_chat_once(messages, model):
+        calls["count"] += 1
+        if "capability ambiguity judge" in messages[0]["content"]:
+            raise AssertionError("ambiguity judge should not run after clarification has been answered")
+        return json.dumps({
+            "needs_clarification": True,
+            "clarification_questions": [{"id": "operation_detail", "type": "short_text", "question": "你希望这个工具完成哪一种具体能力？请用一句话说明，例如查询数据、创建记录或发送通知。", "required": True}],
+            "tool_kind": "external_api",
+            "requires_config": True,
+            "config_required_fields": ["base_url", "auth_type"],
+            "config_form_schema": {"type": "object", "ui": "authorization_modal"},
+            "requires_external_network": True,
+            "requires_live_test": True,
+            "ready_for_code_generation": False,
+            "manifest": {},
+        })
+
+    monkeypatch.setattr(llm_proxy, "complete_chat_once", fake_complete_chat_once)
+    client = TestClient(app)
+    question = "你希望这个工具完成哪一种具体能力？请用一句话说明，例如查询数据、创建记录或发送通知。"
+
+    response = client.post(
+        "/api/creator/tools/author",
+        json={
+            "action": "configure",
+            "needs_external_network": True,
+            "description": "帮我对接那边系统",
+            "clarification_answers": [{"id": "operation_detail", "question": question, "answer": "query", "answer_label": "查询数据"}],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls["count"] == 1
+    assert body["operation"] == "查询数据"
+    assert body["needs_clarification"] is False
+    assert body["clarification_questions"] == []
 
 def test_creator_tool_author_uses_mocked_model_path(monkeypatch, tmp_path):
     from backend.services import creator_tool_registry as registry

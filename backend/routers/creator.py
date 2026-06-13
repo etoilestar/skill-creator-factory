@@ -4090,7 +4090,11 @@ def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
 
 def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
     commands = _extract_script_command_templates(skill_md, file_path)
-    arg_sets = [args for cmd in commands if (args := _render_trial_command_args(cmd, file_path)) is not None]
+    arg_sets: list[list[str]] = []
+    for cmd in commands:
+        args = _render_trial_command_args(cmd, file_path)
+        if args is not None:
+            arg_sets.append(args)
     if not arg_sets and _script_reads_json_argv(content, runtime_for_language(language_for_path(file_path), file_type_for_path(file_path))):
         arg_sets = [[json.dumps({
             "prompt": _sample_value_for_placeholder("prompt"),
@@ -6755,6 +6759,65 @@ def _resolve_e2e_payload_expr(
 def _e2e_command_placeholders(command: E2EWorkflowCommand) -> list[str]:
     return _placeholder_exprs_from_value(command.argv_template)
 
+def _looks_like_directory_tree_block(text: str) -> bool:
+    """Heuristically detect directory-tree/documentation blocks.
+
+    These blocks are often rendered as plain Markdown fences and may contain
+    scripts/ paths, but they are not executable workflow commands.
+    """
+    text = text or ""
+    if any(marker in text for marker in ("├──", "└──", "│", "─")):
+        return True
+
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    # Typical tree blocks contain multiple directory/file-looking lines and no
+    # shell runner at the beginning.
+    first = lines[0].strip()
+    first_word = first.split(maxsplit=1)[0] if first.split() else ""
+    if first_word in {"python", "python3", "node", "bash", "sh"}:
+        return False
+
+    treeish_count = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.endswith("/") or stripped.startswith(("scripts/", "references/", "assets/")):
+            treeish_count += 1
+        elif re.match(r"^[A-Za-z0-9_.-]+\.(py|md|json|yaml|yml|txt|pdf|docx|pptx)$", stripped):
+            treeish_count += 1
+
+    return len(lines) >= 2 and treeish_count >= 2
+
+
+def _is_valid_e2e_script_path(script_path: str) -> bool:
+    """Return whether a token is a concrete executable script path.
+
+    E2E must not accept directories such as scripts/ as workflow steps.
+    """
+    normalized = (script_path or "").replace("\\", "/").strip()
+    if not normalized.startswith("scripts/"):
+        return False
+    if normalized.endswith("/"):
+        return False
+
+    path = Path(normalized)
+    if not path.name or path.name in {".", ".."}:
+        return False
+    if not path.suffix:
+        return False
+
+    return path.suffix.lower() in {
+        ".py",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".sh",
+        ".bash",
+    }
+
 def _parse_e2e_workflow_command(
     *,
     command: str,
@@ -6764,12 +6827,44 @@ def _parse_e2e_workflow_command(
     """Parse one SKILL.md shell command into executable E2E workflow step.
 
     Strict rule:
-    - command must invoke scripts/*
-    - scripts path must be followed by exactly one JSON object argv
+    - The fenced block must contain exactly one effective shell command.
+    - The command must invoke a concrete scripts/<file> path, not scripts/.
+    - The script path must be followed by exactly one JSON object argv.
+    - Directory-tree/documentation blocks are ignored.
     """
-    command = (command or "").strip()
-    if not command:
+    raw_command = (command or "").strip()
+    if not raw_command:
         return None
+
+    if _looks_like_directory_tree_block(raw_command):
+        return None
+
+    effective_lines: list[str] = []
+    for line in raw_command.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        effective_lines.append(stripped)
+
+    if not effective_lines:
+        return None
+
+    if len(effective_lines) != 1:
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_block_multiple",
+                message=(
+                    f"{source_path} 第 {ordinal} 个可执行 fenced block 中包含多条有效命令。\n"
+                    "二次 E2E 要求每个 bash/sh/shell block 只包含一条脚本调用命令。\n"
+                    f"原始块：{raw_command}"
+                ),
+            )
+        )
+
+    command = effective_lines[0]
 
     try:
         parts = shlex.split(command)
@@ -6785,81 +6880,101 @@ def _parse_e2e_workflow_command(
             )
         ) from exc
 
-    for idx, part in enumerate(parts):
+    if not parts:
+        return None
+
+    runner = Path(parts[0]).name
+    if runner not in {"python", "python3", "node", "bash", "sh"}:
+        # This is an explicitly marked shell block, but not a workflow step.
+        return None
+
+    script_idx: int | None = None
+    script_path = ""
+
+    for idx, part in enumerate(parts[1:], start=1):
         normalized = part.replace("\\", "/")
 
+        candidate = ""
         if normalized.startswith("scripts/"):
-            script_path = normalized
+            candidate = normalized
         elif "/scripts/" in normalized:
-            script_path = "scripts/" + normalized.rsplit("/scripts/", 1)[1]
-        else:
+            candidate = "scripts/" + normalized.rsplit("/scripts/", 1)[1]
+
+        if not candidate:
             continue
 
-        runner = Path(parts[idx - 1]).name if idx > 0 else ""
+        if not _is_valid_e2e_script_path(candidate):
+            # Example: scripts/ directory in a tree/list. Not a workflow step.
+            return None
 
-        if idx + 1 >= len(parts):
-            raise ValueError(
-                _e2e_error(
-                    target=source_path,
-                    layer="command_argv_missing",
-                    message=(
-                        f"{source_path} 第 {ordinal} 步 {script_path} 缺少 JSON argv。\n"
-                        f"命令必须形如：python {script_path} '{{\"key\":\"{{{{user_input}}}}\"}}'\n"
-                        f"原始命令：{command}"
-                    ),
-                )
+        script_idx = idx
+        script_path = candidate
+        break
+
+    if script_idx is None:
+        return None
+
+    if script_idx + 1 >= len(parts):
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_argv_missing",
+                message=(
+                    f"{source_path} 第 {ordinal} 步 {script_path} 缺少 JSON argv。\n"
+                    f"命令必须形如：python {script_path} '{{\"payload\":{{\"user_request\":\"{{{{user_request}}}}\"}}}}'\n"
+                    f"原始命令：{command}"
+                ),
             )
-
-        if idx + 2 < len(parts):
-            raise ValueError(
-                _e2e_error(
-                    target=source_path,
-                    layer="command_argv_extra",
-                    message=(
-                        f"{source_path} 第 {ordinal} 步 {script_path} 的 JSON argv 后存在额外参数：{parts[idx + 2:]!r}。\n"
-                        "二次 E2E 校验要求脚本路径后只跟一个 JSON object argv。\n"
-                        f"原始命令：{command}"
-                    ),
-                )
-            )
-
-        try:
-            argv_template = json.loads(parts[idx + 1])
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                _e2e_error(
-                    target=source_path,
-                    layer="command_json_parse",
-                    message=(
-                        f"{source_path} 第 {ordinal} 步 {script_path} 的 JSON argv 不可解析：{exc.msg}\n"
-                        f"argv={parts[idx + 1]!r}\n"
-                        f"原始命令：{command}"
-                    ),
-                )
-            ) from exc
-
-        if not isinstance(argv_template, dict):
-            raise ValueError(
-                _e2e_error(
-                    target=source_path,
-                    layer="command_json_type",
-                    message=(
-                        f"{source_path} 第 {ordinal} 步 {script_path} 的 argv 必须是 JSON object。\n"
-                        f"原始命令：{command}"
-                    ),
-                )
-            )
-
-        return E2EWorkflowCommand(
-            ordinal=ordinal,
-            source_path=source_path,
-            script_path=script_path,
-            raw_command=command,
-            runner=runner,
-            argv_template=argv_template,
         )
 
-    return None
+    if script_idx + 2 < len(parts):
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_argv_extra",
+                message=(
+                    f"{source_path} 第 {ordinal} 步 {script_path} 的 JSON argv 后存在额外参数：{parts[script_idx + 2:]!r}。\n"
+                    "二次 E2E 校验要求脚本路径后只跟一个 JSON object argv。\n"
+                    f"原始命令：{command}"
+                ),
+            )
+        )
+
+    try:
+        argv_template = json.loads(parts[script_idx + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_json_parse",
+                message=(
+                    f"{source_path} 第 {ordinal} 步 {script_path} 的 JSON argv 不可解析：{exc.msg}\n"
+                    f"argv={parts[script_idx + 1]!r}\n"
+                    f"原始命令：{command}"
+                ),
+            )
+        ) from exc
+
+    if not isinstance(argv_template, dict):
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_json_type",
+                message=(
+                    f"{source_path} 第 {ordinal} 步 {script_path} 的 argv 必须是 JSON object。\n"
+                    f"原始命令：{command}"
+                ),
+            )
+        )
+
+    return E2EWorkflowCommand(
+        ordinal=ordinal,
+        source_path=source_path,
+        script_path=script_path,
+        raw_command=command,
+        runner=runner,
+        argv_template=argv_template,
+    )
 
 def _extract_e2e_workflow_commands(skill_dir: Path, skill_md: str) -> list[E2EWorkflowCommand]:
     """Extract executable E2E workflow commands from SKILL.md only.
@@ -7831,12 +7946,14 @@ def _iter_markdown_fenced_blocks(content: str) -> list[tuple[str, str]]:
 def _is_shell_fence_info(info: str) -> bool:
     """Return whether a fenced block should be treated as shell commands.
 
-    Empty info is accepted only when the block contains scripts/ later, matching
-    the previous permissive behavior.
+    Strict Creator/E2E rule:
+    - Only explicitly marked shell fences are executable candidates.
+    - Plain ``` fenced blocks are documentation blocks, not executable blocks.
     """
     normalized = (info or "").strip().lower()
     if not normalized:
-        return True
+        return False
+
     first = normalized.split()[0]
     return first in {"bash", "sh", "shell", "zsh"}
 

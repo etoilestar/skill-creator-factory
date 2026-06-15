@@ -101,96 +101,104 @@ def _persist_tool_authoring_config_store_to_disk() -> None:
         pass
 
 def _infer_wrapper_family(request: dict[str, Any]) -> str:
-    explicit = str(request.get("wrapper_family") or "").strip()
-    if explicit and explicit != "auto":
-        if explicit == "external_api":
-            return "http_api"
-        if explicit in {"python_helper", "data_transform", "local_helper"}:
-            return "python_compute"
-        if explicit == "file_generator":
-            return "file_converter"
-        return explicit
+    request = request if isinstance(request, dict) else {}
 
-    tool_kind = str(request.get("tool_kind") or "").strip()
-    if tool_kind:
-        if tool_kind == "external_api":
-            return "http_api"
-        if tool_kind in {"local_helper", "data_transform"}:
-            return "python_compute"
-        if tool_kind == "file_generator":
-            return "file_converter"
-        if tool_kind in {
-            "web_fetch",
-            "database_query",
-            "local_command",
-            "file_converter",
-            "document_generator",
-            "image_generator",
-            "custom_adapter",
-        }:
-            return tool_kind
+    explicit = str(
+        request.get("wrapper_family")
+        or request.get("adapter_family")
+        or request.get("runtime_family")
+        or ""
+    ).strip()
+
+    if explicit:
+        return _canonical_wrapper_family(explicit)
 
     manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+
     manifest_family = str(
-        manifest.get("wrapper_family") or
-        manifest.get("tool_kind") or
-        manifest.get("category") or
-        manifest.get("tool_type") or
-        ""
+        manifest.get("wrapper_family")
+        or manifest.get("adapter_family")
+        or manifest.get("runtime_family")
+        or ""
     ).strip()
 
     if manifest_family:
-        if manifest_family in {"external_api", "http_api"}:
-            return "http_api"
-        if manifest_family in {"python_helper", "data_transform", "local_helper"}:
-            return "python_compute"
-        if manifest_family == "file_generator":
-            return "file_converter"
-        if manifest_family in {
-            "web_fetch",
-            "database_query",
-            "local_command",
-            "file_converter",
-            "document_generator",
-            "image_generator",
-            "custom_adapter",
-        }:
-            return manifest_family
+        return _canonical_wrapper_family(manifest_family)
 
-    config = request.get("config") if isinstance(request.get("config"), dict) else {}
-    if any(config.get(key) not in (None, "", {}, []) for key in ("base_url", "endpoint", "url")):
+    required_capabilities = []
+    for source in (request, manifest):
+        raw = source.get("required_capabilities") if isinstance(source, dict) else None
+        if isinstance(raw, list):
+            required_capabilities.extend(str(item).strip() for item in raw if item)
+
+    for capability in required_capabilities:
+        wrapper = CAPABILITY_TO_WRAPPER.get(capability)
+        if wrapper:
+            return _canonical_wrapper_family(wrapper)
+
+    tool_kind = str(
+        request.get("tool_kind")
+        or manifest.get("tool_kind")
+        or request.get("tool_type")
+        or manifest.get("tool_type")
+        or ""
+    ).strip().lower()
+
+    if tool_kind in {"external_api", "http_api", "rest_api", "api"}:
         return "http_api"
 
+    if tool_kind in {"web_fetch", "web_search", "fetch_url_text", "managed_helper"}:
+        return "managed_helper"
+
+    if tool_kind in {"database_query", "database_read", "sql_query"}:
+        return "database_query"
+
+    if tool_kind in {"file_converter", "file_generator", "document_generator"}:
+        return "file_io"
+
+    if tool_kind in {"image_generator", "image_generation"}:
+        return "managed_helper"
+
+    if tool_kind in {"local_command", "shell_command", "command"}:
+        return "local_command"
+
+    if tool_kind in {"python_compute", "python_helper", "local_helper", "data_transform"}:
+        return "python_compute"
+
+    if tool_kind == "custom_adapter":
+        return "custom_adapter"
+
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+
+    # Fixed endpoint/base_url means HTTP API wrapper.
+    if any(config.get(key) not in (None, "", {}, []) for key in ("base_url", "endpoint")):
+        return "http_api"
+
+    if any(manifest.get(key) not in (None, "", {}, []) for key in ("base_url", "endpoint")):
+        return "http_api"
+
+    # Database shape is a wrapper family. Auth is still decided separately.
     if any(config.get(key) not in (None, "", {}, []) for key in ("database_url", "dsn", "connection_string")):
         return "database_query"
 
-    explicit_tool_type = str(request.get("tool_type") or "").strip()
-    if explicit_tool_type and explicit_tool_type != "python_helper":
-        if explicit_tool_type == "http_api":
-            return "http_api"
-        if explicit_tool_type in {
-            "web_fetch",
-            "local_command",
-            "database_query",
-            "file_converter",
-            "document_generator",
-            "image_generator",
-            "custom_adapter",
-        }:
-            return explicit_tool_type
+    if any(manifest.get(key) not in (None, "", {}, []) for key in ("database_url", "dsn", "connection_string")):
+        return "database_query"
 
-    code = str(request.get("code_block") or "")
-    facts = extract_runtime_facts(code, manifest)
+    if request.get("generates_file") or manifest.get("generates_file"):
+        return "file_io"
+
+    code = str(request.get("code_block") or request.get("adapter_code") or "")
+    facts = extract_runtime_facts(code, manifest) if code.strip() or manifest else {}
+
     if facts.get("has_configurable_endpoint"):
         return "http_api"
-    if facts.get("uses_external_network"):
-        return "web_fetch"
 
-    if request.get("generates_file"):
-        return "file_converter"
+    # Network without a fixed endpoint is a capability, not a wrapper family.
+    if facts.get("uses_external_network") or request.get("needs_external_network") or manifest.get("needs_external_network"):
+        return "managed_helper"
 
-    if request.get("needs_external_network"):
-        return "web_fetch"
+    if code.strip():
+        return "python_compute"
 
     return "python_compute"
 
@@ -2480,18 +2488,426 @@ def _plan_defaults() -> dict[str, Any]:
         "runtime_facts": {},
     }
 
+WRAPPER_REGISTRY: dict[str, dict[str, Any]] = {
+    "http_api": {
+        "description": "固定 HTTP/API 服务调用包装",
+        "model_scope": "normalize_response_only",
+        "auth_policy": "declared_by_contract",
+    },
+    "managed_helper": {
+        "description": "平台已有 helper 的受控包装",
+        "model_scope": "none",
+        "auth_policy": "platform_or_contract",
+    },
+    "python_compute": {
+        "description": "纯 Python 计算/解析/转换包装",
+        "model_scope": "transform_only",
+        "auth_policy": "declared_by_contract",
+    },
+    "file_io": {
+        "description": "文件输入输出/格式转换包装",
+        "model_scope": "file_transform_only",
+        "auth_policy": "declared_by_contract",
+    },
+    "database_query": {
+        "description": "数据库只读查询包装",
+        "model_scope": "sql_template_or_normalize_only",
+        "auth_policy": "declared_by_contract",
+    },
+    "local_command": {
+        "description": "受限本地命令包装，高风险",
+        "model_scope": "none",
+        "auth_policy": "declared_by_contract",
+    },
+    "custom_adapter": {
+        "description": "无法归类时的兜底自定义 adapter",
+        "model_scope": "full_adapter_with_strict_review",
+        "auth_policy": "declared_by_contract",
+    },
+}
 
-def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str, Any], request: dict[str, Any]) -> list[str]:
-    """Return only connection/config panel requirements, not schema/template questions."""
+CAPABILITY_TO_WRAPPER: dict[str, str] = {
+    "http_request": "http_api",
+    "web_search": "managed_helper",
+    "network_read": "managed_helper",
+    "text_generation": "managed_helper",
+    "image_generation": "managed_helper",
+    "pdf_generation": "managed_helper",
+    "docx_generation": "managed_helper",
+    "pptx_generation": "managed_helper",
+    "spreadsheet_read": "managed_helper",
+    "vision_understanding": "managed_helper",
+    "database_read": "database_query",
+    "file_output": "file_io",
+    "deterministic_execution": "python_compute",
+}
+
+_PROTOCOL_CONFIG_FIELDS = {
+    "base_url",
+    "endpoint",
+    "url",
+    "method",
+    "auth_type",
+    "authentication",
+    "secret_env",
+    "secret_env_name",
+    "auth_placement",
+    "auth_header_name",
+    "auth_query_param",
+    "database_url",
+    "dsn",
+    "connection_string",
+}
+
+_CONNECTION_SCOPES = {
+    "connection_config",
+    "auth_config",
+    "secret_ref",
+    "credential_ref",
+}
+
+_RUNTIME_SCOPES = {
+    "runtime_input",
+    "business_input",
+    "payload",
+}
+
+
+def _canonical_wrapper_family(value: Any) -> str:
+    text = str(value or "").strip().lower()
+
+    aliases = {
+        "": "python_compute",
+        "auto": "python_compute",
+        "unknown": "python_compute",
+        "external_api": "http_api",
+        "api": "http_api",
+        "rest_api": "http_api",
+        "python_helper": "python_compute",
+        "local_helper": "python_compute",
+        "data_transform": "python_compute",
+        "file_converter": "file_io",
+        "file_generator": "file_io",
+        "document_generator": "file_io",
+        "pdf_generator": "file_io",
+        "docx_generator": "file_io",
+        "pptx_generator": "file_io",
+        "image_generator": "managed_helper",
+        "image_generation": "managed_helper",
+        "web_fetch": "managed_helper",
+        "web_search": "managed_helper",
+        "fetch_url_text": "managed_helper",
+    }
+
+    text = aliases.get(text, text)
+
+    if text in WRAPPER_REGISTRY:
+        return text
+
+    return "custom_adapter"
+
+
+def _schema_properties(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties")
+    return properties if isinstance(properties, dict) else {}
+
+
+def _schema_required(schema: Any) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required")
+    if not isinstance(required, list):
+        return []
+    return [str(item) for item in required if isinstance(item, str)]
+
+
+def _property_scope(name: str, schema: Any) -> str:
+    """Scope resolution without provider or natural-language keyword guessing.
+
+    Priority:
+    1. explicit x-scope / x_scope
+    2. explicit x-config-kind / x_config_kind
+    3. exact platform protocol field name
+    4. default runtime_input
+    """
+    prop = schema if isinstance(schema, dict) else {}
+
+    raw_scope = (
+        prop.get("x-scope")
+        or prop.get("x_scope")
+        or prop.get("x-config-kind")
+        or prop.get("x_config_kind")
+        or ""
+    )
+    scope = str(raw_scope).strip().lower()
+
+    if scope in _CONNECTION_SCOPES:
+        return scope
+
+    if scope in _RUNTIME_SCOPES:
+        return "runtime_input"
+
+    # 这里只允许平台协议字段 exact match，不做 token/key/auth/password/url 这类 contains 猜测。
+    normalized_name = str(name or "").strip()
+    if normalized_name in _PROTOCOL_CONFIG_FIELDS:
+        if normalized_name in {"secret_env", "secret_env_name"}:
+            return "secret_ref"
+        if normalized_name in {"auth_type", "authentication", "auth_placement", "auth_header_name", "auth_query_param"}:
+            return "auth_config"
+        return "connection_config"
+
+    return "runtime_input"
+
+
+def _split_config_and_runtime_schema(schema: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split model-provided schema into connection config and runtime input.
+
+    Conservative rule:
+    - explicit x-scope wins;
+    - exact platform protocol fields are config;
+    - everything else is runtime input.
+    """
+    if not isinstance(schema, dict):
+        return {}, {}
+
+    props = _schema_properties(schema)
+    if not props:
+        return {}, {}
+
+    required = set(_schema_required(schema))
+
+    config_props: dict[str, Any] = {}
+    runtime_props: dict[str, Any] = {}
+    config_required: set[str] = set()
+    runtime_required: set[str] = set()
+
+    for name, prop in props.items():
+        scope = _property_scope(str(name), prop)
+
+        if scope in _CONNECTION_SCOPES:
+            config_props[name] = prop
+            if name in required:
+                config_required.add(name)
+        else:
+            runtime_props[name] = prop
+            if name in required:
+                runtime_required.add(name)
+
+    config_schema: dict[str, Any] = {}
+    if config_props:
+        config_schema = {
+            **schema,
+            "type": "object",
+            "properties": config_props,
+            "required": sorted(config_required),
+        }
+
+    runtime_schema: dict[str, Any] = {}
+    if runtime_props:
+        runtime_schema = {
+            "type": "object",
+            "properties": runtime_props,
+            "required": sorted(runtime_required),
+        }
+
+    return config_schema, runtime_schema
+
+
+def _merge_input_schema(manifest: dict[str, Any], runtime_schema: dict[str, Any]) -> dict[str, Any]:
+    manifest = dict(manifest or {})
+
+    if not runtime_schema:
+        return manifest
+
+    input_schema = manifest.get("input_schema")
+    if not isinstance(input_schema, dict):
+        legacy_inputs = manifest.get("inputs")
+        if isinstance(legacy_inputs, dict):
+            input_schema = {
+                "type": "object",
+                "properties": legacy_inputs,
+                "required": [],
+            }
+        else:
+            input_schema = {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            }
+
+    input_props = dict(_schema_properties(input_schema))
+    input_required = set(_schema_required(input_schema))
+
+    for name, prop in _schema_properties(runtime_schema).items():
+        input_props.setdefault(name, prop)
+
+    for name in _schema_required(runtime_schema):
+        if name in input_props:
+            input_required.add(name)
+
+    manifest["input_schema"] = {
+        **input_schema,
+        "type": "object",
+        "properties": input_props,
+        "required": sorted(input_required),
+    }
+    manifest["inputs"] = input_props
+
+    return manifest
+
+
+def _normalize_model_config_schema_into_manifest(
+    manifest: dict[str, Any],
+    model_config_schema: Any,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Move runtime fields accidentally emitted in config_form_schema into manifest.input_schema."""
+    config_schema, runtime_schema = _split_config_and_runtime_schema(model_config_schema)
+    manifest = _merge_input_schema(manifest, runtime_schema)
+    return manifest, config_schema, _schema_required(config_schema)
+
+
+def _required_capabilities_from_contract(manifest: dict[str, Any], plan: dict[str, Any] | None = None) -> list[str]:
+    plan = plan or {}
+    values: list[Any] = []
+
+    for source in (plan, manifest):
+        raw = source.get("required_capabilities")
+        if isinstance(raw, list):
+            values.extend(raw)
+
+    result = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+
+    return result
+
+
+def _infer_helper_name_from_capabilities(capabilities: list[str]) -> str:
+    for capability in capabilities:
+        cap = BUILTIN_TOOL_CAPABILITIES.get(capability)
+        if cap and cap.helper_imports:
+            return cap.helper_imports[0]
+
+    if "network_read" in capabilities or "web_search" in capabilities:
+        return "fetch_url_text"
+
+    if "database_read" in capabilities:
+        return "query_database_readonly"
+
+    return ""
+
+
+def _build_tool_contract(
+    *,
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+) -> dict[str, Any]:
+    wrapper_family = _canonical_wrapper_family(
+        plan.get("wrapper_family")
+        or request.get("wrapper_family")
+        or _infer_wrapper_family({**request, **plan, "manifest": manifest})
+    )
+
+    capabilities = _required_capabilities_from_contract(manifest, plan)
+
+    if not capabilities:
+        if wrapper_family == "http_api":
+            capabilities = ["http_request"]
+        elif wrapper_family == "managed_helper":
+            capabilities = ["web_search"]
+        elif wrapper_family == "database_query":
+            capabilities = ["database_read"]
+        elif wrapper_family == "file_io":
+            capabilities = ["file_output"]
+        elif wrapper_family == "python_compute":
+            capabilities = ["deterministic_execution"]
+
+    helper_name = (
+        str(plan.get("helper_name") or "")
+        or str((plan.get("helper_contract") or {}).get("helper_name") if isinstance(plan.get("helper_contract"), dict) else "")
+        or str((manifest.get("helper_contract") or {}).get("helper_name") if isinstance(manifest.get("helper_contract"), dict) else "")
+        or _infer_helper_name_from_capabilities(capabilities)
+    )
+
+    function_name = _slug(
+        str(
+            manifest.get("name")
+            or request.get("tool_name")
+            or plan.get("operation")
+            or "custom_tool"
+        )
+    )
+
+    return {
+        "contract_version": "1.0",
+        "wrapper_family": wrapper_family,
+        "tool_kind": plan.get("tool_kind") or _infer_tool_kind({**request, **plan, "manifest": manifest}),
+        "function_name": function_name,
+        "required_capabilities": capabilities,
+        "helper_name": helper_name,
+        "manifest": manifest,
+        "sample_input": sample_input,
+        "auth_decision": plan.get("auth_decision") or manifest.get("auth_decision") or {},
+        "auth_gate": plan.get("auth_gate") or manifest.get("auth_gate") or {},
+    }
+
+def _external_api_missing_fields(
+    config: dict[str, Any],
+    sample_input: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    auth_decision: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return only connection/config panel requirements.
+
+    Runtime input fields must not appear here.
+    Auth fields are required only when auth_decision.required=yes.
+    """
+    config = config if isinstance(config, dict) else {}
+    request = request if isinstance(request, dict) else {}
+
     missing: list[str] = []
+
     if not _has_config_value(config, "url", "endpoint", "base_url"):
         missing.append("base_url")
-    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
-    has_secret_ref = bool(_extract_env_refs(config)) or _has_config_value(config, "secret_env", "secret_env_name", "api_key_env", "token_env", "password_env")
-    if not auth_type:
-        missing.append("auth_type")
-    elif auth_type not in {"none", "no_auth", "anonymous"} and not has_secret_ref:
-        missing.append("secret_env")
+
+    decision = _normalize_auth_decision(
+        auth_decision or request.get("auth_decision") or {},
+        default_required="no",
+    )
+
+    auth_required = decision.get("required") == "yes"
+
+    auth_type = _normalize_auth_type(
+        config.get("auth_type")
+        or config.get("authentication")
+        or ((config.get("auth") or {}).get("type") if isinstance(config.get("auth"), dict) else "")
+    )
+
+    has_secret_ref = bool(
+        _extract_env_refs(config)
+        or _has_config_value(
+            config,
+            "secret_env",
+            "secret_env_name",
+            "api_key_env",
+            "token_env",
+            "password_env",
+        )
+    )
+
+    if auth_required:
+        if auth_type in {"", "none", "unknown"}:
+            missing.append("auth_type")
+        elif not has_secret_ref:
+            missing.append("secret_env")
+
     return missing
 
 
@@ -2628,19 +3044,36 @@ def _external_api_clarification_questions(request: dict[str, Any], config: dict[
 
 
 def _infer_tool_kind(request: dict[str, Any]) -> str:
+    request = request if isinstance(request, dict) else {}
+
     explicit = str(request.get("tool_kind") or "").strip()
     if explicit:
         return explicit
+
+    manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+    manifest_kind = str(manifest.get("tool_kind") or "").strip()
+    if manifest_kind:
+        return manifest_kind
+
+    required_capabilities = _required_capabilities_from_contract(manifest, request)
+    if "web_search" in required_capabilities or "network_read" in required_capabilities:
+        return "web_fetch"
+    if "database_read" in required_capabilities:
+        return "database_query"
+    if "image_generation" in required_capabilities:
+        return "image_generator"
+    if any(item in required_capabilities for item in ("pdf_generation", "docx_generation", "pptx_generation", "file_output")):
+        return "file_generator"
 
     wrapper_family = _infer_wrapper_family(request)
 
     if wrapper_family == "http_api":
         return "external_api"
-    if wrapper_family == "web_fetch":
-        return "web_fetch"
+    if wrapper_family == "managed_helper":
+        return "managed_helper"
     if wrapper_family == "python_compute":
         return "local_helper"
-    if wrapper_family == "file_converter":
+    if wrapper_family == "file_io":
         return "file_generator"
 
     return wrapper_family or "unknown"
@@ -2780,47 +3213,132 @@ def _derive_auth_decision(
     wrapper_family: str,
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """Derive auth only from explicit auth/security contract.
+
+    wrapper_family/tool_kind/network usage must not decide auth.
+    """
+    request = request if isinstance(request, dict) else {}
+    config = config if isinstance(config, dict) else {}
+
+    auth_override = _auth_override_from_request(request)
+    override_decision = _auth_override_to_decision(auth_override)
+    if override_decision:
+        return _normalize_auth_decision(override_decision, default_required="unknown")
+
     explicit = request.get("auth_decision")
     if isinstance(explicit, dict):
-        return _normalize_auth_decision(explicit)
+        return _normalize_auth_decision(explicit, default_required="unknown")
 
-    if request.get("needs_secret") or request.get("requires_authorization") or _config_has_auth_material(config):
-        auth_type = _normalize_auth_type(config.get("auth_type") or config.get("authentication") or "api_key")
-        secret_env = str(config.get("secret_env") or config.get("secret_env_name") or "").strip()
+    manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+
+    manifest_decision = manifest.get("auth_decision")
+    if isinstance(manifest_decision, dict):
+        return _normalize_auth_decision(manifest_decision, default_required="unknown")
+
+    required_secrets = manifest.get("required_secrets")
+    if isinstance(required_secrets, list) and any(str(item).strip() for item in required_secrets):
+        return {
+            "required": "yes",
+            "confidence": 1.0,
+            "reason": "manifest declares required_secrets",
+            "evidence": ["manifest.required_secrets"],
+            "security_schemes": [{"type": "api_key"}],
+        }
+
+    auth = manifest.get("auth") if isinstance(manifest.get("auth"), dict) else {}
+    if auth:
+        auth_type = _normalize_auth_type(auth.get("type") or auth.get("scheme"))
+        if auth_type != "none":
+            scheme = dict(auth)
+            scheme["type"] = auth_type
+            return {
+                "required": "yes",
+                "confidence": 1.0,
+                "reason": "manifest declares non-none auth scheme",
+                "evidence": ["manifest.auth"],
+                "security_schemes": [scheme],
+            }
+
+    security_schemes = manifest.get("security_schemes")
+    if isinstance(security_schemes, list):
+        non_none = []
+        for scheme in security_schemes:
+            if not isinstance(scheme, dict):
+                continue
+            scheme_type = _normalize_auth_type(scheme.get("type") or scheme.get("scheme"))
+            if scheme_type != "none":
+                item = dict(scheme)
+                item["type"] = scheme_type
+                non_none.append(item)
+
+        if non_none:
+            return {
+                "required": "yes",
+                "confidence": 1.0,
+                "reason": "manifest declares non-none security_schemes",
+                "evidence": ["manifest.security_schemes"],
+                "security_schemes": non_none,
+            }
+
+    auth_type = _normalize_auth_type(
+        config.get("auth_type")
+        or config.get("authentication")
+        or ((config.get("auth") or {}).get("type") if isinstance(config.get("auth"), dict) else "")
+    )
+    secret_env = str(config.get("secret_env") or config.get("secret_env_name") or "").strip()
+
+    if auth_type not in {"", "none", "unknown"}:
         scheme: dict[str, Any] = {"type": auth_type}
         if secret_env:
             scheme["env"] = secret_env
         return {
             "required": "yes",
-            "confidence": 0.9,
-            "reason": "request/config contains secret or auth material",
-            "evidence": ["needs_secret/config auth/env refs"],
+            "confidence": 1.0,
+            "reason": "config declares non-none auth_type",
+            "evidence": ["config.auth_type"],
             "security_schemes": [scheme],
         }
 
-    auth_type = _normalize_auth_type(config.get("auth_type") or config.get("authentication"))
-    if auth_type == "none":
+    if secret_env:
+        return {
+            "required": "yes",
+            "confidence": 1.0,
+            "reason": "config declares secret_env",
+            "evidence": ["config.secret_env"],
+            "security_schemes": [{"type": "api_key", "env": secret_env}],
+        }
+
+    if manifest.get("requires_auth") is True or request.get("requires_authorization") is True or request.get("needs_secret") is True:
+        return {
+            "required": "unknown",
+            "confidence": 0.8,
+            "reason": "request/manifest says auth is required but no concrete scheme is declared",
+            "evidence": ["requires_authorization/requires_auth/needs_secret"],
+            "security_schemes": [],
+        }
+
+    if manifest.get("requires_auth") is False:
         return {
             "required": "no",
-            "confidence": 0.85,
-            "reason": "config explicitly says no auth",
-            "evidence": ["auth_type=none"],
+            "confidence": 1.0,
+            "reason": "manifest explicitly says requires_auth=false",
+            "evidence": ["manifest.requires_auth=false"],
             "security_schemes": [{"type": "none"}],
         }
 
-    if wrapper_family in {"http_api", "database_query"}:
+    if auth_type == "none":
         return {
-            "required": "unknown",
-            "confidence": 0.5,
-            "reason": "remote/configured service without explicit auth decision",
-            "evidence": ["service integration requires confirmation"],
-            "security_schemes": [],
+            "required": "no",
+            "confidence": 1.0,
+            "reason": "config explicitly says auth_type=none",
+            "evidence": ["config.auth_type=none"],
+            "security_schemes": [{"type": "none"}],
         }
 
     return {
         "required": "no",
-        "confidence": 0.85,
-        "reason": "no auth signal found",
+        "confidence": 0.75,
+        "reason": "no explicit auth contract found",
         "evidence": [],
         "security_schemes": [{"type": "none"}],
     }
@@ -2838,14 +3356,7 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     merged = dict(request)
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
 
-    wrapper_family = _infer_wrapper_family(request)
-    if wrapper_family == "external_api":
-        wrapper_family = "http_api"
-    elif wrapper_family in {"python_helper", "data_transform", "local_helper"}:
-        wrapper_family = "python_compute"
-    elif wrapper_family == "file_generator":
-        wrapper_family = "file_converter"
-
+    wrapper_family = _canonical_wrapper_family(_infer_wrapper_family(request))
     tool_kind = _infer_tool_kind({**request, "wrapper_family": wrapper_family})
 
     sample = (
@@ -2861,14 +3372,6 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
 
     auth_override = _auth_override_from_request(request)
 
-    requires_network = wrapper_family in {"http_api", "web_fetch"} or bool(request.get("needs_external_network"))
-    requires_secret = bool(
-        request.get("needs_secret")
-        or _extract_env_refs(config)
-        or config.get("secret_env")
-        or config.get("secret_env_name")
-    )
-
     auth_decision = _derive_auth_decision(
         request,
         wrapper_family=wrapper_family,
@@ -2879,42 +3382,68 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     if override_decision:
         auth_decision = override_decision
 
-    manifest: dict[str, Any]
     if isinstance(request.get("manifest"), dict) and request.get("manifest"):
         manifest = dict(request["manifest"])
     else:
         manifest_seed = dict(merged)
+        manifest_seed["wrapper_family"] = wrapper_family
+        manifest_seed["tool_kind"] = tool_kind
 
         if wrapper_family == "http_api":
             manifest_seed["needs_external_network"] = True
             manifest_seed["tool_type"] = "custom_adapter"
             manifest_seed["input_schema"] = request.get("input_schema") or {
-                "payload": {
-                    "type": "object",
-                    "required": True,
-                    "description": "Fields used to render confirmed request templates.",
-                }
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "description": "Fields used to render confirmed request templates.",
+                    }
+                },
+                "required": ["payload"],
             }
             manifest_seed["output_schema"] = request.get("output_schema") or _generic_external_api_output_schema()
 
-            if requires_secret:
-                refs = _extract_env_refs(config)
-                manifest_seed["required_secrets"] = (
-                    sorted(refs)
-                    or [
-                        str(
-                            config.get("secret_env")
-                            or config.get("secret_env_name")
-                            or "TOOL_API_KEY"
-                        )
-                    ]
-                )
+        elif wrapper_family == "managed_helper":
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed.setdefault("required_capabilities", ["web_search"])
+            manifest_seed.setdefault("input_schema", request.get("input_schema") or {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "description": "Runtime payload passed to the managed helper wrapper.",
+                    }
+                },
+                "required": [],
+            })
+
+        elif wrapper_family == "python_compute":
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed.setdefault("required_capabilities", ["deterministic_execution"])
+
+        elif wrapper_family == "file_io":
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed.setdefault("required_capabilities", ["file_output"])
 
         manifest = build_tool_manifest_draft(manifest_seed)
 
     manifest = dict(manifest or {})
+    manifest["wrapper_family"] = wrapper_family
+    manifest["tool_kind"] = tool_kind
     manifest["auth_decision"] = auth_decision
     manifest["auth_override"] = auth_override
+
+    model_config_schema = (
+        request.get("config_form_schema")
+        if isinstance(request.get("config_form_schema"), dict)
+        else {}
+    )
+
+    manifest, connection_config_schema, connection_required_fields = _normalize_model_config_schema_into_manifest(
+        manifest,
+        model_config_schema,
+    )
 
     runtime_facts = extract_runtime_facts(code_block, manifest)
 
@@ -2934,10 +3463,16 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
     questions: list[Any] = []
 
     if wrapper_family == "http_api":
-        missing_fields = _external_api_missing_fields(config, sample, request)
+        missing_fields = _external_api_missing_fields(
+            config,
+            sample,
+            request,
+            auth_decision=auth_decision,
+        )
         questions = _external_api_clarification_questions(request, config)
-    elif auth_gate["status"] in {"needs_config", "needs_review"} and _config_has_auth_material(config):
-        missing_fields = ["configuration"]
+
+    elif connection_required_fields:
+        missing_fields = list(connection_required_fields)
 
     if tool_kind == "unknown" and not (
         request.get("tool_name") and (request.get("description") or code_block.strip())
@@ -2952,15 +3487,26 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
             }
         ]
 
-    if not sample and wrapper_family != "http_api":
-        sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
+    if not sample:
+        input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
+        sample = {
+            key: (
+                value.get("default")
+                if isinstance(value, dict) and "default" in value
+                else "demo"
+            )
+            for key, value in _schema_properties(input_schema).items()
+        }
 
+    has_fixed_endpoint = _has_config_value(config, "base_url", "endpoint", "url")
     ready_live = (
         wrapper_family == "http_api"
+        and has_fixed_endpoint
         and not _external_api_missing_fields(
             config,
             sample,
-            {**request, "allow_external_network": True},
+            {**request, "allow_external_network": True, "auth_decision": auth_decision},
+            auth_decision=auth_decision,
         )
     )
 
@@ -2968,11 +3514,11 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
 
     authoring_tool_plan: list[dict[str, Any]] = []
 
-    if wrapper_family == "http_api" and missing_fields:
+    if missing_fields and (wrapper_family == "http_api" or connection_config_schema or auth_gate["status"] == "needs_config"):
         authoring_tool_plan.append(
             {
                 "tool_name": "authoring_config_collector",
-                "reason": "需要通过配置面板确认服务入口、认证方式、env/secret 引用和请求模板",
+                "reason": "需要收集连接/认证/secret 引用配置；运行参数不会进入此配置面板",
                 "input": {
                     "config_required_fields": missing_fields,
                     "config": config,
@@ -3006,19 +3552,24 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    ready_code = bool(manifest) and not questions and not authoring_tool_plan
+    requires_config = bool(missing_fields) or auth_gate["status"] == "needs_config"
+    requires_live_test = bool(
+        auth_gate["status"] == "needs_live_test"
+        or (
+            wrapper_family == "http_api"
+            and has_fixed_endpoint
+            and not live_success
+            and not request.get("skip_live_test")
+        )
+    )
 
+    ready_code = bool(manifest) and not questions and not authoring_tool_plan and not auth_gate.get("block_code_generation")
     if wrapper_family == "http_api":
         ready_code = ready_code and (
             live_success
             or request.get("skip_live_test") is True
+            or not requires_live_test
         )
-
-    requires_config = bool(missing_fields) or auth_gate["status"] in {
-        "needs_config",
-        "needs_review",
-    }
-    requires_live_test = wrapper_family == "http_api" or auth_gate["status"] == "needs_live_test"
 
     result = {
         **_plan_defaults(),
@@ -3027,25 +3578,17 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         "clarification_questions": questions[:3],
         "requires_config": requires_config,
         "config_required_fields": missing_fields,
-        "config_form_schema": (
-            _external_api_config_schema()
-            if requires_config or wrapper_family == "http_api"
-            else {}
-        ),
+        "config_form_schema": connection_config_schema,
         "suggested_entrypoint": (
             _suggest_external_api_entrypoint(request, config)
             if wrapper_family == "http_api"
             else {}
         ),
-        "additional_fields_schema": (
-            _external_api_additional_fields_schema()
-            if wrapper_family == "http_api"
-            else []
-        ),
+        "additional_fields_schema": [],
         "requires_authorization": auth_decision["required"] in {"yes", "unknown"},
         "tool_kind": tool_kind,
         "operation": str(request.get("operation") or request.get("description") or ""),
-        "requires_secret": requires_secret,
+        "requires_secret": auth_decision["required"] == "yes",
         "secret_env_suggestions": (
             sorted(_extract_env_refs(config))
             or (
@@ -3054,33 +3597,22 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
                 else []
             )
         ),
-        "requires_external_network": requires_network,
+        "requires_external_network": bool(
+            request.get("needs_external_network")
+            or wrapper_family in {"http_api", "managed_helper"}
+            or runtime_facts.get("uses_external_network")
+        ),
         "requires_live_test": requires_live_test,
         "ready_for_live_test": ready_live,
         "ready_for_code_generation": ready_code,
         "requires_authoring_tools": bool(authoring_tool_plan),
         "authoring_tool_plan": authoring_tool_plan,
         "missing_fields": [],
-        "suggested_config_schema": (
-            _external_api_config_schema()
-            if requires_config or wrapper_family == "http_api"
-            else {}
-        ),
-        "sample_input_schema": {
-            "type": "object",
-            "description": "Sample payload used for live_test and adapter dynamic validation.",
-        },
+        "suggested_config_schema": connection_config_schema,
+        "sample_input_schema": manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {},
         "manifest": manifest,
         "implementation_plan": (
-            "Use confirmed configuration only. Read secrets from environment variables, "
-            "return deterministic mock when SKILL_TRIAL_RUN=1, and never put secrets in "
-            "payload, logs, manifest, adapter, or snippet."
-            if wrapper_family == "http_api"
-            else (
-                "Normalize existing code_block while preserving business logic."
-                if code_block.strip()
-                else "Generate a complete Python adapter from the manifest."
-            )
+            "Use the finite wrapper registry. Generate only the wrapper-specific internal code, never a provider-specific full adapter."
         ),
         "sample_input": sample,
         "risk_notes": notes,
@@ -3543,40 +4075,13 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
     }
 
     model_tool_kind = str(normalized.get("tool_kind") or "").strip()
-    model_wrapper_family = str(normalized.get("wrapper_family") or "").strip()
 
-    wrapper_family = (
-        str(request.get("wrapper_family") or "").strip()
-        or model_wrapper_family
-        or (
-            model_tool_kind
-            if model_tool_kind in {
-                "web_fetch",
-                "external_api",
-                "http_api",
-                "local_helper",
-                "data_transform",
-                "python_helper",
-                "file_generator",
-                "file_converter",
-                "database_query",
-                "local_command",
-                "document_generator",
-                "image_generator",
-                "custom_adapter",
-            }
-            else ""
-        )
-        or str(fallback.get("wrapper_family") or "").strip()
-        or _infer_wrapper_family(request)
+    wrapper_family = _canonical_wrapper_family(
+        request.get("wrapper_family")
+        or normalized.get("wrapper_family")
+        or fallback.get("wrapper_family")
+        or _infer_wrapper_family({**request, **normalized})
     )
-
-    if wrapper_family == "external_api":
-        wrapper_family = "http_api"
-    elif wrapper_family in {"python_helper", "data_transform", "local_helper"}:
-        wrapper_family = "python_compute"
-    elif wrapper_family == "file_generator":
-        wrapper_family = "file_converter"
 
     normalized["wrapper_family"] = wrapper_family
 
@@ -3603,10 +4108,11 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
             normalized[key] = {}
 
     if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
-        normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
-
-    if wrapper_family == "web_fetch":
-        normalized["tool_kind"] = "web_fetch"
+        normalized["tool_kind"] = (
+            model_tool_kind
+            or fallback.get("tool_kind")
+            or _infer_tool_kind({**request, **normalized, "wrapper_family": wrapper_family})
+        )
 
     if not normalized.get("operation"):
         normalized["operation"] = str(
@@ -3624,102 +4130,37 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
 
     raw_decision = normalized.get("auth_decision")
     if not isinstance(raw_decision, dict) or not raw_decision:
-        raw_decision = {
-            "required": "yes" if normalized.get("requires_authorization") else "unknown",
-            "confidence": 0.5,
-            "reason": "legacy planner fields converted to auth_decision",
-            "evidence": [],
-            "security_schemes": normalized.get("security_schemes") or [],
-        }
+        raw_decision = fallback.get("auth_decision") or {}
 
-    auth_decision = _normalize_auth_decision(raw_decision)
+    auth_decision = _normalize_auth_decision(raw_decision, default_required="unknown")
 
-    if wrapper_family == "web_fetch" and auth_decision["required"] == "unknown":
-        auth_decision = {
-            "required": "no",
-            "confidence": 0.9,
-            "reason": "public web page retrieval/parsing is a no-auth web_fetch tool unless secrets or auth schemes are explicitly declared",
-            "evidence": ["wrapper_family=web_fetch"],
-            "security_schemes": [{"type": "none"}],
-        }
-
-    if auth_decision["required"] == "unknown" and isinstance(fallback.get("auth_decision"), dict):
-        auth_decision = fallback["auth_decision"]
+    if auth_decision["required"] == "unknown":
+        derived = _derive_auth_decision(
+            {**request, "manifest": normalized.get("manifest") or {}},
+            wrapper_family=wrapper_family,
+            config=config,
+        )
+        if derived:
+            auth_decision = derived
 
     override_decision = _auth_override_to_decision(auth_override)
     if override_decision:
         auth_decision = override_decision
 
     manifest = dict(normalized.get("manifest") or {})
+    manifest["wrapper_family"] = wrapper_family
+    manifest["tool_kind"] = normalized.get("tool_kind") or _infer_tool_kind({**request, **normalized})
 
-    model_config_schema = normalized.get("config_form_schema") if isinstance(normalized.get("config_form_schema"), dict) else {}
-    model_config_required = list(normalized.get("config_required_fields") or [])
-    model_additional_schema = normalized.get("additional_fields_schema")
+    model_config_schema = (
+        normalized.get("config_form_schema")
+        if isinstance(normalized.get("config_form_schema"), dict)
+        else {}
+    )
 
-    def _schema_properties(schema: Any) -> dict[str, Any]:
-        if not isinstance(schema, dict):
-            return {}
-        properties = schema.get("properties")
-        return properties if isinstance(properties, dict) else {}
-
-    def _schema_required(schema: Any) -> list[str]:
-        if not isinstance(schema, dict):
-            return []
-        required = schema.get("required")
-        return [str(item) for item in required if isinstance(item, str)] if isinstance(required, list) else []
-
-    def _merge_input_schema_from_model_config(base_manifest: dict[str, Any]) -> dict[str, Any]:
-        merged_manifest = dict(base_manifest or {})
-
-        input_schema = merged_manifest.get("input_schema")
-        if not isinstance(input_schema, dict):
-            legacy_inputs = merged_manifest.get("inputs")
-            if isinstance(legacy_inputs, dict) and legacy_inputs:
-                input_schema = {
-                    "type": "object",
-                    "properties": legacy_inputs,
-                    "required": [
-                        key for key, value in legacy_inputs.items()
-                        if isinstance(value, dict) and value.get("required") is True
-                    ],
-                }
-            else:
-                input_schema = {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                }
-
-        properties = dict(_schema_properties(input_schema))
-        required = set(_schema_required(input_schema))
-
-        for key, value in _schema_properties(model_config_schema).items():
-            if key not in properties:
-                properties[key] = value
-
-        for key in model_config_required:
-            if key in properties:
-                required.add(key)
-
-        if isinstance(model_additional_schema, dict):
-            for key, value in _schema_properties(model_additional_schema).items():
-                if key not in properties:
-                    properties[key] = value
-
-        input_schema = {
-            **input_schema,
-            "type": "object",
-            "properties": properties,
-            "required": sorted(required),
-        }
-
-        merged_manifest["input_schema"] = input_schema
-        merged_manifest["inputs"] = properties
-
-        return merged_manifest
-
-    if wrapper_family == "web_fetch":
-        manifest = _merge_input_schema_from_model_config(manifest)
+    manifest, connection_config_schema, connection_required_fields = _normalize_model_config_schema_into_manifest(
+        manifest,
+        model_config_schema,
+    )
 
     manifest["auth_decision"] = auth_decision
     manifest["auth_override"] = auth_override
@@ -3749,220 +4190,140 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
 
     live_success = _live_test_success_from_request(request)
 
-    if wrapper_family == "http_api":
-        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-        missing = _external_api_missing_fields(config, sample, request)
+    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+    if not sample and isinstance(normalized.get("sample_input"), dict):
+        sample = normalized.get("sample_input") or {}
 
-        normalized["tool_kind"] = "external_api"
+    missing: list[str] = []
+
+    if wrapper_family == "http_api":
+        missing = _external_api_missing_fields(
+            config,
+            sample,
+            {**request, "auth_decision": auth_decision},
+            auth_decision=auth_decision,
+        )
+        normalized["tool_kind"] = normalized.get("tool_kind") or "external_api"
         normalized["requires_external_network"] = True
-        normalized["requires_live_test"] = True
-        normalized["requires_config"] = bool(missing) or auth_gate["status"] in {
-            "needs_config",
-            "needs_review",
-        }
-        normalized["config_required_fields"] = missing
-        normalized["config_form_schema"] = _external_api_config_schema()
-        normalized["suggested_config_schema"] = _external_api_config_schema()
+        normalized["ready_for_live_test"] = not _external_api_missing_fields(
+            config,
+            sample,
+            {**request, "allow_external_network": True, "auth_decision": auth_decision},
+            auth_decision=auth_decision,
+        )
         normalized["suggested_entrypoint"] = {
             **_suggest_external_api_entrypoint(request, config),
             **(normalized.get("suggested_entrypoint") or {}),
         }
-        normalized["additional_fields_schema"] = (
-            normalized.get("additional_fields_schema")
-            or _external_api_additional_fields_schema()
-        )
-        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
-        normalized["requires_secret"] = bool(
-            normalized.get("requires_secret")
-            or auth_decision["required"] == "yes"
-        )
-        normalized["ready_for_live_test"] = not _external_api_missing_fields(
-            config,
-            sample,
-            {**request, "allow_external_network": True},
-        )
-        normalized["missing_fields"] = []
-
-        safe_questions = _safe_clarification_questions(
-            normalized.get("clarification_questions") or normalized.get("questions") or [],
-            fallback.get("clarification_questions") or fallback.get("questions") or [],
-        )
-        safe_questions = _filter_answered_clarification_questions(
-            safe_questions,
-            request.get("clarification_answers") or [],
-        )
-
-        normalized["clarification_questions"] = safe_questions
-        normalized["questions"] = safe_questions
-
-        normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
-            normalized.get("authoring_tool_plan") or []
-        )
-
-        if live_success:
-            normalized["authoring_tool_plan"] = [
-                item
-                for item in normalized["authoring_tool_plan"]
-                if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
-            ]
-        elif missing:
-            normalized["authoring_tool_plan"] = [
-                {
-                    "tool_name": "authoring_config_collector",
-                    "reason": "需要通过配置面板确认服务入口、认证方式、env/secret 引用和请求模板",
-                    "input": {
-                        "config_required_fields": missing,
-                        "config": config,
-                        "sample_input": sample,
-                    },
-                }
-            ]
-        elif (
-            not normalized.get("authoring_tool_plan")
-            and normalized.get("ready_for_live_test")
-            and not request.get("skip_live_test")
-        ):
-            normalized["authoring_tool_plan"] = [
-                {
-                    "tool_name": "authoring_live_test",
-                    "reason": "需要在生成 adapter 前确认固定远程接口配置和 sample input 可用",
-                    "input": {
-                        "config": config,
-                        "sample_input": sample,
-                    },
-                }
-            ]
-
-        if missing:
-            normalized["ready_for_code_generation"] = False
-        elif live_success or request.get("skip_live_test") is True:
-            normalized["ready_for_code_generation"] = bool(
-                normalized.get("manifest") or fallback.get("manifest")
-            )
-        else:
-            normalized["ready_for_code_generation"] = False
-
-    elif wrapper_family == "web_fetch":
-        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-        if not sample and isinstance(normalized.get("sample_input"), dict):
-            sample = normalized.get("sample_input") or {}
-
-        input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
-        input_props = _schema_properties(input_schema)
-        input_required = _schema_required(input_schema)
-
-        normalized["tool_kind"] = "web_fetch"
-        normalized["requires_external_network"] = True
-        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
-        normalized["requires_secret"] = auth_decision["required"] == "yes"
-        normalized["requires_config"] = auth_gate["status"] in {"needs_config", "needs_review"}
-        normalized["requires_live_test"] = auth_gate["status"] == "needs_live_test"
-        normalized["ready_for_live_test"] = False
-        normalized["config_required_fields"] = []
-        normalized["config_form_schema"] = {}
-        normalized["suggested_config_schema"] = {}
-        normalized["additional_fields_schema"] = []
-        normalized["missing_fields"] = []
-        normalized["sample_input_schema"] = input_schema or {
-            "type": "object",
-            "properties": input_props,
-            "required": input_required,
-        }
-
-        if not sample:
-            sample = {
-                key: (
-                    value.get("default")
-                    if isinstance(value, dict) and "default" in value
-                    else "demo"
-                )
-                for key, value in input_props.items()
-            }
-            if "target_url" in input_props:
-                sample["target_url"] = "https://example.com/article"
-            if "content_selector" in input_props:
-                sample["content_selector"] = "article"
-
-        normalized["sample_input"] = sample
-
-        normalized["authoring_tool_plan"] = [
-            item
-            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
-            if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
-        ]
-
-        normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
-
-        if normalized["requires_authoring_tools"]:
-            normalized["ready_for_code_generation"] = False
-        else:
-            normalized["ready_for_code_generation"] = bool(manifest)
-
     else:
-        normalized["requires_config"] = auth_gate["status"] in {
-            "needs_config",
-            "needs_review",
-        }
-        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
-        normalized["requires_live_test"] = auth_gate["status"] == "needs_live_test"
-        normalized["requires_external_network"] = bool(
-            normalized.get("requires_external_network")
-            or wrapper_family == "web_fetch"
-            or runtime_facts.get("uses_external_network")
+        normalized["ready_for_live_test"] = False
+        normalized["suggested_entrypoint"] = normalized.get("suggested_entrypoint") or {}
+
+    if connection_required_fields:
+        missing = sorted(set([*missing, *connection_required_fields]))
+
+    normalized["config_required_fields"] = missing
+    normalized["config_form_schema"] = connection_config_schema
+    normalized["suggested_config_schema"] = connection_config_schema
+    normalized["additional_fields_schema"] = []
+
+    normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
+    normalized["requires_secret"] = auth_decision["required"] == "yes"
+    normalized["requires_config"] = bool(missing) or auth_gate["status"] == "needs_config"
+    normalized["requires_live_test"] = bool(
+        auth_gate["status"] == "needs_live_test"
+        or (
+            wrapper_family == "http_api"
+            and normalized.get("ready_for_live_test")
+            and not live_success
+            and not request.get("skip_live_test")
         )
-
-        if normalized["requires_config"] and not normalized.get("config_form_schema"):
-            normalized["config_form_schema"] = _external_api_config_schema()
-            normalized["suggested_config_schema"] = _external_api_config_schema()
-
-        normalized["authoring_tool_plan"] = [
-            item
-            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
-            if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
-        ]
-
-        if not normalized.get("ready_for_code_generation"):
-            normalized["ready_for_code_generation"] = bool(normalized.get("manifest"))
-
-    if request.get("resolved_clarifications"):
-        normalized["resolved_clarifications"] = request.get("resolved_clarifications")
-
-    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
-        normalized.get("authoring_tool_plan") or []
     )
-    normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
+    normalized["requires_external_network"] = bool(
+        normalized.get("requires_external_network")
+        or wrapper_family in {"http_api", "managed_helper"}
+        or runtime_facts.get("uses_external_network")
+    )
 
-    if normalized["requires_authoring_tools"]:
-        normalized["ready_for_code_generation"] = False
+    normalized["missing_fields"] = []
+    normalized["sample_input_schema"] = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
 
-    normalized["clarification_questions"] = _safe_clarification_questions(
+    if not sample:
+        input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
+        sample = {
+            key: (
+                value.get("default")
+                if isinstance(value, dict) and "default" in value
+                else "demo"
+            )
+            for key, value in _schema_properties(input_schema).items()
+        }
+    normalized["sample_input"] = sample
+
+    safe_questions = _safe_clarification_questions(
         normalized.get("clarification_questions") or normalized.get("questions") or [],
         fallback.get("clarification_questions") or fallback.get("questions") or [],
     )
-    normalized["clarification_questions"] = _filter_answered_clarification_questions(
-        normalized["clarification_questions"],
+    safe_questions = _filter_answered_clarification_questions(
+        safe_questions,
         request.get("clarification_answers") or [],
     )
-    normalized["questions"] = normalized["clarification_questions"]
-    normalized["needs_clarification"] = bool(normalized["clarification_questions"])
+    normalized["clarification_questions"] = safe_questions
+    normalized["questions"] = safe_questions
+    normalized["needs_clarification"] = bool(safe_questions)
 
-    if wrapper_family == "web_fetch":
-        normalized["requires_config"] = normalized["auth_gate"].get("status") in {
-            "needs_config",
-            "needs_review",
-        }
-        normalized["config_required_fields"] = []
-        normalized["config_form_schema"] = {}
-        normalized["suggested_config_schema"] = {}
-        normalized["additional_fields_schema"] = []
-        normalized["authoring_tool_plan"] = [
-            item
-            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
-            if item.get("tool_name") not in {"authoring_config_collector", "authoring_live_test"}
-        ]
-        normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
-        if not normalized["requires_authoring_tools"] and not normalized.get("needs_clarification"):
-            normalized["ready_for_code_generation"] = bool(normalized.get("manifest"))
+    plan_tools = _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
+
+    # Only config/auth/connection missing fields should trigger config collector.
+    plan_tools = [
+        item
+        for item in plan_tools
+        if item.get("tool_name") not in {"authoring_config_collector", "authoring_live_test"}
+    ]
+
+    if normalized["requires_config"]:
+        plan_tools.insert(
+            0,
+            {
+                "tool_name": "authoring_config_collector",
+                "reason": "需要收集连接/认证/secret 引用配置；运行参数不进入配置面板",
+                "input": {
+                    "config_required_fields": missing,
+                    "config": config,
+                    "sample_input": sample,
+                },
+            },
+        )
+    elif (
+        wrapper_family == "http_api"
+        and normalized.get("ready_for_live_test")
+        and not live_success
+        and not request.get("skip_live_test")
+    ):
+        plan_tools.insert(
+            0,
+            {
+                "tool_name": "authoring_live_test",
+                "reason": "需要在生成 adapter 前确认固定远程接口配置和 sample input 可用",
+                "input": {
+                    "config": config,
+                    "sample_input": sample,
+                },
+            },
+        )
+
+    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(plan_tools)
+    normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
+
+    normalized["ready_for_code_generation"] = bool(
+        normalized.get("manifest")
+        and not normalized.get("needs_clarification")
+        and not normalized.get("requires_authoring_tools")
+        and not auth_gate.get("block_code_generation")
+    )
+
+    if wrapper_family == "http_api" and normalized["requires_live_test"]:
+        normalized["ready_for_code_generation"] = False
 
     if (
         request.get("stage") == "draft"
@@ -3972,12 +4333,15 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         and not normalized.get("ready_for_code_generation")
         and "ready_for_code_generation" not in (plan or {})
         and not normalized.get("auth_gate", {}).get("block_code_generation")
+        and not normalized.get("requires_authoring_tools")
     ):
         normalized["ready_for_code_generation"] = True
 
     normalized = _apply_auth_override_to_plan(normalized, request)
 
     manifest = dict(normalized.get("manifest") or {})
+    manifest["wrapper_family"] = normalized.get("wrapper_family") or wrapper_family
+    manifest["tool_kind"] = normalized.get("tool_kind") or ""
     manifest["auth_decision"] = normalized.get("auth_decision") or {}
     manifest["auth_gate"] = normalized.get("auth_gate") or {}
     manifest["auth_override"] = normalized.get("auth_override") or auth_override
@@ -4597,6 +4961,222 @@ def _internal_code_errors(code: str) -> list[str]:
 
     return sorted(set(errors))
 
+def _managed_helper_wrapper_code(contract: dict[str, Any], manifest: dict[str, Any]) -> str:
+    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "managed_helper_tool"))
+    helper_name = str(contract.get("helper_name") or "").strip()
+    if not helper_name:
+        helper_name = "fetch_url_text"
+
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+    return f'''from __future__ import annotations
+
+# AUTO-GENERATED MANAGED HELPER WRAPPER.
+# The platform controls run(), manifest(), main(), trial behavior and helper dispatch.
+# This wrapper must not be replaced with direct provider-specific network/client code.
+
+import json
+import os
+import sys
+from typing import Any
+
+from backend.services import skill_runtime as _skill_runtime
+
+
+FUNCTION_NAME = {function_name!r}
+HELPER_NAME = {helper_name!r}
+MANIFEST_DATA = json.loads({manifest_json_literal})
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {{
+        "success": True,
+        "result": {{"trial_run": True, "payload_keys": sorted(payload.keys())}},
+        "trial_run": True,
+    }}
+
+
+def _call_helper(payload: dict[str, Any]) -> Any:
+    helper = getattr(_skill_runtime, HELPER_NAME, None)
+    if not callable(helper):
+        raise RuntimeError(f"managed helper is not available: {{HELPER_NAME}}")
+
+    if HELPER_NAME == "fetch_url_text":
+        url = str(payload.get("target_url") or payload.get("url") or payload.get("uri") or "").strip()
+        if not url:
+            return {{"success": False, "error": "target_url/url is required"}}
+        max_chars = int(payload.get("max_chars") or 12000)
+        value = helper(url, max_chars=max_chars)
+        if isinstance(value, dict):
+            value.setdefault("success", True)
+            value.setdefault("source_url", url)
+            return value
+        return {{"success": True, "text": str(value), "source_url": url}}
+
+    try:
+        return helper(payload)
+    except TypeError:
+        return helper(**payload)
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(payload or {{}})
+
+    if os.getenv("SKILL_TRIAL_RUN") == "1":
+        return _trial_result(payload)
+
+    value = _call_helper(payload)
+
+    if isinstance(value, dict):
+        return value
+
+    return {{"success": True, "result": value}}
+
+
+def {function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def manifest() -> dict[str, Any]:
+    return MANIFEST_DATA
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{{}}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _default_transform_code() -> str:
+    return '''
+def transform(payload: dict) -> dict:
+    return {
+        "success": True,
+        "result": payload,
+    }
+'''.strip()
+
+
+def _transform_code_errors(code: str) -> list[str]:
+    errors: list[str] = []
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"transform code syntax error: {exc}"]
+
+    allowed_functions = {"transform"}
+    forbidden_imports = {"requests", "httpx", "urllib", "aiohttp", "os", "sys", "subprocess", "socket", "pathlib", "shutil"}
+    forbidden_calls = {"open", "eval", "exec", "compile", "__import__"}
+
+    function_names: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in forbidden_imports:
+                    errors.append(f"transform code must not import {root}")
+
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in forbidden_imports:
+                errors.append(f"transform code must not import {root}")
+
+        elif isinstance(node, ast.FunctionDef):
+            function_names.add(node.name)
+            if node.name not in allowed_functions:
+                errors.append(f"transform code may only define transform(payload), got {node.name}")
+
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+            if called in forbidden_calls:
+                errors.append(f"transform code must not call {called}")
+
+    if "transform" not in function_names:
+        errors.append("transform code must define transform(payload)")
+
+    return sorted(set(errors))
+
+
+def _python_compute_wrapper_code(contract: dict[str, Any], internal_code: str, manifest: dict[str, Any]) -> str:
+    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "python_compute_tool"))
+
+    safe_internal = _strip_code_fence(internal_code or "")
+    if _transform_code_errors(safe_internal):
+        safe_internal = _default_transform_code()
+
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+    return f'''from __future__ import annotations
+
+# AUTO-GENERATED PYTHON COMPUTE WRAPPER.
+# code_model may only provide transform(payload). run(), manifest(), main()
+# and trial behavior are generated deterministically by the platform.
+
+import json
+import os
+import sys
+from typing import Any
+
+
+FUNCTION_NAME = {function_name!r}
+MANIFEST_DATA = json.loads({manifest_json_literal})
+
+
+# === MODEL_INTERNAL_CODE_START ===
+{safe_internal}
+# === MODEL_INTERNAL_CODE_END ===
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {{
+        "success": True,
+        "result": {{"trial_run": True, "payload_keys": sorted(payload.keys())}},
+        "trial_run": True,
+    }}
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(payload or {{}})
+
+    if os.getenv("SKILL_TRIAL_RUN") == "1":
+        return _trial_result(payload)
+
+    fn = globals().get("transform")
+    if not callable(fn):
+        return {{"success": False, "error": "transform(payload) is not defined"}}
+
+    value = fn(payload)
+
+    if isinstance(value, dict):
+        return value
+
+    return {{"success": True, "result": value}}
+
+
+def {function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def manifest() -> dict[str, Any]:
+    return MANIFEST_DATA
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{{}}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
 
 def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, manifest: dict[str, Any]) -> str:
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "external_api_tool"))
@@ -5629,50 +6209,47 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
         ]
     }
 
+    planner_payload["available_wrapper_families"] = sorted(WRAPPER_REGISTRY.keys())
+    planner_payload["available_capabilities"] = sorted(BUILTIN_TOOL_CAPABILITIES.keys())
+
     planner_messages = [
         {
             "role": "system",
             "content": (
-                "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
-                "Return strict JSON only. "
-                "Use this layered contract where possible: "
-                "needs_clarification, clarification_questions, wrapper_family, requires_config, suggested_entrypoint, "
-                "config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind, "
-                "operation, requires_secret, secret_env_suggestions, requires_external_network, requires_live_test, "
-                "ready_for_live_test, ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, "
-                "suggested_config_schema, sample_input_schema, manifest, implementation_plan, sample_input, risk_notes, "
-                "auth_decision. "
+                "You are planner_model for a generic Tool Authoring system. Return strict JSON only. "
+                "You create a draft ToolContract. Do not generate code. Do not invent provider-specific registry entries. "
 
-                "tool_kind must be one of: local_helper, web_fetch, external_api, file_generator, data_transform, database_query, local_command, unknown. "
-                "web_fetch means public web page or URL content retrieval/parsing. "
-                "external_api means a fixed third-party/private/SaaS/service API integration that may need endpoint/auth/account configuration. "
+                "The system has a finite wrapper registry: http_api, managed_helper, python_compute, file_io, database_query, local_command, custom_adapter. "
+                "Choose exactly one wrapper_family from that set. "
+                "wrapper_family describes runtime packaging only; it must not decide authentication. "
+
+                "tool_kind describes business semantics and may be open-ended, e.g. web_fetch, search, summarizer, converter, classifier. "
+                "web_fetch is a tool_kind/capability, not a wrapper_family. For public webpage fetching, use wrapper_family=managed_helper and required_capabilities=[\"web_search\"]. "
+
+                "Authentication is independent from wrapper_family/tool_kind/network usage. "
+                "Represent auth only through auth_decision, security_schemes, required_secrets, config.auth_type, or config.secret_env. "
+                "Do not infer authentication from provider names, field names, network access, or wrapper_family. "
 
                 "auth_decision MUST be an object: "
                 "{\"required\":\"yes|no|unknown\",\"confidence\":0.0-1.0,\"reason\":\"...\","
                 "\"evidence\":[...],\"security_schemes\":[{\"type\":\"none|api_key|token|basic|oauth2|custom\","
                 "\"env\":\"OPTIONAL_ENV\",\"placement\":\"header|query|bearer\",\"header_name\":\"...\",\"query_param\":\"...\"}]}. "
 
-                "Do not collapse unknown auth into no-auth. "
-                "If a private API, SaaS, database, account data, write/publish action, or secret may be involved and you are not sure, output auth_decision.required=unknown. "
-                "Only output auth_decision.required=no with high confidence for pure local computation, deterministic file conversion, or clearly public no-auth retrieval. "
+                "Every schema property should include x-scope when possible: "
+                "runtime_input for normal payload fields; connection_config for stable service connection fields; "
+                "auth_config for auth metadata; secret_ref for env var references. "
+                "config_form_schema may contain only connection_config/auth_config/secret_ref fields. "
+                "manifest.input_schema must contain runtime_input fields. "
+                "If unsure about a field scope, put it in manifest.input_schema, not config_form_schema. "
 
-                "Important classification rule: public web page body scraping, public URL text extraction, HTML parsing, CSS selector extraction, XPath extraction, title/content/image-link extraction from a normal public page should be tool_kind=web_fetch, not external_api. "
-                "For this case, requires_authorization=false, requires_secret=false, auth_decision.required=no, security_schemes=[{\"type\":\"none\"}]. "
-                "Needing external network does not imply authentication. "
-                "Needing a target_url, selector, timeout, encoding, user_agent, headers, or parsing options does not imply authentication. "
-
-                "config_form_schema is only for connection/auth/account/secret configuration such as base_url, endpoint, auth_type, secret_env, token, api_key, username/password, database_url, tenant, region. "
-                "Do NOT put business runtime inputs such as target_url, content_selector, encoding, timeout, use_headless_browser, extract_images, user_agent, or parser options into config_form_schema. "
-                "Put those fields into manifest.input_schema, sample_input_schema, or sample_input instead. "
-
-                "clarification_questions must be structured objects with id/type/question/options/required, Chinese, preferably 1-3 questions and never more than 5. "
-                "Only ask about real capability ambiguity. "
-                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions. "
-                "Do not ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions. "
+                "requires_config should be true only when connection/auth/secret configuration is missing. "
+                "Do not set requires_config=true for runtime inputs like target_url, content_selector, query, prompt, timeout, parser, user_agent, headers, payload. "
 
                 "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. "
                 "Use authoring_config_collector only for connection/auth/account/secret configuration, not for ordinary runtime parameters. "
-                "Do not invent provider details."
+
+                "clarification_questions ask only about real business capability ambiguity. "
+                "Do not ask for endpoint, auth method, token, secret, headers/body/query templates, schemas, sample input, or live-test permission as clarification questions."
             ),
         },
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
@@ -5716,7 +6293,6 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
     model_notes.extend(normalized.get("model_notes") or [])
     return normalized
 
-
 async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     """Generic Tool Authoring pipeline driven by explicit actions."""
     _load_tool_authoring_config_store_from_disk()
@@ -5748,7 +6324,12 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             "manifest": request.get("manifest") or {},
             "adapter_code": "",
             "sample_input": request.get("sample_input") or {},
-            "validation": {"success": bool(result.get("success")), "status": "live_test", "errors": result.get("errors") or [], "warnings": []},
+            "validation": {
+                "success": bool(result.get("success")),
+                "status": "live_test",
+                "errors": result.get("errors") or [],
+                "warnings": [],
+            },
             "snippet": None,
             "model_notes": model_notes,
             "warnings": warnings,
@@ -5804,7 +6385,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     plan = await _run_planner(request, model_notes, warnings)
     live_success = _live_test_success_from_request(request)
 
-    if action == "generate" and live_success and plan.get("tool_kind") == "external_api":
+    if action == "generate" and live_success and _canonical_wrapper_family(plan.get("wrapper_family")) == "http_api":
         plan["authoring_tool_plan"] = []
         plan["requires_authoring_tools"] = False
         if plan.get("manifest"):
@@ -5818,13 +6399,31 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
     raw_manifest = plan.get("manifest") or build_tool_manifest_draft(request)
-    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else plan.get("sample_input") or {}
+    sample_input = (
+        request.get("sample_input")
+        if isinstance(request.get("sample_input"), dict) and request.get("sample_input")
+        else plan.get("sample_input") or {}
+    )
     code_block = str(request.get("code_block") or "")
-    tool_kind = plan.get("tool_kind") or request.get("tool_kind") or ""
 
-    if tool_kind == "external_api":
+    wrapper_family = _canonical_wrapper_family(
+        plan.get("wrapper_family")
+        or request.get("wrapper_family")
+        or _infer_wrapper_family({**request, **plan, "manifest": raw_manifest})
+    )
+
+    contract = _build_tool_contract(
+        request=request,
+        plan=plan,
+        manifest=raw_manifest,
+        sample_input=sample_input,
+    )
+
+    if wrapper_family == "http_api":
         draft_contract = _confirmed_external_api_code_contract(request, plan, raw_manifest, sample_input)
         manifest = _normalize_external_api_manifest_for_adapter(raw_manifest, request, plan, draft_contract)
+        manifest["wrapper_family"] = "http_api"
+
         contract = _confirmed_external_api_code_contract(request, plan, manifest, sample_input)
 
         output_schema = {}
@@ -5862,7 +6461,11 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             },
         ]
 
-        internal_json, code_ack, code_err = await _complete_author_model("code", internal_messages, reason="creator_tool_author_external_api_internal_logic")
+        internal_json, code_ack, code_err = await _complete_author_model(
+            "code",
+            internal_messages,
+            reason="creator_tool_author_external_api_internal_logic",
+        )
         if code_ack:
             model_notes.append(f"code_model={code_ack['model']}")
         if code_err:
@@ -5908,6 +6511,185 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             "requires_human_confirmation": True,
         }
 
+    if wrapper_family == "managed_helper":
+        manifest = dict(raw_manifest or {})
+        manifest["wrapper_family"] = "managed_helper"
+        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
+        manifest["required_capabilities"] = contract.get("required_capabilities") or ["web_search"]
+        manifest["auth_decision"] = plan.get("auth_decision") or manifest.get("auth_decision") or {
+            "required": "no",
+            "confidence": 0.75,
+            "reason": "managed helper auth is declared by platform/helper contract",
+            "evidence": [],
+            "security_schemes": [{"type": "none"}],
+        }
+
+        adapter_code = _managed_helper_wrapper_code(contract, manifest)
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=adapter_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+        )
+
+        static_errors = _author_adapter_static_errors(adapter_code, manifest)
+        if static_errors:
+            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+            validation["success"] = False
+            validation["status"] = "failed"
+
+        validation["adapter_contract"] = contract
+
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "tool_kind": plan.get("tool_kind"),
+            "operation": plan.get("operation"),
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": sample_input,
+            "validation": validation,
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    if wrapper_family == "python_compute":
+        manifest = dict(raw_manifest or {})
+        manifest["wrapper_family"] = "python_compute"
+        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
+        manifest["required_capabilities"] = manifest.get("required_capabilities") or ["deterministic_execution"]
+
+        transform_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are code_model. Do NOT write a full adapter. "
+                    "Return strict JSON only: {\"internal_code\":\"...python code...\"}. "
+                    "The internal code must define exactly transform(payload: dict) -> dict. "
+                    "Do not import network, os, sys, pathlib, subprocess, socket, shutil. "
+                    "Do not define run/main/manifest."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "manifest": manifest,
+                        "sample_input": sample_input,
+                        "implementation_plan": plan.get("implementation_plan"),
+                        "code_block": code_block,
+                        "task": "Write only transform(payload).",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        internal_json, code_ack, code_err = await _complete_author_model(
+            "code",
+            transform_messages,
+            reason="creator_tool_author_python_compute_transform",
+        )
+        if code_ack:
+            model_notes.append(f"code_model={code_ack['model']}")
+        if code_err:
+            warnings.append(f"code_model unavailable, used default transform: {code_err}")
+
+        internal_code = _strip_code_fence(str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or ""))
+        internal_errors = _transform_code_errors(internal_code)
+        if internal_errors:
+            warnings.extend(f"transform_code fallback: {err}" for err in internal_errors)
+            internal_code = _default_transform_code()
+
+        adapter_code = _python_compute_wrapper_code(contract, internal_code, manifest)
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=adapter_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+        )
+
+        static_errors = _author_adapter_static_errors(adapter_code, manifest)
+        if static_errors:
+            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+            validation["success"] = False
+            validation["status"] = "failed"
+
+        validation["adapter_contract"] = contract
+        validation["internal_code_errors"] = internal_errors
+
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "tool_kind": plan.get("tool_kind"),
+            "operation": plan.get("operation"),
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": sample_input,
+            "validation": validation,
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    if wrapper_family in {"file_io", "database_query", "local_command"}:
+        manifest = dict(raw_manifest or {})
+        manifest["wrapper_family"] = wrapper_family
+        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
+
+        if wrapper_family == "file_io":
+            manifest["required_capabilities"] = manifest.get("required_capabilities") or ["file_output"]
+        elif wrapper_family == "database_query":
+            manifest["required_capabilities"] = manifest.get("required_capabilities") or ["database_read"]
+        elif wrapper_family == "local_command":
+            manifest["approval_status"] = manifest.get("approval_status") or "pending_review"
+            manifest["safety_level"] = "high"
+
+        # 当前先用确定性通用 adapter，避免 coder 写完整实现。
+        adapter_code = generate_adapter_code(manifest)
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=adapter_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+        )
+
+        static_errors = _author_adapter_static_errors(adapter_code, manifest)
+        if static_errors:
+            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+            validation["success"] = False
+            validation["status"] = "failed"
+
+        validation["adapter_contract"] = contract
+        validation["warnings"] = sorted(set(validation.get("warnings", []) + [
+            f"{wrapper_family} currently uses deterministic generic wrapper; extend with a specialized wrapper when policy is finalized."
+        ]))
+
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "tool_kind": plan.get("tool_kind"),
+            "operation": plan.get("operation"),
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": sample_input,
+            "validation": validation,
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    # Last-resort custom adapter. This is the only branch where full adapter generation is allowed.
     manifest = raw_manifest
     mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
 
@@ -5915,9 +6697,13 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         {
             "role": "system",
             "content": (
-                f"You are code_model in mode={mode}. Return Python code only. Consume only confirmed requirements/config/sample input/live_test_result/manifest/implementation_plan/protocol. "
-                "Do not guess endpoint, secret name, auth scheme, inputs, or outputs. For network/API adapters, include `if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\": return mock_result`, "
-                "read secrets only with os.getenv(DECLARED_ENV_NAME), never payload.get('api_key'), and never print or return secrets. Include run(payload), manifest function wrapper, and JSON main()."
+                f"You are code_model in mode={mode}. Return Python code only. "
+                "This is custom_adapter fallback only. "
+                "Consume only confirmed requirements/config/sample input/live_test_result/manifest/implementation_plan/protocol. "
+                "Do not guess endpoint, secret name, auth scheme, inputs, or outputs. "
+                "For network/API adapters, include `if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\": return mock_result`, "
+                "read secrets only with os.getenv(DECLARED_ENV_NAME), never payload.get('api_key'), and never print or return secrets. "
+                "Include run(payload), manifest function wrapper, and JSON main()."
             ),
         },
         {
@@ -5953,7 +6739,13 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     validation: dict[str, Any] = {}
 
     for attempt in range(3):
-        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=sample_input, dynamic=True, real_run=False)
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=adapter_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+        )
         static_errors = _author_adapter_static_errors(adapter_code, manifest)
         if static_errors:
             validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
@@ -5966,7 +6758,13 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         if attempt >= 2:
             break
 
-        repair_log.append({"attempt": attempt + 1, "errors": validation.get("errors", []), "warnings": validation.get("warnings", [])})
+        repair_log.append(
+            {
+                "attempt": attempt + 1,
+                "errors": validation.get("errors", []),
+                "warnings": validation.get("warnings", []),
+            }
+        )
         repair_messages = [
             {
                 "role": "system",
@@ -5975,13 +6773,22 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"manifest": manifest, "sample_input": sample_input, "validation": validation, "adapter_code": adapter_code},
+                    {
+                        "manifest": manifest,
+                        "sample_input": sample_input,
+                        "validation": validation,
+                        "adapter_code": adapter_code,
+                    },
                     ensure_ascii=False,
                 ),
             },
         ]
 
-        repair_json, _repair_ack, repair_err = await _complete_author_model("code", repair_messages, reason="creator_tool_author_repair")
+        repair_json, _repair_ack, repair_err = await _complete_author_model(
+            "code",
+            repair_messages,
+            reason="creator_tool_author_repair",
+        )
         repaired = _strip_code_fence(str(repair_json.get("adapter_code") or repair_json.get("code") or "")) if repair_json else ""
         if repair_err or not repaired:
             warnings.append(f"automatic repair stopped; using fallback/local code: {repair_err or 'empty repair'}")
@@ -5989,6 +6796,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         adapter_code = repaired
 
     validation["repair_log"] = repair_log
+    validation["adapter_contract"] = contract
 
     return {
         "needs_clarification": False,
@@ -6004,7 +6812,6 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         "warnings": warnings,
         "requires_human_confirmation": True,
     }
-
 
 async def stream_author_tool(request: dict[str, Any]):
     """SSE-friendly wrapper that emits coarse progress events for long authoring actions."""

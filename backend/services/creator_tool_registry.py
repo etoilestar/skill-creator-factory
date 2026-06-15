@@ -3139,6 +3139,8 @@ def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
         "declared_env": [],
         "declared_secrets": [],
         "auth_config_present": False,
+        "auth_decision_present": False,
+        "auth_decision_required": "unknown",
         "uses_subprocess": False,
         "writes_file": False,
     }
@@ -3157,20 +3159,44 @@ def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
             declared_secrets.update(str(item) for item in value if item)
 
     auth = manifest.get("auth") if isinstance(manifest.get("auth"), dict) else {}
-    auth_decision = manifest.get("auth_decision") if isinstance(manifest.get("auth_decision"), dict) else {}
+    auth_decision_raw = manifest.get("auth_decision") if isinstance(manifest.get("auth_decision"), dict) else {}
+    auth_decision = _normalize_auth_decision(auth_decision_raw, default_required="unknown")
 
-    facts["auth_config_present"] = bool(
-        auth or
-        auth_decision or
-        manifest.get("needs_secret") or
-        declared_secrets
+    facts["auth_decision_present"] = bool(auth_decision_raw)
+    facts["auth_decision_required"] = auth_decision.get("required") or "unknown"
+
+    security_schemes = auth_decision.get("security_schemes") or []
+    non_none_schemes = []
+    for scheme in security_schemes:
+        if not isinstance(scheme, dict):
+            continue
+        scheme_type = _normalize_auth_type(scheme.get("type"))
+        if scheme_type not in {"", "none"}:
+            non_none_schemes.append(scheme)
+
+    manifest_auth_requires_secret = bool(
+        auth
+        or manifest.get("needs_secret") is True
+        or manifest.get("requires_secret") is True
+        or declared_secrets
+        or auth_decision.get("required") == "yes"
+        or (
+            auth_decision.get("required") == "unknown"
+            and bool(non_none_schemes)
+        )
     )
+
+    facts["auth_config_present"] = manifest_auth_requires_secret
 
     try:
         tree = ast.parse(code or "")
     except SyntaxError:
         facts["declared_env"] = sorted(declared_env)
         facts["declared_secrets"] = sorted(declared_secrets)
+        facts["auth_config_present"] = bool(
+            facts["auth_config_present"]
+            or declared_secrets
+        )
         return facts
 
     network_roots = {"requests", "httpx", "aiohttp", "urllib"}
@@ -3179,17 +3205,21 @@ def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             roots = {alias.name.split(".")[0] for alias in node.names}
+
             if roots & network_roots:
                 facts["has_network_import"] = True
                 facts["uses_external_network"] = True
+
             if roots & subprocess_roots:
                 facts["uses_subprocess"] = True
 
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
+
             if root in network_roots:
                 facts["has_network_import"] = True
                 facts["uses_external_network"] = True
+
             if root in subprocess_roots:
                 facts["uses_subprocess"] = True
 
@@ -3217,6 +3247,7 @@ def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
                 target = ast.unparse(node.value)
             except Exception:
                 target = ""
+
             if target.endswith("environ"):
                 facts["reads_env_secret"] = True
 
@@ -3226,10 +3257,11 @@ def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
 
     facts["declared_env"] = sorted(declared_env)
     facts["declared_secrets"] = sorted(declared_secrets)
+
     facts["auth_config_present"] = bool(
-        facts["auth_config_present"] or
-        facts["reads_env_secret"] or
-        declared_secrets
+        facts["auth_config_present"]
+        or facts["reads_env_secret"]
+        or declared_secrets
     )
 
     return facts
@@ -3510,9 +3542,31 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         **(plan if isinstance(plan, dict) else {}),
     }
 
+    model_tool_kind = str(normalized.get("tool_kind") or "").strip()
+    model_wrapper_family = str(normalized.get("wrapper_family") or "").strip()
+
     wrapper_family = (
         str(request.get("wrapper_family") or "").strip()
-        or str(normalized.get("wrapper_family") or "").strip()
+        or model_wrapper_family
+        or (
+            model_tool_kind
+            if model_tool_kind in {
+                "web_fetch",
+                "external_api",
+                "http_api",
+                "local_helper",
+                "data_transform",
+                "python_helper",
+                "file_generator",
+                "file_converter",
+                "database_query",
+                "local_command",
+                "document_generator",
+                "image_generator",
+                "custom_adapter",
+            }
+            else ""
+        )
         or str(fallback.get("wrapper_family") or "").strip()
         or _infer_wrapper_family(request)
     )
@@ -3530,12 +3584,14 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         "questions",
         "clarification_questions",
         "config_required_fields",
-        "additional_fields_schema",
         "missing_fields",
         "authoring_tool_plan",
     ):
         if not isinstance(normalized.get(key), list):
             normalized[key] = []
+
+    if not isinstance(normalized.get("additional_fields_schema"), (list, dict)):
+        normalized["additional_fields_schema"] = []
 
     for key in (
         "config_form_schema",
@@ -3549,6 +3605,9 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
     if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
         normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
 
+    if wrapper_family == "web_fetch":
+        normalized["tool_kind"] = "web_fetch"
+
     if not normalized.get("operation"):
         normalized["operation"] = str(
             request.get("operation")
@@ -3561,7 +3620,6 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         normalized["manifest"] = fallback.get("manifest") or {}
 
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
-
     auth_override = _auth_override_from_request(request)
 
     raw_decision = normalized.get("auth_decision")
@@ -3576,6 +3634,15 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
 
     auth_decision = _normalize_auth_decision(raw_decision)
 
+    if wrapper_family == "web_fetch" and auth_decision["required"] == "unknown":
+        auth_decision = {
+            "required": "no",
+            "confidence": 0.9,
+            "reason": "public web page retrieval/parsing is a no-auth web_fetch tool unless secrets or auth schemes are explicitly declared",
+            "evidence": ["wrapper_family=web_fetch"],
+            "security_schemes": [{"type": "none"}],
+        }
+
     if auth_decision["required"] == "unknown" and isinstance(fallback.get("auth_decision"), dict):
         auth_decision = fallback["auth_decision"]
 
@@ -3584,6 +3651,76 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         auth_decision = override_decision
 
     manifest = dict(normalized.get("manifest") or {})
+
+    model_config_schema = normalized.get("config_form_schema") if isinstance(normalized.get("config_form_schema"), dict) else {}
+    model_config_required = list(normalized.get("config_required_fields") or [])
+    model_additional_schema = normalized.get("additional_fields_schema")
+
+    def _schema_properties(schema: Any) -> dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        return properties if isinstance(properties, dict) else {}
+
+    def _schema_required(schema: Any) -> list[str]:
+        if not isinstance(schema, dict):
+            return []
+        required = schema.get("required")
+        return [str(item) for item in required if isinstance(item, str)] if isinstance(required, list) else []
+
+    def _merge_input_schema_from_model_config(base_manifest: dict[str, Any]) -> dict[str, Any]:
+        merged_manifest = dict(base_manifest or {})
+
+        input_schema = merged_manifest.get("input_schema")
+        if not isinstance(input_schema, dict):
+            legacy_inputs = merged_manifest.get("inputs")
+            if isinstance(legacy_inputs, dict) and legacy_inputs:
+                input_schema = {
+                    "type": "object",
+                    "properties": legacy_inputs,
+                    "required": [
+                        key for key, value in legacy_inputs.items()
+                        if isinstance(value, dict) and value.get("required") is True
+                    ],
+                }
+            else:
+                input_schema = {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                }
+
+        properties = dict(_schema_properties(input_schema))
+        required = set(_schema_required(input_schema))
+
+        for key, value in _schema_properties(model_config_schema).items():
+            if key not in properties:
+                properties[key] = value
+
+        for key in model_config_required:
+            if key in properties:
+                required.add(key)
+
+        if isinstance(model_additional_schema, dict):
+            for key, value in _schema_properties(model_additional_schema).items():
+                if key not in properties:
+                    properties[key] = value
+
+        input_schema = {
+            **input_schema,
+            "type": "object",
+            "properties": properties,
+            "required": sorted(required),
+        }
+
+        merged_manifest["input_schema"] = input_schema
+        merged_manifest["inputs"] = properties
+
+        return merged_manifest
+
+    if wrapper_family == "web_fetch":
+        manifest = _merge_input_schema_from_model_config(manifest)
+
     manifest["auth_decision"] = auth_decision
     manifest["auth_override"] = auth_override
     normalized["manifest"] = manifest
@@ -3705,6 +3842,62 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         else:
             normalized["ready_for_code_generation"] = False
 
+    elif wrapper_family == "web_fetch":
+        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+        if not sample and isinstance(normalized.get("sample_input"), dict):
+            sample = normalized.get("sample_input") or {}
+
+        input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
+        input_props = _schema_properties(input_schema)
+        input_required = _schema_required(input_schema)
+
+        normalized["tool_kind"] = "web_fetch"
+        normalized["requires_external_network"] = True
+        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
+        normalized["requires_secret"] = auth_decision["required"] == "yes"
+        normalized["requires_config"] = auth_gate["status"] in {"needs_config", "needs_review"}
+        normalized["requires_live_test"] = auth_gate["status"] == "needs_live_test"
+        normalized["ready_for_live_test"] = False
+        normalized["config_required_fields"] = []
+        normalized["config_form_schema"] = {}
+        normalized["suggested_config_schema"] = {}
+        normalized["additional_fields_schema"] = []
+        normalized["missing_fields"] = []
+        normalized["sample_input_schema"] = input_schema or {
+            "type": "object",
+            "properties": input_props,
+            "required": input_required,
+        }
+
+        if not sample:
+            sample = {
+                key: (
+                    value.get("default")
+                    if isinstance(value, dict) and "default" in value
+                    else "demo"
+                )
+                for key, value in input_props.items()
+            }
+            if "target_url" in input_props:
+                sample["target_url"] = "https://example.com/article"
+            if "content_selector" in input_props:
+                sample["content_selector"] = "article"
+
+        normalized["sample_input"] = sample
+
+        normalized["authoring_tool_plan"] = [
+            item
+            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
+            if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
+        ]
+
+        normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
+
+        if normalized["requires_authoring_tools"]:
+            normalized["ready_for_code_generation"] = False
+        else:
+            normalized["ready_for_code_generation"] = bool(manifest)
+
     else:
         normalized["requires_config"] = auth_gate["status"] in {
             "needs_config",
@@ -3753,6 +3946,24 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
     normalized["questions"] = normalized["clarification_questions"]
     normalized["needs_clarification"] = bool(normalized["clarification_questions"])
 
+    if wrapper_family == "web_fetch":
+        normalized["requires_config"] = normalized["auth_gate"].get("status") in {
+            "needs_config",
+            "needs_review",
+        }
+        normalized["config_required_fields"] = []
+        normalized["config_form_schema"] = {}
+        normalized["suggested_config_schema"] = {}
+        normalized["additional_fields_schema"] = []
+        normalized["authoring_tool_plan"] = [
+            item
+            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
+            if item.get("tool_name") not in {"authoring_config_collector", "authoring_live_test"}
+        ]
+        normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
+        if not normalized["requires_authoring_tools"] and not normalized.get("needs_clarification"):
+            normalized["ready_for_code_generation"] = bool(normalized.get("manifest"))
+
     if (
         request.get("stage") == "draft"
         and not normalized.get("needs_clarification")
@@ -3760,7 +3971,7 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         and normalized.get("tool_kind") != "external_api"
         and not normalized.get("ready_for_code_generation")
         and "ready_for_code_generation" not in (plan or {})
-        and not auth_gate.get("block_code_generation")
+        and not normalized.get("auth_gate", {}).get("block_code_generation")
     ):
         normalized["ready_for_code_generation"] = True
 

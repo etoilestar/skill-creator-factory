@@ -98,6 +98,52 @@
             </div>
           </div>
 
+          <div
+              v-if="!clarificationQuestions.length"
+              class="manual-auth-panel compact-preview"
+              :class="{ 'manual-active': manualAuthOverride.mode !== 'auto' }"
+          >
+              <div>
+                <strong>人工认证判定</strong>
+                <p class="muted small">
+                  当前模式：{{ manualAuthModeLabel }}。用于修正 planner / 系统误判，只影响认证 gate，不绕过代码安全校验。
+                </p>
+                <small v-if="manualAuthOverride.reason">
+                  原因：{{ manualAuthOverride.reason }}
+                </small>
+              </div>
+
+              <div class="manual-auth-actions">
+                <button
+                  class="btn-primary"
+                  type="button"
+                  :disabled="busy"
+                  @click="forceRequireAuth"
+                >
+                  + 手动添加认证配置
+                </button>
+
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="busy"
+                  @click="forceNoAuth"
+                >
+                  - 手动删除认证要求
+                </button>
+
+                <button
+                  v-if="manualAuthOverride.mode !== 'auto'"
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="busy"
+                  @click="clearManualAuthOverride"
+                >
+                  恢复自动判断
+                </button>
+              </div>
+          </div>
+
           <div v-if="liveTestRunning || liveTestResult || liveTestError" ref="liveTestResultRef" class="validation live-test-card" :class="liveTestResult?.success ? 'ok' : liveTestError || liveTestResult ? 'bad' : ''">
             <div class="live-test-heading">
               <strong>{{ liveTestRunning ? '正在测试连接...' : liveTestResult?.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
@@ -1266,10 +1312,66 @@ function rememberLiveTestResult(result) {
   liveTestHistory.value.unshift({ time: new Date().toISOString(), result })
   if (liveTestHistory.value.length > 10) liveTestHistory.value.pop()
 }
+function normalizeManualAuthOverride(override = {}) {
+  if (!override || typeof override !== 'object') {
+    return null
+  }
+
+  const aliases = {
+    required: 'force_required',
+    force_auth: 'force_required',
+    add: 'force_required',
+    add_auth: 'force_required',
+    no_auth: 'force_no_auth',
+    remove: 'force_no_auth',
+    remove_auth: 'force_no_auth',
+    none: 'force_no_auth'
+  }
+
+  let mode = String(override.mode || 'auto').trim().toLowerCase()
+  mode = aliases[mode] || mode
+
+  if (!['auto', 'force_required', 'force_no_auth'].includes(mode)) {
+    mode = 'auto'
+  }
+
+  return {
+    mode,
+    reason: String(override.reason || ''),
+    source: String(override.source || 'user'),
+    updated_at: String(override.updated_at || '')
+  }
+}
+
+function applyManualAuthOverrideFromData(data = {}) {
+  const override =
+    data?.auth_override ||
+    data?.config?.auth_override ||
+    data?.manifest?.auth_override ||
+    data?.authoring_context?.auth_override
+
+  const normalized = normalizeManualAuthOverride(override)
+  if (!normalized) return
+
+  manualAuthOverride.mode = normalized.mode
+  manualAuthOverride.reason = normalized.reason
+  manualAuthOverride.source = normalized.source
+  manualAuthOverride.updated_at = normalized.updated_at
+
+  if (normalized.mode !== 'auto') {
+    applyManualAuthOverrideToPlan()
+  }
+}
 function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
 function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
 function applyAuthorResult(data = {}) {
-  planState.value = { ...planState.value, ...data }
+  applyManualAuthOverrideFromData(data)
+
+  planState.value = {
+    ...planState.value,
+    ...data,
+    auth_override: manualAuthOverridePayload()
+  }
 
   const liveResult = extractLiveTestResult(data)
   rememberLiveTestResult(liveResult)
@@ -1308,6 +1410,15 @@ function applyAuthorResult(data = {}) {
       ...(data.manifest || {}),
       auth_override: manualAuthOverridePayload()
     }
+
+    if (planState.value?.auth_decision) {
+      manifest.auth_decision = planState.value.auth_decision
+    }
+
+    if (authGate.value) {
+      manifest.auth_gate = authGate.value
+    }
+
     manifestText.value = JSON.stringify(manifest, null, 2)
   }
 
@@ -1384,6 +1495,8 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
     auth_override: manualAuthOverridePayload()
   })
 
+  applyManualAuthOverrideFromData(configSaveResult.value)
+
   configForm.secret_value = ''
 
   if (configureAfterSave) {
@@ -1392,6 +1505,7 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
       config: canonicalAuthoringConfig(),
       auth_override: manualAuthOverridePayload()
     })
+
     applyAuthorResult(data)
   }
 }
@@ -1818,6 +1932,24 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
 .adapter-fixed-code {
   margin: 0 12px 12px;
   max-height: 320px;
+}
+
+.manual-auth-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.manual-auth-panel.manual-active {
+  border-color: var(--accent);
+}
+
+.manual-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
 }
 small { display: block; color: var(--text-muted); } .green { color: var(--success); }
 @media (max-width: 1100px) { .drawer-snippet-layout { grid-template-columns: 1fr; } }

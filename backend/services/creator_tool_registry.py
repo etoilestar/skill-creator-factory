@@ -101,6 +101,12 @@ def _persist_tool_authoring_config_store_to_disk() -> None:
         pass
 
 def _infer_wrapper_family(request: dict[str, Any]) -> str:
+    """Infer wrapper family from explicit runtime contract only.
+
+    This intentionally does not use tool_kind or needs_external_network to select
+    a wrapper. Those are semantic hints. The planner/validator/repair loop must
+    convert them into required_capabilities first.
+    """
     request = request if isinstance(request, dict) else {}
 
     explicit = str(
@@ -162,8 +168,8 @@ def _infer_wrapper_family(request: dict[str, Any]) -> str:
     if code.strip():
         return "python_compute"
 
-    # 没有足够结构信息时，不要猜 managed_helper。
-    # 让合同校验模型判断 capability 是否不足并修复。
+    # Do not use needs_external_network here. External network is a capability,
+    # not a wrapper selector.
     return "python_compute"
 
 def _restore_env_from_authoring_record(record: dict[str, Any] | None) -> None:
@@ -939,6 +945,70 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         validator_kind="helper_import",
         usage_policy="helper_preferred",
         prompt_guidance="视觉理解可优先使用 analyze_image_with_vision 或 ocr_image；试运行时可返回 mock 结果。",
+    ),
+    "http_request": ToolCapability(
+        name="http_request",
+        display_name="HTTP/API 请求",
+        category="retrieval",
+        roles=["search_reader", "generic_script"],
+        helper_imports=[],
+        validator_kind="external_http",
+        usage_policy="self_implementation_allowed",
+        prompt_guidance=(
+            "Use this capability for fixed HTTP/API calls where the request is described by a stable "
+            "endpoint/base_url, method, headers/query/body templates, and optional auth config. "
+            "It must be implemented by the http_api wrapper. The code_model must only write "
+            "normalize_response(data, payload), never a full requests/httpx adapter."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "description": "Runtime payload used to render HTTP request templates.",
+                }
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "success": {"type": "boolean"},
+                "result": {"type": "object"},
+                "status_code": {"type": "integer"},
+            },
+        },
+    ),
+
+    "network_read": ToolCapability(
+        name="network_read",
+        display_name="网络资源读取",
+        category="retrieval",
+        roles=["search_reader", "generic_script"],
+        helper_imports=["fetch_url_text"],
+        validator_kind="helper_import",
+        usage_policy="helper_required",
+        prompt_guidance=(
+            "Use this capability when the tool needs to read external network resources through "
+            "a platform-managed helper rather than a fixed provider API. It must be implemented by "
+            "the managed_helper wrapper with helper_contract.helper_name chosen from helper_imports."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "A runtime-provided network resource identifier such as a URL.",
+                }
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "source": {"type": "string"},
+                "success": {"type": "boolean"},
+            },
+        },
     ),
     "web_search": ToolCapability(
         name="web_search",
@@ -2491,19 +2561,37 @@ WRAPPER_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 CAPABILITY_TO_WRAPPER: dict[str, str] = {
+    # Fixed remote APIs with stable endpoint/templates.
     "http_request": "http_api",
-    "web_search": "managed_helper",
+
+    # Platform-managed helpers. These are generic capability classes, not business cases.
     "network_read": "managed_helper",
+    "web_search": "managed_helper",
     "text_generation": "managed_helper",
     "image_generation": "managed_helper",
     "pdf_generation": "managed_helper",
     "docx_generation": "managed_helper",
     "pptx_generation": "managed_helper",
+    "pdf_parsing": "managed_helper",
+    "docx_parsing": "managed_helper",
+    "pptx_parsing": "managed_helper",
     "spreadsheet_read": "managed_helper",
     "vision_understanding": "managed_helper",
-    "database_read": "database_query",
-    "file_output": "file_io",
+
+    # Local deterministic computation.
     "deterministic_execution": "python_compute",
+
+    # File-producing local/document tools.
+    "file_output": "file_io",
+    "html_asset_generation": "file_io",
+    "asset_generation": "file_io",
+
+    # Restricted read-only database operations.
+    "database_read": "database_query",
+
+    # High-risk local command tools.
+    "local_command": "local_command",
+    "shell_command": "local_command",
 }
 
 _PROTOCOL_CONFIG_FIELDS = {
@@ -2538,6 +2626,12 @@ _RUNTIME_SCOPES = {
 
 
 def _canonical_wrapper_family(value: Any) -> str:
+    """Normalize only wrapper-family aliases.
+
+    Do not map business semantics such as web_fetch/search/summarizer/crawler
+    into wrapper families here. Business semantics belong to tool_kind and must
+    be resolved by planner/validator/repair through capabilities.
+    """
     text = str(value or "").strip().lower()
 
     aliases = {
@@ -2545,7 +2639,7 @@ def _canonical_wrapper_family(value: Any) -> str:
         "auto": "python_compute",
         "unknown": "python_compute",
 
-        # 只保留 wrapper 层 alias，不保留业务语义 alias。
+        # Runtime wrapper aliases only.
         "external_api": "http_api",
         "api": "http_api",
         "rest_api": "http_api",
@@ -2748,13 +2842,18 @@ def _required_capabilities_from_contract(manifest: dict[str, Any], plan: dict[st
 
 
 def _infer_helper_name_from_capabilities(capabilities: list[str]) -> str:
+    """Choose a helper only from the selected capability's helper_imports."""
+    all_caps: dict[str, ToolCapability] = {
+        **BUILTIN_TOOL_CAPABILITIES,
+        **_REGISTERED_TOOL_CAPABILITIES,
+    }
+
     for capability in capabilities:
-        cap = BUILTIN_TOOL_CAPABILITIES.get(capability) or _REGISTERED_TOOL_CAPABILITIES.get(capability)
+        cap = all_caps.get(str(capability or "").strip())
         if cap and cap.helper_imports:
             return cap.helper_imports[0]
 
     return ""
-
 
 def _build_tool_contract(
     *,
@@ -2776,20 +2875,40 @@ def _build_tool_contract(
 
     capabilities = _required_capabilities_from_contract(manifest, plan)
 
-    helper_contract = {}
-    if isinstance(plan.get("helper_contract"), dict):
-        helper_contract.update(plan["helper_contract"])
+    if not capabilities:
+        if wrapper_family == "http_api":
+            capabilities = ["http_request"]
+        elif wrapper_family == "managed_helper":
+            capabilities = []
+        elif wrapper_family == "database_query":
+            capabilities = ["database_read"]
+        elif wrapper_family == "file_io":
+            capabilities = ["file_output"]
+        elif wrapper_family == "python_compute":
+            capabilities = ["deterministic_execution"]
+        elif wrapper_family == "local_command":
+            capabilities = ["local_command"]
+
+    normalized_capabilities: list[str] = []
+    for item in capabilities:
+        text = str(item or "").strip()
+        if text and text not in normalized_capabilities:
+            normalized_capabilities.append(text)
+
+    capabilities = normalized_capabilities
+
+    helper_contract: dict[str, Any] = {}
     if isinstance(manifest.get("helper_contract"), dict):
         helper_contract.update(manifest["helper_contract"])
+    if isinstance(plan.get("helper_contract"), dict):
+        helper_contract.update(plan["helper_contract"])
 
     helper_name = str(
         plan.get("helper_name")
         or helper_contract.get("helper_name")
+        or _infer_helper_name_from_capabilities(capabilities)
         or ""
     ).strip()
-
-    if not helper_name:
-        helper_name = _infer_helper_name_from_capabilities(capabilities)
 
     if helper_name:
         helper_contract["helper_name"] = helper_name
@@ -2804,7 +2923,11 @@ def _build_tool_contract(
     )
 
     manifest["wrapper_family"] = wrapper_family
-    manifest["tool_kind"] = plan.get("tool_kind") or manifest.get("tool_kind") or _infer_tool_kind({**request, **plan, "manifest": manifest})
+    manifest["tool_kind"] = (
+        plan.get("tool_kind")
+        or manifest.get("tool_kind")
+        or _infer_tool_kind({**request, **plan, "manifest": manifest})
+    )
     manifest["required_capabilities"] = capabilities
 
     if helper_contract:
@@ -2823,6 +2946,7 @@ def _build_tool_contract(
         "auth_decision": plan.get("auth_decision") or manifest.get("auth_decision") or {},
         "auth_gate": plan.get("auth_gate") or manifest.get("auth_gate") or {},
     }
+
 
 def _capability_allowed_wrappers(capability_name: str) -> list[str]:
     wrapper = CAPABILITY_TO_WRAPPER.get(str(capability_name or "").strip())
@@ -2979,12 +3103,12 @@ async def _run_contract_validation_model(
                 "You are contract_validator_model for a generic Tool Authoring system. "
                 "Return strict JSON only. "
                 "Your job is semantic consistency validation, not code generation. "
-                "Do not hard-code provider-specific rules. "
-                "Use only the finite wrapper/capability registry provided by the user. "
+                "Do not hard-code provider-specific rules or example business cases. "
+                "Use only the finite wrapper/capability/helper registry provided by the user. "
                 "Check whether the draft ToolContract can implement the user's requested capability. "
-                "If the contract is inconsistent or under-specified, return status='repair' with structured issues. "
+                "If wrapper/capability/helper are inconsistent or under-specified, return status='repair'. "
                 "If multiple implementations are genuinely possible and cannot be chosen from the request, return status='needs_user'. "
-                "If it is valid, return status='pass'. "
+                "If valid, return status='pass'. "
                 "Never output Python code."
             ),
         },
@@ -2998,6 +3122,8 @@ async def _run_contract_validation_model(
                         "tool_name": request.get("tool_name"),
                         "input_description": request.get("input_description"),
                         "output_description": request.get("output_description"),
+                        "tool_kind": request.get("tool_kind"),
+                        "needs_external_network": request.get("needs_external_network"),
                         "clarification_answers": request.get("clarification_answers") or [],
                     },
                     "draft_plan": plan,
@@ -3018,12 +3144,12 @@ async def _run_contract_validation_model(
                                     "wrapper_family": "optional",
                                     "required_capabilities": [],
                                     "helper_contract": {},
-                                    "manifest_patch": {}
+                                    "manifest_patch": {},
                                 },
                                 "needs_user_confirmation": False,
-                                "question": {}
+                                "question": {},
                             }
-                        ]
+                        ],
                     },
                 },
                 ensure_ascii=False,
@@ -3039,6 +3165,7 @@ async def _run_contract_validation_model(
 
     if ack:
         model_notes.append(f"contract_validator_model={ack['model']}")
+
     if err:
         warnings.append(f"contract validator unavailable, used deterministic contract validation only: {err}")
         if deterministic["success"]:
@@ -3065,6 +3192,7 @@ async def _run_contract_validation_model(
             "deterministic": deterministic,
         }
 
+    result = result if isinstance(result, dict) else {}
     status = str(result.get("status") or "").strip().lower()
     if status not in {"pass", "repair", "needs_user", "fail"}:
         status = "pass" if deterministic.get("success") else "repair"
@@ -3108,13 +3236,17 @@ async def _repair_contract_with_model(
             "content": (
                 "You are contract_repair_model for Tool Authoring. "
                 "Return strict JSON only. "
-                "Repair only the ToolContract fields: wrapper_family, required_capabilities, helper_contract, manifest, sample_input, config_form_schema, auth_decision. "
+                "Repair only ToolContract fields: wrapper_family, required_capabilities, helper_contract, "
+                "manifest, sample_input, config_form_schema, auth_decision. "
                 "Do not generate adapter code. "
                 "Do not invent provider-specific registry entries. "
                 "Choose wrapper_family only from wrapper_registry. "
                 "Choose required_capabilities only from capability_registry. "
                 "For managed_helper, choose helper_contract.helper_name only from helper_imports of selected capabilities. "
-                "If the validation says needs_user, preserve that and create clarification_questions instead of guessing."
+                "Prefer this output shape: "
+                "{\"plan_patch\": {...}, \"manifest_patch\": {...}, \"clarification_questions\": [], \"notes\": []}. "
+                "If you return top-level patch fields, the system will still normalize them. "
+                "If validation says needs_user, preserve that and create clarification_questions instead of guessing."
             ),
         },
         {
@@ -3127,6 +3259,8 @@ async def _repair_contract_with_model(
                         "tool_name": request.get("tool_name"),
                         "input_description": request.get("input_description"),
                         "output_description": request.get("output_description"),
+                        "tool_kind": request.get("tool_kind"),
+                        "needs_external_network": request.get("needs_external_network"),
                         "clarification_answers": request.get("clarification_answers") or [],
                     },
                     "current_plan": plan,
@@ -3154,46 +3288,144 @@ async def _repair_contract_with_model(
         model_notes.append(f"contract_repair_model={ack['model']}")
     if err:
         warnings.append(f"contract repair model unavailable: {err}")
-        return plan
+        result = {}
+
+    result = result if isinstance(result, dict) else {}
 
     repaired = dict(plan or {})
+    manifest = dict(repaired.get("manifest") or {})
 
-    plan_patch = result.get("plan_patch") if isinstance(result.get("plan_patch"), dict) else {}
-    manifest_patch = result.get("manifest_patch") if isinstance(result.get("manifest_patch"), dict) else {}
+    allowed_plan_keys = {
+        "wrapper_family",
+        "tool_kind",
+        "required_capabilities",
+        "helper_contract",
+        "helper_name",
+        "auth_decision",
+        "config_form_schema",
+        "sample_input",
+        "requires_config",
+        "requires_external_network",
+        "requires_live_test",
+        "ready_for_code_generation",
+        "implementation_plan",
+    }
+
+    allowed_manifest_keys = {
+        "wrapper_family",
+        "tool_kind",
+        "required_capabilities",
+        "helper_contract",
+        "auth_decision",
+        "auth_gate",
+        "auth_override",
+        "input_schema",
+        "output_schema",
+        "inputs",
+        "outputs",
+        "tool_type",
+        "needs_external_network",
+        "required_env",
+        "required_secrets",
+        "security_schemes",
+    }
+
+    def deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(base or {})
+        for key, value in (patch or {}).items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = deep_merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def normalize_capabilities(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        result_caps: list[str] = []
+        for item in values:
+            text = str(item or "").strip()
+            if text and text not in result_caps:
+                result_caps.append(text)
+        return result_caps
+
+    plan_patch: dict[str, Any] = {}
+    manifest_patch: dict[str, Any] = {}
+
+    if isinstance(result.get("plan_patch"), dict):
+        plan_patch.update(result["plan_patch"])
+
+    if isinstance(result.get("manifest_patch"), dict):
+        manifest_patch.update(result["manifest_patch"])
+
+    for key in allowed_plan_keys:
+        if key in result:
+            plan_patch[key] = result[key]
+
+    if isinstance(result.get("manifest"), dict):
+        manifest_patch = deep_merge_dict(manifest_patch, result["manifest"])
+
+    if not plan_patch and not manifest_patch:
+        for issue in validation.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+
+            suggested = issue.get("suggested_patch")
+            if not isinstance(suggested, dict):
+                continue
+
+            for key in allowed_plan_keys:
+                if key in suggested:
+                    plan_patch[key] = suggested[key]
+
+            if isinstance(suggested.get("manifest_patch"), dict):
+                manifest_patch = deep_merge_dict(manifest_patch, suggested["manifest_patch"])
+
+            for key in allowed_manifest_keys:
+                if key in suggested:
+                    manifest_patch[key] = suggested[key]
 
     for key, value in plan_patch.items():
-        if key in {
-            "wrapper_family",
-            "tool_kind",
-            "required_capabilities",
-            "helper_contract",
-            "helper_name",
-            "auth_decision",
-            "config_form_schema",
-            "sample_input",
-            "requires_config",
-            "requires_external_network",
-            "requires_live_test",
-            "ready_for_code_generation",
-            "implementation_plan",
-        }:
+        if key in allowed_plan_keys:
             repaired[key] = value
 
-    manifest = dict(repaired.get("manifest") or {})
     for key, value in manifest_patch.items():
-        manifest[key] = value
+        if key in allowed_manifest_keys:
+            if isinstance(value, dict) and isinstance(manifest.get(key), dict):
+                manifest[key] = deep_merge_dict(manifest[key], value)
+            else:
+                manifest[key] = value
 
-    if "wrapper_family" in repaired:
+    if repaired.get("wrapper_family"):
         manifest["wrapper_family"] = repaired["wrapper_family"]
 
-    if "required_capabilities" in repaired:
-        manifest["required_capabilities"] = repaired["required_capabilities"]
+    if repaired.get("tool_kind"):
+        manifest["tool_kind"] = repaired["tool_kind"]
 
-    if "helper_contract" in repaired:
-        manifest["helper_contract"] = repaired["helper_contract"]
-
-    if "auth_decision" in repaired:
+    if repaired.get("auth_decision"):
         manifest["auth_decision"] = repaired["auth_decision"]
+
+    caps = normalize_capabilities(repaired.get("required_capabilities"))
+    if not caps:
+        caps = normalize_capabilities(manifest.get("required_capabilities"))
+
+    if caps:
+        repaired["required_capabilities"] = caps
+        manifest["required_capabilities"] = caps
+
+    helper_contract: dict[str, Any] = {}
+    if isinstance(manifest.get("helper_contract"), dict):
+        helper_contract.update(manifest["helper_contract"])
+    if isinstance(repaired.get("helper_contract"), dict):
+        helper_contract.update(repaired["helper_contract"])
+
+    helper_name = str(repaired.get("helper_name") or helper_contract.get("helper_name") or "").strip()
+    if helper_name:
+        helper_contract["helper_name"] = helper_name
+
+    if helper_contract:
+        repaired["helper_contract"] = helper_contract
+        manifest["helper_contract"] = helper_contract
 
     repaired["manifest"] = manifest
 
@@ -3206,7 +3438,10 @@ async def _repair_contract_with_model(
 
     notes = result.get("notes")
     if isinstance(notes, list):
-        repaired["model_notes"] = [*repaired.get("model_notes", []), *[str(item) for item in notes if item]]
+        repaired["model_notes"] = [
+            *repaired.get("model_notes", []),
+            *[str(item) for item in notes if item],
+        ]
 
     return repaired
 
@@ -3274,7 +3509,7 @@ async def _validate_and_repair_contract_loop(
                     {
                         "id": "implementation_choice",
                         "type": "short_text",
-                        "question": "这个工具有多种实现方式，请补充你希望使用平台内置能力、固定 HTTP API，还是纯本地计算。",
+                        "question": "这个工具有多种合理实现方式，请补充希望使用哪类平台能力或外部系统。",
                         "required": True,
                     }
                 )
@@ -3502,6 +3737,11 @@ def _external_api_clarification_questions(request: dict[str, Any], config: dict[
 
 
 def _infer_tool_kind(request: dict[str, Any]) -> str:
+    """Infer only a human/business-facing semantic label.
+
+    tool_kind must not drive backend dispatch. It is for UI, logs, and semantic
+    validation prompts only.
+    """
     request = request if isinstance(request, dict) else {}
 
     explicit = str(request.get("tool_kind") or "").strip()
@@ -3531,6 +3771,10 @@ def _infer_tool_kind(request: dict[str, Any]) -> str:
         return "local_helper"
     if wrapper_family == "file_io":
         return "file_tool"
+    if wrapper_family == "database_query":
+        return "database_tool"
+    if wrapper_family == "managed_helper":
+        return "managed_helper_tool"
 
     return wrapper_family or "unknown"
 
@@ -3848,6 +4092,7 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         if wrapper_family == "http_api":
             manifest_seed["needs_external_network"] = True
             manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed.setdefault("required_capabilities", ["http_request"])
             manifest_seed["input_schema"] = request.get("input_schema") or {
                 "type": "object",
                 "properties": {
@@ -3862,17 +4107,23 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
 
         elif wrapper_family == "managed_helper":
             manifest_seed["tool_type"] = "custom_adapter"
-            manifest_seed.setdefault("required_capabilities", ["web_search"])
-            manifest_seed.setdefault("input_schema", request.get("input_schema") or {
-                "type": "object",
-                "properties": {
-                    "payload": {
-                        "type": "object",
-                        "description": "Runtime payload passed to the managed helper wrapper.",
-                    }
+            # Do not default to network_read/web_search here. The planner/repair loop
+            # must explicitly choose required_capabilities and helper_contract.
+            manifest_seed.setdefault("required_capabilities", [])
+            manifest_seed.setdefault(
+                "input_schema",
+                request.get("input_schema")
+                or {
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "object",
+                            "description": "Runtime payload passed to the managed helper wrapper.",
+                        }
+                    },
+                    "required": [],
                 },
-                "required": [],
-            })
+            )
 
         elif wrapper_family == "python_compute":
             manifest_seed["tool_type"] = "custom_adapter"
@@ -3881,6 +4132,10 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         elif wrapper_family == "file_io":
             manifest_seed["tool_type"] = "custom_adapter"
             manifest_seed.setdefault("required_capabilities", ["file_output"])
+
+        elif wrapper_family == "database_query":
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed.setdefault("required_capabilities", ["database_read"])
 
         manifest = build_tool_manifest_draft(manifest_seed)
 
@@ -4068,7 +4323,8 @@ def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
         "sample_input_schema": manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {},
         "manifest": manifest,
         "implementation_plan": (
-            "Use the finite wrapper registry. Generate only the wrapper-specific internal code, never a provider-specific full adapter."
+            "Use the finite wrapper/capability/helper registry. Generate only wrapper-specific internal code; "
+            "never generate a provider-specific full adapter unless custom_adapter is explicitly selected."
         ),
         "sample_input": sample,
         "risk_notes": notes,
@@ -6681,11 +6937,12 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
 
                 "tool_kind is open-ended business semantics for humans and later semantic validation. "
                 "Do not rely on tool_kind to select implementation. "
-                "Implementation must be represented by wrapper_family + required_capabilities + optional helper_contract. "
+                "Do not use examples or hard-coded business cases to select wrappers. "
+                "Implementation must be represented only by wrapper_family + required_capabilities + optional helper_contract. "
 
                 "For managed_helper, helper_contract.helper_name must be one of helper_imports exposed by the selected capabilities. "
-                "For http_api, use required_capabilities=[\"http_request\"] when it is a fixed remote API call. "
-                "For pure local deterministic computation, use wrapper_family=python_compute and required_capabilities=[\"deterministic_execution\"]. "
+                "For http_api, use a capability whose registry.allowed_wrapper is http_api. "
+                "For pure local deterministic computation, use a capability whose registry.allowed_wrapper is python_compute. "
 
                 "Authentication is independent from wrapper_family/tool_kind/network usage. "
                 "Represent auth only through auth_decision, security_schemes, required_secrets, config.auth_type, or config.secret_env. "
@@ -6743,15 +7000,6 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             normalized["questions"] = judged_questions
             normalized["needs_clarification"] = True
             normalized["ready_for_code_generation"] = False
-
-    if not normalized.get("needs_clarification"):
-        normalized = await _validate_and_repair_contract_loop(
-            request=request,
-            plan=normalized,
-            model_notes=model_notes,
-            warnings=warnings,
-            max_rounds=int(os.environ.get("TOOL_AUTHOR_CONTRACT_REPAIR_ROUNDS", "2")),
-        )
 
     model_notes.extend(normalized.get("model_notes") or [])
     return normalized
@@ -6878,7 +7126,6 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
     code_block = str(request.get("code_block") or "")
 
-    # 关键修改：统一走合同校验/修复闭环，不在 author_tool 内手写单轮 repair。
     plan = await _validate_and_repair_contract_loop(
         request=request,
         plan=plan,
@@ -7300,7 +7547,6 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             "requires_human_confirmation": True,
         }
 
-    # Last-resort custom adapter. This is the only branch where full adapter generation is allowed.
     manifest = raw_manifest
     mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
 

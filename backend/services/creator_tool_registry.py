@@ -100,6 +100,99 @@ def _persist_tool_authoring_config_store_to_disk() -> None:
     except OSError:
         pass
 
+def _infer_wrapper_family(request: dict[str, Any]) -> str:
+    explicit = str(request.get("wrapper_family") or "").strip()
+    if explicit and explicit != "auto":
+        if explicit == "external_api":
+            return "http_api"
+        if explicit in {"python_helper", "data_transform", "local_helper"}:
+            return "python_compute"
+        if explicit == "file_generator":
+            return "file_converter"
+        return explicit
+
+    tool_kind = str(request.get("tool_kind") or "").strip()
+    if tool_kind:
+        if tool_kind == "external_api":
+            return "http_api"
+        if tool_kind in {"local_helper", "data_transform"}:
+            return "python_compute"
+        if tool_kind == "file_generator":
+            return "file_converter"
+        if tool_kind in {
+            "web_fetch",
+            "database_query",
+            "local_command",
+            "file_converter",
+            "document_generator",
+            "image_generator",
+            "custom_adapter",
+        }:
+            return tool_kind
+
+    manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+    manifest_family = str(
+        manifest.get("wrapper_family") or
+        manifest.get("tool_kind") or
+        manifest.get("category") or
+        manifest.get("tool_type") or
+        ""
+    ).strip()
+
+    if manifest_family:
+        if manifest_family in {"external_api", "http_api"}:
+            return "http_api"
+        if manifest_family in {"python_helper", "data_transform", "local_helper"}:
+            return "python_compute"
+        if manifest_family == "file_generator":
+            return "file_converter"
+        if manifest_family in {
+            "web_fetch",
+            "database_query",
+            "local_command",
+            "file_converter",
+            "document_generator",
+            "image_generator",
+            "custom_adapter",
+        }:
+            return manifest_family
+
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+    if any(config.get(key) not in (None, "", {}, []) for key in ("base_url", "endpoint", "url")):
+        return "http_api"
+
+    if any(config.get(key) not in (None, "", {}, []) for key in ("database_url", "dsn", "connection_string")):
+        return "database_query"
+
+    explicit_tool_type = str(request.get("tool_type") or "").strip()
+    if explicit_tool_type and explicit_tool_type != "python_helper":
+        if explicit_tool_type == "http_api":
+            return "http_api"
+        if explicit_tool_type in {
+            "web_fetch",
+            "local_command",
+            "database_query",
+            "file_converter",
+            "document_generator",
+            "image_generator",
+            "custom_adapter",
+        }:
+            return explicit_tool_type
+
+    code = str(request.get("code_block") or "")
+    facts = extract_runtime_facts(code, manifest)
+    if facts.get("has_configurable_endpoint"):
+        return "http_api"
+    if facts.get("uses_external_network"):
+        return "web_fetch"
+
+    if request.get("generates_file"):
+        return "file_converter"
+
+    if request.get("needs_external_network"):
+        return "web_fetch"
+
+    return "python_compute"
 
 def _restore_env_from_authoring_record(record: dict[str, Any] | None) -> None:
     if not isinstance(record, dict):
@@ -116,14 +209,6 @@ def _tool_config_session_id(payload: dict[str, Any] | None = None) -> str:
     seed = str(payload.get("session_id") or payload.get("tool_name") or payload.get("operation") or payload.get("description") or "default")
     slug = _slug(seed) if "_slug" in globals() else re.sub(r"[^a-z0-9]+", "_", seed.lower()).strip("_")
     return slug or "default"
-
-
-def _env_name_for_tool_config(tool_name: str, key: str, *, secret: bool = False) -> str:
-    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper() or "TOOL"
-    suffix = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper() or ("SECRET" if secret else "CONFIG")
-    if secret and not any(token in suffix for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-        suffix = f"{suffix}_SECRET"
-    return f"{prefix}_{suffix}"
 
 def _tool_platform_env_prefix(tool_name: str) -> str:
     prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper()
@@ -300,7 +385,8 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     Single-user minimal version:
     - user-provided secret_env is treated only as source alias;
     - generated adapters read platform env names like TOOLCFG_<TOOL>_SECRET;
-    - key/base_url/method/templates are persisted and restored into os.environ.
+    - key/base_url/method/templates are persisted and restored into os.environ;
+    - auth_override is persisted as user intent metadata, not as a secret.
     """
     _load_tool_authoring_config_store_from_disk()
 
@@ -308,10 +394,23 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     session_id = _tool_config_session_id(data)
     existing = _TOOL_AUTHORING_CONFIG_STORE.get(session_id) or {}
 
-    tool_name = str(data.get("tool_name") or data.get("operation") or existing.get("tool_name") or session_id or "tool")
+    tool_name = str(
+        data.get("tool_name")
+        or data.get("operation")
+        or existing.get("tool_name")
+        or session_id
+        or "tool"
+    )
+
     raw_config = data.get("config") if isinstance(data.get("config"), dict) else {}
-    existing_raw_values = existing.get("raw_values") if isinstance(existing.get("raw_values"), dict) else {}
+    existing_raw_values = (
+        existing.get("raw_values")
+        if isinstance(existing.get("raw_values"), dict)
+        else {}
+    )
     raw_values: dict[str, str] = dict(existing_raw_values)
+
+    auth_override = _auth_override_from_request(data)
 
     envs = _tool_platform_envs(tool_name)
 
@@ -319,7 +418,13 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     configured_env: list[str] = []
     configured_secrets: list[str] = []
 
-    def put_env(env_name: str, value: Any, *, secret: bool = False, keep_old_if_empty: bool = True) -> str | None:
+    def put_env(
+        env_name: str,
+        value: Any,
+        *,
+        secret: bool = False,
+        keep_old_if_empty: bool = True,
+    ) -> str | None:
         name = str(env_name or "").strip()
         if not name:
             return None
@@ -346,42 +451,75 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     if put_env(envs["base_url"], base_url_value):
         config_refs["base_url"] = f"${{ENV:{envs['base_url']}}}"
 
-    method_value = str(data.get("method") or raw_config.get("method") or "GET").strip().upper() or "GET"
+    method_value = (
+        str(data.get("method") or raw_config.get("method") or "GET")
+        .strip()
+        .upper()
+        or "GET"
+    )
     if put_env(envs["method"], method_value):
         config_refs["method"] = f"${{ENV:{envs['method']}}}"
 
-    auth_type = str(
-        data.get("auth_type")
-        or raw_config.get("auth_type")
-        or raw_config.get("authentication")
+    auth_type = (
+        str(
+            data.get("auth_type")
+            or raw_config.get("auth_type")
+            or raw_config.get("authentication")
+            or "none"
+        )
+        .strip()
+        .lower()
         or "none"
-    ).strip().lower() or "none"
+    )
 
-    auth_header_name = str(
-        data.get("auth_header_name")
-        or raw_config.get("auth_header_name")
-        or ((raw_config.get("auth") or {}).get("header_name") if isinstance(raw_config.get("auth"), dict) else "")
+    if auth_type in {"noauth", "no_auth", "anonymous", "public"}:
+        auth_type = "none"
+
+    auth_header_name = (
+        str(
+            data.get("auth_header_name")
+            or raw_config.get("auth_header_name")
+            or (
+                (raw_config.get("auth") or {}).get("header_name")
+                if isinstance(raw_config.get("auth"), dict)
+                else ""
+            )
+            or "X-API-KEY"
+        )
+        .strip()
         or "X-API-KEY"
-    ).strip() or "X-API-KEY"
+    )
+
     put_env(envs["auth_header"], auth_header_name)
     config_refs["auth_header_name"] = f"${{ENV:{envs['auth_header']}}}"
 
-    auth_query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or "").strip()
+    auth_query_param = str(
+        data.get("auth_query_param")
+        or raw_config.get("auth_query_param")
+        or ""
+    ).strip()
+
     if auth_query_param:
         put_env(envs["auth_query_param"], auth_query_param)
         config_refs["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
 
     sample_input = data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {}
 
-    body_template = raw_config.get("json_body_template") if "json_body_template" in raw_config else raw_config.get("body_template", {})
+    body_template = (
+        raw_config.get("json_body_template")
+        if "json_body_template" in raw_config
+        else raw_config.get("body_template", {})
+    )
     if not body_template and method_value not in {"GET", "HEAD"} and sample_input:
         body_template = sample_input
+
     put_env(envs["body_template"], _json_env(body_template or {}))
     config_refs["json_body_template"] = f"${{ENV:{envs['body_template']}}}"
 
     query_template = raw_config.get("query_template") or raw_config.get("params_template") or {}
     if not query_template and method_value in {"GET", "DELETE"} and sample_input:
         query_template = sample_input
+
     put_env(envs["query_template"], _json_env(query_template or {}))
     config_refs["query_template"] = f"${{ENV:{envs['query_template']}}}"
 
@@ -389,7 +527,12 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
     put_env(envs["headers_template"], _json_env(headers_template or {}))
     config_refs["headers_template"] = f"${{ENV:{envs['headers_template']}}}"
 
-    original_secret_env = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
+    original_secret_env = str(
+        data.get("secret_env")
+        or raw_config.get("secret_env")
+        or ""
+    ).strip()
+
     secret_value = (
         data.get("secret_value")
         or raw_config.get("secret_value")
@@ -398,46 +541,68 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
         or raw_config.get("password")
     )
 
-    if auth_type != "none":
+    auth_requires_secret = auth_type not in {
+        "",
+        "none",
+        "no_auth",
+        "noauth",
+        "anonymous",
+        "public",
+        "unknown",
+    }
+
+    if auth_requires_secret:
         if secret_value in (None, "") and original_secret_env:
             secret_value = os.environ.get(original_secret_env, "")
+
         if put_env(envs["secret"], secret_value, secret=True):
             config_refs["secret"] = f"${{ENV:{envs['secret']}}}"
 
     sanitized_config = dict(raw_config)
-    sanitized_config.update({
-        "base_url": f"${{ENV:{envs['base_url']}}}",
-        "method": f"${{ENV:{envs['method']}}}",
-        "auth_type": auth_type,
-        "secret_env": envs["secret"] if auth_type != "none" else "",
-        "original_secret_env": original_secret_env,
-        "platform_env_prefix": envs["prefix"],
-        "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
-        "json_body_template_env": envs["body_template"],
-        "query_template_env": envs["query_template"],
-        "headers_template_env": envs["headers_template"],
-    })
+    sanitized_config.update(
+        {
+            "base_url": f"${{ENV:{envs['base_url']}}}",
+            "method": f"${{ENV:{envs['method']}}}",
+            "auth_type": auth_type,
+            "secret_env": envs["secret"] if auth_requires_secret else "",
+            "original_secret_env": original_secret_env,
+            "platform_env_prefix": envs["prefix"],
+            "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
+            "json_body_template_env": envs["body_template"],
+            "query_template_env": envs["query_template"],
+            "headers_template_env": envs["headers_template"],
+            "auth_override": auth_override,
+        }
+    )
 
     if auth_query_param:
         sanitized_config["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
 
-    if auth_type != "none":
-        sanitized_config["auth"] = _build_saved_auth_config(
+    if auth_requires_secret:
+        saved_auth = _build_saved_auth_config(
             {
                 **data,
                 "secret_env": envs["secret"],
                 "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
-                "auth_query_param": f"${{ENV:{envs['auth_query_param']}}}" if auth_query_param else "",
+                "auth_query_param": (
+                    f"${{ENV:{envs['auth_query_param']}}}"
+                    if auth_query_param
+                    else ""
+                ),
             },
             sanitized_config,
             auth_type,
             envs["secret"],
         )
+        if saved_auth:
+            sanitized_config["auth"] = saved_auth
 
     sanitized_config, inferred_refs = _sanitize_authoring_config(sanitized_config)
+
     for ref in inferred_refs:
         if ref in raw_values:
             os.environ[ref] = str(raw_values[ref])
+
         if ref.endswith("_SECRET"):
             configured_secrets.append(ref)
         else:
@@ -452,6 +617,7 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
         "configured_secrets": sorted(set(configured_secrets)),
         "config_refs": config_refs,
         "raw_values": raw_values,
+        "auth_override": auth_override,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -466,6 +632,7 @@ def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
         "configured_secrets": sorted(set(configured_secrets)),
         "config_refs": config_refs,
         "config": sanitized_config,
+        "auth_override": auth_override,
         "persisted": True,
         "store_path": str(_tool_authoring_config_store_path()),
     }
@@ -476,6 +643,7 @@ def tool_authoring_config_status(session_id: str = "default") -> dict[str, Any]:
 
     key = _tool_config_session_id({"session_id": session_id})
     stored = _TOOL_AUTHORING_CONFIG_STORE.get(key)
+
     if not stored:
         return {
             "success": True,
@@ -484,14 +652,52 @@ def tool_authoring_config_status(session_id: str = "default") -> dict[str, Any]:
             "configured_env": [],
             "configured_secrets": [],
             "config_refs": {},
+            "config": {},
+            "sample_input": {},
+            "auth_override": {
+                "mode": "auto",
+                "reason": "",
+                "source": "user",
+                "updated_at": "",
+            },
             "persisted": False,
             "store_path": str(_tool_authoring_config_store_path()),
         }
 
     _restore_env_from_authoring_record(stored)
 
-    configured_env = [name for name in stored.get("configured_env", []) if os.environ.get(name) is not None]
-    configured_secrets = [name for name in stored.get("configured_secrets", []) if os.environ.get(name) is not None]
+    configured_env = [
+        name
+        for name in stored.get("configured_env", [])
+        if os.environ.get(name) is not None
+    ]
+    configured_secrets = [
+        name
+        for name in stored.get("configured_secrets", [])
+        if os.environ.get(name) is not None
+    ]
+
+    auth_override = (
+        stored.get("auth_override")
+        if isinstance(stored.get("auth_override"), dict)
+        else {}
+    )
+
+    if not auth_override:
+        config = stored.get("config") if isinstance(stored.get("config"), dict) else {}
+        auth_override = (
+            config.get("auth_override")
+            if isinstance(config.get("auth_override"), dict)
+            else {}
+        )
+
+    if not auth_override:
+        auth_override = {
+            "mode": "auto",
+            "reason": "",
+            "source": "user",
+            "updated_at": "",
+        }
 
     return {
         "success": True,
@@ -502,6 +708,7 @@ def tool_authoring_config_status(session_id: str = "default") -> dict[str, Any]:
         "config_refs": stored.get("config_refs") or {},
         "config": stored.get("config") or {},
         "sample_input": stored.get("sample_input") or {},
+        "auth_override": auth_override,
         "updated_at": stored.get("updated_at"),
         "persisted": True,
         "store_path": str(_tool_authoring_config_store_path()),
@@ -2014,34 +2221,12 @@ def validate_tool_manifest(
     is_external_api = (
         str(manifest.get("category") or "").lower() == "external_api"
         or str(manifest.get("type") or "").lower() == "external_api"
+        or str(manifest.get("tool_kind") or "").lower() == "external_api"
         or manifest.get("needs_external_network") is True
     )
 
     if is_external_api:
-        normalized_output_schema = {
-            "type": "object",
-            "properties": {
-                "success": {"type": "boolean"},
-                "results": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
-                "total": {"type": "integer"},
-                "error": {"type": "string"},
-                "status_code": {"type": "integer"},
-                "response_preview": {"type": "string"},
-                "knowledgeGraph": {"type": "object"},
-                "answerBox": {"type": "object"},
-                "relatedSearches": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
-                "raw": {"type": "object"},
-                "trial_run": {"type": "boolean"},
-            },
-            "required": ["success", "results", "total"],
-        }
-
+        normalized_output_schema = _generic_external_api_output_schema()
         manifest["output_schema"] = normalized_output_schema
 
         fixed_functions = []
@@ -2277,6 +2462,22 @@ def _plan_defaults() -> dict[str, Any]:
         "requires_authoring_tools": False,
         "authoring_tool_plan": [],
         "authoring_context": {},
+        "wrapper_family": "auto",
+        "internal_function_name": "",
+        "auth_decision": {
+            "required": "unknown",
+            "confidence": 0.0,
+            "reason": "",
+            "evidence": [],
+            "security_schemes": [],
+        },
+        "auth_gate": {
+            "status": "needs_review",
+            "block_code_generation": False,
+            "block_registration": True,
+            "reasons": ["auth decision has not been evaluated"],
+        },
+        "runtime_facts": {},
     }
 
 
@@ -2430,98 +2631,468 @@ def _infer_tool_kind(request: dict[str, Any]) -> str:
     explicit = str(request.get("tool_kind") or "").strip()
     if explicit:
         return explicit
-    text = " ".join(str(request.get(key) or "") for key in ("description", "tool_type", "operation")).lower()
-    if any(token in text for token in ("api", "http", "https://", "接口", "endpoint", "base_url")) or request.get("needs_external_network"):
+
+    wrapper_family = _infer_wrapper_family(request)
+
+    if wrapper_family == "http_api":
         return "external_api"
-    if request.get("generates_file"):
-        return "file_generator"
-    if any(token in text for token in ("transform", "转换", "normalize", "清洗")):
-        return "data_transform"
-    if request.get("code_block"):
+    if wrapper_family == "web_fetch":
+        return "web_fetch"
+    if wrapper_family == "python_compute":
         return "local_helper"
+    if wrapper_family == "file_converter":
+        return "file_generator"
+
+    return wrapper_family or "unknown"
+
+def _generic_external_api_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "success": {"type": "boolean"},
+            "results": {
+                "type": "array",
+                "items": {"type": "object"},
+            },
+            "total": {"type": "integer"},
+            "error": {"type": "string"},
+            "status_code": {"type": "integer"},
+            "response_preview": {"type": "string"},
+            "raw": {},
+            "trial_run": {"type": "boolean"},
+        },
+        "required": ["success", "results", "total"],
+    }
+
+
+def _normalize_auth_required(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip().lower()
+    if text in {"yes", "true", "required", "requires_auth", "auth_required", "need", "needed"}:
+        return "yes"
+    if text in {"no", "false", "none", "noauth", "no_auth", "anonymous", "public"}:
+        return "no"
+    if text in {"unknown", "uncertain", "maybe", "unsure"}:
+        return "unknown"
+    return default
+
+
+def _normalize_auth_type(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"", "none", "noauth", "no_auth", "anonymous", "public"}:
+        return "none"
+    if text in {"api_key", "apikey", "key"}:
+        return "api_key"
+    if text in {"bearer", "token", "oauth_bearer"}:
+        return "token"
+    if text == "basic":
+        return "basic"
+    if text in {"oauth", "oauth2"}:
+        return "oauth2"
+    if text == "custom":
+        return "custom"
     return "unknown"
 
 
+def _normalize_security_schemes(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    schemes: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        scheme = dict(item)
+        scheme["type"] = _normalize_auth_type(scheme.get("type") or scheme.get("scheme"))
+        schemes.append(scheme)
+    return schemes
+
+
+def _normalize_auth_decision(decision: Any, *, default_required: str = "unknown") -> dict[str, Any]:
+    if not isinstance(decision, dict):
+        decision = {}
+
+    required = _normalize_auth_required(decision.get("required"), default_required)
+    try:
+        confidence = float(decision.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    confidence = max(0.0, min(confidence, 1.0))
+
+    evidence = decision.get("evidence") or decision.get("reasons") or []
+    if isinstance(evidence, str):
+        evidence = [evidence]
+    if not isinstance(evidence, list):
+        evidence = []
+
+    schemes = _normalize_security_schemes(
+        decision.get("security_schemes") or decision.get("securitySchemes") or []
+    )
+
+    return {
+        "required": required,
+        "confidence": confidence,
+        "reason": str(decision.get("reason") or ""),
+        "evidence": [str(item) for item in evidence if item],
+        "security_schemes": schemes,
+    }
+
+
+def _config_has_auth_material(config: dict[str, Any]) -> bool:
+    if not isinstance(config, dict):
+        return False
+
+    auth_type = _normalize_auth_type(
+        config.get("auth_type") or
+        config.get("authentication") or
+        ((config.get("auth") or {}).get("type") if isinstance(config.get("auth"), dict) else "")
+    )
+
+    if auth_type not in {"", "none"}:
+        return True
+
+    if _extract_env_refs(config):
+        return True
+
+    for key in (
+        "secret_env",
+        "secret_env_name",
+        "api_key_env",
+        "token_env",
+        "password_env",
+        "secret_value",
+        "api_key",
+        "token",
+        "password",
+    ):
+        if config.get(key) not in (None, "", {}, []):
+            return True
+
+    if isinstance(config.get("auth"), dict) and config["auth"]:
+        return True
+
+    return False
+
+
+def _derive_auth_decision(
+    request: dict[str, Any],
+    *,
+    wrapper_family: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    explicit = request.get("auth_decision")
+    if isinstance(explicit, dict):
+        return _normalize_auth_decision(explicit)
+
+    if request.get("needs_secret") or request.get("requires_authorization") or _config_has_auth_material(config):
+        auth_type = _normalize_auth_type(config.get("auth_type") or config.get("authentication") or "api_key")
+        secret_env = str(config.get("secret_env") or config.get("secret_env_name") or "").strip()
+        scheme: dict[str, Any] = {"type": auth_type}
+        if secret_env:
+            scheme["env"] = secret_env
+        return {
+            "required": "yes",
+            "confidence": 0.9,
+            "reason": "request/config contains secret or auth material",
+            "evidence": ["needs_secret/config auth/env refs"],
+            "security_schemes": [scheme],
+        }
+
+    auth_type = _normalize_auth_type(config.get("auth_type") or config.get("authentication"))
+    if auth_type == "none":
+        return {
+            "required": "no",
+            "confidence": 0.85,
+            "reason": "config explicitly says no auth",
+            "evidence": ["auth_type=none"],
+            "security_schemes": [{"type": "none"}],
+        }
+
+    if wrapper_family in {"http_api", "database_query"}:
+        return {
+            "required": "unknown",
+            "confidence": 0.5,
+            "reason": "remote/configured service without explicit auth decision",
+            "evidence": ["service integration requires confirmation"],
+            "security_schemes": [],
+        }
+
+    return {
+        "required": "no",
+        "confidence": 0.85,
+        "reason": "no auth signal found",
+        "evidence": [],
+        "security_schemes": [{"type": "none"}],
+    }
+
 def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
+    request = dict(request or {})
+
     code_block = str(request.get("code_block") or "")
-    code_input_schema, code_output_schema, notes = _infer_schema_from_code(code_block) if code_block.strip() else ({}, {}, [])
+    code_input_schema, code_output_schema, notes = (
+        _infer_schema_from_code(code_block)
+        if code_block.strip()
+        else ({}, {}, [])
+    )
+
     merged = dict(request)
     config = request.get("config") if isinstance(request.get("config"), dict) else {}
-    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else {}
+
+    wrapper_family = _infer_wrapper_family(request)
+    if wrapper_family == "external_api":
+        wrapper_family = "http_api"
+    elif wrapper_family in {"python_helper", "data_transform", "local_helper"}:
+        wrapper_family = "python_compute"
+    elif wrapper_family == "file_generator":
+        wrapper_family = "file_converter"
+
+    tool_kind = _infer_tool_kind({**request, "wrapper_family": wrapper_family})
+
+    sample = (
+        request.get("sample_input")
+        if isinstance(request.get("sample_input"), dict) and request.get("sample_input")
+        else {}
+    )
+
     if code_input_schema and not merged.get("input_schema"):
         merged["input_schema"] = code_input_schema
     if code_output_schema and not merged.get("output_schema"):
         merged["output_schema"] = code_output_schema
-    tool_kind = _infer_tool_kind(request)
-    requires_network = tool_kind == "external_api" or bool(request.get("needs_external_network"))
-    requires_secret = bool(request.get("needs_secret") or _extract_env_refs(config) or config.get("secret_env") or config.get("secret_env_name"))
-    missing_fields: list[str] = []
-    questions: list[Any] = []
-    if tool_kind == "external_api":
-        missing_fields = _external_api_missing_fields(config, sample, request)
-        questions = _external_api_clarification_questions(request, config)
-    elif tool_kind == "unknown" and not (request.get("tool_name") and (request.get("description") or code_block.strip())):
-        missing_fields = ["tool_name", "description or code_block"]
-        questions = [{"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}]
 
-    if request.get("manifest"):
+    auth_override = _auth_override_from_request(request)
+
+    requires_network = wrapper_family in {"http_api", "web_fetch"} or bool(request.get("needs_external_network"))
+    requires_secret = bool(
+        request.get("needs_secret")
+        or _extract_env_refs(config)
+        or config.get("secret_env")
+        or config.get("secret_env_name")
+    )
+
+    auth_decision = _derive_auth_decision(
+        request,
+        wrapper_family=wrapper_family,
+        config=config,
+    )
+
+    override_decision = _auth_override_to_decision(auth_override)
+    if override_decision:
+        auth_decision = override_decision
+
+    manifest: dict[str, Any]
+    if isinstance(request.get("manifest"), dict) and request.get("manifest"):
         manifest = dict(request["manifest"])
-    elif tool_kind == "external_api" and missing_fields:
-        manifest = {}
     else:
         manifest_seed = dict(merged)
-        if tool_kind == "external_api":
+
+        if wrapper_family == "http_api":
             manifest_seed["needs_external_network"] = True
+            manifest_seed["tool_type"] = "custom_adapter"
+            manifest_seed["input_schema"] = request.get("input_schema") or {
+                "payload": {
+                    "type": "object",
+                    "required": True,
+                    "description": "Fields used to render confirmed request templates.",
+                }
+            }
+            manifest_seed["output_schema"] = request.get("output_schema") or _generic_external_api_output_schema()
+
             if requires_secret:
                 refs = _extract_env_refs(config)
-                manifest_seed["required_secrets"] = sorted(refs) or [str(config.get("secret_env") or config.get("secret_env_name") or "TOOL_API_KEY")]
-            manifest_seed["tool_type"] = "custom_adapter"
-            manifest_seed["input_schema"] = request.get("input_schema") or {"payload": {"type": "object", "required": True, "description": "Fields used to render the confirmed request templates."}}
-            manifest_seed["output_schema"] = request.get("output_schema") or {"result": {"type": "object", "description": str(request.get("output_description") or "Normalized external API response.")}}
+                manifest_seed["required_secrets"] = (
+                    sorted(refs)
+                    or [
+                        str(
+                            config.get("secret_env")
+                            or config.get("secret_env_name")
+                            or "TOOL_API_KEY"
+                        )
+                    ]
+                )
+
         manifest = build_tool_manifest_draft(manifest_seed)
-    if not sample and tool_kind != "external_api":
+
+    manifest = dict(manifest or {})
+    manifest["auth_decision"] = auth_decision
+    manifest["auth_override"] = auth_override
+
+    runtime_facts = extract_runtime_facts(code_block, manifest)
+
+    live_test = request.get("live_test_result") if isinstance(request.get("live_test_result"), dict) else None
+    if not live_test:
+        ctx = request.get("authoring_context") if isinstance(request.get("authoring_context"), dict) else {}
+        live_test = ctx.get("live_test_result") if isinstance(ctx.get("live_test_result"), dict) else None
+
+    auth_gate = merge_auth_gate(
+        {"auth_decision": auth_decision},
+        runtime_facts,
+        live_test,
+        auth_override=auth_override,
+    )
+
+    missing_fields: list[str] = []
+    questions: list[Any] = []
+
+    if wrapper_family == "http_api":
+        missing_fields = _external_api_missing_fields(config, sample, request)
+        questions = _external_api_clarification_questions(request, config)
+    elif auth_gate["status"] in {"needs_config", "needs_review"} and _config_has_auth_material(config):
+        missing_fields = ["configuration"]
+
+    if tool_kind == "unknown" and not (
+        request.get("tool_name") and (request.get("description") or code_block.strip())
+    ):
+        missing_fields = ["tool_name", "description or code_block"]
+        questions = [
+            {
+                "id": "operation_detail",
+                "type": "short_text",
+                "question": "请用一句话补充这个工具要完成的具体能力。",
+                "required": True,
+            }
+        ]
+
+    if not sample and wrapper_family != "http_api":
         sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
-    ready_live = tool_kind == "external_api" and not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
-    live_success = bool((request.get("live_test_result") or {}).get("success"))
+
+    ready_live = (
+        wrapper_family == "http_api"
+        and not _external_api_missing_fields(
+            config,
+            sample,
+            {**request, "allow_external_network": True},
+        )
+    )
+
+    live_success = _live_test_success_from_request(request)
+
     authoring_tool_plan: list[dict[str, Any]] = []
-    if tool_kind == "external_api" and missing_fields:
-        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要通过授权弹窗保存连接地址、认证方式和 env/secret 引用", "input": {"config_required_fields": missing_fields, "config": config, "sample_input": sample}})
-    elif tool_kind == "external_api" and ready_live and not live_success and not request.get("skip_live_test"):
-        authoring_tool_plan.append({"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}})
+
+    if wrapper_family == "http_api" and missing_fields:
+        authoring_tool_plan.append(
+            {
+                "tool_name": "authoring_config_collector",
+                "reason": "需要通过配置面板确认服务入口、认证方式、env/secret 引用和请求模板",
+                "input": {
+                    "config_required_fields": missing_fields,
+                    "config": config,
+                    "sample_input": sample,
+                },
+            }
+        )
+    elif (
+        wrapper_family == "http_api"
+        and ready_live
+        and not live_success
+        and not request.get("skip_live_test")
+    ):
+        authoring_tool_plan.append(
+            {
+                "tool_name": "authoring_live_test",
+                "reason": "需要在生成 adapter 前确认固定远程接口配置和 sample input 可用",
+                "input": {
+                    "config": config,
+                    "sample_input": sample,
+                },
+            }
+        )
+
     if code_block.strip():
-        authoring_tool_plan.append({"tool_name": "authoring_schema_infer", "reason": "从现有代码推断输入输出 schema", "input": {"code_block": code_block}})
-    ready_code = bool(manifest) and not missing_fields and not authoring_tool_plan and (tool_kind != "external_api" or live_success or request.get("skip_live_test") is True)
-    return {
+        authoring_tool_plan.append(
+            {
+                "tool_name": "authoring_schema_infer",
+                "reason": "从现有代码推断输入输出 schema",
+                "input": {"code_block": code_block},
+            }
+        )
+
+    ready_code = bool(manifest) and not questions and not authoring_tool_plan
+
+    if wrapper_family == "http_api":
+        ready_code = ready_code and (
+            live_success
+            or request.get("skip_live_test") is True
+        )
+
+    requires_config = bool(missing_fields) or auth_gate["status"] in {
+        "needs_config",
+        "needs_review",
+    }
+    requires_live_test = wrapper_family == "http_api" or auth_gate["status"] == "needs_live_test"
+
+    result = {
         **_plan_defaults(),
         "needs_clarification": bool(questions),
         "questions": questions[:3],
         "clarification_questions": questions[:3],
-        "requires_config": tool_kind == "external_api" and bool(missing_fields),
+        "requires_config": requires_config,
         "config_required_fields": missing_fields,
-        "config_form_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
-        "suggested_entrypoint": _suggest_external_api_entrypoint(request, config) if tool_kind == "external_api" else {},
-        "additional_fields_schema": _external_api_additional_fields_schema() if tool_kind == "external_api" else [],
-        "requires_authorization": tool_kind == "external_api" and requires_secret,
+        "config_form_schema": (
+            _external_api_config_schema()
+            if requires_config or wrapper_family == "http_api"
+            else {}
+        ),
+        "suggested_entrypoint": (
+            _suggest_external_api_entrypoint(request, config)
+            if wrapper_family == "http_api"
+            else {}
+        ),
+        "additional_fields_schema": (
+            _external_api_additional_fields_schema()
+            if wrapper_family == "http_api"
+            else []
+        ),
+        "requires_authorization": auth_decision["required"] in {"yes", "unknown"},
         "tool_kind": tool_kind,
         "operation": str(request.get("operation") or request.get("description") or ""),
         "requires_secret": requires_secret,
-        "secret_env_suggestions": sorted(_extract_env_refs(config)) or ([str(config.get("secret_env") or config.get("secret_env_name"))] if config.get("secret_env") or config.get("secret_env_name") else []),
+        "secret_env_suggestions": (
+            sorted(_extract_env_refs(config))
+            or (
+                [str(config.get("secret_env") or config.get("secret_env_name"))]
+                if config.get("secret_env") or config.get("secret_env_name")
+                else []
+            )
+        ),
         "requires_external_network": requires_network,
-        "requires_live_test": tool_kind == "external_api",
+        "requires_live_test": requires_live_test,
         "ready_for_live_test": ready_live,
         "ready_for_code_generation": ready_code,
         "requires_authoring_tools": bool(authoring_tool_plan),
         "authoring_tool_plan": authoring_tool_plan,
         "missing_fields": [],
-        "suggested_config_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
-        "sample_input_schema": {"type": "object", "description": "Sample payload used for live_test and adapter dynamic validation."},
+        "suggested_config_schema": (
+            _external_api_config_schema()
+            if requires_config or wrapper_family == "http_api"
+            else {}
+        ),
+        "sample_input_schema": {
+            "type": "object",
+            "description": "Sample payload used for live_test and adapter dynamic validation.",
+        },
         "manifest": manifest,
-        "implementation_plan": "Use confirmed configuration only. For external APIs, read secrets from environment variables, return a deterministic mock when SKILL_TRIAL_RUN=1, and never put secrets in payload, logs, manifest, adapter, or snippet." if tool_kind == "external_api" else ("Normalize existing code_block while preserving business logic." if code_block.strip() else "Generate a complete Python adapter from the manifest."),
+        "implementation_plan": (
+            "Use confirmed configuration only. Read secrets from environment variables, "
+            "return deterministic mock when SKILL_TRIAL_RUN=1, and never put secrets in "
+            "payload, logs, manifest, adapter, or snippet."
+            if wrapper_family == "http_api"
+            else (
+                "Normalize existing code_block while preserving business logic."
+                if code_block.strip()
+                else "Generate a complete Python adapter from the manifest."
+            )
+        ),
         "sample_input": sample,
         "risk_notes": notes,
         "model_notes": ["deterministic fallback planner used", *notes],
+        "wrapper_family": wrapper_family,
+        "auth_decision": auth_decision,
+        "auth_gate": auth_gate,
+        "auth_override": auth_override,
+        "runtime_facts": runtime_facts,
     }
 
+    return _apply_auth_override_to_plan(result, request)
 
 def _safe_clarification_questions(questions: list[Any], fallback: list[Any]) -> list[dict[str, Any]]:
     banned = ("headers", "body", "query", "schema", "expected output", "输出字段", "输入输出", "method", "模板", "sample input", "服务地址", "连接地址", "endpoint", "密钥", "token", "认证", "auth", "外部网络", "连接测试")
@@ -2552,6 +3123,366 @@ def _live_test_success_from_request(request: dict[str, Any]) -> bool:
     live = ctx.get("live_test_result")
     return isinstance(live, dict) and live.get("success") is True
 
+def extract_runtime_facts(code: str, manifest: dict) -> dict[str, Any]:
+    manifest = manifest if isinstance(manifest, dict) else {}
+    manifest_text = json.dumps(manifest, ensure_ascii=False)
+
+    facts: dict[str, Any] = {
+        "uses_external_network": False,
+        "has_network_import": False,
+        "has_remote_literal": bool(re.search(r"https?://", f"{code or ''}\n{manifest_text}")),
+        "has_configurable_endpoint": any(
+            manifest.get(key) not in (None, "", {}, [])
+            for key in ("base_url", "endpoint", "url")
+        ),
+        "reads_env_secret": False,
+        "declared_env": [],
+        "declared_secrets": [],
+        "auth_config_present": False,
+        "uses_subprocess": False,
+        "writes_file": False,
+    }
+
+    declared_env: set[str] = set()
+    declared_secrets: set[str] = set()
+
+    for key in ("required_env", "env"):
+        value = manifest.get(key)
+        if isinstance(value, list):
+            declared_env.update(str(item) for item in value if item)
+
+    for key in ("required_secrets", "secrets"):
+        value = manifest.get(key)
+        if isinstance(value, list):
+            declared_secrets.update(str(item) for item in value if item)
+
+    auth = manifest.get("auth") if isinstance(manifest.get("auth"), dict) else {}
+    auth_decision = manifest.get("auth_decision") if isinstance(manifest.get("auth_decision"), dict) else {}
+
+    facts["auth_config_present"] = bool(
+        auth or
+        auth_decision or
+        manifest.get("needs_secret") or
+        declared_secrets
+    )
+
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        facts["declared_env"] = sorted(declared_env)
+        facts["declared_secrets"] = sorted(declared_secrets)
+        return facts
+
+    network_roots = {"requests", "httpx", "aiohttp", "urllib"}
+    subprocess_roots = {"subprocess", "os"}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots = {alias.name.split(".")[0] for alias in node.names}
+            if roots & network_roots:
+                facts["has_network_import"] = True
+                facts["uses_external_network"] = True
+            if roots & subprocess_roots:
+                facts["uses_subprocess"] = True
+
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in network_roots:
+                facts["has_network_import"] = True
+                facts["uses_external_network"] = True
+            if root in subprocess_roots:
+                facts["uses_subprocess"] = True
+
+        elif isinstance(node, ast.Call):
+            func_text = ""
+            try:
+                func_text = ast.unparse(node.func)
+            except Exception:
+                pass
+
+            if any(token in func_text for token in ("requests.", "httpx.", "aiohttp.", "urllib.")):
+                facts["uses_external_network"] = True
+
+            if any(token in func_text for token in ("os.getenv", "os.environ.get")):
+                facts["reads_env_secret"] = True
+
+            if func_text in {"open", "Path", "pathlib.Path"} or func_text.endswith(".write"):
+                facts["writes_file"] = True
+
+            if any(token in func_text for token in ("subprocess.", "os.system")):
+                facts["uses_subprocess"] = True
+
+        elif isinstance(node, ast.Subscript):
+            try:
+                target = ast.unparse(node.value)
+            except Exception:
+                target = ""
+            if target.endswith("environ"):
+                facts["reads_env_secret"] = True
+
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith(("http://", "https://")):
+                facts["has_remote_literal"] = True
+
+    facts["declared_env"] = sorted(declared_env)
+    facts["declared_secrets"] = sorted(declared_secrets)
+    facts["auth_config_present"] = bool(
+        facts["auth_config_present"] or
+        facts["reads_env_secret"] or
+        declared_secrets
+    )
+
+    return facts
+
+_AUTH_AUTHORING_TOOL_NAMES = {"authoring_config_collector", "authoring_live_test"}
+
+
+def _auth_override_from_request(request: dict[str, Any] | None) -> dict[str, Any]:
+    request = request or {}
+
+    raw = request.get("auth_override")
+    if not isinstance(raw, dict):
+        raw_config = request.get("config") if isinstance(request.get("config"), dict) else {}
+        raw = raw_config.get("auth_override") if isinstance(raw_config.get("auth_override"), dict) else {}
+
+    mode = str(raw.get("mode") or "auto").strip().lower()
+    aliases = {
+        "required": "force_required",
+        "force_auth": "force_required",
+        "add": "force_required",
+        "add_auth": "force_required",
+        "no_auth": "force_no_auth",
+        "remove": "force_no_auth",
+        "remove_auth": "force_no_auth",
+        "none": "force_no_auth",
+    }
+    mode = aliases.get(mode, mode)
+
+    if mode not in {"auto", "force_required", "force_no_auth"}:
+        mode = "auto"
+
+    return {
+        "mode": mode,
+        "reason": str(raw.get("reason") or "").strip(),
+        "source": str(raw.get("source") or "user").strip() or "user",
+        "updated_at": str(raw.get("updated_at") or "").strip(),
+    }
+
+
+def _remove_auth_authoring_tools(items: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
+        if tool_name in _AUTH_AUTHORING_TOOL_NAMES:
+            continue
+        result.append(item)
+    return result
+
+
+def _auth_override_to_decision(override: dict[str, Any]) -> dict[str, Any] | None:
+    mode = override.get("mode")
+    reason = override.get("reason") or ""
+
+    if mode == "force_required":
+        return {
+            "required": "yes",
+            "confidence": 1.0,
+            "reason": reason or "user manually requires authentication",
+            "evidence": ["manual_override"],
+            "security_schemes": [],
+        }
+
+    if mode == "force_no_auth":
+        return {
+            "required": "no",
+            "confidence": 1.0,
+            "reason": reason or "user manually confirms no authentication is needed",
+            "evidence": ["manual_override"],
+            "security_schemes": [{"type": "none"}],
+        }
+
+    return None
+
+
+def _apply_auth_override_to_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    override = _auth_override_from_request(request)
+    mode = override["mode"]
+
+    if mode == "auto":
+        plan["auth_override"] = override
+        return plan
+
+    updated = dict(plan)
+    updated["auth_override"] = override
+
+    if mode == "force_required":
+        decision = _auth_override_to_decision(override) or {}
+        updated["auth_decision"] = decision
+        updated["auth_gate"] = {
+            "status": "needs_config",
+            "block_code_generation": False,
+            "block_registration": True,
+            "reasons": [override.get("reason") or "用户手动要求该工具必须配置认证"],
+        }
+        updated["requires_config"] = True
+        updated["requires_authorization"] = True
+        updated["requires_secret"] = True
+        updated["config_form_schema"] = updated.get("config_form_schema") or _external_api_config_schema()
+        updated["suggested_config_schema"] = updated.get("suggested_config_schema") or _external_api_config_schema()
+        updated["ready_for_code_generation"] = False
+
+        config = request.get("config") if isinstance(request.get("config"), dict) else {}
+        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+        existing = _remove_auth_authoring_tools(updated.get("authoring_tool_plan") or [])
+        existing.insert(0, {
+            "tool_name": "authoring_config_collector",
+            "reason": "用户手动添加认证配置，需要收集认证/配置字段",
+            "input": {
+                "config_required_fields": ["auth_type", "secret_env"],
+                "config": config,
+                "sample_input": sample,
+            },
+        })
+        updated["authoring_tool_plan"] = existing
+        updated["requires_authoring_tools"] = True
+        return updated
+
+    if mode == "force_no_auth":
+        decision = _auth_override_to_decision(override) or {}
+        updated["auth_decision"] = decision
+        updated["auth_gate"] = {
+            "status": "none",
+            "block_code_generation": False,
+            "block_registration": False,
+            "reasons": [override.get("reason") or "用户手动确认该工具无需认证"],
+        }
+        updated["requires_config"] = False
+        updated["requires_authorization"] = False
+        updated["requires_secret"] = False
+        updated["requires_authoring_tools"] = False
+        updated["authoring_tool_plan"] = _remove_auth_authoring_tools(updated.get("authoring_tool_plan") or [])
+
+        if updated.get("manifest") and not updated.get("needs_clarification"):
+            updated["ready_for_code_generation"] = True
+
+        return updated
+
+    return updated
+
+def merge_auth_gate(
+    planner: dict[str, Any],
+    facts: dict[str, Any],
+    live_test: dict[str, Any] | None = None,
+    auth_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    override = auth_override if isinstance(auth_override, dict) else {}
+    mode = str(override.get("mode") or "auto").strip().lower()
+
+    if mode == "force_required":
+        return {
+            "status": "needs_config",
+            "block_code_generation": False,
+            "block_registration": True,
+            "reasons": [override.get("reason") or "用户手动要求该工具必须配置认证"],
+        }
+
+    if mode == "force_no_auth":
+        return {
+            "status": "none",
+            "block_code_generation": False,
+            "block_registration": False,
+            "reasons": [override.get("reason") or "用户手动确认该工具无需认证"],
+        }
+
+    planner = planner if isinstance(planner, dict) else {}
+    facts = facts if isinstance(facts, dict) else {}
+
+    raw_decision = planner.get("auth_decision") if isinstance(planner.get("auth_decision"), dict) else planner
+    decision = _normalize_auth_decision(raw_decision)
+
+    required = decision["required"]
+    confidence = float(decision.get("confidence") or 0)
+
+    if isinstance(live_test, dict) and live_test:
+        status_code = live_test.get("status_code")
+        missing_env = live_test.get("missing_env") or []
+
+        if status_code in (401, 403) or missing_env:
+            return {
+                "status": "needs_config",
+                "block_code_generation": False,
+                "block_registration": True,
+                "reasons": ["live_test 显示需要认证、授权失败或缺少密钥"],
+            }
+
+        if live_test.get("success") is True:
+            return {
+                "status": "none",
+                "block_code_generation": False,
+                "block_registration": False,
+                "reasons": ["live_test 已通过"],
+            }
+
+    auth_signals = bool(
+        facts.get("reads_env_secret") or
+        facts.get("declared_secrets") or
+        facts.get("auth_config_present")
+    )
+
+    fixed_remote_entrypoint = bool(
+        facts.get("has_configurable_endpoint") or
+        facts.get("has_remote_literal")
+    )
+
+    if required == "yes":
+        return {
+            "status": "needs_config",
+            "block_code_generation": False,
+            "block_registration": True,
+            "reasons": decision.get("evidence") or [decision.get("reason") or "Planner 判定需要认证"],
+        }
+
+    if required == "unknown":
+        return {
+            "status": "needs_review",
+            "block_code_generation": False,
+            "block_registration": True,
+            "reasons": decision.get("evidence") or [decision.get("reason") or "Planner 无法确定是否需要认证"],
+        }
+
+    if required == "no":
+        if auth_signals:
+            return {
+                "status": "needs_config",
+                "block_code_generation": False,
+                "block_registration": True,
+                "reasons": ["Planner 判定无需认证，但代码或 manifest 存在 secret/env/auth 信号"],
+            }
+
+        if fixed_remote_entrypoint and confidence < 0.8:
+            return {
+                "status": "needs_live_test",
+                "block_code_generation": False,
+                "block_registration": True,
+                "reasons": ["固定远程入口未经过 live_test，高置信 no-auth 不成立"],
+            }
+
+        if confidence < 0.6:
+            return {
+                "status": "needs_review",
+                "block_code_generation": False,
+                "block_registration": True,
+                "reasons": ["Planner 的 no-auth 置信度过低"],
+            }
+
+    return {
+        "status": "none",
+        "block_code_generation": False,
+        "block_registration": False,
+        "reasons": ["未发现认证需求或认证风险已被确认"],
+    }
 
 def _normalizable_authoring_tool_plan(items: Any) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
@@ -2568,92 +3499,257 @@ def _normalizable_authoring_tool_plan(items: Any) -> list[dict[str, Any]]:
     return normalized
 
 def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
-    normalized = {**_plan_defaults(), **(plan if isinstance(plan, dict) else {})}
+    request = dict(request or {})
     fallback = _author_fallback_plan(request)
-    if not isinstance(normalized.get("questions"), list):
-        normalized["questions"] = []
-    if not isinstance(normalized.get("clarification_questions"), list):
-        normalized["clarification_questions"] = normalized.get("questions") or []
-    if not isinstance(normalized.get("config_required_fields"), list):
-        normalized["config_required_fields"] = []
-    if not isinstance(normalized.get("config_form_schema"), dict):
-        normalized["config_form_schema"] = {}
-    if not isinstance(normalized.get("suggested_entrypoint"), dict):
-        normalized["suggested_entrypoint"] = {}
-    if not isinstance(normalized.get("additional_fields_schema"), list):
-        normalized["additional_fields_schema"] = []
-    if not isinstance(normalized.get("missing_fields"), list):
-        normalized["missing_fields"] = []
-    if not isinstance(normalized.get("manifest"), dict):
-        normalized["manifest"] = {}
-    if not isinstance(normalized.get("authoring_tool_plan"), list):
-        normalized["authoring_tool_plan"] = []
+
+    normalized = {
+        **_plan_defaults(),
+        **(plan if isinstance(plan, dict) else {}),
+    }
+
+    wrapper_family = (
+        str(request.get("wrapper_family") or "").strip()
+        or str(normalized.get("wrapper_family") or "").strip()
+        or str(fallback.get("wrapper_family") or "").strip()
+        or _infer_wrapper_family(request)
+    )
+
+    if wrapper_family == "external_api":
+        wrapper_family = "http_api"
+    elif wrapper_family in {"python_helper", "data_transform", "local_helper"}:
+        wrapper_family = "python_compute"
+    elif wrapper_family == "file_generator":
+        wrapper_family = "file_converter"
+
+    normalized["wrapper_family"] = wrapper_family
+
+    for key in (
+        "questions",
+        "clarification_questions",
+        "config_required_fields",
+        "additional_fields_schema",
+        "missing_fields",
+        "authoring_tool_plan",
+    ):
+        if not isinstance(normalized.get(key), list):
+            normalized[key] = []
+
+    for key in (
+        "config_form_schema",
+        "suggested_entrypoint",
+        "manifest",
+        "authoring_context",
+    ):
+        if not isinstance(normalized.get(key), dict):
+            normalized[key] = {}
+
     if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
         normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
-    if normalized["tool_kind"] == "external_api":
-        config = request.get("config") if isinstance(request.get("config"), dict) else {}
+
+    if not normalized.get("operation"):
+        normalized["operation"] = str(
+            request.get("operation")
+            or request.get("description")
+            or fallback.get("operation")
+            or ""
+        )
+
+    if not normalized.get("manifest"):
+        normalized["manifest"] = fallback.get("manifest") or {}
+
+    config = request.get("config") if isinstance(request.get("config"), dict) else {}
+
+    auth_override = _auth_override_from_request(request)
+
+    raw_decision = normalized.get("auth_decision")
+    if not isinstance(raw_decision, dict) or not raw_decision:
+        raw_decision = {
+            "required": "yes" if normalized.get("requires_authorization") else "unknown",
+            "confidence": 0.5,
+            "reason": "legacy planner fields converted to auth_decision",
+            "evidence": [],
+            "security_schemes": normalized.get("security_schemes") or [],
+        }
+
+    auth_decision = _normalize_auth_decision(raw_decision)
+
+    if auth_decision["required"] == "unknown" and isinstance(fallback.get("auth_decision"), dict):
+        auth_decision = fallback["auth_decision"]
+
+    override_decision = _auth_override_to_decision(auth_override)
+    if override_decision:
+        auth_decision = override_decision
+
+    manifest = dict(normalized.get("manifest") or {})
+    manifest["auth_decision"] = auth_decision
+    manifest["auth_override"] = auth_override
+    normalized["manifest"] = manifest
+
+    runtime_facts = extract_runtime_facts(
+        str(request.get("code_block") or request.get("adapter_code") or ""),
+        manifest,
+    )
+
+    live_test = request.get("live_test_result") if isinstance(request.get("live_test_result"), dict) else None
+    if not live_test:
+        ctx = request.get("authoring_context") if isinstance(request.get("authoring_context"), dict) else {}
+        live_test = ctx.get("live_test_result") if isinstance(ctx.get("live_test_result"), dict) else None
+
+    auth_gate = merge_auth_gate(
+        {"auth_decision": auth_decision},
+        runtime_facts,
+        live_test,
+        auth_override=auth_override,
+    )
+
+    normalized["auth_decision"] = auth_decision
+    normalized["auth_gate"] = auth_gate
+    normalized["auth_override"] = auth_override
+    normalized["runtime_facts"] = runtime_facts
+
+    live_success = _live_test_success_from_request(request)
+
+    if wrapper_family == "http_api":
         sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
         missing = _external_api_missing_fields(config, sample, request)
+
+        normalized["tool_kind"] = "external_api"
         normalized["requires_external_network"] = True
         normalized["requires_live_test"] = True
-        normalized["requires_config"] = bool(missing)
+        normalized["requires_config"] = bool(missing) or auth_gate["status"] in {
+            "needs_config",
+            "needs_review",
+        }
         normalized["config_required_fields"] = missing
         normalized["config_form_schema"] = _external_api_config_schema()
-        normalized["suggested_entrypoint"] = {**_suggest_external_api_entrypoint(request, config), **(normalized.get("suggested_entrypoint") or {})}
-        normalized["additional_fields_schema"] = normalized.get("additional_fields_schema") or _external_api_additional_fields_schema()
-        normalized["requires_authorization"] = bool(normalized.get("requires_secret") or any(field == "secret_env" for field in missing))
-        normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
+        normalized["suggested_config_schema"] = _external_api_config_schema()
+        normalized["suggested_entrypoint"] = {
+            **_suggest_external_api_entrypoint(request, config),
+            **(normalized.get("suggested_entrypoint") or {}),
+        }
+        normalized["additional_fields_schema"] = (
+            normalized.get("additional_fields_schema")
+            or _external_api_additional_fields_schema()
+        )
+        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
+        normalized["requires_secret"] = bool(
+            normalized.get("requires_secret")
+            or auth_decision["required"] == "yes"
+        )
+        normalized["ready_for_live_test"] = not _external_api_missing_fields(
+            config,
+            sample,
+            {**request, "allow_external_network": True},
+        )
         normalized["missing_fields"] = []
-        safe_questions = _safe_clarification_questions((normalized.get("clarification_questions") or normalized.get("questions") or []), fallback.get("clarification_questions") or fallback.get("questions") or [])
-        safe_questions = _filter_answered_clarification_questions(safe_questions, request.get("clarification_answers") or [])
+
+        safe_questions = _safe_clarification_questions(
+            normalized.get("clarification_questions") or normalized.get("questions") or [],
+            fallback.get("clarification_questions") or fallback.get("questions") or [],
+        )
+        safe_questions = _filter_answered_clarification_questions(
+            safe_questions,
+            request.get("clarification_answers") or [],
+        )
+
         normalized["clarification_questions"] = safe_questions
         normalized["questions"] = safe_questions
-        if missing:
-            normalized["ready_for_code_generation"] = False
-            if not normalized.get("authoring_tool_plan"):
-                normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
-        elif not normalized.get("manifest"):
-            normalized["manifest"] = fallback.get("manifest") or {}
-        live_success = _live_test_success_from_request(request)
+
         normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
-            normalized.get("authoring_tool_plan") or [])
+            normalized.get("authoring_tool_plan") or []
+        )
 
         if live_success:
-            # live_test 已经通过，generate 阶段不要再被 authoring_live_test/config_collector 卡住
             normalized["authoring_tool_plan"] = [
-                item for item in normalized["authoring_tool_plan"]
+                item
+                for item in normalized["authoring_tool_plan"]
                 if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
             ]
-
-        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get(
-                "ready_for_live_test") and not request.get("skip_live_test"):
-            normalized["authoring_tool_plan"] = [{
-                "tool_name": "authoring_live_test",
-                "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用",
-                "input": {"config": config, "sample_input": sample},
-            }]
+        elif missing:
+            normalized["authoring_tool_plan"] = [
+                {
+                    "tool_name": "authoring_config_collector",
+                    "reason": "需要通过配置面板确认服务入口、认证方式、env/secret 引用和请求模板",
+                    "input": {
+                        "config_required_fields": missing,
+                        "config": config,
+                        "sample_input": sample,
+                    },
+                }
+            ]
+        elif (
+            not normalized.get("authoring_tool_plan")
+            and normalized.get("ready_for_live_test")
+            and not request.get("skip_live_test")
+        ):
+            normalized["authoring_tool_plan"] = [
+                {
+                    "tool_name": "authoring_live_test",
+                    "reason": "需要在生成 adapter 前确认固定远程接口配置和 sample input 可用",
+                    "input": {
+                        "config": config,
+                        "sample_input": sample,
+                    },
+                }
+            ]
 
         if missing:
             normalized["ready_for_code_generation"] = False
         elif live_success or request.get("skip_live_test") is True:
-            normalized["ready_for_code_generation"] = bool(normalized.get("manifest") or fallback.get("manifest"))
+            normalized["ready_for_code_generation"] = bool(
+                normalized.get("manifest") or fallback.get("manifest")
+            )
         else:
             normalized["ready_for_code_generation"] = False
-    elif not normalized.get("manifest"):
-        normalized["manifest"] = fallback.get("manifest") or {}
-    if request.get("operation"):
-        normalized["operation"] = request.get("operation")
+
+    else:
+        normalized["requires_config"] = auth_gate["status"] in {
+            "needs_config",
+            "needs_review",
+        }
+        normalized["requires_authorization"] = auth_decision["required"] in {"yes", "unknown"}
+        normalized["requires_live_test"] = auth_gate["status"] == "needs_live_test"
+        normalized["requires_external_network"] = bool(
+            normalized.get("requires_external_network")
+            or wrapper_family == "web_fetch"
+            or runtime_facts.get("uses_external_network")
+        )
+
+        if normalized["requires_config"] and not normalized.get("config_form_schema"):
+            normalized["config_form_schema"] = _external_api_config_schema()
+            normalized["suggested_config_schema"] = _external_api_config_schema()
+
+        normalized["authoring_tool_plan"] = [
+            item
+            for item in _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
+            if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
+        ]
+
+        if not normalized.get("ready_for_code_generation"):
+            normalized["ready_for_code_generation"] = bool(normalized.get("manifest"))
+
     if request.get("resolved_clarifications"):
         normalized["resolved_clarifications"] = request.get("resolved_clarifications")
-    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
-    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan"))
+
+    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
+        normalized.get("authoring_tool_plan") or []
+    )
+    normalized["requires_authoring_tools"] = bool(normalized["authoring_tool_plan"])
 
     if normalized["requires_authoring_tools"]:
         normalized["ready_for_code_generation"] = False
-    normalized["clarification_questions"] = _safe_clarification_questions(normalized.get("clarification_questions") or normalized.get("questions") or [], fallback.get("clarification_questions") or fallback.get("questions") or [])
-    normalized["clarification_questions"] = _filter_answered_clarification_questions(normalized["clarification_questions"], request.get("clarification_answers") or [])
+
+    normalized["clarification_questions"] = _safe_clarification_questions(
+        normalized.get("clarification_questions") or normalized.get("questions") or [],
+        fallback.get("clarification_questions") or fallback.get("questions") or [],
+    )
+    normalized["clarification_questions"] = _filter_answered_clarification_questions(
+        normalized["clarification_questions"],
+        request.get("clarification_answers") or [],
+    )
     normalized["questions"] = normalized["clarification_questions"]
     normalized["needs_clarification"] = bool(normalized["clarification_questions"])
+
     if (
         request.get("stage") == "draft"
         and not normalized.get("needs_clarification")
@@ -2661,10 +3757,19 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         and normalized.get("tool_kind") != "external_api"
         and not normalized.get("ready_for_code_generation")
         and "ready_for_code_generation" not in (plan or {})
+        and not auth_gate.get("block_code_generation")
     ):
         normalized["ready_for_code_generation"] = True
-    return normalized
 
+    normalized = _apply_auth_override_to_plan(normalized, request)
+
+    manifest = dict(normalized.get("manifest") or {})
+    manifest["auth_decision"] = normalized.get("auth_decision") or {}
+    manifest["auth_gate"] = normalized.get("auth_gate") or {}
+    manifest["auth_override"] = normalized.get("auth_override") or auth_override
+    normalized["manifest"] = manifest
+
+    return normalized
 
 def _external_api_config_schema() -> dict[str, Any]:
     return {
@@ -3209,25 +4314,32 @@ def _confirmed_external_api_code_contract(
 def _default_internal_normalize_code() -> str:
     return '''
 def normalize_response(data: dict, payload: dict) -> dict:
-    items = data.get("organic", []) if isinstance(data, dict) else []
-    results = []
-    for idx, item in enumerate(items or [], start=1):
-        if not isinstance(item, dict):
-            continue
-        results.append({
-            "title": item.get("title") or item.get("name") or "",
-            "snippet": item.get("snippet") or item.get("description") or "",
-            "link": item.get("link") or item.get("url") or item.get("imageUrl") or "",
-            "position": item.get("position") or idx,
-        })
+    def coerce_results(value):
+        if isinstance(value, list):
+            return [item if isinstance(item, dict) else {"value": item} for item in value]
+
+        if isinstance(value, dict):
+            for key in ("results", "items", "data", "records", "list", "rows"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    return [
+                        item if isinstance(item, dict) else {"value": item}
+                        for item in nested
+                    ]
+
+            return [value] if value else []
+
+        if value in (None, ""):
+            return []
+
+        return [{"value": value}]
+
+    results = coerce_results(data)
+
     return {
         "success": True,
-        "query": payload.get("query") or payload.get("q") or "",
         "results": results,
         "total": len(results),
-        "knowledgeGraph": data.get("knowledgeGraph", {}) if isinstance(data, dict) else {},
-        "answerBox": data.get("answerBox", {}) if isinstance(data, dict) else {},
-        "relatedSearches": data.get("relatedSearches", []) if isinstance(data, dict) else [],
         "raw": data,
     }
 '''.strip()
@@ -4149,13 +5261,43 @@ def _run_authoring_tool_plan(plan: dict[str, Any], request: dict[str, Any]) -> t
     return updated, results
 
 
-def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+def _author_response_from_plan(
+    plan: dict[str, Any],
+    *,
+    model_notes: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    plan = dict(plan or {})
+
     needs_clarification = bool(plan.get("needs_clarification"))
     status = "needs_clarification" if needs_clarification else "waiting_for_user_input"
+
+    questions = plan.get("clarification_questions") or plan.get("questions") or []
+    auth_override = plan.get("auth_override") if isinstance(plan.get("auth_override"), dict) else {}
+    auth_decision = plan.get("auth_decision") if isinstance(plan.get("auth_decision"), dict) else {}
+    auth_gate = plan.get("auth_gate") if isinstance(plan.get("auth_gate"), dict) else {}
+    runtime_facts = plan.get("runtime_facts") if isinstance(plan.get("runtime_facts"), dict) else {}
+
+    manifest = dict(plan.get("manifest") or {})
+    if auth_decision:
+        manifest["auth_decision"] = auth_decision
+    if auth_gate:
+        manifest["auth_gate"] = auth_gate
+    if auth_override:
+        manifest["auth_override"] = auth_override
+
+    validation_warnings: list[str] = []
+    for item in plan.get("risk_notes") or []:
+        if item:
+            validation_warnings.append(str(item))
+    for item in warnings or []:
+        if item:
+            validation_warnings.append(str(item))
+
     return {
         "needs_clarification": needs_clarification,
-        "questions": plan.get("clarification_questions") or plan.get("questions") or [],
-        "clarification_questions": plan.get("clarification_questions") or plan.get("questions") or [],
+        "questions": questions,
+        "clarification_questions": questions,
         "requires_config": bool(plan.get("requires_config")),
         "config_required_fields": plan.get("config_required_fields") or [],
         "config_form_schema": plan.get("config_form_schema") or plan.get("suggested_config_schema") or {},
@@ -4178,17 +5320,26 @@ def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], 
         "missing_fields": plan.get("missing_fields") or [],
         "suggested_config_schema": plan.get("suggested_config_schema") or {},
         "sample_input_schema": plan.get("sample_input_schema") or {},
-        "manifest": plan.get("manifest") or {},
+        "manifest": manifest,
         "adapter_code": "",
         "sample_input": plan.get("sample_input") or {},
-        "validation": {"success": False, "status": status, "errors": [], "warnings": plan.get("risk_notes") or []},
+        "validation": {
+            "success": False,
+            "status": status,
+            "errors": [],
+            "warnings": sorted(set(validation_warnings)),
+        },
         "snippet": None,
         "model_notes": model_notes,
         "warnings": warnings,
         "requires_human_confirmation": True,
+        "wrapper_family": plan.get("wrapper_family") or "auto",
+        "implementation_plan": plan.get("implementation_plan") or "",
+        "auth_decision": auth_decision,
+        "auth_gate": auth_gate,
+        "auth_override": auth_override,
+        "runtime_facts": runtime_facts,
     }
-
-
 
 async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> list[str]:
     """Ask planner_model to catch capability ambiguity that deterministic heuristics may miss."""

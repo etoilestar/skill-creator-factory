@@ -69,16 +69,10 @@
     },
     "default": {
       "config": {
-        "auth": {
-          "env": "TOOLCFG_DEFAULT_SECRET",
-          "header_name": "${ENV:TOOLCFG_DEFAULT_AUTH_HEADER}",
-          "placement": "header",
-          "type": "api_key"
-        },
         "auth_header_name": "${ENV:TOOLCFG_DEFAULT_AUTH_HEADER}",
         "auth_placement": "header",
         "auth_query_param": "${ENV:TOOLCFG_DEFAULT_AUTH_QUERY_PARAM}",
-        "auth_type": "api_key",
+        "auth_type": "none",
         "base_url": "${ENV:TOOLCFG_DEFAULT_BASE_URL}",
         "headers_template_env": "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON",
         "json_body_template_env": "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON",
@@ -86,7 +80,7 @@
         "original_secret_env": "",
         "platform_env_prefix": "TOOLCFG_DEFAULT",
         "query_template_env": "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON",
-        "secret_env": "TOOLCFG_DEFAULT_SECRET"
+        "secret_env": ""
       },
       "config_refs": {
         "auth_header_name": "${ENV:TOOLCFG_DEFAULT_AUTH_HEADER}",
@@ -95,8 +89,7 @@
         "headers_template": "${ENV:TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON}",
         "json_body_template": "${ENV:TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON}",
         "method": "${ENV:TOOLCFG_DEFAULT_METHOD}",
-        "query_template": "${ENV:TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON}",
-        "secret": "${ENV:TOOLCFG_DEFAULT_SECRET}"
+        "query_template": "${ENV:TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON}"
       },
       "configured_env": [
         "TOOLCFG_DEFAULT_AUTH_HEADER",
@@ -107,9 +100,7 @@
         "TOOLCFG_DEFAULT_METHOD",
         "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON"
       ],
-      "configured_secrets": [
-        "TOOLCFG_DEFAULT_SECRET"
-      ],
+      "configured_secrets": [],
       "platform_env_prefix": "TOOLCFG_DEFAULT",
       "raw_values": {
         "TOOLCFG_DEFAULT_AUTH_HEADER": "X-API-KEY",
@@ -125,7 +116,7 @@
         "query": "测试内容"
       },
       "tool_name": "default",
-      "updated_at": "2026-06-13T16:25:45.220364+00:00"
+      "updated_at": "2026-06-15T06:50:53.070686+00:00"
     },
     "https_google_serper_dev_search": {
       "config": {
@@ -395,6 +386,6 @@
       "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-06-13T16:26:22.621543+00:00",
+  "updated_at": "2026-06-15T06:50:53.076686+00:00",
   "version": 1
 }

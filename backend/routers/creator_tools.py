@@ -114,7 +114,7 @@ class ToolAuthorRequest(BaseModel):
     high_risk: bool = False
     validation: dict[str, Any] | None = None
     stage: str | None = None
-    action: Literal["clarify", "configure", "live_test", "generate", "finalize"] = "clarify"
+    action: Literal["clarify", "configure", "live_test", "generate", "finalize", "revise"] = "clarify"
     clarification_answers: list[dict[str, str]] = Field(default_factory=list)
     tool_kind: str | None = None
     operation: str | None = None
@@ -122,6 +122,10 @@ class ToolAuthorRequest(BaseModel):
     live_test_result: dict[str, Any] | None = None
     allow_external_network: bool = False
     authoring_context: dict[str, Any] = Field(default_factory=dict)
+    wrapper_family: str | None = None
+    revision_target: str | None = None
+    human_feedback: str | None = None
+    snippet: dict[str, Any] | None = None
 
 
 class ToolRegisterRequest(ToolManifestRequest):

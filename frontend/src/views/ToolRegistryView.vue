@@ -232,7 +232,13 @@
             </div>
             <div class="heading-actions">
               <button class="btn-ghost" @click="activeStep = 'validation'">返回验证</button>
-              <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">使用当前 snippet 注册工具</button>
+              <button
+                  class="btn-primary"
+                  :disabled="!canRegister"
+                  @click="registerTool"
+                >
+                  使用当前 snippet 注册工具
+              </button>
             </div>
           </div>
           <SmartCodeEditor v-model="snippetText" language="json" fill placeholder="确认代码后生成 snippet" />
@@ -339,6 +345,8 @@
               <option value="token">token</option>
               <option value="basic">basic</option>
               <option value="custom">custom</option>
+              <option value="unknown">unknown</option>
+              <option value="oauth2">oauth2</option>
             </select>
           </label>
         </div>
@@ -477,7 +485,17 @@ import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
 import { authorCreatorTool, authorCreatorToolStream, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, liveTestCreatorTool, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, saveCreatorToolConfig, validateCreatorTool } from '../composables/useCreator.js'
 
-const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
+const toolTypes = [
+  'python_helper',
+  'web_fetch',
+  'http_api',
+  'local_command',
+  'database_query',
+  'file_converter',
+  'document_generator',
+  'image_generator',
+  'custom_adapter'
+]
 const snippetKinds = ['minimal_usage', 'multi_input_usage', 'file_output_usage', 'batch_usage', 'error_repair_usage', 'anti_pattern', 'trial_run_usage']
 const steps = [
   { key: 'input', index: 1, title: '需求 / 代码', description: '描述能力' },
@@ -497,6 +515,12 @@ const snippetText = ref('{}')
 const clarificationQuestions = ref([])
 const clarificationAnswers = ref([])
 const planState = ref({})
+const manualAuthOverride = reactive({
+  mode: 'auto', // auto | force_required | force_no_auth
+  reason: '',
+  source: 'user',
+  updated_at: ''
+})
 const configForm = reactive({
   base_url: '',
   method: 'GET',
@@ -589,7 +613,18 @@ const snippetTestResult = ref(null)
 const snippetForm = reactive({ id: '', title: '', kind: 'minimal_usage', description: '', code: '', return_rule: '', usage_policy: 'helper_preferred', priority: 80 })
 const expandedPanels = reactive({ input: true, planner: false, adapter: false, validation: false, snippet: false, registeredTools: false, snippetManager: false })
 
-const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
+const form = reactive({
+  tool_name: '',
+  description: '',
+  tool_type: 'python_helper',
+  wrapper_family: 'auto',
+  input_description: '',
+  output_description: '',
+  needs_secret: false,
+  needs_external_network: false,
+  generates_file: false,
+  high_risk: false
+})
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
 const configExtra = computed(() =>
@@ -721,7 +756,23 @@ function canonicalAuthoringConfig() {
   return buildCurrentUiConfig()
 }
 const parsedConfig = computed(() => buildCurrentUiConfig())
-const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
+const effectiveWrapperFamily = computed(() => {
+  const raw =
+    planState.value?.wrapper_family ||
+    form.wrapper_family ||
+    planState.value?.tool_kind ||
+    form.tool_type ||
+    'auto'
+
+  if (raw === 'external_api' || raw === 'http_api') return 'http_api'
+  if (raw === 'web_fetch') return 'web_fetch'
+  if (raw === 'python_helper' || raw === 'data_transform' || raw === 'local_helper') return 'python_compute'
+  if (raw === 'file_generator') return 'file_converter'
+  return raw
+})
+
+const isHttpApiFamily = computed(() => effectiveWrapperFamily.value === 'http_api')
+
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
 const entrypointConfidenceLabel = computed(() => ({ high: '高置信度', medium: '中等置信度', low: '低置信度' }[planState.value?.suggested_entrypoint?.confidence] || '待确认'))
 const liveTestPassed = computed(() => Boolean(liveTestResult.value?.success))
@@ -742,12 +793,123 @@ const configGatePassed = computed(() => {
   return false
 })
 
+function normalizeAuthGate(rawGate = {}) {
+  const status = String(rawGate.status || 'none').trim() || 'none'
+  const blockingStatuses = ['needs_config', 'needs_live_test', 'needs_review', 'blocked']
+
+  return {
+    status,
+    block_code_generation: Boolean(rawGate.block_code_generation),
+    block_registration:
+      rawGate.block_registration !== undefined
+        ? Boolean(rawGate.block_registration)
+        : blockingStatuses.includes(status),
+    reasons: Array.isArray(rawGate.reasons)
+      ? rawGate.reasons.filter(Boolean)
+      : rawGate.reason
+        ? [String(rawGate.reason)]
+        : []
+  }
+}
+
+const authGate = computed(() => {
+  if (manualAuthOverride.mode === 'force_required') {
+    return normalizeAuthGate({
+      status: 'needs_config',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: [
+        manualAuthOverride.reason || '用户手动要求该工具必须配置认证'
+      ]
+    })
+  }
+
+  if (manualAuthOverride.mode === 'force_no_auth') {
+    return normalizeAuthGate({
+      status: 'none',
+      block_code_generation: false,
+      block_registration: false,
+      reasons: [
+        manualAuthOverride.reason || '用户手动确认该工具无需认证'
+      ]
+    })
+  }
+
+  const backendGate = planState.value?.auth_gate
+  if (backendGate && typeof backendGate === 'object') {
+    return normalizeAuthGate(backendGate)
+  }
+
+  const decision =
+    planState.value?.auth_decision ||
+    parsedManifest.value?.auth_decision ||
+    {}
+
+  const required = String(
+    decision.required ||
+    (planState.value?.requires_config ? 'yes' : 'no')
+  ).trim().toLowerCase()
+
+  if (liveTestResult.value?.success) {
+    return normalizeAuthGate({
+      status: 'none',
+      block_code_generation: false,
+      block_registration: false,
+      reasons: ['live_test 已通过']
+    })
+  }
+
+  if (required === 'yes') {
+    return normalizeAuthGate({
+      status: 'needs_config',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: decision.evidence || decision.reasons || ['Planner 判定需要认证或配置']
+    })
+  }
+
+  if (required === 'unknown') {
+    return normalizeAuthGate({
+      status: 'needs_review',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: decision.evidence || decision.reasons || ['Planner 无法确定是否需要认证']
+    })
+  }
+
+  return normalizeAuthGate({
+    status: 'none',
+    block_code_generation: false,
+    block_registration: false,
+    reasons: []
+  })
+})
+
+const requiresConfig = computed(() =>
+  ['needs_config', 'needs_live_test', 'needs_review', 'blocked'].includes(authGate.value.status)
+)
+
+
 const canGenerate = computed(() =>
   !busy.value &&
   !clarificationQuestions.value.length &&
   hasEnoughPlanForGeneration.value &&
-  configGatePassed.value
+  !authGate.value.block_code_generation
 )
+
+const canRegister = computed(() =>
+  Boolean(lastValidation.value?.success) &&
+  !busy.value &&
+  Boolean(parsedManifest.value) &&
+  Boolean(adapterCode.value) &&
+  snippetReady.value &&
+  !authGate.value.block_registration
+)
+const manualAuthModeLabel = computed(() => {
+  if (manualAuthOverride.mode === 'force_required') return '人工要求认证'
+  if (manualAuthOverride.mode === 'force_no_auth') return '人工确认无需认证'
+  return '自动判断'
+})
 const cardPreview = computed(() => (lastValidation.value?.tool_card_preview || []).join('\n\n---\n\n') || '验证后展示 Creator prompt 注入的 function card。')
 const snippetPreview = computed(() => snippets.value.map(snippet => snippet.formatted || '').join('\n\n---\n\n') || '选择工具后展示 Creator 会看到的 Tool Snippet。')
 const snippetReady = computed(() => snippetText.value && snippetText.value.trim() !== '{}')
@@ -773,54 +935,276 @@ function addExtraField() { configExtraFields.value.push({ key: '', value: '', se
 function removeExtraField(idx) { configExtraFields.value.splice(idx, 1) }
 function normalizeSuggestedAuthType(value) {
   const text = String(value || '').trim().toLowerCase()
-  if (!text || ['none', 'no_auth', 'anonymous'].includes(text)) return 'none'
-  if (['header', 'api_key', 'apikey', 'key'].includes(text)) return 'api_key'
-  if (['bearer', 'token'].includes(text)) return 'token'
+
+  if (!text || ['none', 'no_auth', 'anonymous', 'public', 'noauth'].includes(text)) {
+    return 'none'
+  }
+
+  if (['api_key', 'apikey', 'key'].includes(text)) return 'api_key'
+  if (['bearer', 'token', 'oauth_bearer'].includes(text)) return 'token'
   if (text === 'basic') return 'basic'
-  return 'api_key'
+  if (['oauth', 'oauth2'].includes(text)) return 'oauth2'
+  if (text === 'custom') return 'custom'
+
+  // header/query/bearer 是 placement，不是 auth_type。
+  if (['header', 'query'].includes(text)) return 'custom'
+
+  return 'unknown'
+}
+
+function authTypeNeedsSecret(authType) {
+  const text = String(authType || '').trim().toLowerCase()
+  return !['none', 'no_auth', 'anonymous', 'public', 'unknown', ''].includes(text)
+}
+
+function writeConfigIfUseful(key, value, { overwriteDefault = false, defaultValue = '' } = {}) {
+  if (value === undefined || value === null || value === '') return
+
+  const current = configForm[key]
+  const shouldWrite =
+    current === undefined ||
+    current === null ||
+    current === '' ||
+    (overwriteDefault && String(current) === String(defaultValue))
+
+  if (shouldWrite) {
+    configForm[key] = value
+  }
+}
+
+function applyAuthDecision(decision = {}) {
+  if (!decision || typeof decision !== 'object') return
+  if (liveTestResult.value?.success) return
+
+  const schemes = Array.isArray(decision.security_schemes)
+    ? decision.security_schemes
+    : Array.isArray(decision.securitySchemes)
+      ? decision.securitySchemes
+      : []
+
+  const scheme = schemes.find(item => {
+    const type = String(item?.type || item?.scheme || '').trim().toLowerCase()
+    return type && !['none', 'noauth', 'no_auth', 'anonymous', 'public'].includes(type)
+  })
+
+  if (!scheme) {
+    if (decision.required === 'unknown' && configForm.auth_type === 'none') {
+      configForm.auth_type = 'unknown'
+    }
+    return
+  }
+
+  const schemeType = normalizeSuggestedAuthType(scheme.type || scheme.scheme)
+
+  if (schemeType !== 'unknown') {
+    configForm.auth_type = schemeType
+  } else if (configForm.auth_type === 'none') {
+    configForm.auth_type = 'unknown'
+  }
+
+  writeConfigIfUseful('secret_env', scheme.env || scheme.secret_env || scheme.secretEnv)
+
+  const placement = scheme.placement || scheme.in || scheme.auth_placement
+  if (placement) {
+    writeConfigIfUseful('auth_placement', placement, {
+      overwriteDefault: true,
+      defaultValue: 'header'
+    })
+  }
+
+  if (scheme.header_name || scheme.headerName) {
+    writeConfigIfUseful('auth_header_name', scheme.header_name || scheme.headerName, {
+      overwriteDefault: true,
+      defaultValue: 'X-API-KEY'
+    })
+  }
+
+  if (scheme.query_param || scheme.queryParam || scheme.name) {
+    writeConfigIfUseful('auth_query_param', scheme.query_param || scheme.queryParam || scheme.name, {
+      overwriteDefault: true,
+      defaultValue: 'api_key'
+    })
+  }
+
+  if (schemeType === 'token') {
+    configForm.auth_placement = 'bearer'
+    if (!configForm.auth_header_name || configForm.auth_header_name === 'X-API-KEY') {
+      configForm.auth_header_name = 'Authorization'
+    }
+  }
+
+  if (schemeType === 'basic') {
+    configForm.auth_placement = 'header'
+    configForm.auth_header_name = 'Authorization'
+  }
+}
+
+const AUTH_AUTHORING_TOOL_NAMES = new Set([
+  'authoring_config_collector',
+  'authoring_live_test'
+])
+
+function manualAuthOverridePayload() {
+  return {
+    mode: manualAuthOverride.mode,
+    reason: manualAuthOverride.reason,
+    source: manualAuthOverride.source,
+    updated_at: manualAuthOverride.updated_at
+  }
+}
+
+function removeAuthAuthoringTools(items = []) {
+  return (items || []).filter(item => {
+    const toolName = String(item?.tool_name || item?.name || '').trim()
+    return !AUTH_AUTHORING_TOOL_NAMES.has(toolName)
+  })
+}
+
+function applyManualAuthOverrideToPlan() {
+  if (manualAuthOverride.mode === 'auto') return
+
+  if (manualAuthOverride.mode === 'force_required') {
+    planState.value = {
+      ...planState.value,
+      requires_config: true,
+      requires_authorization: true,
+      requires_secret: true,
+      ready_for_code_generation: false,
+      auth_decision: {
+        required: 'yes',
+        confidence: 1,
+        reason: manualAuthOverride.reason || '用户手动要求认证',
+        evidence: ['manual_override'],
+        security_schemes: []
+      },
+      auth_gate: {
+        status: 'needs_config',
+        block_code_generation: false,
+        block_registration: true,
+        reasons: [manualAuthOverride.reason || '用户手动要求该工具必须配置认证']
+      }
+    }
+    return
+  }
+
+  if (manualAuthOverride.mode === 'force_no_auth') {
+    planState.value = {
+      ...planState.value,
+      requires_config: false,
+      requires_authorization: false,
+      requires_secret: false,
+      requires_authoring_tools: false,
+      ready_for_code_generation: Boolean(
+        planState.value?.manifest ||
+        parsedManifest.value ||
+        planState.value?.operation ||
+        form.description
+      ),
+      authoring_tool_plan: removeAuthAuthoringTools(planState.value?.authoring_tool_plan || []),
+      auth_decision: {
+        required: 'no',
+        confidence: 1,
+        reason: manualAuthOverride.reason || '用户手动确认无需认证',
+        evidence: ['manual_override'],
+        security_schemes: [{ type: 'none' }]
+      },
+      auth_gate: {
+        status: 'none',
+        block_code_generation: false,
+        block_registration: false,
+        reasons: [manualAuthOverride.reason || '用户手动确认该工具无需认证']
+      }
+    }
+  }
+}
+
+function setManualAuthOverride(mode, reason) {
+  manualAuthOverride.mode = mode
+  manualAuthOverride.reason = reason
+  manualAuthOverride.source = 'user'
+  manualAuthOverride.updated_at = new Date().toISOString()
+  applyManualAuthOverrideToPlan()
+}
+
+function forceRequireAuth() {
+  setManualAuthOverride('force_required', '用户手动添加认证配置')
+  if (configForm.auth_type === 'none' || configForm.auth_type === 'unknown') {
+    configForm.auth_type = 'api_key'
+  }
+  authConfigOpen.value = true
+  activeStep.value = 'planner'
+}
+
+function forceNoAuth() {
+  setManualAuthOverride('force_no_auth', '用户手动删除认证要求')
+  configForm.auth_type = 'none'
+  configForm.secret_env = ''
+  configForm.secret_value = ''
+  configForm.auth_placement = 'header'
+  liveTestError.value = ''
+  activeStep.value = 'planner'
+}
+
+function clearManualAuthOverride() {
+  manualAuthOverride.mode = 'auto'
+  manualAuthOverride.reason = ''
+  manualAuthOverride.source = 'user'
+  manualAuthOverride.updated_at = new Date().toISOString()
+
+  planState.value = {
+    ...planState.value,
+    auth_override: manualAuthOverridePayload()
+  }
 }
 
 function applySuggestedEntrypoint(entrypoint = {}) {
   if (!entrypoint || typeof entrypoint !== 'object') return
 
-  // live_test 成功后的配置是事实源，planner 后续建议不能覆盖。
   const lockedByLiveTest = Boolean(liveTestResult.value?.success)
+  if (lockedByLiveTest) return
 
-  // base_url 只在为空时预填。
-  if (!lockedByLiveTest) {
-    if (entrypoint.base_url && !configForm.base_url) configForm.base_url = entrypoint.base_url
-    if (entrypoint.endpoint && !configForm.base_url) configForm.base_url = entrypoint.endpoint
-    if (entrypoint.url && !configForm.base_url) configForm.base_url = entrypoint.url
-  }
+  writeConfigIfUseful('base_url', entrypoint.base_url || entrypoint.endpoint || entrypoint.url)
 
-  // method 只在用户还没有明确配置时预填；不要用 planner 覆盖已确认 POST。
   const suggestedMethod = normalizeRequestMethod(entrypoint.method)
   const currentMethod = normalizeRequestMethod(configForm.method)
   const methodLooksDefault = !configForm.method || currentMethod === 'GET'
 
-  if (!lockedByLiveTest && entrypoint.method && methodLooksDefault && !configSaveResult.value?.success) {
+  if (entrypoint.method && methodLooksDefault && !configSaveResult.value?.success) {
     configForm.method = suggestedMethod
   }
 
-  // auth_type 只在当前为 none 时预填，并把 planner 的 header 归一化成 api_key。
-  if (!lockedByLiveTest && entrypoint.auth_type && configForm.auth_type === 'none') {
+  if (entrypoint.auth_type && configForm.auth_type === 'none') {
     configForm.auth_type = normalizeSuggestedAuthType(entrypoint.auth_type)
   }
 
-  if (!lockedByLiveTest && entrypoint.secret_env && !configForm.secret_env) {
-    configForm.secret_env = entrypoint.secret_env
+  writeConfigIfUseful('secret_env', entrypoint.secret_env || entrypoint.secretEnv)
+
+  if (entrypoint.auth_placement) {
+    writeConfigIfUseful('auth_placement', entrypoint.auth_placement, {
+      overwriteDefault: true,
+      defaultValue: 'header'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_placement && !configForm.auth_placement) {
-    configForm.auth_placement = entrypoint.auth_placement
+  if (entrypoint.auth_header_name) {
+    writeConfigIfUseful('auth_header_name', entrypoint.auth_header_name, {
+      overwriteDefault: true,
+      defaultValue: 'X-API-KEY'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_header_name && !configForm.auth_header_name) {
-    configForm.auth_header_name = entrypoint.auth_header_name
+  if (entrypoint.auth_query_param) {
+    writeConfigIfUseful('auth_query_param', entrypoint.auth_query_param, {
+      overwriteDefault: true,
+      defaultValue: 'api_key'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_query_param && !configForm.auth_query_param) {
-    configForm.auth_query_param = entrypoint.auth_query_param
+  if (entrypoint.auth && typeof entrypoint.auth === 'object') {
+    applyAuthDecision({
+      required: entrypoint.auth.type && entrypoint.auth.type !== 'none' ? 'yes' : 'no',
+      security_schemes: [entrypoint.auth]
+    })
   }
 
   const extra = entrypoint.extra || entrypoint.config || {}
@@ -836,6 +1220,7 @@ function applySuggestedEntrypoint(entrypoint = {}) {
     }
   })
 }
+
 function filterAnsweredQuestions(questions) {
   const answered = new Set(clarificationQuestions.value.map((question, idx) => (clarificationAnswers.value[idx] ? questionText(question) : '')).filter(Boolean))
   return questions.filter(question => !answered.has(questionText(question)))
@@ -863,7 +1248,8 @@ function authorPayload(action) {
     config: canonicalAuthoringConfig(),
     live_test_result: liveTestResult.value,
     allow_external_network: allowExternalNetwork.value,
-    authoring_context: planState.value?.authoring_context || {}
+    authoring_context: planState.value?.authoring_context || {},
+    auth_override: manualAuthOverridePayload()
   }
 }
 function extractLiveTestResult(data) {
@@ -882,15 +1268,103 @@ function rememberLiveTestResult(result) {
 }
 function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
 function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; if (!configSaveResult.value?.success && !liveTestResult.value?.success) {
-  applySuggestedEntrypoint(data.suggested_entrypoint)
-}; if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); if (data.adapter_code) {
-  adapterCode.value = data.adapter_code
-}; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.adapter_code) nextTick(refreshEditableInternalCode)}
+function applyAuthorResult(data = {}) {
+  planState.value = { ...planState.value, ...data }
+
+  const liveResult = extractLiveTestResult(data)
+  rememberLiveTestResult(liveResult)
+
+  const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3)
+  clarificationQuestions.value = filterAnsweredQuestions(nextQuestions)
+
+  if (!clarificationQuestions.value.length) {
+    clarificationAnswers.value = []
+  }
+
+  const lockedByConfigOrLiveTest =
+    Boolean(configSaveResult.value?.success) ||
+    Boolean(liveTestResult.value?.success)
+
+  if (!lockedByConfigOrLiveTest && manualAuthOverride.mode === 'auto') {
+    applyAuthDecision(
+      data.auth_decision ||
+      data.manifest?.auth_decision ||
+      data.security_decision ||
+      {}
+    )
+    applySuggestedEntrypoint(data.suggested_entrypoint || {})
+  }
+
+  if (manualAuthOverride.mode !== 'auto') {
+    applyManualAuthOverrideToPlan()
+  }
+
+  if (data.config?.base_url && !configForm.base_url) {
+    configForm.base_url = data.config.base_url
+  }
+
+  if (data.manifest) {
+    const manifest = {
+      ...(data.manifest || {}),
+      auth_override: manualAuthOverridePayload()
+    }
+    manifestText.value = JSON.stringify(manifest, null, 2)
+  }
+
+  if (data.sample_input) {
+    sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2)
+  }
+
+  if (data.adapter_code) {
+    adapterCode.value = data.adapter_code
+  }
+
+  lastValidation.value = data.validation || lastValidation.value
+
+  for (const item of data.authoring_tool_plan || []) {
+    logAuthor({
+      event: 'tool_call_planned',
+      tool: item.tool_name,
+      reason: item.reason
+    })
+  }
+
+  for (const item of data.authoring_tool_results || []) {
+    logAuthor({
+      event: 'tool_call_started',
+      tool: item.tool_name
+    })
+
+    if (item.requires_input) {
+      logAuthor({
+        event: 'tool_call_requires_input',
+        tool: item.tool_name,
+        schema: item.schema || {}
+      })
+    }
+
+    logAuthor({
+      event: 'tool_call_result',
+      tool: item.tool_name,
+      success: Boolean(item.success)
+    })
+  }
+
+  if (data.snippet) {
+    snippetText.value = JSON.stringify(data.snippet, null, 2)
+  }
+
+  if (data.adapter_code) {
+    nextTick(refreshEditableInternalCode)
+  }
+}
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly({ configureAfterSave = true } = {}) {
-  const uiConfig = buildCurrentUiConfig()
+  const uiConfig = {
+    ...buildCurrentUiConfig(),
+    auth_override: manualAuthOverridePayload()
+  }
 
   configSaveResult.value = await saveCreatorToolConfig({
     session_id: configSessionId(),
@@ -906,7 +1380,8 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
     extra: configExtra.value,
     additional_fields: configExtraFields.value.filter(field => field.key),
     sample_input: parsedSample.value,
-    config: uiConfig
+    config: uiConfig,
+    auth_override: manualAuthOverridePayload()
   })
 
   configForm.secret_value = ''
@@ -914,7 +1389,8 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
   if (configureAfterSave) {
     const data = await authorCreatorTool({
       ...authorPayload('configure'),
-      config: canonicalAuthoringConfig()
+      config: canonicalAuthoringConfig(),
+      auth_override: manualAuthOverridePayload()
     })
     applyAuthorResult(data)
   }
@@ -1065,7 +1541,17 @@ function generateAdapter() {
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
 function runLiveTest() {
   return run(async () => {
-    if (!configForm.base_url || (configForm.auth_type !== 'none' && !configForm.secret_env)) {
+    if (!configForm.base_url) {
+      authConfigOpen.value = true
+      return
+    }
+
+    if (configForm.auth_type === 'unknown') {
+      authConfigOpen.value = true
+      return
+    }
+
+    if (authTypeNeedsSecret(configForm.auth_type) && !configForm.secret_env) {
       authConfigOpen.value = true
       return
     }
@@ -1088,9 +1574,32 @@ function validateTool() {
     activeStep.value = 'validation'
   })
 }
-function buildFinalManifestForRegister() { const manifest = { ...(parsedManifest.value || {}) }; const snippet = parseJsonText(snippetText.value); if (snippet && Object.keys(snippet).length) manifest.snippets = [snippet]; return manifest }
+function buildFinalManifestForRegister() {
+  const manifest = { ...(parsedManifest.value || {}) }
+
+  const snippet = parseJsonText(snippetText.value)
+  if (snippet && Object.keys(snippet).length) {
+    manifest.snippets = [snippet]
+  }
+
+  if (planState.value?.auth_decision) {
+    manifest.auth_decision = planState.value.auth_decision
+  }
+
+  manifest.auth_gate = authGate.value
+  manifest.auth_override = manualAuthOverridePayload()
+
+  return manifest
+}
 function registerTool() {
   return run(async () => {
+    if (!canRegister.value) {
+      error.value = authGate.value.reasons?.length
+        ? authGate.value.reasons.join('；')
+        : '当前工具还未通过认证/配置 gate，不能注册。'
+      return
+    }
+
     await registerCreatorTool({
       manifest: buildFinalManifestForRegister(),
       adapter_code: adapterCode.value,
@@ -1100,6 +1609,7 @@ function registerTool() {
       real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
       enable: true
     })
+
     await loadTools()
     registryDrawerOpen.value = true
   })
@@ -1266,6 +1776,23 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
   display: none;
 }
 
+.manual-auth-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.manual-auth-panel.manual-active {
+  border-color: var(--accent);
+}
+
+.manual-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
 .adapter-fixed-block summary::before {
   content: '▶';
   color: var(--text-muted);

@@ -1,0 +1,661 @@
+{
+  "tools": [
+    {
+      "adapter_path": "backend/services/runtime_tools/custom_tools/https_google_serper_dev_search.py",
+      "allow_creator_use": true,
+      "allow_external_side_effect": false,
+      "allowed_roles": [
+        "generic_script",
+        "search_reader"
+      ],
+      "approval_status": "enabled",
+      "category": "external_api",
+      "created_at": "",
+      "created_by": "user",
+      "dependencies": [
+        "requests"
+      ],
+      "display_name": "使用 Serper API 执行网络搜索并返回结构化结果。",
+      "enabled": true,
+      "forbidden_capabilities": [],
+      "forbidden_direct_imports": [],
+      "functions": [
+        {
+          "allowed_roles": [
+            "generic_script",
+            "search_reader"
+          ],
+          "common_mistakes": [
+            "Do not pass API keys in payload.",
+            "Do not call external network when SKILL_TRIAL_RUN=1.",
+            "Do not require provider raw response fields as top-level adapter outputs.",
+            "Do not write or expect files outside OUTPUT_DIR."
+          ],
+          "example_call": "from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\nresult = https_google_serper_dev_search(payload)\nreturn result",
+          "example_return": "",
+          "example_stdout": "return result",
+          "forbidden_imports": [
+            "ftplib",
+            "paramiko",
+            "shutil",
+            "socket",
+            "subprocess",
+            "telnetlib"
+          ],
+          "forbidden_side_effects": [
+            "leak secrets",
+            "undeclared network access"
+          ],
+          "function_name": "https_google_serper_dev_search",
+          "import_path": "backend.services.runtime_tools.custom_tools.https_google_serper_dev_search",
+          "input_schema": {
+            "properties": {
+              "query": {
+                "description": "Search query or API input.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "output_schema": {
+            "properties": {
+              "answerBox": {
+                "type": "object"
+              },
+              "error": {
+                "type": "string"
+              },
+              "knowledgeGraph": {
+                "type": "object"
+              },
+              "raw": {
+                "type": "object"
+              },
+              "relatedSearches": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "response_preview": {
+                "type": "string"
+              },
+              "results": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "status_code": {
+                "type": "integer"
+              },
+              "success": {
+                "type": "boolean"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "trial_run": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "success",
+              "results",
+              "total"
+            ],
+            "type": "object"
+          },
+          "required_capabilities": [
+            "https_google_serper_dev_search"
+          ],
+          "required_env": [
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL",
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD",
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER",
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON",
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON",
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON"
+          ],
+          "required_secrets": [
+            "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"
+          ],
+          "return_contract": "Returns a normalized adapter result with success/results/total. Provider raw response may be included under raw.",
+          "safety_notes": [
+            "Reads API secret from platform-scoped environment only.",
+            "External API network access is declared."
+          ],
+          "short_description": "使用 Serper API 执行网络搜索并返回结构化结果。",
+          "signature": "https_google_serper_dev_search(payload: dict) -> dict",
+          "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.",
+          "usage_policy": "helper_preferred",
+          "when_to_use": "Use 使用 Serper API 执行网络搜索并返回结构化结果。 when this external API is needed."
+        }
+      ],
+      "helper_imports": [],
+      "helper_module": "backend.services.skill_runtime",
+      "input_schema": {
+        "properties": {
+          "query": {
+            "description": "Search query or API input.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "last_validation_result": {
+        "dynamic_trial": {
+          "preview": {
+            "keys": [
+              "answerBox",
+              "knowledgeGraph",
+              "raw",
+              "relatedSearches",
+              "results",
+              "success",
+              "total",
+              "trial_run"
+            ],
+            "preview": {
+              "answerBox": {},
+              "knowledgeGraph": {},
+              "raw": {},
+              "relatedSearches": [],
+              "results": [
+                {
+                  "link": "https://example.com",
+                  "position": 1,
+                  "snippet": "Deterministic trial result for schema validation.",
+                  "title": "Example result"
+                }
+              ],
+              "success": true,
+              "total": 1,
+              "trial_run": true
+            },
+            "type": "object"
+          },
+          "return_keys": [
+            "answerBox",
+            "knowledgeGraph",
+            "raw",
+            "relatedSearches",
+            "results",
+            "success",
+            "total",
+            "trial_run"
+          ],
+          "skipped": false
+        },
+        "errors": [],
+        "real_run": {
+          "preview": {
+            "keys": [
+              "credits",
+              "knowledgeGraph",
+              "raw",
+              "relatedSearches",
+              "results",
+              "success",
+              "total"
+            ],
+            "preview": {
+              "credits": 1,
+              "knowledgeGraph": {
+                "attributes": {
+                  "CEO": "Tim Cook (Aug 24, 2***11–Sep 1, 2***26)",
+                  "COO": "Sabih Khan",
+                  "Customer service": "1 (8******) 275-2273",
+                  "Designated CEO": "John Ternus (Sep 1, 2***26–)",
+                  "Founded": "April 1, 1976, Los Altos, CA",
+                  "Founders": "Steve Jobs, Steve Wozniak, and Ronald Wayne",
+                  "Headquarters": "Cupertino, CA"
+                },
+                "description": "Apple Inc. is an American multinational technology company headquartered in Cupertino, California, in Silicon Valley, and known for consumer electronics, software and online services.",
+                "descriptionLink": "https://en.wikipedia.org/wiki/Apple_Inc.",
+                "descriptionSource": "Wikipedia",
+                "imageUrl": "https://encrypted-tbn***.gstatic.com/images?q=tbn:ANd9GcQwGQRv5TjjkycpctY66mOg_e2-npacrmjAb6_jAWhzlzkFE3OTjxyzbA&s=***",
+                "title": "Apple"
+              },
+              "raw": {
+                "credits": 1,
+                "knowledgeGraph": {
+                  "attributes": {
+                    "CEO": "Tim Cook (Aug 24, 2***11–Sep 1, 2***26)",
+                    "COO": "Sabih Khan",
+                    "Customer service": "1 (8******) 275-2273",
+                    "Designated CEO": "John Ternus (Sep 1, 2***26–)",
+                    "Founded": "April 1, 1976, Los Altos, CA",
+                    "Founders": "Steve Jobs, Steve Wozniak, and Ronald Wayne",
+                    "Headquarters": "Cupertino, CA"
+                  },
+                  "description": "Apple Inc. is an American multinational technology company headquartered in Cupertino, California, in Silicon Valley, and known for consumer electronics, software and online services.",
+                  "descriptionLink": "https://en.wikipedia.org/wiki/Apple_Inc.",
+                  "descriptionSource": "Wikipedia",
+                  "imageUrl": "https://encrypted-tbn***.gstatic.com/images?q=tbn:ANd9GcQwGQRv5TjjkycpctY66mOg_e2-npacrmjAb6_jAWhzlzkFE3OTjxyzbA&s=***",
+                  "title": "Apple"
+                },
+                "organic": [
+                  {
+                    "link": "https://en.wikipedia.org/wiki/Apple_Inc.",
+                    "position": 1,
+                    "snippet": "Apple Inc. is an American multinational technology company headquartered in Cupertino, California, in Silicon Valley, and known for consumer electronics, ...",
+                    "title": "Apple Inc. - Wikipedia"
+                  },
+                  {
+                    "link": "https://www.apple.com/",
+                    "position": 2,
+                    "sitelinks": [
+                      {
+                        "link": "https://www.apple.com/iphone/",
+                        "title": "iPhone"
+                      },
+                      {
+                        "link": "https://www.apple.com/us/shop/goto/store",
+                        "title": "Store"
+                      },
+                      {
+                        "link": "https://www.apple.com/retail/",
+                        "title": "Quick Links"
+                      },
+                      {
+                        "link": "https://www.apple.com/us/shop/goto/special_deals",
+                        "title": "Shop Special Stores"
+                      }
+                    ],
+                    "snippet": "Discover the innovative world of Apple and shop everything iPhone, iPad, Apple Watch, Mac, and Apple TV, plus explore accessories, entertainment, ...",
+                    "title": "Apple"
+                  },
+                  {
+                    "link": "https://finance.yahoo.com/quote/AAPL/",
+                    "position": 3,
+                    "snippet": "Find the latest Apple Inc. (AAPL) stock quote, history, news and other vital information to help you with your stock trading and investing.",
+                    "title": "Apple Inc. (AAPL) Stock Price, News, Quote & History - Yahoo Finance"
+                  },
+                  {
+                    "link": "https://www.apple.com/careers/us/",
+                    "position": 4,
+                    "snippet": "Discover career opportunities at Apple. Learn why people gather here to innovate, collaborate, and create groundbreaking products and services.",
+                    "title": "Apple Roles and Opportunities - Careers at Apple"
+                  },
+                  {
+                    "link": "https://www.apple.com/iphone/",
+                    "position": 5,
+                    "snippet": "Designed for Apple Intelligence. Discover iPhone 17 Pro, iPhone Air, iPhone 17, and iPhone 17e, along with iPhone 16.",
+                    "title": "iPhone - Apple"
+                  },
+                  {
+                    "date": "Jun 5, 2***25",
+                    "link": "https://www.linkedin.com/company***le",
+                    "position": 6,
+                    "snippet": "Company size: 1***,******1+ employees. Headquarters: Cupertino, California. Type: Public Company. Founded: 1976. Specialties: Innovative Product ...",
+                    "title": "Apple - LinkedIn"
+                  },
+                  {
+                    "link": "https://www.ebsco.com/research-starters/computer-science***le-inc",
+                    "position": 7,
+                    "snippet": "Apple Inc. is a leading American technology company known for its innovative consumer electronics, software, and online services.",
+                    "title": "Apple Inc. | Computer Science | Research Starters - EBSCO"
+                  },
+                  {
+                    "link": "https://www.apple.com/newsroom/",
+                    "position": 8,
+                    "snippet": "The official source for news about Apple, from Apple. Read press releases, get updates, watch video and download images.",
+                    "title": "Newsroom - Apple"
+                  },
+                  {
+                    "date": "5 days ago",
+                    "link": "https://www.britannica.com/money/Apple-Inc",
+                    "position": 9,
+                    "snippet": "Apple Inc. is an American multinational technology company that revolutionized the technology sector through its innovation of computer software, personal ...",
+                    "title": "Apple Inc. | History, Products, Headquarters, & Facts - Britannica"
+                  }
+                ],
+                "relatedSearches": [
+                  {
+                    "query": "Apple Inc full form"
+                  },
+                  {
+                    "query": "Apple Inc address"
+                  },
+                  {
+                    "query": "Apple Inc usa"
+                  },
+                  {
+                    "query": "Apple Inc stock"
+                  },
+                  {
+                    "query": "Apple Inc headquarters"
+                  },
+                  {
+                    "query": "Apple Inc website"
+                  },
+                  {
+                    "query": "Apple inc global"
+                  },
+                  {
+                    "query": "Apple Inc investor relations"
+                  }
+                ],
+                "searchParameters": {
+                  "engine": "google",
+                  "q": "apple inc",
+                  "type": "search"
+                }
+              },
+              "relatedSearches": [
+                {
+                  "query": "Apple Inc full form"
+                },
+                {
+                  "query": "Apple Inc address"
+                },
+                {
+                  "query": "Apple Inc usa"
+                },
+                {
+                  "query": "Apple Inc stock"
+                },
+                {
+                  "query": "Apple Inc headquarters"
+                },
+                {
+                  "query": "Apple Inc website"
+                },
+                {
+                  "query": "Apple inc global"
+                },
+                {
+                  "query": "Apple Inc investor relations"
+                }
+              ],
+              "results": [
+                {
+                  "link": "https://en.wikipedia.org/wiki/Apple_Inc.",
+                  "position": 1,
+                  "snippet": "Apple Inc. is an American multinational technology company headquartered in Cupertino, California, in Silicon Valley, and known for consumer electronics, ...",
+                  "title": "Apple Inc. - Wikipedia"
+                },
+                {
+                  "link": "https://www.apple.com/",
+                  "position": 2,
+                  "sitelinks": [
+                    {
+                      "link": "https://www.apple.com/iphone/",
+                      "title": "iPhone"
+                    },
+                    {
+                      "link": "https://www.apple.com/us/shop/goto/store",
+                      "title": "Store"
+                    },
+                    {
+                      "link": "https://www.apple.com/retail/",
+                      "title": "Quick Links"
+                    },
+                    {
+                      "link": "https://www.apple.com/us/shop/goto/special_deals",
+                      "title": "Shop Special Stores"
+                    }
+                  ],
+                  "snippet": "Discover the innovative world of Apple and shop everything iPhone, iPad, Apple Watch, Mac, and Apple TV, plus explore accessories, entertainment, ...",
+                  "title": "Apple"
+                },
+                {
+                  "link": "https://finance.yahoo.com/quote/AAPL/",
+                  "position": 3,
+                  "snippet": "Find the latest Apple Inc. (AAPL) stock quote, history, news and other vital information to help you with your stock trading and investing.",
+                  "title": "Apple Inc. (AAPL) Stock Price, News, Quote & History - Yahoo Finance"
+                },
+                {
+                  "link": "https://www.apple.com/careers/us/",
+                  "position": 4,
+                  "snippet": "Discover career opportunities at Apple. Learn why people gather here to innovate, collaborate, and create groundbreaking products and services.",
+                  "title": "Apple Roles and Opportunities - Careers at Apple"
+                },
+                {
+                  "link": "https://www.apple.com/iphone/",
+                  "position": 5,
+                  "snippet": "Designed for Apple Intelligence. Discover iPhone 17 Pro, iPhone Air, iPhone 17, and iPhone 17e, along with iPhone 16.",
+                  "title": "iPhone - Apple"
+                },
+                {
+                  "date": "Jun 5, 2***25",
+                  "link": "https://www.linkedin.com/company***le",
+                  "position": 6,
+                  "snippet": "Company size: 1***,******1+ employees. Headquarters: Cupertino, California. Type: Public Company. Founded: 1976. Specialties: Innovative Product ...",
+                  "title": "Apple - LinkedIn"
+                },
+                {
+                  "link": "https://www.ebsco.com/research-starters/computer-science***le-inc",
+                  "position": 7,
+                  "snippet": "Apple Inc. is a leading American technology company known for its innovative consumer electronics, software, and online services.",
+                  "title": "Apple Inc. | Computer Science | Research Starters - EBSCO"
+                },
+                {
+                  "link": "https://www.apple.com/newsroom/",
+                  "position": 8,
+                  "snippet": "The official source for news about Apple, from Apple. Read press releases, get updates, watch video and download images.",
+                  "title": "Newsroom - Apple"
+                },
+                {
+                  "date": "5 days ago",
+                  "link": "https://www.britannica.com/money/Apple-Inc",
+                  "position": 9,
+                  "snippet": "Apple Inc. is an American multinational technology company that revolutionized the technology sector through its innovation of computer software, personal ...",
+                  "title": "Apple Inc. | History, Products, Headquarters, & Facts - Britannica"
+                }
+              ],
+              "success": true,
+              "total": 9
+            },
+            "type": "object"
+          },
+          "return_keys": [
+            "credits",
+            "knowledgeGraph",
+            "raw",
+            "relatedSearches",
+            "results",
+            "success",
+            "total"
+          ],
+          "skipped": false
+        },
+        "snippet_preview": [
+          "[Tool Snippet]\nTool: https_google_serper_dev_search\nSnippet: https_google_serper_dev_search.minimal_usage (minimal_usage, priority=80)\nUse when: Use 使用 Serper API 执行网络搜索并返回结构化结果。 when this external API is needed.\nCorrect usage:\nfrom backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\n\npayload = {\n  \"query\": \"demo\"\n}\nresult = https_google_serper_dev_search(payload)\nreturn result\nExpected input shape:\n{\"properties\": {\"query\": {\"description\": \"Search query or API input.\", \"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}\nExpected return:\n{\"properties\": {\"answerBox\": {\"type\": \"object\"}, \"error\": {\"type\": \"string\"}, \"knowledgeGraph\": {\"type\": \"object\"}, \"raw\": {\"type\": \"object\"}, \"relatedSearches\": {\"items\": {\"type\": \"object\"}, \"type\": \"array\"}, \"response_preview\": {\"type\": \"string\"}, \"results\": {\"items\": {\"type\": \"object\"}, \"type\": \"array\"}, \"status_code\": {\"type\": \"integer\"}, \"success\": {\"type\": \"boolean\"}, \"total\": {\"type\": \"integer\"}, \"trial_run\": {\"type\": \"boolean\"}}, \"required\": [\"success\", \"results\", \"total\"], \"type\": \"object\"}\nReturn rule: Return the adapter result directly. It should match expected_output_shape.\nUsage policy: helper_preferred\nDo not:\n- Do not pass API keys or secrets in payload.\n- Do not guess parameter names; follow expected_input_shape.\n- Do not expect provider raw response fields as top-level output unless expected_output_shape declares them."
+        ],
+        "snippet_validations": [
+          {
+            "errors": [],
+            "success": true,
+            "warnings": []
+          }
+        ],
+        "status": "validated",
+        "success": true,
+        "tool_card_preview": [
+          "Tool: https_google_serper_dev_search.https_google_serper_dev_search\nPurpose: 使用 Serper API 执行网络搜索并返回结构化结果。\nWhen to use: Use 使用 Serper API 执行网络搜索并返回结构化结果。 when this external API is needed.\nImport: from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\nSignature: https_google_serper_dev_search(payload: dict) -> dict\nInput schema: {\"properties\": {\"query\": {\"description\": \"Search query or API input.\", \"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}\nOutput schema: {\"properties\": {\"answerBox\": {\"type\": \"object\"}, \"error\": {\"type\": \"string\"}, \"knowledgeGraph\": {\"type\": \"object\"}, \"raw\": {\"type\": \"object\"}, \"relatedSearches\": {\"items\": {\"type\": \"object\"}, \"type\": \"array\"}, \"response_preview\": {\"type\": \"string\"}, \"results\": {\"items\": {\"type\": \"object\"}, \"type\": \"array\"}, \"status_code\": {\"type\": \"integer\"}, \"success\": {\"type\": \"boolean\"}, \"total\": {\"type\": \"integer\"}, \"trial_run\": {\"type\": \"boolean\"}}, \"required\": [\"success\", \"results\", \"total\"], \"type\": \"object\"}\nReturn contract: Returns a normalized adapter result with success/results/total. Provider raw response may be included under raw.\nExample call: from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\nresult = https_google_serper_dev_search(payload)\nreturn result\nExample stdout/return: return result\nCommon mistakes:\n  - Do not pass API keys in payload.\n  - Do not call external network when SKILL_TRIAL_RUN=1.\n  - Do not require provider raw response fields as top-level adapter outputs.\n  - Do not write or expect files outside OUTPUT_DIR.\nTrial mode behavior: When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.\nSafety notes:\n  - Reads API secret from platform-scoped environment only.\n  - External API network access is declared.\nUsage policy: helper_preferred\nAllowed roles: generic_script, search_reader\nRequired capabilities: https_google_serper_dev_search\nRequired env: TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL, TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD, TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER, TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON, TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON, TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON\nRequired secrets: TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET\nForbidden imports: ftplib, paramiko, shutil, socket, subprocess, telnetlib\nForbidden side effects: leak secrets, undeclared network access"
+        ],
+        "warnings": []
+      },
+      "name": "https_google_serper_dev_search",
+      "optional_capabilities": [],
+      "output_schema": {
+        "properties": {
+          "answerBox": {
+            "type": "object"
+          },
+          "error": {
+            "type": "string"
+          },
+          "knowledgeGraph": {
+            "type": "object"
+          },
+          "raw": {
+            "type": "object"
+          },
+          "relatedSearches": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "response_preview": {
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "trial_run": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "results",
+          "total"
+        ],
+        "type": "object"
+      },
+      "prompt_guidance": "",
+      "required_capabilities": [
+        "https_google_serper_dev_search"
+      ],
+      "required_env": [
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON",
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON"
+      ],
+      "required_secrets": [
+        "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"
+      ],
+      "roles": [
+        "generic_script",
+        "search_reader"
+      ],
+      "safety_level": "medium",
+      "snippets": [
+        {
+          "anti_patterns": [
+            "Do not pass API keys or secrets in payload.",
+            "Do not guess parameter names; follow expected_input_shape.",
+            "Do not expect provider raw response fields as top-level output unless expected_output_shape declares them."
+          ],
+          "applies_to": {
+            "capabilities": [
+              "https_google_serper_dev_search"
+            ],
+            "failure_layers": [
+              "helper_call_failed",
+              "final_platform_output_value_invalid"
+            ],
+            "roles": [
+              "generic_script",
+              "search_reader"
+            ]
+          },
+          "code": "from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\n\npayload = {\n  \"query\": \"demo\"\n}\nresult = https_google_serper_dev_search(payload)\nreturn result",
+          "description": "Use 使用 Serper API 执行网络搜索并返回结构化结果。 when this external API is needed.",
+          "expected_input_shape": {
+            "properties": {
+              "query": {
+                "description": "Search query or API input.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "expected_output_shape": {
+            "properties": {
+              "answerBox": {
+                "type": "object"
+              },
+              "error": {
+                "type": "string"
+              },
+              "knowledgeGraph": {
+                "type": "object"
+              },
+              "raw": {
+                "type": "object"
+              },
+              "relatedSearches": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "response_preview": {
+                "type": "string"
+              },
+              "results": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "status_code": {
+                "type": "integer"
+              },
+              "success": {
+                "type": "boolean"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "trial_run": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "success",
+              "results",
+              "total"
+            ],
+            "type": "object"
+          },
+          "id": "https_google_serper_dev_search.minimal_usage",
+          "kind": "minimal_usage",
+          "priority": 80,
+          "requires": [
+            "https_google_serper_dev_search"
+          ],
+          "return_rule": "Return the adapter result directly. It should match expected_output_shape.",
+          "title": "Use 使用 Serper API 执行网络搜索并返回结构化结果。",
+          "usage_policy": "helper_preferred"
+        }
+      ],
+      "test_status": "passed",
+      "tool_type": "custom_adapter",
+      "trial_mode": "mock",
+      "updated_at": "",
+      "usage_policy": "helper_preferred",
+      "validator_kind": "generic",
+      "version": "1.0.0"
+    }
+  ]
+}

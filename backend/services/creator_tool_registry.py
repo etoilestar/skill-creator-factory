@@ -2879,6 +2879,7 @@ def _build_tool_contract(
         if wrapper_family == "http_api":
             capabilities = ["http_request"]
         elif wrapper_family == "managed_helper":
+            # 不默认 network_read/web_search。managed_helper 必须由 planner/repair 明确选择能力。
             capabilities = []
         elif wrapper_family == "database_query":
             capabilities = ["database_read"]
@@ -2898,8 +2899,20 @@ def _build_tool_contract(
     capabilities = normalized_capabilities
 
     helper_contract: dict[str, Any] = {}
+
+    manifest_optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+    optional_helper_contract = (
+        manifest_optional.get("helper_contract")
+        if isinstance(manifest_optional.get("helper_contract"), dict)
+        else {}
+    )
+
+    if optional_helper_contract:
+        helper_contract.update(optional_helper_contract)
+
     if isinstance(manifest.get("helper_contract"), dict):
         helper_contract.update(manifest["helper_contract"])
+
     if isinstance(plan.get("helper_contract"), dict):
         helper_contract.update(plan["helper_contract"])
 
@@ -3286,6 +3299,7 @@ async def _repair_contract_with_model(
 
     if ack:
         model_notes.append(f"contract_repair_model={ack['model']}")
+
     if err:
         warnings.append(f"contract repair model unavailable: {err}")
         result = {}
@@ -3328,6 +3342,7 @@ async def _repair_contract_with_model(
         "required_env",
         "required_secrets",
         "security_schemes",
+        "optional",
     }
 
     def deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -3358,6 +3373,7 @@ async def _repair_contract_with_model(
     if isinstance(result.get("manifest_patch"), dict):
         manifest_patch.update(result["manifest_patch"])
 
+    # 兼容模型直接返回顶层 patch。
     for key in allowed_plan_keys:
         if key in result:
             plan_patch[key] = result[key]
@@ -3365,6 +3381,7 @@ async def _repair_contract_with_model(
     if isinstance(result.get("manifest"), dict):
         manifest_patch = deep_merge_dict(manifest_patch, result["manifest"])
 
+    # 如果 repair model 没返回 patch，则退回 validator suggested_patch。
     if not plan_patch and not manifest_patch:
         for issue in validation.get("issues") or []:
             if not isinstance(issue, dict):
@@ -3396,6 +3413,28 @@ async def _repair_contract_with_model(
             else:
                 manifest[key] = value
 
+    # 兼容 manifest.optional.helper_contract，把它提升成正式 helper_contract。
+    optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+    optional_helper_contract = (
+        optional.get("helper_contract")
+        if isinstance(optional.get("helper_contract"), dict)
+        else {}
+    )
+
+    helper_contract: dict[str, Any] = {}
+    if optional_helper_contract:
+        helper_contract.update(optional_helper_contract)
+
+    if isinstance(manifest.get("helper_contract"), dict):
+        helper_contract.update(manifest["helper_contract"])
+
+    if isinstance(repaired.get("helper_contract"), dict):
+        helper_contract.update(repaired["helper_contract"])
+
+    helper_name = str(repaired.get("helper_name") or helper_contract.get("helper_name") or "").strip()
+    if helper_name:
+        helper_contract["helper_name"] = helper_name
+
     if repaired.get("wrapper_family"):
         manifest["wrapper_family"] = repaired["wrapper_family"]
 
@@ -3412,16 +3451,6 @@ async def _repair_contract_with_model(
     if caps:
         repaired["required_capabilities"] = caps
         manifest["required_capabilities"] = caps
-
-    helper_contract: dict[str, Any] = {}
-    if isinstance(manifest.get("helper_contract"), dict):
-        helper_contract.update(manifest["helper_contract"])
-    if isinstance(repaired.get("helper_contract"), dict):
-        helper_contract.update(repaired["helper_contract"])
-
-    helper_name = str(repaired.get("helper_name") or helper_contract.get("helper_name") or "").strip()
-    if helper_name:
-        helper_contract["helper_name"] = helper_name
 
     if helper_contract:
         repaired["helper_contract"] = helper_contract
@@ -4788,10 +4817,15 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
 
     model_tool_kind = str(normalized.get("tool_kind") or "").strip()
 
+    raw_manifest = normalized.get("manifest") if isinstance(normalized.get("manifest"), dict) else {}
+    request_manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+
     wrapper_family = _canonical_wrapper_family(
-        request.get("wrapper_family")
-        or normalized.get("wrapper_family")
+        normalized.get("wrapper_family")
+        or raw_manifest.get("wrapper_family")
         or fallback.get("wrapper_family")
+        or request.get("wrapper_family")
+        or request_manifest.get("wrapper_family")
         or _infer_wrapper_family({**request, **normalized})
     )
 
@@ -4862,6 +4896,46 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
     manifest = dict(normalized.get("manifest") or {})
     manifest["wrapper_family"] = wrapper_family
     manifest["tool_kind"] = normalized.get("tool_kind") or _infer_tool_kind({**request, **normalized})
+
+    # 同步 required_capabilities，repair 后不能被旧 manifest/request 覆盖。
+    capabilities: list[str] = []
+    for source in (normalized, manifest):
+        raw_caps = source.get("required_capabilities") if isinstance(source, dict) else None
+        if isinstance(raw_caps, list):
+            for item in raw_caps:
+                text = str(item or "").strip()
+                if text and text not in capabilities:
+                    capabilities.append(text)
+
+    if capabilities:
+        normalized["required_capabilities"] = capabilities
+        manifest["required_capabilities"] = capabilities
+
+    # 兼容 manifest.optional.helper_contract，并提升为正式 helper_contract。
+    optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+    optional_helper_contract = (
+        optional.get("helper_contract")
+        if isinstance(optional.get("helper_contract"), dict)
+        else {}
+    )
+
+    helper_contract: dict[str, Any] = {}
+    if optional_helper_contract:
+        helper_contract.update(optional_helper_contract)
+
+    if isinstance(manifest.get("helper_contract"), dict):
+        helper_contract.update(manifest["helper_contract"])
+
+    if isinstance(normalized.get("helper_contract"), dict):
+        helper_contract.update(normalized["helper_contract"])
+
+    helper_name = str(normalized.get("helper_name") or helper_contract.get("helper_name") or "").strip()
+    if helper_name:
+        helper_contract["helper_name"] = helper_name
+
+    if helper_contract:
+        normalized["helper_contract"] = helper_contract
+        manifest["helper_contract"] = helper_contract
 
     model_config_schema = (
         normalized.get("config_form_schema")
@@ -4970,6 +5044,7 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
             )
             for key, value in _schema_properties(input_schema).items()
         }
+
     normalized["sample_input"] = sample
 
     safe_questions = _safe_clarification_questions(
@@ -4980,6 +5055,7 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         safe_questions,
         request.get("clarification_answers") or [],
     )
+
     normalized["clarification_questions"] = safe_questions
     normalized["questions"] = safe_questions
     normalized["needs_clarification"] = bool(safe_questions)
@@ -5042,24 +5118,11 @@ def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dic
         and not normalized.get("needs_clarification")
         and normalized.get("manifest")
         and normalized.get("tool_kind") != "external_api"
-        and not normalized.get("ready_for_code_generation")
-        and "ready_for_code_generation" not in (plan or {})
-        and not normalized.get("auth_gate", {}).get("block_code_generation")
         and not normalized.get("requires_authoring_tools")
     ):
         normalized["ready_for_code_generation"] = True
 
-    normalized = _apply_auth_override_to_plan(normalized, request)
-
-    manifest = dict(normalized.get("manifest") or {})
-    manifest["wrapper_family"] = normalized.get("wrapper_family") or wrapper_family
-    manifest["tool_kind"] = normalized.get("tool_kind") or ""
-    manifest["auth_decision"] = normalized.get("auth_decision") or {}
-    manifest["auth_gate"] = normalized.get("auth_gate") or {}
-    manifest["auth_override"] = normalized.get("auth_override") or auth_override
-    normalized["manifest"] = manifest
-
-    return normalized
+    return _apply_auth_override_to_plan(normalized, request)
 
 def _external_api_config_schema() -> dict[str, Any]:
     return {
@@ -5675,77 +5738,435 @@ def _internal_code_errors(code: str) -> list[str]:
 
 def _managed_helper_wrapper_code(contract: dict[str, Any], manifest: dict[str, Any]) -> str:
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "managed_helper_tool"))
-    helper_name = str(contract.get("helper_name") or "").strip()
-    if not helper_name:
-        helper_name = "fetch_url_text"
+
+    helper_contract: dict[str, Any] = {}
+    manifest_optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+    optional_helper_contract = (
+        manifest_optional.get("helper_contract")
+        if isinstance(manifest_optional.get("helper_contract"), dict)
+        else {}
+    )
+
+    if optional_helper_contract:
+        helper_contract.update(optional_helper_contract)
+
+    if isinstance(manifest.get("helper_contract"), dict):
+        helper_contract.update(manifest["helper_contract"])
+
+    if isinstance(contract.get("helper_contract"), dict):
+        helper_contract.update(contract["helper_contract"])
+
+    helper_name = str(
+        contract.get("helper_name")
+        or helper_contract.get("helper_name")
+        or ""
+    ).strip()
+
+    if helper_name:
+        helper_contract["helper_name"] = helper_name
+
+    manifest = dict(manifest or {})
+    if helper_contract:
+        manifest["helper_contract"] = helper_contract
 
     manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+    helper_contract_json_literal = repr(json.dumps(helper_contract, ensure_ascii=False, sort_keys=True))
 
-    return f'''from __future__ import annotations
+    template = r'''from __future__ import annotations
 
 # AUTO-GENERATED MANAGED HELPER WRAPPER.
 # The platform controls run(), manifest(), main(), trial behavior and helper dispatch.
 # This wrapper must not be replaced with direct provider-specific network/client code.
 
+import inspect
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from backend.services import skill_runtime as _skill_runtime
 
 
-FUNCTION_NAME = {function_name!r}
-HELPER_NAME = {helper_name!r}
-MANIFEST_DATA = json.loads({manifest_json_literal})
+FUNCTION_NAME = __FUNCTION_NAME_LITERAL__
+HELPER_CONTRACT = json.loads(__HELPER_CONTRACT_JSON_LITERAL__)
+HELPER_NAME = str(HELPER_CONTRACT.get("helper_name") or "").strip()
+MANIFEST_DATA = json.loads(__MANIFEST_JSON_LITERAL__)
 
 
-def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
-    return {{
-        "success": True,
-        "result": {{"trial_run": True, "payload_keys": sorted(payload.keys())}},
-        "trial_run": True,
-    }}
+def _schema_properties(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
+
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        return props
+
+    # Some creator manifests store output_schema directly as {field: schema}
+    # instead of JSON-Schema {"type":"object","properties":{...}}.
+    if schema.get("type") == "object":
+        return {}
+
+    return {
+        str(key): value
+        for key, value in schema.items()
+        if isinstance(value, dict)
+    }
+
+
+def _output_properties() -> dict[str, Any]:
+    return _schema_properties(MANIFEST_DATA.get("output_schema"))
+
+
+def _input_properties() -> dict[str, Any]:
+    return _schema_properties(MANIFEST_DATA.get("input_schema"))
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_path(root: Any, path: str, default: Any = None) -> Any:
+    if not path:
+        return default
+
+    current = root
+    parts = [part for part in str(path).replace("[", ".").replace("]", "").split(".") if part]
+
+    if parts and parts[0] in {"payload", "input", "inputs"}:
+        parts = parts[1:]
+
+    for part in parts:
+        if isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current.get(part)
+        elif isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except Exception:
+                return default
+        else:
+            return default
+
+    return current
+
+
+def _resolve_value(spec: Any, payload: dict[str, Any]) -> Any:
+    if isinstance(spec, dict):
+        if "value" in spec:
+            return spec.get("value")
+
+        source = str(spec.get("source") or spec.get("from") or "").strip()
+        default = spec.get("default")
+
+        if source:
+            value = _read_path(payload, source, default)
+            return default if value in (None, "") and "default" in spec else value
+
+        name = str(spec.get("name") or "").strip()
+        if name:
+            return payload.get(name, default)
+
+        return default
+
+    if isinstance(spec, str):
+        return _read_path(payload, spec, None)
+
+    return spec
+
+
+def _first_payload_value(payload: dict[str, Any], names: list[str]) -> Any:
+    for name in names:
+        if name in payload and payload.get(name) not in (None, ""):
+            return payload.get(name)
+    return None
+
+
+def _resource_candidate_for_param(payload: dict[str, Any], param_name: str) -> Any:
+    name = str(param_name or "").strip()
+
+    aliases = [name]
+
+    if name in {"url", "uri", "source", "resource", "target", "input"}:
+        aliases.extend([
+            "target_url",
+            "url",
+            "uri",
+            "source",
+            "resource",
+            "target",
+            "input",
+        ])
+
+    if name.endswith("_url"):
+        aliases.extend(["target_url", "url", "uri"])
+
+    if name in {"text", "content", "query", "prompt"}:
+        aliases.extend([name, "input", "content", "text", "query", "prompt"])
+
+    result = _first_payload_value(payload, aliases)
+    return result
+
+
+def _build_args_kwargs_from_contract(payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any], bool]:
+    invocation = HELPER_CONTRACT.get("invocation")
+    if not isinstance(invocation, dict):
+        invocation = {}
+
+    args_spec = invocation.get("args")
+    kwargs_spec = invocation.get("kwargs")
+
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+
+    used = False
+
+    if isinstance(args_spec, list):
+        used = True
+        for item in args_spec:
+            args.append(_resolve_value(item, payload))
+
+    if isinstance(kwargs_spec, dict):
+        used = True
+        for key, spec in kwargs_spec.items():
+            value = _resolve_value(spec, payload)
+            if value is not None:
+                kwargs[str(key)] = value
+
+    return args, kwargs, used
+
+
+def _build_kwargs_from_signature(helper: Any, payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any], bool]:
+    try:
+        signature = inspect.signature(helper)
+    except Exception:
+        return [], {}, False
+
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    required_missing: list[str] = []
+
+    for param in signature.parameters.values():
+        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
+            continue
+
+        name = param.name
+
+        if name in payload:
+            value = payload.get(name)
+        else:
+            value = _resource_candidate_for_param(payload, name)
+
+        if value is not None:
+            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                args.append(value)
+            else:
+                kwargs[name] = value
+            continue
+
+        if param.default is inspect.Parameter.empty:
+            required_missing.append(name)
+
+    if required_missing:
+        return [], {}, False
+
+    return args, kwargs, bool(args or kwargs)
 
 
 def _call_helper(payload: dict[str, Any]) -> Any:
+    if not HELPER_NAME:
+        raise RuntimeError("managed helper_contract.helper_name is required")
+
     helper = getattr(_skill_runtime, HELPER_NAME, None)
     if not callable(helper):
-        raise RuntimeError(f"managed helper is not available: {{HELPER_NAME}}")
+        raise RuntimeError("managed helper is not available: " + HELPER_NAME)
 
-    if HELPER_NAME == "fetch_url_text":
-        url = str(payload.get("target_url") or payload.get("url") or payload.get("uri") or "").strip()
-        if not url:
-            return {{"success": False, "error": "target_url/url is required"}}
-        max_chars = int(payload.get("max_chars") or 12000)
-        value = helper(url, max_chars=max_chars)
-        if isinstance(value, dict):
-            value.setdefault("success", True)
-            value.setdefault("source_url", url)
-            return value
-        return {{"success": True, "text": str(value), "source_url": url}}
+    args, kwargs, used_contract = _build_args_kwargs_from_contract(payload)
+    if used_contract:
+        return helper(*args, **kwargs)
+
+    args, kwargs, used_signature = _build_kwargs_from_signature(helper, payload)
+    if used_signature:
+        return helper(*args, **kwargs)
 
     try:
         return helper(payload)
-    except TypeError:
-        return helper(**payload)
+    except TypeError as first_error:
+        try:
+            return helper(**payload)
+        except TypeError:
+            raise RuntimeError(
+                "unable to call managed helper "
+                + HELPER_NAME
+                + "; add helper_contract.invocation args/kwargs mapping. "
+                + "original error: "
+                + str(first_error)
+            )
+
+
+def _as_bool_success(value: dict[str, Any]) -> bool:
+    if "success" in value:
+        return bool(value.get("success"))
+
+    status = str(value.get("status") or "").strip().lower()
+    if status in {"success", "ok", "done", "completed"}:
+        return True
+    if status in {"failed", "error", "timeout", "not_found"}:
+        return False
+
+    if value.get("error") or value.get("error_message"):
+        return False
+
+    status_code = value.get("status_code")
+    if isinstance(status_code, int) and status_code >= 400:
+        return False
+
+    return True
+
+
+def _get_first(data: dict[str, Any], names: list[str], default: Any = None) -> Any:
+    for name in names:
+        if name in data and data.get(name) not in (None, ""):
+            return data.get(name)
+    return default
+
+
+def _status_from_value(data: dict[str, Any], success: bool) -> str:
+    status = str(data.get("status") or "").strip()
+    if status:
+        return status
+
+    status_code = data.get("status_code")
+    if isinstance(status_code, int):
+        if status_code == 404:
+            return "not_found"
+        if status_code >= 400:
+            return "failed"
+
+    if data.get("timeout") is True:
+        return "timeout"
+
+    return "success" if success else "failed"
+
+
+def _fill_schema_field(output: dict[str, Any], field: str, spec: dict[str, Any], payload: dict[str, Any]) -> None:
+    if field in output and output.get(field) is not None:
+        return
+
+    field_lower = field.lower()
+    typ = str(spec.get("type") or "").lower()
+    enum_values = spec.get("enum") if isinstance(spec.get("enum"), list) else []
+
+    if field_lower in {"success", "ok"}:
+        output[field] = _as_bool_success(output)
+        return
+
+    if field_lower in {"status", "state"}:
+        output[field] = _status_from_value(output, _as_bool_success(output))
+        if enum_values and output[field] not in enum_values:
+            output[field] = enum_values[0]
+        return
+
+    if field_lower in {"content", "text", "body", "extracted_text", "markdown"}:
+        output[field] = _get_first(
+            output,
+            ["content", "text", "body", "extracted_text", "markdown", "result", "response"],
+            "",
+        )
+        return
+
+    if field_lower in {"url", "source_url", "original_url", "source", "uri"} or field_lower.endswith("_url"):
+        output[field] = _get_first(
+            output,
+            ["url", "source_url", "original_url", "source", "uri"],
+            _first_payload_value(payload, ["target_url", "url", "uri", "source"]),
+        )
+        return
+
+    if field_lower in {"error", "error_message", "message"}:
+        output[field] = _get_first(output, ["error_message", "error", "message"], "")
+        return
+
+    if field_lower in {"extracted_at", "created_at", "updated_at", "timestamp", "time"} or field_lower.endswith("_at"):
+        output[field] = _utc_now()
+        return
+
+    if enum_values:
+        output[field] = enum_values[0]
+        return
+
+    if typ in {"integer", "number"}:
+        output[field] = 0
+    elif typ == "boolean":
+        output[field] = False
+    elif typ == "array":
+        output[field] = []
+    elif typ == "object":
+        output[field] = {}
+    else:
+        output[field] = ""
+
+
+def _normalize_result(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(value, dict):
+        output = dict(value)
+    else:
+        output = {
+            "success": True,
+            "content": "" if value is None else str(value),
+            "result": value,
+        }
+
+    success = _as_bool_success(output)
+    output.setdefault("success", success)
+
+    props = _output_properties()
+    for field, spec in props.items():
+        _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
+
+    return output
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "success": True,
+        "trial_run": True,
+    }
+
+    props = _output_properties()
+    for field, spec in props.items():
+        _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
+
+    output.setdefault("result", {"trial_run": True, "payload_keys": sorted(payload.keys())})
+    return output
 
 
 def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = dict(payload or {{}})
+    payload = dict(payload or {})
 
     if os.getenv("SKILL_TRIAL_RUN") == "1":
         return _trial_result(payload)
 
-    value = _call_helper(payload)
+    try:
+        value = _call_helper(payload)
+        return _normalize_result(value, payload)
+    except Exception as exc:
+        output: dict[str, Any] = {
+            "success": False,
+            "status": "failed",
+            "error": str(exc),
+            "error_message": str(exc),
+        }
 
-    if isinstance(value, dict):
-        return value
+        props = _output_properties()
+        for field, spec in props.items():
+            _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
 
-    return {{"success": True, "result": value}}
+        return output
 
 
-def {function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def __FUNCTION_NAME__(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return run(payload)
 
 
@@ -5754,7 +6175,7 @@ def manifest() -> dict[str, Any]:
 
 
 def main() -> None:
-    raw = sys.stdin.read().strip() or "{{}}"
+    raw = sys.stdin.read().strip() or "{}"
     payload = json.loads(raw)
     print(json.dumps(run(payload), ensure_ascii=False))
 
@@ -5763,6 +6184,13 @@ if __name__ == "__main__":
     main()
 '''
 
+    return (
+        template
+        .replace("__FUNCTION_NAME_LITERAL__", repr(function_name))
+        .replace("__HELPER_CONTRACT_JSON_LITERAL__", helper_contract_json_literal)
+        .replace("__MANIFEST_JSON_LITERAL__", manifest_json_literal)
+        .replace("__FUNCTION_NAME__", function_name)
+    )
 
 def _default_transform_code() -> str:
     return '''

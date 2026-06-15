@@ -3425,15 +3425,16 @@ def merge_auth_gate(
                 "reasons": ["live_test 已通过"],
             }
 
+    declared_secrets = facts.get("declared_secrets") or []
     auth_signals = bool(
-        facts.get("reads_env_secret") or
-        facts.get("declared_secrets") or
-        facts.get("auth_config_present")
+        facts.get("reads_env_secret")
+        or declared_secrets
+        or facts.get("auth_config_present")
     )
 
     fixed_remote_entrypoint = bool(
-        facts.get("has_configurable_endpoint") or
-        facts.get("has_remote_literal")
+        facts.get("has_configurable_endpoint")
+        or facts.get("has_remote_literal")
     )
 
     if required == "yes":
@@ -3458,15 +3459,17 @@ def merge_auth_gate(
                 "status": "needs_config",
                 "block_code_generation": False,
                 "block_registration": True,
-                "reasons": ["Planner 判定无需认证，但代码或 manifest 存在 secret/env/auth 信号"],
+                "reasons": ["Planner 判定无需认证，但代码或 manifest 存在真实 secret/env/auth 配置信号"],
             }
 
-        if fixed_remote_entrypoint and confidence < 0.8:
+        # 注意：网络访问本身不是认证需求。
+        # required=no 且 confidence>=0.75 时，不因为 http/url/web_fetch 自动阻止注册。
+        if fixed_remote_entrypoint and confidence < 0.75:
             return {
                 "status": "needs_live_test",
                 "block_code_generation": False,
                 "block_registration": True,
-                "reasons": ["固定远程入口未经过 live_test，高置信 no-auth 不成立"],
+                "reasons": ["固定远程入口未经过 live_test，且 no-auth 置信度不足"],
             }
 
         if confidence < 0.6:
@@ -5384,12 +5387,14 @@ async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: 
 
 async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
     request = _apply_clarification_answers(request)
+
     planner_payload = {
         key: request.get(key)
         for key in [
             "description",
             "tool_name",
             "tool_type",
+            "wrapper_family",
             "code_block",
             "input_description",
             "output_description",
@@ -5408,44 +5413,87 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             "live_test_result",
             "allow_external_network",
             "authoring_context",
+            "auth_decision",
+            "auth_override",
         ]
     }
+
     planner_messages = [
         {
             "role": "system",
             "content": (
                 "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
-                "Return strict JSON with this layered contract where possible: needs_clarification, clarification_questions, requires_config, "
-                "suggested_entrypoint, config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind "
-                "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
-                "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
-                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, suggested_config_schema, sample_input_schema, manifest, "
-                "implementation_plan. clarification_questions must be structured objects with id/type/question/options/required, Chinese, preferably 1-3 questions and never more than 5, and only ask about real capability ambiguity. Generate options dynamically from the user request when a choice is useful; do not use hardcoded generic options. "
-                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; infer and prefill suggested_entrypoint with base_url, method, auth_type, secret_env, and confidence when possible, using empty base_url with low confidence if unknown. Put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
-                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, suggested_entrypoint, saved config, and test result. "
-                "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
+                "Return strict JSON only. "
+                "Use this layered contract where possible: "
+                "needs_clarification, clarification_questions, wrapper_family, requires_config, suggested_entrypoint, "
+                "config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind, "
+                "operation, requires_secret, secret_env_suggestions, requires_external_network, requires_live_test, "
+                "ready_for_live_test, ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, "
+                "suggested_config_schema, sample_input_schema, manifest, implementation_plan, sample_input, risk_notes, "
+                "auth_decision. "
+
+                "tool_kind must be one of: local_helper, web_fetch, external_api, file_generator, data_transform, database_query, local_command, unknown. "
+                "web_fetch means public web page or URL content retrieval/parsing. "
+                "external_api means a fixed third-party/private/SaaS/service API integration that may need endpoint/auth/account configuration. "
+
+                "auth_decision MUST be an object: "
+                "{\"required\":\"yes|no|unknown\",\"confidence\":0.0-1.0,\"reason\":\"...\","
+                "\"evidence\":[...],\"security_schemes\":[{\"type\":\"none|api_key|token|basic|oauth2|custom\","
+                "\"env\":\"OPTIONAL_ENV\",\"placement\":\"header|query|bearer\",\"header_name\":\"...\",\"query_param\":\"...\"}]}. "
+
+                "Do not collapse unknown auth into no-auth. "
+                "If a private API, SaaS, database, account data, write/publish action, or secret may be involved and you are not sure, output auth_decision.required=unknown. "
+                "Only output auth_decision.required=no with high confidence for pure local computation, deterministic file conversion, or clearly public no-auth retrieval. "
+
+                "Important classification rule: public web page body scraping, public URL text extraction, HTML parsing, CSS selector extraction, XPath extraction, title/content/image-link extraction from a normal public page should be tool_kind=web_fetch, not external_api. "
+                "For this case, requires_authorization=false, requires_secret=false, auth_decision.required=no, security_schemes=[{\"type\":\"none\"}]. "
+                "Needing external network does not imply authentication. "
+                "Needing a target_url, selector, timeout, encoding, user_agent, headers, or parsing options does not imply authentication. "
+
+                "config_form_schema is only for connection/auth/account/secret configuration such as base_url, endpoint, auth_type, secret_env, token, api_key, username/password, database_url, tenant, region. "
+                "Do NOT put business runtime inputs such as target_url, content_selector, encoding, timeout, use_headless_browser, extract_images, user_agent, or parser options into config_form_schema. "
+                "Put those fields into manifest.input_schema, sample_input_schema, or sample_input instead. "
+
+                "clarification_questions must be structured objects with id/type/question/options/required, Chinese, preferably 1-3 questions and never more than 5. "
+                "Only ask about real capability ambiguity. "
+                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions. "
+                "Do not ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions. "
+
+                "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. "
+                "Use authoring_config_collector only for connection/auth/account/secret configuration, not for ordinary runtime parameters. "
+                "Do not invent provider details."
             ),
         },
         {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
     ]
-    model_plan, ack, err = await _complete_author_model("planner", planner_messages, reason="creator_tool_author_plan")
+
+    model_plan, ack, err = await _complete_author_model(
+        "planner",
+        planner_messages,
+        reason="creator_tool_author_plan",
+    )
+
     if ack:
         model_notes.append(f"planner_model={ack['model']}")
+
     if err:
         warnings.append(f"planner_model unavailable, used deterministic fallback: {err}")
+
     plan = model_plan if isinstance(model_plan, dict) and model_plan else _author_fallback_plan(request)
+
     if not isinstance(plan.get("manifest"), dict):
         plan = _author_fallback_plan(request)
+
     normalized = _normalize_author_plan(plan, request)
     action = str(request.get("action") or "").strip().lower()
     live_success = _live_test_success_from_request(request)
 
     if (
-            action not in {"generate", "finalize"}
-            and not live_success
-            and ack
-            and normalized.get("tool_kind") == "external_api"
-            and not normalized.get("clarification_questions")
+        action not in {"generate", "finalize"}
+        and not live_success
+        and ack
+        and normalized.get("tool_kind") == "external_api"
+        and not normalized.get("clarification_questions")
     ):
         judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
         if judged_questions:
@@ -5453,6 +5501,7 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             normalized["questions"] = judged_questions
             normalized["needs_clarification"] = True
             normalized["ready_for_code_generation"] = False
+
     model_notes.extend(normalized.get("model_notes") or [])
     return normalized
 

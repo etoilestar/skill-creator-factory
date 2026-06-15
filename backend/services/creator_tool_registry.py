@@ -5736,7 +5736,105 @@ def _internal_code_errors(code: str) -> list[str]:
 
     return sorted(set(errors))
 
-def _managed_helper_wrapper_code(contract: dict[str, Any], manifest: dict[str, Any]) -> str:
+def _default_helper_normalize_code() -> str:
+    return '''
+def normalize_helper_result(value: object, payload: dict) -> dict:
+    """Normalize a managed helper result to a generic dict.
+
+    The platform wrapper will further fill missing fields according to
+    manifest.output_schema, so this fallback only needs to preserve the raw value.
+    """
+    if isinstance(value, dict):
+        return dict(value)
+
+    return {
+        "success": True,
+        "content": "" if value is None else str(value),
+        "result": value,
+    }
+'''.strip()
+
+def _helper_normalize_code_errors(code: str) -> list[str]:
+    errors: list[str] = []
+
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"helper normalize code syntax error: {exc}"]
+
+    allowed_functions = {"normalize_helper_result"}
+
+    forbidden_imports = {
+        "requests",
+        "httpx",
+        "urllib",
+        "aiohttp",
+        "os",
+        "sys",
+        "subprocess",
+        "socket",
+        "pathlib",
+        "shutil",
+    }
+
+    forbidden_calls = {
+        "open",
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+    }
+
+    function_names: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in forbidden_imports:
+                    errors.append(f"helper normalize code must not import {root}")
+
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in forbidden_imports:
+                errors.append(f"helper normalize code must not import {root}")
+
+        elif isinstance(node, ast.FunctionDef):
+            function_names.add(node.name)
+            if node.name not in allowed_functions:
+                errors.append(
+                    "helper normalize code may only define "
+                    f"normalize_helper_result(value, payload), got {node.name}"
+                )
+
+        elif isinstance(node, ast.AsyncFunctionDef):
+            errors.append("helper normalize code must not define async functions")
+
+        elif isinstance(node, ast.ClassDef):
+            errors.append("helper normalize code must not define classes")
+
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
+                else ""
+            )
+            if called in forbidden_calls:
+                errors.append(f"helper normalize code must not call {called}")
+
+    if "normalize_helper_result" not in function_names:
+        errors.append("helper normalize code must define normalize_helper_result(value, payload)")
+
+    return sorted(set(errors))
+
+def _managed_helper_wrapper_code(
+    contract: dict[str, Any],
+    internal_code: str,
+    manifest: dict[str, Any],
+) -> str:
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "managed_helper_tool"))
 
     helper_contract: dict[str, Any] = {}
@@ -5769,14 +5867,23 @@ def _managed_helper_wrapper_code(contract: dict[str, Any], manifest: dict[str, A
     if helper_contract:
         manifest["helper_contract"] = helper_contract
 
+    safe_internal = _strip_code_fence(internal_code or "")
+    helper_internal_errors = _helper_normalize_code_errors(safe_internal)
+    internal_audit = "model_normalize_helper_result_only"
+
+    if helper_internal_errors:
+        safe_internal = _default_helper_normalize_code()
+        internal_audit = "fallback_default_helper_normalize_code"
+
     manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     helper_contract_json_literal = repr(json.dumps(helper_contract, ensure_ascii=False, sort_keys=True))
 
     template = r'''from __future__ import annotations
 
 # AUTO-GENERATED MANAGED HELPER WRAPPER.
-# The platform controls run(), manifest(), main(), trial behavior and helper dispatch.
-# This wrapper must not be replaced with direct provider-specific network/client code.
+# Only the code between MODEL_INTERNAL_CODE_START/END may come from code_model.
+# The platform controls helper dispatch, run(), manifest(), main(), and trial behavior.
+# internal_audit=__INTERNAL_AUDIT__
 
 import inspect
 import json
@@ -5802,8 +5909,6 @@ def _schema_properties(schema: Any) -> dict[str, Any]:
     if isinstance(props, dict):
         return props
 
-    # Some creator manifests store output_schema directly as {field: schema}
-    # instead of JSON-Schema {"type":"object","properties":{...}}.
     if schema.get("type") == "object":
         return {}
 
@@ -5818,10 +5923,6 @@ def _output_properties() -> dict[str, Any]:
     return _schema_properties(MANIFEST_DATA.get("output_schema"))
 
 
-def _input_properties() -> dict[str, Any]:
-    return _schema_properties(MANIFEST_DATA.get("input_schema"))
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -5831,7 +5932,11 @@ def _read_path(root: Any, path: str, default: Any = None) -> Any:
         return default
 
     current = root
-    parts = [part for part in str(path).replace("[", ".").replace("]", "").split(".") if part]
+    parts = [
+        part
+        for part in str(path).replace("[", ".").replace("]", "").split(".")
+        if part
+    ]
 
     if parts and parts[0] in {"payload", "input", "inputs"}:
         parts = parts[1:]
@@ -5885,7 +5990,6 @@ def _first_payload_value(payload: dict[str, Any], names: list[str]) -> Any:
 
 def _resource_candidate_for_param(payload: dict[str, Any], param_name: str) -> Any:
     name = str(param_name or "").strip()
-
     aliases = [name]
 
     if name in {"url", "uri", "source", "resource", "target", "input"}:
@@ -5905,8 +6009,7 @@ def _resource_candidate_for_param(payload: dict[str, Any], param_name: str) -> A
     if name in {"text", "content", "query", "prompt"}:
         aliases.extend([name, "input", "content", "text", "query", "prompt"])
 
-    result = _first_payload_value(payload, aliases)
-    return result
+    return _first_payload_value(payload, aliases)
 
 
 def _build_args_kwargs_from_contract(payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any], bool]:
@@ -6003,6 +6106,11 @@ def _call_helper(payload: dict[str, Any]) -> Any:
                 + "original error: "
                 + str(first_error)
             )
+
+
+# === MODEL_INTERNAL_CODE_START ===
+__MODEL_INTERNAL_CODE__
+# === MODEL_INTERNAL_CODE_END ===
 
 
 def _as_bool_success(value: dict[str, Any]) -> bool:
@@ -6109,7 +6217,26 @@ def _fill_schema_field(output: dict[str, Any], field: str, spec: dict[str, Any],
 
 
 def _normalize_result(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(value, dict):
+    normalizer = globals().get("normalize_helper_result")
+
+    if callable(normalizer):
+        try:
+            normalized = normalizer(value, payload)
+            if isinstance(normalized, dict):
+                output = dict(normalized)
+            else:
+                output = {
+                    "success": True,
+                    "result": normalized,
+                    "content": "" if normalized is None else str(normalized),
+                }
+        except Exception as exc:
+            output = {
+                "success": False,
+                "error": str(exc),
+                "error_message": str(exc),
+            }
+    elif isinstance(value, dict):
         output = dict(value)
     else:
         output = {
@@ -6132,13 +6259,13 @@ def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
     output: dict[str, Any] = {
         "success": True,
         "trial_run": True,
+        "result": {"trial_run": True, "payload_keys": sorted(payload.keys())},
     }
 
     props = _output_properties()
     for field, spec in props.items():
         _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
 
-    output.setdefault("result", {"trial_run": True, "payload_keys": sorted(payload.keys())})
     return output
 
 
@@ -6189,6 +6316,8 @@ if __name__ == "__main__":
         .replace("__FUNCTION_NAME_LITERAL__", repr(function_name))
         .replace("__HELPER_CONTRACT_JSON_LITERAL__", helper_contract_json_literal)
         .replace("__MANIFEST_JSON_LITERAL__", manifest_json_literal)
+        .replace("__MODEL_INTERNAL_CODE__", safe_internal)
+        .replace("__INTERNAL_AUDIT__", internal_audit)
         .replace("__FUNCTION_NAME__", function_name)
     )
 
@@ -7723,104 +7852,16 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         }
 
     if wrapper_family == "managed_helper":
-        manifest = dict(raw_manifest or {})
-        manifest["wrapper_family"] = "managed_helper"
-        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
-
-        capabilities = contract.get("required_capabilities")
-        if not isinstance(capabilities, list):
-            capabilities = (
-                manifest.get("required_capabilities")
-                if isinstance(manifest.get("required_capabilities"), list)
-                else []
-            )
-
-        capabilities = [
-            str(item).strip()
-            for item in capabilities
-            if str(item).strip()
-        ]
-
-        if not capabilities:
-            return {
-                "needs_clarification": False,
-                "questions": [],
-                "tool_kind": plan.get("tool_kind"),
-                "operation": plan.get("operation"),
-                "manifest": manifest,
-                "adapter_code": "",
-                "sample_input": sample_input,
-                "validation": {
-                    "success": False,
-                    "status": "contract_validation_failed",
-                    "errors": [
-                        "managed_helper requires explicit required_capabilities from the validated ToolContract"
-                    ],
-                    "warnings": [],
-                    "contract_validation_log": plan.get("contract_validation_log") or [],
-                },
-                "snippet": None,
-                "model_notes": model_notes,
-                "warnings": warnings,
-                "requires_human_confirmation": True,
-            }
-
-        manifest["required_capabilities"] = capabilities
-
-        helper_contract: dict[str, Any] = {}
-        if isinstance(manifest.get("helper_contract"), dict):
-            helper_contract.update(manifest["helper_contract"])
-        if isinstance(contract.get("helper_contract"), dict):
-            helper_contract.update(contract["helper_contract"])
-
-        helper_name = str(contract.get("helper_name") or helper_contract.get("helper_name") or "").strip()
-        if helper_name:
-            helper_contract["helper_name"] = helper_name
-
-        if helper_contract:
-            manifest["helper_contract"] = helper_contract
-
-        manifest["auth_decision"] = plan.get("auth_decision") or manifest.get("auth_decision") or {
-            "required": "no",
-            "confidence": 0.75,
-            "reason": "managed helper auth is declared by platform/helper contract",
-            "evidence": [],
-            "security_schemes": [{"type": "none"}],
-        }
-
-        adapter_code = _managed_helper_wrapper_code(contract, manifest)
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
+        return await _author_managed_helper_adapter(
+            request=request,
+            plan=plan,
+            contract=contract,
+            raw_manifest=raw_manifest,
             sample_input=sample_input,
-            dynamic=True,
-            real_run=False,
+            contract_registry_validation=contract_registry_validation,
+            model_notes=model_notes,
+            warnings=warnings,
         )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        validation["adapter_contract"] = contract
-        validation["contract_registry_validation"] = contract_registry_validation
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": sample_input,
-            "validation": validation,
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
 
     if wrapper_family == "python_compute":
         manifest = dict(raw_manifest or {})
@@ -8200,6 +8241,183 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "runtime_helpers_available": runtime_helpers_available,
         "missing_runtime_helpers": missing_runtime_helpers,
         "missing_dependencies": missing_dependencies,
+    }
+
+async def _author_managed_helper_adapter(
+    *,
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    contract: dict[str, Any],
+    raw_manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+    contract_registry_validation: dict[str, Any],
+    model_notes: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    manifest = dict(raw_manifest or {})
+    manifest["wrapper_family"] = "managed_helper"
+    manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
+
+    capabilities = contract.get("required_capabilities")
+    if not isinstance(capabilities, list):
+        capabilities = (
+            manifest.get("required_capabilities")
+            if isinstance(manifest.get("required_capabilities"), list)
+            else []
+        )
+
+    capabilities = [
+        str(item).strip()
+        for item in capabilities
+        if str(item).strip()
+    ]
+
+    if not capabilities:
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "tool_kind": plan.get("tool_kind"),
+            "operation": plan.get("operation"),
+            "manifest": manifest,
+            "adapter_code": "",
+            "sample_input": sample_input,
+            "validation": {
+                "success": False,
+                "status": "contract_validation_failed",
+                "errors": [
+                    "managed_helper requires explicit required_capabilities from the validated ToolContract"
+                ],
+                "warnings": [],
+                "contract_validation_log": plan.get("contract_validation_log") or [],
+            },
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    manifest["required_capabilities"] = capabilities
+
+    helper_contract: dict[str, Any] = {}
+    optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+    optional_helper_contract = (
+        optional.get("helper_contract")
+        if isinstance(optional.get("helper_contract"), dict)
+        else {}
+    )
+
+    if optional_helper_contract:
+        helper_contract.update(optional_helper_contract)
+
+    if isinstance(manifest.get("helper_contract"), dict):
+        helper_contract.update(manifest["helper_contract"])
+
+    if isinstance(contract.get("helper_contract"), dict):
+        helper_contract.update(contract["helper_contract"])
+
+    helper_name = str(contract.get("helper_name") or helper_contract.get("helper_name") or "").strip()
+    if helper_name:
+        helper_contract["helper_name"] = helper_name
+
+    if helper_contract:
+        manifest["helper_contract"] = helper_contract
+
+    manifest["auth_decision"] = plan.get("auth_decision") or manifest.get("auth_decision") or {
+        "required": "no",
+        "confidence": 0.75,
+        "reason": "managed helper auth is declared by platform/helper contract",
+        "evidence": [],
+        "security_schemes": [{"type": "none"}],
+    }
+
+    helper_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are code_model. Do NOT write a full adapter. "
+                "Return strict JSON only: {\"internal_code\":\"...python code...\"}. "
+                "The internal code must define exactly "
+                "normalize_helper_result(value: object, payload: dict) -> dict. "
+                "This function receives the raw managed helper return value and must normalize it "
+                "to the manifest.output_schema. "
+                "Do not call the helper. Do not import requests, httpx, urllib, aiohttp, os, sys, "
+                "pathlib, subprocess, socket, or shutil. "
+                "Do not read environment variables. Do not define run/main/manifest."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "manifest": manifest,
+                    "adapter_contract": contract,
+                    "sample_input": sample_input,
+                    "helper_contract": manifest.get("helper_contract") or contract.get("helper_contract") or {},
+                    "output_schema": manifest.get("output_schema") or {},
+                    "task": "Write only normalize_helper_result(value, payload).",
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    internal_json, code_ack, code_err = await _complete_author_model(
+        "code",
+        helper_messages,
+        reason="creator_tool_author_managed_helper_normalize",
+    )
+
+    if code_ack:
+        model_notes.append(f"code_model={code_ack['model']}")
+
+    if code_err:
+        warnings.append(f"code_model unavailable, used default helper normalizer: {code_err}")
+
+    internal_code = _strip_code_fence(
+        str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
+    )
+
+    internal_errors = _helper_normalize_code_errors(internal_code)
+    if internal_errors:
+        warnings.extend(f"helper_normalize_code fallback: {err}" for err in internal_errors)
+        internal_code = _default_helper_normalize_code()
+
+    adapter_code = _managed_helper_wrapper_code(contract, internal_code, manifest)
+
+    validation = validate_tool_manifest(
+        manifest,
+        adapter_code=adapter_code,
+        sample_input=sample_input,
+        dynamic=True,
+        real_run=False,
+    )
+
+    static_errors = _author_adapter_static_errors(adapter_code, manifest)
+    if static_errors:
+        validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+        validation["success"] = False
+        validation["status"] = "failed"
+
+    validation["adapter_contract"] = contract
+    validation["contract_registry_validation"] = contract_registry_validation
+    validation["internal_code_errors"] = internal_errors
+
+    return {
+        "needs_clarification": False,
+        "questions": [],
+        "tool_kind": plan.get("tool_kind"),
+        "operation": plan.get("operation"),
+        "manifest": manifest,
+        "adapter_code": adapter_code,
+        "adapter_code_kind": "wrapper_with_model_internal_code",
+        "adapter_edit_policy": "internal_code_only",
+        "model_internal_code": internal_code,
+        "sample_input": sample_input,
+        "validation": validation,
+        "snippet": None,
+        "model_notes": model_notes,
+        "warnings": warnings,
+        "requires_human_confirmation": True,
     }
 
 def _make_snippet(

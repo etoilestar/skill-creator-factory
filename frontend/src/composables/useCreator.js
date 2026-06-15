@@ -286,6 +286,61 @@ export function draftCreatorTool(payload) {
   return postCreatorTool('draft', payload)
 }
 
+export function authorCreatorTool(payload) {
+  return postCreatorTool('author', payload)
+}
+
+
+export async function* authorCreatorToolStream(payload, signal) {
+  const resp = await fetch('/api/creator/tools/author/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  })
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}))
+    throw new Error(data.detail?.message || data.detail || data.message || '工具流式请求失败')
+  }
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const chunks = buffer.split('\n\n')
+    buffer = chunks.pop() || ''
+    for (const chunk of chunks) {
+      const line = chunk.split('\n').find(item => item.startsWith('data:'))
+      if (!line) continue
+      yield JSON.parse(line.slice(5).trim())
+    }
+  }
+}
+
+export async function saveCreatorToolConfig(payload) {
+  const resp = await fetch('/api/creator/tool-config/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '配置保存失败')
+  return data
+}
+
+export async function getCreatorToolConfigStatus(sessionId = 'default') {
+  const resp = await fetch(`/api/creator/tool-config/status?session_id=${encodeURIComponent(sessionId)}`)
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) throw new Error(data.detail?.message || data.detail || data.message || '配置状态加载失败')
+  return data
+}
+
+export function liveTestCreatorTool(payload) {
+  return postCreatorTool('author', { ...payload, action: 'live_test' })
+}
+
 export function generateCreatorToolCode(payload) {
   return postCreatorTool('generate-code', payload)
 }

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+import json
+
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..services.creator_tool_registry import (
@@ -12,6 +15,7 @@ from ..services.creator_tool_registry import (
     TOOL_OVERRIDE_PERSISTENCE,
     ToolCapability,
     ToolSnippet,
+    author_tool,
     build_tool_manifest_draft,
     capabilities_for_role,
     generate_adapter_code,
@@ -28,7 +32,11 @@ from ..services.creator_tool_registry import (
     resolve_tool_snippets_for_context,
     validate_tool_manifest,
     validate_tool_snippet,
+    stream_author_tool,
+    save_tool_authoring_config,
+    tool_authoring_config_status,
     tool_status,
+    write_registered_adapter,
     _capability_from_dict,
     _snippet_from_dict,
 )
@@ -67,6 +75,53 @@ class ToolManifestRequest(BaseModel):
     adapter_code: str | None = None
     sample_input: dict[str, Any] = Field(default_factory=dict)
     dynamic: bool = True
+    allow_external_network: bool = False
+    real_run: bool = False
+
+
+class ToolConfigSaveRequest(BaseModel):
+    session_id: str = "default"
+    tool_name: str = ""
+    operation: str = ""
+    base_url: str = ""
+    base_url_env: str | None = None
+    auth_type: str = "none"
+    secret_env: str | None = None
+    secret_value: str | None = None
+    auth_placement: str | None = None
+    auth_header_name: str | None = None
+    auth_query_param: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+    additional_fields: list[dict[str, Any]] = Field(default_factory=list)
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolAuthorRequest(BaseModel):
+    description: str = ""
+    tool_name: str = ""
+    tool_type: str = "python_helper"
+    code_block: str | None = None
+    adapter_code: str | None = None
+    input_description: str = ""
+    output_description: str = ""
+    manifest: dict[str, Any] | None = None
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    allowed_roles: list[str] = Field(default_factory=list)
+    needs_secret: bool = False
+    needs_external_network: bool = False
+    generates_file: bool = False
+    high_risk: bool = False
+    validation: dict[str, Any] | None = None
+    stage: str | None = None
+    action: Literal["clarify", "configure", "live_test", "generate", "finalize"] = "clarify"
+    clarification_answers: list[dict[str, str]] = Field(default_factory=list)
+    tool_kind: str | None = None
+    operation: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    live_test_result: dict[str, Any] | None = None
+    allow_external_network: bool = False
+    authoring_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolRegisterRequest(ToolManifestRequest):
@@ -122,6 +177,35 @@ def generate_creator_tool_code(request: ToolManifestRequest) -> dict[str, Any]:
     return {"adapter_code": code, "adapter_path": request.manifest.get("adapter_path"), "requires_validation": True}
 
 
+@router.post("/tool-config/save")
+def save_creator_tool_config(request: ToolConfigSaveRequest) -> dict[str, Any]:
+    try:
+        return save_tool_authoring_config(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/tool-config/status")
+def creator_tool_config_status(session_id: str = "default") -> dict[str, Any]:
+    return tool_authoring_config_status(session_id)
+
+
+@router.post("/tools/author")
+async def author_creator_tool(request: ToolAuthorRequest) -> dict[str, Any]:
+    try:
+        return await author_tool(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/tools/author/stream")
+async def stream_author_creator_tool(request: ToolAuthorRequest):
+    async def event_source():
+        async for event in stream_author_tool(request.model_dump(exclude_none=True)):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_source(), media_type="text/event-stream")
+
 @router.post("/tools/validate")
 def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:
     return validate_tool_manifest(
@@ -129,6 +213,7 @@ def validate_creator_tool(request: ToolManifestRequest) -> dict[str, Any]:
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
         dynamic=request.dynamic,
+        real_run=bool(request.real_run or request.allow_external_network),
     )
 
 
@@ -139,10 +224,13 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
         adapter_code=request.adapter_code,
         sample_input=request.sample_input,
         dynamic=request.dynamic,
+        real_run=bool(request.real_run or request.allow_external_network),
     )
+
     if not validation["success"]:
         raise HTTPException(status_code=400, detail={"message": "tool validation failed", "validation": validation})
-    payload = dict(request.manifest)
+
+    payload = write_registered_adapter(request.manifest, request.adapter_code)
     payload["enabled"] = bool(request.enable)
     payload["enabled_by_default"] = bool(request.enable)
     payload["allow_creator_use"] = bool(request.enable)
@@ -150,9 +238,11 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
     payload["test_status"] = "passed"
     payload["last_validation_result"] = validation
     payload["created_by"] = request.created_by
+
     cap = _capability_from_dict(payload)
     register_tool_capability(cap)
     persist_registered_tools()
+
     return {"tool": tool_status(cap), "validation": validation}
 
 

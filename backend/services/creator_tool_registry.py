@@ -957,15 +957,18 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
         prompt_guidance=(
             "Use this capability for fixed HTTP/API calls where the request is described by a stable "
             "endpoint/base_url, method, headers/query/body templates, and optional auth config. "
-            "It must be implemented by the http_api wrapper. The code_model must only write "
-            "normalize_response(data, payload), never a full requests/httpx adapter."
+            "It must be implemented by the http_api wrapper. The code_model must write "
+            "execute_task(payload, context), not a full requests/httpx adapter. "
+            "Inside execute_task, the model may build task-specific params/body/headers and call "
+            "context['http_request'](...). The platform owns endpoint/env/auth/secrets and the actual "
+            "network execution. The model must not import requests/httpx/urllib or read secrets directly."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "payload": {
                     "type": "object",
-                    "description": "Runtime payload used to render HTTP request templates.",
+                    "description": "Runtime payload used by execute_task to construct the provider request.",
                 }
             },
         },
@@ -974,11 +977,12 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
             "properties": {
                 "success": {"type": "boolean"},
                 "result": {"type": "object"},
+                "raw": {"type": "object"},
+                "error": {"type": "string"},
                 "status_code": {"type": "integer"},
             },
         },
     ),
-
     "network_read": ToolCapability(
         name="network_read",
         display_name="网络资源读取",
@@ -1460,8 +1464,135 @@ def execute_task(payload: dict, context: dict) -> dict:
     }
 '''.strip()
 
-def _core_logic_code_errors(wrapper_family: str, code: str) -> list[str]:
+def _core_logic_policy(
+    wrapper_family: str,
+    contract: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return generic policy for model-written execute_task code.
+
+    This is capability/wrapper policy, not business hardcoding.
+    """
     wrapper_family = _canonical_wrapper_family(wrapper_family)
+    contract = contract if isinstance(contract, dict) else {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+
+    safe_stdlib_imports = {
+        "base64",
+        "collections",
+        "csv",
+        "datetime",
+        "decimal",
+        "fractions",
+        "functools",
+        "hashlib",
+        "html",
+        "io",
+        "itertools",
+        "json",
+        "math",
+        "operator",
+        "random",
+        "re",
+        "statistics",
+        "string",
+        "textwrap",
+        "typing",
+        "uuid",
+    }
+
+    manifest_policy = manifest.get("code_policy") if isinstance(manifest.get("code_policy"), dict) else {}
+    contract_policy = contract.get("code_policy") if isinstance(contract.get("code_policy"), dict) else {}
+
+    allowed_imports: set[str] = set(safe_stdlib_imports)
+
+    # dependencies 也可以作为允许 import 的来源。
+    for dep in manifest.get("dependencies") or []:
+        if isinstance(dep, str) and dep.strip():
+            allowed_imports.add(_DEPENDENCY_IMPORT_NAMES.get(dep, dep).replace("-", "_").split(".")[0])
+
+    for source in (manifest_policy, contract_policy):
+        raw = source.get("allowed_imports")
+        if isinstance(raw, list):
+            allowed_imports.update(
+                str(item).replace("-", "_").split(".")[0]
+                for item in raw
+                if str(item).strip()
+            )
+
+    context_apis_by_wrapper = {
+        "http_api": {
+            "http_request",
+            "manifest",
+            "endpoint",
+            "method",
+            "base_headers",
+            "base_params",
+            "base_json",
+            "wrapper_family",
+        },
+        "managed_helper": {
+            "call_helper",
+            "helpers",
+            "helper_name",
+            "helper_contract",
+            "manifest",
+            "wrapper_family",
+        },
+        "python_compute": {
+            "manifest",
+            "wrapper_family",
+        },
+        "file_io": {
+            "safe_output_path",
+            "output_dir",
+            "manifest",
+            "wrapper_family",
+        },
+        "database_query": {
+            "query_readonly",
+            "manifest",
+            "wrapper_family",
+        },
+        "local_command": {
+            "render_command",
+            "manifest",
+            "wrapper_family",
+        },
+    }
+
+    return {
+        "wrapper_family": wrapper_family,
+        "required_function": "execute_task",
+        "allowed_functions": {"execute_task"},
+        "allowed_imports": allowed_imports,
+        "allowed_context_keys": context_apis_by_wrapper.get(
+            wrapper_family,
+            {"manifest", "wrapper_family"},
+        ),
+        "forbidden_builtin_calls": {
+            "__import__",
+            "breakpoint",
+            "compile",
+            "eval",
+            "exec",
+            "globals",
+            "input",
+            "locals",
+            "vars",
+        },
+        "allow_open": wrapper_family == "file_io",
+    }
+
+
+def _core_logic_code_errors(
+    wrapper_family: str,
+    code: str,
+    contract: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> list[str]:
+    policy = _core_logic_policy(wrapper_family, contract=contract, manifest=manifest)
+
     errors: list[str] = []
 
     try:
@@ -1469,79 +1600,107 @@ def _core_logic_code_errors(wrapper_family: str, code: str) -> list[str]:
     except SyntaxError as exc:
         return [f"core logic code syntax error: {exc}"]
 
-    allowed_functions = {"execute_task"}
+    wrapper_family = str(policy["wrapper_family"])
+    required_function = str(policy["required_function"])
+    allowed_functions: set[str] = set(policy["allowed_functions"])
+    allowed_imports: set[str] = set(policy["allowed_imports"])
+    forbidden_builtin_calls: set[str] = set(policy["forbidden_builtin_calls"])
+    allow_open = bool(policy["allow_open"])
+
     function_names: set[str] = set()
-
-    forbidden_imports = {
-        "requests",
-        "httpx",
-        "urllib",
-        "aiohttp",
-        "os",
-        "sys",
-        "subprocess",
-        "socket",
-        "pathlib",
-        "shutil",
-        "sqlite3",
-        "sqlalchemy",
-        "pymysql",
-        "psycopg2",
-    }
-
-    # file_io 允许 open，但路径必须来自 context["safe_output_path"]。
-    forbidden_calls = {
-        "eval",
-        "exec",
-        "compile",
-        "__import__",
-    }
-
-    if wrapper_family != "file_io":
-        forbidden_calls.add("open")
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in forbidden_imports:
-                    errors.append(f"core logic code must not import {root}")
+                root = str(alias.name or "").split(".")[0]
+                if root not in allowed_imports:
+                    errors.append(
+                        f"core logic import {root!r} is not allowed for wrapper_family={wrapper_family}; "
+                        "declare it in manifest.code_policy.allowed_imports/dependencies, or use platform context APIs"
+                    )
 
         elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in forbidden_imports:
-                errors.append(f"core logic code must not import {root}")
+            root = str(node.module or "").split(".")[0]
+            if root not in allowed_imports:
+                errors.append(
+                    f"core logic import {root!r} is not allowed for wrapper_family={wrapper_family}; "
+                    "declare it in manifest.code_policy.allowed_imports/dependencies, or use platform context APIs"
+                )
 
         elif isinstance(node, ast.FunctionDef):
             function_names.add(node.name)
+
             if node.name not in allowed_functions:
-                errors.append(f"core logic code may only define execute_task(payload, context), got {node.name}")
+                errors.append(
+                    f"core logic may only define {required_function}(payload, context), got {node.name}"
+                )
+
+            arg_names = [arg.arg for arg in node.args.args]
+            if node.name == required_function and arg_names[:2] != ["payload", "context"]:
+                errors.append(
+                    f"{required_function} must have signature {required_function}(payload, context)"
+                )
 
         elif isinstance(node, ast.AsyncFunctionDef):
-            errors.append("core logic code must not define async functions")
+            errors.append("core logic must not define async functions")
 
         elif isinstance(node, ast.ClassDef):
-            errors.append("core logic code must not define classes")
+            errors.append("core logic must not define classes")
+
+        elif isinstance(node, ast.Global):
+            errors.append("core logic must not use global statements")
+
+        elif isinstance(node, ast.Nonlocal):
+            errors.append("core logic must not use nonlocal statements")
 
         elif isinstance(node, ast.Call):
             func = node.func
-            called = (
-                func.id
-                if isinstance(func, ast.Name)
-                else func.attr
-                if isinstance(func, ast.Attribute)
-                else ""
-            )
-            if called in forbidden_calls:
-                errors.append(f"core logic code must not call {called}")
 
-    if "execute_task" not in function_names:
-        errors.append("core logic code must define execute_task(payload, context)")
+            if isinstance(func, ast.Name):
+                called = func.id
+
+                if called in forbidden_builtin_calls:
+                    errors.append(f"core logic must not call {called}")
+
+                if called == "open" and not allow_open:
+                    errors.append(
+                        f"core logic must not call open for wrapper_family={wrapper_family}; "
+                        "use wrapper context APIs instead"
+                    )
+
+            elif isinstance(func, ast.Attribute):
+                attr = func.attr
+
+                # 这里不是业务词表，而是 Python 逃逸/副作用边界。
+                if attr in {
+                    "system",
+                    "popen",
+                    "spawn",
+                    "fork",
+                    "execv",
+                    "execve",
+                    "remove",
+                    "unlink",
+                    "rmdir",
+                    "rmtree",
+                    "chmod",
+                    "chown",
+                    "connect",
+                }:
+                    errors.append(
+                        f"core logic must not call unsafe method {attr!r}; "
+                        "use platform context APIs instead"
+                    )
+
+    if required_function not in function_names:
+        errors.append(f"core logic code must define {required_function}(payload, context)")
 
     if wrapper_family == "file_io":
         text = code or ""
         if "open(" in text and "safe_output_path" not in text:
-            errors.append("file_io core logic may call open only with paths produced by context['safe_output_path']")
+            errors.append(
+                "file_io core logic may call open only with paths produced by context['safe_output_path']"
+            )
 
     return sorted(set(errors))
 
@@ -2259,27 +2418,97 @@ def _manifest_errors(manifest: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _code_security_errors(code: str) -> list[str]:
+def _code_security_errors(code: str, manifest: dict[str, Any] | None = None) -> list[str]:
+    """Adapter-level security checks.
+
+    This checks full generated adapter code, so it must distinguish platform wrapper
+    code from model-written core logic. Wrapper-owned operations such as file_io.open
+    or local_command.subprocess are allowed only for their wrapper_family.
+    """
     errors: list[str] = []
+    manifest = manifest if isinstance(manifest, dict) else {}
+    wrapper_family = _canonical_wrapper_family(str(manifest.get("wrapper_family") or ""))
+
     try:
         tree = ast.parse(code or "")
     except SyntaxError as exc:
         return [f"adapter code syntax error: {exc}"]
+
+    allowed_wrapper_imports = {
+        "json",
+        "os",
+        "sys",
+        "re",
+        "sqlite3",
+        "inspect",
+        "requests",
+        "pathlib",
+        "typing",
+        "datetime",
+        "backend",
+    }
+
+    if wrapper_family == "local_command":
+        allowed_wrapper_imports.add("subprocess")
+
+    if wrapper_family != "database_query":
+        # sqlite3 只允许 database_query wrapper 平台代码使用。
+        allowed_wrapper_imports.discard("sqlite3")
+
+    if wrapper_family != "http_api":
+        # requests 只允许 http_api wrapper 平台代码使用。
+        allowed_wrapper_imports.discard("requests")
+
+    dangerous_imports = {"shutil", "socket", "paramiko", "ftplib", "telnetlib"}
+
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = [alias.name.split(".")[0] for alias in node.names]
-            if isinstance(node, ast.ImportFrom) and node.module:
-                names.append(node.module.split(".")[0])
-            for name in names:
-                if name in _DANGEROUS_IMPORTS:
-                    errors.append(f"dangerous import is forbidden: {name}")
-        if isinstance(node, ast.Call):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = str(alias.name or "").split(".")[0]
+
+                if root in dangerous_imports:
+                    errors.append(f"dangerous import is forbidden: {root}")
+
+                if root == "subprocess" and wrapper_family != "local_command":
+                    errors.append("subprocess import is only allowed inside local_command wrapper")
+
+                if root == "sqlite3" and wrapper_family != "database_query":
+                    errors.append("sqlite3 import is only allowed inside database_query wrapper")
+
+                if root == "requests" and wrapper_family != "http_api":
+                    errors.append("requests import is only allowed inside http_api wrapper")
+
+        elif isinstance(node, ast.ImportFrom):
+            root = str(node.module or "").split(".")[0]
+
+            if root in dangerous_imports:
+                errors.append(f"dangerous import is forbidden: {root}")
+
+            if root == "subprocess" and wrapper_family != "local_command":
+                errors.append("subprocess import is only allowed inside local_command wrapper")
+
+            if root == "sqlite3" and wrapper_family != "database_query":
+                errors.append("sqlite3 import is only allowed inside database_query wrapper")
+
+            if root == "requests" and wrapper_family != "http_api":
+                errors.append("requests import is only allowed inside http_api wrapper")
+
+        elif isinstance(node, ast.Call):
             func = node.func
-            called = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
-            if called in _DANGEROUS_CALLS:
+            called = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+
+            if called in {"eval", "exec", "compile", "__import__"}:
                 errors.append(f"dangerous call requires a controlled helper: {called}")
+
+            if called == "open" and wrapper_family != "file_io":
+                errors.append("open is only allowed inside file_io wrapper/core logic")
+
+            if called in {"system", "popen"}:
+                errors.append(f"dangerous process call is forbidden: {called}")
+
     if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code or ""):
         errors.append("adapter appears to contain a hard-coded secret")
+
     return sorted(set(errors))
 
 
@@ -2470,7 +2699,7 @@ def validate_tool_manifest(
     cap = _capability_from_dict(manifest) if not errors else None
 
     if adapter_code:
-        errors.extend(_code_security_errors(adapter_code))
+        errors.extend(_code_security_errors(adapter_code, manifest))
 
     dynamic_result: dict[str, Any] = {"skipped": not dynamic}
     real_result: dict[str, Any] = {"skipped": not real_run}
@@ -3432,12 +3661,14 @@ async def _repair_contract_with_model(
                 "You are contract_repair_model for Tool Authoring. "
                 "Return strict JSON only. "
                 "Repair only ToolContract fields: wrapper_family, required_capabilities, helper_contract, "
-                "manifest, sample_input, config_form_schema, auth_decision. "
+                "manifest, sample_input, config_form_schema, auth_decision, code_policy, dependencies, artifact_policy. "
                 "Do not generate adapter code. "
                 "Do not invent provider-specific registry entries. "
                 "Choose wrapper_family only from wrapper_registry. "
                 "Choose required_capabilities only from capability_registry. "
                 "For managed_helper, choose helper_contract.helper_name only from helper_imports of selected capabilities. "
+                "For tools that need third-party Python libraries, declare them in manifest.dependencies and/or "
+                "manifest.code_policy.allowed_imports instead of changing backend code. "
                 "Prefer this output shape: "
                 "{\"plan_patch\": {...}, \"manifest_patch\": {...}, \"clarification_questions\": [], \"notes\": []}. "
                 "If you return top-level patch fields, the system will still normalize them. "
@@ -3505,6 +3736,12 @@ async def _repair_contract_with_model(
         "requires_live_test",
         "ready_for_code_generation",
         "implementation_plan",
+
+        # 新增：允许规划层携带代码策略/依赖，但最终也会同步进 manifest。
+        "code_policy",
+        "dependencies",
+        "artifact_policy",
+        "required_files",
     }
 
     allowed_manifest_keys = {
@@ -3525,6 +3762,16 @@ async def _repair_contract_with_model(
         "required_secrets",
         "security_schemes",
         "optional",
+
+        # 新增：让 planner/repair 能声明第三方库、导入策略、文件/产物策略。
+        "code_policy",
+        "dependencies",
+        "allowed_imports",
+        "required_files",
+        "artifact_policy",
+        "output_artifacts",
+        "runtime_constraints",
+        "sandbox_policy",
     }
 
     def deep_merge_dict(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -3545,6 +3792,16 @@ async def _repair_contract_with_model(
             if text and text not in result_caps:
                 result_caps.append(text)
         return result_caps
+
+    def normalize_string_list(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        result_values: list[str] = []
+        for item in values:
+            text = str(item or "").strip()
+            if text and text not in result_values:
+                result_values.append(text)
+        return result_values
 
     plan_patch: dict[str, Any] = {}
     manifest_patch: dict[str, Any] = {}
@@ -3594,6 +3851,41 @@ async def _repair_contract_with_model(
                 manifest[key] = deep_merge_dict(manifest[key], value)
             else:
                 manifest[key] = value
+
+    # 兼容 plan 级 code_policy/dependencies，同步到 manifest。
+    if isinstance(repaired.get("code_policy"), dict):
+        if isinstance(manifest.get("code_policy"), dict):
+            manifest["code_policy"] = deep_merge_dict(manifest["code_policy"], repaired["code_policy"])
+        else:
+            manifest["code_policy"] = repaired["code_policy"]
+
+    deps = normalize_string_list(repaired.get("dependencies"))
+    manifest_deps = normalize_string_list(manifest.get("dependencies"))
+    merged_deps = []
+    for item in [*manifest_deps, *deps]:
+        if item and item not in merged_deps:
+            merged_deps.append(item)
+    if merged_deps:
+        repaired["dependencies"] = merged_deps
+        manifest["dependencies"] = merged_deps
+
+    if isinstance(repaired.get("artifact_policy"), dict):
+        if isinstance(manifest.get("artifact_policy"), dict):
+            manifest["artifact_policy"] = deep_merge_dict(manifest["artifact_policy"], repaired["artifact_policy"])
+        else:
+            manifest["artifact_policy"] = repaired["artifact_policy"]
+
+    # 兼容 manifest.allowed_imports，把它归入 manifest.code_policy.allowed_imports。
+    allowed_imports = normalize_string_list(manifest.get("allowed_imports"))
+    if allowed_imports:
+        code_policy = manifest.get("code_policy") if isinstance(manifest.get("code_policy"), dict) else {}
+        existing = normalize_string_list(code_policy.get("allowed_imports"))
+        merged_imports: list[str] = []
+        for item in [*existing, *allowed_imports]:
+            if item and item not in merged_imports:
+                merged_imports.append(item)
+        code_policy["allowed_imports"] = merged_imports
+        manifest["code_policy"] = code_policy
 
     # 兼容 manifest.optional.helper_contract，把它提升成正式 helper_contract。
     optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
@@ -5847,59 +6139,20 @@ def _confirmed_external_api_code_contract(
     }
 
 def _default_internal_normalize_code() -> str:
-    return '''
-def normalize_response(data: dict, payload: dict) -> dict:
-    def coerce_results(value):
-        if isinstance(value, list):
-            return [item if isinstance(item, dict) else {"value": item} for item in value]
+    return _default_core_logic_code("http_api")
 
-        if isinstance(value, dict):
-            for key in ("results", "items", "data", "records", "list", "rows"):
-                nested = value.get(key)
-                if isinstance(nested, list):
-                    return [
-                        item if isinstance(item, dict) else {"value": item}
-                        for item in nested
-                    ]
 
-            return [value] if value else []
+def _default_helper_normalize_code() -> str:
+    return _default_core_logic_code("managed_helper")
 
-        if value in (None, ""):
-            return []
 
-        return [{"value": value}]
-
-    results = coerce_results(data)
-
-    return {
-        "success": True,
-        "results": results,
-        "total": len(results),
-        "raw": data,
-    }
-'''.strip()
+def _default_transform_code() -> str:
+    return _default_core_logic_code("python_compute")
 
 
 def _internal_code_errors(code: str) -> list[str]:
     return _core_logic_code_errors("http_api", code)
 
-def _default_helper_normalize_code() -> str:
-    return '''
-def normalize_helper_result(value: object, payload: dict) -> dict:
-    """Normalize a managed helper result to a generic dict.
-
-    The platform wrapper will further fill missing fields according to
-    manifest.output_schema, so this fallback only needs to preserve the raw value.
-    """
-    if isinstance(value, dict):
-        return dict(value)
-
-    return {
-        "success": True,
-        "content": "" if value is None else str(value),
-        "result": value,
-    }
-'''.strip()
 
 def _helper_normalize_code_errors(code: str) -> list[str]:
     return _core_logic_code_errors("managed_helper", code)
@@ -5942,7 +6195,7 @@ def _managed_helper_wrapper_code(
         manifest["helper_contract"] = helper_contract
 
     safe_internal = _strip_code_fence(internal_code or "")
-    internal_errors = _core_logic_code_errors("managed_helper", safe_internal)
+    internal_errors = _core_logic_code_errors("managed_helper", safe_internal, contract=contract, manifest=manifest)
     internal_audit = "model_execute_task_core_logic"
 
     if internal_errors:
@@ -6243,16 +6496,6 @@ if __name__ == "__main__":
         .replace("__FUNCTION_NAME__", function_name)
     )
 
-def _default_transform_code() -> str:
-    return '''
-def transform(payload: dict) -> dict:
-    return {
-        "success": True,
-        "result": payload,
-    }
-'''.strip()
-
-
 def _transform_code_errors(code: str) -> list[str]:
     return _core_logic_code_errors("python_compute", code)
 
@@ -6266,7 +6509,7 @@ def _python_compute_wrapper_code(contract: dict[str, Any], internal_code: str, m
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "python_compute_tool"))
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _core_logic_code_errors("python_compute", safe_internal):
+    if _core_logic_code_errors("python_compute", safe_internal, contract=contract, manifest=manifest):
         safe_internal = _default_core_logic_code("python_compute")
 
     manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
@@ -6369,7 +6612,7 @@ def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, man
     headers_template = contract.get("headers_template") if isinstance(contract.get("headers_template"), dict) else {}
 
     safe_internal = _strip_code_fence(internal_code or "")
-    internal_errors = _core_logic_code_errors("http_api", safe_internal)
+    internal_errors = _core_logic_code_errors("http_api", safe_internal, contract=contract, manifest=manifest)
 
     if internal_errors:
         safe_internal = _default_core_logic_code("http_api")
@@ -6619,7 +6862,7 @@ def _file_io_wrapper_code(
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "file_tool"))
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _core_logic_code_errors("file_io", safe_internal):
+    if _core_logic_code_errors("file_io", safe_internal, contract=contract, manifest=manifest):
         safe_internal = _default_core_logic_code("file_io")
 
     manifest = dict(manifest or {})
@@ -6775,7 +7018,7 @@ def _database_query_wrapper_code(
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "database_tool"))
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _core_logic_code_errors("database_query", safe_internal):
+    if _core_logic_code_errors("database_query", safe_internal, contract=contract, manifest=manifest):
         safe_internal = _default_core_logic_code("database_query")
 
     manifest = dict(manifest or {})
@@ -6930,7 +7173,7 @@ def _local_command_wrapper_code(
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "local_command_tool"))
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _core_logic_code_errors("local_command", safe_internal):
+    if _core_logic_code_errors("local_command", safe_internal, contract=contract, manifest=manifest):
         safe_internal = _default_core_logic_code("local_command")
 
     manifest = dict(manifest or {})
@@ -7104,25 +7347,103 @@ async def _author_core_logic_with_model(
 ) -> tuple[str, list[str]]:
     wrapper_family = _canonical_wrapper_family(wrapper_family)
 
+    def _allowed_imports_for_prompt() -> list[str]:
+        # 优先复用你后面如果已经加好的 _core_logic_policy。
+        if "_core_logic_policy" in globals():
+            try:
+                policy = _core_logic_policy(wrapper_family, contract=contract, manifest=manifest)  # type: ignore[name-defined]
+                raw = policy.get("allowed_imports") if isinstance(policy, dict) else None
+                if isinstance(raw, set):
+                    return sorted(str(item) for item in raw if str(item).strip())
+                if isinstance(raw, list):
+                    return sorted(str(item) for item in raw if str(item).strip())
+            except Exception:
+                pass
+
+        # 兜底：不依赖额外函数，避免你现在直接替换时报 NameError。
+        safe_stdlib_imports = {
+            "base64",
+            "collections",
+            "csv",
+            "datetime",
+            "decimal",
+            "fractions",
+            "functools",
+            "hashlib",
+            "html",
+            "io",
+            "itertools",
+            "json",
+            "math",
+            "operator",
+            "random",
+            "re",
+            "statistics",
+            "string",
+            "textwrap",
+            "typing",
+            "uuid",
+        }
+
+        allowed = set(safe_stdlib_imports)
+
+        dependency_import_names = globals().get("_DEPENDENCY_IMPORT_NAMES")
+        if not isinstance(dependency_import_names, dict):
+            dependency_import_names = {
+                "python-docx": "docx",
+                "python-pptx": "pptx",
+                "pillow": "PIL",
+                "opencv-python": "cv2",
+                "beautifulsoup4": "bs4",
+                "scikit-learn": "sklearn",
+            }
+
+        deps = manifest.get("dependencies")
+        if isinstance(deps, list):
+            for dep in deps:
+                dep_text = str(dep or "").strip()
+                if not dep_text:
+                    continue
+                mapped = dependency_import_names.get(dep_text, dep_text)
+                allowed.add(str(mapped).replace("-", "_").split(".")[0])
+
+        for source in (
+            manifest.get("code_policy") if isinstance(manifest.get("code_policy"), dict) else {},
+            contract.get("code_policy") if isinstance(contract.get("code_policy"), dict) else {},
+        ):
+            raw = source.get("allowed_imports")
+            if isinstance(raw, list):
+                allowed.update(
+                    str(item).replace("-", "_").split(".")[0]
+                    for item in raw
+                    if str(item).strip()
+                )
+
+        return sorted(allowed)
+
+    allowed_imports = _allowed_imports_for_prompt()
+
     context_guidance = {
         "http_api": (
             "context contains http_request(...), endpoint, method, base_headers, base_params, base_json. "
-            "Use context['http_request'] to perform the platform-controlled HTTP request."
+            "Use context['http_request'] to perform the platform-controlled HTTP request. "
+            "Do not import requests/httpx/urllib yourself and do not read secrets yourself."
         ),
         "managed_helper": (
             "context contains call_helper(helper_name, *args, **kwargs), helpers dict, helper_name, helper_contract. "
-            "Use only context['call_helper'] or context['helpers'][allowed_name]."
+            "Use only context['call_helper'] or context['helpers'][allowed_name] to call platform-managed helpers."
         ),
         "python_compute": (
-            "context contains manifest only. Implement deterministic local business logic."
+            "context contains manifest and wrapper_family. Implement deterministic local business logic."
         ),
         "file_io": (
             "context contains safe_output_path(filename), output_dir and manifest. "
-            "Use context['safe_output_path'] for every file path before opening/writing."
+            "Use context['safe_output_path'] for every file path before opening/writing. "
+            "Never construct output paths manually."
         ),
         "database_query": (
             "context contains query_readonly(sql, params, limit). "
-            "Only SELECT/WITH readonly SQL is allowed."
+            "Only SELECT/WITH readonly SQL is allowed. Do not import database drivers or connect directly."
         ),
         "local_command": (
             "context contains render_command(payload). "
@@ -7140,11 +7461,15 @@ async def _author_core_logic_with_model(
                 "Write the actual core task logic for this tool. "
                 "The internal code must define exactly one function: "
                 "execute_task(payload: dict, context: dict) -> dict. "
-                "The platform wrapper controls run(), manifest(), main(), trial behavior, IO protocol, auth, secrets, and unsafe operations. "
+                "The platform wrapper controls run(), manifest(), main(), trial behavior, IO protocol, auth, secrets, "
+                "network/database/helper/file/command boundaries, and unsafe operations. "
                 "Do not define run/main/manifest. "
-                "Do not import requests, httpx, urllib, aiohttp, os, sys, pathlib, subprocess, socket, shutil, sqlite3 or database drivers. "
                 "Do not read environment variables. "
                 "Do not call eval/exec/compile/__import__. "
+                "Allowed imports for this tool are: "
+                + (", ".join(allowed_imports) if allowed_imports else "(none)")
+                + ". Do not import anything else. "
+                "External/network/database/file/command capabilities must use context APIs, not direct imports. "
                 + context_guidance
             ),
         },
@@ -7166,11 +7491,15 @@ async def _author_core_logic_with_model(
                     "sample_input": sample_input,
                     "input_schema": manifest.get("input_schema") or {},
                     "output_schema": manifest.get("output_schema") or {},
+                    "code_policy": manifest.get("code_policy") or contract.get("code_policy") or {},
+                    "dependencies": manifest.get("dependencies") or contract.get("dependencies") or [],
                     "implementation_plan": plan.get("implementation_plan"),
+                    "context_guidance": context_guidance,
                     "task": (
                         "Write the real core functionality in execute_task(payload, context). "
                         "Do not merely reformat an already-perfect result. "
-                        "Use context capabilities to perform the required operation, then return a dict conforming to output_schema."
+                        "Use context capabilities to perform the required operation, then return a dict conforming to output_schema. "
+                        "Template/wrapper code is not part of your output."
                     ),
                 },
                 ensure_ascii=False,
@@ -7194,7 +7523,17 @@ async def _author_core_logic_with_model(
         str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
     )
 
-    internal_errors = _core_logic_code_errors(wrapper_family, internal_code)
+    try:
+        internal_errors = _core_logic_code_errors(
+            wrapper_family,
+            internal_code,
+            contract=contract,
+            manifest=manifest,
+        )
+    except TypeError:
+        # 兼容你当前旧签名 _core_logic_code_errors(wrapper_family, code)。
+        internal_errors = _core_logic_code_errors(wrapper_family, internal_code)
+
     if internal_errors:
         warnings.extend(f"{wrapper_family}_core_logic fallback: {err}" for err in internal_errors)
         internal_code = _default_core_logic_code(wrapper_family)

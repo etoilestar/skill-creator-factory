@@ -4393,6 +4393,66 @@ async def _validate_and_repair_contract_loop(
 
     return current
 
+def _manifest_has_runtime_url_input(manifest: dict[str, Any] | None) -> bool:
+    """Whether this tool can provide request URL at runtime.
+
+    This is generic: it checks schema shape/scope, not business words like web/page/extract.
+    """
+    manifest = manifest if isinstance(manifest, dict) else {}
+    input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
+
+    props = _schema_properties(input_schema)
+
+    runtime_url_names = {
+        "url",
+        "uri",
+        "target_url",
+        "source_url",
+        "request_url",
+        "endpoint_url",
+        "resource_url",
+        "page_url",
+        "source",
+    }
+
+    for name, spec in props.items():
+        field = str(name or "").strip().lower()
+        spec = spec if isinstance(spec, dict) else {}
+
+        if field in runtime_url_names or field.endswith("_url"):
+            scope = str(spec.get("x-scope") or spec.get("scope") or "runtime_input").strip()
+            typ = str(spec.get("type") or "string").strip().lower()
+            fmt = str(spec.get("format") or "").strip().lower()
+
+            if scope == "runtime_input" and typ in {"", "string"}:
+                return True
+
+            if scope == "runtime_input" and fmt in {"uri", "url"}:
+                return True
+
+    return False
+
+
+def _http_api_can_use_runtime_url(request: dict[str, Any], manifest: dict[str, Any] | None = None) -> bool:
+    manifest = manifest if isinstance(manifest, dict) else {}
+    request_manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+
+    if _manifest_has_runtime_url_input(manifest):
+        return True
+
+    if _manifest_has_runtime_url_input(request_manifest):
+        return True
+
+    sample = request.get("sample_input")
+    if isinstance(sample, dict):
+        for key, value in sample.items():
+            name = str(key or "").lower()
+            if (name in {"url", "uri", "target_url", "source_url", "request_url", "page_url"} or name.endswith("_url")):
+                if str(value or "").startswith(("http://", "https://")):
+                    return True
+
+    return False
+
 def _external_api_missing_fields(
     config: dict[str, Any],
     sample_input: dict[str, Any],
@@ -4403,14 +4463,40 @@ def _external_api_missing_fields(
     """Return only connection/config panel requirements.
 
     Runtime input fields must not appear here.
-    Auth fields are required only when auth_decision.required=yes.
+
+    For http_api there are two valid generic shapes:
+    1. fixed provider API: config has base_url/endpoint/url;
+    2. runtime URL tool: manifest.input_schema/sample_input provides a runtime URL,
+       and execute_task calls context["http_request"](url=payload[...]).
     """
     config = config if isinstance(config, dict) else {}
     request = request if isinstance(request, dict) else {}
+    sample_input = sample_input if isinstance(sample_input, dict) else {}
+
+    manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
 
     missing: list[str] = []
 
-    if not _has_config_value(config, "url", "endpoint", "base_url"):
+    has_fixed_entrypoint = _has_config_value(config, "url", "endpoint", "base_url")
+
+    has_runtime_url = (
+        _http_api_can_use_runtime_url(request, manifest)
+        or any(
+            str(value or "").startswith(("http://", "https://"))
+            for key, value in sample_input.items()
+            if str(key or "").lower() in {
+                "url",
+                "uri",
+                "target_url",
+                "source_url",
+                "request_url",
+                "page_url",
+            }
+            or str(key or "").lower().endswith("_url")
+        )
+    )
+
+    if not has_fixed_entrypoint and not has_runtime_url:
         missing.append("base_url")
 
     decision = _normalize_auth_decision(
@@ -4444,7 +4530,7 @@ def _external_api_missing_fields(
         elif not has_secret_ref:
             missing.append("secret_env")
 
-    return missing
+    return sorted(set(missing))
 
 
 def _slug_env_prefix(value: str) -> str:
@@ -7767,6 +7853,9 @@ async def _author_core_logic_with_model(
         "http_api": (
             "context contains http_request(...), endpoint, method, base_headers, base_params, base_json. "
             "Use context['http_request'] to perform the platform-controlled HTTP request. "
+            "For fixed provider APIs, call context['http_request'] with params/json/headers and omit url. "
+            "For runtime URL tools, read the URL from payload fields such as target_url/url/source_url "
+            "and call context['http_request'](url=..., method='GET', headers=..., timeout=...). "
             "Do not import requests/httpx/urllib yourself and do not read secrets yourself."
         ),
         "managed_helper": (
@@ -9131,7 +9220,8 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         plan, _helper_results = _run_authoring_tool_plan(plan, request)
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
-    if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get("ready_for_code_generation"):
+    # clarify/configure 仍然只返回计划，不生成代码。
+    if action in {"clarify", "configure"}:
         return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
     raw_manifest = plan.get("manifest") or build_tool_manifest_draft(request)
@@ -9144,6 +9234,8 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
     code_block = str(request.get("code_block") or "")
 
+    # generate 阶段必须先跑 contract validation/repair。
+    # 否则 planner 选错 wrapper 或 missing_fields 误判时，会在 code_model 前被提前 return。
     plan = await _validate_and_repair_contract_loop(
         request=request,
         plan=plan,
@@ -9172,6 +9264,11 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         }
 
     raw_manifest = plan.get("manifest") or raw_manifest
+
+    # repair 后再判断是否仍然缺配置。
+    # 注意：runtime URL 工具不应因为缺 base_url 被挡住。
+    if plan.get("requires_config") or plan.get("requires_live_test") or not plan.get("ready_for_code_generation", True):
+        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
 
     wrapper_for_sample = _canonical_wrapper_family(
         (plan.get("adapter_contract") or {}).get("wrapper_family")

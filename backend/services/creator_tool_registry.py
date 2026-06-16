@@ -2671,22 +2671,106 @@ def validate_tool_manifest(
 
     manifest = dict(manifest or {})
 
+    def _schema_props(schema: Any) -> dict[str, Any]:
+        if not isinstance(schema, dict):
+            return {}
+
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            return props
+
+        if schema.get("type") == "object":
+            return {}
+
+        meta_keys = {
+            "type",
+            "properties",
+            "required",
+            "description",
+            "title",
+            "$schema",
+            "additionalProperties",
+        }
+
+        return {
+            str(key): value
+            for key, value in schema.items()
+            if key not in meta_keys and isinstance(value, dict)
+        }
+
+    def _merge_output_schema_without_overwrite(
+        existing_schema: Any,
+        generic_schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        generic_schema = generic_schema if isinstance(generic_schema, dict) else {}
+
+        if not isinstance(existing_schema, dict) or not existing_schema:
+            return generic_schema
+
+        existing_props = _schema_props(existing_schema)
+        generic_props = _schema_props(generic_schema)
+
+        # JSON Schema 形态。
+        if existing_schema.get("type") == "object" or "properties" in existing_schema:
+            merged_props = dict(existing_props)
+            for key, value in generic_props.items():
+                merged_props.setdefault(key, value)
+
+            required: list[str] = []
+            if isinstance(existing_schema.get("required"), list):
+                required.extend(str(item) for item in existing_schema["required"] if isinstance(item, str))
+            if isinstance(generic_schema.get("required"), list):
+                for item in generic_schema["required"]:
+                    if isinstance(item, str) and item not in required:
+                        required.append(item)
+
+            merged_schema = {
+                **existing_schema,
+                "type": "object",
+                "properties": merged_props,
+            }
+
+            if required:
+                merged_schema["required"] = required
+
+            return merged_schema
+
+        # 旧 field-map 形态。
+        merged = dict(existing_schema)
+        for key, value in generic_schema.items():
+            if key in {"type", "properties", "required", "description", "title", "$schema", "additionalProperties"}:
+                continue
+            merged.setdefault(key, value)
+
+        # 如果 generic 是 JSON Schema，需要把 properties 里的通用字段补到 field-map。
+        for key, value in generic_props.items():
+            merged.setdefault(key, value)
+
+        return merged
+
     is_external_api = (
         str(manifest.get("category") or "").lower() == "external_api"
         or str(manifest.get("type") or "").lower() == "external_api"
         or str(manifest.get("tool_kind") or "").lower() == "external_api"
+        or _canonical_wrapper_family(str(manifest.get("wrapper_family") or "")) == "http_api"
         or manifest.get("needs_external_network") is True
     )
 
     if is_external_api:
         normalized_output_schema = _generic_external_api_output_schema()
-        manifest["output_schema"] = normalized_output_schema
+        manifest["output_schema"] = _merge_output_schema_without_overwrite(
+            manifest.get("output_schema"),
+            normalized_output_schema,
+        )
 
         fixed_functions = []
         for fn in manifest.get("functions") or []:
             if isinstance(fn, dict):
                 fixed_fn = dict(fn)
-                fixed_fn["output_schema"] = normalized_output_schema
+                fixed_fn["output_schema"] = _merge_output_schema_without_overwrite(
+                    fixed_fn.get("output_schema") or manifest.get("output_schema"),
+                    normalized_output_schema,
+                )
                 fixed_functions.append(fixed_fn)
             else:
                 fixed_functions.append(fn)
@@ -2699,7 +2783,11 @@ def validate_tool_manifest(
     cap = _capability_from_dict(manifest) if not errors else None
 
     if adapter_code:
-        errors.extend(_code_security_errors(adapter_code, manifest))
+        try:
+            errors.extend(_code_security_errors(adapter_code, manifest))
+        except TypeError:
+            # 兼容当前旧签名 _code_security_errors(code)。
+            errors.extend(_code_security_errors(adapter_code))
 
     dynamic_result: dict[str, Any] = {"skipped": not dynamic}
     real_result: dict[str, Any] = {"skipped": not real_run}

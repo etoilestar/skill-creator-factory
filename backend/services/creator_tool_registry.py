@@ -1361,7 +1361,189 @@ def _schema_summary(schema: dict[str, Any]) -> str:
         return "{}"
     return json.dumps(schema, ensure_ascii=False, sort_keys=True)
 
+def _default_core_logic_code(wrapper_family: str = "python_compute") -> str:
+    wrapper_family = _canonical_wrapper_family(wrapper_family)
 
+    if wrapper_family == "http_api":
+        return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core tool logic for a fixed HTTP/API tool.
+
+    Use context["http_request"](...) to perform the platform-controlled HTTP call.
+    The platform owns endpoint, auth, secrets and actual network execution.
+    """
+    response = context["http_request"](
+        params=dict(payload or {}),
+        json={},
+    )
+    if isinstance(response, dict):
+        response.setdefault("success", True)
+        return response
+    return {"success": True, "result": response}
+'''.strip()
+
+    if wrapper_family == "managed_helper":
+        return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core tool logic for a managed helper tool.
+
+    Use context["call_helper"](...) to call an allowed platform helper.
+    """
+    helper_name = context.get("helper_name") or ""
+    value = context["call_helper"](helper_name, **dict(payload or {}))
+    if isinstance(value, dict):
+        value.setdefault("success", True)
+        return value
+    return {"success": True, "result": value}
+'''.strip()
+
+    if wrapper_family == "file_io":
+        return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core file tool logic.
+
+    Use context["safe_output_path"](filename) for every output path.
+    """
+    filename = str(payload.get("filename") or "output.txt").strip() or "output.txt"
+    path = context["safe_output_path"](filename)
+    content = str(payload.get("content") or payload.get("text") or "")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return {
+        "success": True,
+        "path": path,
+        "file_path": path,
+        "file_paths": [path],
+        "file_outputs": [{"path": path}],
+    }
+'''.strip()
+
+    if wrapper_family == "database_query":
+        return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core readonly database logic.
+
+    Use context["query_readonly"](sql, params, limit) for database reads.
+    """
+    sql = str(payload.get("sql") or "SELECT 1 AS value")
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    limit = int(payload.get("limit") or 100)
+    rows = context["query_readonly"](sql, params=params, limit=limit)
+
+    return {
+        "success": True,
+        "rows": rows,
+        "results": rows,
+        "total": len(rows),
+    }
+'''.strip()
+
+    if wrapper_family == "local_command":
+        return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core local command planning logic.
+
+    Return {"argv": [...]} only. The platform wrapper validates approval and executes.
+    """
+    return {
+        "argv": context["render_command"](payload),
+    }
+'''.strip()
+
+    return '''
+def execute_task(payload: dict, context: dict) -> dict:
+    """Core local deterministic tool logic."""
+    return {
+        "success": True,
+        "result": dict(payload or {}),
+    }
+'''.strip()
+
+def _core_logic_code_errors(wrapper_family: str, code: str) -> list[str]:
+    wrapper_family = _canonical_wrapper_family(wrapper_family)
+    errors: list[str] = []
+
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"core logic code syntax error: {exc}"]
+
+    allowed_functions = {"execute_task"}
+    function_names: set[str] = set()
+
+    forbidden_imports = {
+        "requests",
+        "httpx",
+        "urllib",
+        "aiohttp",
+        "os",
+        "sys",
+        "subprocess",
+        "socket",
+        "pathlib",
+        "shutil",
+        "sqlite3",
+        "sqlalchemy",
+        "pymysql",
+        "psycopg2",
+    }
+
+    # file_io 允许 open，但路径必须来自 context["safe_output_path"]。
+    forbidden_calls = {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+    }
+
+    if wrapper_family != "file_io":
+        forbidden_calls.add("open")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in forbidden_imports:
+                    errors.append(f"core logic code must not import {root}")
+
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in forbidden_imports:
+                errors.append(f"core logic code must not import {root}")
+
+        elif isinstance(node, ast.FunctionDef):
+            function_names.add(node.name)
+            if node.name not in allowed_functions:
+                errors.append(f"core logic code may only define execute_task(payload, context), got {node.name}")
+
+        elif isinstance(node, ast.AsyncFunctionDef):
+            errors.append("core logic code must not define async functions")
+
+        elif isinstance(node, ast.ClassDef):
+            errors.append("core logic code must not define classes")
+
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
+                else ""
+            )
+            if called in forbidden_calls:
+                errors.append(f"core logic code must not call {called}")
+
+    if "execute_task" not in function_names:
+        errors.append("core logic code must define execute_task(payload, context)")
+
+    if wrapper_family == "file_io":
+        text = code or ""
+        if "open(" in text and "safe_output_path" not in text:
+            errors.append("file_io core logic may call open only with paths produced by context['safe_output_path']")
+
+    return sorted(set(errors))
 
 def _default_snippet_for_function(capability: ToolCapability, fn: ToolFunctionManifest) -> ToolSnippet:
     import_stmt = f"from {fn.import_path} import {fn.function_name}" if fn.import_path else f"import {fn.function_name}"
@@ -5699,42 +5881,7 @@ def normalize_response(data: dict, payload: dict) -> dict:
 
 
 def _internal_code_errors(code: str) -> list[str]:
-    errors: list[str] = []
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError as exc:
-        return [f"internal code syntax error: {exc}"]
-
-    allowed_functions = {"normalize_response"}
-    forbidden_imports = {"requests", "httpx", "urllib", "os", "sys", "subprocess", "socket", "pathlib", "shutil"}
-    forbidden_calls = {"open", "eval", "exec", "compile", "__import__"}
-
-    function_names: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in forbidden_imports:
-                    errors.append(f"internal code must not import {root}")
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in forbidden_imports:
-                errors.append(f"internal code must not import {root}")
-        elif isinstance(node, ast.FunctionDef):
-            function_names.add(node.name)
-            if node.name not in allowed_functions:
-                errors.append(f"internal code may only define normalize_response, got {node.name}")
-        elif isinstance(node, ast.Call):
-            func = node.func
-            called = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
-            if called in forbidden_calls:
-                errors.append(f"internal code must not call {called}")
-
-    if "normalize_response" not in function_names:
-        errors.append("internal code must define normalize_response(data, payload)")
-
-    return sorted(set(errors))
+    return _core_logic_code_errors("http_api", code)
 
 def _default_helper_normalize_code() -> str:
     return '''
@@ -5755,80 +5902,7 @@ def normalize_helper_result(value: object, payload: dict) -> dict:
 '''.strip()
 
 def _helper_normalize_code_errors(code: str) -> list[str]:
-    errors: list[str] = []
-
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError as exc:
-        return [f"helper normalize code syntax error: {exc}"]
-
-    allowed_functions = {"normalize_helper_result"}
-
-    forbidden_imports = {
-        "requests",
-        "httpx",
-        "urllib",
-        "aiohttp",
-        "os",
-        "sys",
-        "subprocess",
-        "socket",
-        "pathlib",
-        "shutil",
-    }
-
-    forbidden_calls = {
-        "open",
-        "eval",
-        "exec",
-        "compile",
-        "__import__",
-    }
-
-    function_names: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in forbidden_imports:
-                    errors.append(f"helper normalize code must not import {root}")
-
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in forbidden_imports:
-                errors.append(f"helper normalize code must not import {root}")
-
-        elif isinstance(node, ast.FunctionDef):
-            function_names.add(node.name)
-            if node.name not in allowed_functions:
-                errors.append(
-                    "helper normalize code may only define "
-                    f"normalize_helper_result(value, payload), got {node.name}"
-                )
-
-        elif isinstance(node, ast.AsyncFunctionDef):
-            errors.append("helper normalize code must not define async functions")
-
-        elif isinstance(node, ast.ClassDef):
-            errors.append("helper normalize code must not define classes")
-
-        elif isinstance(node, ast.Call):
-            func = node.func
-            called = (
-                func.id
-                if isinstance(func, ast.Name)
-                else func.attr
-                if isinstance(func, ast.Attribute)
-                else ""
-            )
-            if called in forbidden_calls:
-                errors.append(f"helper normalize code must not call {called}")
-
-    if "normalize_helper_result" not in function_names:
-        errors.append("helper normalize code must define normalize_helper_result(value, payload)")
-
-    return sorted(set(errors))
+    return _core_logic_code_errors("managed_helper", code)
 
 def _managed_helper_wrapper_code(
     contract: dict[str, Any],
@@ -5868,12 +5942,12 @@ def _managed_helper_wrapper_code(
         manifest["helper_contract"] = helper_contract
 
     safe_internal = _strip_code_fence(internal_code or "")
-    helper_internal_errors = _helper_normalize_code_errors(safe_internal)
-    internal_audit = "model_normalize_helper_result_only"
+    internal_errors = _core_logic_code_errors("managed_helper", safe_internal)
+    internal_audit = "model_execute_task_core_logic"
 
-    if helper_internal_errors:
-        safe_internal = _default_helper_normalize_code()
-        internal_audit = "fallback_default_helper_normalize_code"
+    if internal_errors:
+        safe_internal = _default_core_logic_code("managed_helper")
+        internal_audit = "fallback_default_managed_helper_core_logic"
 
     manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     helper_contract_json_literal = repr(json.dumps(helper_contract, ensure_ascii=False, sort_keys=True))
@@ -5881,8 +5955,8 @@ def _managed_helper_wrapper_code(
     template = r'''from __future__ import annotations
 
 # AUTO-GENERATED MANAGED HELPER WRAPPER.
-# Only the code between MODEL_INTERNAL_CODE_START/END may come from code_model.
-# The platform controls helper dispatch, run(), manifest(), main(), and trial behavior.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns helper registry, helper call boundary, run(), manifest(), main(), trial behavior.
 # internal_audit=__INTERNAL_AUDIT__
 
 import inspect
@@ -5904,19 +5978,12 @@ MANIFEST_DATA = json.loads(__MANIFEST_JSON_LITERAL__)
 def _schema_properties(schema: Any) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return {}
-
     props = schema.get("properties")
     if isinstance(props, dict):
         return props
-
     if schema.get("type") == "object":
         return {}
-
-    return {
-        str(key): value
-        for key, value in schema.items()
-        if isinstance(value, dict)
-    }
+    return {str(key): value for key, value in schema.items() if isinstance(value, dict)}
 
 
 def _output_properties() -> dict[str, Any]:
@@ -5927,210 +5994,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _read_path(root: Any, path: str, default: Any = None) -> Any:
-    if not path:
-        return default
-
-    current = root
-    parts = [
-        part
-        for part in str(path).replace("[", ".").replace("]", "").split(".")
-        if part
-    ]
-
-    if parts and parts[0] in {"payload", "input", "inputs"}:
-        parts = parts[1:]
-
-    for part in parts:
-        if isinstance(current, dict):
-            if part not in current:
-                return default
-            current = current.get(part)
-        elif isinstance(current, list):
-            try:
-                current = current[int(part)]
-            except Exception:
-                return default
-        else:
-            return default
-
-    return current
-
-
-def _resolve_value(spec: Any, payload: dict[str, Any]) -> Any:
-    if isinstance(spec, dict):
-        if "value" in spec:
-            return spec.get("value")
-
-        source = str(spec.get("source") or spec.get("from") or "").strip()
-        default = spec.get("default")
-
-        if source:
-            value = _read_path(payload, source, default)
-            return default if value in (None, "") and "default" in spec else value
-
-        name = str(spec.get("name") or "").strip()
-        if name:
-            return payload.get(name, default)
-
-        return default
-
-    if isinstance(spec, str):
-        return _read_path(payload, spec, None)
-
-    return spec
-
-
 def _first_payload_value(payload: dict[str, Any], names: list[str]) -> Any:
     for name in names:
         if name in payload and payload.get(name) not in (None, ""):
             return payload.get(name)
     return None
-
-
-def _resource_candidate_for_param(payload: dict[str, Any], param_name: str) -> Any:
-    name = str(param_name or "").strip()
-    aliases = [name]
-
-    if name in {"url", "uri", "source", "resource", "target", "input"}:
-        aliases.extend([
-            "target_url",
-            "url",
-            "uri",
-            "source",
-            "resource",
-            "target",
-            "input",
-        ])
-
-    if name.endswith("_url"):
-        aliases.extend(["target_url", "url", "uri"])
-
-    if name in {"text", "content", "query", "prompt"}:
-        aliases.extend([name, "input", "content", "text", "query", "prompt"])
-
-    return _first_payload_value(payload, aliases)
-
-
-def _build_args_kwargs_from_contract(payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any], bool]:
-    invocation = HELPER_CONTRACT.get("invocation")
-    if not isinstance(invocation, dict):
-        invocation = {}
-
-    args_spec = invocation.get("args")
-    kwargs_spec = invocation.get("kwargs")
-
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {}
-
-    used = False
-
-    if isinstance(args_spec, list):
-        used = True
-        for item in args_spec:
-            args.append(_resolve_value(item, payload))
-
-    if isinstance(kwargs_spec, dict):
-        used = True
-        for key, spec in kwargs_spec.items():
-            value = _resolve_value(spec, payload)
-            if value is not None:
-                kwargs[str(key)] = value
-
-    return args, kwargs, used
-
-
-def _build_kwargs_from_signature(helper: Any, payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any], bool]:
-    try:
-        signature = inspect.signature(helper)
-    except Exception:
-        return [], {}, False
-
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {}
-    required_missing: list[str] = []
-
-    for param in signature.parameters.values():
-        if param.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}:
-            continue
-
-        name = param.name
-
-        if name in payload:
-            value = payload.get(name)
-        else:
-            value = _resource_candidate_for_param(payload, name)
-
-        if value is not None:
-            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                args.append(value)
-            else:
-                kwargs[name] = value
-            continue
-
-        if param.default is inspect.Parameter.empty:
-            required_missing.append(name)
-
-    if required_missing:
-        return [], {}, False
-
-    return args, kwargs, bool(args or kwargs)
-
-
-def _call_helper(payload: dict[str, Any]) -> Any:
-    if not HELPER_NAME:
-        raise RuntimeError("managed helper_contract.helper_name is required")
-
-    helper = getattr(_skill_runtime, HELPER_NAME, None)
-    if not callable(helper):
-        raise RuntimeError("managed helper is not available: " + HELPER_NAME)
-
-    args, kwargs, used_contract = _build_args_kwargs_from_contract(payload)
-    if used_contract:
-        return helper(*args, **kwargs)
-
-    args, kwargs, used_signature = _build_kwargs_from_signature(helper, payload)
-    if used_signature:
-        return helper(*args, **kwargs)
-
-    try:
-        return helper(payload)
-    except TypeError as first_error:
-        try:
-            return helper(**payload)
-        except TypeError:
-            raise RuntimeError(
-                "unable to call managed helper "
-                + HELPER_NAME
-                + "; add helper_contract.invocation args/kwargs mapping. "
-                + "original error: "
-                + str(first_error)
-            )
-
-
-# === MODEL_INTERNAL_CODE_START ===
-__MODEL_INTERNAL_CODE__
-# === MODEL_INTERNAL_CODE_END ===
-
-
-def _as_bool_success(value: dict[str, Any]) -> bool:
-    if "success" in value:
-        return bool(value.get("success"))
-
-    status = str(value.get("status") or "").strip().lower()
-    if status in {"success", "ok", "done", "completed"}:
-        return True
-    if status in {"failed", "error", "timeout", "not_found"}:
-        return False
-
-    if value.get("error") or value.get("error_message"):
-        return False
-
-    status_code = value.get("status_code")
-    if isinstance(status_code, int) and status_code >= 400:
-        return False
-
-    return True
 
 
 def _get_first(data: dict[str, Any], names: list[str], default: Any = None) -> Any:
@@ -6140,21 +6008,34 @@ def _get_first(data: dict[str, Any], names: list[str], default: Any = None) -> A
     return default
 
 
+def _as_bool_success(value: dict[str, Any]) -> bool:
+    if "success" in value:
+        return bool(value.get("success"))
+    status = str(value.get("status") or "").strip().lower()
+    if status in {"success", "ok", "done", "completed"}:
+        return True
+    if status in {"failed", "error", "timeout", "not_found"}:
+        return False
+    if value.get("error") or value.get("error_message"):
+        return False
+    status_code = value.get("status_code")
+    if isinstance(status_code, int) and status_code >= 400:
+        return False
+    return True
+
+
 def _status_from_value(data: dict[str, Any], success: bool) -> str:
     status = str(data.get("status") or "").strip()
     if status:
         return status
-
     status_code = data.get("status_code")
     if isinstance(status_code, int):
         if status_code == 404:
             return "not_found"
         if status_code >= 400:
             return "failed"
-
     if data.get("timeout") is True:
         return "timeout"
-
     return "success" if success else "failed"
 
 
@@ -6216,37 +6097,78 @@ def _fill_schema_field(output: dict[str, Any], field: str, spec: dict[str, Any],
         output[field] = ""
 
 
-def _normalize_result(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
-    normalizer = globals().get("normalize_helper_result")
+def _filter_kwargs_for_signature(helper: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(helper)
+    except Exception:
+        return kwargs
 
-    if callable(normalizer):
-        try:
-            normalized = normalizer(value, payload)
-            if isinstance(normalized, dict):
-                output = dict(normalized)
-            else:
-                output = {
-                    "success": True,
-                    "result": normalized,
-                    "content": "" if normalized is None else str(normalized),
-                }
-        except Exception as exc:
-            output = {
-                "success": False,
-                "error": str(exc),
-                "error_message": str(exc),
-            }
-    elif isinstance(value, dict):
+    params = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+
+    allowed = {
+        name
+        for name, param in params.items()
+        if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    }
+    return {key: value for key, value in kwargs.items() if key in allowed}
+
+
+def _allowed_helper_names() -> set[str]:
+    names: set[str] = set()
+    if HELPER_NAME:
+        names.add(HELPER_NAME)
+
+    allowed = HELPER_CONTRACT.get("allowed_helpers")
+    if isinstance(allowed, list):
+        names.update(str(item).strip() for item in allowed if str(item).strip())
+
+    return names
+
+
+def _call_helper(helper_name: str | None = None, *args: Any, **kwargs: Any) -> Any:
+    selected = str(helper_name or HELPER_NAME or "").strip()
+    allowed = _allowed_helper_names()
+
+    if not selected:
+        raise RuntimeError("managed helper_contract.helper_name is required")
+
+    if allowed and selected not in allowed:
+        raise RuntimeError("helper is not allowed by helper_contract: " + selected)
+
+    helper = getattr(_skill_runtime, selected, None)
+    if not callable(helper):
+        raise RuntimeError("managed helper is not available: " + selected)
+
+    kwargs = _filter_kwargs_for_signature(helper, dict(kwargs or {}))
+
+    return helper(*args, **kwargs)
+
+
+# === MODEL_INTERNAL_CODE_START ===
+__MODEL_INTERNAL_CODE__
+# === MODEL_INTERNAL_CODE_END ===
+
+
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "wrapper_family": "managed_helper",
+        "helper_name": HELPER_NAME,
+        "helper_contract": HELPER_CONTRACT,
+        "manifest": MANIFEST_DATA,
+        "call_helper": _call_helper,
+        "helpers": {name: (lambda *args, _name=name, **kwargs: _call_helper(_name, *args, **kwargs)) for name in _allowed_helper_names()},
+    }
+
+
+def _normalize_output(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(value, dict):
         output = dict(value)
     else:
-        output = {
-            "success": True,
-            "content": "" if value is None else str(value),
-            "result": value,
-        }
+        output = {"success": True, "result": value, "content": "" if value is None else str(value)}
 
-    success = _as_bool_success(output)
-    output.setdefault("success", success)
+    output.setdefault("success", _as_bool_success(output))
 
     props = _output_properties()
     for field, spec in props.items():
@@ -6261,11 +6183,9 @@ def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
         "trial_run": True,
         "result": {"trial_run": True, "payload_keys": sorted(payload.keys())},
     }
-
     props = _output_properties()
     for field, spec in props.items():
         _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
-
     return output
 
 
@@ -6275,9 +6195,13 @@ def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if os.getenv("SKILL_TRIAL_RUN") == "1":
         return _trial_result(payload)
 
+    fn = globals().get("execute_task")
+    if not callable(fn):
+        return {"success": False, "error": "execute_task(payload, context) is not defined"}
+
     try:
-        value = _call_helper(payload)
-        return _normalize_result(value, payload)
+        value = fn(payload, _core_context(payload))
+        return _normalize_output(value, payload)
     except Exception as exc:
         output: dict[str, Any] = {
             "success": False,
@@ -6285,11 +6209,9 @@ def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
             "error": str(exc),
             "error_message": str(exc),
         }
-
         props = _output_properties()
         for field, spec in props.items():
             _fill_schema_field(output, field, spec if isinstance(spec, dict) else {}, payload)
-
         return output
 
 
@@ -6332,61 +6254,28 @@ def transform(payload: dict) -> dict:
 
 
 def _transform_code_errors(code: str) -> list[str]:
-    errors: list[str] = []
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError as exc:
-        return [f"transform code syntax error: {exc}"]
+    return _core_logic_code_errors("python_compute", code)
 
-    allowed_functions = {"transform"}
-    forbidden_imports = {"requests", "httpx", "urllib", "aiohttp", "os", "sys", "subprocess", "socket", "pathlib", "shutil"}
-    forbidden_calls = {"open", "eval", "exec", "compile", "__import__"}
+def _file_transform_code_errors(code: str) -> list[str]:
+    return _core_logic_code_errors("file_io", code)
 
-    function_names: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in forbidden_imports:
-                    errors.append(f"transform code must not import {root}")
-
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in forbidden_imports:
-                errors.append(f"transform code must not import {root}")
-
-        elif isinstance(node, ast.FunctionDef):
-            function_names.add(node.name)
-            if node.name not in allowed_functions:
-                errors.append(f"transform code may only define transform(payload), got {node.name}")
-
-        elif isinstance(node, ast.Call):
-            func = node.func
-            called = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
-            if called in forbidden_calls:
-                errors.append(f"transform code must not call {called}")
-
-    if "transform" not in function_names:
-        errors.append("transform code must define transform(payload)")
-
-    return sorted(set(errors))
-
+def _database_query_code_errors(code: str) -> list[str]:
+    return _core_logic_code_errors("database_query", code)
 
 def _python_compute_wrapper_code(contract: dict[str, Any], internal_code: str, manifest: dict[str, Any]) -> str:
     function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "python_compute_tool"))
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _transform_code_errors(safe_internal):
-        safe_internal = _default_transform_code()
+    if _core_logic_code_errors("python_compute", safe_internal):
+        safe_internal = _default_core_logic_code("python_compute")
 
     manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
 
     return f'''from __future__ import annotations
 
 # AUTO-GENERATED PYTHON COMPUTE WRAPPER.
-# code_model may only provide transform(payload). run(), manifest(), main()
-# and trial behavior are generated deterministically by the platform.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns run(), manifest(), main(), trial behavior and IO protocol.
 
 import json
 import os
@@ -6411,17 +6300,24 @@ def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
     }}
 
 
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {{
+        "wrapper_family": "python_compute",
+        "manifest": MANIFEST_DATA,
+    }}
+
+
 def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = dict(payload or {{}})
 
     if os.getenv("SKILL_TRIAL_RUN") == "1":
         return _trial_result(payload)
 
-    fn = globals().get("transform")
+    fn = globals().get("execute_task")
     if not callable(fn):
-        return {{"success": False, "error": "transform(payload) is not defined"}}
+        return {{"success": False, "error": "execute_task(payload, context) is not defined"}}
 
-    value = fn(payload)
+    value = fn(payload, _core_context(payload))
 
     if isinstance(value, dict):
         return value
@@ -6463,6 +6359,7 @@ def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, man
 
     endpoint = str(contract.get("url") or "")
     method = str(contract.get("method") or "POST").upper()
+
     auth = contract.get("auth") if isinstance(contract.get("auth"), dict) else {}
     secret_env = str(auth.get("required_secret_env") or f"{platform_env_prefix}_SECRET").strip()
     header_name = str(auth.get("header_name") or "X-API-KEY").strip() or "X-API-KEY"
@@ -6472,11 +6369,13 @@ def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, man
     headers_template = contract.get("headers_template") if isinstance(contract.get("headers_template"), dict) else {}
 
     safe_internal = _strip_code_fence(internal_code or "")
-    if _internal_code_errors(safe_internal):
-        safe_internal = _default_internal_normalize_code()
-        internal_audit = "fallback_default_internal_normalize_code"
+    internal_errors = _core_logic_code_errors("http_api", safe_internal)
+
+    if internal_errors:
+        safe_internal = _default_core_logic_code("http_api")
+        internal_audit = "fallback_default_http_core_logic"
     else:
-        internal_audit = "model_internal_normalize_response_only"
+        internal_audit = "model_execute_task_core_logic"
 
     body_template_json_literal = repr(json.dumps(body_template, ensure_ascii=False, sort_keys=True))
     query_template_json_literal = repr(json.dumps(query_template, ensure_ascii=False, sort_keys=True))
@@ -6486,9 +6385,8 @@ def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, man
     return f'''from __future__ import annotations
 
 # AUTO-GENERATED EXTERNAL API WRAPPER.
-# Only the code between MODEL_INTERNAL_CODE_START/END may come from code_model.
-# Wrapper protocol, env access, network request, manifest(), run(), and main()
-# are generated deterministically by the platform.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns endpoint/env/auth/secret/network boundary, manifest(), run(), main(), trial behavior.
 # internal_audit={internal_audit}
 
 import json
@@ -6549,82 +6447,127 @@ def _render(value: Any, payload: dict[str, Any]) -> Any:
     return value
 
 
-def _default_normalize_response(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    items = data.get("organic", []) if isinstance(data, dict) else []
-    results = []
-    for idx, item in enumerate(items or [], start=1):
-        if not isinstance(item, dict):
-            continue
-        results.append({{
-            "title": item.get("title") or item.get("name") or "",
-            "snippet": item.get("snippet") or item.get("description") or "",
-            "link": item.get("link") or item.get("url") or item.get("imageUrl") or "",
-            "position": item.get("position") or idx,
-        }})
-    return {{
-        "success": True,
-        "results": results,
-        "total": len(results),
-        "knowledgeGraph": data.get("knowledgeGraph", {{}}) if isinstance(data, dict) else {{}},
-        "answerBox": data.get("answerBox", {{}}) if isinstance(data, dict) else {{}},
-        "relatedSearches": data.get("relatedSearches", []) if isinstance(data, dict) else [],
-        "raw": data,
-    }}
-
-
 # === MODEL_INTERNAL_CODE_START ===
 {safe_internal}
 # === MODEL_INTERNAL_CODE_END ===
 
 
-def _normalize(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    fn = globals().get("normalize_response")
-    required = {{"success", "results", "total"}}
+def _base_headers(payload: dict[str, Any]) -> dict[str, Any]:
+    headers = _render(HEADERS_TEMPLATE, payload)
+    headers = dict(headers or {{}}) if isinstance(headers, dict) else {{}}
+    if METHOD not in {{"GET", "HEAD"}}:
+        headers.setdefault("Content-Type", "application/json")
+    return headers
 
-    if callable(fn):
+
+def _base_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = _render(QUERY_TEMPLATE, payload)
+    return dict(params or {{}}) if isinstance(params, dict) else {{}}
+
+
+def _base_json(payload: dict[str, Any]) -> Any:
+    body = _render(BODY_TEMPLATE, payload)
+    return dict(body or {{}}) if isinstance(body, dict) else body
+
+
+def _http_request(
+    *,
+    url: str | None = None,
+    method: str | None = None,
+    headers: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    json_body: Any = None,
+    json: Any = None,
+    data: Any = None,
+    timeout: float | int | None = None,
+) -> dict[str, Any]:
+    endpoint = str(url or ENDPOINT or "")
+    http_method = str(method or METHOD or "GET").upper()
+
+    if not endpoint.startswith(("http://", "https://")):
+        return {{"success": False, "error": "Invalid endpoint", "raw": None}}
+
+    api_key = os.getenv(SECRET_ENV) if SECRET_ENV else ""
+    if SECRET_ENV and not api_key:
+        return {{
+            "success": False,
+            "error": f"Missing required environment variable: {{SECRET_ENV}}",
+            "raw": None,
+        }}
+
+    request_headers = _base_headers({{}})
+    if isinstance(headers, dict):
+        request_headers.update({{str(k): str(v) for k, v in headers.items() if v is not None}})
+
+    if SECRET_ENV:
+        request_headers[AUTH_HEADER_NAME] = api_key
+
+    body = json_body if json_body is not None else json
+    timeout_value = float(timeout or 30)
+
+    try:
+        response = requests.request(
+            http_method,
+            endpoint,
+            headers=request_headers,
+            params=params if isinstance(params, dict) else None,
+            json=body if http_method not in {{"GET", "HEAD"}} and data is None else None,
+            data=data,
+            timeout=timeout_value,
+        )
+        status_code = response.status_code
+        preview = response.text[:4000]
+        response.raise_for_status()
+
         try:
-            value = fn(data, payload)
-        except Exception as exc:
-            fallback = _default_normalize_response(data, payload)
-            fallback["_normalizer_warning"] = {{
-                "reason": "model_normalize_response_raised_exception",
-                "error": str(exc),
-                "required_keys": sorted(required),
-            }}
-            return fallback
+            parsed: Any = response.json()
+        except ValueError:
+            parsed = {{"text": response.text}}
 
-        if isinstance(value, dict):
-            if required.issubset(value.keys()) and isinstance(value.get("results"), list):
-                return value
+        return {{
+            "success": True,
+            "status_code": status_code,
+            "data": parsed,
+            "text": response.text,
+            "headers": dict(response.headers),
+            "raw": parsed,
+        }}
 
-            fallback = _default_normalize_response(data, payload)
-            fallback["_normalizer_warning"] = {{
-                "reason": "model_normalize_response_did_not_match_required_contract",
-                "model_return_keys": sorted(str(key) for key in value.keys()),
-                "required_keys": sorted(required),
-            }}
-            return fallback
-
-    return _default_normalize_response(data, payload)
+    except requests.exceptions.HTTPError:
+        return {{
+            "success": False,
+            "error": f"HTTP {{status_code}}",
+            "status_code": status_code,
+            "response_preview": preview,
+            "raw": None,
+        }}
+    except requests.exceptions.RequestException as exc:
+        return {{"success": False, "error": str(exc), "raw": None}}
 
 
 def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
     return {{
         "success": True,
-        "results": [
-            {{
-                "title": "Example result",
-                "snippet": "Deterministic trial result for schema validation.",
-                "link": "https://example.com",
-                "position": 1,
-            }}
-        ],
-        "total": 1,
-        "knowledgeGraph": {{}},
-        "answerBox": {{}},
-        "relatedSearches": [],
-        "raw": {{}},
         "trial_run": True,
+        "request_preview": {{
+            "method": METHOD,
+            "endpoint_configured": bool(ENDPOINT),
+            "payload_keys": sorted(payload.keys()),
+        }},
+        "raw": {{}},
+    }}
+
+
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {{
+        "wrapper_family": "http_api",
+        "manifest": MANIFEST_DATA,
+        "endpoint": ENDPOINT,
+        "method": METHOD,
+        "base_headers": _base_headers(payload),
+        "base_params": _base_params(payload),
+        "base_json": _base_json(payload),
+        "http_request": _http_request,
     }}
 
 
@@ -6634,63 +6577,20 @@ def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if os.getenv("SKILL_TRIAL_RUN") == "1":
         return _trial_result(payload)
 
-    if not ENDPOINT.startswith(("http://", "https://")):
-        return {{"success": False, "error": "Invalid endpoint", "results": [], "total": 0}}
-
-    api_key = os.getenv(SECRET_ENV) if SECRET_ENV else ""
-    if SECRET_ENV and not api_key:
-        return {{
-            "success": False,
-            "error": f"Missing required environment variable: {{SECRET_ENV}}",
-            "results": [],
-            "total": 0,
-        }}
-
-    headers = _render(HEADERS_TEMPLATE, payload)
-    headers = dict(headers or {{}}) if isinstance(headers, dict) else {{}}
-    if METHOD not in {{"GET", "HEAD"}}:
-        headers.setdefault("Content-Type", "application/json")
-    if SECRET_ENV:
-        headers[AUTH_HEADER_NAME] = api_key
-
-    params = _render(QUERY_TEMPLATE, payload)
-    params = dict(params or {{}}) if isinstance(params, dict) else {{}}
-
-    body = _render(BODY_TEMPLATE, payload)
-    body = dict(body or {{}}) if isinstance(body, dict) else {{}}
+    fn = globals().get("execute_task")
+    if not callable(fn):
+        return {{"success": False, "error": "execute_task(payload, context) is not defined", "raw": None}}
 
     try:
-        response = requests.request(
-            METHOD,
-            ENDPOINT,
-            headers=headers,
-            params=params,
-            json=body if METHOD not in {{"GET", "HEAD"}} else None,
-            timeout=30,
-        )
-        status_code = response.status_code
-        text = response.text[:2000]
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.HTTPError:
-        return {{
-            "success": False,
-            "error": f"HTTP {{status_code}}",
-            "status_code": status_code,
-            "response_preview": text,
-            "results": [],
-            "total": 0,
-        }}
-    except requests.exceptions.RequestException as exc:
-        return {{"success": False, "error": str(exc), "results": [], "total": 0}}
-    except ValueError as exc:
-        return {{"success": False, "error": f"Non-JSON response: {{exc}}", "results": [], "total": 0}}
+        value = fn(payload, _core_context(payload))
+    except Exception as exc:
+        return {{"success": False, "error": str(exc), "raw": None}}
 
-    normalized = _normalize(data, payload)
-    normalized.setdefault("success", True)
-    normalized.setdefault("results", [])
-    normalized.setdefault("total", len(normalized.get("results") or []))
-    return normalized
+    if isinstance(value, dict):
+        value.setdefault("success", True)
+        return value
+
+    return {{"success": True, "result": value, "raw": value}}
 
 
 def {function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -6710,6 +6610,757 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
+
+def _file_io_wrapper_code(
+    contract: dict[str, Any],
+    internal_code: str,
+    manifest: dict[str, Any],
+) -> str:
+    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "file_tool"))
+
+    safe_internal = _strip_code_fence(internal_code or "")
+    if _core_logic_code_errors("file_io", safe_internal):
+        safe_internal = _default_core_logic_code("file_io")
+
+    manifest = dict(manifest or {})
+    manifest["wrapper_family"] = "file_io"
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+    template = r'''from __future__ import annotations
+
+# AUTO-GENERATED FILE_IO WRAPPER.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns OUTPUT_DIR, path safety, run(), manifest(), main(), trial behavior.
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+FUNCTION_NAME = __FUNCTION_NAME_LITERAL__
+MANIFEST_DATA = json.loads(__MANIFEST_JSON_LITERAL__)
+
+
+def safe_output_path(filename: str) -> str:
+    base = Path(os.getenv("OUTPUT_DIR") or "outputs").resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    raw = str(filename or "output.txt").strip().replace("\\", "/")
+    raw = raw.split("/")[-1] or "output.txt"
+
+    path = (base / raw).resolve()
+
+    if path != base and base not in path.parents:
+        raise RuntimeError("unsafe output path")
+
+    return str(path)
+
+
+# === MODEL_INTERNAL_CODE_START ===
+__MODEL_INTERNAL_CODE__
+# === MODEL_INTERNAL_CODE_END ===
+
+
+def _collect_paths(result: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+
+    for key in ("path", "file_path", "output_path"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            paths.append(value)
+
+    for key in ("file_paths", "paths"):
+        value = result.get(key)
+        if isinstance(value, list):
+            paths.extend(str(item) for item in value if item)
+
+    value = result.get("file_outputs")
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict) and item.get("path"):
+                paths.append(str(item["path"]))
+
+    return sorted(set(paths))
+
+
+def _validate_file_result(result: dict[str, Any]) -> dict[str, Any]:
+    result = dict(result or {})
+    paths = _collect_paths(result)
+    missing = [path for path in paths if not Path(path).exists()]
+
+    result.setdefault("file_paths", paths)
+    result.setdefault("success", not missing)
+
+    if missing:
+        result["success"] = False
+        result["error"] = "missing output files: " + ", ".join(missing)
+
+    return result
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    path = safe_output_path("trial_output.txt")
+    Path(path).write_text("trial run", encoding="utf-8")
+    return {
+        "success": True,
+        "trial_run": True,
+        "path": path,
+        "file_path": path,
+        "file_paths": [path],
+        "file_outputs": [{"path": path}],
+    }
+
+
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "wrapper_family": "file_io",
+        "manifest": MANIFEST_DATA,
+        "output_dir": os.getenv("OUTPUT_DIR") or "outputs",
+        "safe_output_path": safe_output_path,
+    }
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(payload or {})
+
+    if os.getenv("SKILL_TRIAL_RUN") == "1":
+        return _trial_result(payload)
+
+    fn = globals().get("execute_task")
+    if not callable(fn):
+        return {"success": False, "error": "execute_task(payload, context) is not defined"}
+
+    try:
+        value = fn(payload, _core_context(payload))
+        if not isinstance(value, dict):
+            value = {"success": True, "result": value}
+        return _validate_file_result(value)
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "file_paths": [], "file_outputs": []}
+
+
+def __FUNCTION_NAME__(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def manifest() -> dict[str, Any]:
+    return MANIFEST_DATA
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    return (
+        template
+        .replace("__FUNCTION_NAME_LITERAL__", repr(function_name))
+        .replace("__MANIFEST_JSON_LITERAL__", manifest_json_literal)
+        .replace("__MODEL_INTERNAL_CODE__", safe_internal)
+        .replace("__FUNCTION_NAME__", function_name)
+    )
+
+def _database_query_wrapper_code(
+    contract: dict[str, Any],
+    internal_code: str,
+    manifest: dict[str, Any],
+) -> str:
+    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "database_tool"))
+
+    safe_internal = _strip_code_fence(internal_code or "")
+    if _core_logic_code_errors("database_query", safe_internal):
+        safe_internal = _default_core_logic_code("database_query")
+
+    manifest = dict(manifest or {})
+    manifest["wrapper_family"] = "database_query"
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+    template = r'''from __future__ import annotations
+
+# AUTO-GENERATED DATABASE_QUERY WRAPPER.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns DB connection, readonly SQL validation, execution, manifest(), main().
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from typing import Any
+
+
+FUNCTION_NAME = __FUNCTION_NAME_LITERAL__
+MANIFEST_DATA = json.loads(__MANIFEST_JSON_LITERAL__)
+
+_FORBIDDEN_SQL = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|replace|merge|grant|revoke|attach|detach|pragma|vacuum)\b",
+    re.I,
+)
+
+
+# === MODEL_INTERNAL_CODE_START ===
+__MODEL_INTERNAL_CODE__
+# === MODEL_INTERNAL_CODE_END ===
+
+
+def _database_url() -> str:
+    return (
+        os.getenv("DATABASE_URL")
+        or str(MANIFEST_DATA.get("database_url") or "")
+        or str(MANIFEST_DATA.get("dsn") or "")
+    )
+
+
+def _validate_readonly_sql(sql: str) -> None:
+    text = str(sql or "").strip()
+
+    if not text:
+        raise RuntimeError("SQL is empty")
+
+    if ";" in text.rstrip(";"):
+        raise RuntimeError("multiple SQL statements are not allowed")
+
+    lowered = text.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        raise RuntimeError("only SELECT/WITH read-only SQL is allowed")
+
+    if _FORBIDDEN_SQL.search(text):
+        raise RuntimeError("forbidden SQL operation detected")
+
+
+def _connect(url: str):
+    if not url:
+        raise RuntimeError("DATABASE_URL is required")
+
+    if url.startswith("sqlite:///"):
+        return sqlite3.connect(url[len("sqlite:///"):])
+
+    if url.startswith("sqlite://"):
+        return sqlite3.connect(url[len("sqlite://"):])
+
+    if url == ":memory:" or url.endswith(".db") or "/" in url:
+        return sqlite3.connect(url)
+
+    raise RuntimeError("generic database_query wrapper currently supports sqlite only; register a managed helper for other engines")
+
+
+def query_readonly(sql: str, params: dict[str, Any] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    _validate_readonly_sql(sql)
+
+    conn = _connect(_database_url())
+    try:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(sql, params or {})
+        rows = [dict(row) for row in cursor.fetchmany(int(limit or 100))]
+        return rows
+    finally:
+        conn.close()
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"success": True, "trial_run": True, "rows": [], "results": [], "total": 0}
+
+
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "wrapper_family": "database_query",
+        "manifest": MANIFEST_DATA,
+        "query_readonly": query_readonly,
+    }
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(payload or {})
+
+    if os.getenv("SKILL_TRIAL_RUN") == "1":
+        return _trial_result(payload)
+
+    fn = globals().get("execute_task")
+    if not callable(fn):
+        return {"success": False, "error": "execute_task(payload, context) is not defined", "rows": [], "results": []}
+
+    try:
+        value = fn(payload, _core_context(payload))
+        if isinstance(value, dict):
+            value.setdefault("success", True)
+            return value
+        return {"success": True, "result": value}
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "rows": [], "results": [], "total": 0}
+
+
+def __FUNCTION_NAME__(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def manifest() -> dict[str, Any]:
+    return MANIFEST_DATA
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    return (
+        template
+        .replace("__FUNCTION_NAME_LITERAL__", repr(function_name))
+        .replace("__MANIFEST_JSON_LITERAL__", manifest_json_literal)
+        .replace("__MODEL_INTERNAL_CODE__", safe_internal)
+        .replace("__FUNCTION_NAME__", function_name)
+    )
+
+def _local_command_wrapper_code(
+    contract: dict[str, Any],
+    internal_code: str,
+    manifest: dict[str, Any],
+) -> str:
+    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "local_command_tool"))
+
+    safe_internal = _strip_code_fence(internal_code or "")
+    if _core_logic_code_errors("local_command", safe_internal):
+        safe_internal = _default_core_logic_code("local_command")
+
+    manifest = dict(manifest or {})
+    manifest["wrapper_family"] = "local_command"
+    manifest["safety_level"] = "high"
+    manifest.setdefault("approval_status", "pending_review")
+
+    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+
+    template = r'''from __future__ import annotations
+
+# AUTO-GENERATED LOCAL_COMMAND WRAPPER.
+# Only MODEL_INTERNAL_CODE may come from code_model.
+# Platform owns approval gate, command rendering, execution, manifest(), main().
+
+import json
+import os
+import subprocess
+import sys
+from typing import Any
+
+
+FUNCTION_NAME = __FUNCTION_NAME_LITERAL__
+MANIFEST_DATA = json.loads(__MANIFEST_JSON_LITERAL__)
+
+
+# === MODEL_INTERNAL_CODE_START ===
+__MODEL_INTERNAL_CODE__
+# === MODEL_INTERNAL_CODE_END ===
+
+
+def _render_template(value: Any, payload: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        result = value
+        for key, item in payload.items():
+            result = result.replace("{{" + str(key) + "}}", str(item))
+        return result
+
+    if isinstance(value, list):
+        return [_render_template(item, payload) for item in value]
+
+    if isinstance(value, dict):
+        return {str(k): _render_template(v, payload) for k, v in value.items()}
+
+    return value
+
+
+def render_command(payload: dict[str, Any]) -> list[str]:
+    command = MANIFEST_DATA.get("command_args_template") or MANIFEST_DATA.get("command")
+
+    if isinstance(command, str):
+        raise RuntimeError("local_command requires command_args_template list, not shell string")
+
+    if not isinstance(command, list) or not command:
+        raise RuntimeError("manifest.command_args_template must be a non-empty list")
+
+    rendered = _render_template(command, payload)
+    argv = [str(item) for item in rendered if str(item).strip()]
+
+    if not argv:
+        raise RuntimeError("empty command")
+
+    return argv
+
+
+def _is_approved() -> bool:
+    return str(MANIFEST_DATA.get("approval_status") or "").lower() == "approved"
+
+
+def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": True,
+        "trial_run": True,
+        "command_preview": render_command(payload) if MANIFEST_DATA.get("command_args_template") else [],
+    }
+
+
+def _core_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "wrapper_family": "local_command",
+        "manifest": MANIFEST_DATA,
+        "render_command": render_command,
+    }
+
+
+def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(payload or {})
+
+    if os.getenv("SKILL_TRIAL_RUN") == "1":
+        return _trial_result(payload)
+
+    if not _is_approved():
+        return {
+            "success": False,
+            "error": "local command tool is not approved",
+            "approval_status": MANIFEST_DATA.get("approval_status") or "pending_review",
+        }
+
+    fn = globals().get("execute_task")
+    if not callable(fn):
+        return {"success": False, "error": "execute_task(payload, context) is not defined"}
+
+    try:
+        plan = fn(payload, _core_context(payload))
+        if not isinstance(plan, dict):
+            raise RuntimeError("execute_task must return a dict")
+
+        argv = plan.get("argv")
+        if not isinstance(argv, list):
+            argv = render_command(payload)
+
+        argv = [str(item) for item in argv if str(item).strip()]
+        timeout = float(MANIFEST_DATA.get("timeout_seconds") or payload.get("timeout") or 30)
+
+        completed = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        return {
+            "success": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "command_preview": argv,
+        }
+
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def __FUNCTION_NAME__(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return run(payload)
+
+
+def manifest() -> dict[str, Any]:
+    return MANIFEST_DATA
+
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{}"
+    payload = json.loads(raw)
+    print(json.dumps(run(payload), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    return (
+        template
+        .replace("__FUNCTION_NAME_LITERAL__", repr(function_name))
+        .replace("__MANIFEST_JSON_LITERAL__", manifest_json_literal)
+        .replace("__MODEL_INTERNAL_CODE__", safe_internal)
+        .replace("__FUNCTION_NAME__", function_name)
+    )
+
+async def _author_core_logic_with_model(
+    *,
+    wrapper_family: str,
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    contract: dict[str, Any],
+    manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+    model_notes: list[str],
+    warnings: list[str],
+) -> tuple[str, list[str]]:
+    wrapper_family = _canonical_wrapper_family(wrapper_family)
+
+    context_guidance = {
+        "http_api": (
+            "context contains http_request(...), endpoint, method, base_headers, base_params, base_json. "
+            "Use context['http_request'] to perform the platform-controlled HTTP request."
+        ),
+        "managed_helper": (
+            "context contains call_helper(helper_name, *args, **kwargs), helpers dict, helper_name, helper_contract. "
+            "Use only context['call_helper'] or context['helpers'][allowed_name]."
+        ),
+        "python_compute": (
+            "context contains manifest only. Implement deterministic local business logic."
+        ),
+        "file_io": (
+            "context contains safe_output_path(filename), output_dir and manifest. "
+            "Use context['safe_output_path'] for every file path before opening/writing."
+        ),
+        "database_query": (
+            "context contains query_readonly(sql, params, limit). "
+            "Only SELECT/WITH readonly SQL is allowed."
+        ),
+        "local_command": (
+            "context contains render_command(payload). "
+            "Return {'argv': [...]} only; platform approval gate controls execution."
+        ),
+    }.get(wrapper_family, "context contains manifest and wrapper metadata.")
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are code_model for a generic tool authoring platform. "
+                "Return strict JSON only: {\"internal_code\":\"...python code...\"}. "
+                "Do NOT write a full adapter. "
+                "Write the actual core task logic for this tool. "
+                "The internal code must define exactly one function: "
+                "execute_task(payload: dict, context: dict) -> dict. "
+                "The platform wrapper controls run(), manifest(), main(), trial behavior, IO protocol, auth, secrets, and unsafe operations. "
+                "Do not define run/main/manifest. "
+                "Do not import requests, httpx, urllib, aiohttp, os, sys, pathlib, subprocess, socket, shutil, sqlite3 or database drivers. "
+                "Do not read environment variables. "
+                "Do not call eval/exec/compile/__import__. "
+                + context_guidance
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "wrapper_family": wrapper_family,
+                    "user_request": {
+                        "description": request.get("description"),
+                        "operation": request.get("operation"),
+                        "tool_name": request.get("tool_name"),
+                        "input_description": request.get("input_description"),
+                        "output_description": request.get("output_description"),
+                        "tool_kind": plan.get("tool_kind") or manifest.get("tool_kind"),
+                    },
+                    "manifest": manifest,
+                    "adapter_contract": contract,
+                    "sample_input": sample_input,
+                    "input_schema": manifest.get("input_schema") or {},
+                    "output_schema": manifest.get("output_schema") or {},
+                    "implementation_plan": plan.get("implementation_plan"),
+                    "task": (
+                        "Write the real core functionality in execute_task(payload, context). "
+                        "Do not merely reformat an already-perfect result. "
+                        "Use context capabilities to perform the required operation, then return a dict conforming to output_schema."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    internal_json, code_ack, code_err = await _complete_author_model(
+        "code",
+        messages,
+        reason=f"creator_tool_author_{wrapper_family}_core_logic",
+    )
+
+    if code_ack:
+        model_notes.append(f"code_model={code_ack['model']}")
+
+    if code_err:
+        warnings.append(f"code_model unavailable, used default {wrapper_family} core logic: {code_err}")
+
+    internal_code = _strip_code_fence(
+        str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
+    )
+
+    internal_errors = _core_logic_code_errors(wrapper_family, internal_code)
+    if internal_errors:
+        warnings.extend(f"{wrapper_family}_core_logic fallback: {err}" for err in internal_errors)
+        internal_code = _default_core_logic_code(wrapper_family)
+
+    return internal_code, internal_errors
+
+async def _author_wrapper_with_core_logic(
+    *,
+    wrapper_family: str,
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    contract: dict[str, Any],
+    raw_manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+    contract_registry_validation: dict[str, Any],
+    model_notes: list[str],
+    warnings: list[str],
+    live_success: bool = False,
+) -> dict[str, Any]:
+    wrapper_family = _canonical_wrapper_family(wrapper_family)
+
+    manifest = dict(raw_manifest or {})
+    manifest["wrapper_family"] = wrapper_family
+    manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
+
+    if wrapper_family == "http_api":
+        draft_contract = _confirmed_external_api_code_contract(request, plan, manifest, sample_input)
+        manifest = _normalize_external_api_manifest_for_adapter(manifest, request, plan, draft_contract)
+        manifest["wrapper_family"] = "http_api"
+        contract = _confirmed_external_api_code_contract(request, plan, manifest, sample_input)
+
+    elif wrapper_family == "managed_helper":
+        capabilities = contract.get("required_capabilities")
+        if isinstance(capabilities, list):
+            manifest["required_capabilities"] = [str(item) for item in capabilities if str(item).strip()]
+
+        helper_contract: dict[str, Any] = {}
+        optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
+        if isinstance(optional.get("helper_contract"), dict):
+            helper_contract.update(optional["helper_contract"])
+        if isinstance(manifest.get("helper_contract"), dict):
+            helper_contract.update(manifest["helper_contract"])
+        if isinstance(contract.get("helper_contract"), dict):
+            helper_contract.update(contract["helper_contract"])
+
+        helper_name = str(contract.get("helper_name") or helper_contract.get("helper_name") or "").strip()
+        if helper_name:
+            helper_contract["helper_name"] = helper_name
+        if helper_contract:
+            manifest["helper_contract"] = helper_contract
+
+    elif wrapper_family == "python_compute":
+        manifest["required_capabilities"] = (
+            contract.get("required_capabilities")
+            or manifest.get("required_capabilities")
+            or ["deterministic_execution"]
+        )
+
+    elif wrapper_family == "file_io":
+        manifest["required_capabilities"] = (
+            contract.get("required_capabilities")
+            or manifest.get("required_capabilities")
+            or ["file_output"]
+        )
+
+    elif wrapper_family == "database_query":
+        manifest["required_capabilities"] = (
+            contract.get("required_capabilities")
+            or manifest.get("required_capabilities")
+            or ["database_read"]
+        )
+
+    elif wrapper_family == "local_command":
+        manifest["required_capabilities"] = (
+            contract.get("required_capabilities")
+            or manifest.get("required_capabilities")
+            or ["local_command"]
+        )
+        manifest["safety_level"] = "high"
+        manifest["approval_status"] = manifest.get("approval_status") or "pending_review"
+
+    internal_code, internal_errors = await _author_core_logic_with_model(
+        wrapper_family=wrapper_family,
+        request=request,
+        plan=plan,
+        contract=contract,
+        manifest=manifest,
+        sample_input=sample_input,
+        model_notes=model_notes,
+        warnings=warnings,
+    )
+
+    if wrapper_family == "http_api":
+        adapter_code = _external_api_wrapper_code(contract, internal_code, manifest)
+        real_run = bool(live_success or request.get("allow_external_network"))
+
+    elif wrapper_family == "managed_helper":
+        adapter_code = _managed_helper_wrapper_code(contract, internal_code, manifest)
+        real_run = False
+
+    elif wrapper_family == "python_compute":
+        adapter_code = _python_compute_wrapper_code(contract, internal_code, manifest)
+        real_run = False
+
+    elif wrapper_family == "file_io":
+        adapter_code = _file_io_wrapper_code(contract, internal_code, manifest)
+        real_run = False
+
+    elif wrapper_family == "database_query":
+        adapter_code = _database_query_wrapper_code(contract, internal_code, manifest)
+        real_run = False
+
+    elif wrapper_family == "local_command":
+        adapter_code = _local_command_wrapper_code(contract, internal_code, manifest)
+        real_run = False
+
+    else:
+        adapter_code = generate_adapter_code(manifest)
+        real_run = False
+
+    validation = validate_tool_manifest(
+        manifest,
+        adapter_code=adapter_code,
+        sample_input=sample_input,
+        dynamic=True,
+        real_run=real_run,
+    )
+
+    static_errors = _author_adapter_static_errors(adapter_code, manifest)
+    if static_errors:
+        validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
+        validation["success"] = False
+        validation["status"] = "failed"
+
+    validation["adapter_contract"] = contract
+    validation["contract_registry_validation"] = contract_registry_validation
+    validation["internal_code_errors"] = internal_errors
+
+    if wrapper_family == "local_command":
+        validation["warnings"] = sorted(
+            set(
+                validation.get("warnings", [])
+                + [
+                    "local_command is high risk and requires human approval before real execution",
+                    "code_model may only return argv planning logic through execute_task",
+                ]
+            )
+        )
+
+    return {
+        "needs_clarification": False,
+        "questions": [],
+        "tool_kind": plan.get("tool_kind"),
+        "operation": plan.get("operation"),
+        "manifest": manifest,
+        "adapter_code": adapter_code,
+        "adapter_code_kind": "wrapper_with_model_internal_code",
+        "adapter_edit_policy": "internal_code_only" if wrapper_family != "local_command" else "internal_code_only_until_approved",
+        "model_internal_code": internal_code,
+        "sample_input": sample_input,
+        "validation": validation,
+        "snippet": None,
+        "model_notes": model_notes,
+        "warnings": warnings,
+        "requires_human_confirmation": True,
+    }
 
 def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
     cap = _capability_from_dict(manifest)
@@ -7752,107 +8403,16 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
     wrapper_family = _canonical_wrapper_family(contract.get("wrapper_family"))
 
-    if wrapper_family == "http_api":
-        draft_contract = _confirmed_external_api_code_contract(request, plan, raw_manifest, sample_input)
-        manifest = _normalize_external_api_manifest_for_adapter(raw_manifest, request, plan, draft_contract)
-        manifest["wrapper_family"] = "http_api"
-
-        contract = _confirmed_external_api_code_contract(request, plan, manifest, sample_input)
-
-        output_schema = {}
-        try:
-            cap = _capability_from_dict(manifest)
-            output_schema = cap.functions[0].output_schema if cap.functions else {}
-        except Exception:
-            output_schema = _schema_from_planner_io(manifest, input_side=False)
-
-        internal_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are code_model. Do NOT write a full adapter. "
-                    "Only write internal business logic. "
-                    "Return strict JSON only: {\"internal_code\": \"...python code...\"}. "
-                    "The internal code must define exactly: normalize_response(data: dict, payload: dict) -> dict. "
-                    "Do not import requests, httpx, urllib, os, sys, pathlib, subprocess, socket, or shutil. "
-                    "Do not read environment variables. Do not define run/main/manifest. "
-                    "Do not call external network. Do not return or log secrets."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "adapter_contract": contract,
-                        "sample_input": sample_input,
-                        "live_test_result": (
-                            request.get("live_test_result")
-                            or (plan.get("authoring_context") or {}).get("live_test_result")
-                        ),
-                        "output_schema": output_schema,
-                        "task": "Write only normalize_response(data, payload).",
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-
-        internal_json, code_ack, code_err = await _complete_author_model(
-            "code",
-            internal_messages,
-            reason="creator_tool_author_external_api_internal_logic",
-        )
-        if code_ack:
-            model_notes.append(f"code_model={code_ack['model']}")
-        if code_err:
-            warnings.append(f"code_model unavailable, used default internal normalizer: {code_err}")
-
-        internal_code = _strip_code_fence(
-            str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
-        )
-
-        internal_errors = _internal_code_errors(internal_code)
-        if internal_errors:
-            warnings.extend(f"internal_code fallback: {err}" for err in internal_errors)
-            internal_code = _default_internal_normalize_code()
-
-        adapter_code = _external_api_wrapper_code(contract, internal_code, manifest)
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
-            sample_input=sample_input,
-            dynamic=True,
-            real_run=bool(live_success or request.get("allow_external_network")),
-        )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        validation["adapter_contract"] = contract
-        validation["contract_registry_validation"] = contract_registry_validation
-        validation["internal_code_errors"] = internal_errors
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": sample_input,
-            "validation": validation,
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    if wrapper_family == "managed_helper":
-        return await _author_managed_helper_adapter(
+    if wrapper_family in {
+        "http_api",
+        "managed_helper",
+        "python_compute",
+        "file_io",
+        "database_query",
+        "local_command",
+    }:
+        return await _author_wrapper_with_core_logic(
+            wrapper_family=wrapper_family,
             request=request,
             plan=plan,
             contract=contract,
@@ -7861,160 +8421,8 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             contract_registry_validation=contract_registry_validation,
             model_notes=model_notes,
             warnings=warnings,
+            live_success=live_success,
         )
-
-    if wrapper_family == "python_compute":
-        manifest = dict(raw_manifest or {})
-        manifest["wrapper_family"] = "python_compute"
-        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
-        manifest["required_capabilities"] = (
-            contract.get("required_capabilities")
-            or manifest.get("required_capabilities")
-            or ["deterministic_execution"]
-        )
-
-        transform_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are code_model. Do NOT write a full adapter. "
-                    "Return strict JSON only: {\"internal_code\":\"...python code...\"}. "
-                    "The internal code must define exactly transform(payload: dict) -> dict. "
-                    "Do not import network, os, sys, pathlib, subprocess, socket, shutil. "
-                    "Do not define run/main/manifest."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "manifest": manifest,
-                        "sample_input": sample_input,
-                        "implementation_plan": plan.get("implementation_plan"),
-                        "code_block": code_block,
-                        "task": "Write only transform(payload).",
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-
-        internal_json, code_ack, code_err = await _complete_author_model(
-            "code",
-            transform_messages,
-            reason="creator_tool_author_python_compute_transform",
-        )
-        if code_ack:
-            model_notes.append(f"code_model={code_ack['model']}")
-        if code_err:
-            warnings.append(f"code_model unavailable, used default transform: {code_err}")
-
-        internal_code = _strip_code_fence(
-            str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
-        )
-
-        internal_errors = _transform_code_errors(internal_code)
-        if internal_errors:
-            warnings.extend(f"transform_code fallback: {err}" for err in internal_errors)
-            internal_code = _default_transform_code()
-
-        adapter_code = _python_compute_wrapper_code(contract, internal_code, manifest)
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
-            sample_input=sample_input,
-            dynamic=True,
-            real_run=False,
-        )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        validation["adapter_contract"] = contract
-        validation["contract_registry_validation"] = contract_registry_validation
-        validation["internal_code_errors"] = internal_errors
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": sample_input,
-            "validation": validation,
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    if wrapper_family in {"file_io", "database_query", "local_command"}:
-        manifest = dict(raw_manifest or {})
-        manifest["wrapper_family"] = wrapper_family
-        manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
-
-        if wrapper_family == "file_io":
-            manifest["required_capabilities"] = (
-                contract.get("required_capabilities")
-                or manifest.get("required_capabilities")
-                or ["file_output"]
-            )
-        elif wrapper_family == "database_query":
-            manifest["required_capabilities"] = (
-                contract.get("required_capabilities")
-                or manifest.get("required_capabilities")
-                or ["database_read"]
-            )
-        elif wrapper_family == "local_command":
-            manifest["approval_status"] = manifest.get("approval_status") or "pending_review"
-            manifest["safety_level"] = "high"
-
-        adapter_code = generate_adapter_code(manifest)
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
-            sample_input=sample_input,
-            dynamic=True,
-            real_run=False,
-        )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        validation["adapter_contract"] = contract
-        validation["contract_registry_validation"] = contract_registry_validation
-        validation["warnings"] = sorted(
-            set(
-                validation.get("warnings", [])
-                + [
-                    f"{wrapper_family} currently uses deterministic generic wrapper; extend with a specialized wrapper when policy is finalized."
-                ]
-            )
-        )
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": sample_input,
-            "validation": validation,
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
 
     manifest = raw_manifest
     mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
@@ -8254,171 +8662,17 @@ async def _author_managed_helper_adapter(
     model_notes: list[str],
     warnings: list[str],
 ) -> dict[str, Any]:
-    manifest = dict(raw_manifest or {})
-    manifest["wrapper_family"] = "managed_helper"
-    manifest["tool_type"] = manifest.get("tool_type") or "custom_adapter"
-
-    capabilities = contract.get("required_capabilities")
-    if not isinstance(capabilities, list):
-        capabilities = (
-            manifest.get("required_capabilities")
-            if isinstance(manifest.get("required_capabilities"), list)
-            else []
-        )
-
-    capabilities = [
-        str(item).strip()
-        for item in capabilities
-        if str(item).strip()
-    ]
-
-    if not capabilities:
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": "",
-            "sample_input": sample_input,
-            "validation": {
-                "success": False,
-                "status": "contract_validation_failed",
-                "errors": [
-                    "managed_helper requires explicit required_capabilities from the validated ToolContract"
-                ],
-                "warnings": [],
-                "contract_validation_log": plan.get("contract_validation_log") or [],
-            },
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    manifest["required_capabilities"] = capabilities
-
-    helper_contract: dict[str, Any] = {}
-    optional = manifest.get("optional") if isinstance(manifest.get("optional"), dict) else {}
-    optional_helper_contract = (
-        optional.get("helper_contract")
-        if isinstance(optional.get("helper_contract"), dict)
-        else {}
-    )
-
-    if optional_helper_contract:
-        helper_contract.update(optional_helper_contract)
-
-    if isinstance(manifest.get("helper_contract"), dict):
-        helper_contract.update(manifest["helper_contract"])
-
-    if isinstance(contract.get("helper_contract"), dict):
-        helper_contract.update(contract["helper_contract"])
-
-    helper_name = str(contract.get("helper_name") or helper_contract.get("helper_name") or "").strip()
-    if helper_name:
-        helper_contract["helper_name"] = helper_name
-
-    if helper_contract:
-        manifest["helper_contract"] = helper_contract
-
-    manifest["auth_decision"] = plan.get("auth_decision") or manifest.get("auth_decision") or {
-        "required": "no",
-        "confidence": 0.75,
-        "reason": "managed helper auth is declared by platform/helper contract",
-        "evidence": [],
-        "security_schemes": [{"type": "none"}],
-    }
-
-    helper_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are code_model. Do NOT write a full adapter. "
-                "Return strict JSON only: {\"internal_code\":\"...python code...\"}. "
-                "The internal code must define exactly "
-                "normalize_helper_result(value: object, payload: dict) -> dict. "
-                "This function receives the raw managed helper return value and must normalize it "
-                "to the manifest.output_schema. "
-                "Do not call the helper. Do not import requests, httpx, urllib, aiohttp, os, sys, "
-                "pathlib, subprocess, socket, or shutil. "
-                "Do not read environment variables. Do not define run/main/manifest."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "manifest": manifest,
-                    "adapter_contract": contract,
-                    "sample_input": sample_input,
-                    "helper_contract": manifest.get("helper_contract") or contract.get("helper_contract") or {},
-                    "output_schema": manifest.get("output_schema") or {},
-                    "task": "Write only normalize_helper_result(value, payload).",
-                },
-                ensure_ascii=False,
-            ),
-        },
-    ]
-
-    internal_json, code_ack, code_err = await _complete_author_model(
-        "code",
-        helper_messages,
-        reason="creator_tool_author_managed_helper_normalize",
-    )
-
-    if code_ack:
-        model_notes.append(f"code_model={code_ack['model']}")
-
-    if code_err:
-        warnings.append(f"code_model unavailable, used default helper normalizer: {code_err}")
-
-    internal_code = _strip_code_fence(
-        str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or "")
-    )
-
-    internal_errors = _helper_normalize_code_errors(internal_code)
-    if internal_errors:
-        warnings.extend(f"helper_normalize_code fallback: {err}" for err in internal_errors)
-        internal_code = _default_helper_normalize_code()
-
-    adapter_code = _managed_helper_wrapper_code(contract, internal_code, manifest)
-
-    validation = validate_tool_manifest(
-        manifest,
-        adapter_code=adapter_code,
+    return await _author_wrapper_with_core_logic(
+        wrapper_family="managed_helper",
+        request=request,
+        plan=plan,
+        contract=contract,
+        raw_manifest=raw_manifest,
         sample_input=sample_input,
-        dynamic=True,
-        real_run=False,
+        contract_registry_validation=contract_registry_validation,
+        model_notes=model_notes,
+        warnings=warnings,
     )
-
-    static_errors = _author_adapter_static_errors(adapter_code, manifest)
-    if static_errors:
-        validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-        validation["success"] = False
-        validation["status"] = "failed"
-
-    validation["adapter_contract"] = contract
-    validation["contract_registry_validation"] = contract_registry_validation
-    validation["internal_code_errors"] = internal_errors
-
-    return {
-        "needs_clarification": False,
-        "questions": [],
-        "tool_kind": plan.get("tool_kind"),
-        "operation": plan.get("operation"),
-        "manifest": manifest,
-        "adapter_code": adapter_code,
-        "adapter_code_kind": "wrapper_with_model_internal_code",
-        "adapter_edit_policy": "internal_code_only",
-        "model_internal_code": internal_code,
-        "sample_input": sample_input,
-        "validation": validation,
-        "snippet": None,
-        "model_notes": model_notes,
-        "warnings": warnings,
-        "requires_human_confirmation": True,
-    }
 
 def _make_snippet(
     tool: str,

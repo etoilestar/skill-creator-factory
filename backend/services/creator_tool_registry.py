@@ -12,13 +12,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, replace
 from datetime import datetime, timezone
+import subprocess
 import asyncio
 import ast
 import base64
 import importlib
 import importlib.util
 import json
-import os
+import os, sys
 import re
 import tempfile
 import urllib.error
@@ -1194,9 +1195,76 @@ _DEPENDENCY_IMPORT_NAMES = {
 }
 
 
-def _dependency_available(dependency: str) -> bool:
-    module_name = _DEPENDENCY_IMPORT_NAMES.get(dependency, dependency).replace("-", "_")
-    return importlib.util.find_spec(module_name) is not None
+def _normalize_dependency_record(dep: Any) -> dict[str, Any]:
+    if isinstance(dep, str):
+        package = dep.strip()
+        return {
+            "package": package,
+            "imports": [package.replace("-", "_")] if package else [],
+            "version": "",
+        }
+
+    if isinstance(dep, dict):
+        package = str(
+            dep.get("package")
+            or dep.get("name")
+            or dep.get("pip")
+            or ""
+        ).strip()
+
+        imports = dep.get("imports") or dep.get("import_names") or dep.get("modules") or []
+        if isinstance(imports, str):
+            imports = [imports]
+        if not isinstance(imports, list):
+            imports = []
+
+        imports = [
+            str(item).strip()
+            for item in imports
+            if str(item).strip()
+        ]
+
+        # 如果模型没给 imports，保底用 package 名的简单转换。
+        # 这不是业务词表，只是兜底；正确路径是 planner 给 imports。
+        if not imports and package:
+            imports = [package.replace("-", "_")]
+
+        return {
+            "package": package,
+            "imports": imports,
+            "version": str(dep.get("version") or "").strip(),
+        }
+
+    return {"package": "", "imports": [], "version": ""}
+
+
+def _manifest_dependency_records(manifest: dict[str, Any] | None) -> list[dict[str, Any]]:
+    manifest = manifest if isinstance(manifest, dict) else {}
+    deps = manifest.get("dependencies")
+    if not isinstance(deps, list):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for dep in deps:
+        record = _normalize_dependency_record(dep)
+        if record.get("package") or record.get("imports"):
+            records.append(record)
+
+    return records
+
+
+def _dependency_available(dependency: Any) -> bool:
+    record = _normalize_dependency_record(dependency)
+
+    imports = record.get("imports")
+    if not isinstance(imports, list) or not imports:
+        return True
+
+    for module_name in imports:
+        if importlib.util.find_spec(str(module_name)) is None:
+            return False
+
+    return True
 
 
 def _with_overrides(capability: ToolCapability) -> ToolCapability:
@@ -1464,6 +1532,100 @@ def execute_task(payload: dict, context: dict) -> dict:
     }
 '''.strip()
 
+async def _author_sample_input_with_model(
+    *,
+    request: dict[str, Any],
+    plan: dict[str, Any],
+    manifest: dict[str, Any],
+    wrapper_family: str,
+    model_notes: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    existing = request.get("sample_input")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    planned = plan.get("sample_input")
+    if isinstance(planned, dict) and planned:
+        return planned
+
+    input_schema = manifest.get("input_schema") if isinstance(manifest.get("input_schema"), dict) else {}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are sample_input_model for a generic tool authoring system. "
+                "Return strict JSON only: {\"sample_input\": {...}, \"notes\": []}. "
+                "Generate one realistic, safe, runnable test input for the current tool. "
+                "It must conform to manifest.input_schema and should exercise the core functionality. "
+                "Do not use secrets. Do not use private URLs. "
+                "For HTTP/API tools, use the user's confirmed sample/query if available. "
+                "For file/plot tools, include small synthetic data. "
+                "For ML tools such as SVM/decision tree, include a tiny synthetic dataset and labels. "
+                "For document/PDF parsing, use a placeholder local file path only if the input schema requires a file path."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "wrapper_family": wrapper_family,
+                    "user_request": {
+                        "description": request.get("description"),
+                        "operation": request.get("operation"),
+                        "tool_name": request.get("tool_name"),
+                        "input_description": request.get("input_description"),
+                        "output_description": request.get("output_description"),
+                    },
+                    "manifest": manifest,
+                    "input_schema": input_schema,
+                    "tool_kind": plan.get("tool_kind") or manifest.get("tool_kind"),
+                    "code_policy": manifest.get("code_policy") or {},
+                    "dependencies": manifest.get("dependencies") or [],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    result, ack, err = await _complete_author_model(
+        "planner",
+        messages,
+        reason="creator_tool_author_sample_input",
+    )
+
+    if ack:
+        model_notes.append(f"sample_input_model={ack['model']}")
+    if err:
+        warnings.append(f"sample_input_model unavailable, used schema fallback: {err}")
+
+    sample = result.get("sample_input") if isinstance(result, dict) else None
+    if isinstance(sample, dict) and sample:
+        return sample
+
+    props = _schema_properties(input_schema)
+    fallback: dict[str, Any] = {}
+    for key, spec in props.items():
+        spec = spec if isinstance(spec, dict) else {}
+        if "default" in spec:
+            fallback[key] = spec["default"]
+            continue
+
+        typ = str(spec.get("type") or "").lower()
+        if typ in {"number", "integer"}:
+            fallback[key] = 1
+        elif typ == "boolean":
+            fallback[key] = True
+        elif typ == "array":
+            fallback[key] = []
+        elif typ == "object":
+            fallback[key] = {}
+        else:
+            fallback[key] = "demo"
+
+    return fallback
+
 def _core_logic_policy(
     wrapper_family: str,
     contract: dict[str, Any] | None = None,
@@ -1507,9 +1669,12 @@ def _core_logic_policy(
     allowed_imports: set[str] = set(safe_stdlib_imports)
 
     # dependencies 也可以作为允许 import 的来源。
-    for dep in manifest.get("dependencies") or []:
-        if isinstance(dep, str) and dep.strip():
-            allowed_imports.add(_DEPENDENCY_IMPORT_NAMES.get(dep, dep).replace("-", "_").split(".")[0])
+    for dep in _manifest_dependency_records(manifest):
+        imports = dep.get("imports") if isinstance(dep.get("imports"), list) else []
+        for import_name in imports:
+            text = str(import_name or "").strip()
+            if text:
+                allowed_imports.add(text.replace("-", "_").split(".")[0])
 
     for source in (manifest_policy, contract_policy):
         raw = source.get("allowed_imports")
@@ -2565,71 +2730,96 @@ def _run_adapter_once(
     path: Path,
     sample_input: dict[str, Any],
     trial: bool,
+    extra_sys_path: list[str] | None = None,
 ) -> dict[str, Any]:
-    module_name = f"_custom_tool_validation_{cap.name}_{'trial' if trial else 'real'}_{abs(hash(str(path)))}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError("could not create import spec")
+    """Import and run a generated adapter once.
 
-    module = importlib.util.module_from_spec(spec)
+    extra_sys_path is used for temporary dependency installation directories
+    created during authoring validation.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"adapter file does not exist: {path}")
+
+    function_name = ""
+    if cap.functions:
+        function_name = str(cap.functions[0].function_name or "").strip()
+
+    payload = dict(sample_input or {})
 
     old_trial = os.environ.get("SKILL_TRIAL_RUN")
     old_output_dir = os.environ.get("OUTPUT_DIR")
+    old_sys_path = list(sys.path)
 
-    if trial:
-        os.environ["SKILL_TRIAL_RUN"] = "1"
-    else:
-        os.environ.pop("SKILL_TRIAL_RUN", None)
+    temp_output_dir = tempfile.TemporaryDirectory(prefix="creator_tool_output_")
 
-    with tempfile.TemporaryDirectory(prefix="creator_tool_trial_") as trial_dir:
-        os.environ["OUTPUT_DIR"] = trial_dir
-        trial_root = Path(trial_dir).resolve()
+    module_name = f"_creator_tool_validate_{_slug(cap.name)}_{abs(hash(str(path)))}"
+
+    try:
+        if trial:
+            os.environ["SKILL_TRIAL_RUN"] = "1"
+        else:
+            os.environ.pop("SKILL_TRIAL_RUN", None)
+
+        os.environ["OUTPUT_DIR"] = temp_output_dir.name
+
+        # Temporary dependency target dirs should be searched before global site-packages.
+        for item in reversed(extra_sys_path or []):
+            item = str(item or "").strip()
+            if item and item not in sys.path:
+                sys.path.insert(0, item)
+
+        # Also make the adapter directory importable for local sibling imports.
+        adapter_parent = str(path.parent.resolve())
+        if adapter_parent not in sys.path:
+            sys.path.insert(0, adapter_parent)
+
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load adapter module from {path}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
 
         try:
             spec.loader.exec_module(module)
-            fn = cap.functions[0]
-            target = getattr(module, fn.function_name)
-            if not callable(target):
-                raise TypeError(f"{fn.function_name} is not callable")
-
-            payload = sample_input or {}
-            try:
-                value = target(payload)
-            except TypeError:
-                value = target(**payload)
         finally:
-            if old_trial is None:
-                os.environ.pop("SKILL_TRIAL_RUN", None)
-            else:
-                os.environ["SKILL_TRIAL_RUN"] = old_trial
+            # Avoid stale module reuse between repair attempts.
+            sys.modules.pop(module_name, None)
 
-            if old_output_dir is None:
-                os.environ.pop("OUTPUT_DIR", None)
-            else:
-                os.environ["OUTPUT_DIR"] = old_output_dir
+        runner = getattr(module, "run", None)
+
+        if not callable(runner) and function_name:
+            candidate = getattr(module, function_name, None)
+            if callable(candidate):
+                runner = candidate
+
+        if not callable(runner):
+            raise RuntimeError("adapter must expose run(payload) or manifest function")
+
+        value = runner(payload)
 
         if not isinstance(value, dict):
-            raise TypeError("dynamic run must return a dict")
-
-        file_values: list[str] = []
-        for key in ("path", "output_path"):
-            if isinstance(value.get(key), str):
-                file_values.append(value[key])
-        for key in ("file_paths", "paths"):
-            if isinstance(value.get(key), list):
-                file_values.extend(str(item) for item in value[key] if isinstance(item, str))
-        for item in value.get("file_outputs", []) if isinstance(value.get("file_outputs"), list) else []:
-            if isinstance(item, dict) and isinstance(item.get("path"), str):
-                file_values.append(item["path"])
-
-        for file_path in file_values:
-            resolved = Path(file_path).resolve()
-            if trial_root not in resolved.parents and resolved != trial_root:
-                raise ValueError(f"dynamic run returned file outside OUTPUT_DIR: {file_path}")
-            if not resolved.exists():
-                raise ValueError(f"dynamic run returned missing file path: {file_path}")
+            value = {
+                "success": True,
+                "result": value,
+            }
 
         return value
+
+    finally:
+        if old_trial is None:
+            os.environ.pop("SKILL_TRIAL_RUN", None)
+        else:
+            os.environ["SKILL_TRIAL_RUN"] = old_trial
+
+        if old_output_dir is None:
+            os.environ.pop("OUTPUT_DIR", None)
+        else:
+            os.environ["OUTPUT_DIR"] = old_output_dir
+
+        sys.path[:] = old_sys_path
+
+        temp_output_dir.cleanup()
 
 def _declared_output_field_names(output_schema: dict[str, Any] | None, *, required_only: bool = False) -> set[str]:
     """Extract business output field names from either JSON Schema or legacy field-map schema.
@@ -2710,15 +2900,20 @@ def validate_tool_manifest(
         existing_props = _schema_props(existing_schema)
         generic_props = _schema_props(generic_schema)
 
-        # JSON Schema 形态。
         if existing_schema.get("type") == "object" or "properties" in existing_schema:
             merged_props = dict(existing_props)
             for key, value in generic_props.items():
                 merged_props.setdefault(key, value)
 
             required: list[str] = []
+
             if isinstance(existing_schema.get("required"), list):
-                required.extend(str(item) for item in existing_schema["required"] if isinstance(item, str))
+                required.extend(
+                    str(item)
+                    for item in existing_schema["required"]
+                    if isinstance(item, str)
+                )
+
             if isinstance(generic_schema.get("required"), list):
                 for item in generic_schema["required"]:
                     if isinstance(item, str) and item not in required:
@@ -2735,14 +2930,21 @@ def validate_tool_manifest(
 
             return merged_schema
 
-        # 旧 field-map 形态。
         merged = dict(existing_schema)
+
         for key, value in generic_schema.items():
-            if key in {"type", "properties", "required", "description", "title", "$schema", "additionalProperties"}:
+            if key in {
+                "type",
+                "properties",
+                "required",
+                "description",
+                "title",
+                "$schema",
+                "additionalProperties",
+            }:
                 continue
             merged.setdefault(key, value)
 
-        # 如果 generic 是 JSON Schema，需要把 properties 里的通用字段补到 field-map。
         for key, value in generic_props.items():
             merged.setdefault(key, value)
 
@@ -2758,6 +2960,7 @@ def validate_tool_manifest(
 
     if is_external_api:
         normalized_output_schema = _generic_external_api_output_schema()
+
         manifest["output_schema"] = _merge_output_schema_without_overwrite(
             manifest.get("output_schema"),
             normalized_output_schema,
@@ -2780,20 +2983,28 @@ def validate_tool_manifest(
 
     errors = _manifest_errors(manifest)
     warnings: list[str] = []
+
     cap = _capability_from_dict(manifest) if not errors else None
 
     if adapter_code:
         try:
             errors.extend(_code_security_errors(adapter_code, manifest))
         except TypeError:
-            # 兼容当前旧签名 _code_security_errors(code)。
             errors.extend(_code_security_errors(adapter_code))
 
     dynamic_result: dict[str, Any] = {"skipped": not dynamic}
     real_result: dict[str, Any] = {"skipped": not real_run}
+    dependency_result: dict[str, Any] = {
+        "success": True,
+        "skipped": True,
+        "installed": [],
+        "target_dir": "",
+        "errors": [],
+    }
 
     if cap and dynamic and not errors:
         temp_code_dir: tempfile.TemporaryDirectory[str] | None = None
+        temp_deps_dir: tempfile.TemporaryDirectory[str] | None = None
 
         try:
             if adapter_code:
@@ -2806,32 +3017,64 @@ def validate_tool_manifest(
             if not path.exists():
                 errors.append(f"adapter file does not exist: {path}")
             else:
-                try:
-                    value = _run_adapter_once(
-                        cap=cap,
-                        path=path,
-                        sample_input=sample_input or {},
-                        trial=True,
+                packages = _dependency_packages_for_install(manifest)
+                extra_sys_path: list[str] = []
+
+                if packages:
+                    temp_deps_dir = tempfile.TemporaryDirectory(prefix="creator_tool_deps_")
+                    deps_path = Path(temp_deps_dir.name)
+
+                    dependency_result = _install_dependencies_to_target(
+                        packages,
+                        deps_path,
+                        timeout_seconds=int(
+                            os.environ.get(
+                                "TOOL_AUTHOR_DEP_INSTALL_TIMEOUT_SECONDS",
+                                "180",
+                            )
+                        ),
                     )
 
-                    output_schema = cap.functions[0].output_schema if cap.functions else {}
-                    required = _declared_output_field_names(output_schema, required_only=True)
-                    missing_required = [key for key in sorted(required) if key not in value]
+                    if not dependency_result.get("success"):
+                        errors.extend(
+                            dependency_result.get("errors")
+                            or ["dependency installation failed"]
+                        )
+                    else:
+                        extra_sys_path.append(str(deps_path))
 
-                    if missing_required:
-                        errors.append(
-                            "dynamic trial did not return required output fields: "
-                            + ", ".join(missing_required)
+                if not errors:
+                    try:
+                        value = _run_adapter_once(
+                            cap=cap,
+                            path=path,
+                            sample_input=sample_input or {},
+                            trial=True,
+                            extra_sys_path=extra_sys_path,
                         )
 
-                    dynamic_result = {
-                        "skipped": False,
-                        "return_keys": sorted(value.keys()),
-                        "preview": _normalized_preview(value),
-                    }
+                        output_schema = cap.functions[0].output_schema if cap.functions else {}
+                        required = _declared_output_field_names(output_schema, required_only=True)
+                        missing_required = [
+                            key
+                            for key in sorted(required)
+                            if key not in value
+                        ]
 
-                except Exception as exc:
-                    errors.append(f"dynamic trial failed: {exc}")
+                        if missing_required:
+                            errors.append(
+                                "dynamic trial did not return required output fields: "
+                                + ", ".join(missing_required)
+                            )
+
+                        dynamic_result = {
+                            "skipped": False,
+                            "return_keys": sorted(value.keys()),
+                            "preview": _normalized_preview(value),
+                        }
+
+                    except Exception as exc:
+                        errors.append(f"dynamic trial failed: {exc}")
 
                 if real_run and not errors:
                     try:
@@ -2840,17 +3083,22 @@ def validate_tool_manifest(
                             path=path,
                             sample_input=sample_input or {},
                             trial=False,
+                            extra_sys_path=extra_sys_path,
                         )
 
                         if value.get("success") is False:
                             errors.append(
-                                f"real run returned success=false: "
-                                f"{value.get('error') or value.get('message') or value}"
+                                "real run returned success=false: "
+                                + str(value.get("error") or value.get("message") or value)
                             )
 
                         output_schema = cap.functions[0].output_schema if cap.functions else {}
                         required = _declared_output_field_names(output_schema, required_only=True)
-                        missing_required = [key for key in sorted(required) if key not in value]
+                        missing_required = [
+                            key
+                            for key in sorted(required)
+                            if key not in value
+                        ]
 
                         if missing_required:
                             errors.append(
@@ -2873,6 +3121,9 @@ def validate_tool_manifest(
             if temp_code_dir is not None:
                 temp_code_dir.cleanup()
 
+            if temp_deps_dir is not None:
+                temp_deps_dir.cleanup()
+
     snippet_validations = [
         validate_tool_snippet(cap, snippet)
         for snippet in snippets_for_tool(cap)
@@ -2887,6 +3138,7 @@ def validate_tool_manifest(
         "warnings": sorted(set(warnings)),
         "dynamic_trial": dynamic_result,
         "real_run": real_result,
+        "dependency_environment": dependency_result,
         "tool_card_preview": function_cards_for_tool(cap) if cap else [],
         "snippet_preview": [
             format_tool_snippet(cap, snippet)
@@ -8523,7 +8775,11 @@ async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: 
     question = judge.get("question") or judge.get("clarification_question") or {"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}
     return _safe_clarification_questions([question], [])
 
-async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+async def _run_planner(
+    request: dict[str, Any],
+    model_notes: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
     request = _apply_clarification_answers(request)
 
     planner_payload = {
@@ -8578,6 +8834,7 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "For managed_helper, helper_contract.helper_name must be one of helper_imports exposed by the selected capabilities. "
                 "For http_api, use a capability whose registry.allowed_wrapper is http_api. "
                 "For pure local deterministic computation, use a capability whose registry.allowed_wrapper is python_compute. "
+                "For file-producing tools such as charts, reports, generated images, transformed files, choose file_io or managed_helper according to capability. "
 
                 "Authentication is independent from wrapper_family/tool_kind/network usage. "
                 "Represent auth only through auth_decision, security_schemes, required_secrets, config.auth_type, or config.secret_env. "
@@ -8593,11 +8850,39 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "requires_config should be true only when connection/auth/secret configuration is missing. "
                 "Do not set requires_config=true for runtime inputs such as target_url, content_selector, query, prompt, timeout, parser, user_agent, headers, payload. "
 
+                "If third-party Python packages are needed, declare them in manifest.dependencies as objects, not as backend hard-coded mappings. "
+                "Each dependency object must have this shape: "
+                "{\"package\": \"pip-package-name\", \"imports\": [\"python_import_name\"], \"version\": \"optional-version-spec\"}. "
+                "Examples: "
+                "{\"package\": \"scikit-learn\", \"imports\": [\"sklearn\"]}; "
+                "{\"package\": \"matplotlib\", \"imports\": [\"matplotlib\"]}; "
+                "{\"package\": \"beautifulsoup4\", \"imports\": [\"bs4\"]}. "
+                "Also add the same import names to manifest.code_policy.allowed_imports. "
+                "Do not rely on backend package/import-name vocabularies. "
+                "Do not ask the user to install dependencies manually during planning; declare them in manifest.dependencies. "
+
+                "For ML tools such as SVM, logistic regression, k-means, decision tree or random forest, do not create a new wrapper. "
+                "Use python_compute with deterministic_execution, declare dependencies such as scikit-learn/numpy when needed, "
+                "and let code_model implement execute_task(payload, context). "
+
+                "For plotting/chart tools such as scatter plot, line chart or histogram, do not create a new wrapper. "
+                "Use file_io with file_output, declare dependencies such as matplotlib/numpy when needed, "
+                "and let code_model implement execute_task(payload, context) using context['safe_output_path']. "
+
+                "For HTTP/API search tools, do not create a provider-specific wrapper. "
+                "Use http_api with http_request, and let code_model implement execute_task(payload, context) using context['http_request']. "
+
+                "For document/PDF/image helpers already exposed by capabilities, prefer managed_helper and helper_contract. "
+                "Do not generate backend templates for a specific business example. "
+
                 "clarification_questions ask only about real business capability ambiguity. "
                 "Do not ask for endpoint, auth method, token, secret, headers/body/query templates, schemas, sample input, or live-test permission as clarification questions."
             ),
         },
-        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+        {
+            "role": "user",
+            "content": json.dumps(planner_payload, ensure_ascii=False),
+        },
     ]
 
     model_plan, ack, err = await _complete_author_model(
@@ -8629,7 +8914,12 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
         and normalized.get("tool_kind") == "external_api"
         and not normalized.get("clarification_questions")
     ):
-        judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
+        judged_questions = await _run_capability_ambiguity_judge(
+            request,
+            model_notes,
+            warnings,
+        )
+
         if judged_questions:
             normalized["clarification_questions"] = judged_questions
             normalized["questions"] = judged_questions
@@ -8637,7 +8927,82 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
             normalized["ready_for_code_generation"] = False
 
     model_notes.extend(normalized.get("model_notes") or [])
+
     return normalized
+
+def _dependency_packages_for_install(manifest: dict[str, Any] | None) -> list[str]:
+    packages: list[str] = []
+    for record in _manifest_dependency_records(manifest):
+        package = str(record.get("package") or "").strip()
+        version = str(record.get("version") or "").strip()
+        if not package:
+            continue
+        spec = f"{package}{version}" if version and version.startswith(("==", ">=", "<=", "~=", ">", "<")) else package
+        if spec not in packages:
+            packages.append(spec)
+    return packages
+
+
+def _install_dependencies_to_target(
+    packages: list[str],
+    target_dir: Path,
+    *,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    if not packages:
+        return {
+            "success": True,
+            "installed": [],
+            "target_dir": str(target_dir),
+            "errors": [],
+        }
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--target",
+        str(target_dir),
+        *packages,
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "installed": [],
+            "target_dir": str(target_dir),
+            "errors": [str(exc)],
+        }
+
+    if completed.returncode != 0:
+        return {
+            "success": False,
+            "installed": [],
+            "target_dir": str(target_dir),
+            "errors": [
+                completed.stderr[-4000:] or completed.stdout[-4000:] or f"pip exited {completed.returncode}"
+            ],
+        }
+
+    return {
+        "success": True,
+        "installed": packages,
+        "target_dir": str(target_dir),
+        "errors": [],
+    }
 
 async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     """Generic Tool Authoring pipeline driven by explicit actions."""
@@ -8654,8 +9019,15 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
     model_notes: list[str] = []
     warnings: list[str] = []
 
-    if action not in {"clarify", "configure", "live_test", "generate", "finalize"}:
-        raise ValueError("action must be one of clarify/configure/live_test/generate/finalize")
+    if action not in {"clarify", "configure", "live_test", "generate", "finalize", "revise"}:
+        raise ValueError("action must be one of clarify/configure/live_test/generate/finalize/revise")
+
+    if action == "revise":
+        return await _revise_adapter_and_snippet_with_feedback(
+            request,
+            model_notes=model_notes,
+            warnings=warnings,
+        )
 
     if action == "live_test":
         result = live_test_tool(request)
@@ -8790,10 +9162,19 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
     raw_manifest = plan.get("manifest") or raw_manifest
 
-    sample_input = (
-        request.get("sample_input")
-        if isinstance(request.get("sample_input"), dict) and request.get("sample_input")
-        else plan.get("sample_input") or sample_input
+    wrapper_for_sample = _canonical_wrapper_family(
+        (plan.get("adapter_contract") or {}).get("wrapper_family")
+        if isinstance(plan.get("adapter_contract"), dict)
+        else plan.get("wrapper_family")
+    )
+
+    sample_input = await _author_sample_input_with_model(
+        request=request,
+        plan=plan,
+        manifest=raw_manifest,
+        wrapper_family=wrapper_for_sample,
+        model_notes=model_notes,
+        warnings=warnings,
     )
 
     contract = plan.get("adapter_contract")
@@ -9001,6 +9382,220 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
         "sample_input": sample_input,
         "validation": validation,
         "snippet": None,
+        "model_notes": model_notes,
+        "warnings": warnings,
+        "requires_human_confirmation": True,
+    }
+
+def _extract_model_internal_code(adapter_code: str) -> str:
+    start = "# === MODEL_INTERNAL_CODE_START ==="
+    end = "# === MODEL_INTERNAL_CODE_END ==="
+
+    code = str(adapter_code or "")
+    if start not in code or end not in code:
+        return ""
+
+    try:
+        return code.split(start, 1)[1].split(end, 1)[0].strip()
+    except Exception:
+        return ""
+
+
+def _replace_model_internal_code(adapter_code: str, internal_code: str) -> str:
+    start = "# === MODEL_INTERNAL_CODE_START ==="
+    end = "# === MODEL_INTERNAL_CODE_END ==="
+
+    code = str(adapter_code or "")
+    internal = _strip_code_fence(str(internal_code or "")).strip()
+
+    if start not in code or end not in code:
+        return code
+
+    before, rest = code.split(start, 1)
+    _old, after = rest.split(end, 1)
+
+    return before.rstrip() + "\n" + start + "\n" + internal + "\n" + end + after
+
+
+async def _revise_adapter_and_snippet_with_feedback(
+    request: dict[str, Any],
+    *,
+    model_notes: list[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
+    adapter_code = str(request.get("adapter_code") or request.get("code_block") or "")
+    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+    validation = request.get("validation") if isinstance(request.get("validation"), dict) else {}
+
+    feedback = str(
+        request.get("human_feedback")
+        or request.get("review_feedback")
+        or request.get("feedback")
+        or ""
+    ).strip()
+
+    snippet = request.get("snippet") if isinstance(request.get("snippet"), dict) else None
+    wrapper_family = _canonical_wrapper_family(
+        request.get("wrapper_family")
+        or manifest.get("wrapper_family")
+        or ""
+    )
+
+    current_internal = _extract_model_internal_code(adapter_code)
+
+    if not feedback:
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": sample_input,
+            "validation": {
+                "success": False,
+                "status": "missing_human_feedback",
+                "errors": ["human_feedback is required for action=revise"],
+                "warnings": [],
+            },
+            "snippet": snippet,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    if not current_internal:
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "sample_input": sample_input,
+            "validation": {
+                "success": False,
+                "status": "not_revisable",
+                "errors": ["adapter_code has no MODEL_INTERNAL_CODE_START/END block"],
+                "warnings": [],
+            },
+            "snippet": snippet,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    policy = _core_logic_policy(wrapper_family, manifest=manifest)
+    allowed_imports = sorted(policy.get("allowed_imports") or [])
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are code_model revising a generated tool after human testing. "
+                "Return strict JSON only: {\"internal_code\":\"...\", \"snippet\": {...}, \"notes\": []}. "
+                "Revise only execute_task(payload, context). Do not write a full adapter. "
+                "Preserve the platform wrapper protocol. "
+                "Use the human feedback and validation result to fix the core logic. "
+                "Allowed imports are: "
+                + (", ".join(allowed_imports) if allowed_imports else "(none)")
+                + ". Do not import anything else."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "wrapper_family": wrapper_family,
+                    "manifest": manifest,
+                    "sample_input": sample_input,
+                    "current_internal_code": current_internal,
+                    "current_snippet": snippet,
+                    "validation": validation,
+                    "human_feedback": feedback,
+                    "task": (
+                        "Revise execute_task(payload, context) and revise snippet if needed. "
+                        "Do not change wrapper code."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+    result, ack, err = await _complete_author_model(
+        "code",
+        messages,
+        reason="creator_tool_author_revise_from_human_feedback",
+    )
+
+    if ack:
+        model_notes.append(f"revise_code_model={ack['model']}")
+
+    if err:
+        warnings.append(f"revise code_model unavailable: {err}")
+        result = {}
+
+    revised_internal = _strip_code_fence(
+        str((result or {}).get("internal_code") or (result or {}).get("code") or "")
+    )
+
+    internal_errors = _core_logic_code_errors(
+        wrapper_family,
+        revised_internal,
+        manifest=manifest,
+    )
+
+    if internal_errors:
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+            "adapter_code": adapter_code,
+            "model_internal_code": current_internal,
+            "sample_input": sample_input,
+            "validation": {
+                "success": False,
+                "status": "revision_failed_static_check",
+                "errors": internal_errors,
+                "warnings": [],
+            },
+            "snippet": snippet,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+        }
+
+    revised_adapter = _replace_model_internal_code(adapter_code, revised_internal)
+
+    revised_snippet = result.get("snippet") if isinstance(result.get("snippet"), dict) else snippet
+
+    revised_validation = validate_tool_manifest(
+        manifest,
+        adapter_code=revised_adapter,
+        sample_input=sample_input,
+        dynamic=True,
+        real_run=bool(request.get("allow_external_network")),
+    )
+
+    if revised_snippet:
+        snippet_validation = _validate_author_snippet(revised_snippet, manifest)
+        revised_validation["snippet_validation"] = snippet_validation
+        if not snippet_validation.get("success"):
+            revised_validation["success"] = False
+            revised_validation["status"] = "failed"
+            revised_validation["errors"] = sorted(
+                set(revised_validation.get("errors", []) + snippet_validation.get("errors", []))
+            )
+
+    return {
+        "needs_clarification": False,
+        "questions": [],
+        "manifest": manifest,
+        "adapter_code": revised_adapter,
+        "adapter_code_kind": "wrapper_with_model_internal_code",
+        "adapter_edit_policy": "internal_code_only",
+        "model_internal_code": revised_internal,
+        "sample_input": sample_input,
+        "validation": revised_validation,
+        "snippet": revised_snippet,
         "model_notes": model_notes,
         "warnings": warnings,
         "requires_human_confirmation": True,

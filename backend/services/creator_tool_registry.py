@@ -6023,7 +6023,7 @@ if __name__ == "__main__":
 
 
 def _author_adapter_static_errors(code: str, manifest: dict[str, Any]) -> list[str]:
-    errors = _code_security_errors(code)
+    errors = _code_security_errors(code, manifest)
     try:
         tree = ast.parse(code or "")
     except SyntaxError:
@@ -8932,16 +8932,27 @@ async def _run_planner(
 
 def _dependency_packages_for_install(manifest: dict[str, Any] | None) -> list[str]:
     packages: list[str] = []
+
     for record in _manifest_dependency_records(manifest):
         package = str(record.get("package") or "").strip()
         version = str(record.get("version") or "").strip()
+
         if not package:
             continue
-        spec = f"{package}{version}" if version and version.startswith(("==", ">=", "<=", "~=", ">", "<")) else package
+
+        if _dependency_available(record):
+            continue
+
+        spec = (
+            f"{package}{version}"
+            if version and version.startswith(("==", ">=", "<=", "~=", ">", "<", "!="))
+            else package
+        )
+
         if spec not in packages:
             packages.append(spec)
-    return packages
 
+    return packages
 
 def _install_dependencies_to_target(
     packages: list[str],

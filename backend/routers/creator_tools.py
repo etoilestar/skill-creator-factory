@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from ..services.creator_tool_registry import (
     RESOURCE_ROLES,
@@ -98,33 +98,80 @@ class ToolConfigSaveRequest(BaseModel):
 
 
 class ToolAuthorRequest(BaseModel):
+    # Creator authoring 是通用协议，payload 会随阶段扩展。
+    # 必须允许额外字段透传，否则 runtime_code/script_code 等字段会被 model_dump 过滤。
+    model_config = ConfigDict(extra="allow")
+
+    # Step 1 / planner input
     description: str = ""
     tool_name: str = ""
     tool_type: str = "python_helper"
-    code_block: str | None = None
-    adapter_code: str | None = None
     input_description: str = ""
     output_description: str = ""
-    manifest: dict[str, Any] | None = None
-    sample_input: dict[str, Any] = Field(default_factory=dict)
     allowed_roles: list[str] = Field(default_factory=list)
     needs_secret: bool = False
     needs_external_network: bool = False
     generates_file: bool = False
     high_risk: bool = False
-    validation: dict[str, Any] | None = None
     stage: str | None = None
-    action: Literal["clarify", "configure", "live_test", "generate", "finalize", "revise"] = "clarify"
-    clarification_answers: list[dict[str, str]] = Field(default_factory=list)
-    tool_kind: str | None = None
-    operation: str | None = None
+    action: Literal[
+        "clarify",
+        "configure",
+        "live_test",
+        "generate",
+        "finalize",
+        "revise",
+        "trial_run",
+        "summarize",
+    ] = "clarify"
+
+    # Reference / optional user code
+    code_block: str | None = None
+    reference_code: str | None = None
+    reference_snippet: str | None = None
+
+    # Manifest / sample / config
+    manifest: dict[str, Any] | None = None
+    sample_input: dict[str, Any] = Field(default_factory=dict)
+    validation: dict[str, Any] | None = None
+    trial_run_result: dict[str, Any] | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     live_test_result: dict[str, Any] | None = None
     allow_external_network: bool = False
     authoring_context: dict[str, Any] = Field(default_factory=dict)
+    auth_override: dict[str, Any] | None = None
+
+    # Clarification
+    clarification_answers: list[dict[str, str]] = Field(default_factory=list)
+
+    # Tool metadata
+    tool_kind: str | None = None
+    operation: str | None = None
     wrapper_family: str | None = None
     revision_target: str | None = None
+
+    # Display code: 主窗格展示，不作为执行源
+    adapter_code: str | None = None
+    display_code: str | None = None
+    public_api_code: str | None = None
+
+    # Runtime code: 唯一完整执行源
+    runtime_code: str | None = None
+    full_adapter_code: str | None = None
+    internal_code: str | None = None
+    script_code: str | None = None
+
+    # Human feedback
     human_feedback: str | None = None
+    review_feedback: str | None = None
+    feedback: str | None = None
+
+    # Debug / summary context
+    debug_sections: list[dict[str, Any]] = Field(default_factory=list)
+    collapsible_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    call_chain: list[Any] = Field(default_factory=list)
+    tool_contract: dict[str, Any] | None = None
+    tool_summary: dict[str, Any] | None = None
     snippet: dict[str, Any] | None = None
 
 

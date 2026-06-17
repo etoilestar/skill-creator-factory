@@ -68,55 +68,31 @@
       "updated_at": "2026-06-13T12:46:30.777356+00:00"
     },
     "default": {
+      "auth_override": {},
       "config": {
-        "auth_header_name": "${ENV:TOOLCFG_DEFAULT_AUTH_HEADER}",
+        "auth_header_name": "X-API-KEY",
         "auth_placement": "header",
-        "auth_query_param": "${ENV:TOOLCFG_DEFAULT_AUTH_QUERY_PARAM}",
+        "auth_query_param": "api_key",
         "auth_type": "none",
-        "base_url": "${ENV:TOOLCFG_DEFAULT_BASE_URL}",
-        "headers_template_env": "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON",
-        "json_body_template_env": "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON",
-        "method": "${ENV:TOOLCFG_DEFAULT_METHOD}",
-        "original_secret_env": "",
-        "platform_env_prefix": "TOOLCFG_DEFAULT",
-        "query_template_env": "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON",
-        "secret_env": ""
+        "method": "GET",
+        "query_template": {
+          "extract_strategy": "auto",
+          "output_format": "text",
+          "timeout": 15,
+          "url": "https://example.com"
+        }
       },
-      "config_refs": {
-        "auth_header_name": "${ENV:TOOLCFG_DEFAULT_AUTH_HEADER}",
-        "auth_query_param": "${ENV:TOOLCFG_DEFAULT_AUTH_QUERY_PARAM}",
-        "base_url": "${ENV:TOOLCFG_DEFAULT_BASE_URL}",
-        "headers_template": "${ENV:TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON}",
-        "json_body_template": "${ENV:TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON}",
-        "method": "${ENV:TOOLCFG_DEFAULT_METHOD}",
-        "query_template": "${ENV:TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON}"
-      },
-      "configured_env": [
-        "TOOLCFG_DEFAULT_AUTH_HEADER",
-        "TOOLCFG_DEFAULT_AUTH_QUERY_PARAM",
-        "TOOLCFG_DEFAULT_BASE_URL",
-        "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON",
-        "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON",
-        "TOOLCFG_DEFAULT_METHOD",
-        "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON"
-      ],
+      "config_refs": {},
+      "configured_env": [],
       "configured_secrets": [],
-      "platform_env_prefix": "TOOLCFG_DEFAULT",
-      "raw_values": {
-        "TOOLCFG_DEFAULT_AUTH_HEADER": "X-API-KEY",
-        "TOOLCFG_DEFAULT_AUTH_QUERY_PARAM": "api_key",
-        "TOOLCFG_DEFAULT_BASE_URL": "https://api.serper.com/v1/search",
-        "TOOLCFG_DEFAULT_BODY_TEMPLATE_JSON": "{}",
-        "TOOLCFG_DEFAULT_HEADERS_TEMPLATE_JSON": "{}",
-        "TOOLCFG_DEFAULT_METHOD": "GET",
-        "TOOLCFG_DEFAULT_QUERY_TEMPLATE_JSON": "{\"query\": \"测试内容\"}",
-        "TOOLCFG_DEFAULT_SECRET": "87a99224b9c866422f4333a985ca3b4fa67ae0e5"
-      },
       "sample_input": {
-        "query": "测试内容"
+        "extract_strategy": "auto",
+        "output_format": "text",
+        "timeout": 15,
+        "url": "https://example.com"
       },
-      "tool_name": "default",
-      "updated_at": "2026-06-15T06:50:53.070686+00:00"
+      "tool_name": "web_content_scraper",
+      "updated_at": "2026-06-16T10:00:59.737128+00:00"
     },
     "https_google_serper_dev_search": {
       "config": {
@@ -254,6 +230,140 @@
       "tool_name": "search",
       "updated_at": "2026-06-13T15:48:24.422576+00:00"
     },
+    "serper": {
+      "auth_override": {
+        "mode": "auto",
+        "reason": "",
+        "source": "user",
+        "updated_at": ""
+      },
+      "config": {
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "none",
+        "method": "GET",
+        "query_template": {
+          "num_results": 5,
+          "query": "人工智能最新进展",
+          "search_type": "news"
+        }
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [],
+      "sample_input": {
+        "num_results": 5,
+        "query": "人工智能最新进展",
+        "search_type": "news"
+      },
+      "tool_name": "serper_search",
+      "updated_at": "2026-06-17T06:27:59.351335+00:00"
+    },
+    "svm": {
+      "auth_override": {
+        "mode": "auto",
+        "reason": "",
+        "source": "user",
+        "updated_at": ""
+      },
+      "config": {
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "none",
+        "method": "GET",
+        "query_template": {
+          "C": 1,
+          "data": [
+            [
+              1,
+              2
+            ],
+            [
+              2,
+              3
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              4,
+              2
+            ]
+          ],
+          "degree": 3,
+          "gamma": "scale",
+          "kernel": "rbf",
+          "labels": [
+            0,
+            0,
+            1,
+            1
+          ],
+          "normalize": true,
+          "output_metrics": true,
+          "test_data": [
+            [
+              2.5,
+              2.5
+            ],
+            [
+              3.5,
+              1.5
+            ]
+          ]
+        }
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [],
+      "sample_input": {
+        "C": 1,
+        "data": [
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            4,
+            2
+          ]
+        ],
+        "degree": 3,
+        "gamma": "scale",
+        "kernel": "rbf",
+        "labels": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "normalize": true,
+        "output_metrics": true,
+        "test_data": [
+          [
+            2.5,
+            2.5
+          ],
+          [
+            3.5,
+            1.5
+          ]
+        ]
+      },
+      "tool_name": "svm_tool",
+      "updated_at": "2026-06-17T03:04:37.097224+00:00"
+    },
     "true": {
       "config": {
         "auth": {
@@ -386,6 +496,6 @@
       "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-06-15T06:50:53.076686+00:00",
+  "updated_at": "2026-06-17T06:27:59.357202+00:00",
   "version": 1
 }

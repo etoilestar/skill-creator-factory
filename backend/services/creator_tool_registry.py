@@ -1,512 +1,37 @@
-"""Creator tool capability registry.
+"""Single-runtime Creator tool registry.
 
-This module is the single source of truth for Creator-facing tool metadata
-and default role mappings.  The sandbox/runtime execution path is kept separate:
-this registry describes what Creator may plan, prompt and expose through
-management APIs.  Runtime helpers and deep source validators are intentionally
-implemented in follow-up modules; tool status reports whether registered helper
-names are exported by ``backend.services.skill_runtime``.
+Complete generic backend replacement for Creator tool authoring.
+
+Design:
+- exactly one runtime: python_script
+- step 1 receives user requirements and optional reference code
+- step 2 planner asks clarifying questions, decides auth, and stores authorization config when provided
+- step 3 coder model writes the whole script
+- step 4 backend creates a temporary environment, runs the script, and supports human feedback repair
+- step 5 model summarizes reusable snippet + direct/indirect usage + IO contract for sandbox/skill creator
+- backend never adds tool-specific business rules; it only enforces generic protocol, auth, dependencies, and IO schema
+- no http_api/managed_helper/file_io/python_compute/database_query/local_command wrapper branches
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, replace
-from datetime import datetime, timezone
-import asyncio
 import ast
-import base64
-import importlib
+import asyncio
 import importlib.util
+import importlib.metadata
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
+from dataclasses import asdict, dataclass, field, fields as dataclasses_fields, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
-
-
-
-_TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
-_TOOL_AUTHORING_CONFIG_LOADED = False
-
-
-def _tool_authoring_config_store_path() -> Path:
-    raw = os.environ.get("TOOL_AUTHORING_CONFIG_STORE_PATH", "").strip()
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return (Path(__file__).resolve().parents[1] / "config" / "tool_authoring_configs.json").resolve()
-
-
-def _load_tool_authoring_config_store_from_disk() -> None:
-    """Load saved authoring configs and restore env values.
-
-    This intentionally persists plaintext local dev secrets because custom tools
-    need to keep working after container restart. For production, replace this
-    with KMS/Vault/DB encrypted secret storage.
-    """
-    global _TOOL_AUTHORING_CONFIG_LOADED
-    if _TOOL_AUTHORING_CONFIG_LOADED:
-        return
-
-    _TOOL_AUTHORING_CONFIG_LOADED = True
-    path = _tool_authoring_config_store_path()
-    if not path.exists():
-        return
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-
-    sessions = payload.get("sessions") if isinstance(payload, dict) else {}
-    if not isinstance(sessions, dict):
-        return
-
-    for session_id, record in sessions.items():
-        if not isinstance(record, dict):
-            continue
-
-        key = _tool_config_session_id({"session_id": session_id})
-        _TOOL_AUTHORING_CONFIG_STORE[key] = record
-
-        raw_values = record.get("raw_values") if isinstance(record.get("raw_values"), dict) else {}
-        for env_name, value in raw_values.items():
-            if env_name and value not in (None, ""):
-                os.environ[str(env_name)] = str(value)
-
-
-def _persist_tool_authoring_config_store_to_disk() -> None:
-    path = _tool_authoring_config_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "version": 1,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "sessions": _TOOL_AUTHORING_CONFIG_STORE,
-    }
-
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
-
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-
-
-def _restore_env_from_authoring_record(record: dict[str, Any] | None) -> None:
-    if not isinstance(record, dict):
-        return
-    raw_values = record.get("raw_values") if isinstance(record.get("raw_values"), dict) else {}
-    for env_name, value in raw_values.items():
-        if env_name and value not in (None, ""):
-            os.environ[str(env_name)] = str(value)
-_SENSITIVE_CONFIG_KEYS = ("api_key", "apikey", "token", "password", "secret", "authorization", "credential")
-
-
-def _tool_config_session_id(payload: dict[str, Any] | None = None) -> str:
-    payload = payload or {}
-    seed = str(payload.get("session_id") or payload.get("tool_name") or payload.get("operation") or payload.get("description") or "default")
-    slug = _slug(seed) if "_slug" in globals() else re.sub(r"[^a-z0-9]+", "_", seed.lower()).strip("_")
-    return slug or "default"
-
-
-def _env_name_for_tool_config(tool_name: str, key: str, *, secret: bool = False) -> str:
-    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper() or "TOOL"
-    suffix = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper() or ("SECRET" if secret else "CONFIG")
-    if secret and not any(token in suffix for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-        suffix = f"{suffix}_SECRET"
-    return f"{prefix}_{suffix}"
-
-def _tool_platform_env_prefix(tool_name: str) -> str:
-    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "TOOL")).strip("_").upper()
-    return f"TOOLCFG_{prefix or 'TOOL'}"
-
-
-def _tool_platform_envs(tool_name: str) -> dict[str, str]:
-    prefix = _tool_platform_env_prefix(tool_name)
-    return {
-        "prefix": prefix,
-        "base_url": f"{prefix}_BASE_URL",
-        "method": f"{prefix}_METHOD",
-        "secret": f"{prefix}_SECRET",
-        "auth_header": f"{prefix}_AUTH_HEADER",
-        "auth_query_param": f"{prefix}_AUTH_QUERY_PARAM",
-        "body_template": f"{prefix}_BODY_TEMPLATE_JSON",
-        "query_template": f"{prefix}_QUERY_TEMPLATE_JSON",
-        "headers_template": f"{prefix}_HEADERS_TEMPLATE_JSON",
-    }
-
-def _tool_platform_envs_from_prefix(prefix: str) -> dict[str, str]:
-    prefix = str(prefix or "").strip()
-    if not prefix:
-        prefix = "TOOLCFG_TOOL"
-    return {
-        "prefix": prefix,
-        "base_url": f"{prefix}_BASE_URL",
-        "method": f"{prefix}_METHOD",
-        "secret": f"{prefix}_SECRET",
-        "auth_header": f"{prefix}_AUTH_HEADER",
-        "auth_query_param": f"{prefix}_AUTH_QUERY_PARAM",
-        "body_template": f"{prefix}_BODY_TEMPLATE_JSON",
-        "query_template": f"{prefix}_QUERY_TEMPLATE_JSON",
-        "headers_template": f"{prefix}_HEADERS_TEMPLATE_JSON",
-    }
-
-
-def _env_ref_name(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    match = _ENV_REF_RE.fullmatch(value.strip())
-    return match.group(1) if match else ""
-
-
-def _resolve_env_ref_or_value(value: Any, default: str = "") -> str:
-    ref = _env_ref_name(value)
-    if ref:
-        return os.environ.get(ref, default)
-    if value in (None, "", {}, []):
-        return default
-    return str(value)
-
-
-def _find_saved_authoring_record_for_request(
-    request: dict[str, Any],
-    manifest: dict[str, Any] | None = None,
-    plan: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Best-effort single-user lookup for saved authoring config.
-
-    This fixes prefix drift between save-time tool_name and generate-time manifest.name.
-    """
-    _load_tool_authoring_config_store_from_disk()
-
-    manifest = manifest or {}
-    plan = plan or {}
-
-    candidates: list[str] = []
-    for value in (
-        request.get("session_id"),
-        request.get("tool_name"),
-        request.get("operation"),
-        manifest.get("name"),
-        manifest.get("display_name"),
-        plan.get("operation"),
-    ):
-        if value:
-            candidates.append(_tool_config_session_id({"session_id": str(value)}))
-            candidates.append(_tool_config_session_id({"tool_name": str(value)}))
-
-    for key in candidates:
-        record = _TOOL_AUTHORING_CONFIG_STORE.get(key)
-        if isinstance(record, dict):
-            _restore_env_from_authoring_record(record)
-            return record
-
-    names = {
-        str(item or "").strip()
-        for item in (
-            request.get("tool_name"),
-            request.get("operation"),
-            manifest.get("name"),
-            manifest.get("display_name"),
-            plan.get("operation"),
-        )
-        if str(item or "").strip()
-    }
-
-    for record in _TOOL_AUTHORING_CONFIG_STORE.values():
-        if not isinstance(record, dict):
-            continue
-        stored_tool_name = str(record.get("tool_name") or "").strip()
-        if stored_tool_name and stored_tool_name in names:
-            _restore_env_from_authoring_record(record)
-            return record
-
-    # 单用户最小策略：如果只有一个已保存配置，直接用它，避免 tool_name/manifest.name 漂移。
-    records = [item for item in _TOOL_AUTHORING_CONFIG_STORE.values() if isinstance(item, dict)]
-    if len(records) == 1:
-        _restore_env_from_authoring_record(records[0])
-        return records[0]
-
-    return {}
-
-
-def _json_env(value: Any) -> str:
-    return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
-
-
-def _load_json_env(env_name: str, default: Any = None) -> Any:
-    raw = os.environ.get(env_name, "")
-    if not raw:
-        return {} if default is None else default
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {} if default is None else default
-
-def _is_sensitive_config_key(key: str) -> bool:
-    lowered = (key or "").lower()
-    return any(token in lowered for token in _SENSITIVE_CONFIG_KEYS)
-
-
-def _build_saved_auth_config(data: dict[str, Any], raw_config: dict[str, Any], auth_type: str, secret_env: str) -> dict[str, Any]:
-    if auth_type in {"", "none", "no_auth", "anonymous"} or not secret_env:
-        return {}
-    existing = raw_config.get("auth") if isinstance(raw_config.get("auth"), dict) else {}
-    normalized_type = "token" if auth_type in {"token", "bearer"} else "api_key" if auth_type in {"api_key", "key"} else auth_type
-    placement = str(data.get("auth_placement") or raw_config.get("auth_placement") or existing.get("placement") or "").strip().lower()
-    if normalized_type == "token":
-        placement = placement or "bearer"
-    elif normalized_type == "api_key":
-        placement = placement or "header"
-    elif normalized_type == "basic":
-        placement = placement or "header"
-    auth: dict[str, Any] = {"type": normalized_type, "env": secret_env, "placement": placement}
-    header_name = str(data.get("auth_header_name") or raw_config.get("auth_header_name") or existing.get("header_name") or "").strip()
-    query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or existing.get("query_param") or "").strip()
-    if normalized_type == "api_key":
-        if placement == "query":
-            auth["query_param"] = query_param or "api_key"
-        elif placement == "bearer":
-            auth["header_name"] = "Authorization"
-            auth["scheme"] = "Bearer"
-        else:
-            auth["placement"] = "header"
-            auth["header_name"] = header_name or "X-API-KEY"
-    elif normalized_type == "token":
-        auth["placement"] = "header"
-        auth["header_name"] = header_name or "Authorization"
-        auth["scheme"] = str(existing.get("scheme") or raw_config.get("auth_scheme") or "Bearer").strip() or "Bearer"
-    elif normalized_type == "basic":
-        auth["placement"] = "header"
-        auth["header_name"] = "Authorization"
-        auth["scheme"] = "Basic"
-    elif normalized_type == "custom":
-        auth["placement"] = placement or "custom"
-    return auth
-
-
-def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
-    """Save authoring configuration and persist it.
-
-    Single-user minimal version:
-    - user-provided secret_env is treated only as source alias;
-    - generated adapters read platform env names like TOOLCFG_<TOOL>_SECRET;
-    - key/base_url/method/templates are persisted and restored into os.environ.
-    """
-    _load_tool_authoring_config_store_from_disk()
-
-    data = dict(payload or {})
-    session_id = _tool_config_session_id(data)
-    existing = _TOOL_AUTHORING_CONFIG_STORE.get(session_id) or {}
-
-    tool_name = str(data.get("tool_name") or data.get("operation") or existing.get("tool_name") or session_id or "tool")
-    raw_config = data.get("config") if isinstance(data.get("config"), dict) else {}
-    existing_raw_values = existing.get("raw_values") if isinstance(existing.get("raw_values"), dict) else {}
-    raw_values: dict[str, str] = dict(existing_raw_values)
-
-    envs = _tool_platform_envs(tool_name)
-
-    config_refs: dict[str, str] = {}
-    configured_env: list[str] = []
-    configured_secrets: list[str] = []
-
-    def put_env(env_name: str, value: Any, *, secret: bool = False, keep_old_if_empty: bool = True) -> str | None:
-        name = str(env_name or "").strip()
-        if not name:
-            return None
-
-        if value in (None, "", {}, []):
-            if keep_old_if_empty and raw_values.get(name) not in (None, ""):
-                os.environ[name] = str(raw_values[name])
-                (configured_secrets if secret else configured_env).append(name)
-                return name
-            return None
-
-        raw = str(value).strip() if isinstance(value, str) else str(value)
-        os.environ[name] = raw
-        raw_values[name] = raw
-        (configured_secrets if secret else configured_env).append(name)
-        return name
-
-    base_url_value = (
-        data.get("base_url")
-        or raw_config.get("base_url")
-        or raw_config.get("endpoint")
-        or raw_config.get("url")
-    )
-    if put_env(envs["base_url"], base_url_value):
-        config_refs["base_url"] = f"${{ENV:{envs['base_url']}}}"
-
-    method_value = str(data.get("method") or raw_config.get("method") or "GET").strip().upper() or "GET"
-    if put_env(envs["method"], method_value):
-        config_refs["method"] = f"${{ENV:{envs['method']}}}"
-
-    auth_type = str(
-        data.get("auth_type")
-        or raw_config.get("auth_type")
-        or raw_config.get("authentication")
-        or "none"
-    ).strip().lower() or "none"
-
-    auth_header_name = str(
-        data.get("auth_header_name")
-        or raw_config.get("auth_header_name")
-        or ((raw_config.get("auth") or {}).get("header_name") if isinstance(raw_config.get("auth"), dict) else "")
-        or "X-API-KEY"
-    ).strip() or "X-API-KEY"
-    put_env(envs["auth_header"], auth_header_name)
-    config_refs["auth_header_name"] = f"${{ENV:{envs['auth_header']}}}"
-
-    auth_query_param = str(data.get("auth_query_param") or raw_config.get("auth_query_param") or "").strip()
-    if auth_query_param:
-        put_env(envs["auth_query_param"], auth_query_param)
-        config_refs["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
-
-    sample_input = data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {}
-
-    body_template = raw_config.get("json_body_template") if "json_body_template" in raw_config else raw_config.get("body_template", {})
-    if not body_template and method_value not in {"GET", "HEAD"} and sample_input:
-        body_template = sample_input
-    put_env(envs["body_template"], _json_env(body_template or {}))
-    config_refs["json_body_template"] = f"${{ENV:{envs['body_template']}}}"
-
-    query_template = raw_config.get("query_template") or raw_config.get("params_template") or {}
-    if not query_template and method_value in {"GET", "DELETE"} and sample_input:
-        query_template = sample_input
-    put_env(envs["query_template"], _json_env(query_template or {}))
-    config_refs["query_template"] = f"${{ENV:{envs['query_template']}}}"
-
-    headers_template = raw_config.get("headers_template") or raw_config.get("headers") or {}
-    put_env(envs["headers_template"], _json_env(headers_template or {}))
-    config_refs["headers_template"] = f"${{ENV:{envs['headers_template']}}}"
-
-    original_secret_env = str(data.get("secret_env") or raw_config.get("secret_env") or "").strip()
-    secret_value = (
-        data.get("secret_value")
-        or raw_config.get("secret_value")
-        or raw_config.get("api_key")
-        or raw_config.get("token")
-        or raw_config.get("password")
-    )
-
-    if auth_type != "none":
-        if secret_value in (None, "") and original_secret_env:
-            secret_value = os.environ.get(original_secret_env, "")
-        if put_env(envs["secret"], secret_value, secret=True):
-            config_refs["secret"] = f"${{ENV:{envs['secret']}}}"
-
-    sanitized_config = dict(raw_config)
-    sanitized_config.update({
-        "base_url": f"${{ENV:{envs['base_url']}}}",
-        "method": f"${{ENV:{envs['method']}}}",
-        "auth_type": auth_type,
-        "secret_env": envs["secret"] if auth_type != "none" else "",
-        "original_secret_env": original_secret_env,
-        "platform_env_prefix": envs["prefix"],
-        "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
-        "json_body_template_env": envs["body_template"],
-        "query_template_env": envs["query_template"],
-        "headers_template_env": envs["headers_template"],
-    })
-
-    if auth_query_param:
-        sanitized_config["auth_query_param"] = f"${{ENV:{envs['auth_query_param']}}}"
-
-    if auth_type != "none":
-        sanitized_config["auth"] = _build_saved_auth_config(
-            {
-                **data,
-                "secret_env": envs["secret"],
-                "auth_header_name": f"${{ENV:{envs['auth_header']}}}",
-                "auth_query_param": f"${{ENV:{envs['auth_query_param']}}}" if auth_query_param else "",
-            },
-            sanitized_config,
-            auth_type,
-            envs["secret"],
-        )
-
-    sanitized_config, inferred_refs = _sanitize_authoring_config(sanitized_config)
-    for ref in inferred_refs:
-        if ref in raw_values:
-            os.environ[ref] = str(raw_values[ref])
-        if ref.endswith("_SECRET"):
-            configured_secrets.append(ref)
-        else:
-            configured_env.append(ref)
-
-    record = {
-        "tool_name": tool_name,
-        "platform_env_prefix": envs["prefix"],
-        "config": sanitized_config,
-        "sample_input": sample_input,
-        "configured_env": sorted(set(configured_env)),
-        "configured_secrets": sorted(set(configured_secrets)),
-        "config_refs": config_refs,
-        "raw_values": raw_values,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    _TOOL_AUTHORING_CONFIG_STORE[session_id] = record
-    _persist_tool_authoring_config_store_to_disk()
-
-    return {
-        "success": True,
-        "session_id": session_id,
-        "platform_env_prefix": envs["prefix"],
-        "configured_env": sorted(set(configured_env)),
-        "configured_secrets": sorted(set(configured_secrets)),
-        "config_refs": config_refs,
-        "config": sanitized_config,
-        "persisted": True,
-        "store_path": str(_tool_authoring_config_store_path()),
-    }
-
-
-def tool_authoring_config_status(session_id: str = "default") -> dict[str, Any]:
-    _load_tool_authoring_config_store_from_disk()
-
-    key = _tool_config_session_id({"session_id": session_id})
-    stored = _TOOL_AUTHORING_CONFIG_STORE.get(key)
-    if not stored:
-        return {
-            "success": True,
-            "configured": False,
-            "session_id": key,
-            "configured_env": [],
-            "configured_secrets": [],
-            "config_refs": {},
-            "persisted": False,
-            "store_path": str(_tool_authoring_config_store_path()),
-        }
-
-    _restore_env_from_authoring_record(stored)
-
-    configured_env = [name for name in stored.get("configured_env", []) if os.environ.get(name) is not None]
-    configured_secrets = [name for name in stored.get("configured_secrets", []) if os.environ.get(name) is not None]
-
-    return {
-        "success": True,
-        "configured": bool(configured_env or configured_secrets),
-        "session_id": key,
-        "configured_env": configured_env,
-        "configured_secrets": configured_secrets,
-        "config_refs": stored.get("config_refs") or {},
-        "config": stored.get("config") or {},
-        "sample_input": stored.get("sample_input") or {},
-        "updated_at": stored.get("updated_at"),
-        "persisted": True,
-        "store_path": str(_tool_authoring_config_store_path()),
-    }
-
 SnippetKind = Literal[
     "minimal_usage",
     "multi_input_usage",
@@ -516,6 +41,34 @@ SnippetKind = Literal[
     "anti_pattern",
     "trial_run_usage",
 ]
+
+RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset", "tool_authoring"})
+TOOL_OVERRIDE_PERSISTENCE = "process_memory"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+CUSTOM_TOOL_REGISTRY_PATH = CONFIG_DIR / "tool_registry.custom.json"
+CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
+
+_TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
+_TOOL_AUTHORING_CONFIG_LOADED = False
+_REGISTERED_TOOL_CAPABILITIES: dict[str, "ToolCapability"] = {}
+_TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
+
+_ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
+_ALLOWED_SNIPPET_KINDS = {
+    "minimal_usage", "multi_input_usage", "file_output_usage", "batch_usage",
+    "error_repair_usage", "anti_pattern", "trial_run_usage",
+}
+_ALLOWED_TOOL_TYPES = {"python_script", "python_helper", "custom_adapter", "internal_authoring_tool"}
+
+# Safety boundaries, not business routing wrappers.
+_NETWORK_IMPORT_ROOTS = {"requests", "httpx", "aiohttp", "socket", "urllib"}
+_SUBPROCESS_IMPORT_ROOTS = {"subprocess"}
+_DANGEROUS_IMPORT_ROOTS = {"paramiko", "ftplib", "telnetlib"}
+_FORBIDDEN_BUILTIN_CALLS = {"eval", "exec", "compile", "__import__", "input", "breakpoint"}
+_UNSAFE_FS_ATTRS = {"remove", "unlink", "rmdir", "rmtree", "chmod", "chown"}
+_RUNTIME_ENV_NAMES = {"TOOL_OUTPUT_DIR", "OUTPUT_DIR", "TOOL_TRIAL_RUN", "SKILL_TRIAL_RUN"}
 
 
 @dataclass(frozen=True)
@@ -533,6 +86,7 @@ class ToolSnippet:
     requires: list[str] = field(default_factory=list)
     usage_policy: UsagePolicy = "self_implementation_allowed"
     priority: int = 0
+
 
 @dataclass(frozen=True)
 class ToolFunctionManifest:
@@ -565,11 +119,9 @@ class ToolCapability:
     display_name: str
     category: str
     roles: list[str] = field(default_factory=list)
-
     enabled_by_default: bool = True
     allow_creator_use: bool = True
     allow_external_side_effect: bool = False
-
     helper_imports: list[str] = field(default_factory=list)
     allowed_roles: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
@@ -578,18 +130,16 @@ class ToolCapability:
     usage_policy: UsagePolicy = "self_implementation_allowed"
     required_env: list[str] = field(default_factory=list)
     required_secrets: list[str] = field(default_factory=list)
-    dependencies: list[str] = field(default_factory=list)
+    dependencies: list[Any] = field(default_factory=list)
     helper_module: str = "backend.services.skill_runtime"
     forbidden_direct_imports: list[str] = field(default_factory=list)
     safety_level: str = "standard"
-
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
-
     trial_mode: Literal["none", "mock", "minimal_file"] = "mock"
-    validator_kind: str = "generic"
+    validator_kind: str = "generic_python_script"
     prompt_guidance: str = ""
-    tool_type: str = "python_helper"
+    tool_type: str = "python_script"
     functions: list[ToolFunctionManifest] = field(default_factory=list)
     snippets: list[ToolSnippet] = field(default_factory=list)
     adapter_path: str = ""
@@ -602,358 +152,73 @@ class ToolCapability:
     updated_at: str = ""
 
 
+@dataclass(frozen=True)
+class ToolResolveResult:
+    allowed_tools: list[str] = field(default_factory=list)
+    allowed_helper_imports: list[str] = field(default_factory=list)
+    required_dependencies: list[str] = field(default_factory=list)
+    forbidden_imports: list[str] = field(default_factory=list)
+    tool_function_cards: list[str] = field(default_factory=list)
+    tool_snippets: list[dict[str, Any]] = field(default_factory=list)
+    tool_usage_prompt: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
 _ROLE_FORBIDDEN_CAPABILITIES: dict[str, list[str]] = {
     "text_generator": ["image_generation", "pdf_generation"],
     "image_generator": ["text_generation", "pdf_generation"],
-    "composite_generator": ["pdf_generation"],
-    "generic_script": ["text_generation", "image_generation", "pdf_generation"],
+    "composite_generator": [],
+    "generic_script": [],
     "reference": ["runtime_execution", "image_generation"],
     "asset": ["runtime_execution", "image_generation"],
-    "skill_overview": ["hidden_runtime_protocol"],
+    "skill_overview": ["runtime_execution"],
 }
+
+
+def _simple_cap(name: str, display_name: str, category: str, roles: list[str], **kwargs: Any) -> ToolCapability:
+    return ToolCapability(
+        name=name,
+        display_name=display_name,
+        category=category,
+        roles=roles,
+        dependencies=kwargs.get("dependencies") or [],
+        prompt_guidance=kwargs.get("prompt", ""),
+        allow_external_side_effect=bool(kwargs.get("allow_external_side_effect", False)),
+        enabled_by_default=bool(kwargs.get("enabled", True)),
+        allow_creator_use=bool(kwargs.get("allow_creator_use", True)),
+        helper_imports=kwargs.get("helper_imports") or [],
+        required_env=kwargs.get("required_env") or [],
+        required_secrets=kwargs.get("required_secrets") or [],
+    )
 
 
 BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
-    "text_generation": ToolCapability(
-        name="text_generation",
-        display_name="文本生成",
-        category="generation",
-        roles=["text_generator", "composite_generator"],
-        helper_imports=["generate_text_with_llm"],
-        input_schema={"type": "object", "properties": {"prompt": {"type": "string"}}},
-        output_schema={"type": "object", "properties": {"text": {"type": "string"}}},
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="需要文本生成时，可优先使用 backend.services.skill_runtime.generate_text_with_llm；也可在声明能力边界内自实现。",
-    ),
-    "image_generation": ToolCapability(
-        name="image_generation",
-        display_name="图片生成",
-        category="generation",
-        roles=["image_generator", "composite_generator"],
-        helper_imports=["generate_stable_diffusion_image"],
-        output_schema={"type": "object", "properties": {"image_path": {"type": "string"}}},
-        trial_mode="minimal_file",
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="需要图片生成时，可优先使用 generate_stable_diffusion_image；也可自实现，但最终 stdout/artifact 必须通过 E2E 校验。",
-    ),
-    "pdf_generation": ToolCapability(
-        name="pdf_generation",
-        display_name="PDF 生成",
-        category="document",
-        roles=["pdf_builder"],
-        helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
-        dependencies=["reportlab"],
-        output_schema={"type": "object", "properties": {"pdf_path": {"type": "string"}}},
-        trial_mode="minimal_file",
-        validator_kind="file_output",
-        usage_policy="helper_preferred",
-        prompt_guidance=(
-            "PDF 生成可优先使用平台 helper create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；"
-            "也可自实现，但最终 PDF 文件、路径和 stdout 字段必须通过 E2E 校验。"
-        ),
-    ),
-    "docx_generation": ToolCapability(
-        name="docx_generation",
-        display_name="Word 生成",
-        category="document",
-        roles=["docx_builder"],
-        helper_imports=["create_docx"],
-        dependencies=["python-docx"],
-        output_schema={"type": "object", "properties": {"docx_path": {"type": "string"}}},
-        trial_mode="minimal_file",
-        validator_kind="file_output",
-        usage_policy="helper_preferred",
-        prompt_guidance="Word 生成可优先使用平台 helper create_docx；也可自实现，并返回合法 docx_path/file_outputs。",
-    ),
-    "pptx_generation": ToolCapability(
-        name="pptx_generation",
-        display_name="PPT 生成",
-        category="document",
-        roles=["pptx_builder"],
-        helper_imports=["create_pptx"],
-        dependencies=["python-pptx"],
-        output_schema={"type": "object", "properties": {"pptx_path": {"type": "string"}}},
-        trial_mode="minimal_file",
-        validator_kind="file_output",
-        usage_policy="helper_preferred",
-        prompt_guidance="PPT 生成可优先使用平台 helper create_pptx；也可自实现，并返回合法 pptx_path/file_outputs。",
-    ),
-    "html_asset_generation": ToolCapability(
-        name="html_asset_generation",
-        display_name="HTML 素材生成",
-        category="document",
-        roles=["html_asset_builder"],
-        output_schema={"type": "object", "properties": {"html_path": {"type": "string"}}},
-        validator_kind="file_output",
-        prompt_guidance="HTML 资产生成必须输出确定性 HTML 文件路径，并在 stdout JSON 中声明文件输出。",
-    ),
-    "asset_generation": ToolCapability(
-        name="asset_generation",
-        display_name="静态素材生成",
-        category="asset",
-        roles=["asset_builder"],
-        output_schema={"type": "object", "properties": {"asset_path": {"type": "string"}}},
-        validator_kind="file_output",
-        prompt_guidance="静态素材生成只能创建本地文件，不得调用外部服务。",
-    ),
-    "file_output": ToolCapability(
-        name="file_output",
-        display_name="文件输出",
-        category="common",
-        roles=["pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"],
-        trial_mode="minimal_file",
-        validator_kind="file_output",
-        prompt_guidance="写文件时必须输出可校验的本地路径，并在 stdout JSON 中包含 path 或 file_outputs。",
-    ),
-    "pdf_parsing": ToolCapability(
-        name="pdf_parsing",
-        display_name="PDF 解析",
-        category="parsing",
-        roles=["pdf_parser"],
-        helper_imports=["extract_pdf_text"],
-        dependencies=["pypdf"],
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="PDF 解析可优先使用 extract_pdf_text；也可自实现。",
-    ),
-    "docx_parsing": ToolCapability(
-        name="docx_parsing",
-        display_name="Word 解析",
-        category="parsing",
-        roles=["docx_parser"],
-        helper_imports=["read_docx_text"],
-        dependencies=["python-docx"],
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="Word 解析可优先使用 read_docx_text；也可自实现。",
-    ),
-    "pptx_parsing": ToolCapability(
-        name="pptx_parsing",
-        display_name="PPT 解析",
-        category="parsing",
-        roles=["pptx_parser"],
-        helper_imports=["read_pptx_text"],
-        dependencies=["python-pptx"],
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="PPT 解析可优先使用 read_pptx_text；也可自实现。",
-    ),
-    "spreadsheet_read": ToolCapability(
-        name="spreadsheet_read",
-        display_name="表格读取",
-        category="parsing",
-        roles=["spreadsheet_reader"],
-        helper_imports=["read_spreadsheet"],
-        dependencies=["openpyxl"],
-        validator_kind="helper_import",
-        prompt_guidance="表格读取只能读取本地文件，避免写入或修改原始表格。",
-    ),
-    "vision_understanding": ToolCapability(
-        name="vision_understanding",
-        display_name="视觉理解",
-        category="ai",
-        roles=["vision_analyzer"],
-        helper_imports=["analyze_image_with_vision", "ocr_image"],
-        required_env=["VISION_MODEL"],
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="视觉理解可优先使用 analyze_image_with_vision 或 ocr_image；试运行时可返回 mock 结果。",
-    ),
-    "web_search": ToolCapability(
-        name="web_search",
-        display_name="网页搜索",
-        category="retrieval",
-        roles=["search_reader"],
-        helper_imports=["web_search", "fetch_url_text"],
-        required_env=["SEARCHXNG_BASE_URL"],
-        validator_kind="helper_import",
-        usage_policy="helper_preferred",
-        prompt_guidance="网页搜索可优先使用 web_search/fetch_url_text；也可在能力声明边界内自实现。",
-    ),
-    "database_read": ToolCapability(
-        name="database_read",
-        display_name="数据库只读查询",
-        category="retrieval",
-        roles=["database_reader"],
-        helper_imports=["query_database_readonly", "list_database_tables", "describe_database_table"],
-        usage_policy="helper_required",
-        required_secrets=["DATABASE_URL"],
-        validator_kind="database_readonly",
-        prompt_guidance="数据库能力只允许 SELECT/WITH 只读查询，必须通过 query_database_readonly，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE。",
-    ),
-    "wechat_draft": ToolCapability(
-        name="wechat_draft",
-        display_name="微信公众号草稿",
-        category="publisher",
-        roles=["wechat_draft_creator"],
-        helper_imports=["create_wechat_draft", "upload_wechat_media"],
-        required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"],
-        validator_kind="helper_import",
-        usage_policy="helper_required",
-        prompt_guidance="默认只能创建微信公众号草稿，不得自动发布。使用 create_wechat_draft 并返回 draft_id。",
-    ),
-    "wechat_publish": ToolCapability(
-        name="wechat_publish",
-        display_name="微信公众号发布",
-        category="publisher",
-        roles=["wechat_publisher"],
-        enabled_by_default=False,
-        allow_external_side_effect=True,
-        helper_imports=["publish_wechat_draft"],
-        required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"],
-        validator_kind="external_side_effect",
-        usage_policy="helper_required",
-        prompt_guidance="除非用户明确要求直接发布，否则只能创建草稿；发布必须通过 publish_wechat_draft。",
-    ),
-    "deterministic_execution": ToolCapability(
-        name="deterministic_execution",
-        display_name="确定性脚本执行",
-        category="common",
-        roles=["generic_script"],
-        trial_mode="none",
-        validator_kind="generic",
-        prompt_guidance="通用脚本不得调用模型、搜索、数据库或外部发布能力，除非 SkillPlan 显式声明对应 capability。",
-    ),
-    "reference_guidance": ToolCapability(
-        name="reference_guidance",
-        display_name="参考文档指导",
-        category="resource",
-        roles=["reference"],
-        allow_creator_use=False,
-        trial_mode="none",
-        validator_kind="resource",
-    ),
-    "static_resource": ToolCapability(
-        name="static_resource",
-        display_name="静态资源",
-        category="resource",
-        roles=["asset"],
-        allow_creator_use=False,
-        trial_mode="none",
-        validator_kind="resource",
-    ),
-    "workflow_overview": ToolCapability(
-        name="workflow_overview",
-        display_name="工作流概览",
-        category="resource",
-        roles=["skill_overview"],
-        allow_creator_use=False,
-        trial_mode="none",
-        validator_kind="resource",
-    ),
-    "authoring_config_collector": ToolCapability(
-        name="authoring_config_collector",
-        display_name="Authoring 通用配置收集",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；收集 endpoint/base_url、认证、env/secret 引用、headers/query/body 模板和 sample input，不保存明文 secret。",
-    ),
-    "authoring_schema_infer": ToolCapability(
-        name="authoring_schema_infer",
-        display_name="Authoring Schema 推断",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；根据需求、配置和 sample input 推断输入/输出 schema 草案。",
-    ),
-    "authoring_live_test": ToolCapability(
-        name="authoring_live_test",
-        display_name="Authoring Live Test",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        allow_external_side_effect=True,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；在用户确认外部网络后执行一次通用 live_test。",
-    ),
-    "authoring_dependency_check": ToolCapability(
-        name="authoring_dependency_check",
-        display_name="Authoring 依赖检测",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；检测 adapter 计划所需 Python 依赖是否可 import。",
-    ),
-    "authoring_code_protocol_check": ToolCapability(
-        name="authoring_code_protocol_check",
-        display_name="Authoring 代码协议检查",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；静态检查 adapter 是否暴露 run/manifest function、env 读取和危险调用。",
-    ),
-    "authoring_file_output_check": ToolCapability(
-        name="authoring_file_output_check",
-        display_name="Authoring 文件输出协议检查",
-        category="authoring",
-        roles=["tool_authoring"],
-        allow_creator_use=False,
-        tool_type="internal_authoring_tool",
-        validator_kind="internal_authoring_tool",
-        usage_policy="helper_required",
-        prompt_guidance="仅 Tool Authoring 流程可调用；检查文件输出 schema 是否声明 file_paths/file_outputs 或 OUTPUT_DIR 约束。",
-    ),
+    "text_generation": _simple_cap("text_generation", "文本生成", "generation", ["text_generator", "composite_generator"]),
+    "image_generation": _simple_cap("image_generation", "图片生成", "generation", ["image_generator", "composite_generator"]),
+    "pdf_generation": _simple_cap("pdf_generation", "PDF 生成", "document", ["pdf_builder", "composite_generator"], dependencies=[{"package": "reportlab", "imports": ["reportlab"]}]),
+    "docx_generation": _simple_cap("docx_generation", "Word 生成", "document", ["docx_builder", "composite_generator"], dependencies=[{"package": "python-docx", "imports": ["docx"]}]),
+    "pptx_generation": _simple_cap("pptx_generation", "PPT 生成", "document", ["pptx_builder", "composite_generator"], dependencies=[{"package": "python-pptx", "imports": ["pptx"]}]),
+    "html_asset_generation": _simple_cap("html_asset_generation", "HTML 素材生成", "document", ["html_asset_builder"]),
+    "asset_generation": _simple_cap("asset_generation", "静态素材生成", "asset", ["asset_builder"]),
+    "file_output": _simple_cap("file_output", "文件输出", "common", ["generic_script", "pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder", "composite_generator"]),
+    "pdf_parsing": _simple_cap("pdf_parsing", "PDF 解析", "parsing", ["pdf_parser"], dependencies=[{"package": "pypdf", "imports": ["pypdf"]}]),
+    "docx_parsing": _simple_cap("docx_parsing", "Word 解析", "parsing", ["docx_parser"], dependencies=[{"package": "python-docx", "imports": ["docx"]}]),
+    "pptx_parsing": _simple_cap("pptx_parsing", "PPT 解析", "parsing", ["pptx_parser"], dependencies=[{"package": "python-pptx", "imports": ["pptx"]}]),
+    "spreadsheet_read": _simple_cap("spreadsheet_read", "表格读取", "parsing", ["spreadsheet_reader"], dependencies=[{"package": "openpyxl", "imports": ["openpyxl"]}]),
+    "vision_understanding": _simple_cap("vision_understanding", "视觉理解", "ai", ["vision_analyzer"]),
+    "http_request": _simple_cap("http_request", "HTTP/API 请求", "retrieval", ["search_reader", "generic_script"], prompt="Metadata only. Generated scripts implement HTTP themselves when permissions.network=true."),
+    "network_read": _simple_cap("network_read", "网络资源读取", "retrieval", ["search_reader", "generic_script"]),
+    "web_search": _simple_cap("web_search", "网页搜索", "retrieval", ["search_reader"], required_env=["SEARCHXNG_BASE_URL"]),
+    "database_read": _simple_cap("database_read", "数据库只读查询", "retrieval", ["database_reader"], required_secrets=["DATABASE_URL"]),
+    "wechat_draft": _simple_cap("wechat_draft", "微信公众号草稿", "publisher", ["wechat_draft_creator"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"]),
+    "wechat_publish": _simple_cap("wechat_publish", "微信公众号发布", "publisher", ["wechat_publisher"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"], allow_external_side_effect=True, enabled=False),
+    "deterministic_execution": _simple_cap("deterministic_execution", "确定性脚本执行", "common", ["generic_script"]),
+    "reference_guidance": _simple_cap("reference_guidance", "参考文档指导", "resource", ["reference"], allow_creator_use=False),
+    "static_resource": _simple_cap("static_resource", "静态资源", "resource", ["asset"], allow_creator_use=False),
+    "workflow_overview": _simple_cap("workflow_overview", "工作流概览", "resource", ["skill_overview"], allow_creator_use=False),
+    "authoring_dependency_check": _simple_cap("authoring_dependency_check", "Authoring 依赖检测", "authoring", ["tool_authoring"], allow_creator_use=False),
+    "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
-
-RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset", "tool_authoring"})
-TOOL_OVERRIDE_PERSISTENCE = "process_memory"
-CUSTOM_TOOL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "tool_registry.custom.json"
-CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_REGISTERED_TOOL_CAPABILITIES: dict[str, ToolCapability] = {}
-_TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
-_RUNTIME_HELPERS_CACHE: set[str] | None = None
-
-_ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
-_ALLOWED_SNIPPET_KINDS = {"minimal_usage", "multi_input_usage", "file_output_usage", "batch_usage", "error_repair_usage", "anti_pattern", "trial_run_usage"}
-_ALLOWED_TOOL_TYPES = {
-    "python_helper", "http_api", "local_command", "database_query",
-    "file_converter", "document_generator", "image_generator", "custom_adapter",
-    "internal_authoring_tool",
-}
-_DANGEROUS_IMPORTS = {"subprocess", "shutil", "socket", "paramiko", "ftplib", "telnetlib"}
-_DANGEROUS_CALLS = {"eval", "exec", "compile", "open"}
-_HIGH_RISK_CAPABILITIES = {
-    "database_write", "external_http", "wechat_publish", "file_delete",
-    "shell_command", "network_access", "secret_access",
-}
-
-_DEPENDENCY_IMPORT_NAMES = {
-    "python-docx": "docx",
-    "python-pptx": "pptx",
-}
-
-
-def _dependency_available(dependency: str) -> bool:
-    module_name = _DEPENDENCY_IMPORT_NAMES.get(dependency, dependency).replace("-", "_")
-    return importlib.util.find_spec(module_name) is not None
-
-
-def _with_overrides(capability: ToolCapability) -> ToolCapability:
-    override = _TOOL_OVERRIDES.get(capability.name, {})
-    return replace(
-        capability,
-        enabled_by_default=override.get("enabled", capability.enabled_by_default),
-        allow_creator_use=override.get("allow_creator_use", capability.allow_creator_use),
-    )
-
 
 
 def _utc_now() -> str:
@@ -969,36 +234,605 @@ def _slug(value: str, fallback: str = "custom_tool") -> str:
     return text[:64]
 
 
+def _env_name(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip().upper()).strip("_")
+    if not text:
+        text = "TOOL_SECRET"
+    if text[0].isdigit():
+        text = f"TOOL_{text}"
+    return text[:96]
+
+
+def _default_secret_env_for_tool(tool_name: str) -> str:
+    return f"{_env_name(tool_name or 'custom_tool')}_API_KEY"
+
+
+def _strip_code_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:python|py)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw
+
+
+def _schema_properties(schema: Any) -> dict[str, Any]:
+    return schema.get("properties") if isinstance(schema, dict) and isinstance(schema.get("properties"), dict) else {}
+
+
+def _schema_required(schema: Any) -> list[str]:
+    required = schema.get("required") if isinstance(schema, dict) else []
+    return [str(item) for item in required] if isinstance(required, list) else []
+
+
+def _canonical_schema(schema: Any, *, fallback_properties: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
+    """Return canonical JSON Schema object.
+
+    Compatibility: legacy frontend field-map input like
+    {"field": {"type":"string"}} is structurally migrated to canonical
+    schema. This is not business-field inference.
+    """
+    if isinstance(schema, dict) and schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        result = dict(schema)
+        result["required"] = _schema_required(result)
+        return result
+    if isinstance(schema, dict) and "type" not in schema and "properties" not in schema:
+        if all(isinstance(value, dict) for value in schema.values()):
+            return {"type": "object", "properties": dict(schema), "required": required or []}
+    return {"type": "object", "properties": fallback_properties or {}, "required": required or []}
+
+
+def _normalized_preview(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        return {"type": "object", "keys": sorted(str(k) for k in data.keys())[:50], "preview": {str(k): data[k] for k in list(data.keys())[:10]}}
+    if isinstance(data, list):
+        return {"type": "array", "length": len(data), "first_item": data[0] if data else None}
+    return {"type": type(data).__name__, "value": data}
+
+
+def _redact_secrets(value: Any, secret_values: set[str] | None = None) -> Any:
+    secrets = {str(item) for item in (secret_values or set()) if str(item)}
+    if isinstance(value, str):
+        out = value
+        for secret in secrets:
+            if secret:
+                out = out.replace(secret, "***")
+        return out
+    if isinstance(value, dict):
+        return {k: _redact_secrets(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_secrets(v, secrets) for v in value]
+    return value
+
+
+def _json_from_model_text(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    match = re.search(r"\{.*\}", raw, re.S)
+    if match:
+        raw = match.group(0)
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_dependency_record(dep: Any) -> dict[str, Any]:
+    if isinstance(dep, dict):
+        imports = dep.get("imports") or dep.get("import_names") or []
+        if isinstance(imports, str):
+            imports = [imports]
+        if not isinstance(imports, list):
+            imports = []
+        return {
+            "package": str(dep.get("package") or dep.get("name") or dep.get("pip") or "").strip(),
+            "imports": [str(item).strip() for item in imports if str(item).strip()],
+            "version": str(dep.get("version") or "").strip(),
+        }
+    if isinstance(dep, str):
+        return {"package": dep.strip(), "imports": [], "version": ""}
+    return {"package": "", "imports": [], "version": ""}
+
+
+def _manifest_dependency_records(manifest: dict[str, Any] | None) -> list[dict[str, Any]]:
+    deps = (manifest or {}).get("dependencies")
+    if not isinstance(deps, list):
+        return []
+    return [r for r in (_normalize_dependency_record(dep) for dep in deps) if r.get("package") or r.get("imports")]
+
+
+def _script_import_roots(script_code: str) -> list[str]:
+    """Return importable module roots used by the generated script.
+
+    This is structural AST extraction. It is not tied to any business tool type.
+    The result is used only to keep dependency declarations aligned with the
+    actual imports in the generated Python script.
+    """
+    try:
+        tree = ast.parse(script_code or "")
+    except SyntaxError:
+        return []
+
+    roots: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = str(alias.name or "").split(".")[0].strip()
+                if root and root not in roots:
+                    roots.append(root)
+        elif isinstance(node, ast.ImportFrom):
+            root = str(node.module or "").split(".")[0].strip()
+            if root and root not in roots:
+                roots.append(root)
+    return roots
+
+
+def _normalized_distribution_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", str(value or "").strip().lower())
+
+
+def _distribution_import_roots(package: str) -> list[str]:
+    """Return import roots advertised by installed package metadata.
+
+    This is a generic package-metadata lookup, not a business rule table.  It
+    covers common cases where the pip distribution name and the import module
+    name differ.  If metadata is unavailable, callers fall back to the generated
+    script's AST imports without blocking authoring.
+    """
+    package_key = _normalized_distribution_name(package)
+    if not package_key:
+        return []
+    roots: list[str] = []
+    try:
+        mapping = importlib.metadata.packages_distributions()
+    except Exception:
+        mapping = {}
+    for root, dists in mapping.items():
+        if not isinstance(dists, list):
+            continue
+        for dist in dists:
+            if _normalized_distribution_name(dist) == package_key:
+                if root and root not in roots:
+                    roots.append(root)
+                break
+    return roots
+
+
+def _safe_find_spec(module_name: str) -> Any:
+    """Safe wrapper around importlib.util.find_spec.
+
+    ``find_spec`` can raise ModuleNotFoundError for dotted names when a parent
+    package is absent, for example ``sklearn.svm.SVC`` when ``sklearn`` is not
+    installed in the backend process.  Dependency normalization must never crash
+    the authoring stream; an absent module simply means the dependency should be
+    installed later in the temporary execution environment.
+    """
+    name = str(module_name or "").strip()
+    if not name:
+        return None
+    try:
+        return importlib.util.find_spec(name)
+    except (ImportError, ModuleNotFoundError, AttributeError, ValueError):
+        return None
+
+
+def _import_root_from_name(name: str) -> str:
+    return str(name or "").strip().split(".")[0].strip()
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _normalize_dependencies_for_script(manifest: dict[str, Any], script_code: str) -> dict[str, Any]:
+    """Normalize dependency import names against the actual generated script.
+
+    This is generic protocol repair, not business logic.  The planner may emit
+    class/function paths such as ``sklearn.svm.SVC`` in ``dependencies[].imports``.
+    Those paths are not module roots and may not be importable before the package
+    is installed.  We therefore align declared imports to AST import roots used
+    by the generated script and never require the dependency to exist in the
+    backend process before the temporary environment installs it.
+    """
+    payload = dict(manifest or {})
+    deps = payload.get("dependencies")
+    if not isinstance(deps, list):
+        return payload
+
+    script_roots = _unique_strings(_script_import_roots(script_code))
+    script_root_set = set(script_roots)
+    normalized: list[dict[str, Any]] = []
+
+    for dep in deps:
+        record = _normalize_dependency_record(dep)
+        package = str(record.get("package") or "").strip()
+        imports = [str(item).strip() for item in record.get("imports") or [] if str(item).strip()]
+
+        metadata_roots = _distribution_import_roots(package)
+        declared_roots = _unique_strings([_import_root_from_name(name) for name in imports])
+        fixed_imports: list[str] = []
+
+        # Prefer metadata roots that are actually imported by the generated script.
+        if metadata_roots:
+            fixed_imports = [root for root in metadata_roots if root in script_root_set] or metadata_roots
+
+        # If metadata is unavailable because the package is not installed in the
+        # backend, use the root of the model-declared import path.
+        if not fixed_imports and declared_roots:
+            fixed_imports = [root for root in declared_roots if root in script_root_set] or declared_roots
+
+        # Last resort: keep already importable declared modules, but use a safe
+        # find_spec wrapper so missing parent packages do not crash the request.
+        if not fixed_imports:
+            fixed_imports = [name for name in imports if _safe_find_spec(name) is not None]
+
+        record["imports"] = _unique_strings(fixed_imports or script_roots or declared_roots or imports)
+        normalized.append(record)
+
+    payload["dependencies"] = normalized
+    return payload
+
+
+def _dependency_available(dep: Any) -> bool:
+    record = _normalize_dependency_record(dep)
+    imports = record.get("imports")
+    if not isinstance(imports, list) or not imports:
+        return False if record.get("package") else True
+    return all(_safe_find_spec(str(module)) is not None for module in imports)
+
+
+
+def _dependency_packages_for_install(manifest: dict[str, Any] | None) -> list[str]:
+    packages: list[str] = []
+    for record in _manifest_dependency_records(manifest):
+        package = str(record.get("package") or "").strip()
+        version = str(record.get("version") or "").strip()
+        if not package or _dependency_available(record):
+            continue
+        spec = f"{package}{version}" if version and version.startswith(("==", ">=", "<=", "~=", ">", "<", "!=")) else package
+        if spec not in packages:
+            packages.append(spec)
+    return packages
+
+
+def _install_dependencies_to_target(packages: list[str], target_dir: Path, *, timeout_seconds: int = 180) -> dict[str, Any]:
+    packages = [str(item).strip() for item in packages if str(item).strip()]
+    if not packages:
+        return {"success": True, "skipped": True, "installed": [], "target_dir": str(target_dir), "errors": []}
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--target", str(target_dir), *packages]
+    try:
+        completed = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout_seconds, check=False)
+    except Exception as exc:
+        return {"success": False, "skipped": False, "installed": [], "target_dir": str(target_dir), "errors": [str(exc)]}
+    if completed.returncode != 0:
+        return {"success": False, "skipped": False, "installed": [], "target_dir": str(target_dir), "errors": [completed.stderr[-4000:] or completed.stdout[-4000:] or f"pip exited with code {completed.returncode}"]}
+    return {"success": True, "skipped": False, "installed": packages, "target_dir": str(target_dir), "errors": []}
+
+
+def _normalize_secret_record(item: Any, *, fallback_env: str = "") -> dict[str, Any] | None:
+    if isinstance(item, str):
+        env = _env_name(item)
+        return {"env": env, "name": env, "description": "", "required": True}
+    if not isinstance(item, dict):
+        return None
+    env = str(item.get("env") or item.get("name") or item.get("secret_env") or item.get("env_name") or "").strip() or fallback_env
+    if not env:
+        return None
+    env = _env_name(env)
+    return {"env": env, "name": str(item.get("name") or env), "description": str(item.get("description") or item.get("label") or ""), "required": bool(item.get("required", True))}
+
+
+def _normalize_auth_plan(manifest: dict[str, Any] | None, request: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Normalize the authentication contract only from explicit auth/secret signals.
+
+    Important distinction:
+    - permissions.env means "the generated script is allowed to read these environment
+      variables". It can contain ordinary runtime knobs such as USER_AGENT or HTTP_TIMEOUT.
+    - auth.secrets / required_secrets means "the user must configure credentials before
+      registration/live execution".
+
+    Therefore permissions.env must never by itself upgrade auth.required=no to yes.
+    """
+    manifest = manifest if isinstance(manifest, dict) else {}
+    request = request if isinstance(request, dict) else {}
+    tool_name = str(manifest.get("tool_name") or manifest.get("name") or request.get("tool_name") or "custom_tool")
+    auth = manifest.get("auth") if isinstance(manifest.get("auth"), dict) else {}
+
+    raw_required = str(auth.get("required") or auth.get("requires_auth") or "").strip().lower()
+    if raw_required in {"true", "yes", "required", "1"}:
+        required = "yes"
+    elif raw_required in {"false", "no", "none", "not_required", "0", "public", "anonymous"}:
+        required = "no"
+    elif raw_required == "unknown":
+        required = "unknown"
+    else:
+        required = "yes" if request.get("needs_secret") or request.get("requires_auth") else "no"
+
+    secret_items: list[Any] = []
+    for key in ("secrets", "required_secrets"):
+        value = auth.get(key)
+        if isinstance(value, list):
+            secret_items.extend(value)
+
+    # required_secrets is credential material. required_env / permissions.env are general
+    # environment permissions and must not be treated as authentication.
+    value = manifest.get("required_secrets")
+    if isinstance(value, list):
+        secret_items.extend(value)
+
+    secrets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in secret_items:
+        record = _normalize_secret_record(item)
+        if record and record["env"] not in seen:
+            seen.add(record["env"])
+            secrets.append(record)
+
+    if required == "yes" and not secrets:
+        env = _default_secret_env_for_tool(tool_name)
+        secrets.append({"env": env, "name": env, "description": "API key or token required by this tool.", "required": True})
+
+    # Only explicit secrets can override a missing/unknown auth decision. Do not let
+    # permissions.env or required_env do this.
+    if required == "no" and secrets:
+        required = "yes"
+
+    return {"required": required, "reason": str(auth.get("reason") or auth.get("description") or ""), "secrets": secrets}
+
+
+def _auth_secret_env_names(manifest: dict[str, Any] | None) -> list[str]:
+    """Environment variables that are credentials and block registration if missing."""
+    names: list[str] = []
+    for secret in _normalize_auth_plan(manifest).get("secrets") or []:
+        if isinstance(secret, dict) and secret.get("env") and secret.get("required", True):
+            names.append(str(secret["env"]))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        env = _env_name(name)
+        if env not in seen:
+            seen.add(env)
+            normalized.append(env)
+    return normalized
+
+
+def _declared_env_names(manifest: dict[str, Any] | None) -> list[str]:
+    """All env vars the script is allowed to read, including non-secret knobs."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    names: list[str] = []
+    permissions = manifest.get("permissions") if isinstance(manifest.get("permissions"), dict) else {}
+    if isinstance(permissions.get("env"), list):
+        names.extend(str(item) for item in permissions["env"] if str(item).strip())
+    if isinstance(manifest.get("required_env"), list):
+        names.extend(str(item) for item in manifest["required_env"] if str(item).strip())
+    names.extend(_auth_secret_env_names(manifest))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        env = _env_name(name)
+        if env not in seen:
+            seen.add(env)
+            normalized.append(env)
+    return normalized
+
+
+def _sync_auth_into_manifest(manifest: dict[str, Any], request: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(manifest or {})
+    payload["runtime_type"] = "python_script"
+    name = _slug(str(payload.get("tool_name") or payload.get("name") or (request or {}).get("tool_name") or "custom_tool"))
+    payload["tool_name"] = name
+    payload["name"] = name
+
+    auth = _normalize_auth_plan(payload, request)
+    secret_env_names = [str(secret["env"]) for secret in auth.get("secrets") or [] if isinstance(secret, dict) and secret.get("env")]
+
+    permissions = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else {}
+    env_list = [_env_name(item) for item in permissions.get("env", [])] if isinstance(permissions.get("env"), list) else []
+    for env in secret_env_names:
+        if env not in env_list:
+            env_list.append(env)
+
+    payload["permissions"] = {
+        "network": bool(permissions.get("network")),
+        "read_files": bool(permissions.get("read_files")),
+        "write_files": bool(permissions.get("write_files")),
+        "subprocess": bool(permissions.get("subprocess")),
+        "env": env_list,
+        "timeout_seconds": int(permissions.get("timeout_seconds") or payload.get("timeout_seconds") or 30),
+    }
+    payload["auth"] = auth
+
+    # required_env remains a non-secret runtime/config env declaration. It should not
+    # imply auth. required_secrets is the only credential declaration.
+    existing_required_env = payload.get("required_env") if isinstance(payload.get("required_env"), list) else []
+    payload["required_env"] = [_env_name(item) for item in existing_required_env if str(item).strip()]
+    payload["required_secrets"] = secret_env_names
+    return payload
+
+
+def _script_env_usage(script_code: str) -> list[str]:
+    try:
+        tree = ast.parse(script_code or "")
+    except SyntaxError:
+        return []
+    names: set[str] = set()
+    def literal(node: ast.AST | None) -> str | None:
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            target = node.value
+            if isinstance(target, ast.Attribute) and target.attr == "environ" and isinstance(target.value, ast.Name) and target.value.id == "os":
+                env = literal(node.slice)
+                if env:
+                    names.add(_env_name(env))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            func = node.func
+            if func.attr == "getenv" and isinstance(func.value, ast.Name) and func.value.id == "os" and node.args:
+                env = literal(node.args[0])
+                if env:
+                    names.add(_env_name(env))
+            elif func.attr == "get" and isinstance(func.value, ast.Attribute) and func.value.attr == "environ" and isinstance(func.value.value, ast.Name) and func.value.value.id == "os" and node.args:
+                env = literal(node.args[0])
+                if env:
+                    names.add(_env_name(env))
+    return sorted(names)
+
+
+def _auth_gate_for_manifest(manifest: dict[str, Any], *, require_config: bool = True) -> dict[str, Any]:
+    manifest = manifest if isinstance(manifest, dict) else {}
+    auth = _normalize_auth_plan(manifest)
+    declared_env = _declared_env_names(manifest)
+    secret_env = _auth_secret_env_names(manifest)
+    configured_secret_env = [name for name in secret_env if bool(os.environ.get(name))]
+    missing_secret_env = [name for name in secret_env if not os.environ.get(name)]
+    configured_declared_env = [name for name in declared_env if bool(os.environ.get(name))]
+    missing_declared_env = [name for name in declared_env if not os.environ.get(name)]
+
+    required = auth.get("required") in {"yes", "unknown"} or bool(secret_env)
+    status = "not_required" if not required else "needs_config" if missing_secret_env else "configured"
+    return {
+        "required": bool(required),
+        "status": status,
+        "reason": auth.get("reason") or "",
+        "required_env": secret_env,
+        "required_secrets": secret_env,
+        "declared_env": declared_env,
+        "optional_env": [name for name in declared_env if name not in secret_env],
+        "configured_env": configured_declared_env,
+        "configured_secrets": configured_secret_env,
+        "missing_env": missing_secret_env,
+        "missing_secrets": missing_secret_env,
+        "missing_optional_env": [name for name in missing_declared_env if name not in secret_env],
+        "can_run_trial": not missing_secret_env,
+        "can_register": not missing_secret_env,
+        "block_registration": bool(require_config and missing_secret_env),
+        "auth": auth,
+    }
+
+
+def _auth_validation_report(manifest: dict[str, Any], script_code: str, *, require_auth_config: bool = True) -> dict[str, Any]:
+    declared_env = set(_declared_env_names(manifest))
+    secret_env = set(_auth_secret_env_names(manifest))
+    used_env = set(_script_env_usage(script_code)) - _RUNTIME_ENV_NAMES
+    undeclared = sorted(name for name in used_env if name not in declared_env)
+    gate = _auth_gate_for_manifest(manifest, require_config=require_auth_config)
+    auth = _normalize_auth_plan(manifest)
+    errors: list[str] = []
+    if undeclared:
+        errors.append("script reads undeclared environment variables: " + ", ".join(undeclared))
+    if require_auth_config and gate.get("missing_secrets"):
+        errors.append("required auth configuration is missing: " + ", ".join(gate["missing_secrets"]))
+    warnings: list[str] = []
+    if secret_env and not (used_env & secret_env):
+        warnings.append("manifest declares auth secrets, but script does not read them; confirm whether auth is actually needed.")
+    unused_optional = sorted(name for name in declared_env - secret_env if name not in used_env)
+    if unused_optional:
+        warnings.append("declared non-secret env variables are not used by script: " + ", ".join(unused_optional))
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "used_env": sorted(used_env),
+        "declared_env": sorted(declared_env),
+        "declared_secret_env": sorted(secret_env),
+        "undeclared_env": undeclared,
+        "auth_gate": gate,
+        "script_uses_auth": bool(used_env & secret_env),
+        "planner_declared_auth": bool(auth.get("required") in {"yes", "unknown"} or secret_env),
+    }
+
+
+def _extract_env_values_from_payload(payload: dict[str, Any], manifest: dict[str, Any] | None = None) -> dict[str, str]:
+    data = dict(payload or {})
+    manifest = manifest if isinstance(manifest, dict) else {}
+    declared = _declared_env_names(manifest)
+    env_values: dict[str, str] = {}
+    def put(name: str, value: Any) -> None:
+        if value is None:
+            return
+        text = str(value)
+        if not text or text in {"***", "********", "<redacted>"}:
+            return
+        env_values[_env_name(name)] = text
+    for key in ("env", "secrets", "secret_values", "auth_config"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            for name, secret in value.items():
+                put(str(name), secret)
+    config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    for name in declared:
+        if name in config:
+            put(name, config.get(name))
+    single_value = data.get("secret_value") or data.get("api_key") or data.get("token") or data.get("password")
+    explicit_env = data.get("secret_env") or data.get("env_name") or data.get("api_key_env") or data.get("token_env")
+    if single_value:
+        if explicit_env:
+            put(str(explicit_env), single_value)
+        elif len(declared) == 1:
+            put(declared[0], single_value)
+    return env_values
+
+
+def _apply_env_values(env_values: dict[str, str]) -> None:
+    for name, value in (env_values or {}).items():
+        if name and value:
+            os.environ[_env_name(name)] = str(value)
+
+
+def safe_adapter_path_for_tool_name(tool_name: str) -> str:
+    path = (CUSTOM_TOOL_ADAPTER_DIR / f"{_slug(tool_name)}.py").resolve()
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _safe_adapter_module_path_for_name(tool_name: str) -> Path:
+    return (CUSTOM_TOOL_ADAPTER_DIR / f"{_slug(tool_name)}.py").resolve()
+
+
+# Registry / snippets compatibility functions.
 def _function_from_dict(data: dict[str, Any]) -> ToolFunctionManifest:
     known = {field.name for field in dataclasses_fields(ToolFunctionManifest)}
     payload = {key: value for key, value in (data or {}).items() if key in known}
+    payload.setdefault("function_name", "run")
+    payload.setdefault("import_path", "")
+    payload.setdefault("short_description", "")
+    payload.setdefault("when_to_use", "")
+    payload.setdefault("signature", "run(payload: dict, config: dict | None = None) -> dict")
     return ToolFunctionManifest(**payload)
 
 
 def _snippet_from_dict(data: dict[str, Any]) -> ToolSnippet:
     known = {field.name for field in dataclasses_fields(ToolSnippet)}
     payload = {key: value for key, value in (data or {}).items() if key in known}
-    if not payload.get("id"):
-        payload["id"] = _slug(str(payload.get("title") or "snippet"), fallback="snippet")
-    if not payload.get("title"):
-        payload["title"] = str(payload["id"]).replace("_", " ").title()
+    payload.setdefault("id", _slug(str(payload.get("title") or "snippet"), fallback="snippet"))
+    payload.setdefault("title", str(payload["id"]).replace("_", " ").title())
     if payload.get("kind") not in _ALLOWED_SNIPPET_KINDS:
         payload["kind"] = "minimal_usage"
     if not isinstance(payload.get("applies_to"), dict):
         payload["applies_to"] = {}
-    for key in ("roles", "capabilities", "failure_layers"):
-        values = payload["applies_to"].get(key, [])
-        payload["applies_to"][key] = [str(item) for item in values if item] if isinstance(values, list) else []
     for key in ("expected_input_shape", "expected_output_shape"):
         if not isinstance(payload.get(key), dict):
             payload[key] = {}
     for key in ("anti_patterns", "requires"):
-        payload[key] = [str(item) for item in payload.get(key, []) if item] if isinstance(payload.get(key), list) else []
+        if not isinstance(payload.get(key), list):
+            payload[key] = []
+        payload[key] = [str(item) for item in payload[key] if str(item)]
     if payload.get("usage_policy") not in _ALLOWED_USAGE_POLICIES:
         payload["usage_policy"] = "self_implementation_allowed"
     try:
         payload["priority"] = int(payload.get("priority") or 0)
-    except (TypeError, ValueError):
+    except Exception:
         payload["priority"] = 0
     return ToolSnippet(**payload)
 
@@ -1011,6 +845,33 @@ def _capability_from_dict(data: dict[str, Any]) -> ToolCapability:
         payload["enabled_by_default"] = bool(payload.pop("enabled"))
     if "allowed_roles" in payload and "roles" not in payload:
         payload["roles"] = list(payload.get("allowed_roles") or [])
+    if "tool_name" in payload and "name" not in payload:
+        payload["name"] = payload.get("tool_name")
+    name = _slug(str(payload.get("name") or payload.get("tool_name") or "custom_tool"))
+    payload["name"] = name
+    payload.setdefault("display_name", str(payload.get("description") or name.replace("_", " ").title()))
+    payload.setdefault("category", "custom")
+    payload.setdefault("roles", ["generic_script"])
+    payload.setdefault("tool_type", "python_script")
+    payload.setdefault("adapter_path", safe_adapter_path_for_tool_name(name))
+    payload.setdefault("created_by", "user")
+    payload["input_schema"] = _canonical_schema(payload.get("input_schema"), fallback_properties={}, required=[])
+    payload["output_schema"] = _canonical_schema(payload.get("output_schema"), fallback_properties={"success": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}, required=["success"])
+    payload = _sync_auth_into_manifest(payload, None)
+    if not functions:
+        adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
+        functions = [{
+            "function_name": name,
+            "import_path": adapter_import,
+            "short_description": str(payload.get("description") or payload.get("display_name") or name),
+            "when_to_use": str(payload.get("description") or f"Use {name}."),
+            "signature": f"{name}(payload: dict) -> dict",
+            "input_schema": payload["input_schema"],
+            "output_schema": payload["output_schema"],
+            "return_contract": "Returns JSON-serializable dict from generated python_script run(payload, config=None).",
+            "allowed_roles": payload.get("roles") or ["generic_script"],
+            "required_capabilities": payload.get("required_capabilities") or ["deterministic_execution"],
+        }]
     known = {field.name for field in dataclasses_fields(ToolCapability)}
     payload = {key: value for key, value in payload.items() if key in known}
     payload["functions"] = [_function_from_dict(item) for item in functions if isinstance(item, dict)]
@@ -1022,7 +883,13 @@ def _capability_to_registry_record(capability: ToolCapability) -> dict[str, Any]
     data = asdict(capability)
     data["enabled"] = data.pop("enabled_by_default")
     data["allowed_roles"] = capability.allowed_roles or capability.roles
+    data["runtime_type"] = "python_script"
     return data
+
+
+def _with_overrides(capability: ToolCapability) -> ToolCapability:
+    override = _TOOL_OVERRIDES.get(capability.name, {})
+    return replace(capability, enabled_by_default=override.get("enabled", capability.enabled_by_default), allow_creator_use=override.get("allow_creator_use", capability.allow_creator_use))
 
 
 def _load_registered_tools_from_disk() -> None:
@@ -1036,563 +903,38 @@ def _load_registered_tools_from_disk() -> None:
     if not isinstance(records, list):
         return
     for record in records:
-        if not isinstance(record, dict):
-            continue
-        try:
-            cap = _capability_from_dict(record)
-        except Exception:
-            continue
-        if cap.name:
-            _REGISTERED_TOOL_CAPABILITIES[cap.name] = cap
+        if isinstance(record, dict):
+            try:
+                cap = _capability_from_dict(record)
+                _REGISTERED_TOOL_CAPABILITIES[cap.name] = cap
+            except Exception:
+                continue
 
 
 def persist_registered_tools() -> None:
     CUSTOM_TOOL_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
     records = [_capability_to_registry_record(cap) for cap in _REGISTERED_TOOL_CAPABILITIES.values()]
-    CUSTOM_TOOL_REGISTRY_PATH.write_text(
-        json.dumps({"tools": records}, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    CUSTOM_TOOL_REGISTRY_PATH.write_text(json.dumps({"tools": records}, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
-
-def _runtime_helper_names() -> set[str]:
-    global _RUNTIME_HELPERS_CACHE
-    if _RUNTIME_HELPERS_CACHE is not None:
-        return set(_RUNTIME_HELPERS_CACHE)
-
-    try:
-        runtime_module = importlib.import_module("backend.services.skill_runtime")
-    except Exception:
-        runtime_module = None
-
-    if runtime_module is not None:
-        _RUNTIME_HELPERS_CACHE = {
-            helper
-            for capability in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]
-            for helper in capability.helper_imports
-            if hasattr(runtime_module, helper)
-        }
-        return set(_RUNTIME_HELPERS_CACHE)
-
-    # Fallback for damaged import environments: keep the old static scan, but
-    # include imported/re-exported helper aliases as well as local definitions.
-    runtime_path = Path(__file__).with_name("skill_runtime.py")
-    try:
-        tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
-    except OSError:
-        _RUNTIME_HELPERS_CACHE = set()
-        return set()
-
-    helper_names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            helper_names.add(node.name)
-        elif isinstance(node, ast.ImportFrom):
-            helper_names.update(alias.asname or alias.name for alias in node.names)
-    _RUNTIME_HELPERS_CACHE = helper_names
-    return set(_RUNTIME_HELPERS_CACHE)
-
-
-
-@dataclass(frozen=True)
-class ToolResolveResult:
-    allowed_tools: list[str] = field(default_factory=list)
-    allowed_helper_imports: list[str] = field(default_factory=list)
-    required_dependencies: list[str] = field(default_factory=list)
-    forbidden_imports: list[str] = field(default_factory=list)
-    tool_function_cards: list[str] = field(default_factory=list)
-    tool_snippets: list[dict[str, Any]] = field(default_factory=list)
-    tool_usage_prompt: str = ""
-    warnings: list[str] = field(default_factory=list)
-
-
-
-def _schema_summary(schema: dict[str, Any]) -> str:
-    if not schema:
-        return "{}"
-    return json.dumps(schema, ensure_ascii=False, sort_keys=True)
-
-
-
-def _default_snippet_for_function(capability: ToolCapability, fn: ToolFunctionManifest) -> ToolSnippet:
-    import_stmt = f"from {fn.import_path} import {fn.function_name}" if fn.import_path else f"import {fn.function_name}"
-    return ToolSnippet(
-        id=f"{fn.function_name}.minimal_usage",
-        title=f"Use {fn.function_name}",
-        kind="minimal_usage",
-        applies_to={
-            "roles": fn.allowed_roles or capability.allowed_roles or capability.roles,
-            "capabilities": fn.required_capabilities or capability.required_capabilities or [capability.name],
-            "failure_layers": ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing"],
-        },
-        description=fn.when_to_use or fn.short_description,
-        code=f"{import_stmt}\n\nresult = {fn.function_name}(... )\nreturn result",
-        expected_input_shape=fn.input_schema or capability.input_schema,
-        expected_output_shape=fn.output_schema or capability.output_schema,
-        return_rule=fn.return_contract or "Return the helper result directly if it is already a platform stdout dict.",
-        anti_patterns=fn.common_mistakes or ["Do not guess parameters.", "Do not wrap a platform stdout dict inside the wrong field."],
-        requires=fn.required_capabilities or capability.required_capabilities or [capability.name],
-        usage_policy=fn.usage_policy or capability.usage_policy,
-        priority=10,
-    )
-
-
-def snippets_for_tool(capability: ToolCapability) -> list[ToolSnippet]:
-    snippets = list(capability.snippets)
-    if snippets:
-        return snippets
-    functions = list(capability.functions)
-    if not functions:
-        functions = [
-            ToolFunctionManifest(
-                function_name=helper,
-                import_path=capability.helper_module,
-                short_description=capability.prompt_guidance or capability.display_name,
-                when_to_use=f"Use for capability {capability.name} when role/capability resolution allows it.",
-                signature=f"{helper}(...) -> dict",
-                input_schema=capability.input_schema,
-                output_schema=capability.output_schema,
-                return_contract="Return the helper result directly when it already contains platform stdout fields; do not wrap helper result in the wrong key.",
-                usage_policy=capability.usage_policy,
-                allowed_roles=capability.allowed_roles or capability.roles,
-                required_capabilities=capability.required_capabilities or [capability.name],
-            )
-            for helper in capability.helper_imports
-        ]
-    return [_default_snippet_for_function(capability, fn) for fn in functions]
-
-
-def format_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> str:
-    anti = "\n".join(f"- {item}" for item in snippet.anti_patterns) or "- Follow the helper contract; do not guess parameters or return shape."
-    return "\n".join([
-        "[Tool Snippet]",
-        f"Tool: {capability.name}",
-        f"Snippet: {snippet.id} ({snippet.kind}, priority={snippet.priority})",
-        f"Use when: {snippet.description or snippet.title}",
-        "Correct usage:",
-        snippet.code.strip(),
-        "Expected input shape:",
-        _schema_summary(snippet.expected_input_shape),
-        "Expected return:",
-        _schema_summary(snippet.expected_output_shape),
-        f"Return rule: {snippet.return_rule or 'Return a JSON-serializable dict that matches the expected return.'}",
-        f"Usage policy: {snippet.usage_policy}",
-        "Do not:",
-        anti,
-    ])
-
-
-def validate_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> dict[str, Any]:
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", snippet.id or ""):
-        errors.append("snippet id must be 1-128 chars of letters, numbers, '_', '.', ':', or '-'")
-
-    if snippet.kind not in _ALLOWED_SNIPPET_KINDS:
-        errors.append(f"snippet kind must be one of {sorted(_ALLOWED_SNIPPET_KINDS)}")
-
-    if not (snippet.code or "").strip():
-        errors.append("snippet code is required")
-
-    if snippet.usage_policy not in _ALLOWED_USAGE_POLICIES:
-        errors.append("snippet usage_policy is invalid")
-
-    code = snippet.code or ""
-    imported_names: set[str] = set()
-
-    try:
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                imported_names.update(alias.asname or alias.name for alias in node.names)
-                root = (node.module or "").split(".")[0]
-                if root in _DANGEROUS_IMPORTS:
-                    errors.append(f"dangerous import is forbidden in snippet: {root}")
-
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".")[0]
-                    imported_names.add(alias.asname or alias.name.split(".")[-1])
-                    if root in _DANGEROUS_IMPORTS:
-                        errors.append(f"dangerous import is forbidden in snippet: {root}")
-
-    except SyntaxError as exc:
-        warnings.append(f"snippet is not a complete executable Python block: {exc}")
-
-    helpers = set(capability.helper_imports) | {fn.function_name for fn in capability.functions}
-
-    if helpers and not any(helper in code for helper in helpers):
-        errors.append("snippet code must reference at least one manifest helper/function name")
-
-    if imported_names and helpers and not (imported_names & helpers):
-        warnings.append("snippet imports do not include a declared manifest helper/function")
-
-    if re.search(r"(?:/tmp|/var|/etc|~[/\\]|[A-Za-z]:\\\\)", code):
-        errors.append("snippet must not write or direct outputs to dangerous absolute paths")
-
-    if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code):
-        errors.append("snippet appears to contain a hard-coded secret")
-
-    declared_outputs = _declared_output_field_names(capability.output_schema, required_only=False)
-    declared_required_outputs = _declared_output_field_names(capability.output_schema, required_only=True)
-
-    for fn in capability.functions:
-        declared_outputs.update(_declared_output_field_names(fn.output_schema, required_only=False))
-        declared_required_outputs.update(_declared_output_field_names(fn.output_schema, required_only=True))
-
-    snippet_outputs = _declared_output_field_names(snippet.expected_output_shape, required_only=False)
-    snippet_required_outputs = _declared_output_field_names(snippet.expected_output_shape, required_only=True)
-
-    if declared_required_outputs and snippet_outputs:
-        missing = sorted(declared_required_outputs - snippet_outputs)
-        if missing:
-            errors.append(
-                "snippet expected_output_shape is missing required manifest output fields: "
-                + ", ".join(missing)
-            )
-
-    if declared_outputs and snippet_outputs and not (declared_outputs & snippet_outputs):
-        warnings.append("snippet expected_output_shape has no overlap with manifest output_schema")
-
-    declared_inputs: set[str] = set()
-    declared_required_inputs: set[str] = set()
-    if capability.input_schema:
-        props = capability.input_schema.get("properties") if isinstance(capability.input_schema, dict) else {}
-        req = capability.input_schema.get("required") if isinstance(capability.input_schema, dict) else []
-        if isinstance(props, dict):
-            declared_inputs.update(str(key) for key in props.keys())
-        if isinstance(req, list):
-            declared_required_inputs.update(str(item) for item in req if isinstance(item, str))
-
-    for fn in capability.functions:
-        schema = fn.input_schema or {}
-        props = schema.get("properties") if isinstance(schema, dict) else {}
-        req = schema.get("required") if isinstance(schema, dict) else []
-        if isinstance(props, dict):
-            declared_inputs.update(str(key) for key in props.keys())
-        if isinstance(req, list):
-            declared_required_inputs.update(str(item) for item in req if isinstance(item, str))
-
-    snippet_inputs: set[str] = set()
-    schema = snippet.expected_input_shape or {}
-    props = schema.get("properties") if isinstance(schema, dict) else {}
-    if isinstance(props, dict):
-        snippet_inputs.update(str(key) for key in props.keys())
-
-    if declared_required_inputs and snippet_inputs:
-        missing_inputs = sorted(declared_required_inputs - snippet_inputs)
-        if missing_inputs:
-            errors.append(
-                "snippet expected_input_shape is missing required manifest input fields: "
-                + ", ".join(missing_inputs)
-            )
-
-    if snippet_required_outputs - snippet_outputs:
-        warnings.append("snippet required output fields are not present in snippet properties")
-
-    return {
-        "success": not errors,
-        "errors": sorted(set(errors)),
-        "warnings": sorted(set(warnings)),
-    }
-
-def _snippet_score(*, capability: ToolCapability, snippet: ToolSnippet, role: str, capabilities: list[str], tool_names: list[str], failure_layer: str | None, error_text: str | None) -> tuple[int, int, int, int, int, int]:
-    applies = snippet.applies_to or {}
-    snippet_caps = set(applies.get("capabilities") or snippet.requires or [])
-    snippet_roles = set(applies.get("roles") or [])
-    snippet_failures = set(applies.get("failure_layers") or [])
-    haystack = (error_text or "").lower()
-    helper_names = set(capability.helper_imports) | {fn.function_name for fn in capability.functions} | {capability.name}
-    capability_match = len(snippet_caps & set(capabilities))
-    role_match = 1 if role and role in snippet_roles else 0
-    failure_match = 1 if failure_layer and failure_layer in snippet_failures else 0
-    error_match = 1 if any(name.lower() in haystack for name in helper_names) else 0
-    minimal = 1 if snippet.kind in {"minimal_usage", "error_repair_usage"} else 0
-    tool_match = 1 if capability.name in tool_names or any(name in tool_names for name in helper_names) else 0
-    return (capability_match + tool_match, role_match, failure_match, error_match, int(snippet.priority or 0), minimal)
-
-
-def resolve_tool_snippets_for_context(
-    *,
-    role: str,
-    capabilities: list[str],
-    tool_names: list[str],
-    file_path: str,
-    failure_layer: str | None = None,
-    error_text: str | None = None,
-    max_snippets: int = 5,
-) -> list[dict[str, Any]]:
-    max_snippets = max(1, min(int(max_snippets or 5), 10))
-    candidates: list[tuple[tuple[int, int, int, int, int, int], ToolCapability, ToolSnippet]] = []
-    requested_tools = set(tool_names or [])
-    requested_caps = set(capabilities or [])
-    for cap in list_tool_capabilities():
-        status = tool_status(cap)
-        if not status.get("creator_available"):
-            continue
-        helper_names = set(cap.helper_imports) | {fn.function_name for fn in cap.functions}
-        if requested_tools and cap.name not in requested_tools and not (helper_names & requested_tools):
-            continue
-        if not requested_tools and requested_caps and cap.name not in requested_caps and not (set(cap.required_capabilities or [cap.name]) & requested_caps):
-            continue
-        if cap.roles and role and role not in cap.roles and cap.name not in {"file_output", "deterministic_execution"}:
-            # Still allow explicit error-text matches during repair.
-            haystack = (error_text or "").lower()
-            if not any(name.lower() in haystack for name in helper_names | {cap.name}):
-                continue
-        for snippet in snippets_for_tool(cap):
-            score = _snippet_score(
-                capability=cap,
-                snippet=snippet,
-                role=role,
-                capabilities=capabilities or [],
-                tool_names=tool_names or [],
-                failure_layer=failure_layer,
-                error_text=error_text,
-            )
-            if any(score[:4]) or not requested_tools:
-                candidates.append((score, cap, snippet))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return [
-        {"tool": cap.name, **asdict(snippet), "formatted": format_tool_snippet(cap, snippet)}
-        for _, cap, snippet in candidates[:max_snippets]
-    ]
-
-
-def tool_snippet_prompt(snippets: list[dict[str, Any]]) -> str:
-    if not snippets:
-        return "当前脚本可用工具 Snippets: 无"
-    return "当前脚本可用工具 Snippets（调用任何工具前必须优先参考；不要根据函数名猜参数或返回值；若 snippet 与猜测冲突，以 snippet 为准）：\n\n" + "\n\n---\n\n".join(str(item.get("formatted") or "") for item in snippets)
-
-
-def set_tool_snippets(name: str, snippets: list[ToolSnippet]) -> ToolCapability | None:
-    global BUILTIN_TOOL_CAPABILITIES
-    current = BUILTIN_TOOL_CAPABILITIES.get(name) or _REGISTERED_TOOL_CAPABILITIES.get(name)
-    if current is None:
-        return None
-    updated = replace(current, snippets=snippets, updated_at=_utc_now())
-    if name in BUILTIN_TOOL_CAPABILITIES:
-        BUILTIN_TOOL_CAPABILITIES[name] = updated
-    else:
-        _REGISTERED_TOOL_CAPABILITIES[name] = updated
-    return get_tool_capability(name)
-
-
-def function_cards_for_tool(capability: ToolCapability) -> list[str]:
-    """Return Creator prompt cards with function-level I/O and call contracts."""
-    functions = list(capability.functions)
-    if not functions:
-        functions = [
-            ToolFunctionManifest(
-                function_name=helper,
-                import_path=capability.helper_module,
-                short_description=capability.prompt_guidance or capability.display_name,
-                when_to_use=f"Use for capability {capability.name} when role/capability resolution allows it.",
-                signature=f"{helper}(...) -> dict",
-                input_schema=capability.input_schema,
-                output_schema=capability.output_schema,
-                return_contract="Return the helper result directly when it already contains platform stdout fields; do not wrap helper result in the wrong key.",
-                example_call=f"from {capability.helper_module} import {helper}\nresult = {helper}(...)\nreturn result",
-                example_stdout="return result",
-                common_mistakes=[
-                    "Do not guess parameters; inspect the signature or follow the generated adapter contract.",
-                    "Do not wrap a platform stdout dict inside another unrelated field.",
-                ],
-                trial_mode_behavior=str(capability.trial_mode),
-                safety_notes=[capability.prompt_guidance] if capability.prompt_guidance else [],
-                required_env=capability.required_env,
-                required_secrets=capability.required_secrets,
-                usage_policy=capability.usage_policy,
-                allowed_roles=capability.allowed_roles or capability.roles,
-                required_capabilities=capability.required_capabilities or [capability.name],
-                forbidden_imports=capability.forbidden_direct_imports,
-            )
-            for helper in capability.helper_imports
-        ]
-    cards: list[str] = []
-    for fn in functions:
-        mistakes = "\n".join(f"  - {item}" for item in fn.common_mistakes) or "  - None declared"
-        safety = "\n".join(f"  - {item}" for item in fn.safety_notes) or "  - Follow platform sandbox and OUTPUT_DIR rules."
-        import_stmt = f"from {fn.import_path} import {fn.function_name}" if fn.import_path else f"import {fn.function_name}"
-        cards.append(
-            "\n".join([
-                f"Tool: {capability.name}.{fn.function_name}",
-                f"Purpose: {fn.short_description}",
-                f"When to use: {fn.when_to_use}",
-                f"Import: {import_stmt}",
-                f"Signature: {fn.signature}",
-                f"Input schema: {_schema_summary(fn.input_schema)}",
-                f"Output schema: {_schema_summary(fn.output_schema)}",
-                f"Return contract: {fn.return_contract}",
-                f"Example call: {fn.example_call}",
-                f"Example stdout/return: {fn.example_stdout or fn.example_return}",
-                "Common mistakes:",
-                mistakes,
-                f"Trial mode behavior: {fn.trial_mode_behavior}",
-                "Safety notes:",
-                safety,
-                f"Usage policy: {fn.usage_policy or capability.usage_policy}",
-                f"Allowed roles: {', '.join(fn.allowed_roles or capability.allowed_roles or capability.roles) if (fn.allowed_roles or capability.allowed_roles or capability.roles) else 'all'}",
-                f"Required capabilities: {', '.join(fn.required_capabilities or capability.required_capabilities or [capability.name])}",
-                f"Required env: {', '.join(fn.required_env or capability.required_env) if (fn.required_env or capability.required_env) else 'none'}",
-                f"Required secrets: {', '.join(fn.required_secrets or capability.required_secrets) if (fn.required_secrets or capability.required_secrets) else 'none'}",
-                f"Forbidden imports: {', '.join(fn.forbidden_imports or capability.forbidden_direct_imports) if (fn.forbidden_imports or capability.forbidden_direct_imports) else 'none'}",
-                f"Forbidden side effects: {', '.join(fn.forbidden_side_effects) if fn.forbidden_side_effects else 'none'}",
-            ])
-        )
-    return cards
-
-
-def _entry_capabilities(entry: Any) -> list[str]:
-    values: list[str] = []
-    for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
-        raw = getattr(entry, attr, None) if not isinstance(entry, dict) else entry.get(attr)
-        if isinstance(raw, list):
-            values.extend(str(item) for item in raw if item)
-    seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
-def _entry_role(entry: Any) -> str:
-    if isinstance(entry, dict):
-        return str(entry.get("role") or "")
-    return str(getattr(entry, "role", "") or "")
-
-
-def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
-    """Resolve Creator-usable helpers for a SkillPlan entry.
-
-    This is the pre-generation Tool Resolve step.  It is the only place that
-    converts role/capability declarations into helper names exposed to the
-    model.  Disabled tools, disallowed Creator tools, missing env/secret, and
-    missing runtime helpers are excluded before prompt construction.
-    """
-    role = _entry_role(entry)
-    capabilities = _entry_capabilities(entry)
-    allowed_tools: list[str] = []
-    allowed_helper_imports: list[str] = []
-    required_dependencies: list[str] = []
-    forbidden_imports: list[str] = []
-    guidance: list[str] = []
-    tool_function_cards: list[str] = []
-    warnings: list[str] = []
-
-    for capability in capabilities:
-        cap = get_tool_capability(capability)
-        if not cap:
-            warnings.append(f"unknown capability {capability!r} has no registered tool")
-            continue
-        status = tool_status(cap)
-        if not status["enabled"]:
-            warnings.append(f"tool {cap.name} is disabled")
-            continue
-        if not status["creator_available"]:
-            warnings.append(f"tool {cap.name} is not allowed for Creator use")
-            continue
-        if cap.roles and role and role not in cap.roles and capability not in {"file_output", "deterministic_execution"}:
-            warnings.append(f"tool {cap.name} is not allowed for role {role}")
-            continue
-        if status["missing_env"] or status["missing_secrets"]:
-            warnings.append(f"tool {cap.name} is not configured: missing env/secret")
-            continue
-        if cap.helper_imports and status["missing_runtime_helpers"] and cap.usage_policy == "helper_required":
-            warnings.append(f"tool {cap.name} missing required runtime helpers: {', '.join(status['missing_runtime_helpers'])}")
-            continue
-        allowed_tools.append(cap.name)
-        allowed_helper_imports.extend(status["runtime_helpers_available"] or cap.helper_imports)
-        required_dependencies.extend(cap.dependencies)
-        if cap.usage_policy == "helper_required":
-            forbidden_imports.extend(cap.forbidden_direct_imports)
-        tool_function_cards.extend(function_cards_for_tool(cap))
-        if cap.prompt_guidance:
-            guidance.append(f"- {cap.name}: {cap.prompt_guidance}")
-
-    # de-duplicate preserving order
-    def dedupe(items: list[str]) -> list[str]:
-        seen: set[str] = set(); out: list[str] = []
-        for item in items:
-            if item and item not in seen:
-                seen.add(item); out.append(item)
-        return out
-
-    allowed_helper_imports = dedupe(allowed_helper_imports)
-    allowed_tools = dedupe(allowed_tools)
-    required_dependencies = dedupe(required_dependencies)
-    forbidden_imports = dedupe(forbidden_imports)
-    helper_line = (
-        "可优先使用的 backend.services.skill_runtime helper: "
-        + (", ".join(allowed_helper_imports) if allowed_helper_imports else "无")
-        + "。"
-    )
-    policy_lines = [
-        f"- {cap.name}: usage_policy={cap.usage_policy}; allowed_roles={', '.join(cap.roles) if cap.roles else 'all'}; "
-        f"required_env={', '.join(cap.required_env) if cap.required_env else '无'}; "
-        f"required_secrets={', '.join(cap.required_secrets) if cap.required_secrets else '无'}; "
-        f"dependencies={', '.join(cap.dependencies) if cap.dependencies else '无'}; "
-        f"required_capabilities={', '.join(cap.required_capabilities or [cap.name])}; "
-        f"optional_capabilities={', '.join(cap.optional_capabilities) if cap.optional_capabilities else '无'}; "
-        f"forbidden_capabilities={', '.join(cap.forbidden_capabilities or _ROLE_FORBIDDEN_CAPABILITIES.get(role, [])) if (cap.forbidden_capabilities or _ROLE_FORBIDDEN_CAPABILITIES.get(role, [])) else '无'}"
-        for cap_name in allowed_tools
-        for cap in [get_tool_capability(cap_name)]
-        if cap is not None
-    ]
-    forbid_line = (
-        "helper_required 工具禁止直接 import/调用底层库或绕过 helper: " + ", ".join(forbidden_imports) + "。"
-        if forbidden_imports else
-        "除 usage_policy=helper_required 的能力外，helper 是可用/推荐工具，不强制实现方式；最终以 E2E stdout/artifact 合同为准。"
-    )
-    resolved_snippets = resolve_tool_snippets_for_context(
-        role=role,
-        capabilities=capabilities,
-        tool_names=allowed_tools + allowed_helper_imports,
-        file_path=str(getattr(entry, "path", "") if not isinstance(entry, dict) else entry.get("path", "")),
-        max_snippets=5,
-    ) if allowed_tools or allowed_helper_imports else []
-    snippet_prompt = tool_snippet_prompt(resolved_snippets)
-    cards_text = "\n\n".join(tool_function_cards)
-    card_header = "当前脚本可用工具 Function Cards（作为 schema 补充；真实调用优先模仿 Tool Snippets，不要只凭函数名猜参数/返回值）:" if tool_function_cards else "当前脚本可用工具 Function Cards: 无"
-    tool_usage_prompt = "\n".join([helper_line, forbid_line, *policy_lines, *guidance, snippet_prompt, card_header, cards_text])
-    return ToolResolveResult(
-        allowed_tools=allowed_tools,
-        allowed_helper_imports=allowed_helper_imports,
-        required_dependencies=required_dependencies,
-        forbidden_imports=forbidden_imports,
-        tool_function_cards=tool_function_cards,
-        tool_snippets=resolved_snippets,
-        tool_usage_prompt=tool_usage_prompt,
-        warnings=warnings,
-    )
 
 def list_tool_capabilities() -> list[ToolCapability]:
     return [_with_overrides(cap) for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]]
 
 
 def get_tool_capability(name: str) -> ToolCapability | None:
-    key = (name or "").strip()
-    cap = BUILTIN_TOOL_CAPABILITIES.get(key) or _REGISTERED_TOOL_CAPABILITIES.get(key)
+    cap = BUILTIN_TOOL_CAPABILITIES.get((name or "").strip()) or _REGISTERED_TOOL_CAPABILITIES.get((name or "").strip())
     return _with_overrides(cap) if cap else None
 
 
 def register_tool_capability(capability: ToolCapability) -> ToolCapability:
-    """Register a user/admin-provided Creator tool capability in process memory."""
     if not capability.name:
         raise ValueError("registered tool capability name is required")
     _REGISTERED_TOOL_CAPABILITIES[capability.name] = capability
-    global _RUNTIME_HELPERS_CACHE
-    _RUNTIME_HELPERS_CACHE = None
     return capability
 
 
 def clear_registered_tool_capabilities() -> None:
     _REGISTERED_TOOL_CAPABILITIES.clear()
-    global _RUNTIME_HELPERS_CACHE
-    _RUNTIME_HELPERS_CACHE = None
 
 
 def set_tool_capability_override(name: str, *, enabled: bool | None = None, allow_creator_use: bool | None = None) -> ToolCapability | None:
@@ -1607,22 +949,8 @@ def set_tool_capability_override(name: str, *, enabled: bool | None = None, allo
     return get_tool_capability(name)
 
 
-def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tuple[list[str], list[str]]:
-    role = (role or "").strip()
-    capabilities = list_tool_capabilities()
-    if only_creator_enabled:
-        capabilities = [
-            cap
-            for cap in capabilities
-            if cap.enabled_by_default and cap.allow_creator_use
-        ]
-    required = [cap.name for cap in capabilities if role in cap.roles]
-    return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get(role, []))
-
-
 def roles() -> list[str]:
-    values = {role for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()] for role in cap.roles}
-    return sorted(values)
+    return sorted({role for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()] for role in cap.roles})
 
 
 def get_script_roles() -> list[str]:
@@ -1645,243 +973,1095 @@ def get_role_pattern() -> str:
     return role_regex()
 
 
+def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tuple[list[str], list[str]]:
+    caps = list_tool_capabilities()
+    if only_creator_enabled:
+        caps = [cap for cap in caps if cap.enabled_by_default and cap.allow_creator_use]
+    required = [cap.name for cap in caps if (role or "").strip() in cap.roles]
+    if role == "generic_script" and "deterministic_execution" not in required:
+        required.append("deterministic_execution")
+    return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
+
+
 def validate_capability_names(names: list[str]) -> list[str]:
     known = set(BUILTIN_TOOL_CAPABILITIES) | set(_REGISTERED_TOOL_CAPABILITIES)
     return [name for name in names if name not in known]
 
 
+def tool_status(capability: ToolCapability) -> dict[str, Any]:
+    cap = _with_overrides(capability)
+    missing_dependencies = []
+    for dep in cap.dependencies or []:
+        record = _normalize_dependency_record(dep)
+        if record.get("imports") and not _dependency_available(record):
+            missing_dependencies.append(record.get("package") or ",".join(record.get("imports") or []))
+    missing_env = [name for name in cap.required_env if not os.environ.get(name)]
+    missing_secrets = [name for name in cap.required_secrets if not os.environ.get(name)]
+    return {
+        **_capability_to_registry_record(cap),
+        "enabled": cap.enabled_by_default,
+        "creator_available": bool(cap.enabled_by_default and cap.allow_creator_use),
+        "configured": not missing_env and not missing_secrets,
+        "missing_env": missing_env,
+        "missing_secrets": missing_secrets,
+        "missing_dependencies": missing_dependencies,
+        "missing_runtime_helpers": [],
+        "runtime_helpers_available": [],
+        "runtime_type": "python_script",
+    }
+
+
+def snippets_for_tool(capability: ToolCapability) -> list[ToolSnippet]:
+    if capability.snippets:
+        return list(capability.snippets)
+    fn = capability.functions[0] if capability.functions else _function_from_dict({})
+    return [ToolSnippet(
+        id=f"{capability.name}.minimal_usage",
+        title=f"Use {capability.display_name}",
+        applies_to={"roles": capability.roles, "capabilities": [capability.name], "failure_layers": ["final_platform_output_value_invalid", "artifact_missing"]},
+        description=fn.when_to_use or capability.prompt_guidance or capability.display_name,
+        code=f"from {fn.import_path} import {fn.function_name}\n\npayload = {{...}}\nresult = {fn.function_name}(payload)\nreturn result",
+        expected_input_shape=fn.input_schema or capability.input_schema,
+        expected_output_shape=fn.output_schema or capability.output_schema,
+        return_rule="Return the generated tool result directly.",
+        anti_patterns=["Do not pass secrets in payload.", "Do not write outside TOOL_OUTPUT_DIR/OUTPUT_DIR."],
+        requires=[capability.name],
+        usage_policy=capability.usage_policy,
+        priority=80,
+    )]
+
+
+def format_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> str:
+    anti = "\n".join(f"- {item}" for item in snippet.anti_patterns) or "- Follow the tool contract."
+    return "\n".join([
+        "[Tool Snippet]",
+        f"Tool: {capability.name}",
+        f"Snippet: {snippet.id} ({snippet.kind}, priority={snippet.priority})",
+        f"Use when: {snippet.description or snippet.title}",
+        "Correct usage:",
+        snippet.code.strip(),
+        "Expected input shape:",
+        json.dumps(snippet.expected_input_shape or {}, ensure_ascii=False, sort_keys=True),
+        "Expected return:",
+        json.dumps(snippet.expected_output_shape or {}, ensure_ascii=False, sort_keys=True),
+        f"Return rule: {snippet.return_rule or 'Return a JSON-serializable dict.'}",
+        "Do not:",
+        anti,
+    ])
+
+
+def validate_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", snippet.id or ""):
+        errors.append("snippet id must be 1-128 chars of letters, numbers, '_', '.', ':', or '-'")
+    if snippet.kind not in _ALLOWED_SNIPPET_KINDS:
+        errors.append(f"snippet kind must be one of {sorted(_ALLOWED_SNIPPET_KINDS)}")
+    if not (snippet.code or "").strip():
+        errors.append("snippet code is required")
+    try:
+        ast.parse(snippet.code or "pass")
+    except SyntaxError as exc:
+        warnings.append(f"snippet is not a complete executable Python block: {exc}")
+    return {"success": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings))}
+
+
+def set_tool_snippets(name: str, snippets: list[ToolSnippet]) -> ToolCapability | None:
+    current = BUILTIN_TOOL_CAPABILITIES.get(name) or _REGISTERED_TOOL_CAPABILITIES.get(name)
+    if current is None:
+        return None
+    updated = replace(current, snippets=snippets, updated_at=_utc_now())
+    if name in BUILTIN_TOOL_CAPABILITIES:
+        BUILTIN_TOOL_CAPABILITIES[name] = updated
+    else:
+        _REGISTERED_TOOL_CAPABILITIES[name] = updated
+    return get_tool_capability(name)
+
+
+def function_cards_for_tool(capability: ToolCapability) -> list[str]:
+    return [f"Tool: {capability.name}.{fn.function_name}\nSignature: {fn.signature}\nRuntime: python_script" for fn in capability.functions]
+
+
+def resolve_tool_snippets_for_context(*, role: str, capabilities: list[str], tool_names: list[str], file_path: str, failure_layer: str | None = None, error_text: str | None = None, max_snippets: int = 5) -> list[dict[str, Any]]:
+    requested = set(tool_names or []) | set(capabilities or [])
+    out: list[dict[str, Any]] = []
+    for cap in list_tool_capabilities():
+        if requested and cap.name not in requested and not any(fn.function_name in requested for fn in cap.functions):
+            continue
+        if role and cap.roles and role not in cap.roles and not requested:
+            continue
+        for snippet in snippets_for_tool(cap):
+            out.append({"tool": cap.name, **asdict(snippet), "formatted": format_tool_snippet(cap, snippet)})
+            if len(out) >= max(1, min(int(max_snippets or 5), 10)):
+                return out
+    return out
+
+
+def tool_snippet_prompt(snippets: list[dict[str, Any]]) -> str:
+    if not snippets:
+        return "当前脚本可用工具 Snippets: 无"
+    return "当前脚本可用工具 Snippets：\n\n" + "\n\n---\n\n".join(str(item.get("formatted") or "") for item in snippets)
+
+
+def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
+    role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
+    caps = []
+    for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
+        raw = entry.get(attr) if isinstance(entry, dict) else getattr(entry, attr, None)
+        if isinstance(raw, list):
+            caps.extend(str(item) for item in raw if item)
+    allowed_tools = []
+    dependencies: list[str] = []
+    warnings: list[str] = []
+    for name in caps:
+        cap = get_tool_capability(name)
+        if not cap:
+            warnings.append(f"unknown capability {name!r}")
+            continue
+        if cap.roles and role and role not in cap.roles and name != "file_output":
+            warnings.append(f"tool {name} is not allowed for role {role}")
+            continue
+        allowed_tools.append(name)
+        for dep in cap.dependencies or []:
+            record = _normalize_dependency_record(dep)
+            if record.get("package"):
+                dependencies.append(record["package"])
+    snippets = resolve_tool_snippets_for_context(role=role, capabilities=allowed_tools, tool_names=allowed_tools, file_path="", max_snippets=5)
+    return ToolResolveResult(
+        allowed_tools=allowed_tools,
+        allowed_helper_imports=[],
+        required_dependencies=sorted(set(dependencies)),
+        forbidden_imports=[],
+        tool_function_cards=[],
+        tool_snippets=snippets,
+        tool_usage_prompt="通用工具平台：coder 生成 python_script，后端 runner 只负责执行和校验。\n" + tool_snippet_prompt(snippets),
+        warnings=warnings,
+    )
+
 
 def build_tool_manifest_draft(description: dict[str, Any]) -> dict[str, Any]:
-    '''Deterministically draft a complete function-level manifest from NL form fields.'''
+    description = dict(description or {})
     name = _slug(str(description.get("tool_name") or description.get("name") or description.get("display_name") or "custom_tool"))
     display_name = str(description.get("display_name") or description.get("tool_name") or name.replace("_", " ").title())
-    tool_type = str(description.get("tool_type") or "python_helper")
-    output_generates_file = bool(description.get("generates_file"))
-    safety_level = "high" if description.get("high_risk") else ("medium" if description.get("needs_external_network") or description.get("needs_secret") else "low")
-    usage_policy = "helper_required" if safety_level == "high" else "helper_preferred"
-    roles = [str(item) for item in description.get("allowed_roles") or [] if item] or ["generic_script", "composite_generator"]
-    capability = _slug(str(description.get("capability") or name))
-    input_schema = description.get("input_schema") if isinstance(description.get("input_schema"), dict) else {
-        "payload": {"type": "object", "required": True, "description": str(description.get("input_description") or "Tool input payload.")}
+    input_schema = _canonical_schema(description.get("input_schema"), fallback_properties={"payload": {"type": "object", "description": str(description.get("input_description") or "Tool input payload.")}}, required=[])
+    output_schema = _canonical_schema(description.get("output_schema"), fallback_properties={"success": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}, required=["success"])
+    permissions = description.get("permissions") if isinstance(description.get("permissions"), dict) else {
+        "network": bool(description.get("needs_external_network") or description.get("allow_external_network")),
+        "read_files": bool(description.get("reads_file") or description.get("needs_file_input")),
+        "write_files": bool(description.get("generates_file")),
+        "subprocess": bool(description.get("needs_subprocess")),
+        "env": [str(item) for item in (description.get("required_env") or []) if str(item).strip()],
+        "timeout_seconds": int(description.get("timeout_seconds") or 30),
     }
-    output_schema = description.get("output_schema") if isinstance(description.get("output_schema"), dict) else {
-        "result": {"type": "object", "description": str(description.get("output_description") or "Tool result.")}
-    }
-    if output_generates_file:
-        output_schema.setdefault("file_paths", {"type": "array[string]", "description": "Generated files under OUTPUT_DIR."})
-        output_schema.setdefault("file_outputs", {"type": "array[object]", "description": "Platform downloadable file metadata."})
+    artifact_policy = description.get("artifact_policy") if isinstance(description.get("artifact_policy"), dict) else {"file_fields": ["file_paths", "file_outputs"] if permissions.get("write_files") else []}
+    roles_value = [str(item) for item in description.get("allowed_roles") or [] if item] or ["generic_script"]
     adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
-    return {
-        "name": name, "display_name": display_name, "category": str(description.get("category") or ("document" if output_generates_file else "custom")),
-        "capability": capability, "tool_type": tool_type if tool_type in _ALLOWED_TOOL_TYPES else "custom_adapter", "usage_policy": usage_policy,
-        "allowed_roles": roles, "roles": roles, "required_capabilities": [capability],
-        "required_env": [str(item) for item in description.get("required_env") or [] if item],
-        "required_secrets": [str(item) for item in description.get("required_secrets") or [] if item] + (["TOOL_API_KEY"] if description.get("needs_secret") else []),
-        "dependencies": [str(item) for item in description.get("dependencies") or [] if item], "safety_level": safety_level,
-        "enabled": False, "approval_status": "draft", "test_status": "untested", "adapter_path": f"backend/services/runtime_tools/custom_tools/{name}.py",
+    payload = {
+        "runtime_type": "python_script",
+        "name": name,
+        "tool_name": name,
+        "display_name": display_name,
+        "description": str(description.get("description") or description.get("short_description") or display_name),
+        "category": str(description.get("category") or "custom"),
+        "tool_type": "python_script",
+        "usage_policy": "self_implementation_allowed",
+        "allowed_roles": roles_value,
+        "roles": roles_value,
+        "required_capabilities": ["deterministic_execution"] + (["file_output"] if permissions.get("write_files") else []),
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "dependencies": description.get("dependencies") if isinstance(description.get("dependencies"), list) else [],
+        "permissions": permissions,
+        "auth": description.get("auth") if isinstance(description.get("auth"), dict) else {},
+        "artifact_policy": artifact_policy,
+        "enabled": False,
+        "enabled_by_default": False,
+        "allow_creator_use": False,
+        "approval_status": "draft",
+        "test_status": "untested",
+        "adapter_path": safe_adapter_path_for_tool_name(name),
         "version": "0.1.0",
         "functions": [{
-            "function_name": name, "import_path": adapter_import,
-            "short_description": str(description.get("short_description") or description.get("purpose") or description.get("description") or display_name),
+            "function_name": name,
+            "import_path": adapter_import,
+            "short_description": str(description.get("short_description") or description.get("description") or display_name),
             "when_to_use": str(description.get("when_to_use") or f"Use when a Creator script needs {display_name}."),
-            "signature": f"{name}(payload: dict) -> dict", "input_schema": input_schema, "output_schema": output_schema,
-            "return_contract": "Returns a dict conforming to output_schema. If file_outputs/file_paths are returned, paths must exist under OUTPUT_DIR.",
-            "example_call": f"from {adapter_import} import {name}\nresult = {name}(payload)\nreturn result",
-            "example_stdout": "return result", "example_return": "{...output_schema fields...}",
-            "common_mistakes": ["Do not guess parameter names; follow the signature and input_schema.", "Do not print or return secret values.", "Do not write files outside OUTPUT_DIR."],
-            "trial_mode_behavior": str(description.get("trial_mode_behavior") or "When SKILL_TRIAL_RUN=1, return a minimal deterministic mock that still satisfies output_schema."),
-            "safety_notes": ["Validate paths before reading or writing.", "Declare every env var, secret, network host, and side effect in the manifest."],
-            "required_env": [str(item) for item in description.get("required_env") or [] if item], "required_secrets": [str(item) for item in description.get("required_secrets") or [] if item],
-            "usage_policy": usage_policy, "allowed_roles": roles, "required_capabilities": [capability],
-            "forbidden_imports": sorted(_DANGEROUS_IMPORTS), "forbidden_side_effects": ["write outside OUTPUT_DIR", "leak secrets", "undeclared network access"],
+            "signature": f"{name}(payload: dict) -> dict",
+            "input_schema": input_schema,
+            "output_schema": output_schema,
+            "return_contract": "Returns the dict produced by generated python_script run(payload, config=None).",
+            "allowed_roles": roles_value,
+            "required_capabilities": ["deterministic_execution"],
         }],
-        "snippets": [{
-            "id": f"{name}.minimal_usage", "title": f"Use {display_name}", "kind": "minimal_usage",
-            "applies_to": {"roles": roles, "capabilities": [capability], "failure_layers": ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing"]},
-            "description": str(description.get("when_to_use") or f"Use when a Creator script needs {display_name}."),
-            "code": f"from {adapter_import} import {name}\n\npayload = {{...}}\nresult = {name}(payload)\nreturn result",
-            "expected_input_shape": input_schema, "expected_output_shape": output_schema,
-            "return_rule": "Return the adapter result directly when it already matches output_schema; do not wrap it in another field.",
-            "anti_patterns": ["Do not guess parameter names; pass a payload dict unless the signature says otherwise.", "Do not print or return secret values.", "Do not write files outside OUTPUT_DIR."],
-            "requires": [capability], "usage_policy": usage_policy, "priority": 80,
-        }],
+        "snippets": [],
     }
+    return _sync_auth_into_manifest(payload, description)
 
 
 def generate_adapter_code(manifest: dict[str, Any]) -> str:
-    cap = _capability_from_dict(manifest)
-    fn = cap.functions[0] if cap.functions else _function_from_dict(build_tool_manifest_draft(manifest)["functions"][0])
-    output_keys = list((fn.output_schema or {}).keys()) or ["result"]
-    input_keys = list((fn.input_schema or {}).keys())
-    return f"""# Generated adapter for registered Creator tool: {cap.name}.
-
-from __future__ import annotations
+    manifest = _sync_auth_into_manifest(dict(manifest or {}), None)
+    name = _slug(str(manifest.get("tool_name") or manifest.get("name") or "custom_tool"))
+    required_outputs = _schema_required(_canonical_schema(manifest.get("output_schema"), fallback_properties={"success": {"type": "boolean"}, "result": {}}, required=["success"]))
+    return f'''from __future__ import annotations
 
 import json
-import os
 import sys
-from pathlib import Path
 from typing import Any
 
 
-OUTPUT_KEYS = {output_keys!r}
-INPUT_KEYS = {input_keys!r}
-
-
-def _output_dir() -> Path:
-    root = Path(os.environ.get(\"OUTPUT_DIR\", \"outputs\")).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _safe_filename(value: str, default: str = \"result\") -> str:
-    cleaned = \"\".join(ch if ch.isalnum() or ch in (\"-\", \"_\", \".\") else \"_\" for ch in value.strip())
-    return (cleaned or default)[:120]
-
-
-def _build_file(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    output_dir = _output_dir()
-    title = str(payload.get(\"title\") or payload.get(\"name\") or \"result\")
-    suffix = str(payload.get(\"extension\") or payload.get(\"suffix\") or \"txt\").lstrip(\".\") or \"txt\"
-    if suffix not in {{\"txt\", \"md\", \"json\", \"csv\", \"html\"}}:
-        suffix = \"txt\"
-    path = (output_dir / f\"{{_safe_filename(title)}}.{{suffix}}\").resolve()
-    if output_dir not in path.parents and path != output_dir:
-        raise ValueError(\"generated file path must stay under OUTPUT_DIR\")
-    content = payload.get(\"content\") or payload.get(\"markdown\") or payload.get(\"text\") or json.dumps(payload, ensure_ascii=False, indent=2)
-    path.write_text(str(content), encoding=\"utf-8\")
-    return str(path), {{\"path\": str(path), \"mime_type\": \"text/plain\", \"label\": title}}
-
-
-def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    \"\"\"{fn.short_description}\"\"\"
+def run(payload: dict, config: dict | None = None) -> dict:
     payload = dict(payload or {{}})
-    if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\":
-        mock_result: dict[str, Any] = {{\"result\": {{\"ok\": True, \"trial_run\": True, \"payload_keys\": sorted(payload.keys())}}}}
-        for key in OUTPUT_KEYS:
-            mock_result.setdefault(key, [] if key.endswith(\"s\") else {{\"ok\": True, \"trial_run\": True}})
-        return mock_result
-    result: dict[str, Any] = {{\"result\": {{\"ok\": True, \"payload_keys\": sorted(payload.keys())}}}}
-    wants_file = any(key in OUTPUT_KEYS for key in (\"file_paths\", \"file_outputs\", \"path\", \"output_path\"))
-    if wants_file:
-        path, file_output = _build_file(payload)
-        result.update({{\"path\": path, \"output_path\": path, \"file_paths\": [path], \"file_outputs\": [file_output]}})
-    for key in OUTPUT_KEYS:
-        if key in result:
-            continue
-        if \"path\" in key:
-            path, _file_output = _build_file(payload)
-            result[key] = path
-        elif key.endswith(\"s\"):
-            result[key] = []
-        else:
-            result[key] = {{\"ok\": True}}
+    config = dict(config or {{}})
+    result: dict[str, Any] = {{"success": True, "result": {{"payload_keys": sorted(payload.keys())}}}}
+    for key in {required_outputs!r}:
+        result.setdefault(key, True if key == "success" else None)
     return result
 
 
-def {fn.function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return run(payload)
+def {name}(payload: dict | None = None) -> dict:
+    return run(dict(payload or {{}}), None)
 
 
 def main() -> None:
-    raw = sys.stdin.read().strip() or \"{{}}\"
-    payload = json.loads(raw)
-    print(json.dumps(run(payload), ensure_ascii=False))
+    raw = sys.stdin.read().strip() or "{{}}"
+    data = json.loads(raw)
+    if isinstance(data, dict) and "payload" in data:
+        payload = data.get("payload") or {{}}
+        config = data.get("config") or {{}}
+    else:
+        payload = data if isinstance(data, dict) else {{}}
+        config = {{}}
+    print(json.dumps(run(payload, config), ensure_ascii=False))
 
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     main()
-"""
+'''
 
-def _manifest_errors(manifest: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
+
+
+def _manifest_tool_function_name(manifest: dict[str, Any] | None) -> str:
+    manifest = manifest if isinstance(manifest, dict) else {}
+    return _slug(str(manifest.get("tool_name") or manifest.get("name") or "custom_tool"))
+
+
+def _top_level_function_names(script_code: str) -> set[str]:
     try:
-        cap = _capability_from_dict(manifest)
-    except Exception as exc:
-        return [f"manifest cannot be parsed: {exc}"]
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", cap.name or ""):
-        errors.append("name must be a valid Python identifier-like slug")
-    if cap.tool_type not in _ALLOWED_TOOL_TYPES:
-        errors.append(f"tool_type must be one of {sorted(_ALLOWED_TOOL_TYPES)}")
-    if cap.usage_policy not in _ALLOWED_USAGE_POLICIES:
-        errors.append("usage_policy is invalid")
-    if cap.safety_level not in {"low", "medium", "high", "standard"}:
-        errors.append("safety_level must be low/medium/high")
-    if not cap.functions:
-        errors.append("at least one function manifest is required")
-    for fn in cap.functions:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", fn.function_name or ""):
-            errors.append(f"invalid function_name: {fn.function_name!r}")
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", fn.import_path or ""):
-            errors.append(f"invalid import_path for {fn.function_name}")
-        if not fn.signature or "(" not in fn.signature or ")" not in fn.signature:
-            errors.append(f"signature is not parseable for {fn.function_name}")
-        if not isinstance(fn.input_schema, dict) or not fn.input_schema:
-            errors.append(f"input_schema is required for {fn.function_name}")
-        if not isinstance(fn.output_schema, dict) or not fn.output_schema:
-            errors.append(f"output_schema is required for {fn.function_name}")
-    for snippet in snippets_for_tool(cap):
-        result = validate_tool_snippet(cap, snippet)
-        errors.extend(f"snippet {snippet.id}: {err}" for err in result["errors"])
-    if set(cap.required_capabilities) & _HIGH_RISK_CAPABILITIES and cap.approval_status not in {"approved", "validated"}:
-        errors.append("high-risk tools must be validated and admin-approved before enabling")
-    return errors
+        tree = ast.parse(script_code or "")
+    except SyntaxError:
+        return set()
+    return {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+def _script_has_run_function(script_code: str) -> bool:
+    return "run" in _top_level_function_names(script_code or "")
 
 
-def _code_security_errors(code: str) -> list[str]:
+def _script_completeness_report(script_code: str, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Generic runtime completeness check.
+
+    This is not business-specific. It only verifies that a python_script still has
+    the platform-required internal run() entrypoint and the public tool function.
+    """
+    code = _strip_code_fence(script_code or "")
     errors: list[str] = []
+
+    if not code.strip():
+        return {
+            "complete": False,
+            "errors": ["script_code is empty"],
+            "function_names": [],
+            "line_count": 0,
+        }
+
     try:
-        tree = ast.parse(code or "")
+        ast.parse(code)
     except SyntaxError as exc:
-        return [f"adapter code syntax error: {exc}"]
-    for node in ast.walk(tree):
+        return {
+            "complete": False,
+            "errors": [f"script syntax error: {exc}"],
+            "function_names": [],
+            "line_count": len(code.splitlines()),
+        }
+
+    function_names = sorted(_top_level_function_names(code))
+    tool_fn = _manifest_tool_function_name(manifest)
+
+    if "run" not in function_names:
+        errors.append("script must define run(payload, config=None)")
+
+    if tool_fn and tool_fn not in function_names:
+        errors.append(f"script must define public tool function {tool_fn}(payload, config=None)")
+
+    try:
+        functions = _top_level_function_nodes(code)
+        public_node = functions.get(tool_fn)
+        if public_node is not None and _is_run_delegate_function(public_node, "run") and "run" not in function_names:
+            errors.append(f"public function {tool_fn} delegates to missing run()")
+    except Exception:
+        pass
+
+    return {
+        "complete": not errors,
+        "errors": sorted(set(errors)),
+        "function_names": function_names,
+        "line_count": len([line for line in code.splitlines() if line.strip()]),
+    }
+
+
+def _looks_like_incomplete_repair(
+    *,
+    original_code: str,
+    repaired_code: str,
+    manifest: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Detect repair outputs that would destroy the previous complete runtime.
+
+    A repair result must not replace the previous runtime if it removes run(),
+    removes the public entrypoint, or collapses a non-trivial script into a tiny
+    wrapper shell.
+    """
+    original = _strip_code_fence(original_code or "")
+    repaired = _strip_code_fence(repaired_code or "")
+
+    reasons: list[str] = []
+
+    original_report = _script_completeness_report(original, manifest)
+    repaired_report = _script_completeness_report(repaired, manifest)
+
+    if not repaired_report.get("complete"):
+        reasons.extend(repaired_report.get("errors") or [])
+
+    original_names = set(original_report.get("function_names") or [])
+    repaired_names = set(repaired_report.get("function_names") or [])
+    tool_fn = _manifest_tool_function_name(manifest)
+
+    if "run" in original_names and "run" not in repaired_names:
+        reasons.append("repair model removed required run(payload, config=None) entrypoint")
+
+    if tool_fn in original_names and tool_fn not in repaired_names:
+        reasons.append(f"repair model removed public tool function {tool_fn}")
+
+    original_line_count = int(original_report.get("line_count") or 0)
+    repaired_line_count = int(repaired_report.get("line_count") or 0)
+
+    if original_line_count >= 20 and repaired_line_count <= max(8, original_line_count // 4):
+        reasons.append("repair model output is much shorter than original runtime and may be an incomplete shell")
+
+    try:
+        functions = _top_level_function_nodes(repaired)
+        public_node = functions.get(tool_fn)
+        if public_node is not None and _is_run_delegate_function(public_node, "run") and "run" not in repaired_names:
+            reasons.append("repair model returned only a public wrapper that delegates to missing run()")
+    except Exception:
+        pass
+
+    return bool(reasons), sorted(set(reasons))
+
+def _ensure_named_entrypoint(script_code: str, manifest: dict[str, Any] | None) -> str:
+    code = _strip_code_fence(script_code or "")
+    if not code.strip():
+        return code
+    tool_fn = _manifest_tool_function_name(manifest)
+    names = _top_level_function_names(code)
+    if tool_fn in names:
+        return code.rstrip() + "\n"
+    suffix = "\n\n\ndef " + tool_fn + "(payload: dict | None = None, config: dict | None = None) -> dict:\n" \
+             "    \"\"\"Public entrypoint for this generated tool; delegates to run().\"\"\"\n" \
+             "    return run(dict(payload or {}), config)\n"
+    return code.rstrip() + suffix
+
+def _request_runtime_code(
+    request: dict[str, Any],
+    *,
+    allow_display_fallback: bool = False,
+) -> str:
+    """Read executable runtime code from official protocol fields.
+
+    This function is intentionally a transport/protocol extractor only.
+    It must not validate whether code contains run(), because syntax/protocol
+    validation belongs to validate_tool_manifest / repair stage.
+
+    Official runtime fields:
+    - runtime_code
+    - full_adapter_code
+    - internal_code
+    - script_code
+
+    Display fields are only allowed when allow_display_fallback=True.
+    """
+    request = request or {}
+
+    for key in (
+        "runtime_code",
+        "full_adapter_code",
+        "internal_code",
+        "script_code",
+    ):
+        value = request.get(key)
+        if isinstance(value, str) and value.strip():
+            return _strip_code_fence(value)
+
+    if allow_display_fallback:
+        for key in (
+            "adapter_code",
+            "display_code",
+            "public_api_code",
+            "code_block",
+        ):
+            value = request.get(key)
+            if isinstance(value, str) and value.strip():
+                return _strip_code_fence(value)
+
+    return ""
+
+def _is_run_delegate_function(node: ast.FunctionDef, target_name: str = "run") -> bool:
+    """Return True if a public function only delegates to run(...)."""
+    body = [
+        stmt for stmt in node.body
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+    ]
+
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return False
+
+    value = body[0].value
+    if not isinstance(value, ast.Call):
+        return False
+
+    return isinstance(value.func, ast.Name) and value.func.id == target_name
+
+
+def _module_import_lines(script_code: str) -> list[str]:
+    try:
+        tree = ast.parse(script_code or "")
+    except SyntaxError:
+        return []
+
+    lines: list[str] = []
+    for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = [alias.name.split(".")[0] for alias in node.names]
-            if isinstance(node, ast.ImportFrom) and node.module:
-                names.append(node.module.split(".")[0])
-            for name in names:
-                if name in _DANGEROUS_IMPORTS:
-                    errors.append(f"dangerous import is forbidden: {name}")
-        if isinstance(node, ast.Call):
-            func = node.func
-            called = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
-            if called in _DANGEROUS_CALLS:
-                errors.append(f"dangerous call requires a controlled helper: {called}")
-    if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", code or ""):
-        errors.append("adapter appears to contain a hard-coded secret")
+            try:
+                line = ast.unparse(node)
+            except Exception:
+                continue
+            if line not in lines:
+                lines.append(line)
+    return lines
+
+
+def _top_level_function_nodes(script_code: str) -> dict[str, ast.FunctionDef]:
+    try:
+        tree = ast.parse(script_code or "")
+    except SyntaxError:
+        return {}
+
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+def _function_source_with_name(node: ast.FunctionDef, name: str) -> str:
+    import copy
+
+    cloned = copy.deepcopy(node)
+    cloned.name = name
+
+    try:
+        return ast.unparse(cloned).strip() + "\n"
+    except Exception:
+        return ""
+
+
+def _public_api_display_code(
+    manifest: dict[str, Any] | None,
+    sample_input: dict[str, Any] | None = None,
+    *,
+    runtime_code: str | None = None,
+) -> str:
+    """Return code shown in the main editor.
+
+    The main editor should show the public tool function's core implementation.
+    The backend runner protocol run(...) and full implementation remain available
+    through runtime_code / internal_code / debug_sections.
+    """
+    manifest = manifest if isinstance(manifest, dict) else {}
+    tool_fn = _manifest_tool_function_name(manifest)
+    code = _strip_code_fence(runtime_code or "")
+
+    functions = _top_level_function_nodes(code)
+    imports = _module_import_lines(code)
+
+    public_node = functions.get(tool_fn)
+    run_node = functions.get("run")
+
+    sections: list[str] = []
+
+    if imports:
+        sections.append("\n".join(imports))
+
+    if public_node is not None and not _is_run_delegate_function(public_node, "run"):
+        public_source = _function_source_with_name(public_node, tool_fn)
+    elif run_node is not None:
+        public_source = _function_source_with_name(run_node, tool_fn)
+    elif public_node is not None:
+        public_source = _function_source_with_name(public_node, tool_fn)
+    else:
+        description = str(manifest.get("description") or f"Implement {tool_fn}.").strip()
+        public_source = (
+            f"def {tool_fn}(payload: dict | None = None, config: dict | None = None) -> dict:\n"
+            f"    \"\"\"{description}\"\"\"\n"
+            "    payload = dict(payload or {})\n"
+            "    return {\"success\": True, \"result\": payload}\n"
+        )
+
+    sections.append(public_source.rstrip())
+
+    helper_sources: list[str] = []
+    for name, node in functions.items():
+        if name in {"run", tool_fn, "main"}:
+            continue
+        src = _function_source_with_name(node, name)
+        if src:
+            helper_sources.append(src.rstrip())
+
+    if helper_sources:
+        sections.append(
+            "# Internal helper functions used by the public tool implementation\n"
+            + "\n\n".join(helper_sources)
+        )
+
+    return "\n\n".join(section for section in sections if section.strip()).rstrip() + "\n"
+
+
+def _code_view_fields(
+    *,
+    manifest: dict[str, Any],
+    runtime_code: str,
+    sample_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return consistent frontend code fields.
+
+    adapter_code/display_code/public_api_code are for main display.
+    runtime_code/full_adapter_code/internal_code/script_code are executable.
+    """
+    display_code = _public_api_display_code(
+        manifest,
+        sample_input if isinstance(sample_input, dict) else {},
+        runtime_code=runtime_code,
+    )
+
+    return {
+        "display_code": display_code,
+        "public_api_code": display_code,
+        "adapter_code": display_code,
+        "adapter_code_kind": "python_public_function",
+
+        "runtime_code": runtime_code,
+        "script_code": runtime_code,
+        "full_adapter_code": runtime_code,
+        "internal_code": runtime_code,
+        "internal_code_kind": "python_script",
+    }
+
+def _debug_call_sections(*, script_code: str, manifest: dict[str, Any], payload: dict[str, Any], config: dict[str, Any] | None, runner_code: str, command: list[str], temporary_environment: dict[str, Any], stdout: str, stderr: str, result: Any, errors: list[str]) -> dict[str, Any]:
+    config = config if isinstance(config, dict) else {}
+    public_env = temporary_environment.get("env") if isinstance(temporary_environment, dict) else {}
+    command_text = " ".join(command)
+    manifest_text = json.dumps(manifest or {}, ensure_ascii=False, indent=2, default=str)
+    payload_text = json.dumps({"payload": payload or {}, "config": config}, ensure_ascii=False, indent=2, default=str)
+    env_obj = {"temporary_environment": temporary_environment, "runtime_env": public_env}
+    output_text = json.dumps({"stdout": stdout[-4000:], "stderr": stderr[-4000:], "result": result, "errors": errors}, ensure_ascii=False, indent=2, default=str)
+    sections = [
+        {"id": "input_contract", "title": "1. 输入与工具合同", "summary": "展示前端传入的 payload/config 以及 planner 生成的 manifest。", "language": "json", "code": payload_text + "\n\n// manifest\n" + manifest_text, "collapsed": True},
+        {"id": "generated_tool_code", "title": "2. 模型生成的工具代码 tool_impl.py", "summary": "这是 coder 生成并由后端实际执行的代码。", "language": "python", "code": script_code, "collapsed": False},
+        {"id": "runner_code", "title": "3. 后端通用 runner 调用代码", "summary": "后端只通过统一 runner 导入 tool_impl.py 并调用 run(payload, config)。", "language": "python", "code": runner_code, "collapsed": True},
+        {"id": "temporary_environment", "title": "4. 临时环境与执行命令", "summary": "展示临时工作目录、依赖目录、输出目录、PYTHONPATH 和执行命令。", "language": "json", "code": json.dumps({"command": command_text, "environment": env_obj}, ensure_ascii=False, indent=2, default=str), "collapsed": True},
+        {"id": "execution_output", "title": "5. stdout / stderr / 返回结果", "summary": "展示脚本执行输出、错误和解析后的 JSON 结果。", "language": "json", "code": output_text, "collapsed": False},
+    ]
+    return {"call_chain": ["frontend payload/config", "planner manifest", "generated tool_impl.py", "generic tool_runner.py", "subprocess execution", "stdout JSON parse", "schema/artifact/auth validation"], "debug_sections": sections, "collapsible_blocks": sections}
+
+def _script_tool_spec_errors(manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["manifest must be an object"]
+    if str(manifest.get("runtime_type") or "") != "python_script":
+        errors.append("manifest.runtime_type must be 'python_script'")
+    if not str(manifest.get("tool_name") or manifest.get("name") or "").strip():
+        errors.append("manifest.tool_name is required")
+    for key in ("input_schema", "output_schema"):
+        schema = manifest.get(key)
+        if not isinstance(schema, dict):
+            errors.append(f"manifest.{key} must be a JSON Schema object")
+            continue
+        if schema.get("type") != "object":
+            errors.append(f"manifest.{key} must be canonical JSON Schema")
+        if not isinstance(schema.get("properties"), dict):
+            errors.append(f"manifest.{key}.properties must be an object")
+        if "required" in schema and not isinstance(schema.get("required"), list):
+            errors.append(f"manifest.{key}.required must be a list")
+    deps = manifest.get("dependencies", [])
+    if not isinstance(deps, list):
+        errors.append("manifest.dependencies must be a list")
+    else:
+        for idx, dep in enumerate(deps):
+            if not isinstance(dep, dict):
+                errors.append(f"manifest.dependencies[{idx}] must be an object with package/imports")
+                continue
+            if not str(dep.get("package") or "").strip():
+                errors.append(f"manifest.dependencies[{idx}].package is required")
+            imports = dep.get("imports")
+            if not isinstance(imports, list) or not all(str(item).strip() for item in imports):
+                errors.append(f"manifest.dependencies[{idx}].imports must be a non-empty list")
+    permissions = manifest.get("permissions")
+    if not isinstance(permissions, dict):
+        errors.append("manifest.permissions must be an object")
+    else:
+        for key in ("network", "read_files", "write_files", "subprocess"):
+            if key in permissions and not isinstance(permissions.get(key), bool):
+                errors.append(f"manifest.permissions.{key} must be boolean")
+        if "env" in permissions and not isinstance(permissions.get("env"), list):
+            errors.append("manifest.permissions.env must be a list")
+    auth = _normalize_auth_plan(manifest)
+    if auth.get("required") == "yes" and not auth.get("secrets"):
+        errors.append("manifest.auth.required=yes requires at least one secret/env declaration")
     return sorted(set(errors))
 
 
-def _safe_adapter_module_path(cap: ToolCapability) -> Path:
-    """Return the only allowed persistent adapter path for a custom tool."""
-    return (CUSTOM_TOOL_ADAPTER_DIR / f"{_slug(cap.name)}.py").resolve()
+def _script_static_errors(script_code: str, manifest: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    try:
+        tree = ast.parse(script_code or "")
+    except SyntaxError as exc:
+        return [f"script syntax error: {exc}"]
+    permissions = manifest.get("permissions") if isinstance(manifest.get("permissions"), dict) else {}
+    allow_network = bool(permissions.get("network"))
+    allow_subprocess = bool(permissions.get("subprocess"))
+    run_func = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run"), None)
+    if run_func is None:
+        errors.append("script must define run(payload: dict, config: dict | None = None) -> dict")
+    else:
+        args = [arg.arg for arg in run_func.args.args]
+        if not args or args[0] != "payload":
+            errors.append("run first argument must be payload")
+        if len(args) >= 2 and args[1] != "config":
+            errors.append("run second argument, if present, must be config")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots = {str(alias.name or "").split(".")[0] for alias in node.names}
+            if not allow_network and roots & _NETWORK_IMPORT_ROOTS:
+                errors.append("script imports network modules but manifest.permissions.network is false")
+            if not allow_subprocess and roots & _SUBPROCESS_IMPORT_ROOTS:
+                errors.append("script imports subprocess but manifest.permissions.subprocess is false")
+            if roots & _DANGEROUS_IMPORT_ROOTS:
+                errors.append("script imports dangerous modules: " + ", ".join(sorted(roots & _DANGEROUS_IMPORT_ROOTS)))
+        elif isinstance(node, ast.ImportFrom):
+            root = str(node.module or "").split(".")[0]
+            if not allow_network and root in _NETWORK_IMPORT_ROOTS:
+                errors.append("script imports network modules but manifest.permissions.network is false")
+            if not allow_subprocess and root in _SUBPROCESS_IMPORT_ROOTS:
+                errors.append("script imports subprocess but manifest.permissions.subprocess is false")
+            if root in _DANGEROUS_IMPORT_ROOTS:
+                errors.append(f"script imports dangerous module: {root}")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _FORBIDDEN_BUILTIN_CALLS:
+                errors.append(f"script must not call {func.id}")
+            if isinstance(func, ast.Attribute):
+                try:
+                    func_text = ast.unparse(func)
+                except Exception:
+                    func_text = ""
+                if not allow_subprocess and (func_text.startswith("os.system") or func_text.startswith("subprocess.")):
+                    errors.append("script calls subprocess/os.system but manifest.permissions.subprocess is false")
+                if func.attr in _UNSAFE_FS_ATTRS:
+                    errors.append(f"script must not call unsafe filesystem method {func.attr}")
+    tool_fn = _manifest_tool_function_name(manifest)
+    if tool_fn and tool_fn != "run" and tool_fn not in _top_level_function_names(script_code):
+        errors.append(f"script must expose public tool function {tool_fn}(payload, config=None) in addition to run")
+    if re.search(r"(?:sk-|AKIA|-----BEGIN [A-Z ]*PRIVATE KEY-----)[A-Za-z0-9_\-+/=]{8,}", script_code or ""):
+        errors.append("script appears to contain a hard-coded secret")
+    return sorted(set(errors))
 
 
-def _adapter_module_path(cap: ToolCapability) -> Path:
-    """Resolve persisted adapters without trusting arbitrary manifest paths."""
-    return _safe_adapter_module_path(cap)
+
+def _tool_runner_script_code() -> str:
+    return r"""
+from __future__ import annotations
+import importlib.util, json, sys, traceback
+from pathlib import Path
+
+def _load_module(path: str):
+    spec = importlib.util.spec_from_file_location("tool_impl", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load tool_impl.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+def main() -> None:
+    raw = sys.stdin.read().strip() or "{}"
+    data = json.loads(raw)
+    payload = data.get("payload") if isinstance(data, dict) else {}
+    config = data.get("config") if isinstance(data, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if not isinstance(config, dict):
+        config = {}
+    module = _load_module(str(Path(__file__).with_name("tool_impl.py")))
+    fn = getattr(module, "run", None)
+    if not callable(fn):
+        raise RuntimeError("tool_impl.py must define run(payload, config=None)")
+    try:
+        result = fn(payload, config)
+    except TypeError:
+        result = fn(payload)
+    if not isinstance(result, dict):
+        result = {"success": True, "result": result}
+    print(json.dumps(result, ensure_ascii=False))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({"success": False, "error": str(exc), "traceback": traceback.format_exc(limit=8)}, ensure_ascii=False))
+        sys.exit(1)
+"""
+
+
+def _temporary_environment_result(
+    *,
+    success: bool,
+    status: str,
+    root: Path,
+    script_path: Path,
+    runner_path: Path,
+    output_dir: Path,
+    deps_dir: Path,
+    packages: list[str],
+    dependency_result: dict[str, Any],
+    python_path_items: list[str],
+    env: dict[str, str] | None = None,
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    env = env or {}
+    public_env_names = ["TOOL_OUTPUT_DIR", "OUTPUT_DIR", "TOOL_TRIAL_RUN", "SKILL_TRIAL_RUN", "PYTHONPATH"]
+    return {
+        "success": bool(success),
+        "status": status,
+        "errors": errors or [],
+        "root_dir": str(root),
+        "work_dir": str(root),
+        "script_path": str(script_path),
+        "runner_path": str(runner_path),
+        "output_dir": str(output_dir),
+        "dependency_dir": str(deps_dir),
+        "packages_requested": packages,
+        "dependency_environment": dependency_result,
+        "pythonpath_entries": python_path_items,
+        "env": {name: env.get(name, "") for name in public_env_names if name in env},
+        "cleanup_policy": "temporary_directory_cleanup_after_validation",
+    }
+
+
+def _create_temporary_execution_environment(
+    *,
+    script_code: str,
+    manifest: dict[str, Any],
+    trial: bool = True,
+) -> tuple[dict[str, Any], dict[str, str], tempfile.TemporaryDirectory[str]]:
+    """Create the explicit temporary environment used by offline debugging.
+
+    This is the front-end visible stage 4:
+    1. create isolated temp root
+    2. create output directory
+    3. create dependency target directory
+    4. write generated tool script
+    5. write platform runner script
+    6. install missing declared dependencies into dependency target
+    7. prepare env/PYTHONPATH for subprocess execution
+    """
+    manifest = manifest if isinstance(manifest, dict) else {}
+    temp_root = tempfile.TemporaryDirectory(prefix="creator_script_env_")
+    root = Path(temp_root.name)
+    script_path = root / "tool_impl.py"
+    runner_path = root / "tool_runner.py"
+    output_dir = root / "outputs"
+    deps_dir = root / "deps"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(script_code, encoding="utf-8")
+    runner_path.write_text(_tool_runner_script_code(), encoding="utf-8")
+
+    packages = _dependency_packages_for_install(manifest)
+    dependency_result = _install_dependencies_to_target(
+        packages,
+        deps_dir,
+        timeout_seconds=int(os.environ.get("TOOL_AUTHOR_DEP_INSTALL_TIMEOUT_SECONDS", "180")),
+    ) if packages else {
+        "success": True,
+        "skipped": True,
+        "installed": [],
+        "target_dir": str(deps_dir),
+        "errors": [],
+    }
+
+    python_path_items = [str(root)]
+    if packages and dependency_result.get("success"):
+        python_path_items.insert(0, str(deps_dir))
+
+    env = os.environ.copy()
+    env["TOOL_OUTPUT_DIR"] = str(output_dir)
+    env["OUTPUT_DIR"] = str(output_dir)
+    env["TOOL_TRIAL_RUN"] = "1" if trial else "0"
+    env["SKILL_TRIAL_RUN"] = "1" if trial else "0"
+    old_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([*python_path_items, old_pythonpath] if old_pythonpath else python_path_items)
+
+    status = "created" if dependency_result.get("success") else "dependency_install_failed"
+    metadata = _temporary_environment_result(
+        success=bool(dependency_result.get("success")),
+        status=status,
+        root=root,
+        script_path=script_path,
+        runner_path=runner_path,
+        output_dir=output_dir,
+        deps_dir=deps_dir,
+        packages=packages,
+        dependency_result=dependency_result,
+        python_path_items=python_path_items,
+        env=env,
+        errors=dependency_result.get("errors") or [],
+    )
+    return metadata, env, temp_root
+
+
+def create_temporary_tool_environment(
+    manifest: dict[str, Any],
+    *,
+    adapter_code: str | None = None,
+    script_code: str | None = None,
+    trial: bool = True,
+) -> dict[str, Any]:
+    """Create and immediately clean up a temporary execution environment.
+
+    This helper is safe for a front-end stage/status endpoint. For actual
+    validation, _run_generated_tool_script keeps the returned temp directory
+    alive until the subprocess finishes.
+    """
+    manifest = _sync_auth_into_manifest(dict(manifest or {}), None)
+    code = _strip_code_fence(str(script_code or adapter_code or generate_adapter_code(manifest)))
+    metadata: dict[str, Any] = {}
+    temp_root: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        metadata, _env, temp_root = _create_temporary_execution_environment(script_code=code, manifest=manifest, trial=trial)
+        metadata["cleaned_up"] = False
+        return metadata
+    finally:
+        if temp_root is not None:
+            temp_root.cleanup()
+            if metadata:
+                metadata["cleaned_up"] = True
+
+
+def _run_generated_tool_script(*, script_code: str, manifest: dict[str, Any], payload: dict[str, Any], config: dict[str, Any] | None = None, trial: bool = True) -> dict[str, Any]:
+    manifest = _sync_auth_into_manifest(manifest if isinstance(manifest, dict) else {}, None)
+    payload = payload if isinstance(payload, dict) else {}
+    config = config if isinstance(config, dict) else {}
+    temporary_environment: dict[str, Any] = {}
+    temp_root: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary_environment, env, temp_root = _create_temporary_execution_environment(script_code=script_code, manifest=manifest, trial=trial)
+        dependency_result = temporary_environment.get("dependency_environment") or {}
+        if not temporary_environment.get("success"):
+            return {
+                "success": False,
+                "status": temporary_environment.get("status") or "temporary_environment_failed",
+                "errors": temporary_environment.get("errors") or ["temporary environment creation failed"],
+                "temporary_environment": temporary_environment,
+                "dependency_environment": dependency_result,
+                "stdout": "",
+                "stderr": "",
+                "result": None,
+            }
+
+        runner_path = Path(str(temporary_environment["runner_path"]))
+        output_dir = Path(str(temporary_environment["output_dir"]))
+        permissions = manifest.get("permissions") if isinstance(manifest.get("permissions"), dict) else {}
+        timeout_seconds = int(permissions.get("timeout_seconds") or manifest.get("timeout_seconds") or 30)
+        command = [sys.executable, str(runner_path)]
+        runner_code = _tool_runner_script_code()
+        completed = subprocess.run(
+            command,
+            input=json.dumps({"payload": payload, "config": config}, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+            env=env,
+        )
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        try:
+            result = json.loads(stdout) if stdout else {}
+        except Exception:
+            debug = _debug_call_sections(script_code=script_code, manifest=manifest, payload=payload, config=config, runner_code=runner_code, command=command, temporary_environment=temporary_environment, stdout=stdout, stderr=stderr, result=None, errors=["script stdout is not valid JSON"])
+            return {
+                "success": False,
+                "status": "invalid_stdout_json",
+                "errors": ["script stdout is not valid JSON"],
+                "stdout": stdout[-4000:],
+                "stderr": stderr[-4000:],
+                "returncode": completed.returncode,
+                "temporary_environment": temporary_environment,
+                "dependency_environment": dependency_result,
+                "result": None,
+                **debug,
+            }
+        if not isinstance(result, dict):
+            result = {"success": True, "result": result}
+        errors: list[str] = []
+        if completed.returncode != 0 and result.get("success") is not False:
+            errors.append(f"script exited with code {completed.returncode}")
+        required_outputs = _schema_required(manifest.get("output_schema") if isinstance(manifest.get("output_schema"), dict) else {})
+        missing_required = [key for key in required_outputs if key not in result]
+        if missing_required:
+            errors.append("script result missing required output fields: " + ", ".join(missing_required))
+        artifact_policy = manifest.get("artifact_policy") if isinstance(manifest.get("artifact_policy"), dict) else {}
+        file_fields = artifact_policy.get("file_fields") if isinstance(artifact_policy.get("file_fields"), list) else []
+        for field in file_fields:
+            value = result.get(str(field))
+            paths = [value] if isinstance(value, str) else [str(item) for item in value if str(item).strip()] if isinstance(value, list) else []
+            for item in paths:
+                path = Path(item)
+                if not path.is_absolute():
+                    path = output_dir / path
+                if not path.exists():
+                    errors.append(f"declared artifact does not exist: {item}")
+        redacted = _redact_secrets(result, set(os.environ.values()))
+        status = "validated" if not errors and result.get("success") is not False else "failed"
+        debug = _debug_call_sections(script_code=script_code, manifest=manifest, payload=payload, config=config, runner_code=runner_code, command=command, temporary_environment=temporary_environment, stdout=stdout, stderr=stderr, result=redacted, errors=errors)
+        return {
+            "success": not errors and result.get("success") is not False,
+            "status": status,
+            "errors": sorted(set(errors)),
+            "warnings": [],
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
+            "returncode": completed.returncode,
+            "result": redacted,
+            "return_keys": sorted(result.keys()),
+            "preview": _normalized_preview(redacted),
+            "temporary_environment": temporary_environment,
+            "dependency_environment": dependency_result,
+            "output_dir": str(output_dir),
+            **debug,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "status": "timeout",
+            "errors": ["script execution timed out"],
+            "warnings": [],
+            "stdout": "",
+            "stderr": "",
+            "result": None,
+            "temporary_environment": temporary_environment,
+            "dependency_environment": temporary_environment.get("dependency_environment") if isinstance(temporary_environment, dict) else {},
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "runner_failed",
+            "errors": [str(exc)],
+            "warnings": [],
+            "stdout": "",
+            "stderr": "",
+            "result": None,
+            "temporary_environment": temporary_environment,
+            "dependency_environment": temporary_environment.get("dependency_environment") if isinstance(temporary_environment, dict) else {},
+        }
+    finally:
+        if temp_root is not None:
+            temp_root.cleanup()
+
+def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None = None, sample_input: dict[str, Any] | None = None, dynamic: bool = True, real_run: bool = False, require_auth_config: bool = True) -> dict[str, Any]:
+    manifest = _sync_auth_into_manifest(dict(manifest or {}), None)
+    script_code = _strip_code_fence(str(adapter_code or ""))
+    if script_code.strip():
+        manifest = _normalize_dependencies_for_script(manifest, script_code)
+    errors = _script_tool_spec_errors(manifest)
+    warnings: list[str] = []
+    if not script_code.strip():
+        errors.append("adapter_code/script_code is required and must contain the generated Python script")
+        auth_report = _auth_validation_report(manifest, "", require_auth_config=require_auth_config)
+    else:
+        errors.extend(_script_static_errors(script_code, manifest))
+        auth_report = _auth_validation_report(manifest, script_code, require_auth_config=require_auth_config)
+    errors.extend(auth_report.get("errors") or [])
+    warnings.extend(auth_report.get("warnings") or [])
+    dynamic_result: dict[str, Any] = {"skipped": not dynamic}
+    auth_gate = auth_report.get("auth_gate") or _auth_gate_for_manifest(manifest, require_config=require_auth_config)
+    if dynamic and not errors:
+        if auth_gate.get("missing_env") and not require_auth_config:
+            dynamic_result = {"skipped": True, "reason": "auth_config_missing", "auth_gate": auth_gate, "temporary_environment": {"success": True, "status": "skipped_auth_config_missing", "reason": "auth config is missing; script execution is skipped until credentials are configured"}}
+        else:
+            dynamic_result = _run_generated_tool_script(script_code=script_code, manifest=manifest, payload=sample_input or {}, config={}, trial=not real_run)
+            if not dynamic_result.get("success"):
+                errors.extend(dynamic_result.get("errors") or ["dynamic script validation failed"])
+    success = not errors
+    block_registration = bool(auth_gate.get("block_registration") or (auth_gate.get("missing_env") and require_auth_config))
+    return {
+        "success": success,
+        "status": "validated" if success else "failed",
+        "errors": sorted(set(errors)),
+        "warnings": sorted(set(warnings)),
+        "dynamic_trial": dynamic_result,
+        "real_run": {"skipped": not real_run},
+        "dependency_environment": dynamic_result.get("dependency_environment") if isinstance(dynamic_result, dict) else {},
+        "temporary_environment": dynamic_result.get("temporary_environment") if isinstance(dynamic_result, dict) else {},
+        "debug_sections": dynamic_result.get("debug_sections") if isinstance(dynamic_result, dict) else [],
+        "collapsible_blocks": dynamic_result.get("collapsible_blocks") if isinstance(dynamic_result, dict) else [],
+        "call_chain": dynamic_result.get("call_chain") if isinstance(dynamic_result, dict) else [],
+        "auth_gate": auth_gate,
+        "auth_review": {
+            "planner_declared_auth": auth_report.get("planner_declared_auth"),
+            "script_uses_auth": auth_report.get("script_uses_auth"),
+            "used_env": auth_report.get("used_env") or [],
+            "declared_env": auth_report.get("declared_env") or [],
+            "undeclared_env": auth_report.get("undeclared_env") or [],
+        },
+        "block_registration": block_registration,
+        "can_register": bool(success and not block_registration),
+        "tool_card_preview": [],
+        "snippet_preview": [],
+        "snippet_validations": [],
+    }
 
 
 def safe_adapter_path_for_manifest(manifest: dict[str, Any]) -> str:
-    """Return the normalized repository-relative adapter path for a manifest."""
-    cap = _capability_from_dict(manifest)
-    path = _safe_adapter_module_path(cap)
-    try:
-        return str(path.relative_to(PROJECT_ROOT))
-    except ValueError:
-        return str(path)
+    return safe_adapter_path_for_tool_name(str(manifest.get("tool_name") or manifest.get("name") or "custom_tool"))
 
 
 def normalize_tool_manifest_adapter_path(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Force registered custom adapters into CUSTOM_TOOL_ADAPTER_DIR."""
-    payload = dict(manifest or {})
-    cap = _capability_from_dict(payload)
-    payload["adapter_path"] = safe_adapter_path_for_manifest(payload)
-    adapter_import = f"backend.services.runtime_tools.custom_tools.{_slug(cap.name)}"
+    payload = _sync_auth_into_manifest(dict(manifest or {}), None)
+    name = _slug(str(payload.get("tool_name") or payload.get("name") or "custom_tool"))
+    payload["runtime_type"] = "python_script"
+    payload["tool_name"] = name
+    payload["name"] = name
+    payload["adapter_path"] = safe_adapter_path_for_tool_name(name)
+    adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
     functions = []
     for item in payload.get("functions") or []:
         if isinstance(item, dict):
             fn = dict(item)
+            fn["function_name"] = name
             fn["import_path"] = adapter_import
             functions.append(fn)
     if functions:
@@ -1890,2947 +2070,1447 @@ def normalize_tool_manifest_adapter_path(manifest: dict[str, Any]) -> dict[str, 
 
 
 def write_registered_adapter(manifest: dict[str, Any], adapter_code: str | None) -> dict[str, Any]:
-    """Persist confirmed adapter code and return a path-normalized manifest."""
     payload = normalize_tool_manifest_adapter_path(manifest)
-    if adapter_code:
-        cap = _capability_from_dict(payload)
-        path = _safe_adapter_module_path(cap)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(adapter_code, encoding="utf-8")
+    name = _slug(str(payload.get("tool_name") or payload.get("name") or "custom_tool"))
+    script_code = _strip_code_fence(str(adapter_code or generate_adapter_code(payload)))
+    if f"def {name}(" not in script_code:
+        script_code += f"""
+
+def {name}(payload: dict | None = None) -> dict:
+    return run(dict(payload or {{}}), None)
+"""
+    path = _safe_adapter_module_path_for_name(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script_code, encoding="utf-8")
+    payload.update({"enabled": True, "enabled_by_default": True, "allow_creator_use": True, "approval_status": "approved", "test_status": payload.get("test_status") or "validated", "adapter_path": safe_adapter_path_for_tool_name(name), "updated_at": _utc_now()})
+    payload.setdefault("created_at", payload["updated_at"])
     return payload
-
-def _run_adapter_once(
-    *,
-    cap: ToolCapability,
-    path: Path,
-    sample_input: dict[str, Any],
-    trial: bool,
-) -> dict[str, Any]:
-    module_name = f"_custom_tool_validation_{cap.name}_{'trial' if trial else 'real'}_{abs(hash(str(path)))}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError("could not create import spec")
-
-    module = importlib.util.module_from_spec(spec)
-
-    old_trial = os.environ.get("SKILL_TRIAL_RUN")
-    old_output_dir = os.environ.get("OUTPUT_DIR")
-
-    if trial:
-        os.environ["SKILL_TRIAL_RUN"] = "1"
-    else:
-        os.environ.pop("SKILL_TRIAL_RUN", None)
-
-    with tempfile.TemporaryDirectory(prefix="creator_tool_trial_") as trial_dir:
-        os.environ["OUTPUT_DIR"] = trial_dir
-        trial_root = Path(trial_dir).resolve()
-
-        try:
-            spec.loader.exec_module(module)
-            fn = cap.functions[0]
-            target = getattr(module, fn.function_name)
-            if not callable(target):
-                raise TypeError(f"{fn.function_name} is not callable")
-
-            payload = sample_input or {}
-            try:
-                value = target(payload)
-            except TypeError:
-                value = target(**payload)
-        finally:
-            if old_trial is None:
-                os.environ.pop("SKILL_TRIAL_RUN", None)
-            else:
-                os.environ["SKILL_TRIAL_RUN"] = old_trial
-
-            if old_output_dir is None:
-                os.environ.pop("OUTPUT_DIR", None)
-            else:
-                os.environ["OUTPUT_DIR"] = old_output_dir
-
-        if not isinstance(value, dict):
-            raise TypeError("dynamic run must return a dict")
-
-        file_values: list[str] = []
-        for key in ("path", "output_path"):
-            if isinstance(value.get(key), str):
-                file_values.append(value[key])
-        for key in ("file_paths", "paths"):
-            if isinstance(value.get(key), list):
-                file_values.extend(str(item) for item in value[key] if isinstance(item, str))
-        for item in value.get("file_outputs", []) if isinstance(value.get("file_outputs"), list) else []:
-            if isinstance(item, dict) and isinstance(item.get("path"), str):
-                file_values.append(item["path"])
-
-        for file_path in file_values:
-            resolved = Path(file_path).resolve()
-            if trial_root not in resolved.parents and resolved != trial_root:
-                raise ValueError(f"dynamic run returned file outside OUTPUT_DIR: {file_path}")
-            if not resolved.exists():
-                raise ValueError(f"dynamic run returned missing file path: {file_path}")
-
-        return value
-
-def _declared_output_field_names(output_schema: dict[str, Any] | None, *, required_only: bool = False) -> set[str]:
-    """Extract business output field names from either JSON Schema or legacy field-map schema.
-
-    JSON Schema shape:
-      {"type": "object", "properties": {"success": ...}, "required": ["success"]}
-
-    Legacy field-map shape:
-      {"success": {"type": "boolean"}, "results": {"type": "array"}}
-    """
-    if not isinstance(output_schema, dict) or not output_schema:
-        return set()
-
-    properties = output_schema.get("properties")
-    required = output_schema.get("required")
-
-    if isinstance(properties, dict):
-        if required_only and isinstance(required, list):
-            return {str(item) for item in required if isinstance(item, str) and item in properties}
-        return {str(key) for key in properties.keys()}
-
-    meta_keys = {"type", "properties", "required", "description", "title", "$schema", "additionalProperties"}
-    field_names = {str(key) for key in output_schema.keys() if key not in meta_keys}
-
-    if required_only and isinstance(required, list):
-        return {str(item) for item in required if isinstance(item, str) and item in field_names}
-
-    return field_names
-
-def validate_tool_manifest(
-    manifest: dict[str, Any],
-    *,
-    adapter_code: str | None = None,
-    sample_input: dict[str, Any] | None = None,
-    dynamic: bool = True,
-    real_run: bool = False,
-) -> dict[str, Any]:
-    _load_tool_authoring_config_store_from_disk()
-
-    manifest = dict(manifest or {})
-
-    is_external_api = (
-        str(manifest.get("category") or "").lower() == "external_api"
-        or str(manifest.get("type") or "").lower() == "external_api"
-        or manifest.get("needs_external_network") is True
-    )
-
-    if is_external_api:
-        normalized_output_schema = {
-            "type": "object",
-            "properties": {
-                "success": {"type": "boolean"},
-                "results": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
-                "total": {"type": "integer"},
-                "error": {"type": "string"},
-                "status_code": {"type": "integer"},
-                "response_preview": {"type": "string"},
-                "knowledgeGraph": {"type": "object"},
-                "answerBox": {"type": "object"},
-                "relatedSearches": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                },
-                "raw": {"type": "object"},
-                "trial_run": {"type": "boolean"},
-            },
-            "required": ["success", "results", "total"],
-        }
-
-        manifest["output_schema"] = normalized_output_schema
-
-        fixed_functions = []
-        for fn in manifest.get("functions") or []:
-            if isinstance(fn, dict):
-                fixed_fn = dict(fn)
-                fixed_fn["output_schema"] = normalized_output_schema
-                fixed_functions.append(fixed_fn)
-            else:
-                fixed_functions.append(fn)
-
-        if fixed_functions:
-            manifest["functions"] = fixed_functions
-
-    errors = _manifest_errors(manifest)
-    warnings: list[str] = []
-    cap = _capability_from_dict(manifest) if not errors else None
-
-    if adapter_code:
-        errors.extend(_code_security_errors(adapter_code))
-
-    dynamic_result: dict[str, Any] = {"skipped": not dynamic}
-    real_result: dict[str, Any] = {"skipped": not real_run}
-
-    if cap and dynamic and not errors:
-        temp_code_dir: tempfile.TemporaryDirectory[str] | None = None
-
-        try:
-            if adapter_code:
-                temp_code_dir = tempfile.TemporaryDirectory(prefix="creator_tool_validate_")
-                path = Path(temp_code_dir.name) / f"{_slug(cap.name)}.py"
-                path.write_text(adapter_code, encoding="utf-8")
-            else:
-                path = _adapter_module_path(cap)
-
-            if not path.exists():
-                errors.append(f"adapter file does not exist: {path}")
-            else:
-                try:
-                    value = _run_adapter_once(
-                        cap=cap,
-                        path=path,
-                        sample_input=sample_input or {},
-                        trial=True,
-                    )
-
-                    output_schema = cap.functions[0].output_schema if cap.functions else {}
-                    required = _declared_output_field_names(output_schema, required_only=True)
-                    missing_required = [key for key in sorted(required) if key not in value]
-
-                    if missing_required:
-                        errors.append(
-                            "dynamic trial did not return required output fields: "
-                            + ", ".join(missing_required)
-                        )
-
-                    dynamic_result = {
-                        "skipped": False,
-                        "return_keys": sorted(value.keys()),
-                        "preview": _normalized_preview(value),
-                    }
-
-                except Exception as exc:
-                    errors.append(f"dynamic trial failed: {exc}")
-
-                if real_run and not errors:
-                    try:
-                        value = _run_adapter_once(
-                            cap=cap,
-                            path=path,
-                            sample_input=sample_input or {},
-                            trial=False,
-                        )
-
-                        if value.get("success") is False:
-                            errors.append(
-                                f"real run returned success=false: "
-                                f"{value.get('error') or value.get('message') or value}"
-                            )
-
-                        output_schema = cap.functions[0].output_schema if cap.functions else {}
-                        required = _declared_output_field_names(output_schema, required_only=True)
-                        missing_required = [key for key in sorted(required) if key not in value]
-
-                        if missing_required:
-                            errors.append(
-                                "real run did not return required output fields: "
-                                + ", ".join(missing_required)
-                            )
-
-                        real_result = {
-                            "skipped": False,
-                            "return_keys": sorted(value.keys()),
-                            "preview": _normalized_preview(
-                                _redact_secrets(value, set(os.environ.values()))
-                            ),
-                        }
-
-                    except Exception as exc:
-                        errors.append(f"real run failed: {exc}")
-
-        finally:
-            if temp_code_dir is not None:
-                temp_code_dir.cleanup()
-
-    snippet_validations = [
-        validate_tool_snippet(cap, snippet)
-        for snippet in snippets_for_tool(cap)
-    ] if cap else []
-
-    success = not errors
-
-    return {
-        "success": success,
-        "status": "validated" if success else "failed",
-        "errors": sorted(set(errors)),
-        "warnings": sorted(set(warnings)),
-        "dynamic_trial": dynamic_result,
-        "real_run": real_result,
-        "tool_card_preview": function_cards_for_tool(cap) if cap else [],
-        "snippet_preview": [
-            format_tool_snippet(cap, snippet)
-            for snippet in snippets_for_tool(cap)
-        ] if cap else [],
-        "snippet_validations": snippet_validations,
-    }
-
-def _json_from_model_text(text: str) -> dict[str, Any]:
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    match = re.search(r"\{.*\}", raw, re.S)
-    if match:
-        raw = match.group(0)
-    try:
-        value = json.loads(raw)
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
 
 
 async def _complete_author_model(task: str, messages: list[dict[str, str]], *, reason: str) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
-    """Call the routed model with a short authoring timeout and JSON parsing."""
     try:
         from .llm_proxy import complete_chat_once
         from .model_router import route_model
-
         route = route_model(task, reason=reason)
-        text = await asyncio.wait_for(complete_chat_once(messages, route.model), timeout=float(os.environ.get(f"TOOL_AUTHOR_{task.upper()}_TIMEOUT_SECONDS", os.environ.get("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "120"))))
+        timeout = float(os.environ.get(f"TOOL_AUTHOR_{task.upper()}_TIMEOUT_SECONDS", os.environ.get("TOOL_AUTHOR_LLM_TIMEOUT_SECONDS", "120")))
+        text = await asyncio.wait_for(complete_chat_once(messages, route.model), timeout=timeout)
         parsed = _json_from_model_text(text)
         if task == "code" and not parsed and (text or "").strip():
-            parsed = {"code": _strip_code_fence(text)}
+            parsed = {"script_code": _strip_code_fence(text)}
         return parsed, route.ack(), None
     except Exception as exc:
         return {}, None, str(exc)
 
 
-def _infer_schema_from_code(code: str) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    input_keys: set[str] = set()
-    output_keys: set[str] = set()
-    notes: list[str] = []
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError:
-        return {}, {}, ["code_block has syntax errors; code_model should repair before trial run"]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
-            target = node.func.value
-            if isinstance(target, ast.Name) and target.id in {"payload", "data", "input"} and node.args and isinstance(node.args[0], ast.Constant):
-                if isinstance(node.args[0].value, str):
-                    input_keys.add(node.args[0].value)
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in {"payload", "data", "input"}:
-            key = node.slice
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                input_keys.add(key.value)
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
-            for key in node.value.keys:
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    output_keys.add(key.value)
-    input_schema = {key: {"type": "string", "required": False, "description": f"Inferred from code_block field {key}."} for key in sorted(input_keys)}
-    output_schema = {key: {"type": "object", "description": f"Inferred from code_block return field {key}."} for key in sorted(output_keys)}
-    if input_keys:
-        notes.append(f"inferred input fields from code_block: {', '.join(sorted(input_keys))}")
-    if output_keys:
-        notes.append(f"inferred output fields from code_block: {', '.join(sorted(output_keys))}")
-    return input_schema, output_schema, notes
-
-
-def _first_function_name(code: str) -> str:
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError:
-        return "run"
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and not node.name.startswith("_") and node.name not in {"main"}:
-            return node.name
-    return "run"
-
-
-def _has_config_value(config: dict[str, Any], *keys: str) -> bool:
-    return any(config.get(key) not in (None, "", {}, []) for key in keys)
-
-
-def _plan_defaults() -> dict[str, Any]:
-    return {
-        "needs_clarification": False,
-        "questions": [],
-        "clarification_questions": [],
-        "requires_config": False,
-        "config_required_fields": [],
-        "config_form_schema": {},
-        "suggested_entrypoint": {},
-        "additional_fields_schema": [],
-        "requires_authorization": False,
-        "tool_kind": "unknown",
-        "operation": "",
-        "resolved_clarifications": [],
-        "requires_secret": False,
-        "secret_env_suggestions": [],
-        "requires_external_network": False,
-        "requires_live_test": False,
-        "ready_for_live_test": False,
-        "ready_for_code_generation": False,
-        "missing_fields": [],
-        "suggested_config_schema": {},
-        "sample_input_schema": {},
-        "manifest": {},
-        "implementation_plan": "",
-        "sample_input": {},
-        "risk_notes": [],
-        "model_notes": [],
-        "requires_authoring_tools": False,
-        "authoring_tool_plan": [],
-        "authoring_context": {},
-    }
-
-
-def _external_api_missing_fields(config: dict[str, Any], sample_input: dict[str, Any], request: dict[str, Any]) -> list[str]:
-    """Return only connection/config panel requirements, not schema/template questions."""
-    missing: list[str] = []
-    if not _has_config_value(config, "url", "endpoint", "base_url"):
-        missing.append("base_url")
-    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
-    has_secret_ref = bool(_extract_env_refs(config)) or _has_config_value(config, "secret_env", "secret_env_name", "api_key_env", "token_env", "password_env")
-    if not auth_type:
-        missing.append("auth_type")
-    elif auth_type not in {"none", "no_auth", "anonymous"} and not has_secret_ref:
-        missing.append("secret_env")
-    return missing
-
-
-def _slug_env_prefix(value: str) -> str:
-    prefix = re.sub(r"[^A-Za-z0-9]+", "_", (value or "TOOL")).strip("_").upper()
-    return prefix or "TOOL"
-
-
-def _suggest_external_api_entrypoint(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Build a best-effort prefill for the authorization modal without asking the user."""
-    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "tool_name"))
-    url_match = re.search(r"https?://[^\s，。；,;]+", text)
-    base_url = str(config.get("base_url") or config.get("endpoint") or config.get("url") or (url_match.group(0) if url_match else "")).strip()
-    method = str(config.get("method") or "").strip().upper()
-    lowered = text.lower()
-    if not method:
-        method = "POST" if any(token in lowered for token in ("创建", "新增", "提交", "发送", "发布", "上传", "create", "post", "send", "submit")) else "GET"
-    auth_type = str(config.get("auth_type") or config.get("authentication") or "").strip().lower()
-    has_secret_hint = bool(request.get("needs_secret") or any(token in lowered for token in ("key", "token", "密钥", "令牌", "认证", "鉴权", "bearer")))
-    if not auth_type:
-        auth_type = "token" if "token" in lowered or "令牌" in lowered or "bearer" in lowered else "api_key" if has_secret_hint else "none"
-    env_prefix = _slug_env_prefix(str(request.get("tool_name") or request.get("operation") or request.get("description") or "TOOL"))
-    existing_secret = str(config.get("secret_env") or config.get("secret_env_name") or config.get("api_key_env") or config.get("token_env") or "").strip()
-    secret_env = existing_secret or (f"{env_prefix}_{'TOKEN' if auth_type == 'token' else 'API_KEY'}" if auth_type not in {"none", "no_auth", "anonymous"} else "")
-    confidence = "high" if base_url and (config.get("auth_type") or config.get("authentication") or existing_secret) else "medium" if base_url else "low"
-    auth_placement = str(config.get("auth_placement") or ((config.get("auth") or {}).get("placement") if isinstance(config.get("auth"), dict) else "") or ("header" if auth_type == "api_key" else "")).strip()
-    auth_header_name = str(config.get("auth_header_name") or ((config.get("auth") or {}).get("header_name") if isinstance(config.get("auth"), dict) else "") or ("X-API-KEY" if auth_type == "api_key" else "Authorization" if auth_type == "token" else "")).strip()
-    auth_query_param = str(config.get("auth_query_param") or ((config.get("auth") or {}).get("query_param") if isinstance(config.get("auth"), dict) else "") or "api_key").strip()
-    return {"base_url": base_url, "method": method, "auth_type": auth_type, "secret_env": secret_env, "auth_placement": auth_placement, "auth_header_name": auth_header_name, "auth_query_param": auth_query_param, "confidence": confidence}
-
-
-def _clarification_answer_texts(request_or_answers: Any) -> list[str]:
-    answers = request_or_answers.get("clarification_answers") if isinstance(request_or_answers, dict) else request_or_answers
-    values: list[str] = []
-    for item in answers or []:
-        if isinstance(item, dict):
-            answer = str(item.get("answer_label") or item.get("answer") or "").strip()
-        else:
-            answer = str(item or "").strip()
-        if answer:
-            values.append(answer)
-    return values
-
-
-def _apply_clarification_answers(request: dict[str, Any]) -> dict[str, Any]:
-    updated = dict(request or {})
-    answers = [item for item in (updated.get("clarification_answers") or []) if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()]
-    capability_answers = _clarification_answer_texts(answers)
-    if capability_answers:
-        updated["operation"] = capability_answers[-1]
-    if answers:
-        updated["resolved_clarifications"] = answers
-    return updated
-
-
-def _question_text(question: Any) -> str:
-    if isinstance(question, dict):
-        return str(question.get("question") or question.get("text") or "").strip()
-    return str(question or "").strip()
-
-
-def _normalize_clarification_question(question: Any) -> dict[str, Any] | None:
-    text = _question_text(question)
-    if not text:
-        return None
-    if isinstance(question, dict):
-        normalized = {
-            "id": str(question.get("id") or _slug(text) or "capability_detail"),
-            "type": str(question.get("type") or ("single_choice" if question.get("options") else "short_text")),
-            "question": text,
-            "required": bool(question.get("required", True)),
-        }
-        options: list[dict[str, str]] = []
-        for idx, option in enumerate(question.get("options") or []):
-            if isinstance(option, dict):
-                label = str(option.get("label") or option.get("text") or option.get("value") or "").strip()
-                value = str(option.get("value") or label or idx).strip()
-            else:
-                label = str(option or "").strip()
-                value = label
-            if label:
-                options.append({"label": label, "value": value})
-        if options:
-            normalized["options"] = options
-        elif normalized["type"] in {"single_choice", "multi_choice"}:
-            normalized["type"] = "short_text"
-        return normalized
-    return {"id": _slug(text) or "capability_detail", "type": "short_text", "question": text, "required": True}
-
-
-def _filter_answered_clarification_questions(questions: list[Any], answers: list[Any]) -> list[dict[str, Any]]:
-    answered_questions = {
-        str(item.get("question") or "").strip()
-        for item in answers or []
-        if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()
-    }
-    answered_ids = {
-        str(item.get("id") or item.get("question_id") or "").strip()
-        for item in answers or []
-        if isinstance(item, dict) and str(item.get("answer_label") or item.get("answer") or "").strip()
-    }
-    filtered: list[dict[str, Any]] = []
-    for question in questions or []:
-        normalized = _normalize_clarification_question(question)
-        if not normalized:
-            continue
-        if normalized.get("id") in answered_ids or normalized.get("question") in answered_questions:
-            continue
-        filtered.append(normalized)
-    return filtered
-
-
-def _needs_capability_clarification(request: dict[str, Any]) -> bool:
-    if _clarification_answer_texts(request):
-        return False
-    text = " ".join(str(request.get(key) or "") for key in ("description", "operation", "input_description", "output_description")).strip().lower()
-    if not text:
-        return True
-    vague_phrases = ("调用接口", "连接接口", "外部 api", "某个api", "某个 api", "api tool", "http tool", "小工具")
-    has_vague_api_goal = any(phrase in text for phrase in vague_phrases)
-    action_tokens = ("查询", "创建", "更新", "删除", "同步", "发送", "发布", "下载", "上传", "检索", "搜索", "分析", "转换", "生成", "通知", "query", "create", "update", "delete", "sync", "send", "search", "fetch")
-    object_tokens = ("数据", "订单", "用户", "消息", "文件", "报告", "记录", "天气", "价格", "库存", "邮件", "短信", "result", "record", "message", "file")
-    has_action = any(token in text for token in action_tokens)
-    has_object = any(token in text for token in object_tokens)
-    return has_vague_api_goal and not (has_action and has_object)
-
-
-def _external_api_clarification_questions(request: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Ask only about real capability ambiguity; connection/key fields belong to config_form_schema."""
-    questions: list[dict[str, Any]] = []
-    if _needs_capability_clarification(request):
-        questions.append({"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True})
-    return questions[:3]
-
-
-def _infer_tool_kind(request: dict[str, Any]) -> str:
-    explicit = str(request.get("tool_kind") or "").strip()
-    if explicit:
-        return explicit
-    text = " ".join(str(request.get(key) or "") for key in ("description", "tool_type", "operation")).lower()
-    if any(token in text for token in ("api", "http", "https://", "接口", "endpoint", "base_url")) or request.get("needs_external_network"):
-        return "external_api"
-    if request.get("generates_file"):
-        return "file_generator"
-    if any(token in text for token in ("transform", "转换", "normalize", "清洗")):
-        return "data_transform"
-    if request.get("code_block"):
-        return "local_helper"
-    return "unknown"
-
-
-def _author_fallback_plan(request: dict[str, Any]) -> dict[str, Any]:
-    code_block = str(request.get("code_block") or "")
-    code_input_schema, code_output_schema, notes = _infer_schema_from_code(code_block) if code_block.strip() else ({}, {}, [])
-    merged = dict(request)
-    config = request.get("config") if isinstance(request.get("config"), dict) else {}
-    sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else {}
-    if code_input_schema and not merged.get("input_schema"):
-        merged["input_schema"] = code_input_schema
-    if code_output_schema and not merged.get("output_schema"):
-        merged["output_schema"] = code_output_schema
-    tool_kind = _infer_tool_kind(request)
-    requires_network = tool_kind == "external_api" or bool(request.get("needs_external_network"))
-    requires_secret = bool(request.get("needs_secret") or _extract_env_refs(config) or config.get("secret_env") or config.get("secret_env_name"))
-    missing_fields: list[str] = []
-    questions: list[Any] = []
-    if tool_kind == "external_api":
-        missing_fields = _external_api_missing_fields(config, sample, request)
-        questions = _external_api_clarification_questions(request, config)
-    elif tool_kind == "unknown" and not (request.get("tool_name") and (request.get("description") or code_block.strip())):
-        missing_fields = ["tool_name", "description or code_block"]
-        questions = [{"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}]
-
-    if request.get("manifest"):
-        manifest = dict(request["manifest"])
-    elif tool_kind == "external_api" and missing_fields:
-        manifest = {}
-    else:
-        manifest_seed = dict(merged)
-        if tool_kind == "external_api":
-            manifest_seed["needs_external_network"] = True
-            if requires_secret:
-                refs = _extract_env_refs(config)
-                manifest_seed["required_secrets"] = sorted(refs) or [str(config.get("secret_env") or config.get("secret_env_name") or "TOOL_API_KEY")]
-            manifest_seed["tool_type"] = "custom_adapter"
-            manifest_seed["input_schema"] = request.get("input_schema") or {"payload": {"type": "object", "required": True, "description": "Fields used to render the confirmed request templates."}}
-            manifest_seed["output_schema"] = request.get("output_schema") or {"result": {"type": "object", "description": str(request.get("output_description") or "Normalized external API response.")}}
-        manifest = build_tool_manifest_draft(manifest_seed)
-    if not sample and tool_kind != "external_api":
-        sample = {key: "demo" for key in (code_input_schema or {"payload": {}}).keys()} or {"payload": {}}
-    ready_live = tool_kind == "external_api" and not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
-    live_success = bool((request.get("live_test_result") or {}).get("success"))
-    authoring_tool_plan: list[dict[str, Any]] = []
-    if tool_kind == "external_api" and missing_fields:
-        authoring_tool_plan.append({"tool_name": "authoring_config_collector", "reason": "需要通过授权弹窗保存连接地址、认证方式和 env/secret 引用", "input": {"config_required_fields": missing_fields, "config": config, "sample_input": sample}})
-    elif tool_kind == "external_api" and ready_live and not live_success and not request.get("skip_live_test"):
-        authoring_tool_plan.append({"tool_name": "authoring_live_test", "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用", "input": {"config": config, "sample_input": sample}})
-    if code_block.strip():
-        authoring_tool_plan.append({"tool_name": "authoring_schema_infer", "reason": "从现有代码推断输入输出 schema", "input": {"code_block": code_block}})
-    ready_code = bool(manifest) and not missing_fields and not authoring_tool_plan and (tool_kind != "external_api" or live_success or request.get("skip_live_test") is True)
-    return {
-        **_plan_defaults(),
-        "needs_clarification": bool(questions),
-        "questions": questions[:3],
-        "clarification_questions": questions[:3],
-        "requires_config": tool_kind == "external_api" and bool(missing_fields),
-        "config_required_fields": missing_fields,
-        "config_form_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
-        "suggested_entrypoint": _suggest_external_api_entrypoint(request, config) if tool_kind == "external_api" else {},
-        "additional_fields_schema": _external_api_additional_fields_schema() if tool_kind == "external_api" else [],
-        "requires_authorization": tool_kind == "external_api" and requires_secret,
-        "tool_kind": tool_kind,
-        "operation": str(request.get("operation") or request.get("description") or ""),
-        "requires_secret": requires_secret,
-        "secret_env_suggestions": sorted(_extract_env_refs(config)) or ([str(config.get("secret_env") or config.get("secret_env_name"))] if config.get("secret_env") or config.get("secret_env_name") else []),
-        "requires_external_network": requires_network,
-        "requires_live_test": tool_kind == "external_api",
-        "ready_for_live_test": ready_live,
-        "ready_for_code_generation": ready_code,
-        "requires_authoring_tools": bool(authoring_tool_plan),
-        "authoring_tool_plan": authoring_tool_plan,
-        "missing_fields": [],
-        "suggested_config_schema": _external_api_config_schema() if tool_kind == "external_api" else {},
-        "sample_input_schema": {"type": "object", "description": "Sample payload used for live_test and adapter dynamic validation."},
-        "manifest": manifest,
-        "implementation_plan": "Use confirmed configuration only. For external APIs, read secrets from environment variables, return a deterministic mock when SKILL_TRIAL_RUN=1, and never put secrets in payload, logs, manifest, adapter, or snippet." if tool_kind == "external_api" else ("Normalize existing code_block while preserving business logic." if code_block.strip() else "Generate a complete Python adapter from the manifest."),
-        "sample_input": sample,
-        "risk_notes": notes,
-        "model_notes": ["deterministic fallback planner used", *notes],
-    }
-
-
-def _safe_clarification_questions(questions: list[Any], fallback: list[Any]) -> list[dict[str, Any]]:
-    banned = ("headers", "body", "query", "schema", "expected output", "输出字段", "输入输出", "method", "模板", "sample input", "服务地址", "连接地址", "endpoint", "密钥", "token", "认证", "auth", "外部网络", "连接测试")
-    safe: list[dict[str, Any]] = []
-    for item in questions or []:
-        normalized = _normalize_clarification_question(item)
-        if not normalized:
-            continue
-        text = normalized.get("question", "")
-        if any(token.lower() in text.lower() for token in banned):
-            continue
-        safe.append(normalized)
-    if not safe:
-        for item in fallback or []:
-            normalized = _normalize_clarification_question(item)
-            if not normalized:
-                continue
-            text = normalized.get("question", "")
-            if not any(token.lower() in text.lower() for token in banned):
-                safe.append(normalized)
-    return safe[:3]
-
-def _live_test_success_from_request(request: dict[str, Any]) -> bool:
-    live = request.get("live_test_result")
-    if isinstance(live, dict) and live.get("success") is True:
-        return True
-    ctx = request.get("authoring_context") if isinstance(request.get("authoring_context"), dict) else {}
-    live = ctx.get("live_test_result")
-    return isinstance(live, dict) and live.get("success") is True
-
-
-def _normalizable_authoring_tool_plan(items: Any) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for item in items or []:
-        if isinstance(item, dict):
-            tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
-            if not tool_name:
-                continue
-            normalized.append({**item, "tool_name": tool_name})
-        elif isinstance(item, str):
-            tool_name = item.strip()
-            if tool_name:
-                normalized.append({"tool_name": tool_name, "reason": "planner requested this internal authoring helper", "input": {}})
-    return normalized
-
-def _normalize_author_plan(plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
-    normalized = {**_plan_defaults(), **(plan if isinstance(plan, dict) else {})}
-    fallback = _author_fallback_plan(request)
-    if not isinstance(normalized.get("questions"), list):
-        normalized["questions"] = []
-    if not isinstance(normalized.get("clarification_questions"), list):
-        normalized["clarification_questions"] = normalized.get("questions") or []
-    if not isinstance(normalized.get("config_required_fields"), list):
-        normalized["config_required_fields"] = []
-    if not isinstance(normalized.get("config_form_schema"), dict):
-        normalized["config_form_schema"] = {}
-    if not isinstance(normalized.get("suggested_entrypoint"), dict):
-        normalized["suggested_entrypoint"] = {}
-    if not isinstance(normalized.get("additional_fields_schema"), list):
-        normalized["additional_fields_schema"] = []
-    if not isinstance(normalized.get("missing_fields"), list):
-        normalized["missing_fields"] = []
-    if not isinstance(normalized.get("manifest"), dict):
-        normalized["manifest"] = {}
-    if not isinstance(normalized.get("authoring_tool_plan"), list):
-        normalized["authoring_tool_plan"] = []
-    if not normalized.get("tool_kind") or normalized.get("tool_kind") == "unknown":
-        normalized["tool_kind"] = fallback.get("tool_kind", "unknown")
-    if normalized["tool_kind"] == "external_api":
-        config = request.get("config") if isinstance(request.get("config"), dict) else {}
-        sample = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-        missing = _external_api_missing_fields(config, sample, request)
-        normalized["requires_external_network"] = True
-        normalized["requires_live_test"] = True
-        normalized["requires_config"] = bool(missing)
-        normalized["config_required_fields"] = missing
-        normalized["config_form_schema"] = _external_api_config_schema()
-        normalized["suggested_entrypoint"] = {**_suggest_external_api_entrypoint(request, config), **(normalized.get("suggested_entrypoint") or {})}
-        normalized["additional_fields_schema"] = normalized.get("additional_fields_schema") or _external_api_additional_fields_schema()
-        normalized["requires_authorization"] = bool(normalized.get("requires_secret") or any(field == "secret_env" for field in missing))
-        normalized["ready_for_live_test"] = not _external_api_missing_fields(config, sample, {**request, "allow_external_network": True})
-        normalized["missing_fields"] = []
-        safe_questions = _safe_clarification_questions((normalized.get("clarification_questions") or normalized.get("questions") or []), fallback.get("clarification_questions") or fallback.get("questions") or [])
-        safe_questions = _filter_answered_clarification_questions(safe_questions, request.get("clarification_answers") or [])
-        normalized["clarification_questions"] = safe_questions
-        normalized["questions"] = safe_questions
-        if missing:
-            normalized["ready_for_code_generation"] = False
-            if not normalized.get("authoring_tool_plan"):
-                normalized["authoring_tool_plan"] = fallback.get("authoring_tool_plan") or []
-        elif not normalized.get("manifest"):
-            normalized["manifest"] = fallback.get("manifest") or {}
-        live_success = _live_test_success_from_request(request)
-        normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(
-            normalized.get("authoring_tool_plan") or [])
-
-        if live_success:
-            # live_test 已经通过，generate 阶段不要再被 authoring_live_test/config_collector 卡住
-            normalized["authoring_tool_plan"] = [
-                item for item in normalized["authoring_tool_plan"]
-                if item.get("tool_name") not in {"authoring_live_test", "authoring_config_collector"}
-            ]
-
-        if not normalized.get("authoring_tool_plan") and not live_success and normalized.get(
-                "ready_for_live_test") and not request.get("skip_live_test"):
-            normalized["authoring_tool_plan"] = [{
-                "tool_name": "authoring_live_test",
-                "reason": "需要在生成 adapter 前确认配置、凭据和 sample input 可用",
-                "input": {"config": config, "sample_input": sample},
-            }]
-
-        if missing:
-            normalized["ready_for_code_generation"] = False
-        elif live_success or request.get("skip_live_test") is True:
-            normalized["ready_for_code_generation"] = bool(normalized.get("manifest") or fallback.get("manifest"))
-        else:
-            normalized["ready_for_code_generation"] = False
-    elif not normalized.get("manifest"):
-        normalized["manifest"] = fallback.get("manifest") or {}
-    if request.get("operation"):
-        normalized["operation"] = request.get("operation")
-    if request.get("resolved_clarifications"):
-        normalized["resolved_clarifications"] = request.get("resolved_clarifications")
-    normalized["authoring_tool_plan"] = _normalizable_authoring_tool_plan(normalized.get("authoring_tool_plan") or [])
-    normalized["requires_authoring_tools"] = bool(normalized.get("authoring_tool_plan"))
-
-    if normalized["requires_authoring_tools"]:
-        normalized["ready_for_code_generation"] = False
-    normalized["clarification_questions"] = _safe_clarification_questions(normalized.get("clarification_questions") or normalized.get("questions") or [], fallback.get("clarification_questions") or fallback.get("questions") or [])
-    normalized["clarification_questions"] = _filter_answered_clarification_questions(normalized["clarification_questions"], request.get("clarification_answers") or [])
-    normalized["questions"] = normalized["clarification_questions"]
-    normalized["needs_clarification"] = bool(normalized["clarification_questions"])
-    if (
-        request.get("stage") == "draft"
-        and not normalized.get("needs_clarification")
-        and normalized.get("manifest")
-        and normalized.get("tool_kind") != "external_api"
-        and not normalized.get("ready_for_code_generation")
-        and "ready_for_code_generation" not in (plan or {})
-    ):
-        normalized["ready_for_code_generation"] = True
-    return normalized
-
-
-def _external_api_config_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "ui": "authorization_modal",
-        "required": ["base_url", "auth_type"],
-        "properties": {
-            "base_url": {"type": "string", "title": "连接地址 / endpoint / IP", "placeholder": "https://api.example.com"},
-            "auth_type": {"type": "string", "title": "认证方式", "enum": ["none", "api_key", "token", "basic", "custom"], "default": "none"},
-            "secret_env": {"type": "string", "title": "密钥名称", "description": "自动生成 env 名，可修改；代码只使用 os.getenv 引用。"},
-            "secret_value": {"type": "string", "title": "密钥值", "format": "password", "writeOnly": True},
-            "auth_placement": {"type": "string", "title": "密钥放置位置", "enum": ["header", "query", "bearer"], "default": "header"},
-            "auth_header_name": {"type": "string", "title": "Header 名称", "placeholder": "X-API-KEY"},
-            "auth_query_param": {"type": "string", "title": "Query 参数名", "placeholder": "api_key"},
-            "extra": {"type": "object", "title": "其他字段", "additionalProperties": {"type": "string"}},
-            "sample_input": {"type": "object", "title": "sample input（可选）"},
-        },
-    }
-
-
-
-def _external_api_additional_fields_schema() -> list[dict[str, Any]]:
-    return [
-        {"key": "", "value": "", "sensitive": False, "description": "Optional extra connection field added by the user."}
-    ]
-
-
-def _strip_code_fence(text: str) -> str:
-    raw = (text or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:python)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    return raw
-
-
-def _normalize_existing_code_fallback(code: str, manifest: dict[str, Any]) -> str:
-    cap = _capability_from_dict(manifest)
-    fn = cap.functions[0] if cap.functions else _function_from_dict(build_tool_manifest_draft(manifest)["functions"][0])
-    code = _strip_code_fence(code)
-    if not code.strip():
-        return generate_adapter_code(manifest)
-    try:
-        tree = ast.parse(code)
-        has_run = any(isinstance(node, ast.FunctionDef) and node.name == "run" for node in tree.body)
-        has_main = any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in tree.body)
-        first_fn = _first_function_name(code)
-    except SyntaxError:
-        return generate_adapter_code(manifest)
-    suffix = ""
-    if not has_run:
-        suffix += f'''
-
-
-def run(payload: dict | None = None) -> dict:
-    payload = dict(payload or {{}})
-    value = {first_fn}(payload)
-    if isinstance(value, dict):
-        return value
-    return {{"result": value}}
-'''
-    if fn.function_name not in {"run", first_fn}:
-        suffix += f'''
-
-
-def {fn.function_name}(payload: dict | None = None) -> dict:
-    return run(payload)
-'''
-    if not has_main:
-        suffix += '''
-
-
-def main() -> None:
-    import json
-    import sys
-    raw = sys.stdin.read().strip() or "{}"
-    payload = json.loads(raw)
-    print(json.dumps(run(payload), ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
-'''
-    return code.rstrip() + suffix
-
-
-def _author_adapter_static_errors(code: str, manifest: dict[str, Any]) -> list[str]:
-    errors = _code_security_errors(code)
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError:
-        return errors
-
-    function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-    if "run" not in function_names:
-        errors.append("adapter must define run(payload: dict) -> dict")
-    if "main" not in function_names:
-        errors.append("adapter must define a JSON stdin/stdout main() entrypoint")
-
-    def collect_top_level_string_constants(module: ast.Module) -> dict[str, str]:
-        constants: dict[str, str] = {}
-        for item in module.body:
-            if isinstance(item, ast.Assign) and len(item.targets) == 1:
-                target = item.targets[0]
-                if (
-                    isinstance(target, ast.Name)
-                    and isinstance(item.value, ast.Constant)
-                    and isinstance(item.value.value, str)
-                ):
-                    constants[target.id] = item.value.value
-            elif isinstance(item, ast.AnnAssign):
-                target = item.target
-                if (
-                    isinstance(target, ast.Name)
-                    and isinstance(item.value, ast.Constant)
-                    and isinstance(item.value.value, str)
-                ):
-                    constants[target.id] = item.value.value
-        return constants
-
-    def resolve_string(node: ast.AST, constants: dict[str, str]) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.Name):
-            return constants.get(node.id)
-        return None
-
-    try:
-        cap = _capability_from_dict(manifest)
-        if cap.functions and cap.functions[0].function_name not in function_names:
-            errors.append(f"adapter must expose manifest function {cap.functions[0].function_name}")
-
-        constants = collect_top_level_string_constants(tree)
-        imports: set[str] = set()
-        env_keys: set[str] = set()
-        has_dynamic_env_read = False
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imports.update(alias.name.split(".")[0] for alias in node.names)
-
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.add(node.module.split(".")[0])
-
-            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                # os.getenv("KEY") / os.getenv(SECRET_ENV)
-                if node.func.attr == "getenv" and node.args:
-                    value = resolve_string(node.args[0], constants)
-                    if value:
-                        env_keys.add(value)
-                    else:
-                        has_dynamic_env_read = True
-
-                # os.environ.get("KEY") / os.environ.get(SECRET_ENV)
-                elif node.func.attr == "get" and node.args:
-                    try:
-                        owner = ast.unparse(node.func.value)
-                    except Exception:
-                        owner = ""
-                    if owner.endswith("environ"):
-                        value = resolve_string(node.args[0], constants)
-                        if value:
-                            env_keys.add(value)
-                        else:
-                            has_dynamic_env_read = True
-
-            elif isinstance(node, ast.Subscript):
-                # os.environ["KEY"] / os.environ[SECRET_ENV]
-                try:
-                    owner = ast.unparse(node.value)
-                except Exception:
-                    owner = ""
-                if owner.endswith("environ"):
-                    value = resolve_string(node.slice, constants)
-                    if value:
-                        env_keys.add(value)
-                    else:
-                        has_dynamic_env_read = True
-
-        allowed_runtime_env = {"OUTPUT_DIR", "SKILL_TRIAL_RUN"}
-        declared_env = set(cap.required_env or [])
-        declared_secrets = set(cap.required_secrets or [])
-
-        for fn in cap.functions or []:
-            declared_env.update(fn.required_env or [])
-            declared_secrets.update(fn.required_secrets or [])
-
-        external_env_keys = env_keys - allowed_runtime_env
-        declared_external = declared_env | declared_secrets
-
-        if imports & {"requests", "httpx", "urllib"} and cap.safety_level not in {"medium", "high"}:
-            errors.append("adapter imports network libraries but manifest does not declare external network access")
-
-        undeclared_env_keys = external_env_keys - declared_external
-        if undeclared_env_keys:
-            errors.append(
-                "adapter reads undeclared environment variables or secrets: "
-                + ", ".join(sorted(undeclared_env_keys))
-            )
-
-        # 只有在完全没有读到 declared secret，且也没有动态 env 读取时才报错。
-        # 这能避免 os.getenv(SECRET_ENV) 被误判。
-        if declared_secrets and not (external_env_keys & declared_secrets) and not has_dynamic_env_read:
-            errors.append(
-                "adapter does not read required declared secret env vars: "
-                + ", ".join(sorted(declared_secrets))
-            )
-
-    except Exception:
-        pass
-
-    return sorted(set(errors))
-
-
-def _validate_author_snippet(snippet: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    errors: list[str] = []
-    warnings: list[str] = []
-    required = ["id", "title", "description", "code", "return_rule", "usage_policy", "priority"]
-    for key in required:
-        if snippet.get(key) in (None, ""):
-            errors.append(f"snippet {key} is required")
-    if not isinstance(snippet.get("anti_patterns", []), list) or not all(isinstance(item, str) for item in snippet.get("anti_patterns", [])):
-        errors.append("snippet anti_patterns must be a string array")
-    if snippet.get("usage_policy") not in _ALLOWED_USAGE_POLICIES:
-        errors.append("snippet usage_policy is invalid")
-    try:
-        priority = int(snippet.get("priority", 0))
-        if priority < 0 or priority > 100:
-            warnings.append("snippet priority should be between 0 and 100")
-    except Exception:
-        errors.append("snippet priority must be numeric")
-    try:
-        cap = _capability_from_dict({**manifest, "snippets": [snippet]})
-        if cap.snippets:
-            result = validate_tool_snippet(cap, cap.snippets[0])
-            errors.extend(result["errors"])
-            warnings.extend(result["warnings"])
-    except Exception as exc:
-        errors.append(f"snippet cannot be parsed: {exc}")
-    return {"success": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings))}
-
-def _schema_from_planner_io(manifest: dict[str, Any], *, input_side: bool) -> dict[str, Any]:
-    direct_key = "input_schema" if input_side else "output_schema"
-    value = manifest.get(direct_key)
-    if isinstance(value, dict) and value:
-        return value
-
-    legacy_key = "inputs" if input_side else "outputs"
-    legacy = manifest.get(legacy_key)
-    if isinstance(legacy, dict) and legacy:
-        return {
-            "type": "object",
-            "properties": legacy,
-            "required": [
-                name for name, spec in legacy.items()
-                if isinstance(spec, dict) and spec.get("required") is True
-            ],
-        }
-
-    fields_key = "input_fields" if input_side else "output_fields"
-    fields = manifest.get(fields_key)
-    if isinstance(fields, list) and fields:
-        props: dict[str, Any] = {}
-        required: list[str] = []
-        for item in fields:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            if not name:
-                continue
-            props[name] = {
-                "type": item.get("type") or "string",
-                "description": item.get("description") or "",
-            }
-            if item.get("required"):
-                required.append(name)
-        return {"type": "object", "properties": props, "required": required}
-
-    if input_side:
-        return {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or API input."}
-            },
-            "required": ["query"],
-        }
-
-    return {
-        "type": "object",
-        "properties": {
-            "success": {"type": "boolean"},
-            "results": {"type": "array"},
-            "total": {"type": "integer"},
-            "error": {"type": "string"},
-        },
-        "required": ["success", "results", "total"],
-    }
-
-
-def _normalize_external_api_manifest_for_adapter(
-    manifest: dict[str, Any],
-    request: dict[str, Any],
-    plan: dict[str, Any],
-    contract: dict[str, Any],
-) -> dict[str, Any]:
-    original = dict(manifest or {})
-    name = _slug(str(original.get("name") or request.get("tool_name") or plan.get("operation") or "external_api_tool"))
-    display_name = str(original.get("display_name") or original.get("description") or name.replace("_", " ").title())
-
-    secret_env = str((contract.get("auth") or {}).get("required_secret_env") or "").strip()
-    required_secrets = [secret_env] if secret_env else []
-
-    platform_env_prefix = str(contract.get("platform_env_prefix") or "").strip()
-    required_env = []
-    if platform_env_prefix:
-        required_env = [
-            f"{platform_env_prefix}_BASE_URL",
-            f"{platform_env_prefix}_METHOD",
-            f"{platform_env_prefix}_AUTH_HEADER",
-            f"{platform_env_prefix}_BODY_TEMPLATE_JSON",
-            f"{platform_env_prefix}_QUERY_TEMPLATE_JSON",
-            f"{platform_env_prefix}_HEADERS_TEMPLATE_JSON",
-        ]
-
-    input_schema = _schema_from_planner_io(original, input_side=True)
-
-    # external_api adapter 的最终输出不是 provider 原始响应，
-    # 而是平台 wrapper 归一化后的输出。不要沿用 planner 的 raw API output_schema。
-    output_schema = {
-        "type": "object",
-        "properties": {
-            "success": {"type": "boolean"},
-            "results": {
-                "type": "array",
-                "items": {"type": "object"},
-            },
-            "total": {"type": "integer"},
-            "error": {"type": "string"},
-            "status_code": {"type": "integer"},
-            "response_preview": {"type": "string"},
-            "knowledgeGraph": {"type": "object"},
-            "answerBox": {"type": "object"},
-            "relatedSearches": {
-                "type": "array",
-                "items": {"type": "object"},
-            },
-            "raw": {"type": "object"},
-            "trial_run": {"type": "boolean"},
-        },
-        "required": ["success", "results", "total"],
-    }
-
-    adapter_import = f"backend.services.runtime_tools.custom_tools.{name}"
-
-    return {
-        **original,
-        "name": name,
-        "display_name": display_name,
-        "description": str(original.get("description") or request.get("description") or display_name),
-        "category": original.get("category") or "external_api",
-        "tool_type": "custom_adapter",
-        "usage_policy": original.get("usage_policy") or "helper_preferred",
-        "allowed_roles": original.get("allowed_roles") or original.get("roles") or ["generic_script", "search_reader"],
-        "roles": original.get("roles") or original.get("allowed_roles") or ["generic_script", "search_reader"],
-        "required_capabilities": original.get("required_capabilities") or [name],
-        "required_env": required_env,
-        "required_secrets": required_secrets,
-        "dependencies": sorted(set([*(original.get("dependencies") or []), "requests"])),
-        "safety_level": original.get("safety_level") or "medium",
-        "enabled": False,
-        "enabled_by_default": False,
-        "approval_status": "draft",
-        "test_status": "untested",
-        "adapter_path": f"backend/services/runtime_tools/custom_tools/{name}.py",
-        "version": str(original.get("version") or "1.0.0"),
-        "input_schema": input_schema,
-        "output_schema": output_schema,
-        "functions": [
-            {
-                "function_name": name,
-                "import_path": adapter_import,
-                "short_description": str(original.get("description") or request.get("description") or display_name),
-                "when_to_use": str(original.get("when_to_use") or f"Use {display_name} when this external API is needed."),
-                "signature": f"{name}(payload: dict) -> dict",
-                "input_schema": input_schema,
-                "output_schema": output_schema,
-                "return_contract": "Returns a normalized adapter result with success/results/total. Provider raw response may be included under raw.",
-                "example_call": f"from {adapter_import} import {name}\nresult = {name}(payload)\nreturn result",
-                "example_stdout": "return result",
-                "common_mistakes": [
-                    "Do not pass API keys in payload.",
-                    "Do not call external network when SKILL_TRIAL_RUN=1.",
-                    "Do not require provider raw response fields as top-level adapter outputs.",
-                    "Do not write or expect files outside OUTPUT_DIR.",
-                ],
-                "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.",
-                "safety_notes": [
-                    "Reads API secret from platform-scoped environment only.",
-                    "External API network access is declared.",
-                ],
-                "required_env": required_env,
-                "required_secrets": required_secrets,
-                "usage_policy": "helper_preferred",
-                "allowed_roles": original.get("allowed_roles") or original.get("roles") or ["generic_script", "search_reader"],
-                "required_capabilities": original.get("required_capabilities") or [name],
-                "forbidden_imports": sorted(_DANGEROUS_IMPORTS),
-                "forbidden_side_effects": ["leak secrets", "undeclared network access"],
-            }
-        ],
-        "snippets": original.get("snippets") or [],
-        "needs_external_network": True,
-        "needs_secret": bool(required_secrets),
-        "generates_file": False,
-        "high_risk": False,
-    }
-
-def _confirmed_external_api_code_contract(
-    request: dict[str, Any],
-    plan: dict[str, Any],
-    manifest: dict[str, Any],
-    sample_input: dict[str, Any],
-) -> dict[str, Any]:
-    raw_config = request.get("config") if isinstance(request.get("config"), dict) else {}
-
-    saved_record = _find_saved_authoring_record_for_request(request, manifest, plan)
-    saved_config = saved_record.get("config") if isinstance(saved_record.get("config"), dict) else {}
-
-    # 保存配置是事实源；当前请求 config 只补充未保存字段。
-    config = {**raw_config}
-    for key, value in saved_config.items():
-        if key not in config or config.get(key) in (None, "", {}, []):
-            config[key] = value
-
-    tool_name = str(
-        saved_record.get("tool_name")
-        or request.get("tool_name")
-        or manifest.get("name")
-        or plan.get("operation")
-        or "external_api_tool"
-    )
-
-    platform_env_prefix = str(config.get("platform_env_prefix") or saved_record.get("platform_env_prefix") or "").strip()
-
-    # 如果 config 里已有 secret_env=TOOLCFG_xxx_SECRET，也能反推出 prefix。
-    config_secret_env = str(config.get("secret_env") or "").strip()
-    if not platform_env_prefix and config_secret_env.startswith("TOOLCFG_") and config_secret_env.endswith("_SECRET"):
-        platform_env_prefix = config_secret_env[: -len("_SECRET")]
-
-    if platform_env_prefix:
-        envs = _tool_platform_envs_from_prefix(platform_env_prefix)
-    else:
-        envs = _tool_platform_envs(tool_name)
-        platform_env_prefix = envs["prefix"]
-
-    url = (
-        _resolve_env_ref_or_value(config.get("url"))
-        or _resolve_env_ref_or_value(config.get("endpoint"))
-        or _resolve_env_ref_or_value(config.get("base_url"))
-        or os.environ.get(envs["base_url"], "")
-    )
-
-    method = (
-        _resolve_env_ref_or_value(config.get("method"))
-        or os.environ.get(envs["method"], "")
-        or "GET"
-    ).upper()
-
-    body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template", {})
-    if isinstance(body_template, str):
-        ref = _env_ref_name(body_template)
-        body_template = _load_json_env(ref, {}) if ref else {}
-    if not body_template:
-        body_template = _load_json_env(envs["body_template"], {})
-    if method not in {"GET", "HEAD"} and not body_template and isinstance(sample_input, dict):
-        body_template = sample_input
-
-    query_template = config.get("query_template") or config.get("params_template") or {}
-    if isinstance(query_template, str):
-        ref = _env_ref_name(query_template)
-        query_template = _load_json_env(ref, {}) if ref else {}
-    if not query_template:
-        query_template = _load_json_env(envs["query_template"], {})
-    if method in {"GET", "DELETE"} and not query_template and isinstance(sample_input, dict):
-        query_template = sample_input
-
-    headers_template = config.get("headers_template") or config.get("headers") or {}
-    if isinstance(headers_template, str):
-        ref = _env_ref_name(headers_template)
-        headers_template = _load_json_env(ref, {}) if ref else {}
-    if not headers_template:
-        headers_template = _load_json_env(envs["headers_template"], {})
-    headers_template = dict(headers_template or {})
-    if method not in {"GET", "HEAD"}:
-        headers_template.setdefault("Content-Type", "application/json")
-
-    auth = _auth_config_for_live_test(config)
-    auth_type = auth.get("type") or config.get("auth_type") or "none"
-
-    auth_header = (
-        os.environ.get(envs["auth_header"], "")
-        or _resolve_env_ref_or_value(config.get("auth_header_name"))
-        or auth.get("header_name")
-        or "X-API-KEY"
-    )
-
-    auth_query_param = (
-        os.environ.get(envs["auth_query_param"], "")
-        or _resolve_env_ref_or_value(config.get("auth_query_param"))
-        or auth.get("query_param")
-        or ""
-    )
-
-    function_name = _slug(str(manifest.get("name") or request.get("tool_name") or plan.get("operation") or tool_name or "external_api_tool"))
-
-    return {
-        "adapter_contract_version": "1.0",
-        "tool_kind": "external_api",
-        "function_name": function_name,
-        "method": method,
-        "url": url,
-        "platform_env_prefix": platform_env_prefix,
-        "auth": {
-            "type": auth_type,
-            "required_secret_env": envs["secret"] if auth_type not in {"", "none", "no_auth", "anonymous"} else "",
-            "placement": auth.get("placement") or config.get("auth_placement") or "header",
-            "header_name": auth_header,
-            "query_param": auth_query_param,
-        },
-        "headers_template": headers_template,
-        "query_template": query_template or {},
-        "json_body_template": body_template or {},
-        "sample_input": sample_input or {},
-        "runtime_protocol": {
-            "must_define_run": True,
-            "must_define_manifest_function": True,
-            "must_define_main": True,
-            "main_input": "stdin_json",
-            "main_output": "stdout_json",
-            "trial_env": "SKILL_TRIAL_RUN",
-        },
-    }
-
-def _default_internal_normalize_code() -> str:
-    return '''
-def normalize_response(data: dict, payload: dict) -> dict:
-    items = data.get("organic", []) if isinstance(data, dict) else []
-    results = []
-    for idx, item in enumerate(items or [], start=1):
-        if not isinstance(item, dict):
-            continue
-        results.append({
-            "title": item.get("title") or item.get("name") or "",
-            "snippet": item.get("snippet") or item.get("description") or "",
-            "link": item.get("link") or item.get("url") or item.get("imageUrl") or "",
-            "position": item.get("position") or idx,
-        })
-    return {
-        "success": True,
-        "query": payload.get("query") or payload.get("q") or "",
-        "results": results,
-        "total": len(results),
-        "knowledgeGraph": data.get("knowledgeGraph", {}) if isinstance(data, dict) else {},
-        "answerBox": data.get("answerBox", {}) if isinstance(data, dict) else {},
-        "relatedSearches": data.get("relatedSearches", []) if isinstance(data, dict) else [],
-        "raw": data,
-    }
-'''.strip()
-
-
-def _internal_code_errors(code: str) -> list[str]:
-    errors: list[str] = []
-    try:
-        tree = ast.parse(code or "")
-    except SyntaxError as exc:
-        return [f"internal code syntax error: {exc}"]
-
-    allowed_functions = {"normalize_response"}
-    forbidden_imports = {"requests", "httpx", "urllib", "os", "sys", "subprocess", "socket", "pathlib", "shutil"}
-    forbidden_calls = {"open", "eval", "exec", "compile", "__import__"}
-
-    function_names: set[str] = set()
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in forbidden_imports:
-                    errors.append(f"internal code must not import {root}")
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root in forbidden_imports:
-                errors.append(f"internal code must not import {root}")
-        elif isinstance(node, ast.FunctionDef):
-            function_names.add(node.name)
-            if node.name not in allowed_functions:
-                errors.append(f"internal code may only define normalize_response, got {node.name}")
-        elif isinstance(node, ast.Call):
-            func = node.func
-            called = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
-            if called in forbidden_calls:
-                errors.append(f"internal code must not call {called}")
-
-    if "normalize_response" not in function_names:
-        errors.append("internal code must define normalize_response(data, payload)")
-
-    return sorted(set(errors))
-
-
-def _external_api_wrapper_code(contract: dict[str, Any], internal_code: str, manifest: dict[str, Any]) -> str:
-    function_name = _slug(str(contract.get("function_name") or manifest.get("name") or "external_api_tool"))
-
-    platform_env_prefix = str(contract.get("platform_env_prefix") or "").strip()
-    if not platform_env_prefix:
-        platform_env_prefix = _tool_platform_env_prefix(function_name)
-
-    endpoint_env = f"{platform_env_prefix}_BASE_URL"
-    method_env = f"{platform_env_prefix}_METHOD"
-    auth_header_env = f"{platform_env_prefix}_AUTH_HEADER"
-    body_template_env = f"{platform_env_prefix}_BODY_TEMPLATE_JSON"
-    query_template_env = f"{platform_env_prefix}_QUERY_TEMPLATE_JSON"
-    headers_template_env = f"{platform_env_prefix}_HEADERS_TEMPLATE_JSON"
-
-    endpoint = str(contract.get("url") or "")
-    method = str(contract.get("method") or "POST").upper()
-    auth = contract.get("auth") if isinstance(contract.get("auth"), dict) else {}
-    secret_env = str(auth.get("required_secret_env") or f"{platform_env_prefix}_SECRET").strip()
-    header_name = str(auth.get("header_name") or "X-API-KEY").strip() or "X-API-KEY"
-
-    body_template = contract.get("json_body_template") if isinstance(contract.get("json_body_template"), dict) else {}
-    query_template = contract.get("query_template") if isinstance(contract.get("query_template"), dict) else {}
-    headers_template = contract.get("headers_template") if isinstance(contract.get("headers_template"), dict) else {}
-
-    safe_internal = _strip_code_fence(internal_code or "")
-    if _internal_code_errors(safe_internal):
-        safe_internal = _default_internal_normalize_code()
-        internal_audit = "fallback_default_internal_normalize_code"
-    else:
-        internal_audit = "model_internal_normalize_response_only"
-
-    body_template_json_literal = repr(json.dumps(body_template, ensure_ascii=False, sort_keys=True))
-    query_template_json_literal = repr(json.dumps(query_template, ensure_ascii=False, sort_keys=True))
-    headers_template_json_literal = repr(json.dumps(headers_template, ensure_ascii=False, sort_keys=True))
-    manifest_json_literal = repr(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-
-    return f'''from __future__ import annotations
-
-# AUTO-GENERATED EXTERNAL API WRAPPER.
-# Only the code between MODEL_INTERNAL_CODE_START/END may come from code_model.
-# Wrapper protocol, env access, network request, manifest(), run(), and main()
-# are generated deterministically by the platform.
-# internal_audit={internal_audit}
-
-import json
-import os
-import sys
-from typing import Any
-
-import requests
-
-
-FUNCTION_NAME = {function_name!r}
-TOOL_ENV_PREFIX = {platform_env_prefix!r}
-ENDPOINT_ENV = {endpoint_env!r}
-METHOD_ENV = {method_env!r}
-SECRET_ENV = {secret_env!r}
-AUTH_HEADER_ENV = {auth_header_env!r}
-BODY_TEMPLATE_ENV = {body_template_env!r}
-QUERY_TEMPLATE_ENV = {query_template_env!r}
-HEADERS_TEMPLATE_ENV = {headers_template_env!r}
-
-ENDPOINT = os.getenv(ENDPOINT_ENV, {endpoint!r})
-METHOD = os.getenv(METHOD_ENV, {method!r}).upper()
-AUTH_HEADER_NAME = os.getenv(AUTH_HEADER_ENV, {header_name!r})
-BODY_TEMPLATE = json.loads(os.getenv(BODY_TEMPLATE_ENV, {body_template_json_literal}))
-QUERY_TEMPLATE = json.loads(os.getenv(QUERY_TEMPLATE_ENV, {query_template_json_literal}))
-HEADERS_TEMPLATE = json.loads(os.getenv(HEADERS_TEMPLATE_ENV, {headers_template_json_literal}))
-MANIFEST_DATA = json.loads({manifest_json_literal})
-
-
-def _flatten(prefix: str, value: Any, out: dict[str, Any]) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            path = f"{{prefix}}.{{key}}" if prefix else str(key)
-            _flatten(path, item, out)
-    else:
-        out[prefix] = value
-
-
-def _render_string(text: str, payload: dict[str, Any]) -> str:
-    values: dict[str, Any] = {{}}
-    _flatten("", payload, values)
-    for key, value in values.items():
-        rendered = "" if value is None else str(value)
-        text = text.replace("${{input." + key + "}}", rendered)
-        text = text.replace("${{payload." + key + "}}", rendered)
-        text = text.replace("{{{{" + key + "}}}}", rendered)
-        text = text.replace("{{{{ " + key + " }}}}", rendered)
-    return text
-
-
-def _render(value: Any, payload: dict[str, Any]) -> Any:
-    if isinstance(value, str):
-        return _render_string(value, payload)
-    if isinstance(value, dict):
-        return {{key: _render(item, payload) for key, item in value.items() if item is not None}}
-    if isinstance(value, list):
-        return [_render(item, payload) for item in value]
-    return value
-
-
-def _default_normalize_response(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    items = data.get("organic", []) if isinstance(data, dict) else []
-    results = []
-    for idx, item in enumerate(items or [], start=1):
-        if not isinstance(item, dict):
-            continue
-        results.append({{
-            "title": item.get("title") or item.get("name") or "",
-            "snippet": item.get("snippet") or item.get("description") or "",
-            "link": item.get("link") or item.get("url") or item.get("imageUrl") or "",
-            "position": item.get("position") or idx,
-        }})
-    return {{
-        "success": True,
-        "results": results,
-        "total": len(results),
-        "knowledgeGraph": data.get("knowledgeGraph", {{}}) if isinstance(data, dict) else {{}},
-        "answerBox": data.get("answerBox", {{}}) if isinstance(data, dict) else {{}},
-        "relatedSearches": data.get("relatedSearches", []) if isinstance(data, dict) else [],
-        "raw": data,
-    }}
-
-
-# === MODEL_INTERNAL_CODE_START ===
-{safe_internal}
-# === MODEL_INTERNAL_CODE_END ===
-
-
-def _normalize(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    fn = globals().get("normalize_response")
-    required = {{"success", "results", "total"}}
-
-    if callable(fn):
-        try:
-            value = fn(data, payload)
-        except Exception as exc:
-            fallback = _default_normalize_response(data, payload)
-            fallback["_normalizer_warning"] = {{
-                "reason": "model_normalize_response_raised_exception",
-                "error": str(exc),
-                "required_keys": sorted(required),
-            }}
-            return fallback
-
-        if isinstance(value, dict):
-            if required.issubset(value.keys()) and isinstance(value.get("results"), list):
-                return value
-
-            fallback = _default_normalize_response(data, payload)
-            fallback["_normalizer_warning"] = {{
-                "reason": "model_normalize_response_did_not_match_required_contract",
-                "model_return_keys": sorted(str(key) for key in value.keys()),
-                "required_keys": sorted(required),
-            }}
-            return fallback
-
-    return _default_normalize_response(data, payload)
-
-
-def _trial_result(payload: dict[str, Any]) -> dict[str, Any]:
-    return {{
-        "success": True,
-        "results": [
-            {{
-                "title": "Example result",
-                "snippet": "Deterministic trial result for schema validation.",
-                "link": "https://example.com",
-                "position": 1,
-            }}
-        ],
-        "total": 1,
-        "knowledgeGraph": {{}},
-        "answerBox": {{}},
-        "relatedSearches": [],
-        "raw": {{}},
-        "trial_run": True,
-    }}
-
-
-def run(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = dict(payload or {{}})
-
-    if os.getenv("SKILL_TRIAL_RUN") == "1":
-        return _trial_result(payload)
-
-    if not ENDPOINT.startswith(("http://", "https://")):
-        return {{"success": False, "error": "Invalid endpoint", "results": [], "total": 0}}
-
-    api_key = os.getenv(SECRET_ENV) if SECRET_ENV else ""
-    if SECRET_ENV and not api_key:
-        return {{
-            "success": False,
-            "error": f"Missing required environment variable: {{SECRET_ENV}}",
-            "results": [],
-            "total": 0,
-        }}
-
-    headers = _render(HEADERS_TEMPLATE, payload)
-    headers = dict(headers or {{}}) if isinstance(headers, dict) else {{}}
-    if METHOD not in {{"GET", "HEAD"}}:
-        headers.setdefault("Content-Type", "application/json")
-    if SECRET_ENV:
-        headers[AUTH_HEADER_NAME] = api_key
-
-    params = _render(QUERY_TEMPLATE, payload)
-    params = dict(params or {{}}) if isinstance(params, dict) else {{}}
-
-    body = _render(BODY_TEMPLATE, payload)
-    body = dict(body or {{}}) if isinstance(body, dict) else {{}}
-
-    try:
-        response = requests.request(
-            METHOD,
-            ENDPOINT,
-            headers=headers,
-            params=params,
-            json=body if METHOD not in {{"GET", "HEAD"}} else None,
-            timeout=30,
-        )
-        status_code = response.status_code
-        text = response.text[:2000]
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.HTTPError:
-        return {{
-            "success": False,
-            "error": f"HTTP {{status_code}}",
-            "status_code": status_code,
-            "response_preview": text,
-            "results": [],
-            "total": 0,
-        }}
-    except requests.exceptions.RequestException as exc:
-        return {{"success": False, "error": str(exc), "results": [], "total": 0}}
-    except ValueError as exc:
-        return {{"success": False, "error": f"Non-JSON response: {{exc}}", "results": [], "total": 0}}
-
-    normalized = _normalize(data, payload)
-    normalized.setdefault("success", True)
-    normalized.setdefault("results", [])
-    normalized.setdefault("total", len(normalized.get("results") or []))
-    return normalized
-
-
-def {function_name}(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return run(payload)
-
-
-def manifest() -> dict[str, Any]:
-    return MANIFEST_DATA
-
-
-def main() -> None:
-    raw = sys.stdin.read().strip() or "{{}}"
-    payload = json.loads(raw)
-    print(json.dumps(run(payload), ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-def _fallback_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
-    cap = _capability_from_dict(manifest)
-    fn = cap.functions[0]
-
-    input_schema = fn.input_schema or cap.input_schema or {}
-    output_schema = fn.output_schema or cap.output_schema or {}
-
-    props = input_schema.get("properties") if isinstance(input_schema, dict) else {}
-    required = input_schema.get("required") if isinstance(input_schema, dict) else []
-    props = props if isinstance(props, dict) else {}
-    required = [str(item) for item in required or [] if isinstance(item, str)]
-
-    sample = sample_input if isinstance(sample_input, dict) else {}
-    payload: dict[str, Any] = {}
-
-    # 先按 input_schema.properties 构造示例，避免 snippet 里出现 q 但 schema 要 query。
-    for name, spec in props.items():
-        if name in sample:
-            payload[name] = sample[name]
-            continue
-
-        if isinstance(spec, dict) and "default" in spec:
-            payload[name] = spec["default"]
-            continue
-
-        # 如果 schema 需要字段但 sample 没有，就给一个类型安全占位。
-        typ = str((spec or {}).get("type") or "string") if isinstance(spec, dict) else "string"
-        if typ in {"integer", "number"}:
-            payload[name] = 10
-        elif typ == "boolean":
-            payload[name] = True
-        elif typ == "array":
-            payload[name] = []
-        elif typ == "object":
-            payload[name] = {}
-        else:
-            payload[name] = "demo"
-
-    # 如果 schema 没有 properties，就退回 sample_input。
-    if not payload:
-        payload = dict(sample)
-
-    # required 字段必须存在。
-    for name in required:
-        payload.setdefault(name, "demo")
-
-    is_external_api = (
-        str(manifest.get("category") or "").lower() == "external_api"
-        or str(manifest.get("type") or "").lower() == "external_api"
-        or manifest.get("needs_external_network") is True
-    )
-
-    failure_layers = ["helper_call_failed", "final_platform_output_value_invalid"]
-    anti_patterns = [
-        "Do not pass API keys or secrets in payload.",
-        "Do not guess parameter names; follow expected_input_shape.",
-        "Do not expect provider raw response fields as top-level output unless expected_output_shape declares them.",
-    ]
-    return_rule = "Return the adapter result directly. It should match expected_output_shape."
-
-    if not is_external_api and manifest.get("generates_file"):
-        failure_layers.append("artifact_missing")
-        anti_patterns.append("Do not write or expect files outside OUTPUT_DIR.")
-        return_rule = "Return the adapter result directly. If it contains generated file paths, pass those exact OUTPUT_DIR paths to downstream skill steps."
-
-    return {
-        "id": f"{cap.name}.minimal_usage",
-        "title": f"Use {cap.display_name}",
-        "kind": "minimal_usage",
-        "applies_to": {
-            "roles": cap.allowed_roles or cap.roles,
-            "capabilities": cap.required_capabilities or [cap.name],
-            "failure_layers": failure_layers,
-        },
-        "description": fn.when_to_use or fn.short_description,
-        "code": (
-            f"from {fn.import_path} import {fn.function_name}\n\n"
-            f"payload = {json.dumps(payload, ensure_ascii=False, indent=2)}\n"
-            f"result = {fn.function_name}(payload)\n"
-            f"return result"
-        ),
-        "expected_input_shape": input_schema,
-        "expected_output_shape": output_schema,
-        "return_rule": return_rule,
-        "anti_patterns": anti_patterns,
-        "requires": cap.required_capabilities or [cap.name],
-        "usage_policy": cap.usage_policy,
-        "priority": 80,
-    }
-
-
-_ENV_REF_RE = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
-_INPUT_REF_RE = re.compile(r"\$\{(?:input|payload)\.([A-Za-z0-9_.-]+)\}")
-_MUSTACHE_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}")
-
-
-def _extract_env_refs(value: Any) -> set[str]:
-    refs: set[str] = set()
-    if isinstance(value, str):
-        refs.update(_ENV_REF_RE.findall(value))
-    elif isinstance(value, dict):
-        for item in value.values():
-            refs.update(_extract_env_refs(item))
-    elif isinstance(value, list):
-        for item in value:
-            refs.update(_extract_env_refs(item))
-    return refs
-
-
-def _redact_secrets(value: Any, secret_values: set[str] | None = None) -> Any:
-    secret_values = {item for item in (secret_values or set()) if item}
-    if isinstance(value, str):
-        redacted = value
-        for secret in secret_values:
-            redacted = redacted.replace(secret, "***")
-        if _ENV_REF_RE.search(redacted):
-            return _ENV_REF_RE.sub("${ENV:***}", redacted)
-        return redacted
-    if isinstance(value, dict):
-        return {key: _redact_secrets(item, secret_values) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_secrets(item, secret_values) for item in value]
-    return value
-
-
-def _get_by_path(payload: dict[str, Any], path: str) -> Any:
-    current: Any = payload
-    for part in path.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        else:
-            return ""
-    return current
-
-
-def _render_template(value: Any, sample_input: dict[str, Any], secret_values: dict[str, str]) -> Any:
-    if isinstance(value, str):
-        def env_replace(match: re.Match[str]) -> str:
-            name = match.group(1)
-            return secret_values.get(name, "")
-
-        def input_replace(match: re.Match[str]) -> str:
-            resolved = _get_by_path(sample_input, match.group(1))
-            return str(resolved if resolved is not None else "")
-
-        rendered = _ENV_REF_RE.sub(env_replace, value)
-        rendered = _INPUT_REF_RE.sub(input_replace, rendered)
-        rendered = _MUSTACHE_REF_RE.sub(input_replace, rendered)
-        return rendered
-
-    if isinstance(value, dict):
-        return {key: _render_template(item, sample_input, secret_values) for key, item in value.items() if item is not None}
-    if isinstance(value, list):
-        return [_render_template(item, sample_input, secret_values) for item in value]
-    return value
-
-
-def _normalized_preview(data: Any) -> dict[str, Any]:
-    if isinstance(data, dict):
-        keys = sorted(str(key) for key in data.keys())
-        return {"type": "object", "keys": keys[:50], "preview": {key: data[key] for key in list(data.keys())[:10]}}
-    if isinstance(data, list):
-        return {"type": "array", "length": len(data), "first_item": data[0] if data else None}
-    return {"type": type(data).__name__, "value": data}
-
-
-def _auth_env_refs(config: dict[str, Any]) -> set[str]:
-    refs = _extract_env_refs(config)
-    auth = config.get("auth") if isinstance(config.get("auth"), dict) else {}
-    for key in ("env", "username_env", "password_env"):
-        value = str(auth.get(key) or "").strip()
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
-            refs.add(value)
-    secret_env = str(config.get("secret_env") or "").strip()
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
-        refs.add(secret_env)
-    return refs
-
-
-def _auth_config_for_live_test(config: dict[str, Any]) -> dict[str, Any]:
-    auth = dict(config.get("auth") or {}) if isinstance(config.get("auth"), dict) else {}
-
-    auth_type = str(
-        auth.get("type")
-        or config.get("auth_type")
-        or config.get("authentication")
-        or "none"
-    ).strip().lower()
-
-    auth_type = (
-        "token" if auth_type in {"token", "bearer"}
-        else "api_key" if auth_type in {"api_key", "key", "header"}
-        else auth_type
-    )
-
-    if auth_type in {"", "none", "no_auth", "anonymous"}:
-        return {}
-
-    # env_name 是变量名，不要解析成 secret 值。
-    env_name = str(
-        auth.get("env")
-        or config.get("secret_env")
-        or config.get("api_key_env")
-        or config.get("token_env")
-        or config.get("password_env")
-        or ""
-    ).strip()
-
-    placement = _resolve_env_ref_or_value(
-        auth.get("placement") or config.get("auth_placement") or "",
-        "",
-    ).strip().lower()
-
-    if auth_type in {"token", "api_key", "basic"}:
-        placement = placement or "header"
-
-    normalized = {**auth, "type": auth_type, "env": env_name, "placement": placement}
-
-    if auth_type == "token":
-        normalized["header_name"] = _resolve_env_ref_or_value(
-            auth.get("header_name") or config.get("auth_header_name") or "Authorization",
-            "Authorization",
-        ).strip() or "Authorization"
-        normalized["scheme"] = _resolve_env_ref_or_value(
-            auth.get("scheme") or config.get("auth_scheme") or "Bearer",
-            "Bearer",
-        ).strip() or "Bearer"
-
-    elif auth_type == "api_key":
-        if placement == "query":
-            normalized["query_param"] = _resolve_env_ref_or_value(
-                auth.get("query_param") or config.get("auth_query_param") or "api_key",
-                "api_key",
-            ).strip() or "api_key"
-        elif placement == "bearer":
-            normalized["header_name"] = "Authorization"
-            normalized["scheme"] = "Bearer"
-        else:
-            normalized["placement"] = "header"
-            normalized["header_name"] = _resolve_env_ref_or_value(
-                auth.get("header_name") or config.get("auth_header_name") or "X-API-KEY",
-                "X-API-KEY",
-            ).strip() or "X-API-KEY"
-
-    elif auth_type == "basic":
-        normalized["placement"] = "header"
-        normalized["header_name"] = "Authorization"
-        normalized["scheme"] = "Basic"
-
-    return normalized
-
-
-def _apply_auth_to_request(headers: dict[str, Any], query: dict[str, Any], config: dict[str, Any], secret_values: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any], list[str], bool]:
-    auth = _auth_config_for_live_test(config)
-    if not auth:
-        return headers, query, [], False
-    env_name = str(auth.get("env") or "").strip()
-    secret = secret_values.get(env_name, "")
-    warnings: list[str] = []
-    if not env_name or not secret:
-        return headers, query, warnings, False
-    auth_type = str(auth.get("type") or "").lower()
-    placement = str(auth.get("placement") or "").lower()
-    if auth_type == "api_key" and placement == "query":
-        query[str(auth.get("query_param") or "api_key")] = secret
-        return headers, query, warnings, True
-    if auth_type == "api_key":
-        if placement == "bearer":
-            headers["Authorization"] = f"Bearer {secret}"
-        else:
-            header_name = str(auth.get("header_name") or "").strip()
-            if not header_name:
-                warnings.append("已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。")
-                return headers, query, warnings, False
-            headers[header_name] = secret
-        return headers, query, warnings, True
-    if auth_type == "token":
-        header_name = str(auth.get("header_name") or "Authorization").strip() or "Authorization"
-        scheme = str(auth.get("scheme") or "Bearer").strip()
-        headers[header_name] = f"{scheme} {secret}".strip()
-        return headers, query, warnings, True
-    if auth_type == "basic":
-        encoded = base64.b64encode(secret.encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {encoded}"
-        return headers, query, warnings, True
-    if auth_type == "custom":
-        return headers, query, warnings, bool(headers)
-    return headers, query, warnings, False
-
-
-def live_test_tool(request: dict[str, Any]) -> dict[str, Any]:
-    """Perform one generic external API probe without generating or registering code."""
-    _load_tool_authoring_config_store_from_disk()
-
-    if request.get("allow_external_network") is not True:
-        return {
-            "success": False,
-            "status": "blocked",
-            "errors": ["allow_external_network must be true for live_test"],
-            "preview": None,
-            "normalized_preview": None,
-        }
-
-    config = request.get("config") if isinstance(request.get("config"), dict) else {}
-    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
-
-    env_refs = _auth_env_refs(config)
-    missing_env = sorted(name for name in env_refs if not os.environ.get(name))
-    if missing_env:
-        auth = _auth_config_for_live_test(config)
-        expected_header = str(auth.get("header_name") or "").strip() if auth and auth.get("placement") != "query" else ""
-        raw_url = str(config.get("url") or config.get("endpoint") or config.get("base_url") or "")
-        return {
-            "success": False,
-            "status": "missing_secret",
-            "errors": ["missing required env secret(s): " + ", ".join(missing_env)],
-            "missing_env": missing_env,
-            "preview": None,
-            "normalized_preview": None,
-            "request_preview": {
-                "method": str(config.get("method") or "GET").upper(),
-                "url": _redact_secrets(raw_url),
-                "header_keys": [expected_header] if expected_header else [],
-                "has_body": False,
-                "body_preview": None,
-                "query_preview": {},
-                "auth_applied": False,
-            },
-        }
-
-    secret_values = {name: os.environ.get(name, "") for name in env_refs}
-
-    method = _resolve_env_ref_or_value(config.get("method"), "GET").upper()
-    url = str(config.get("url") or config.get("endpoint") or "")
-    if not url:
-        base = str(config.get("base_url") or "").rstrip("/")
-        path = str(config.get("path") or "").lstrip("/")
-        url = f"{base}/{path}" if base and path else base
-
-    url = _render_template(url, sample_input, secret_values)
-    if not url.startswith(("http://", "https://")):
-        return {
-            "success": False,
-            "status": "invalid_config",
-            "errors": ["live_test url must start with http:// or https://"],
-            "preview": None,
-            "normalized_preview": None,
-        }
-
-    headers_template = config.get("headers_template") or config.get("headers") or {}
-    if isinstance(headers_template, str):
-        ref = _env_ref_name(headers_template)
-        headers_template = _load_json_env(ref, {}) if ref else {}
-    if not headers_template and config.get("headers_template_env"):
-        headers_template = _load_json_env(str(config.get("headers_template_env")), {})
-
-    query_template = config.get("query_template") or config.get("params_template") or {}
-    if isinstance(query_template, str):
-        ref = _env_ref_name(query_template)
-        query_template = _load_json_env(ref, {}) if ref else {}
-    if not query_template and config.get("query_template_env"):
-        query_template = _load_json_env(str(config.get("query_template_env")), {})
-
-    body_template = config.get("json_body_template") if "json_body_template" in config else config.get("body_template",
-                                                                                                       {})
-    if isinstance(body_template, str):
-        ref = _env_ref_name(body_template)
-        body_template = _load_json_env(ref, {}) if ref else {}
-    if not body_template and config.get("json_body_template_env"):
-        body_template = _load_json_env(str(config.get("json_body_template_env")), {})
-
-    headers = _render_template(headers_template or {}, sample_input, secret_values)
-    query = _render_template(query_template or {}, sample_input, secret_values)
-
-    headers = dict(headers or {}) if isinstance(headers, dict) else {}
-    query = dict(query or {}) if isinstance(query, dict) else {}
-
-    headers, query, auth_warnings, auth_applied = _apply_auth_to_request(headers, query, config, secret_values)
-
-    auth_warning = "已保存密钥，但当前请求模板没有使用该密钥，请配置 Header 名称或认证方式。" if _auth_config_for_live_test(
-        config) and not auth_applied else ""
-    if auth_warning and auth_warning not in auth_warnings:
-        auth_warnings.append(auth_warning)
-
-    json_body = _render_template(body_template or {}, sample_input, secret_values)
-    json_body = dict(json_body or {}) if isinstance(json_body, dict) else json_body
-
-    if isinstance(query, dict) and query:
-        parsed = urllib.parse.urlsplit(url)
-        merged_query = urllib.parse.urlencode({**dict(urllib.parse.parse_qsl(parsed.query)), **query}, doseq=True)
-        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, merged_query, parsed.fragment))
-
-    data: bytes | None = None
-    if method not in {"GET", "HEAD"}:
-        data = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
-        headers = {**headers, "Content-Type": headers.get("Content-Type") or headers.get("content-type") or "application/json"}
-
-    request_preview = {
-        "method": method,
-        "url": _redact_secrets(url, set(secret_values.values())),
-        "header_keys": sorted((headers or {}).keys()),
-        "has_body": data is not None,
-        "body_preview": _redact_secrets(json_body, set(secret_values.values())) if data is not None else None,
-        "query_preview": _redact_secrets(query, set(secret_values.values())),
-        "auth_applied": auth_applied,
-    }
-
-    timeout = float(config.get("timeout_seconds") or os.environ.get("TOOL_AUTHOR_LIVE_TEST_TIMEOUT_SECONDS", "20"))
-    req = urllib.request.Request(url=url, data=data, method=method, headers={str(k): str(v) for k, v in (headers or {}).items()})
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(int(config.get("max_preview_bytes") or 65536))
-            status_code = int(resp.status)
-            content_type = resp.headers.get("content-type", "")
-    except urllib.error.HTTPError as exc:
-        raw = exc.read(65536)
-        status_code = int(exc.code)
-        content_type = exc.headers.get("content-type", "") if exc.headers else ""
-    except Exception as exc:
-        return {
-            "success": False,
-            "status": "request_failed",
-            "errors": [str(exc), *auth_warnings],
-            "preview": None,
-            "normalized_preview": None,
-            "request_preview": request_preview,
-        }
-
-    text = raw.decode("utf-8", errors="replace")
-    try:
-        preview: Any = json.loads(text)
-    except Exception:
-        preview = text[:4000]
-
-    redacted_preview = _redact_secrets(preview, set(secret_values.values()))
-    success = 200 <= status_code < 400
-
-    return {
-        "success": success,
-        "status": "ok" if success else "http_error",
-        "status_code": status_code,
-        "content_type": content_type,
-        "preview": redacted_preview,
-        "normalized_preview": _normalized_preview(redacted_preview),
-        "request_preview": request_preview,
-        "errors": ([] if success else [f"HTTP {status_code}"]) + auth_warnings,
-    }
-AUTHORING_HELPER_NAMES = {
-    "authoring_config_collector",
-    "authoring_schema_infer",
-    "authoring_live_test",
-    "authoring_dependency_check",
-    "authoring_code_protocol_check",
-    "authoring_file_output_check",
-}
-
-
-def _secret_env_name_from_key(key: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", key or "TOOL_SECRET").strip("_").upper()
-    if not cleaned:
-        cleaned = "TOOL_SECRET"
-    if not any(token in cleaned for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-        cleaned += "_SECRET"
-    return cleaned[:80]
-
-
-def _sanitize_authoring_config(value: Any, *, parent_key: str = "") -> tuple[Any, set[str]]:
-    env_refs: set[str] = set()
-    if isinstance(value, dict):
-        sanitized: dict[str, Any] = {}
-        for key, item in value.items():
-            child, child_refs = _sanitize_authoring_config(item, parent_key=str(key))
-            env_refs.update(child_refs)
-            sanitized[key] = child
-        return sanitized, env_refs
-    if isinstance(value, list):
-        items = []
-        for item in value:
-            child, child_refs = _sanitize_authoring_config(item, parent_key=parent_key)
-            env_refs.update(child_refs)
-            items.append(child)
-        return items, env_refs
-    if isinstance(value, str):
-        refs = _extract_env_refs(value)
-        env_refs.update(refs)
-        lowered_key = (parent_key or "").lower()
-        is_env_reference_field = lowered_key.endswith("_env") or lowered_key in {"secret_env", "secret_env_name", "api_key_env", "token_env", "username_env", "password_env"}
-        looks_secret_key = any(token in lowered_key for token in ("api_key", "apikey", "token", "password", "secret", "authorization"))
-        if is_env_reference_field:
-            return value, env_refs | ({value} if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) else set())
-        if looks_secret_key and value and not refs:
-            env_name = _secret_env_name_from_key(parent_key)
-            env_refs.add(env_name)
-            if "authorization" in lowered_key and value.lower().startswith("bearer "):
-                return f"Bearer ${{ENV:{env_name}}}", env_refs
-            return f"${{ENV:{env_name}}}", env_refs
-        return value, env_refs
-    return value, env_refs
-
-
-def _authoring_helper_result_context(context: dict[str, Any], tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
-    updated = dict(context or {})
-    results = dict(updated.get("tool_results") or {})
-    # Store only sanitized helper outputs. Secret values are redacted/replaced before this point.
-    results[tool_name] = result
-    updated["tool_results"] = results
-    if result.get("config"):
-        updated["config"] = result["config"]
-    if result.get("sample_input"):
-        updated["sample_input"] = result["sample_input"]
-    if result.get("schemas"):
-        updated["schemas"] = result["schemas"]
-    if result.get("live_test_result"):
-        updated["live_test_result"] = result["live_test_result"]
-    return updated
-
-
-def _config_collector_schema(missing_fields: list[str] | None = None) -> dict[str, Any]:
-    schema = _external_api_config_schema()
-    schema["properties"] = {
-        **schema.get("properties", {}),
-        "ip": {"type": "string"},
-        "port": {"type": "string"},
-        "api_key_env": {"type": "string", "description": "Environment variable name only; do not enter the secret value."},
-        "token_env": {"type": "string", "description": "Environment variable name only; do not enter the token value."},
-        "username_env": {"type": "string", "description": "Optional username env var name."},
-        "password_env": {"type": "string", "description": "Optional password env var name."},
-        "sample_input": {"type": "object"},
-    }
-    if missing_fields:
-        schema["missing_fields"] = missing_fields
-    return schema
-
-
-def run_authoring_helper(tool_name: str, input: dict[str, Any] | None, context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Run one internal Tool Authoring helper and write its output into authoring context."""
-    normalized_name = _slug(tool_name)
-    cap = get_tool_capability(normalized_name)
-    if cap is None or cap.tool_type != "internal_authoring_tool" or normalized_name not in AUTHORING_HELPER_NAMES:
-        raise ValueError(f"authoring helper is not allowed: {tool_name}")
-    payload = dict(input or {})
-    ctx = dict(context or {})
-    result: dict[str, Any]
-    if normalized_name == "authoring_config_collector":
-        config = payload.get("config") if isinstance(payload.get("config"), dict) else ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
-        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
-        required_fields = [str(item) for item in payload.get("config_required_fields") or payload.get("missing_fields") or []]
-        if required_fields:
-            result = {"success": False, "requires_input": True, "schema": _config_collector_schema(required_fields), "config_required_fields": required_fields, "message": "等待用户在授权弹窗保存连接配置。"}
-        else:
-            saved = save_tool_authoring_config({**ctx, **payload, "config": config, "sample_input": sample_input})
-            result = {"success": True, "requires_input": False, "config": saved.get("config") or {}, "sample_input": sample_input, "configured_env": saved.get("configured_env") or [], "configured_secrets": saved.get("configured_secrets") or [], "config_refs": saved.get("config_refs") or {}, "secret_env_suggestions": saved.get("configured_secrets") or [], "message": "配置已保存为 env/secret 引用。"}
-    elif normalized_name == "authoring_schema_infer":
-        code = str(payload.get("code_block") or ctx.get("code_block") or "")
-        input_schema, output_schema, notes = _infer_schema_from_code(code) if code.strip() else ({}, {}, [])
-        sample_input = payload.get("sample_input") if isinstance(payload.get("sample_input"), dict) else ctx.get("sample_input") if isinstance(ctx.get("sample_input"), dict) else {}
-        if sample_input and not input_schema:
-            input_schema = {key: {"type": type(value).__name__, "required": False, "description": "Inferred from sample_input."} for key, value in sample_input.items()}
-        expected = payload.get("expected_output_fields") or ((ctx.get("config") or {}).get("expected_output_fields") if isinstance(ctx.get("config"), dict) else [])
-        if expected and not output_schema:
-            output_schema = {str(key): {"type": "object", "description": "Expected output field confirmed during authoring."} for key in expected}
-        result = {"success": True, "schemas": {"input_schema": input_schema, "output_schema": output_schema}, "notes": notes}
-    elif normalized_name == "authoring_live_test":
-        if payload.get("allow_external_network") is not True and ctx.get("allow_external_network") is not True:
-            result = {"success": False, "requires_input": True, "schema": {"type": "object", "required": ["allow_external_network"], "properties": {"allow_external_network": {"type": "boolean", "const": True}}}, "message": "live_test 需要用户确认允许外部网络。"}
-        else:
-            live_request = {**ctx, **payload, "allow_external_network": True}
-            result = {"success": True, "requires_input": False, "live_test_result": live_test_tool(live_request)}
-            result["success"] = bool(result["live_test_result"].get("success"))
-    elif normalized_name == "authoring_dependency_check":
-        dependencies = [str(item) for item in payload.get("dependencies") or ctx.get("dependencies") or []]
-        missing = [dep for dep in dependencies if not _dependency_available(dep)]
-        result = {"success": not missing, "dependencies": dependencies, "missing_dependencies": missing}
-    elif normalized_name == "authoring_code_protocol_check":
-        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
-        adapter_code = str(payload.get("adapter_code") or ctx.get("adapter_code") or "")
-        errors = _author_adapter_static_errors(adapter_code, manifest) if adapter_code and manifest else ["adapter_code and manifest are required"]
-        result = {"success": not errors, "errors": errors}
-    elif normalized_name == "authoring_file_output_check":
-        manifest = payload.get("manifest") if isinstance(payload.get("manifest"), dict) else ctx.get("manifest") if isinstance(ctx.get("manifest"), dict) else {}
-        output_schema = ((manifest.get("functions") or [{}])[0].get("output_schema") if isinstance(manifest, dict) else {}) or {}
-        has_file_contract = any(key in output_schema for key in ("file_paths", "file_outputs", "path", "output_path"))
-        result = {"success": has_file_contract, "has_file_contract": has_file_contract, "warnings": [] if has_file_contract else ["file output tools should declare file_paths/file_outputs or path/output_path"]}
-    else:
-        raise ValueError(f"unknown authoring helper: {tool_name}")
-    return {"tool_name": normalized_name, **result, "authoring_context": _authoring_helper_result_context(ctx, normalized_name, result)}
-
-
-def _run_authoring_tool_plan(plan: dict[str, Any], request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    context = dict(request.get("authoring_context") or plan.get("authoring_context") or {})
-    context.update({
-        "config": request.get("config") or context.get("config") or {},
-        "sample_input": request.get("sample_input") or context.get("sample_input") or {},
-        "allow_external_network": request.get("allow_external_network") is True,
-        "manifest": request.get("manifest") or plan.get("manifest") or context.get("manifest") or {},
-        "code_block": request.get("code_block") or context.get("code_block") or "",
-    })
-    results: list[dict[str, Any]] = []
-    for item in plan.get("authoring_tool_plan") or []:
-        if not isinstance(item, dict):
-            continue
-        tool_name = str(item.get("tool_name") or "")
-        helper_input = item.get("input") if isinstance(item.get("input"), dict) else {}
-        result = run_authoring_helper(tool_name, helper_input, context)
-        results.append(result)
-        context = result.get("authoring_context") or context
-        if result.get("requires_input"):
-            break
-    updated = {**plan, "authoring_context": context, "authoring_tool_results": results, "ready_for_code_generation": False}
-    return updated, results
-
-
-def _author_response_from_plan(plan: dict[str, Any], *, model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
-    needs_clarification = bool(plan.get("needs_clarification"))
-    status = "needs_clarification" if needs_clarification else "waiting_for_user_input"
-    return {
-        "needs_clarification": needs_clarification,
-        "questions": plan.get("clarification_questions") or plan.get("questions") or [],
-        "clarification_questions": plan.get("clarification_questions") or plan.get("questions") or [],
-        "requires_config": bool(plan.get("requires_config")),
-        "config_required_fields": plan.get("config_required_fields") or [],
-        "config_form_schema": plan.get("config_form_schema") or plan.get("suggested_config_schema") or {},
-        "suggested_entrypoint": plan.get("suggested_entrypoint") or {},
-        "additional_fields_schema": plan.get("additional_fields_schema") or [],
-        "requires_authorization": bool(plan.get("requires_authorization")),
-        "tool_kind": plan.get("tool_kind") or "unknown",
-        "operation": plan.get("operation") or "",
-        "resolved_clarifications": plan.get("resolved_clarifications") or [],
-        "requires_secret": bool(plan.get("requires_secret")),
-        "secret_env_suggestions": plan.get("secret_env_suggestions") or [],
-        "requires_external_network": bool(plan.get("requires_external_network")),
-        "requires_live_test": bool(plan.get("requires_live_test")),
-        "ready_for_live_test": bool(plan.get("ready_for_live_test")),
-        "ready_for_code_generation": bool(plan.get("ready_for_code_generation")),
-        "requires_authoring_tools": bool(plan.get("requires_authoring_tools")),
-        "authoring_tool_plan": plan.get("authoring_tool_plan") or [],
-        "authoring_context": plan.get("authoring_context") or {},
-        "authoring_tool_results": plan.get("authoring_tool_results") or [],
-        "missing_fields": plan.get("missing_fields") or [],
-        "suggested_config_schema": plan.get("suggested_config_schema") or {},
-        "sample_input_schema": plan.get("sample_input_schema") or {},
-        "manifest": plan.get("manifest") or {},
-        "adapter_code": "",
-        "sample_input": plan.get("sample_input") or {},
-        "validation": {"success": False, "status": status, "errors": [], "warnings": plan.get("risk_notes") or []},
-        "snippet": None,
-        "model_notes": model_notes,
-        "warnings": warnings,
-        "requires_human_confirmation": True,
-    }
-
-
-
-async def _run_capability_ambiguity_judge(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> list[str]:
-    """Ask planner_model to catch capability ambiguity that deterministic heuristics may miss."""
-    if _clarification_answer_texts(request):
-        return []
-    judge_payload = {
-        key: request.get(key)
-        for key in [
-            "description",
-            "operation",
-            "input_description",
-            "output_description",
-            "tool_kind",
-            "needs_external_network",
-            "clarification_answers",
-        ]
-    }
-    judge_messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are the planner_model capability ambiguity judge for Tool Authoring. "
-                "Return strict JSON: {needs_capability_clarification: boolean, question: {id, type, question, options, required}}. "
-                "Set needs_capability_clarification=true only when the user's desired business capability or operation is genuinely unclear. "
-                "If clarification_answers already contain a non-empty answer that resolves the requested operation, return needs_capability_clarification=false. Do not ask the same question again. "
-                "The question must be Chinese, short, structured, and ask only what the tool should do. If you provide options, generate context-specific options for this user request; do not use generic fixed options. "
-                "Do not ask for service address, endpoint, IP, key, token, auth method, connection-test permission, method, headers/body/query templates, schemas, sample input, or expected output fields."
-            ),
-        },
-        {"role": "user", "content": json.dumps(judge_payload, ensure_ascii=False)},
-    ]
-    judge, ack, err = await _complete_author_model("planner", judge_messages, reason="creator_tool_author_capability_ambiguity")
-    if ack:
-        model_notes.append(f"capability_ambiguity_judge={ack['model']}")
-    if err:
-        warnings.append(f"capability ambiguity judge unavailable, used deterministic ambiguity heuristic only: {err}")
-        return []
-    if not bool(judge.get("needs_capability_clarification") or judge.get("capability_ambiguous")):
-        return []
-    question = judge.get("question") or judge.get("clarification_question") or {"id": "operation_detail", "type": "short_text", "question": "请用一句话补充这个工具要完成的具体能力。", "required": True}
-    return _safe_clarification_questions([question], [])
-
 async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
-    request = _apply_clarification_answers(request)
-    planner_payload = {
+    """Step 2 planner: clarify requirements and decide auth generically.
+
+    The planner is intentionally business-agnostic. It may ask clarification
+    questions and it may declare auth requirements, but it must not select or
+    trigger any old wrapper family.
+    """
+    request = dict(request or {})
+    payload = {
         key: request.get(key)
         for key in [
             "description",
+            "requirement",
+            "requirements",
             "tool_name",
             "tool_type",
-            "code_block",
             "input_description",
             "output_description",
-            "manifest",
             "sample_input",
-            "allowed_roles",
             "needs_secret",
+            "requires_auth",
             "needs_external_network",
             "generates_file",
             "high_risk",
-            "clarification_answers",
-            "resolved_clarifications",
-            "tool_kind",
             "operation",
             "config",
-            "live_test_result",
             "allow_external_network",
             "authoring_context",
+            "reference_code",
+            "reference_snippet",
+            "reference_files",
+            "constraints",
+            "expected_usage",
         ]
+        if key in request
     }
-    planner_messages = [
+    messages = [
         {
             "role": "system",
             "content": (
-                "You are planner_model, a generic Tool Authoring flow controller, not a provider-specific code generator. "
-                "Return strict JSON with this layered contract where possible: needs_clarification, clarification_questions, requires_config, "
-                "suggested_entrypoint, config_required_fields, config_form_schema, additional_fields_schema, requires_authorization, tool_kind "
-                "(local_helper|external_api|file_generator|data_transform|unknown), operation, requires_secret, "
-                "secret_env_suggestions, requires_external_network, requires_live_test, ready_for_live_test, "
-                "ready_for_code_generation, requires_authoring_tools, authoring_tool_plan, suggested_config_schema, sample_input_schema, manifest, "
-                "implementation_plan. clarification_questions must be structured objects with id/type/question/options/required, Chinese, preferably 1-3 questions and never more than 5, and only ask about real capability ambiguity. Generate options dynamically from the user request when a choice is useful; do not use hardcoded generic options. "
-                "Do not ask whether the user has a service address, key, token, account, auth method, or connection-test permission as clarification questions; infer and prefill suggested_entrypoint with base_url, method, auth_type, secret_env, and confidence when possible, using empty base_url with low confidence if unknown. Put connection/key/IP/auth/test-permission fields only in config_form_schema/config_required_fields so the UI can show an authorization modal. "
-                "Never ask users for method, headers/body/query templates, input/output schema, sample input, or expected output fields as clarification questions; infer those later from the goal, suggested_entrypoint, saved config, and test result. "
-                "If helper tools are needed, plan only internal_authoring_tool names such as authoring_config_collector, authoring_schema_infer, authoring_live_test, authoring_dependency_check, authoring_code_protocol_check, or authoring_file_output_check. Do not invent provider details."
+                "You are planner_model for a generic tool creation platform. Return strict JSON only. "
+                "Workflow step 2: read the user's requirement and optional reference code, ask only necessary clarification questions, "
+                "and decide whether the tool needs authentication. There is exactly one runtime: python_script. "
+                "Do not output wrapper_family, helper_contract, context APIs, or backend-specific business rules. "
+                "Return shape: {"
+                "\"needs_clarification\": false, "
+                "\"clarification_questions\": [], "
+                "\"tool_name\": \"snake_case\", "
+                "\"description\": \"...\", "
+                "\"manifest\": {...}, "
+                "\"sample_input\": {}, "
+                "\"implementation_notes\": []}. "
+                "manifest must contain runtime_type='python_script', tool_name, description, canonical JSON Schema input_schema/output_schema, dependencies, permissions, artifact_policy, and auth. "
+                "auth must be {required:'yes'|'no'|'unknown', reason:'...', secrets:[{env:'ENV_NAME', description:'...', required:true}]}. "
+                "Only auth.secrets are credentials. permissions.env is only an allow-list for environment variables and must not by itself imply auth. "
+                "dependencies must be objects: {package:'pip-package-name', imports:['python_import_name'], version:''}. "
+                "permissions must include booleans network/read_files/write_files/subprocess and env list. "
+                "Do not enforce any tool-specific output fields beyond the schema you define."
             ),
         },
-        {"role": "user", "content": json.dumps(planner_payload, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
     ]
-    model_plan, ack, err = await _complete_author_model("planner", planner_messages, reason="creator_tool_author_plan")
+    model_plan, ack, err = await _complete_author_model("planner", messages, reason="creator_tool_step2_clarify_auth_plan")
     if ack:
         model_notes.append(f"planner_model={ack['model']}")
     if err:
-        warnings.append(f"planner_model unavailable, used deterministic fallback: {err}")
-    plan = model_plan if isinstance(model_plan, dict) and model_plan else _author_fallback_plan(request)
-    if not isinstance(plan.get("manifest"), dict):
-        plan = _author_fallback_plan(request)
-    normalized = _normalize_author_plan(plan, request)
-    action = str(request.get("action") or "").strip().lower()
-    live_success = _live_test_success_from_request(request)
+        warnings.append(f"planner_model unavailable: {err}")
+    plan = model_plan if isinstance(model_plan, dict) else {}
+    manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
+    name = _slug(str(manifest.get("tool_name") or manifest.get("name") or plan.get("tool_name") or request.get("tool_name") or request.get("operation") or "custom_tool"))
+    base = build_tool_manifest_draft({
+        **request,
+        "tool_name": name,
+        "description": plan.get("description") or request.get("description") or request.get("requirement") or name,
+        "input_schema": manifest.get("input_schema"),
+        "output_schema": manifest.get("output_schema"),
+        "dependencies": manifest.get("dependencies") if isinstance(manifest.get("dependencies"), list) else [],
+        "permissions": manifest.get("permissions") if isinstance(manifest.get("permissions"), dict) else None,
+        "artifact_policy": manifest.get("artifact_policy") if isinstance(manifest.get("artifact_policy"), dict) else None,
+        "auth": manifest.get("auth") if isinstance(manifest.get("auth"), dict) else None,
+    })
+    merged = {**base, **manifest, "runtime_type": "python_script", "tool_name": name, "name": name}
+    merged["input_schema"] = _canonical_schema(merged.get("input_schema"), fallback_properties={}, required=[])
+    merged["output_schema"] = _canonical_schema(merged.get("output_schema"), fallback_properties={"success": {"type": "boolean"}, "result": {}, "error": {"type": "string"}}, required=["success"])
+    merged.setdefault("dependencies", [])
+    merged.setdefault("permissions", base["permissions"])
+    merged.setdefault("artifact_policy", base["artifact_policy"])
+    merged = _sync_auth_into_manifest(merged, request)
+    sample = plan.get("sample_input") if isinstance(plan.get("sample_input"), dict) else {}
+    if not sample and isinstance(request.get("sample_input"), dict):
+        sample = request["sample_input"]
+    questions = plan.get("clarification_questions") or plan.get("questions") or []
+    if isinstance(questions, str):
+        questions = [questions]
+    if not isinstance(questions, list):
+        questions = []
+    questions = [str(q).strip() for q in questions if str(q).strip()][:5]
+    needs_clarification = bool(plan.get("needs_clarification") or questions)
+    auth_gate = _auth_gate_for_manifest(merged, require_config=True)
+    return {
+        "needs_clarification": needs_clarification,
+        "questions": questions,
+        "clarification_questions": questions,
+        "tool_name": name,
+        "tool_kind": "python_script_tool",
+        "operation": str(request.get("operation") or request.get("description") or request.get("requirement") or ""),
+        "manifest": merged,
+        "sample_input": sample,
+        "implementation_notes": plan.get("implementation_notes") if isinstance(plan.get("implementation_notes"), list) else [],
+        "ready_for_code_generation": not needs_clarification and not bool(auth_gate.get("block_registration")),
+        "requires_config": bool(auth_gate.get("required") and auth_gate.get("status") == "needs_config"),
+        "requires_live_test": False,
+        "requires_authoring_tools": False,
+        "authoring_tool_plan": [],
+        "auth_gate": auth_gate,
+        "model_notes": [],
+    }
 
-    if (
-            action not in {"generate", "finalize"}
-            and not live_success
-            and ack
-            and normalized.get("tool_kind") == "external_api"
-            and not normalized.get("clarification_questions")
-    ):
-        judged_questions = await _run_capability_ambiguity_judge(request, model_notes, warnings)
-        if judged_questions:
-            normalized["clarification_questions"] = judged_questions
-            normalized["questions"] = judged_questions
-            normalized["needs_clarification"] = True
-            normalized["ready_for_code_generation"] = False
-    model_notes.extend(normalized.get("model_notes") or [])
-    return normalized
+
+async def _repair_script_tool_spec_with_model(*, request: dict[str, Any], plan: dict[str, Any], errors: list[str], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    messages = [
+        {"role": "system", "content": "You are tool_spec_repair_model. Return strict JSON only. Repair manifest for python_script runtime. Do not write code. Do not output wrapper_family or helper contracts. Schemas must be canonical JSON Schema objects. Dependencies must have package/imports. Permissions must be explicit booleans. Auth must be represented only as manifest.auth plus permissions.env."},
+        {"role": "user", "content": json.dumps({"request": request, "current_plan": plan, "validation_errors": errors}, ensure_ascii=False)},
+    ]
+    repaired, ack, err = await _complete_author_model("planner", messages, reason="creator_tool_script_spec_repair")
+    if ack:
+        model_notes.append(f"tool_spec_repair_model={ack['model']}")
+    if err:
+        warnings.append(f"tool_spec_repair_model unavailable: {err}")
+        return plan
+    manifest = repaired.get("manifest") if isinstance(repaired, dict) and isinstance(repaired.get("manifest"), dict) else {}
+    if not manifest:
+        return plan
+    updated = dict(plan)
+    updated["manifest"] = _sync_auth_into_manifest(manifest, request)
+    if isinstance(repaired.get("sample_input"), dict):
+        updated["sample_input"] = repaired["sample_input"]
+    return updated
 
 
-async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
-    """Generic Tool Authoring pipeline driven by explicit actions."""
-    _load_tool_authoring_config_store_from_disk()
+async def _author_sample_input_with_model(*, request: dict[str, Any], plan: dict[str, Any], manifest: dict[str, Any], wrapper_family: str | None = None, model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    if isinstance(request.get("sample_input"), dict) and request.get("sample_input"):
+        return request["sample_input"]
+    if isinstance(plan.get("sample_input"), dict) and plan.get("sample_input"):
+        return plan["sample_input"]
+    messages = [{"role": "system", "content": "You are sample_input_model. Return strict JSON only: {\"sample_input\": {...}, \"notes\": []}. Generate one safe runnable test payload conforming to manifest.input_schema. Do not include secrets, API keys, tokens, or passwords."}, {"role": "user", "content": json.dumps({"request": request, "manifest": manifest}, ensure_ascii=False)}]
+    result, ack, err = await _complete_author_model("planner", messages, reason="creator_tool_script_sample_input")
+    if ack:
+        model_notes.append(f"sample_input_model={ack['model']}")
+    if err:
+        warnings.append(f"sample_input_model unavailable, used empty fallback: {err}")
+        return {}
+    sample = result.get("sample_input") if isinstance(result, dict) else None
+    return sample if isinstance(sample, dict) else {}
 
-    stage = str(request.get("stage") or "").strip().lower()
-    action = str(request.get("action") or "clarify").strip().lower()
 
-    if stage == "finalize":
-        action = "finalize"
-    elif stage == "draft" and action == "clarify":
-        action = "generate"
+async def _author_script_with_model(*, request: dict[str, Any], plan: dict[str, Any], manifest: dict[str, Any], sample_input: dict[str, Any], model_notes: list[str], warnings: list[str]) -> str:
+    messages = [
+        {"role": "system", "content": "You are code_model. Return strict JSON only: {\"script_code\":\"...python code...\"}. Generate a complete Python script implementing the tool. The script must define run(payload: dict, config: dict | None = None) -> dict AND a public tool-specific function named after manifest.tool_name that delegates to run. Do not define execute_task. Do not use wrapper_family or platform context APIs. If writing files, write only under os.environ['TOOL_OUTPUT_DIR'] or OUTPUT_DIR. Return a JSON-serializable dict conforming to manifest.output_schema. Use only manifest.dependencies and Python standard library. Dependency imports in code must be actual Python module roots, not class/function names. If manifest.auth.required=yes, read required secrets from the env names declared in manifest.permissions.env/auth.secrets. Never hard-code secret values. Never require secrets in payload. When TOOL_TRIAL_RUN=1 and a required env var is missing, do not fail; return a successful dry-run response indicating auth_required=true and missing_env=[...]."},
+        {"role": "user", "content": json.dumps({"user_request": {"description": request.get("description"), "operation": request.get("operation"), "tool_name": request.get("tool_name"), "input_description": request.get("input_description"), "output_description": request.get("output_description")}, "manifest": manifest, "sample_input": sample_input, "implementation_notes": plan.get("implementation_notes") or []}, ensure_ascii=False)},
+    ]
+    result, ack, err = await _complete_author_model("code", messages, reason="creator_tool_script_code")
+    if ack:
+        model_notes.append(f"code_model={ack['model']}")
+    if err:
+        warnings.append(f"code_model unavailable: {err}")
+        return ""
+    code = _strip_code_fence(str(result.get("script_code") or result.get("adapter_code") or result.get("code") or "")) if isinstance(result, dict) else ""
+    return _ensure_named_entrypoint(code, manifest)
 
-    model_notes: list[str] = []
-    warnings: list[str] = []
 
-    if action not in {"clarify", "configure", "live_test", "generate", "finalize"}:
-        raise ValueError("action must be one of clarify/configure/live_test/generate/finalize")
+async def _repair_script_with_model(
+    *,
+    request: dict[str, Any],
+    manifest: dict[str, Any],
+    sample_input: dict[str, Any],
+    script_code: str,
+    validation: dict[str, Any],
+    human_feedback: str = "",
+    model_notes: list[str],
+    warnings: list[str],
+) -> str:
+    original_code = _strip_code_fence(script_code or "")
 
-    if action == "live_test":
-        result = live_test_tool(request)
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": request.get("tool_kind") or "external_api",
-            "operation": request.get("operation") or "",
-            "live_test_result": result,
-            "preview": result.get("preview"),
-            "normalized_preview": result.get("normalized_preview"),
-            "manifest": request.get("manifest") or {},
-            "adapter_code": "",
-            "sample_input": request.get("sample_input") or {},
-            "validation": {"success": bool(result.get("success")), "status": "live_test", "errors": result.get("errors") or [], "warnings": []},
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    if action == "finalize":
-        manifest = request.get("manifest") if isinstance(request.get("manifest"), dict) else {}
-        adapter_code = str(request.get("adapter_code") or request.get("code_block") or "")
-        allow_real = bool(request.get("allow_external_network") or (request.get("live_test_result") or {}).get("success"))
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
-            sample_input=request.get("sample_input") or {},
-            dynamic=True,
-            real_run=allow_real,
-        )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        snippet = None
-        if validation.get("success"):
-            snippet = _fallback_snippet(manifest, request.get("sample_input") or {})
-            snippet_validation = _validate_author_snippet(snippet, manifest)
-
-            if not snippet_validation["success"]:
-                validation["success"] = False
-                validation["status"] = "failed"
-                validation["errors"] = sorted(
-                    set(validation.get("errors", []) + snippet_validation.get("errors", []))
-                )
-
-            validation["snippet_validation"] = snippet_validation
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": request.get("sample_input") or {},
-            "validation": validation,
-            "snippet": snippet,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    plan = await _run_planner(request, model_notes, warnings)
-    live_success = _live_test_success_from_request(request)
-
-    if action == "generate" and live_success and plan.get("tool_kind") == "external_api":
-        plan["authoring_tool_plan"] = []
-        plan["requires_authoring_tools"] = False
-        if plan.get("manifest"):
-            plan["ready_for_code_generation"] = True
-
-    if action != "generate" and (plan.get("requires_authoring_tools") or plan.get("authoring_tool_plan")):
-        plan, _helper_results = _run_authoring_tool_plan(plan, request)
-        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
-
-    if action in {"clarify", "configure"} or plan.get("needs_clarification") or not plan.get("ready_for_code_generation"):
-        return _author_response_from_plan(plan, model_notes=model_notes, warnings=warnings)
-
-    raw_manifest = plan.get("manifest") or build_tool_manifest_draft(request)
-    sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) and request.get("sample_input") else plan.get("sample_input") or {}
-    code_block = str(request.get("code_block") or "")
-    tool_kind = plan.get("tool_kind") or request.get("tool_kind") or ""
-
-    if tool_kind == "external_api":
-        draft_contract = _confirmed_external_api_code_contract(request, plan, raw_manifest, sample_input)
-        manifest = _normalize_external_api_manifest_for_adapter(raw_manifest, request, plan, draft_contract)
-        contract = _confirmed_external_api_code_contract(request, plan, manifest, sample_input)
-
-        output_schema = {}
-        try:
-            cap = _capability_from_dict(manifest)
-            output_schema = cap.functions[0].output_schema if cap.functions else {}
-        except Exception:
-            output_schema = _schema_from_planner_io(manifest, input_side=False)
-
-        internal_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are code_model. Do NOT write a full adapter. "
-                    "Only write internal business logic. "
-                    "Return strict JSON only: {\"internal_code\": \"...python code...\"}. "
-                    "The internal code must define exactly: normalize_response(data: dict, payload: dict) -> dict. "
-                    "Do not import requests, httpx, urllib, os, sys, pathlib, subprocess, socket, or shutil. "
-                    "Do not read environment variables. Do not define run/main/manifest. "
-                    "Do not call external network. Do not return or log secrets."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "adapter_contract": contract,
-                        "sample_input": sample_input,
-                        "live_test_result": request.get("live_test_result") or (plan.get("authoring_context") or {}).get("live_test_result"),
-                        "output_schema": output_schema,
-                        "task": "Write only normalize_response(data, payload).",
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-
-        internal_json, code_ack, code_err = await _complete_author_model("code", internal_messages, reason="creator_tool_author_external_api_internal_logic")
-        if code_ack:
-            model_notes.append(f"code_model={code_ack['model']}")
-        if code_err:
-            warnings.append(f"code_model unavailable, used default internal normalizer: {code_err}")
-
-        internal_code = _strip_code_fence(str((internal_json or {}).get("internal_code") or (internal_json or {}).get("code") or ""))
-        internal_errors = _internal_code_errors(internal_code)
-        if internal_errors:
-            warnings.extend(f"internal_code fallback: {err}" for err in internal_errors)
-            internal_code = _default_internal_normalize_code()
-
-        adapter_code = _external_api_wrapper_code(contract, internal_code, manifest)
-
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=adapter_code,
-            sample_input=sample_input,
-            dynamic=True,
-            real_run=bool(live_success or request.get("allow_external_network")),
-        )
-
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
-
-        validation["adapter_contract"] = contract
-        validation["internal_code_errors"] = internal_errors
-
-        return {
-            "needs_clarification": False,
-            "questions": [],
-            "tool_kind": plan.get("tool_kind"),
-            "operation": plan.get("operation"),
-            "manifest": manifest,
-            "adapter_code": adapter_code,
-            "sample_input": sample_input,
-            "validation": validation,
-            "snippet": None,
-            "model_notes": model_notes,
-            "warnings": warnings,
-            "requires_human_confirmation": True,
-        }
-
-    manifest = raw_manifest
-    mode = "normalize_existing_code" if code_block.strip() else "generate_new_adapter"
-
-    code_messages = [
+    messages = [
         {
             "role": "system",
             "content": (
-                f"You are code_model in mode={mode}. Return Python code only. Consume only confirmed requirements/config/sample input/live_test_result/manifest/implementation_plan/protocol. "
-                "Do not guess endpoint, secret name, auth scheme, inputs, or outputs. For network/API adapters, include `if os.getenv(\"SKILL_TRIAL_RUN\") == \"1\": return mock_result`, "
-                "read secrets only with os.getenv(DECLARED_ENV_NAME), never payload.get('api_key'), and never print or return secrets. Include run(payload), manifest function wrapper, and JSON main()."
+                "You are code_repair_model. Return strict JSON only: {\"script_code\":\"...python code...\"}. "
+                "Repair the complete standalone python_script module according to the user's human_feedback. "
+                "Do not return only a public wrapper. Do not return a diff. "
+                "The returned script_code must define run(payload: dict, config: dict | None = None) -> dict "
+                "and the public tool-specific function named after manifest.tool_name. "
+                "The public function may delegate to run(), but run() must be present in the same returned script. "
+                "Preserve helper functions that are still needed. "
+                "Do not introduce wrapper_family, execute_task, platform context APIs, or backend-specific tool branches. "
+                "Respect manifest.auth and permissions.env. Use env vars for secrets. Never hard-code secrets. "
+                "Fix validation errors, stderr, traceback, and human feedback while preserving the full previous implementation. "
+                "If no meaningful change is possible, still return the best complete corrected script, not an empty response."
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
-                    "final_requirement": request.get("description") or "",
-                    "confirmed_config": request.get("config") or {},
-                    "sample_input": sample_input,
-                    "live_test_result": request.get("live_test_result") or (plan.get("authoring_context") or {}).get("live_test_result"),
-                    "authoring_context": plan.get("authoring_context") or {},
                     "manifest": manifest,
-                    "implementation_plan": plan.get("implementation_plan"),
-                    "adapter_protocol": "Expose run(payload: dict|None)->dict and the manifest function; dynamic validation runs with SKILL_TRIAL_RUN=1 and must not access real external services.",
-                    "code_block": code_block,
+                    "sample_input": sample_input,
+                    "current_full_script_code": original_code,
+                    "validation": validation,
+                    "human_feedback": human_feedback,
+                    "repair_goal": "Modify the existing implementation to satisfy human_feedback. Return the full corrected script.",
+                    "forbidden_repair_outputs": [
+                        "empty script_code",
+                        "only imports plus public wrapper",
+                        "public function that calls run() when run() is missing",
+                        "diff or patch only",
+                        "markdown explanation instead of JSON",
+                        "partial code excerpt",
+                    ],
                 },
                 ensure_ascii=False,
+                default=str,
             ),
         },
     ]
 
-    code_json, code_ack, code_err = await _complete_author_model("code", code_messages, reason=f"creator_tool_author_{mode}")
-    if code_ack:
-        model_notes.append(f"code_model={code_ack['model']}")
-    if code_err:
-        warnings.append(f"code_model unavailable, used deterministic fallback: {code_err}")
+    result, ack, err = await _complete_author_model(
+        "code",
+        messages,
+        reason="creator_tool_script_repair",
+    )
 
-    adapter_code = _strip_code_fence(str(code_json.get("adapter_code") or code_json.get("code") or "")) if code_json else ""
-    if not adapter_code:
-        adapter_code = _normalize_existing_code_fallback(code_block, manifest) if code_block.strip() else generate_adapter_code(manifest)
+    if ack:
+        model_notes.append(f"repair_code_model={ack['model']}")
+
+    if err:
+        warnings.append(f"repair_code_model unavailable: {err}")
+        return original_code
+
+    repaired = (
+        _strip_code_fence(
+            str(
+                result.get("script_code")
+                or result.get("adapter_code")
+                or result.get("code")
+                or ""
+            )
+        )
+        if isinstance(result, dict)
+        else ""
+    )
+
+    if not repaired.strip():
+        warnings.append("repair_code_model returned empty script_code; kept previous runtime_code")
+        return original_code
+
+    repaired = _ensure_named_entrypoint(repaired, manifest)
+
+    incomplete, reasons = _looks_like_incomplete_repair(
+        original_code=original_code,
+        repaired_code=repaired,
+        manifest=manifest,
+    )
+
+    if incomplete:
+        warnings.append(
+            "repair_code_model returned incomplete script; kept previous runtime_code. "
+            + "；".join(reasons)
+        )
+        return original_code
+
+    return repaired
+
+async def _author_snippet_with_model(*, request: dict[str, Any], manifest: dict[str, Any], sample_input: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any] | None:
+    """Step 5: summarize a generic reusable snippet and IO contract.
+
+    This is not a hard-coded business snippet. The model summarizes how the
+    completed tool should be called by sandbox / skill creator / workflow code.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are snippet_model for a generic tool platform. Return strict JSON only: {\"snippet\": {...}}. "
+                "Summarize the completed tool for downstream callers. Include: "
+                "direct_usage code that calls run_tool(payload), indirect_usage guidance for sandbox/skill creator/workflow, "
+                "input_io fields, output_io fields, required inputs, required outputs, auth notes, artifact notes, and integration cautions. "
+                "Do not add tool-specific backend rules. Do not invent fields not present in manifest schemas. Do not include secrets in examples."
+            ),
+        },
+        {"role": "user", "content": json.dumps({"request": request, "manifest": manifest, "sample_input": sample_input}, ensure_ascii=False, default=str)},
+    ]
+    result, ack, err = await _complete_author_model("planner", messages, reason="creator_tool_step5_snippet_summary")
+    if ack:
+        model_notes.append(f"snippet_model={ack['model']}")
+    if err:
+        warnings.append(f"snippet_model unavailable; used deterministic snippet: {err}")
+        return None
+    snippet = result.get("snippet") if isinstance(result, dict) else None
+    return snippet if isinstance(snippet, dict) else None
+
+
+def _script_tool_snippet(manifest: dict[str, Any], sample_input: dict[str, Any]) -> dict[str, Any]:
+    tool_name = _slug(str(manifest.get("tool_name") or manifest.get("name") or "custom_tool"))
+    input_schema = _canonical_schema(manifest.get("input_schema"), fallback_properties={}, required=[])
+    output_schema = _canonical_schema(manifest.get("output_schema"), fallback_properties={}, required=[])
+    auth = _normalize_auth_plan(manifest)
+    return {
+        "id": f"{tool_name}.generic_usage",
+        "title": f"Use {tool_name}",
+        "kind": "minimal_usage",
+        "description": str(manifest.get("description") or f"Run {tool_name} with a JSON payload."),
+        "direct_usage": {
+            "code": "payload = " + json.dumps(sample_input or {}, ensure_ascii=False, indent=2) + "\nresult = run_tool(payload)\nreturn result",
+            "entrypoint": "run_tool(payload)",
+            "public_entrypoint": f"{tool_name}(payload, config=None)",
+        },
+        "indirect_usage": {
+            "for_sandbox": "Use this snippet when a sandbox step needs this tool. Pass a dict that conforms to input_io.schema and consume only output_io.required_fields unless optional fields are documented.",
+            "for_skill_creator": "Reference this tool_contract/snippet when generating SKILL.md or runtime scripts. Do not infer extra IO beyond the schemas.",
+            "for_workflow": "Use call_contract.public_entrypoint or platform run_tool with the payload object. Keep secrets out of payload.",
+        },
+        "code": "payload = " + json.dumps(sample_input or {}, ensure_ascii=False, indent=2) + "\nresult = run_tool(payload)\nreturn result",
+        "input_io": {"schema": input_schema, "fields": _schema_field_summaries(input_schema), "required_fields": _schema_required(input_schema), "sample_input": sample_input or {}},
+        "output_io": {"schema": output_schema, "fields": _schema_field_summaries(output_schema), "required_fields": _schema_required(output_schema)},
+        "auth": {"required": auth.get("required") or "no", "secrets": auth.get("secrets") or [], "reason": auth.get("reason") or ""},
+        "artifact_io": manifest.get("artifact_policy") if isinstance(manifest.get("artifact_policy"), dict) else {"file_fields": []},
+        "expected_input_shape": input_schema,
+        "expected_output_shape": output_schema,
+        "return_rule": "Return the generated tool result directly; downstream modules should rely on output_io.schema.",
+        "anti_patterns": ["Do not pass secrets in payload.", "Do not invent input/output fields outside the tool contract.", "Do not write files outside TOOL_OUTPUT_DIR unless the artifact policy allows it."],
+        "requires": ["deterministic_execution"],
+        "usage_policy": "self_implementation_allowed",
+        "priority": 80,
+    }
+
+
+def _schema_field_summaries(schema: Any) -> list[dict[str, Any]]:
+    schema = schema if isinstance(schema, dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = set(_schema_required(schema))
+    rows: list[dict[str, Any]] = []
+    for name, spec in properties.items():
+        spec = spec if isinstance(spec, dict) else {}
+        rows.append({
+            "name": str(name),
+            "type": spec.get("type") or "any",
+            "required": str(name) in required,
+            "description": spec.get("description") or "",
+            "default": spec.get("default") if "default" in spec else None,
+        })
+    return rows
+
+
+def _fallback_tool_contract(*, request: dict[str, Any], manifest: dict[str, Any], script_code: str, sample_input: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
+    tool_name = _slug(str(manifest.get("tool_name") or manifest.get("name") or request.get("tool_name") or "custom_tool"))
+    auth = _normalize_auth_plan(manifest)
+    permissions = manifest.get("permissions") if isinstance(manifest.get("permissions"), dict) else {}
+    input_schema = _canonical_schema(manifest.get("input_schema"), fallback_properties={}, required=[])
+    output_schema = _canonical_schema(manifest.get("output_schema"), fallback_properties={}, required=[])
+    snippet = _script_tool_snippet(manifest, sample_input if isinstance(sample_input, dict) else {})
+    return {
+        "tool_name": tool_name,
+        "display_name": str(manifest.get("display_name") or tool_name.replace("_", " ").title()),
+        "function_name": _manifest_tool_function_name(manifest),
+        "runtime_type": "python_script",
+        "purpose": str(manifest.get("description") or request.get("description") or request.get("requirement") or ""),
+        "when_to_use": str(manifest.get("when_to_use") or manifest.get("description") or ""),
+        "input_contract": {
+            "schema": input_schema,
+            "fields": _schema_field_summaries(input_schema),
+            "required_fields": _schema_required(input_schema),
+            "sample_input": sample_input if isinstance(sample_input, dict) else {},
+        },
+        "output_contract": {
+            "schema": output_schema,
+            "fields": _schema_field_summaries(output_schema),
+            "required_fields": _schema_required(output_schema),
+        },
+        "call_contract": {
+            "internal_entrypoint": "run(payload, config=None)",
+            "public_entrypoint": f"{_manifest_tool_function_name(manifest)}(payload, config=None)",
+            "platform_snippet_entrypoint": "run_tool(payload)",
+            "returns": "JSON-serializable dict conforming to output_contract.schema",
+        },
+        "snippet": snippet,
+        "direct_usage": snippet.get("direct_usage"),
+        "indirect_usage": snippet.get("indirect_usage"),
+        "artifacts": manifest.get("artifact_policy") if isinstance(manifest.get("artifact_policy"), dict) else {"file_fields": []},
+        "auth": {
+            "required": auth.get("required") or "no",
+            "reason": auth.get("reason") or "",
+            "secrets": auth.get("secrets") or [],
+        },
+        "permissions": permissions,
+        "dependencies": manifest.get("dependencies") if isinstance(manifest.get("dependencies"), list) else [],
+        "validation_summary": {
+            "success": bool(validation.get("success")) if isinstance(validation, dict) else False,
+            "status": validation.get("status") if isinstance(validation, dict) else "unknown",
+            "errors": validation.get("errors") if isinstance(validation, dict) else [],
+            "can_register": validation.get("can_register") if isinstance(validation, dict) else False,
+        },
+        "integration_notes": [
+            "This contract is generic and derived from manifest/code/validation; downstream modules should not infer hidden IO.",
+            "Call the public entrypoint with a dict payload, or let the platform call run(payload, config=None).",
+            "Do not pass secrets in payload; use declared environment variables when auth.required is yes.",
+            "Downstream callers should depend on output_contract.required_fields, not incidental debug fields.",
+        ],
+    }
+
+
+async def _summarize_tool_contract_with_model(*, request: dict[str, Any], manifest: dict[str, Any], script_code: str, sample_input: dict[str, Any], validation: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any]:
+    """Use the planner model to summarize the completed generic tool contract.
+
+    This summary is intentionally business-agnostic: the model must describe the
+    generated tool's observed contract from manifest/code/validation, not enforce
+    any special rule for a particular tool type.
+    """
+    fallback = _fallback_tool_contract(request=request, manifest=manifest, script_code=script_code, sample_input=sample_input, validation=validation)
+    script_excerpt = (script_code or "")[:12000]
+    dynamic_trial = validation.get("dynamic_trial") if isinstance(validation, dict) and isinstance(validation.get("dynamic_trial"), dict) else {}
+    observed_result = dynamic_trial.get("result") if isinstance(dynamic_trial, dict) else None
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are tool_contract_model for a generic tool creation platform. "
+                "Return strict JSON only: {\"tool_contract\": {...}}. "
+                "Summarize what the completed generated tool does, how downstream modules should call it, "
+                "its input schema, output schema, required fields, auth requirements, artifacts, dependencies, "
+                "and integration cautions. Do not add business-specific validation rules. Do not change schemas. "
+                "Do not invent secrets. Base the summary only on manifest, generated code, sample input, and validation result."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "request": {k: request.get(k) for k in ["description", "tool_name", "operation", "input_description", "output_description"]},
+                    "manifest": manifest,
+                    "sample_input": sample_input,
+                    "validation": {
+                        "success": validation.get("success") if isinstance(validation, dict) else False,
+                        "status": validation.get("status") if isinstance(validation, dict) else "unknown",
+                        "errors": validation.get("errors") if isinstance(validation, dict) else [],
+                        "warnings": validation.get("warnings") if isinstance(validation, dict) else [],
+                        "auth_gate": validation.get("auth_gate") if isinstance(validation, dict) else {},
+                        "observed_result": observed_result,
+                    },
+                    "generated_script_excerpt": script_excerpt,
+                    "required_output_fields": _schema_required(manifest.get("output_schema") if isinstance(manifest, dict) else {}),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        },
+    ]
+    result, ack, err = await _complete_author_model("planner", messages, reason="creator_tool_contract_summary")
+    if ack:
+        model_notes.append(f"tool_contract_model={ack['model']}")
+    if err:
+        warnings.append(f"tool_contract_model unavailable; used deterministic contract: {err}")
+        return fallback
+    contract = result.get("tool_contract") if isinstance(result, dict) else None
+    if not isinstance(contract, dict):
+        warnings.append("tool_contract_model returned invalid JSON shape; used deterministic contract")
+        return fallback
+    # Preserve canonical machine-readable fields even if the model writes a more
+    # human friendly summary.
+    merged = {**fallback, **contract}
+    merged["tool_name"] = fallback["tool_name"]
+    merged["function_name"] = fallback["function_name"]
+    merged["runtime_type"] = "python_script"
+    merged["input_contract"] = fallback["input_contract"] | (contract.get("input_contract") if isinstance(contract.get("input_contract"), dict) else {})
+    merged["output_contract"] = fallback["output_contract"] | (contract.get("output_contract") if isinstance(contract.get("output_contract"), dict) else {})
+    merged["auth"] = fallback["auth"] | (contract.get("auth") if isinstance(contract.get("auth"), dict) else {})
+    merged["call_contract"] = fallback["call_contract"] | (contract.get("call_contract") if isinstance(contract.get("call_contract"), dict) else {})
+    return merged
+
+
+async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
+    """Generic five-step authoring workflow.
+
+    Step 1: receive requirement and optional reference code.
+    Step 2: planner clarifies requirements and decides auth; configure stores auth.
+    Step 3: coder writes a complete python_script.
+    Step 4: human trial/debug can run generated code and revise with feedback.
+    Step 5: model summarizes snippet + IO + indirect usage contract for sandbox/skill creator.
+    """
+    request = dict(request or {})
+    model_notes: list[str] = []
+    warnings: list[str] = []
+    raw_action = str(request.get("action") or "generate").strip().lower()
+    action_aliases = {
+        "plan": "clarify",
+        "ask": "clarify",
+        "requirements": "clarify",
+        "auth": "configure",
+        "authorize": "configure",
+        "save_auth": "configure",
+        "save_config": "configure",
+        "code": "generate",
+        "generate_code": "generate",
+        "live_test": "trial_run",
+        "test": "trial_run",
+        "debug": "trial_run",
+        "run": "trial_run",
+        "feedback": "revise",
+        "repair": "revise",
+        "summary": "summarize",
+        "snippet": "summarize",
+        "contract": "summarize",
+    }
+    action = action_aliases.get(raw_action, raw_action)
+    if action not in {"clarify", "configure", "generate", "trial_run", "finalize", "revise", "summarize"}:
+        raise ValueError("action must be one of clarify/configure/generate/trial_run/finalize/revise/summarize")
+
+    if action == "configure":
+        saved = save_tool_authoring_config(request)
+        manifest = _sync_auth_into_manifest(request.get("manifest") if isinstance(request.get("manifest"), dict) else {}, request)
+        auth_gate = _auth_gate_for_manifest(manifest)
+        return {
+            "workflow_step": 2,
+            "current_step": "auth_configured" if saved.get("configured") else "auth_config_needed",
+            "current_phase": "auth_configured" if saved.get("configured") else "auth_config_needed",
+            "needs_clarification": False,
+            "questions": [],
+            "clarification_questions": [],
+            "manifest": manifest,
+            "auth_gate": auth_gate,
+            "config_status": saved,
+            "validation": {"success": bool(saved.get("configured")), "status": "auth_configured" if saved.get("configured") else "auth_config_needed", "errors": [] if saved.get("configured") else saved.get("missing_secrets") or [], "warnings": [], "auth_gate": auth_gate},
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+            "can_register": bool(auth_gate.get("can_register")),
+        }
+
+    if action == "clarify":
+        plan = await _run_planner(request, model_notes, warnings)
+        manifest = _sync_auth_into_manifest(plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}, request)
+        auth_gate = _auth_gate_for_manifest(manifest)
+        return {
+            "workflow_step": 2,
+            "current_step": "clarification_needed" if plan.get("needs_clarification") else "planned",
+            "current_phase": "clarification_needed" if plan.get("needs_clarification") else "auth_reviewed",
+            "needs_clarification": bool(plan.get("needs_clarification")),
+            "questions": plan.get("questions") or [],
+            "clarification_questions": plan.get("clarification_questions") or plan.get("questions") or [],
+            "manifest": manifest,
+            "sample_input": plan.get("sample_input") or {},
+            "auth_gate": auth_gate,
+            "requires_config": bool(auth_gate.get("required") and auth_gate.get("status") == "needs_config"),
+            "validation": {"success": not bool(plan.get("needs_clarification")), "status": "planned", "errors": [], "warnings": [], "auth_gate": auth_gate},
+            "snippet": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+            "can_register": False,
+        }
+
+    if action == "trial_run":
+        manifest = _sync_auth_into_manifest(
+            request.get("manifest") if isinstance(request.get("manifest"), dict) else {},
+            request,
+        )
+        sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+
+        script_code = _ensure_named_entrypoint(
+            _request_runtime_code(request),
+            manifest,
+        )
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=script_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=bool(request.get("real_run") or request.get("allow_external_network")),
+            require_auth_config=False,
+        )
+
+        return {
+            "workflow_step": 4,
+            "current_step": "trial_run_complete",
+            "current_phase": "trial_run_success" if validation.get("success") else "trial_run_needs_feedback",
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+            **_code_view_fields(
+                manifest=manifest,
+                runtime_code=script_code,
+                sample_input=sample_input,
+            ),
+            "sample_input": sample_input,
+            "validation": validation,
+            "auth_gate": validation.get("auth_gate") or _auth_gate_for_manifest(manifest),
+            "debug_sections": validation.get("debug_sections") or [],
+            "collapsible_blocks": validation.get("collapsible_blocks") or [],
+            "call_chain": validation.get("call_chain") or [],
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "ready_for_feedback": True,
+            "requires_human_confirmation": True,
+            "can_register": bool(validation.get("can_register")),
+        }
+
+    if action == "finalize":
+        manifest = _sync_auth_into_manifest(
+            request.get("manifest") if isinstance(request.get("manifest"), dict) else {},
+            request,
+        )
+        sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+
+        script_code = _ensure_named_entrypoint(
+            _request_runtime_code(request),
+            manifest,
+        )
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=script_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=bool(request.get("allow_external_network")),
+            require_auth_config=True,
+        )
+
+        snippet = None
+        tool_contract = None
+
+        if validation.get("success"):
+            snippet = await _author_snippet_with_model(
+                request=request,
+                manifest=manifest,
+                sample_input=sample_input,
+                model_notes=model_notes,
+                warnings=warnings,
+            ) or _script_tool_snippet(manifest, sample_input)
+
+            tool_contract = await _summarize_tool_contract_with_model(
+                request=request,
+                manifest=manifest,
+                script_code=script_code,
+                sample_input=sample_input,
+                validation=validation,
+                model_notes=model_notes,
+                warnings=warnings,
+            )
+            tool_contract.setdefault("snippet", snippet)
+
+        return {
+            "workflow_step": 5,
+            "current_step": "finalized" if validation.get("success") else "finalize_failed",
+            "current_phase": "contract_ready" if validation.get("success") else "finalize_needs_fix",
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+
+            **_code_view_fields(
+                manifest=manifest,
+                runtime_code=script_code,
+                sample_input=sample_input,
+            ),
+
+            "sample_input": sample_input,
+            "validation": validation,
+            "auth_gate": validation.get("auth_gate"),
+            "debug_sections": validation.get("debug_sections") or [],
+            "collapsible_blocks": validation.get("collapsible_blocks") or [],
+            "call_chain": validation.get("call_chain") or [],
+
+            "tool_contract": tool_contract,
+            "tool_summary": tool_contract,
+            "snippet": snippet,
+
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+            "can_register": bool(validation.get("can_register", False)),
+        }
+
+    if action == "summarize":
+        manifest = _sync_auth_into_manifest(
+            request.get("manifest") if isinstance(request.get("manifest"), dict) else {},
+            request,
+        )
+        sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+
+        script_code = _ensure_named_entrypoint(
+            _request_runtime_code(request),
+            manifest,
+        )
+
+        validation = (
+            request.get("validation")
+            if isinstance(request.get("validation"), dict)
+            else validate_tool_manifest(
+                manifest,
+                adapter_code=script_code,
+                sample_input=sample_input,
+                dynamic=False,
+                require_auth_config=False,
+            )
+        )
+
+        snippet = await _author_snippet_with_model(
+            request=request,
+            manifest=manifest,
+            sample_input=sample_input,
+            model_notes=model_notes,
+            warnings=warnings,
+        ) or _script_tool_snippet(manifest, sample_input)
+
+        tool_contract = await _summarize_tool_contract_with_model(
+            request=request,
+            manifest=manifest,
+            script_code=script_code,
+            sample_input=sample_input,
+            validation=validation,
+            model_notes=model_notes,
+            warnings=warnings,
+        )
+        tool_contract.setdefault("snippet", snippet)
+
+        return {
+            "workflow_step": 5,
+            "current_step": "contract_ready",
+            "current_phase": "snippet_and_io_summarized",
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+
+            **_code_view_fields(
+                manifest=manifest,
+                runtime_code=script_code,
+                sample_input=sample_input,
+            ),
+
+            "sample_input": sample_input,
+            "validation": validation,
+            "auth_gate": validation.get("auth_gate") if isinstance(validation, dict) else _auth_gate_for_manifest(manifest),
+            "tool_contract": tool_contract,
+            "tool_summary": tool_contract,
+            "snippet": snippet,
+
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "can_register": bool(validation.get("can_register", False)) if isinstance(validation, dict) else False,
+        }
+
+    if action == "revise":
+        manifest = _sync_auth_into_manifest(
+            request.get("manifest") if isinstance(request.get("manifest"), dict) else {},
+            request,
+        )
+        sample_input = request.get("sample_input") if isinstance(request.get("sample_input"), dict) else {}
+
+        raw_script_code = _request_runtime_code(
+            request,
+            allow_display_fallback=False,
+        )
+
+        human_feedback = str(
+            request.get("human_feedback")
+            or request.get("review_feedback")
+            or request.get("feedback")
+            or ""
+        ).strip()
+
+        if not raw_script_code.strip():
+            validation = {
+                "success": False,
+                "status": "missing_runtime_code",
+                "errors": [
+                    "revise requires previous full runtime_code/full_adapter_code/internal_code/script_code; display-only adapter_code is not enough"
+                ],
+                "warnings": [],
+                "auth_gate": _auth_gate_for_manifest(manifest, require_config=False),
+                "debug_sections": [],
+                "collapsible_blocks": [],
+                "call_chain": [],
+                "can_register": False,
+            }
+
+            return {
+                "workflow_step": 4,
+                "current_step": "revision_missing_runtime_code",
+                "current_phase": "revision_needs_previous_runtime_code",
+                "needs_clarification": False,
+                "questions": [],
+                "manifest": manifest,
+                "sample_input": sample_input,
+                "validation": validation,
+                "auth_gate": validation["auth_gate"],
+                "debug_sections": [],
+                "collapsible_blocks": [],
+                "call_chain": [],
+                "human_feedback": human_feedback,
+                "repair_replaced_code": False,
+                "repair_status": "missing_runtime_code",
+                "model_notes": model_notes,
+                "warnings": warnings,
+                "requires_human_confirmation": True,
+                "ready_for_feedback": True,
+                "ready_for_debug": True,
+                "can_register": False,
+            }
+
+        # 这里不再把“解析失败 / 缺 run()”当成 missing。
+        # 因为 raw_script_code 已经来自官方 runtime 字段。
+        # repair_model 可以基于这份完整代码继续修。
+        script_code = _ensure_named_entrypoint(raw_script_code, manifest)
+
+        initial_validation = validate_tool_manifest(
+            manifest,
+            adapter_code=script_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+            require_auth_config=False,
+        )
+
+        repaired_code = await _repair_script_with_model(
+            request=request,
+            manifest=manifest,
+            sample_input=sample_input,
+            script_code=script_code,
+            validation=request.get("validation") if isinstance(request.get("validation"), dict) else initial_validation,
+            human_feedback=human_feedback,
+            model_notes=model_notes,
+            warnings=warnings,
+        )
+
+        repaired_code = _ensure_named_entrypoint(repaired_code, manifest)
+
+        repair_replaced_code = repaired_code.strip() != script_code.strip()
+
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=repaired_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+            require_auth_config=False,
+        )
+
+        if not repair_replaced_code:
+            validation = {
+                **validation,
+                "success": False,
+                "status": "repair_incomplete_or_no_change",
+                "errors": sorted(set([
+                    *(validation.get("errors") or []),
+                    "repair model did not return a changed complete script; previous runtime_code was kept",
+                ])),
+                "warnings": sorted(set([
+                    *(validation.get("warnings") or []),
+                    *warnings,
+                ])),
+                "can_register": False,
+            }
+
+        snippet = None
+        tool_contract = None
+
+        if validation.get("success"):
+            snippet = await _author_snippet_with_model(
+                request=request,
+                manifest=manifest,
+                sample_input=sample_input,
+                model_notes=model_notes,
+                warnings=warnings,
+            ) or _script_tool_snippet(manifest, sample_input)
+
+            tool_contract = await _summarize_tool_contract_with_model(
+                request=request,
+                manifest=manifest,
+                script_code=repaired_code,
+                sample_input=sample_input,
+                validation=validation,
+                model_notes=model_notes,
+                warnings=warnings,
+            )
+            tool_contract.setdefault("snippet", snippet)
+
+        return {
+            "workflow_step": 4,
+            "current_step": "code_revised" if repair_replaced_code else "repair_incomplete",
+            "current_phase": "revision_validated" if validation.get("success") else "revision_needs_more_feedback",
+            "needs_clarification": False,
+            "questions": [],
+            "manifest": manifest,
+
+            **_code_view_fields(
+                manifest=manifest,
+                runtime_code=repaired_code,
+                sample_input=sample_input,
+            ),
+
+            "sample_input": sample_input,
+            "validation": validation,
+            "auth_gate": validation.get("auth_gate") or _auth_gate_for_manifest(manifest),
+            "debug_sections": validation.get("debug_sections") or [],
+            "collapsible_blocks": validation.get("collapsible_blocks") or [],
+            "call_chain": validation.get("call_chain") or [],
+
+            "human_feedback": human_feedback,
+            "repair_replaced_code": repair_replaced_code,
+            "repair_status": "changed" if repair_replaced_code else "no_change",
+
+            "tool_contract": tool_contract,
+            "tool_summary": tool_contract,
+            "snippet": snippet,
+
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+            "ready_for_feedback": True,
+            "ready_for_debug": True,
+            "code_generated": True,
+            "code_generation_complete": True,
+            "can_register": bool(validation.get("can_register")),
+        }
+
+    # Step 3: generate code. Do not run business-specific rules; only generic validation.
+    plan = await _run_planner(request, model_notes, warnings)
+    manifest = _sync_auth_into_manifest(
+        plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {},
+        request,
+    )
+    auth_gate = _auth_gate_for_manifest(manifest)
+
+    if plan.get("needs_clarification"):
+        return {
+            "workflow_step": 2,
+            "current_step": "clarification_needed",
+            "current_phase": "waiting_for_user_clarification",
+            "needs_clarification": True,
+            "questions": plan.get("questions") or [],
+            "clarification_questions": plan.get("clarification_questions") or plan.get("questions") or [],
+            "manifest": manifest,
+            "sample_input": plan.get("sample_input") or {},
+            "auth_gate": auth_gate,
+            "requires_config": bool(auth_gate.get("required") and auth_gate.get("status") == "needs_config"),
+            "validation": {
+                "success": False,
+                "status": "clarification_needed",
+                "errors": [],
+                "warnings": [],
+                "auth_gate": auth_gate,
+            },
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "can_register": False,
+        }
+
+    spec_repair_log: list[dict[str, Any]] = []
+
+    for attempt in range(3):
+        spec_errors = _script_tool_spec_errors(manifest)
+        if not spec_errors:
+            break
+
+        spec_repair_log.append({
+            "attempt": attempt + 1,
+            "errors": spec_errors,
+        })
+
+        plan = await _repair_script_tool_spec_with_model(
+            request=request,
+            plan={**plan, "manifest": manifest},
+            errors=spec_errors,
+            model_notes=model_notes,
+            warnings=warnings,
+        )
+
+        manifest = _sync_auth_into_manifest(
+            plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {},
+            request,
+        )
+
+    spec_errors = _script_tool_spec_errors(manifest)
+
+    if spec_errors:
+        auth_gate = _auth_gate_for_manifest(manifest)
+
+        return {
+            "workflow_step": 2,
+            "current_step": "tool_spec_invalid",
+            "current_phase": "tool_spec_needs_repair",
+            "needs_clarification": False,
+            "questions": [],
+            "clarification_questions": [],
+            "manifest": manifest,
+
+            # 没有生成可执行代码，四类代码字段都返回空，避免前端误用旧代码。
+            "display_code": "",
+            "public_api_code": "",
+            "adapter_code": "",
+            "adapter_code_kind": "python_public_function",
+            "runtime_code": "",
+            "script_code": "",
+            "full_adapter_code": "",
+            "internal_code": "",
+            "internal_code_kind": "python_script",
+
+            "sample_input": plan.get("sample_input") or {},
+            "validation": {
+                "success": False,
+                "status": "tool_spec_invalid",
+                "errors": spec_errors,
+                "warnings": [],
+                "spec_repair_log": spec_repair_log,
+                "auth_gate": auth_gate,
+            },
+            "auth_gate": auth_gate,
+            "snippet": None,
+            "tool_contract": None,
+            "tool_summary": None,
+            "model_notes": model_notes,
+            "warnings": warnings,
+            "requires_human_confirmation": True,
+            "can_register": False,
+        }
+
+    sample_input = await _author_sample_input_with_model(
+        request=request,
+        plan=plan,
+        manifest=manifest,
+        wrapper_family=None,
+        model_notes=model_notes,
+        warnings=warnings,
+    )
+
+    script_code = await _author_script_with_model(
+        request=request,
+        plan=plan,
+        manifest=manifest,
+        sample_input=sample_input,
+        model_notes=model_notes,
+        warnings=warnings,
+    )
+
+    if not script_code.strip():
+        script_code = generate_adapter_code(manifest)
+        warnings.append("code_model returned empty script_code; used deterministic template")
+
+    script_code = _ensure_named_entrypoint(script_code, manifest)
 
     repair_log: list[dict[str, Any]] = []
     validation: dict[str, Any] = {}
 
     for attempt in range(3):
-        validation = validate_tool_manifest(manifest, adapter_code=adapter_code, sample_input=sample_input, dynamic=True, real_run=False)
-        static_errors = _author_adapter_static_errors(adapter_code, manifest)
-        if static_errors:
-            validation["errors"] = sorted(set(validation.get("errors", []) + static_errors))
-            validation["success"] = False
-            validation["status"] = "failed"
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=script_code,
+            sample_input=sample_input,
+            dynamic=True,
+            real_run=False,
+            require_auth_config=False,
+        )
 
         if validation.get("success"):
             break
 
+        repair_log.append({
+            "attempt": attempt + 1,
+            "errors": validation.get("errors") or [],
+            "dynamic_trial": validation.get("dynamic_trial") or {},
+            "auth_review": validation.get("auth_review") or {},
+        })
+
         if attempt >= 2:
             break
 
-        repair_log.append({"attempt": attempt + 1, "errors": validation.get("errors", []), "warnings": validation.get("warnings", [])})
-        repair_messages = [
-            {
-                "role": "system",
-                "content": "Repair the Python adapter locally. Preserve business logic. Return code only. Keep SKILL_TRIAL_RUN mock behavior for network/API adapters.",
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"manifest": manifest, "sample_input": sample_input, "validation": validation, "adapter_code": adapter_code},
-                    ensure_ascii=False,
-                ),
-            },
-        ]
+        repaired_code = await _repair_script_with_model(
+            request=request,
+            manifest=manifest,
+            sample_input=sample_input,
+            script_code=script_code,
+            validation=validation,
+            human_feedback="",
+            model_notes=model_notes,
+            warnings=warnings,
+        )
 
-        repair_json, _repair_ack, repair_err = await _complete_author_model("code", repair_messages, reason="creator_tool_author_repair")
-        repaired = _strip_code_fence(str(repair_json.get("adapter_code") or repair_json.get("code") or "")) if repair_json else ""
-        if repair_err or not repaired:
-            warnings.append(f"automatic repair stopped; using fallback/local code: {repair_err or 'empty repair'}")
+        repaired_code = _ensure_named_entrypoint(repaired_code, manifest)
+
+        # 这里不做业务判断，只防止 repair 返回空壳或把完整 run() 弄丢。
+        incomplete, reasons = _looks_like_incomplete_repair(
+            original_code=script_code,
+            repaired_code=repaired_code,
+            manifest=manifest,
+        )
+
+        if incomplete:
+            warnings.append(
+                "auto repair returned incomplete script; kept previous runtime_code. "
+                + "；".join(reasons)
+            )
             break
-        adapter_code = repaired
+
+        script_code = repaired_code
 
     validation["repair_log"] = repair_log
+    validation["spec_repair_log"] = spec_repair_log
+
+    snippet = await _author_snippet_with_model(
+        request=request,
+        manifest=manifest,
+        sample_input=sample_input,
+        model_notes=model_notes,
+        warnings=warnings,
+    ) or _script_tool_snippet(manifest, sample_input)
+
+    tool_contract = await _summarize_tool_contract_with_model(
+        request=request,
+        manifest=manifest,
+        script_code=script_code,
+        sample_input=sample_input,
+        validation=validation,
+        model_notes=model_notes,
+        warnings=warnings,
+    )
+    tool_contract.setdefault("snippet", snippet)
+
+    code_generated = bool(script_code.strip())
+    validation_success = bool(validation.get("success"))
 
     return {
+        "workflow_step": 3,
+        "current_step": "validated" if validation_success else "code_generated",
+        "current_phase": "validated" if validation_success else "code_generated_needs_manual_trial",
+
         "needs_clarification": False,
         "questions": [],
-        "tool_kind": plan.get("tool_kind"),
-        "operation": plan.get("operation"),
+        "clarification_questions": [],
+
+        "tool_kind": "python_script_tool",
+        "operation": (
+            plan.get("operation")
+            or request.get("operation")
+            or request.get("description")
+            or request.get("requirement")
+            or ""
+        ),
+
         "manifest": manifest,
-        "adapter_code": adapter_code,
+
+        # 关键修改：
+        # 主框展示 display_code / adapter_code，只展示公开函数核心实现；
+        # 折叠框和后续执行使用 runtime_code / script_code / full_adapter_code / internal_code。
+        **_code_view_fields(
+            manifest=manifest,
+            runtime_code=script_code,
+            sample_input=sample_input,
+        ),
+
         "sample_input": sample_input,
         "validation": validation,
-        "snippet": None,
+        "auth_gate": validation.get("auth_gate") or _auth_gate_for_manifest(manifest),
+
+        "debug_sections": validation.get("debug_sections") or [],
+        "collapsible_blocks": validation.get("collapsible_blocks") or [],
+        "call_chain": validation.get("call_chain") or [],
+
+        "tool_contract": tool_contract,
+        "tool_summary": tool_contract,
+        "snippet": snippet if code_generated else None,
+
         "model_notes": model_notes,
         "warnings": warnings,
+
         "requires_human_confirmation": True,
+        "requires_config": False,
+        "requires_live_test": True,
+        "requires_authoring_tools": False,
+        "ready_for_code_generation": True,
+        "code_generated": code_generated,
+        "code_generation_complete": code_generated,
+        "ready_for_debug": code_generated,
+        "can_register": validation.get("can_register", False),
     }
 
+async def stream_author_tool(request: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    """Stream events for the generic five-step authoring workflow."""
+    yield {"event": "started", "workflow_step": 1, "message": "已接收需求和参考代码"}
+    yield {"event": "planning", "workflow_step": 2, "message": "模型正在追问、规划输入输出并判断授权"}
 
-async def stream_author_tool(request: dict[str, Any]):
-    """SSE-friendly wrapper that emits coarse progress events for long authoring actions."""
-    action = str(request.get("action") or ("finalize" if request.get("stage") == "finalize" else "clarify"))
-    try:
-        yield {"event": "step_started", "step": "planner", "message": "正在理解需求"}
-        if action == "live_test":
-            yield {"event": "step_started", "step": "live_test", "message": "正在测试连接"}
-        elif action == "generate":
-            yield {"event": "step_started", "step": "code", "message": "正在生成 adapter"}
-        elif action == "finalize":
-            yield {"event": "step_started", "step": "validation", "message": "正在执行动态验证"}
-        result = await author_tool(request)
-        for item in result.get("authoring_tool_plan") or []:
-            if isinstance(item, dict):
-                yield {"event": "tool_call_planned", "tool": item.get("tool_name"), "reason": item.get("reason") or ""}
-        for item in result.get("authoring_tool_results") or []:
-            if not isinstance(item, dict):
-                continue
-            tool_name = item.get("tool_name")
-            yield {"event": "tool_call_started", "tool": tool_name}
-            if item.get("requires_input"):
-                yield {"event": "tool_call_requires_input", "tool": tool_name, "schema": item.get("schema") or {}}
-            yield {"event": "tool_call_result", "tool": tool_name, "success": bool(item.get("success"))}
-        if result.get("needs_clarification"):
-            yield {"event": "clarification_required", "questions": result.get("questions") or []}
-        if result.get("live_test_result"):
-            yield {"event": "live_test_result", **result["live_test_result"]}
-        if result.get("adapter_code"):
-            yield {"event": "model_delta", "step": "code", "delta": result.get("adapter_code")}
-        elif action == "generate":
-            yield {
-                "event": "code_not_generated",
-                "step": "code",
-                "message": "未生成 adapter_code；可能仍需澄清、配置或 live_test。",
-                "needs_clarification": bool(result.get("needs_clarification")),
-                "requires_config": bool(result.get("requires_config")),
-                "requires_authoring_tools": bool(
-                    result.get("requires_authoring_tools") or result.get("authoring_tool_plan")),
-                "ready_for_code_generation": bool(result.get("ready_for_code_generation")),
-            }
-        if result.get("validation"):
-            yield {"event": "validation", "success": bool(result["validation"].get("success")), "errors": result["validation"].get("errors") or [], "warnings": result["validation"].get("warnings") or []}
-        yield {"event": "step_finished", "step": "planner", "summary": result.get("validation", {}).get("status", "done")}
-        yield {"event": "final_result", **result}
-    except Exception as exc:
-        yield {"event": "error", "message": str(exc)}
+    result = await author_tool(request)
+    result = result if isinstance(result, dict) else {}
 
+    if result.get("needs_clarification"):
+        yield {
+            "event": "clarification_questions",
+            "workflow_step": 2,
+            "message": "模型需要补充信息",
+            "questions": result.get("questions") or result.get("clarification_questions") or [],
+            "clarification_questions": result.get("clarification_questions") or result.get("questions") or [],
+            "manifest": result.get("manifest") or {},
+            "auth_gate": result.get("auth_gate") or {},
+        }
 
-def tool_status(capability: ToolCapability) -> dict[str, Any]:
-    missing_env = [name for name in capability.required_env if not os.environ.get(name)]
-    missing_secrets = [name for name in capability.required_secrets if not os.environ.get(name)]
-    helper_names = _runtime_helper_names()
-    runtime_helpers_available = [name for name in capability.helper_imports if name in helper_names]
-    missing_runtime_helpers = [name for name in capability.helper_imports if name not in helper_names]
-    missing_dependencies = [name for name in capability.dependencies if not _dependency_available(name)]
-    creator_available = capability.enabled_by_default and capability.allow_creator_use
-    return {
-        **asdict(capability),
-        "allowed_roles": capability.allowed_roles or capability.roles,
-        "enabled": capability.enabled_by_default,
-        "creator_available": creator_available,
-        "configured": not missing_env and not missing_secrets,
-        "missing_env": missing_env,
-        "missing_secrets": missing_secrets,
-        # Toggle overrides remain process-local; custom registered manifests are
-        # persisted separately in backend/config/tool_registry.custom.json.
-        "override_persistence": TOOL_OVERRIDE_PERSISTENCE,
-        "runtime_helpers_available": runtime_helpers_available,
-        "missing_runtime_helpers": missing_runtime_helpers,
-        "missing_dependencies": missing_dependencies,
-    }
+    if result.get("auth_gate"):
+        yield {
+            "event": "auth_review",
+            "workflow_step": 2,
+            "message": "授权判断完成",
+            "auth_gate": result.get("auth_gate") or {},
+            "manifest": result.get("manifest") or {},
+        }
 
-def _make_snippet(
-    tool: str,
-    helper: str,
-    title: str,
-    code: str,
-    outputs: dict[str, str],
-    *,
-    kind: SnippetKind = "minimal_usage",
-    roles: list[str] | None = None,
-    capabilities: list[str] | None = None,
-    failures: list[str] | None = None,
-    description: str = "",
-    anti_patterns: list[str] | None = None,
-    priority: int = 100,
-    usage_policy: UsagePolicy = "helper_preferred",
-) -> ToolSnippet:
-    return ToolSnippet(
-        id=f"{helper}.{kind}",
-        title=title,
-        kind=kind,
-        applies_to={"roles": roles or [], "capabilities": capabilities or [tool], "failure_layers": failures or ["helper_call_failed", "final_platform_output_value_invalid", "artifact_missing", "artifact_invalid"]},
-        description=description or title,
-        code=code.strip(),
-        expected_input_shape={},
-        expected_output_shape=outputs,
-        return_rule="If the helper returns the platform stdout dict with file_paths/file_outputs, return that dict directly; only merge with extra scalar fields using {**result, ...}.",
-        anti_patterns=anti_patterns or ["Do not guess parameter names.", "Do not wrap helper result inside an output field.", "Do not write files outside OUTPUT_DIR/outputs."],
-        requires=capabilities or [tool],
-        usage_policy=usage_policy,
-        priority=priority,
+    display_code = str(
+        result.get("display_code")
+        or result.get("public_api_code")
+        or result.get("adapter_code")
+        or ""
     )
 
+    runtime_code = str(
+        result.get("runtime_code")
+        or result.get("full_adapter_code")
+        or result.get("internal_code")
+        or result.get("script_code")
+        or ""
+    )
 
-def _install_builtin_tool_snippets() -> None:
-    specs: dict[str, list[ToolSnippet]] = {
-        "pdf_generation": [
-            _make_snippet("pdf_generation", "create_pdf", "Create a simple text PDF", """
-from backend.services.skill_runtime import create_pdf
+    if display_code or runtime_code:
+        yield {
+            "event": "model_delta",
+            "workflow_step": 3,
+            "message": "模型代码已生成",
+            "delta": display_code or runtime_code,
+            "display_code": display_code,
+            "public_api_code": display_code,
+            "adapter_code": display_code,
+            "runtime_code": runtime_code,
+            "script_code": runtime_code,
+            "full_adapter_code": runtime_code,
+            "internal_code": runtime_code,
+            "adapter_code_kind": result.get("adapter_code_kind") or "python_public_function",
+            "internal_code_kind": result.get("internal_code_kind") or "python_script",
+        }
 
-content = payload.get("text") or payload.get("content") or "Generated PDF"
-result = create_pdf(content, filename="output.pdf")
-return result
-""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder", "document_generator", "composite_generator"], capabilities=["pdf_generation"], anti_patterns=["Do not return {'pdf_path': result}; create_pdf returns a dict, not a string.", "Do not pass a dict as the text argument unless you intentionally want its string/list lines.", "Do not write outside OUTPUT_DIR; use filename or output_dir/output_path under outputs."], priority=120),
-            _make_snippet("pdf_generation", "build_pdf_report", "Create a structured PDF report", """
-from backend.services.skill_runtime import build_pdf_report
+    validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
 
-sections = [
-    {"heading": "Summary", "content": payload.get("summary") or "No summary provided."},
-    {"heading": "Details", "content": payload.get("details") or []},
-]
-result = build_pdf_report("Report", sections, image_paths=payload.get("image_paths") or [], filename="report.pdf")
-return result
-""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], priority=100),
-            _make_snippet("pdf_generation", "images_to_pdf", "Convert images to one PDF", """
-from backend.services.skill_runtime import images_to_pdf
+    if validation:
+        yield {
+            "event": "validation",
+            "workflow_step": 4 if (display_code or runtime_code) else 2,
+            "message": "代码校验完成" if validation.get("success") else "代码已生成，但需要人工试运行/反馈",
+            "success": bool(validation.get("success")),
+            "errors": validation.get("errors") or [],
+            "warnings": validation.get("warnings") or [],
+            "validation": validation,
+            "debug_sections": validation.get("debug_sections") or [],
+            "collapsible_blocks": validation.get("collapsible_blocks") or [],
+        }
 
-image_paths = payload.get("image_paths") or []
-result = images_to_pdf(image_paths, output_path="outputs/images.pdf")
-return result
-""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], kind="file_output_usage", priority=90),
-            _make_snippet("pdf_generation", "merge_pdfs", "Merge several PDFs", """
-from backend.services.skill_runtime import merge_pdfs
+    debug_sections = (
+        validation.get("debug_sections")
+        or validation.get("collapsible_blocks")
+        or []
+    ) if isinstance(validation, dict) else []
 
-pdf_paths = payload.get("pdf_paths") or []
-result = merge_pdfs(pdf_paths, output_path="outputs/merged.pdf")
-return result
-""", {"pdf_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pdf_builder"], capabilities=["pdf_generation"], kind="batch_usage", priority=90),
-        ],
-        "image_generation": [
-            _make_snippet("image_generation", "generate_stable_diffusion_image", "Generate one image", """
-from backend.services.skill_runtime import generate_stable_diffusion_image
+    if debug_sections:
+        yield {
+            "event": "debug_trace",
+            "workflow_step": 4,
+            "message": "调试调用链已生成",
+            "debug_sections": debug_sections,
+            "collapsible_blocks": debug_sections,
+            "call_chain": validation.get("call_chain") or [],
+        }
 
-prompt = payload.get("prompt") or payload.get("description") or payload.get("text") or "A clean illustration"
-result = generate_stable_diffusion_image(prompt, filename_prefix="generated")
-return {"image_path": result["image_path"], "image_paths": [result["image_path"]]}
-""", {"image_path": "string", "image_paths": "list[string]"}, roles=["image_generator", "composite_generator"], capabilities=["image_generation"], anti_patterns=["Do not call /v1/images/generations directly; use the registered helper.", "Do not use VISION_MODEL for image generation.", "During SKILL_TRIAL_RUN the helper may return a deterministic minimal file; still return image_path/image_paths."], priority=120),
-            _make_snippet("image_generation", "generate_stable_diffusion_image", "Generate multiple images in a loop", """
-from backend.services.skill_runtime import generate_stable_diffusion_image
+    dynamic_trial = validation.get("dynamic_trial") if isinstance(validation, dict) else {}
+    temporary_environment = (
+        dynamic_trial.get("temporary_environment")
+        if isinstance(dynamic_trial, dict)
+        else validation.get("temporary_environment")
+        if isinstance(validation, dict)
+        else {}
+    )
 
-prompts = payload.get("prompts") or [payload.get("prompt") or "Generated image"]
-image_paths = []
-for index, prompt in enumerate(prompts, start=1):
-    result = generate_stable_diffusion_image(str(prompt), filename_prefix=f"generated_{index}")
-    image_paths.append(result["image_path"])
-return {"image_paths": image_paths, "image_path": image_paths[0] if image_paths else ""}
-""", {"image_path": "string", "image_paths": "list[string]"}, kind="batch_usage", roles=["image_generator", "composite_generator"], capabilities=["image_generation"], priority=80),
-        ],
-        "docx_generation": [_make_snippet("docx_generation", "create_docx", "Create a DOCX document", """
-from backend.services.skill_runtime import create_docx
+    if temporary_environment:
+        yield {
+            "event": "temporary_environment",
+            "workflow_step": 4,
+            "message": "临时环境创建完成",
+            "temporary_environment": temporary_environment,
+        }
 
-content = payload.get("sections") or payload.get("text") or "Generated document"
-result = create_docx(content, filename="output.docx", title=payload.get("title") or "Document")
-return result
-""", {"docx_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["docx_builder"], capabilities=["docx_generation"], priority=120)],
-        "pptx_generation": [_make_snippet("pptx_generation", "create_pptx", "Create a PPTX deck", """
-from backend.services.skill_runtime import create_pptx
+    tool_contract = (
+        result.get("tool_contract")
+        if isinstance(result.get("tool_contract"), dict)
+        else result.get("tool_summary")
+        if isinstance(result.get("tool_summary"), dict)
+        else {}
+    )
 
-slides = payload.get("slides") or payload.get("sections") or [payload.get("text") or "Generated slide"]
-result = create_pptx(slides, filename="output.pptx", title=payload.get("title") or "Presentation")
-return result
-""", {"pptx_path": "string", "file_paths": "list[string]", "file_outputs": "list[object]"}, roles=["pptx_builder"], capabilities=["pptx_generation"], priority=120)],
-        "pdf_parsing": [_make_snippet("pdf_parsing", "extract_pdf_text", "Extract text from an input PDF", """
-from backend.services.skill_runtime import extract_pdf_text
+    if tool_contract:
+        yield {
+            "event": "tool_contract",
+            "workflow_step": 5,
+            "message": "工具功能、Snippet 和输入输出合同已生成",
+            "tool_contract": tool_contract,
+            "tool_summary": tool_contract,
+            "snippet": result.get("snippet") or tool_contract.get("snippet"),
+        }
 
-input_files = payload.get("input_files") or payload.get("files") or []
-pdf_path = payload.get("pdf_path") or (input_files[0] if input_files else "")
-result = extract_pdf_text(pdf_path, max_pages=payload.get("max_pages"))
-return {"text": result["text"], "pages": result.get("pages", []), "pdf_path": result.get("pdf_path", pdf_path)}
-""", {"text": "string", "pages": "list[string]", "pdf_path": "string"}, roles=["pdf_parser"], capabilities=["pdf_parsing"], priority=110)],
-        "docx_parsing": [_make_snippet("docx_parsing", "read_docx_text", "Read text from a DOCX", """
-from backend.services.skill_runtime import read_docx_text
-
-input_files = payload.get("input_files") or payload.get("files") or []
-docx_path = payload.get("docx_path") or (input_files[0] if input_files else "")
-result = read_docx_text(docx_path)
-return {"text": result["text"], "paragraphs": result.get("paragraphs", []), "source_path": result.get("source_path", docx_path)}
-""", {"text": "string", "paragraphs": "list[string]", "source_path": "string"}, roles=["docx_parser"], capabilities=["docx_parsing"], priority=100)],
-        "pptx_parsing": [_make_snippet("pptx_parsing", "read_pptx_text", "Read text from a PPTX", """
-from backend.services.skill_runtime import read_pptx_text
-
-input_files = payload.get("input_files") or payload.get("files") or []
-pptx_path = payload.get("pptx_path") or (input_files[0] if input_files else "")
-result = read_pptx_text(pptx_path)
-return {"text": result["text"], "slides": result.get("slides", []), "source_path": result.get("source_path", pptx_path)}
-""", {"text": "string", "slides": "list[string]", "source_path": "string"}, roles=["pptx_parser"], capabilities=["pptx_parsing"], priority=100)],
-        "web_search": [_make_snippet("web_search", "web_search", "Search the web with the registered helper", """
-from backend.services.skill_runtime import web_search
-
-query = payload.get("query") or payload.get("user_request") or payload.get("text") or ""
-result = web_search(query, top_k=int(payload.get("top_k") or 5), language=payload.get("language"))
-return {"results": result.get("results", []), "query": query}
-""", {"results": "list[object]", "query": "string"}, roles=["search_reader"], capabilities=["web_search"], anti_patterns=["Do not use requests against undeclared search APIs when web_search is registered.", "Do not output secrets or raw provider credentials.", "If SEARCHXNG_BASE_URL is missing, fail clearly or use trial-run behavior."], priority=100)],
-        "database_read": [_make_snippet("database_read", "query_database_readonly", "Run a bounded readonly SQL query", """
-from backend.services.skill_runtime import query_database_readonly
-
-sql = payload.get("sql") or "SELECT 1 AS value"
-result = query_database_readonly(sql, params=payload.get("params") or {}, limit=int(payload.get("limit") or 100))
-return result
-""", {"columns": "list[string]", "rows": "list[object]", "row_count": "integer", "truncated": "boolean"}, roles=["database_reader"], capabilities=["database_read"], anti_patterns=["Only SELECT/WITH is allowed; never INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE.", "Do not read or print DATABASE_URL.", "Do not bypass query_database_readonly with a direct database driver."], priority=120, usage_policy="helper_required")],
-        "wechat_draft": [_make_snippet("wechat_draft", "create_wechat_draft", "Create a WeChat draft only", """
-from backend.services.skill_runtime import create_wechat_draft
-
-result = create_wechat_draft(
-    title=payload.get("title") or "Untitled",
-    content_html=payload.get("content_html") or payload.get("html") or "<p>Draft</p>",
-    author=payload.get("author") or "",
-    digest=payload.get("digest") or "",
-    cover_image_path=payload.get("cover_image_path"),
-)
-return result
-""", {"draft_id": "string", "media_id": "string", "url": "string|null", "status": "string"}, roles=["wechat_draft_creator"], capabilities=["wechat_draft"], anti_patterns=["Do not publish automatically from a draft creator script.", "Do not output WECHAT_APP_ID or WECHAT_APP_SECRET.", "Use upload_wechat_media only for declared local cover images."], priority=120, usage_policy="helper_required")],
-        "wechat_publish": [_make_snippet("wechat_publish", "publish_wechat_draft", "Publish an explicitly requested WeChat draft", """
-from backend.services.skill_runtime import publish_wechat_draft
-
-draft_id = payload.get("draft_id") or ""
-result = publish_wechat_draft(draft_id)
-return result
-""", {"draft_id": "string", "publish_id": "string", "status": "string"}, roles=["wechat_publisher"], capabilities=["wechat_publish"], anti_patterns=["Do not publish unless the user explicitly requested publishing and the tool is enabled.", "Do not output WeChat secrets.", "Do not create a draft and publish as a hidden side effect unless the plan says so."], priority=120, usage_policy="helper_required")],
+    yield {
+        "event": "final_result",
+        "message": "流程完成" if (display_code or runtime_code or tool_contract) else "流程完成，但未得到代码",
+        **result,
     }
-    for name, snippets in specs.items():
-        cap = BUILTIN_TOOL_CAPABILITIES.get(name)
-        if cap is not None and not cap.snippets:
-            BUILTIN_TOOL_CAPABILITIES[name] = replace(cap, snippets=snippets)
+
+    yield {"event": "completed", "result": result}
 
 
-_install_builtin_tool_snippets()
+def _tool_authoring_config_store_path() -> Path:
+    raw = os.environ.get("TOOL_AUTHORING_CONFIG_STORE_PATH", "").strip()
+    return Path(raw).expanduser().resolve() if raw else (CONFIG_DIR / "tool_authoring_configs.json").resolve()
+
+
+def _tool_config_session_id(payload: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    seed = str(payload.get("session_id") or payload.get("tool_name") or payload.get("operation") or payload.get("description") or "default")
+    return _slug(seed, fallback="default")
+
+
+def _load_tool_authoring_config_store_from_disk() -> None:
+    global _TOOL_AUTHORING_CONFIG_LOADED
+    if _TOOL_AUTHORING_CONFIG_LOADED:
+        return
+    _TOOL_AUTHORING_CONFIG_LOADED = True
+    path = _tool_authoring_config_store_path()
+    if not path.exists():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    sessions = payload.get("sessions") if isinstance(payload, dict) else {}
+    if isinstance(sessions, dict):
+        for key, value in sessions.items():
+            if isinstance(value, dict):
+                _TOOL_AUTHORING_CONFIG_STORE[str(key)] = value
+
+
+def _persist_tool_authoring_config_store_to_disk() -> None:
+    path = _tool_authoring_config_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_sessions: dict[str, Any] = {}
+    for session_id, record in _TOOL_AUTHORING_CONFIG_STORE.items():
+        safe = dict(record)
+        safe.pop("env_values", None)  # Do not persist secret values to disk.
+        safe["config"] = _redact_secrets(safe.get("config") or {}, set(os.environ.values()))
+        safe_sessions[session_id] = safe
+    payload = {"version": 1, "updated_at": _utc_now(), "sessions": safe_sessions}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_tool_authoring_config(payload: dict[str, Any]) -> dict[str, Any]:
+    _load_tool_authoring_config_store_from_disk()
+    data = dict(payload or {})
+    manifest = _sync_auth_into_manifest(data.get("manifest") if isinstance(data.get("manifest"), dict) else {}, data)
+    session_id = _tool_config_session_id(data)
+    config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    sample_input = data.get("sample_input") if isinstance(data.get("sample_input"), dict) else {}
+    env_values = _extract_env_values_from_payload(data, manifest)
+    _apply_env_values(env_values)
+    auth_gate = _auth_gate_for_manifest(manifest)
+    configured_env = sorted(set([*auth_gate.get("configured_env", []), *env_values.keys()]))
+    record = {
+        "tool_name": str(data.get("tool_name") or data.get("operation") or manifest.get("tool_name") or session_id),
+        "config": config,
+        "sample_input": sample_input,
+        "env_values": env_values,
+        "configured_env": configured_env,
+        "configured_secrets": configured_env,
+        "config_refs": {name: f"env:{name}" for name in configured_env},
+        "auth_override": data.get("auth_override") if isinstance(data.get("auth_override"), dict) else {},
+        "updated_at": _utc_now(),
+    }
+    _TOOL_AUTHORING_CONFIG_STORE[session_id] = record
+    _persist_tool_authoring_config_store_to_disk()
+    auth_gate = _auth_gate_for_manifest(manifest)
+    return {"success": True, "session_id": session_id, "configured": bool(auth_gate.get("status") in {"configured", "not_required"}), "config": _redact_secrets(config, set(env_values.values())), "sample_input": sample_input, "configured_env": configured_env, "configured_secrets": configured_env, "missing_env": auth_gate.get("missing_env") or [], "missing_secrets": auth_gate.get("missing_secrets") or [], "config_refs": record["config_refs"], "auth_override": record["auth_override"], "auth_gate": auth_gate, "platform_env_prefix": "", "persisted": True, "store_path": str(_tool_authoring_config_store_path())}
+
+
+def tool_authoring_config_status(session_id: str = "default", manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    _load_tool_authoring_config_store_from_disk()
+    key = _tool_config_session_id({"session_id": session_id})
+    stored = _TOOL_AUTHORING_CONFIG_STORE.get(key)
+    if stored and isinstance(stored.get("env_values"), dict):
+        _apply_env_values(stored.get("env_values") or {})
+    normalized_manifest = _sync_auth_into_manifest(manifest or {}, {"session_id": session_id}) if manifest else {}
+    auth_gate = _auth_gate_for_manifest(normalized_manifest) if normalized_manifest else {"required": False, "status": "not_required", "required_env": [], "required_secrets": [], "configured_env": [], "configured_secrets": [], "missing_env": [], "missing_secrets": [], "can_register": True, "block_registration": False}
+    if not stored:
+        return {"success": True, "configured": bool(auth_gate.get("status") in {"configured", "not_required"}), "session_id": key, "config": {}, "sample_input": {}, "configured_env": auth_gate.get("configured_env") or [], "configured_secrets": auth_gate.get("configured_secrets") or [], "missing_env": auth_gate.get("missing_env") or [], "missing_secrets": auth_gate.get("missing_secrets") or [], "config_refs": {}, "auth_override": {}, "auth_gate": auth_gate, "platform_env_prefix": "", "persisted": False, "store_path": str(_tool_authoring_config_store_path())}
+    configured_env = sorted(set(stored.get("configured_env") or []))
+    return {"success": True, "configured": bool(auth_gate.get("status") in {"configured", "not_required"} or configured_env), "session_id": key, "config": _redact_secrets(stored.get("config") or {}, set((stored.get("env_values") or {}).values()) if isinstance(stored.get("env_values"), dict) else set()), "sample_input": stored.get("sample_input") or {}, "configured_env": configured_env or auth_gate.get("configured_env") or [], "configured_secrets": configured_env or auth_gate.get("configured_secrets") or [], "missing_env": auth_gate.get("missing_env") or [], "missing_secrets": auth_gate.get("missing_secrets") or [], "config_refs": stored.get("config_refs") or {}, "auth_override": stored.get("auth_override") or {}, "auth_gate": auth_gate, "platform_env_prefix": "", "updated_at": stored.get("updated_at"), "persisted": True, "store_path": str(_tool_authoring_config_store_path())}
+
+
 _load_registered_tools_from_disk()

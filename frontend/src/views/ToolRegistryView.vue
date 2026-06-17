@@ -98,6 +98,52 @@
             </div>
           </div>
 
+          <div
+              v-if="!clarificationQuestions.length"
+              class="manual-auth-panel compact-preview"
+              :class="{ 'manual-active': manualAuthOverride.mode !== 'auto' }"
+          >
+              <div>
+                <strong>人工认证判定</strong>
+                <p class="muted small">
+                  当前模式：{{ manualAuthModeLabel }}。用于修正 planner / 系统误判，只影响认证 gate，不绕过代码安全校验。
+                </p>
+                <small v-if="manualAuthOverride.reason">
+                  原因：{{ manualAuthOverride.reason }}
+                </small>
+              </div>
+
+              <div class="manual-auth-actions">
+                <button
+                  class="btn-primary"
+                  type="button"
+                  :disabled="busy"
+                  @click="forceRequireAuth"
+                >
+                  + 手动添加认证配置
+                </button>
+
+                <button
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="busy"
+                  @click="forceNoAuth"
+                >
+                  - 手动删除认证要求
+                </button>
+
+                <button
+                  v-if="manualAuthOverride.mode !== 'auto'"
+                  class="btn-ghost"
+                  type="button"
+                  :disabled="busy"
+                  @click="clearManualAuthOverride"
+                >
+                  恢复自动判断
+                </button>
+              </div>
+          </div>
+
           <div v-if="liveTestRunning || liveTestResult || liveTestError" ref="liveTestResultRef" class="validation live-test-card" :class="liveTestResult?.success ? 'ok' : liveTestError || liveTestResult ? 'bad' : ''">
             <div class="live-test-heading">
               <strong>{{ liveTestRunning ? '正在测试连接...' : liveTestResult?.success ? 'live_test 成功' : 'live_test 失败' }}</strong>
@@ -139,56 +185,79 @@
             </div>
             <div class="heading-actions">
               <button class="btn-ghost" :disabled="busy || !canGenerate" @click="generateAdapter">重新生成实现</button>
-              <button class="btn-primary" :disabled="busy || !parsedManifest || !adapterCode" @click="finalizeAuthoring">确认代码 → 生成 snippet</button>
+              <button
+                  class="btn-primary"
+                  :disabled="busy || !parsedManifest || !effectiveRuntimeCode"
+                  @click="activeStep = 'validation'"
+              >
+                  确认代码 → 进入试运行
+              </button>
             </div>
           </div>
-          <div v-if="adapterSections.hasSections" class="adapter-edit-layout">
+          <div class="adapter-edit-layout">
               <div class="pane model-code-pane">
                 <div class="section-title row-title">
                   <div>
-                    <h3>模型生成代码（可人工修改）</h3>
-                    <small>这里只允许修改 normalize_response(data, payload)，固定 wrapper 默认折叠在下方。</small>
+                    <h3>对外发布函数核心实现</h3>
+                    <small>这里只展示工具对外暴露的核心函数实现；内部 run / runner / 临时环境在下方折叠框查看。</small>
                   </div>
-                  <button class="btn-primary" type="button" @click="applyInternalCodeEdit">
-                    应用到完整 Adapter
-                  </button>
                 </div>
 
                 <SmartCodeEditor
-                  v-model="editableInternalCode"
+                  v-model="adapterCode"
                   language="python"
                   density="compact"
                   min-height="420px"
                   max-height="680px"
-                  placeholder="def normalize_response(data, payload): ..."
-                  @focus="refreshEditableInternalCode"
+                  placeholder="def your_tool_name(payload: dict, config: dict | None = None) -> dict:"
                 />
               </div>
 
-              <details class="adapter-fixed-block">
-                <summary>
-                  <strong>固定 Wrapper 模板前半段（只读）</strong>
-                  <small>env、模板渲染、默认归一化等平台代码</small>
-                </summary>
-                <pre class="tool-card adapter-fixed-code">{{ adapterSections.wrapperBefore }}</pre>
-              </details>
+              <CollapsiblePanel
+                v-if="runtimeCode"
+                title="完整内部实现代码（注册 / 验证使用）"
+                description="包含 run(payload, config=None)、内部 helper 和完整可执行实现；默认折叠，不作为主框展示。"
+              >
+                <SmartCodeEditor
+                  v-model="runtimeCode"
+                  language="python"
+                  density="compact"
+                  min-height="360px"
+                  max-height="680px"
+                />
+              </CollapsiblePanel>
 
-              <details class="adapter-fixed-block">
-                <summary>
-                  <strong>固定 Wrapper 模板后半段（只读）</strong>
-                  <small>run、manifest、main、导出函数等平台代码</small>
-                </summary>
-                <pre class="tool-card adapter-fixed-code">{{ adapterSections.wrapperAfter }}</pre>
-              </details>
+              <CollapsiblePanel
+                v-for="panel in visibleDebugPanels"
+                :key="panel.id"
+                :title="panel.title"
+                :description="panel.description"
+              >
+                <SmartCodeEditor
+                  v-if="panel.language === 'python' || panel.language === 'code'"
+                  :model-value="String(panel.content || '')"
+                  language="python"
+                  density="compact"
+                  :toolbar="false"
+                  min-height="240px"
+                  max-height="520px"
+                  readonly
+                />
+
+                <SmartCodeEditor
+                  v-else-if="panel.language === 'json'"
+                  :model-value="stringifyPretty(panel.content)"
+                  language="json"
+                  density="compact"
+                  :toolbar="false"
+                  min-height="220px"
+                  max-height="420px"
+                  readonly
+                />
+
+                <pre v-else class="tool-card adapter-fixed-code">{{ stringifyPretty(panel.content) }}</pre>
+              </CollapsiblePanel>
           </div>
-
-          <SmartCodeEditor
-              v-else
-              v-model="adapterCode"
-              language="python"
-              fill
-              placeholder="Python adapter code"
-          />
         </section>
 
         <section v-show="activeStep === 'validation'" class="workspace-card compact-card">
@@ -213,13 +282,93 @@
               <p v-else class="muted small">还没有运行验证。</p>
               <div v-if="snippetReady" class="compact-preview">Snippet 已生成，请到「5 Snippet」确认后注册。</div>
             </div>
+            <div class="pane feedback-pane">
+              <h3>人工反馈修改</h3>
+              <p class="muted small">
+                试运行后，把不符合预期的地方写在这里。系统会把当前代码、manifest、sample input、验证结果和你的反馈一起交给 code_model 修改。
+              </p>
+
+              <SmartCodeEditor
+                v-model="humanFeedbackText"
+                language="markdown"
+                density="compact"
+                :toolbar="false"
+                min-height="140px"
+                max-height="260px"
+                placeholder="例如：抓取结果包含导航栏和页脚，希望只保留正文；output_format=markdown 时应该返回 markdown；失败时不要抛异常，返回 success=false 和 error。"
+              />
+
+              <div class="actions">
+                <button
+                  class="btn-primary"
+                  :disabled="busy || reviseRunning || !humanFeedbackText.trim() || !effectiveRuntimeCode"
+                  @click="reviseWithFeedback"
+                >
+                  根据反馈修改代码
+                </button>
+              </div>
+
+              <div v-if="revisionHistory.length" class="revision-history">
+                <strong>修改历史</strong>
+                <details
+                  v-for="(item, idx) in revisionHistory"
+                  :key="item.time"
+                  class="adapter-fixed-block"
+                >
+                  <summary>
+                    <strong>第 {{ revisionHistory.length - idx }} 次反馈</strong>
+                    <small>{{ item.time }}</small>
+                  </summary>
+                  <pre class="tool-card">{{ item.feedback }}</pre>
+                </details>
+              </div>
+            </div>
           </div>
-          <CollapsiblePanel v-model:open="debugOpen" title="调试信息 / Function card preview" description="模型注入时看到的函数卡片预览">
-            <pre class="tool-card">{{ cardPreview }}</pre>
+          <CollapsiblePanel v-model:open="debugOpen" title="调试信息 / 调用链 / Function card preview" description="包含临时环境、完整运行代码、runner 调用、stdout/stderr 和模型注入预览">
+              <div v-if="visibleDebugPanels.length" class="debug-panel-list">
+                <CollapsiblePanel
+                  v-for="panel in visibleDebugPanels"
+                  :key="`validation_${panel.id}`"
+                  :title="panel.title"
+                  :description="panel.description"
+                >
+                  <SmartCodeEditor
+                    v-if="panel.language === 'python' || panel.language === 'code'"
+                    :model-value="String(panel.content || '')"
+                    language="python"
+                    density="compact"
+                    :toolbar="false"
+                    min-height="220px"
+                    max-height="480px"
+                    readonly
+                  />
+
+                  <SmartCodeEditor
+                    v-else-if="panel.language === 'json'"
+                    :model-value="stringifyPretty(panel.content)"
+                    language="json"
+                    density="compact"
+                    :toolbar="false"
+                    min-height="220px"
+                    max-height="420px"
+                    readonly
+                  />
+
+                  <pre v-else class="tool-card">{{ stringifyPretty(panel.content) }}</pre>
+                </CollapsiblePanel>
+              </div>
+
+              <pre class="tool-card">{{ cardPreview }}</pre>
           </CollapsiblePanel>
           <div class="step-actions">
             <button class="btn-ghost" @click="activeStep = 'adapter'">返回 Adapter</button>
-            <button class="btn-primary" :disabled="!lastValidation?.success || busy" @click="finalizeAuthoring">继续确认 Snippet</button>
+            <button
+              class="btn-primary"
+              :disabled="!lastValidation?.success || busy || humanFeedbackText.trim()"
+              @click="finalizeAuthoring"
+            >
+              试运行满意 → 生成 Snippet
+            </button>
           </div>
         </section>
 
@@ -232,7 +381,13 @@
             </div>
             <div class="heading-actions">
               <button class="btn-ghost" @click="activeStep = 'validation'">返回验证</button>
-              <button class="btn-primary" :disabled="busy || !lastValidation?.success" @click="registerTool">使用当前 snippet 注册工具</button>
+              <button
+                  class="btn-primary"
+                  :disabled="!canRegister"
+                  @click="registerTool"
+                >
+                  使用当前 snippet 注册工具
+              </button>
             </div>
           </div>
           <SmartCodeEditor v-model="snippetText" language="json" fill placeholder="确认代码后生成 snippet" />
@@ -339,6 +494,8 @@
               <option value="token">token</option>
               <option value="basic">basic</option>
               <option value="custom">custom</option>
+              <option value="unknown">unknown</option>
+              <option value="oauth2">oauth2</option>
             </select>
           </label>
         </div>
@@ -477,7 +634,17 @@ import SideDrawer from '../components/SideDrawer.vue'
 import SmartCodeEditor from '../components/SmartCodeEditor.vue'
 import { authorCreatorTool, authorCreatorToolStream, createCreatorToolSnippet, draftCreatorTool, generateCreatorToolCode, listCreatorToolSnippets, listCreatorTools, liveTestCreatorTool, registerCreatorTool, testCreatorToolSnippet, updateCreatorToolSnippet, saveCreatorToolConfig, validateCreatorTool } from '../composables/useCreator.js'
 
-const toolTypes = ['python_helper', 'http_api', 'local_command', 'database_query', 'file_converter', 'document_generator', 'image_generator', 'custom_adapter']
+const toolTypes = [
+  'python_helper',
+  'web_fetch',
+  'http_api',
+  'local_command',
+  'database_query',
+  'file_converter',
+  'document_generator',
+  'image_generator',
+  'custom_adapter'
+]
 const snippetKinds = ['minimal_usage', 'multi_input_usage', 'file_output_usage', 'batch_usage', 'error_repair_usage', 'anti_pattern', 'trial_run_usage']
 const steps = [
   { key: 'input', index: 1, title: '需求 / 代码', description: '描述能力' },
@@ -492,11 +659,20 @@ const tools = ref([])
 const allowedRolesText = ref('')
 const manifestText = ref('')
 const adapterCode = ref('')
+const runtimeCode = ref('')
+const debugSections = ref([])
+const toolContract = ref(null)
 const optionalCodeBlock = ref('')
 const snippetText = ref('{}')
 const clarificationQuestions = ref([])
 const clarificationAnswers = ref([])
 const planState = ref({})
+const manualAuthOverride = reactive({
+  mode: 'auto', // auto | force_required | force_no_auth
+  reason: '',
+  source: 'user',
+  updated_at: ''
+})
 const configForm = reactive({
   base_url: '',
   method: 'GET',
@@ -577,6 +753,9 @@ const sampleInputText = ref(`{
   "query": "测试内容"
 }`)
 const lastValidation = ref(null)
+const humanFeedbackText = ref('')
+const reviseRunning = ref(false)
+const revisionHistory = ref([])
 const selectedToolName = ref('')
 const snippets = ref([])
 const snippetRolesText = ref('')
@@ -589,7 +768,38 @@ const snippetTestResult = ref(null)
 const snippetForm = reactive({ id: '', title: '', kind: 'minimal_usage', description: '', code: '', return_rule: '', usage_policy: 'helper_preferred', priority: 80 })
 const expandedPanels = reactive({ input: true, planner: false, adapter: false, validation: false, snippet: false, registeredTools: false, snippetManager: false })
 
-const form = reactive({ tool_name: '', description: '', tool_type: 'python_helper', input_description: '', output_description: '', needs_secret: false, needs_external_network: false, generates_file: false, high_risk: false })
+const form = reactive({
+  tool_name: '',
+  description: '',
+  tool_type: 'python_helper',
+  wrapper_family: 'auto',
+  input_description: '',
+  output_description: '',
+  needs_secret: false,
+  needs_external_network: false,
+  generates_file: false,
+  high_risk: false
+})
+
+function looksLikeFullRuntime(code = '') {
+  return /\bdef\s+run\s*\(/.test(String(code || ''))
+}
+
+const effectiveRuntimeCode = computed(() => {
+  return looksLikeFullRuntime(runtimeCode.value)
+    ? runtimeCode.value
+    : ''
+})
+
+const visibleDebugPanels = computed(() =>
+  mergeDebugSections(
+    debugSections.value,
+    lastValidation.value?.debug_sections,
+    lastValidation.value?.collapsible_blocks,
+    lastValidation.value?.dynamic_trial?.debug_sections,
+    lastValidation.value?.dynamic_trial?.collapsible_blocks
+  )
+)
 const parsedManifest = computed(() => { try { return manifestText.value ? JSON.parse(manifestText.value) : null } catch { return null } })
 const parsedSample = computed(() => { try { return sampleInputText.value ? JSON.parse(sampleInputText.value) : {} } catch { return {} } })
 const configExtra = computed(() =>
@@ -721,7 +931,98 @@ function canonicalAuthoringConfig() {
   return buildCurrentUiConfig()
 }
 const parsedConfig = computed(() => buildCurrentUiConfig())
-const requiresConfig = computed(() => planState.value?.requires_config || planState.value?.tool_kind === 'external_api' || planState.value?.requires_external_network || form.needs_external_network)
+const effectiveWrapperFamily = computed(() => {
+  const raw =
+    planState.value?.wrapper_family ||
+    form.wrapper_family ||
+    planState.value?.tool_kind ||
+    form.tool_type ||
+    'auto'
+
+  if (raw === 'external_api' || raw === 'http_api') return 'http_api'
+  if (raw === 'web_fetch') return 'web_fetch'
+  if (raw === 'python_helper' || raw === 'data_transform' || raw === 'local_helper') return 'python_compute'
+  if (raw === 'file_generator') return 'file_converter'
+  return raw
+})
+
+function stripUnconfirmedDefaultAuthConfig(config = {}) {
+  const cfg = { ...(config || {}) }
+
+  const authType = String(cfg.auth_type || '').trim().toLowerCase()
+
+  // auth_type=none 是 UI 默认值，不代表用户确认无需认证。
+  if (['', 'none', 'no_auth', 'anonymous', 'public', 'noauth'].includes(authType)) {
+    delete cfg.auth_type
+
+    if (String(cfg.auth_placement || '').toLowerCase() === 'header') {
+      delete cfg.auth_placement
+    }
+
+    if (String(cfg.auth_header_name || '').toUpperCase() === 'X-API-KEY') {
+      delete cfg.auth_header_name
+    }
+
+    if (String(cfg.auth_query_param || '').toLowerCase() === 'api_key') {
+      delete cfg.auth_query_param
+    }
+  }
+
+  // method=GET 也是 UI 默认值；没有 base_url 时不要发给 planner。
+  if (!cfg.base_url && String(cfg.method || '').toUpperCase() === 'GET') {
+    delete cfg.method
+  }
+
+  return Object.fromEntries(
+    Object.entries(cfg).filter(([, value]) => {
+      if (value === undefined || value === null || value === '') return false
+      if (Array.isArray(value) && !value.length) return false
+      if (isPlainObject(value) && !Object.keys(value).length) return false
+      return true
+    })
+  )
+}
+
+function hasExplicitAuthConfig() {
+  const authType = String(configForm.auth_type || '').trim().toLowerCase()
+
+  if (authType && !['none', 'no_auth', 'anonymous', 'public', 'noauth'].includes(authType)) {
+    return true
+  }
+
+  return Boolean(configForm.secret_env || configForm.secret_value)
+}
+
+function configForAuthorAction(action) {
+  const config = canonicalAuthoringConfig()
+
+  // configure / live_test / finalize / revise 可以带完整 config。
+  if (!['clarify', 'generate'].includes(action)) {
+    return config
+  }
+
+  // 保存过配置，说明用户确认过，可以发送。
+  if (configSaveResult.value?.success) {
+    return config
+  }
+
+  // 人工强制认证/无认证，也属于用户确认。
+  if (manualAuthOverride.mode !== 'auto') {
+    return config
+  }
+
+  // 用户显式选择了 api_key/token/basic 等，才发送。
+  if (hasExplicitAuthConfig()) {
+    return config
+  }
+
+  // 否则只发非默认字段，不发 auth_type=none。
+  const cleaned = stripUnconfirmedDefaultAuthConfig(config)
+  return Object.keys(cleaned).length ? cleaned : undefined
+}
+
+const isHttpApiFamily = computed(() => effectiveWrapperFamily.value === 'http_api')
+
 const canRunLiveTest = computed(() => allowExternalNetwork.value && (configSaveResult.value?.success || planState.value?.ready_for_live_test))
 const entrypointConfidenceLabel = computed(() => ({ high: '高置信度', medium: '中等置信度', low: '低置信度' }[planState.value?.suggested_entrypoint?.confidence] || '待确认'))
 const liveTestPassed = computed(() => Boolean(liveTestResult.value?.success))
@@ -742,12 +1043,123 @@ const configGatePassed = computed(() => {
   return false
 })
 
+function normalizeAuthGate(rawGate = {}) {
+  const status = String(rawGate.status || 'none').trim() || 'none'
+  const blockingStatuses = ['needs_config', 'needs_live_test', 'needs_review', 'blocked']
+
+  return {
+    status,
+    block_code_generation: Boolean(rawGate.block_code_generation),
+    block_registration:
+      rawGate.block_registration !== undefined
+        ? Boolean(rawGate.block_registration)
+        : blockingStatuses.includes(status),
+    reasons: Array.isArray(rawGate.reasons)
+      ? rawGate.reasons.filter(Boolean)
+      : rawGate.reason
+        ? [String(rawGate.reason)]
+        : []
+  }
+}
+
+const authGate = computed(() => {
+  if (manualAuthOverride.mode === 'force_required') {
+    return normalizeAuthGate({
+      status: 'needs_config',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: [
+        manualAuthOverride.reason || '用户手动要求该工具必须配置认证'
+      ]
+    })
+  }
+
+  if (manualAuthOverride.mode === 'force_no_auth') {
+    return normalizeAuthGate({
+      status: 'none',
+      block_code_generation: false,
+      block_registration: false,
+      reasons: [
+        manualAuthOverride.reason || '用户手动确认该工具无需认证'
+      ]
+    })
+  }
+
+  const backendGate = planState.value?.auth_gate
+  if (backendGate && typeof backendGate === 'object') {
+    return normalizeAuthGate(backendGate)
+  }
+
+  const decision =
+    planState.value?.auth_decision ||
+    parsedManifest.value?.auth_decision ||
+    {}
+
+  const required = String(
+    decision.required ||
+    (planState.value?.requires_config ? 'yes' : 'no')
+  ).trim().toLowerCase()
+
+  if (liveTestResult.value?.success) {
+    return normalizeAuthGate({
+      status: 'none',
+      block_code_generation: false,
+      block_registration: false,
+      reasons: ['live_test 已通过']
+    })
+  }
+
+  if (required === 'yes') {
+    return normalizeAuthGate({
+      status: 'needs_config',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: decision.evidence || decision.reasons || ['Planner 判定需要认证或配置']
+    })
+  }
+
+  if (required === 'unknown') {
+    return normalizeAuthGate({
+      status: 'needs_review',
+      block_code_generation: false,
+      block_registration: true,
+      reasons: decision.evidence || decision.reasons || ['Planner 无法确定是否需要认证']
+    })
+  }
+
+  return normalizeAuthGate({
+    status: 'none',
+    block_code_generation: false,
+    block_registration: false,
+    reasons: []
+  })
+})
+
+const requiresConfig = computed(() =>
+  ['needs_config', 'needs_live_test', 'needs_review', 'blocked'].includes(authGate.value.status)
+)
+
+
 const canGenerate = computed(() =>
   !busy.value &&
   !clarificationQuestions.value.length &&
   hasEnoughPlanForGeneration.value &&
-  configGatePassed.value
+  !authGate.value.block_code_generation
 )
+
+const canRegister = computed(() =>
+  Boolean(lastValidation.value?.success) &&
+  !busy.value &&
+  Boolean(parsedManifest.value) &&
+  Boolean(effectiveRuntimeCode.value) &&
+  snippetReady.value &&
+  !authGate.value.block_registration
+)
+const manualAuthModeLabel = computed(() => {
+  if (manualAuthOverride.mode === 'force_required') return '人工要求认证'
+  if (manualAuthOverride.mode === 'force_no_auth') return '人工确认无需认证'
+  return '自动判断'
+})
 const cardPreview = computed(() => (lastValidation.value?.tool_card_preview || []).join('\n\n---\n\n') || '验证后展示 Creator prompt 注入的 function card。')
 const snippetPreview = computed(() => snippets.value.map(snippet => snippet.formatted || '').join('\n\n---\n\n') || '选择工具后展示 Creator 会看到的 Tool Snippet。')
 const snippetReady = computed(() => snippetText.value && snippetText.value.trim() !== '{}')
@@ -760,7 +1172,20 @@ function stepStatus(key) {
   if (key === 'snippet' && snippetReady.value) return 'ok'
   return ''
 }
-async function run(task) { busy.value = true; error.value = ''; try { await task() } catch (e) { error.value = e.message || String(e) } finally { busy.value = false; statusMessage.value = '' } }
+async function run(task) {
+  busy.value = true
+  error.value = ''
+
+  try {
+    await task()
+  } catch (e) {
+    error.value = e.message || String(e)
+  } finally {
+    busy.value = false
+    // 不要在 finally 里清空 statusMessage，否则 revise 成功/失败提示会一闪而过。
+    // statusMessage.value = ''
+  }
+}
 function logAuthor(event) { const helperMessages = { tool_call_planned: `正在分析需要辅助工具：${event.tool || ''} ${event.reason || ''}`, tool_call_started: `正在调用${event.tool || '辅助工具'}...`, tool_call_requires_input: `等待用户填写${event.tool || '辅助工具'}配置...`, tool_call_result: `${event.tool || '辅助工具'}${event.success ? '完成，继续生成 adapter...' : '需要补充信息或执行失败'}` }; const message = event.message || helperMessages[event.event] || ''; authorLogs.value.push({ time: new Date().toLocaleTimeString(), ...event, message }); if (authorLogs.value.length > 80) authorLogs.value.shift(); if (message) statusMessage.value = message }
 async function loadTools() { const data = await listCreatorTools(); tools.value = data.tools || [] }
 function payload() { return { ...form, allowed_roles: allowedRolesText.value.split(',').map(s => s.trim()).filter(Boolean) } }
@@ -773,54 +1198,276 @@ function addExtraField() { configExtraFields.value.push({ key: '', value: '', se
 function removeExtraField(idx) { configExtraFields.value.splice(idx, 1) }
 function normalizeSuggestedAuthType(value) {
   const text = String(value || '').trim().toLowerCase()
-  if (!text || ['none', 'no_auth', 'anonymous'].includes(text)) return 'none'
-  if (['header', 'api_key', 'apikey', 'key'].includes(text)) return 'api_key'
-  if (['bearer', 'token'].includes(text)) return 'token'
+
+  if (!text || ['none', 'no_auth', 'anonymous', 'public', 'noauth'].includes(text)) {
+    return 'none'
+  }
+
+  if (['api_key', 'apikey', 'key'].includes(text)) return 'api_key'
+  if (['bearer', 'token', 'oauth_bearer'].includes(text)) return 'token'
   if (text === 'basic') return 'basic'
-  return 'api_key'
+  if (['oauth', 'oauth2'].includes(text)) return 'oauth2'
+  if (text === 'custom') return 'custom'
+
+  // header/query/bearer 是 placement，不是 auth_type。
+  if (['header', 'query'].includes(text)) return 'custom'
+
+  return 'unknown'
+}
+
+function authTypeNeedsSecret(authType) {
+  const text = String(authType || '').trim().toLowerCase()
+  return !['none', 'no_auth', 'anonymous', 'public', 'unknown', ''].includes(text)
+}
+
+function writeConfigIfUseful(key, value, { overwriteDefault = false, defaultValue = '' } = {}) {
+  if (value === undefined || value === null || value === '') return
+
+  const current = configForm[key]
+  const shouldWrite =
+    current === undefined ||
+    current === null ||
+    current === '' ||
+    (overwriteDefault && String(current) === String(defaultValue))
+
+  if (shouldWrite) {
+    configForm[key] = value
+  }
+}
+
+function applyAuthDecision(decision = {}) {
+  if (!decision || typeof decision !== 'object') return
+  if (liveTestResult.value?.success) return
+
+  const schemes = Array.isArray(decision.security_schemes)
+    ? decision.security_schemes
+    : Array.isArray(decision.securitySchemes)
+      ? decision.securitySchemes
+      : []
+
+  const scheme = schemes.find(item => {
+    const type = String(item?.type || item?.scheme || '').trim().toLowerCase()
+    return type && !['none', 'noauth', 'no_auth', 'anonymous', 'public'].includes(type)
+  })
+
+  if (!scheme) {
+    if (decision.required === 'unknown' && configForm.auth_type === 'none') {
+      configForm.auth_type = 'unknown'
+    }
+    return
+  }
+
+  const schemeType = normalizeSuggestedAuthType(scheme.type || scheme.scheme)
+
+  if (schemeType !== 'unknown') {
+    configForm.auth_type = schemeType
+  } else if (configForm.auth_type === 'none') {
+    configForm.auth_type = 'unknown'
+  }
+
+  writeConfigIfUseful('secret_env', scheme.env || scheme.secret_env || scheme.secretEnv)
+
+  const placement = scheme.placement || scheme.in || scheme.auth_placement
+  if (placement) {
+    writeConfigIfUseful('auth_placement', placement, {
+      overwriteDefault: true,
+      defaultValue: 'header'
+    })
+  }
+
+  if (scheme.header_name || scheme.headerName) {
+    writeConfigIfUseful('auth_header_name', scheme.header_name || scheme.headerName, {
+      overwriteDefault: true,
+      defaultValue: 'X-API-KEY'
+    })
+  }
+
+  if (scheme.query_param || scheme.queryParam || scheme.name) {
+    writeConfigIfUseful('auth_query_param', scheme.query_param || scheme.queryParam || scheme.name, {
+      overwriteDefault: true,
+      defaultValue: 'api_key'
+    })
+  }
+
+  if (schemeType === 'token') {
+    configForm.auth_placement = 'bearer'
+    if (!configForm.auth_header_name || configForm.auth_header_name === 'X-API-KEY') {
+      configForm.auth_header_name = 'Authorization'
+    }
+  }
+
+  if (schemeType === 'basic') {
+    configForm.auth_placement = 'header'
+    configForm.auth_header_name = 'Authorization'
+  }
+}
+
+const AUTH_AUTHORING_TOOL_NAMES = new Set([
+  'authoring_config_collector',
+  'authoring_live_test'
+])
+
+function manualAuthOverridePayload() {
+  return {
+    mode: manualAuthOverride.mode,
+    reason: manualAuthOverride.reason,
+    source: manualAuthOverride.source,
+    updated_at: manualAuthOverride.updated_at
+  }
+}
+
+function removeAuthAuthoringTools(items = []) {
+  return (items || []).filter(item => {
+    const toolName = String(item?.tool_name || item?.name || '').trim()
+    return !AUTH_AUTHORING_TOOL_NAMES.has(toolName)
+  })
+}
+
+function applyManualAuthOverrideToPlan() {
+  if (manualAuthOverride.mode === 'auto') return
+
+  if (manualAuthOverride.mode === 'force_required') {
+    planState.value = {
+      ...planState.value,
+      requires_config: true,
+      requires_authorization: true,
+      requires_secret: true,
+      ready_for_code_generation: false,
+      auth_decision: {
+        required: 'yes',
+        confidence: 1,
+        reason: manualAuthOverride.reason || '用户手动要求认证',
+        evidence: ['manual_override'],
+        security_schemes: []
+      },
+      auth_gate: {
+        status: 'needs_config',
+        block_code_generation: false,
+        block_registration: true,
+        reasons: [manualAuthOverride.reason || '用户手动要求该工具必须配置认证']
+      }
+    }
+    return
+  }
+
+  if (manualAuthOverride.mode === 'force_no_auth') {
+    planState.value = {
+      ...planState.value,
+      requires_config: false,
+      requires_authorization: false,
+      requires_secret: false,
+      requires_authoring_tools: false,
+      ready_for_code_generation: Boolean(
+        planState.value?.manifest ||
+        parsedManifest.value ||
+        planState.value?.operation ||
+        form.description
+      ),
+      authoring_tool_plan: removeAuthAuthoringTools(planState.value?.authoring_tool_plan || []),
+      auth_decision: {
+        required: 'no',
+        confidence: 1,
+        reason: manualAuthOverride.reason || '用户手动确认无需认证',
+        evidence: ['manual_override'],
+        security_schemes: [{ type: 'none' }]
+      },
+      auth_gate: {
+        status: 'none',
+        block_code_generation: false,
+        block_registration: false,
+        reasons: [manualAuthOverride.reason || '用户手动确认该工具无需认证']
+      }
+    }
+  }
+}
+
+function setManualAuthOverride(mode, reason) {
+  manualAuthOverride.mode = mode
+  manualAuthOverride.reason = reason
+  manualAuthOverride.source = 'user'
+  manualAuthOverride.updated_at = new Date().toISOString()
+  applyManualAuthOverrideToPlan()
+}
+
+function forceRequireAuth() {
+  setManualAuthOverride('force_required', '用户手动添加认证配置')
+  if (configForm.auth_type === 'none' || configForm.auth_type === 'unknown') {
+    configForm.auth_type = 'api_key'
+  }
+  authConfigOpen.value = true
+  activeStep.value = 'planner'
+}
+
+function forceNoAuth() {
+  setManualAuthOverride('force_no_auth', '用户手动删除认证要求')
+  configForm.auth_type = 'none'
+  configForm.secret_env = ''
+  configForm.secret_value = ''
+  configForm.auth_placement = 'header'
+  liveTestError.value = ''
+  activeStep.value = 'planner'
+}
+
+function clearManualAuthOverride() {
+  manualAuthOverride.mode = 'auto'
+  manualAuthOverride.reason = ''
+  manualAuthOverride.source = 'user'
+  manualAuthOverride.updated_at = new Date().toISOString()
+
+  planState.value = {
+    ...planState.value,
+    auth_override: manualAuthOverridePayload()
+  }
 }
 
 function applySuggestedEntrypoint(entrypoint = {}) {
   if (!entrypoint || typeof entrypoint !== 'object') return
 
-  // live_test 成功后的配置是事实源，planner 后续建议不能覆盖。
   const lockedByLiveTest = Boolean(liveTestResult.value?.success)
+  if (lockedByLiveTest) return
 
-  // base_url 只在为空时预填。
-  if (!lockedByLiveTest) {
-    if (entrypoint.base_url && !configForm.base_url) configForm.base_url = entrypoint.base_url
-    if (entrypoint.endpoint && !configForm.base_url) configForm.base_url = entrypoint.endpoint
-    if (entrypoint.url && !configForm.base_url) configForm.base_url = entrypoint.url
-  }
+  writeConfigIfUseful('base_url', entrypoint.base_url || entrypoint.endpoint || entrypoint.url)
 
-  // method 只在用户还没有明确配置时预填；不要用 planner 覆盖已确认 POST。
   const suggestedMethod = normalizeRequestMethod(entrypoint.method)
   const currentMethod = normalizeRequestMethod(configForm.method)
   const methodLooksDefault = !configForm.method || currentMethod === 'GET'
 
-  if (!lockedByLiveTest && entrypoint.method && methodLooksDefault && !configSaveResult.value?.success) {
+  if (entrypoint.method && methodLooksDefault && !configSaveResult.value?.success) {
     configForm.method = suggestedMethod
   }
 
-  // auth_type 只在当前为 none 时预填，并把 planner 的 header 归一化成 api_key。
-  if (!lockedByLiveTest && entrypoint.auth_type && configForm.auth_type === 'none') {
+  if (entrypoint.auth_type && configForm.auth_type === 'none') {
     configForm.auth_type = normalizeSuggestedAuthType(entrypoint.auth_type)
   }
 
-  if (!lockedByLiveTest && entrypoint.secret_env && !configForm.secret_env) {
-    configForm.secret_env = entrypoint.secret_env
+  writeConfigIfUseful('secret_env', entrypoint.secret_env || entrypoint.secretEnv)
+
+  if (entrypoint.auth_placement) {
+    writeConfigIfUseful('auth_placement', entrypoint.auth_placement, {
+      overwriteDefault: true,
+      defaultValue: 'header'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_placement && !configForm.auth_placement) {
-    configForm.auth_placement = entrypoint.auth_placement
+  if (entrypoint.auth_header_name) {
+    writeConfigIfUseful('auth_header_name', entrypoint.auth_header_name, {
+      overwriteDefault: true,
+      defaultValue: 'X-API-KEY'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_header_name && !configForm.auth_header_name) {
-    configForm.auth_header_name = entrypoint.auth_header_name
+  if (entrypoint.auth_query_param) {
+    writeConfigIfUseful('auth_query_param', entrypoint.auth_query_param, {
+      overwriteDefault: true,
+      defaultValue: 'api_key'
+    })
   }
 
-  if (!lockedByLiveTest && entrypoint.auth_query_param && !configForm.auth_query_param) {
-    configForm.auth_query_param = entrypoint.auth_query_param
+  if (entrypoint.auth && typeof entrypoint.auth === 'object') {
+    applyAuthDecision({
+      required: entrypoint.auth.type && entrypoint.auth.type !== 'none' ? 'yes' : 'no',
+      security_schemes: [entrypoint.auth]
+    })
   }
 
   const extra = entrypoint.extra || entrypoint.config || {}
@@ -836,20 +1483,55 @@ function applySuggestedEntrypoint(entrypoint = {}) {
     }
   })
 }
+
 function filterAnsweredQuestions(questions) {
   const answered = new Set(clarificationQuestions.value.map((question, idx) => (clarificationAnswers.value[idx] ? questionText(question) : '')).filter(Boolean))
   return questions.filter(question => !answered.has(questionText(question)))
 }
 function configSessionId() { return form.tool_name || planState.value?.operation || form.description || 'default' }
+
 function authorPayload(action) {
+  const runtime = looksLikeFullRuntime(runtimeCode.value)
+    ? runtimeCode.value
+    : ''
+
+  const isGenerateLike = ['generate', 'clarify'].includes(action)
+
   return {
     ...payload(),
+
     action,
-    code_block: optionalCodeBlock.value || (action === 'generate' ? adapterCode.value : undefined),
+
+    reference_code: optionalCodeBlock.value || undefined,
+    reference_snippet: optionalCodeBlock.value || undefined,
+
+    code_block: isGenerateLike
+      ? (optionalCodeBlock.value || undefined)
+      : undefined,
+
+    // 主窗格展示代码
     adapter_code: adapterCode.value,
+    display_code: adapterCode.value,
+    public_api_code: adapterCode.value,
+
+    // 唯一完整执行代码来源
+    runtime_code: runtime,
+    full_adapter_code: runtime,
+    internal_code: runtime,
+    script_code: runtime,
+
     sample_input: parsedSample.value,
     manifest: parsedManifest.value,
     validation: lastValidation.value,
+
+    human_feedback: humanFeedbackText.value,
+    review_feedback: humanFeedbackText.value,
+    feedback: humanFeedbackText.value,
+
+    trial_run_result: lastValidation.value,
+    debug_sections: debugSections.value,
+    tool_contract: toolContract.value,
+
     clarification_answers: clarificationQuestions.value
       .map((question, idx) => ({
         id: question?.id || '',
@@ -858,14 +1540,17 @@ function authorPayload(action) {
         answer_label: answerLabel(question, clarificationAnswers.value[idx] || '')
       }))
       .filter(item => item.answer),
+
     tool_kind: planState.value?.tool_kind,
     operation: planState.value?.operation,
-    config: canonicalAuthoringConfig(),
+    config: configForAuthorAction(action),
     live_test_result: liveTestResult.value,
     allow_external_network: allowExternalNetwork.value,
-    authoring_context: planState.value?.authoring_context || {}
+    authoring_context: planState.value?.authoring_context || {},
+    auth_override: manualAuthOverridePayload()
   }
 }
+
 function extractLiveTestResult(data) {
   if (data?.live_test_result) return data.live_test_result
   if (data?.authoring_context?.live_test_result) return data.authoring_context.live_test_result
@@ -880,17 +1565,293 @@ function rememberLiveTestResult(result) {
   liveTestHistory.value.unshift({ time: new Date().toISOString(), result })
   if (liveTestHistory.value.length > 10) liveTestHistory.value.pop()
 }
+function normalizeManualAuthOverride(override = {}) {
+  if (!override || typeof override !== 'object') {
+    return null
+  }
+
+  const aliases = {
+    required: 'force_required',
+    force_auth: 'force_required',
+    add: 'force_required',
+    add_auth: 'force_required',
+    no_auth: 'force_no_auth',
+    remove: 'force_no_auth',
+    remove_auth: 'force_no_auth',
+    none: 'force_no_auth'
+  }
+
+  let mode = String(override.mode || 'auto').trim().toLowerCase()
+  mode = aliases[mode] || mode
+
+  if (!['auto', 'force_required', 'force_no_auth'].includes(mode)) {
+    mode = 'auto'
+  }
+
+  return {
+    mode,
+    reason: String(override.reason || ''),
+    source: String(override.source || 'user'),
+    updated_at: String(override.updated_at || '')
+  }
+}
+
+function applyManualAuthOverrideFromData(data = {}) {
+  const override =
+    data?.auth_override ||
+    data?.config?.auth_override ||
+    data?.manifest?.auth_override ||
+    data?.authoring_context?.auth_override
+
+  const normalized = normalizeManualAuthOverride(override)
+  if (!normalized) return
+
+  manualAuthOverride.mode = normalized.mode
+  manualAuthOverride.reason = normalized.reason
+  manualAuthOverride.source = normalized.source
+  manualAuthOverride.updated_at = normalized.updated_at
+
+  if (normalized.mode !== 'auto') {
+    applyManualAuthOverrideToPlan()
+  }
+}
 function stringifyPretty(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) }
+function normalizeDebugSections(items = []) {
+  const raw = Array.isArray(items) ? items : []
+  return raw
+    .map((item, index) => {
+      if (!item) return null
+
+      if (typeof item === 'string') {
+        return {
+          id: `debug_${index}`,
+          title: `调试信息 ${index + 1}`,
+          description: '',
+          language: 'text',
+          content: item
+        }
+      }
+
+      return {
+        id: item.id || item.key || `debug_${index}`,
+        title: item.title || item.name || `调试信息 ${index + 1}`,
+        description: item.description || item.summary || '',
+        language: item.language || item.type || 'text',
+        content:
+          item.content !== undefined
+            ? item.content
+            : item.code !== undefined
+              ? item.code
+              : item.data !== undefined
+                ? item.data
+                : item
+      }
+    })
+    .filter(Boolean)
+}
+
+function mergeDebugSections(...groups) {
+  const merged = []
+  const seen = new Set()
+
+  for (const group of groups) {
+    for (const item of normalizeDebugSections(group)) {
+      const key = `${item.id}:${item.title}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      merged.push(item)
+    }
+  }
+
+  return merged
+}
+
+function extractRuntimeCode(data = {}) {
+  const candidates = [
+    data.runtime_code,
+    data.full_adapter_code,
+    data.internal_code,
+    data.script_code
+  ]
+
+  for (const item of candidates) {
+    const code = String(item || '').trim()
+    if (looksLikeFullRuntime(code)) {
+      return code
+    }
+  }
+
+  return ''
+}
+
+function extractDisplayCode(data = {}) {
+  return (
+    data.display_code ||
+    data.public_api_code ||
+    data.adapter_code ||
+    data.core_display_code ||
+    ''
+  )
+}
+
+function extractDebugSections(data = {}) {
+  return mergeDebugSections(
+    data.debug_sections,
+    data.collapsible_blocks,
+    data.validation?.debug_sections,
+    data.validation?.collapsible_blocks,
+    data.validation?.dynamic_trial?.debug_sections,
+    data.validation?.dynamic_trial?.collapsible_blocks
+  )
+}
 function scrollToLiveTestResult() { nextTick(() => liveTestResultRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })) }
-function applyAuthorResult(data) { planState.value = { ...planState.value, ...data }; const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3); clarificationQuestions.value = filterAnsweredQuestions(nextQuestions); if (!clarificationQuestions.value.length) clarificationAnswers.value = []; if (!configSaveResult.value?.success && !liveTestResult.value?.success) {
-  applySuggestedEntrypoint(data.suggested_entrypoint)
-}; if (data.config?.base_url && !configForm.base_url) configForm.base_url = data.config.base_url; if (data.manifest) manifestText.value = JSON.stringify(data.manifest || {}, null, 2); if (data.sample_input) sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2); if (data.adapter_code) {
-  adapterCode.value = data.adapter_code
-}; lastValidation.value = data.validation || lastValidation.value; rememberLiveTestResult(extractLiveTestResult(data)); for (const item of data.authoring_tool_plan || []) logAuthor({ event: 'tool_call_planned', tool: item.tool_name, reason: item.reason }); for (const item of data.authoring_tool_results || []) { logAuthor({ event: 'tool_call_started', tool: item.tool_name }); if (item.requires_input) logAuthor({ event: 'tool_call_requires_input', tool: item.tool_name, schema: item.schema || {} }); logAuthor({ event: 'tool_call_result', tool: item.tool_name, success: Boolean(item.success) }) } snippetText.value = data.snippet ? JSON.stringify(data.snippet, null, 2) : snippetText.value; if (data.adapter_code) nextTick(refreshEditableInternalCode)}
+
+function applyAuthorResult(data = {}) {
+  applyManualAuthOverrideFromData(data)
+
+  planState.value = {
+    ...planState.value,
+    ...data,
+    auth_override: manualAuthOverridePayload()
+  }
+
+  const liveResult = extractLiveTestResult(data)
+  rememberLiveTestResult(liveResult)
+
+  const nextQuestions = (data.clarification_questions || data.questions || []).slice(0, 3)
+  clarificationQuestions.value = filterAnsweredQuestions(nextQuestions)
+
+  if (!clarificationQuestions.value.length) {
+    clarificationAnswers.value = []
+  }
+
+  const lockedByConfigOrLiveTest =
+    Boolean(configSaveResult.value?.success) ||
+    Boolean(liveTestResult.value?.success)
+
+  if (!lockedByConfigOrLiveTest && manualAuthOverride.mode === 'auto') {
+    applyAuthDecision(
+      data.auth_decision ||
+      data.manifest?.auth_decision ||
+      data.security_decision ||
+      {}
+    )
+
+    applySuggestedEntrypoint(data.suggested_entrypoint || {})
+  }
+
+  if (manualAuthOverride.mode !== 'auto') {
+    applyManualAuthOverrideToPlan()
+  }
+
+  if (data.config?.base_url && !configForm.base_url) {
+    configForm.base_url = data.config.base_url
+  }
+
+  if (data.manifest) {
+    const manifest = {
+      ...(data.manifest || {}),
+      auth_override: manualAuthOverridePayload()
+    }
+
+    if (planState.value?.auth_decision) {
+      manifest.auth_decision = planState.value.auth_decision
+    }
+
+    if (authGate.value) {
+      manifest.auth_gate = authGate.value
+    }
+
+    manifestText.value = JSON.stringify(manifest, null, 2)
+  }
+
+  if (data.sample_input) {
+    sampleInputText.value = JSON.stringify(data.sample_input || {}, null, 2)
+  }
+
+  // 代码协议：
+  // display 只进主窗格；
+  // runtime 只来自后端正式 runtime 字段；
+  // 不从 debug/validation 里兜底捞代码。
+  const display = extractDisplayCode(data)
+  const runtime = extractRuntimeCode(data)
+
+  if (display) {
+    adapterCode.value = display
+  }
+
+  if (runtime) {
+    runtimeCode.value = runtime
+  }
+
+  const hasRuntimeField =
+    Boolean(data.runtime_code) ||
+    Boolean(data.full_adapter_code) ||
+    Boolean(data.internal_code) ||
+    Boolean(data.script_code)
+
+  if (hasRuntimeField && !runtime) {
+    error.value = '后端返回了 runtime 字段，但内容不包含 def run(...)，生成阶段协议不完整。'
+  }
+
+  const sections = extractDebugSections(data)
+  if (sections.length) {
+    debugSections.value = mergeDebugSections(debugSections.value, sections)
+  }
+
+  if (data.tool_contract) {
+    toolContract.value = data.tool_contract
+  }
+
+  if (data.validation) {
+    lastValidation.value = data.validation
+  }
+
+  for (const item of data.authoring_tool_plan || []) {
+    logAuthor({
+      event: 'tool_call_planned',
+      tool: item.tool_name,
+      reason: item.reason
+    })
+  }
+
+  for (const item of data.authoring_tool_results || []) {
+    logAuthor({
+      event: 'tool_call_started',
+      tool: item.tool_name
+    })
+
+    if (item.requires_input) {
+      logAuthor({
+        event: 'tool_call_requires_input',
+        tool: item.tool_name,
+        schema: item.schema || {}
+      })
+    }
+
+    logAuthor({
+      event: 'tool_call_result',
+      tool: item.tool_name,
+      success: Boolean(item.success)
+    })
+  }
+
+  if (data.snippet) {
+    snippetText.value = JSON.stringify(data.snippet, null, 2)
+  }
+
+  if (display || runtime) {
+    nextTick(refreshEditableInternalCode)
+  }
+}
+
 function draftManifest() { return run(async () => { const data = await draftCreatorTool(payload()); manifestText.value = JSON.stringify(data.manifest, null, 2); lastValidation.value = null; clarificationQuestions.value = []; activeStep.value = 'planner' }) }
 function continuePlanning() { return run(async () => { const data = await authorCreatorTool(authorPayload('configure')); applyAuthorResult(data); activeStep.value = 'planner' }) }
 async function saveConfigOnly({ configureAfterSave = true } = {}) {
-  const uiConfig = buildCurrentUiConfig()
+  const uiConfig = {
+    ...buildCurrentUiConfig(),
+    auth_override: manualAuthOverridePayload()
+  }
 
   configSaveResult.value = await saveCreatorToolConfig({
     session_id: configSessionId(),
@@ -906,16 +1867,21 @@ async function saveConfigOnly({ configureAfterSave = true } = {}) {
     extra: configExtra.value,
     additional_fields: configExtraFields.value.filter(field => field.key),
     sample_input: parsedSample.value,
-    config: uiConfig
+    config: uiConfig,
+    auth_override: manualAuthOverridePayload()
   })
+
+  applyManualAuthOverrideFromData(configSaveResult.value)
 
   configForm.secret_value = ''
 
   if (configureAfterSave) {
     const data = await authorCreatorTool({
       ...authorPayload('configure'),
-      config: canonicalAuthoringConfig()
+      config: canonicalAuthoringConfig(),
+      auth_override: manualAuthOverridePayload()
     })
+
     applyAuthorResult(data)
   }
 }
@@ -981,16 +1947,20 @@ function saveConfigAndRunLiveTest() { return run(async () => { await performLive
 function authorDraft() { return run(async () => { const data = await authorCreatorTool(authorPayload('clarify')); authorStage.value = 'clarify'; applyAuthorResult(data); activeStep.value = 'planner' }) }
 function generateAdapter() {
   return run(async () => {
-    const previousCode = adapterCode.value
+    const previousDisplayCode = adapterCode.value
+    const previousRuntimeCode = runtimeCode.value
 
     adapterCode.value = ''
+    runtimeCode.value = ''
     editableInternalCode.value = ''
+    debugSections.value = []
+    toolContract.value = null
     authorLogs.value = []
     lastValidation.value = null
     streamController.value = new AbortController()
 
     let finalResult = null
-    let receivedCode = false
+    let receivedDisplayFromStructuredField = false
 
     for await (const event of authorCreatorToolStream(authorPayload('generate'), streamController.value.signal)) {
       logAuthor(event)
@@ -1000,11 +1970,63 @@ function generateAdapter() {
       }
 
       if (event.event === 'model_delta') {
+        const runtime =
+          event.runtime_code ||
+          event.full_adapter_code ||
+          event.internal_code ||
+          event.script_code ||
+          ''
+
+        const display =
+          event.display_code ||
+          event.public_api_code ||
+          event.adapter_code ||
+          ''
+
         const delta = event.delta || ''
-        if (delta) {
+
+        if (display) {
+          adapterCode.value = display
+          receivedDisplayFromStructuredField = true
+        } else if (delta && !receivedDisplayFromStructuredField) {
           adapterCode.value += delta
-          receivedCode = true
         }
+
+        if (runtime && looksLikeFullRuntime(runtime)) {
+          runtimeCode.value = runtime
+        } else if (!runtimeCode.value && looksLikeFullRuntime(delta)) {
+          // 兼容旧 stream：delta 本身是完整 runtime。
+          runtimeCode.value = delta
+        }
+      }
+
+      if (event.event === 'debug_trace') {
+        debugSections.value = mergeDebugSections(
+          debugSections.value,
+          event.debug_sections,
+          event.collapsible_blocks
+        )
+
+        const debugRuntime = extractRuntimeCode(event)
+        if (debugRuntime && !runtimeCode.value) {
+          runtimeCode.value = debugRuntime
+        }
+      }
+
+      if (event.event === 'temporary_environment') {
+        debugSections.value = mergeDebugSections(debugSections.value, [
+          {
+            id: 'temporary_environment',
+            title: '临时环境创建',
+            description: '后端用于试运行工具的临时目录、依赖目录和环境变量',
+            language: 'json',
+            content: event.temporary_environment || event
+          }
+        ])
+      }
+
+      if (event.event === 'tool_contract') {
+        toolContract.value = event.tool_contract || null
       }
 
       if (event.event === 'validation') {
@@ -1012,7 +2034,23 @@ function generateAdapter() {
           ...(lastValidation.value || {}),
           success: Boolean(event.success),
           errors: event.errors || [],
-          warnings: event.warnings || []
+          warnings: event.warnings || [],
+          debug_sections: event.debug_sections || [],
+          collapsible_blocks: event.collapsible_blocks || [],
+          dynamic_trial: event.validation?.dynamic_trial || lastValidation.value?.dynamic_trial
+        }
+
+        debugSections.value = mergeDebugSections(
+          debugSections.value,
+          event.debug_sections,
+          event.collapsible_blocks,
+          event.validation?.debug_sections,
+          event.validation?.collapsible_blocks
+        )
+
+        const validationRuntime = extractRuntimeCode(event.validation || event)
+        if (validationRuntime && !runtimeCode.value) {
+          runtimeCode.value = validationRuntime
         }
       }
 
@@ -1020,19 +2058,25 @@ function generateAdapter() {
         finalResult = event
         applyAuthorResult(event)
 
-        if (event.adapter_code) {
-          receivedCode = true
+        const finalRuntime = extractRuntimeCode(event)
+        if (finalRuntime) {
+          runtimeCode.value = finalRuntime
         }
       }
     }
 
-    if (adapterCode.value) {
+    const runtime = effectiveRuntimeCode.value
+
+    if (adapterCode.value || runtime) {
+      if (runtime) {
+        runtimeCode.value = runtime
+      }
+
       refreshEditableInternalCode()
       activeStep.value = 'adapter'
       return
     }
 
-    // 没生成代码时，不要跳到空白 Adapter 页面。
     if (finalResult?.needs_clarification || finalResult?.questions?.length || finalResult?.clarification_questions?.length) {
       statusMessage.value = '还需要补充信息，暂未生成代码。'
       activeStep.value = 'planner'
@@ -1051,13 +2095,14 @@ function generateAdapter() {
       return
     }
 
-    // 避免把用户原来手动改过的代码直接丢失。
-    adapterCode.value = previousCode || ''
-    if (adapterCode.value) {
+    adapterCode.value = previousDisplayCode || ''
+    runtimeCode.value = previousRuntimeCode || ''
+
+    if (adapterCode.value || runtimeCode.value) {
       refreshEditableInternalCode()
       activeStep.value = 'adapter'
     } else {
-      statusMessage.value = '后端未返回 adapter_code，请查看生成日志。'
+      statusMessage.value = '后端未返回可展示代码，请查看生成日志。'
       activeStep.value = 'planner'
     }
   })
@@ -1065,7 +2110,17 @@ function generateAdapter() {
 function cancelAuthoring() { if (streamController.value) { streamController.value.abort(); streamController.value = null; statusMessage.value = '已取消当前生成' } }
 function runLiveTest() {
   return run(async () => {
-    if (!configForm.base_url || (configForm.auth_type !== 'none' && !configForm.secret_env)) {
+    if (!configForm.base_url) {
+      authConfigOpen.value = true
+      return
+    }
+
+    if (configForm.auth_type === 'unknown') {
+      authConfigOpen.value = true
+      return
+    }
+
+    if (authTypeNeedsSecret(configForm.auth_type) && !configForm.secret_env) {
       authConfigOpen.value = true
       return
     }
@@ -1073,33 +2128,244 @@ function runLiveTest() {
     await performLiveTest({ saveFirst: true })
   })
 }
-function finalizeAuthoring() { return run(async () => { const data = await authorCreatorTool(authorPayload('finalize')); authorStage.value = 'finalize'; applyAuthorResult(data); if (data.snippet && parsedManifest.value) { const manifest = { ...parsedManifest.value, snippets: [data.snippet] }; manifestText.value = JSON.stringify(manifest, null, 2) } activeStep.value = data.snippet ? 'snippet' : 'validation' }) }
+function finalizeAuthoring() {
+  return run(async () => {
+    const runtime = effectiveRuntimeCode.value
+
+    if (!runtime) {
+      error.value = '当前没有完整运行代码，不能生成 snippet。'
+      activeStep.value = 'adapter'
+      return
+    }
+
+    const data = await authorCreatorTool({
+      ...authorPayload('finalize'),
+
+      action: 'finalize',
+      manifest: parsedManifest.value,
+      sample_input: parsedSample.value,
+
+      adapter_code: adapterCode.value,
+      display_code: adapterCode.value,
+      public_api_code: adapterCode.value,
+
+      runtime_code: runtime,
+      full_adapter_code: runtime,
+      internal_code: runtime,
+      script_code: runtime,
+
+      validation: lastValidation.value
+    })
+
+    authorStage.value = 'finalize'
+    applyAuthorResult(data)
+
+    if (data.snippet && parsedManifest.value) {
+      const manifest = {
+        ...parsedManifest.value,
+        snippets: [data.snippet]
+      }
+      manifestText.value = JSON.stringify(manifest, null, 2)
+    }
+
+    activeStep.value = data.snippet ? 'snippet' : 'validation'
+  })
+}
 function generateCode() { return run(async () => { const data = await generateCreatorToolCode({ manifest: parsedManifest.value }); adapterCode.value = data.adapter_code; activeStep.value = 'adapter' }) }
+function normalizeCodeForCompare(code = '') {
+  return String(code || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .trim()
+}
+
+function reviseWithFeedback() {
+  return run(async () => {
+    if (!humanFeedbackText.value.trim()) {
+      error.value = '请先填写人工反馈。'
+      return
+    }
+
+    if (!looksLikeFullRuntime(runtimeCode.value)) {
+      error.value = '当前 runtimeCode 为空或不包含 def run(...)。这是生成阶段协议断了，不应该进入反馈修改。请重新生成实现或检查后端 generate 是否返回 runtime_code。'
+      activeStep.value = 'adapter'
+      return
+    }
+
+    reviseRunning.value = true
+    statusMessage.value = '正在根据反馈修改代码...'
+
+    try {
+      const feedback = humanFeedbackText.value
+      const previousDisplay = adapterCode.value
+      const previousRuntime = runtimeCode.value
+      const previousValidation = lastValidation.value
+
+      const data = await authorCreatorTool({
+        ...authorPayload('revise'),
+
+        action: 'revise',
+
+        adapter_code: previousDisplay,
+        display_code: previousDisplay,
+        public_api_code: previousDisplay,
+
+        runtime_code: previousRuntime,
+        full_adapter_code: previousRuntime,
+        internal_code: previousRuntime,
+        script_code: previousRuntime,
+
+        manifest: parsedManifest.value,
+        sample_input: parsedSample.value,
+        validation: previousValidation,
+
+        human_feedback: feedback,
+        review_feedback: feedback,
+        feedback
+      })
+
+      revisionHistory.value.unshift({
+        time: new Date().toISOString(),
+        feedback,
+        validation: previousValidation,
+        result: data
+      })
+
+      const nextRuntime = extractRuntimeCode(data)
+      const nextDisplay = extractDisplayCode(data)
+
+      if (!nextRuntime) {
+        runtimeCode.value = previousRuntime
+        adapterCode.value = previousDisplay
+        lastValidation.value = data.validation || previousValidation
+
+        error.value =
+          data.validation?.errors?.join('；') ||
+          data.warnings?.join('；') ||
+          '后端 revise 没有返回有效 runtime_code，这是后端 revise 协议问题。'
+
+        statusMessage.value = '反馈修改失败，已保留上一版代码。'
+        activeStep.value = 'validation'
+        return
+      }
+
+      runtimeCode.value = nextRuntime
+
+      if (nextDisplay) {
+        adapterCode.value = nextDisplay
+      }
+
+      if (data.validation) {
+        lastValidation.value = data.validation
+      }
+
+      if (data.snippet) {
+        snippetText.value = JSON.stringify(data.snippet, null, 2)
+      }
+
+      humanFeedbackText.value = ''
+      statusMessage.value = '已根据反馈修改代码。'
+      activeStep.value = 'adapter'
+      nextTick(refreshEditableInternalCode)
+    } finally {
+      reviseRunning.value = false
+    }
+  })
+}
+
 function validateTool() {
   return run(async () => {
+    const runtime = effectiveRuntimeCode.value
+
+    if (!runtime) {
+      error.value = '当前没有完整运行代码，请先生成或返回 Adapter 检查完整内部实现代码。'
+      activeStep.value = 'adapter'
+      return
+    }
+
     lastValidation.value = await validateCreatorTool({
       manifest: parsedManifest.value,
-      adapter_code: adapterCode.value,
+
+      adapter_code: runtime,
+      runtime_code: runtime,
+      full_adapter_code: runtime,
+      internal_code: runtime,
+      script_code: runtime,
+
+      display_code: adapterCode.value,
+      public_api_code: adapterCode.value,
+
       sample_input: parsedSample.value,
       dynamic: true,
       allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
       real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success)
     })
+
+    debugSections.value = mergeDebugSections(
+      debugSections.value,
+      lastValidation.value?.debug_sections,
+      lastValidation.value?.collapsible_blocks,
+      lastValidation.value?.dynamic_trial?.debug_sections,
+      lastValidation.value?.dynamic_trial?.collapsible_blocks
+    )
+
     activeStep.value = 'validation'
   })
 }
-function buildFinalManifestForRegister() { const manifest = { ...(parsedManifest.value || {}) }; const snippet = parseJsonText(snippetText.value); if (snippet && Object.keys(snippet).length) manifest.snippets = [snippet]; return manifest }
+
+function buildFinalManifestForRegister() {
+  const manifest = { ...(parsedManifest.value || {}) }
+
+  const snippet = parseJsonText(snippetText.value)
+  if (snippet && Object.keys(snippet).length) {
+    manifest.snippets = [snippet]
+  }
+
+  if (planState.value?.auth_decision) {
+    manifest.auth_decision = planState.value.auth_decision
+  }
+
+  manifest.auth_gate = authGate.value
+  manifest.auth_override = manualAuthOverridePayload()
+
+  return manifest
+}
 function registerTool() {
   return run(async () => {
+    const runtime = effectiveRuntimeCode.value
+
+    if (!canRegister.value) {
+      error.value = authGate.value.reasons?.length
+        ? authGate.value.reasons.join('；')
+        : '当前工具还未通过认证/配置 gate，不能注册。'
+      return
+    }
+
+    if (!runtime) {
+      error.value = '当前没有完整运行代码，不能注册。'
+      activeStep.value = 'adapter'
+      return
+    }
+
     await registerCreatorTool({
       manifest: buildFinalManifestForRegister(),
-      adapter_code: adapterCode.value,
+
+      adapter_code: runtime,
+      runtime_code: runtime,
+      full_adapter_code: runtime,
+      internal_code: runtime,
+      script_code: runtime,
+
+      display_code: adapterCode.value,
+      public_api_code: adapterCode.value,
+
       sample_input: parsedSample.value,
       dynamic: true,
       allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
       real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
       enable: true
     })
+
     await loadTools()
     registryDrawerOpen.value = true
   })
@@ -1266,6 +2532,23 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
   display: none;
 }
 
+.manual-auth-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.manual-auth-panel.manual-active {
+  border-color: var(--accent);
+}
+
+.manual-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
 .adapter-fixed-block summary::before {
   content: '▶';
   color: var(--text-muted);
@@ -1291,6 +2574,44 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text-muted
 .adapter-fixed-code {
   margin: 0 12px 12px;
   max-height: 320px;
+}
+
+.manual-auth-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.manual-auth-panel.manual-active {
+  border-color: var(--accent);
+}
+
+.debug-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.adapter-edit-layout .collapsible-panel {
+  width: 100%;
+}
+
+.manual-auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.feedback-pane {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.revision-history {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 small { display: block; color: var(--text-muted); } .green { color: var(--success); }
 @media (max-width: 1100px) { .drawer-snippet-layout { grid-template-columns: 1fr; } }

@@ -2064,6 +2064,23 @@ def _build_script_file_contract_text(
     else:
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
 
+    try:
+        workflow_commands = _extract_e2e_workflow_commands(blueprint_text or "")
+        script_commands = [cmd for cmd in workflow_commands if cmd.script_path == file_path]
+        is_last_workflow_step = bool(script_commands and workflow_commands and script_commands[-1].ordinal == workflow_commands[-1].ordinal)
+    except Exception:
+        is_last_workflow_step = False
+
+    if is_last_workflow_step:
+        lines.append(
+            "- 这是 SKILL.md workflow 的最后一步：stdout JSON 必须至少包含一个 sandbox 平台最终字段："
+            "text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。"
+        )
+        lines.append(
+            "- 可以同时保留业务内部字段，例如 {\"time_output\": \"12:00:00\", \"text\": \"当前时间：12:00:00\"}；"
+            "中间步骤不强制平台字段，只要下一步 placeholder 可解析。"
+        )
+
     lines.append("D. 能力边界:")
     lines.append("- required_capabilities / forbidden_capabilities 只声明能力边界；helper_required 能力必须使用平台 helper，其余能力可优先使用推荐 helper或自实现。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
@@ -2192,99 +2209,54 @@ def _reference_metadata_contract_checks(
     content: str,
     purpose: str = "",
 ) -> list[ContractCheckResult]:
+    """Light metadata checks for references.
+
+    Frontmatter is optional. If present, only reject fields that conflict with
+    the file's identity/resource role; do not require a rich metadata schema.
+    """
     meta, body = _reference_frontmatter_metadata(content)
+    results: list[ContractCheckResult] = []
 
-    required_keys = [
-        "name",
-        "description",
-        "role",
-        "type",
-        "path",
-        "scope",
-        "loading",
-        "when_to_use",
-    ]
+    if meta:
+        path_value = meta.get("path")
+        if path_value not in (None, ""):
+            results.append(ContractCheckResult(
+                id="reference.metadata.path_matches",
+                passed=path_value == file_path,
+                target=file_path,
+                message=(
+                    "reference metadata.path 与文件路径不冲突。"
+                    if path_value == file_path
+                    else f"reference metadata.path={path_value!r} 与文件路径 {file_path!r} 冲突。"
+                ),
+                expected=f"如声明 metadata.path，则必须等于 {file_path}；也可以删除该字段。",
+                minimal_edit=f"把 metadata.path 改为 {file_path}，或删除 path 字段。",
+            ))
 
-    missing = [
-        key for key in required_keys
-        if key not in meta or meta.get(key) in (None, "", [], {})
-    ]
-
-    results: list[ContractCheckResult] = [
-        ContractCheckResult(
-            id="reference.metadata.frontmatter_exists",
-            passed=bool(meta),
-            target=file_path,
-            message=(
-                "reference 包含 YAML frontmatter metadata。"
-                if meta
-                else f"{file_path} 缺少 YAML frontmatter metadata。"
-            ),
-            expected="reference 文件必须以 YAML frontmatter 开始：--- / name, description, role, type, path, scope, loading, when_to_use / ---。",
-            minimal_edit="在文件开头补充 YAML frontmatter metadata。",
-        ),
-        ContractCheckResult(
-            id="reference.metadata.required_keys",
-            passed=not missing,
-            target=file_path,
-            message=(
-                "reference metadata 必需字段齐全。"
-                if not missing
-                else f"{file_path} metadata 缺少字段：{', '.join(missing)}。"
-            ),
-            expected="metadata 至少包含 name/description/role/type/path/scope/loading/when_to_use。",
-            minimal_edit="补齐缺失 metadata 字段，正文保持不变。",
-        ),
-        ContractCheckResult(
-            id="reference.metadata.path_matches",
-            passed=meta.get("path") == file_path,
-            target=file_path,
-            message=(
-                "reference metadata.path 与文件路径一致。"
-                if meta.get("path") == file_path
-                else f"reference metadata.path={meta.get('path')!r} 与文件路径 {file_path!r} 不一致。"
-            ),
-            expected=f"metadata.path 必须等于 {file_path}",
-            minimal_edit=f"把 metadata.path 改为 {file_path}",
-        ),
-        ContractCheckResult(
+        role_value = meta.get("role")
+        type_value = meta.get("type")
+        role_type_ok = role_value in (None, "", "reference") and type_value in (None, "", "reference")
+        results.append(ContractCheckResult(
             id="reference.metadata.role_type",
-            passed=meta.get("role") == "reference" and meta.get("type") == "reference",
+            passed=role_type_ok,
             target=file_path,
             message=(
-                "reference metadata role/type 合法。"
-                if meta.get("role") == "reference" and meta.get("type") == "reference"
-                else "reference metadata.role/type 必须都是 reference。"
+                "reference metadata role/type 不冲突。"
+                if role_type_ok
+                else "reference metadata.role/type 与 reference 定位冲突。"
             ),
-            expected="role: reference 且 type: reference。",
-            minimal_edit="把 role/type 改为 reference。",
-        ),
-        ContractCheckResult(
-            id="reference.metadata.loading_strategy",
-            passed=meta.get("loading") == "metadata-first-body-on-demand",
-            target=file_path,
-            message=(
-                "reference metadata 声明 metadata-first 按需正文加载。"
-                if meta.get("loading") == "metadata-first-body-on-demand"
-                else "reference metadata.loading 缺少按需加载策略。"
-            ),
-            expected="loading: metadata-first-body-on-demand。",
-            minimal_edit="补充 loading: metadata-first-body-on-demand。",
-        ),
-        ContractCheckResult(
-            id="reference.metadata.body_exists",
-            passed=bool(body.strip()),
-            target=file_path,
-            message=(
-                "reference metadata 后存在正文。"
-                if body.strip()
-                else "reference 只有 metadata，没有正文。"
-            ),
-            expected="frontmatter 后必须有 Markdown 正文。",
-            minimal_edit="在 frontmatter 后补充 reference 正文。",
-        ),
-    ]
+            expected="如声明 role/type，只能为 reference；也可以删除这些字段。",
+            minimal_edit="把 role/type 改为 reference，或删除冲突字段。",
+        ))
 
+    results.append(ContractCheckResult(
+        id="reference.metadata.body_exists",
+        passed=bool(body.strip()),
+        target=file_path,
+        message=("reference 存在 Markdown 正文。" if body.strip() else "reference 正文为空。"),
+        expected="reference 作为辅助上下文必须有非空 Markdown 正文。",
+        minimal_edit="补充 reference 正文。",
+    ))
     return results
 
 def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
@@ -2448,59 +2420,9 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         ),
     ])
 
-    min_chars = 120
-    has_min_length = len(stripped) >= min_chars
-    results.append(ContractCheckResult(
-        id="reference.min_quality_length",
-        passed=has_min_length,
-        target=file_path,
-        message=(
-            "参考资料正文长度满足最低质量要求。"
-            if has_min_length
-            else f"{file_path} 正文过短，无法作为子任务参考资料。"
-        ),
-        expected=f"frontmatter 后正文至少 {min_chars} 个字符，包含任务规则、示例和约束。",
-        minimal_edit="扩充 reference 正文，加入规范、示例、反例和质量标准。",
-    ))
-
-    required_sections = {
-        "rules": bool(re.search(r"(?im)^#{1,3}.*(规范|规则|步骤|流程|要求|Rules|Steps)", stripped)),
-        "examples": bool(re.search(r"(?im)^#{1,3}.*(示例|例子|Examples?)", stripped)),
-        "anti_examples": bool(re.search(r"(?im)^#{1,3}.*(反例|错误示例|Anti[- ]?examples?)", stripped)),
-        "constraints": bool(re.search(r"(?im)^#{1,3}.*(约束|限制|禁止|Constraints?)", stripped)),
-    }
-    sections_ok = all(required_sections.values())
-    missing_sections = [name for name, present in required_sections.items() if not present]
-    results.append(ContractCheckResult(
-        id="reference.required_sections",
-        passed=sections_ok,
-        target=file_path,
-        message=(
-            "参考资料正文包含规范/示例/反例/约束章节。"
-            if sections_ok
-            else f"{file_path} 正文缺少必要章节：{', '.join(missing_sections)}。"
-        ),
-        expected="正文包含规范/步骤、示例、反例、约束/禁止项章节。",
-        minimal_edit="在正文补齐 Markdown 标题章节：## 规范、## 示例、## 反例、## 约束。",
-    ))
-
-    role_sections = {
-        "io": bool(re.search(r"(?im)^#{1,3}.*(输入|输出|Inputs?|Outputs?)", stripped)),
-        "quality": bool(re.search(r"(?im)^#{1,3}.*(质量|验收|检查|Quality|Acceptance)", stripped)),
-    }
-    missing_role_sections = [name for name, present in role_sections.items() if not present]
-    results.append(ContractCheckResult(
-        id="reference.role_sections",
-        passed=not missing_role_sections,
-        target=file_path,
-        message=(
-            "参考资料正文包含输入输出/质量验收章节。"
-            if not missing_role_sections
-            else f"{file_path} 正文缺少角色相关章节：{', '.join(missing_role_sections)}。"
-        ),
-        expected="正文应包含输入/输出说明和质量/验收标准。",
-        minimal_edit="补充 ## 输入输出 和 ## 质量验收 章节。",
-    ))
+    # references/*.md are auxiliary context, not executable contracts.
+    # Keep validation intentionally light: readable non-empty Markdown plus
+    # safety checks below, but no fixed section/metadata richness requirements.
 
     # references may mention scripts/** in prose, but should not preserve executable shell blocks.
     executable_reference_blocks: list[str] = []
@@ -3568,14 +3490,8 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
     effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry) if plan_entry else []
     if plan_entry and plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"} and not ({"text_generation", "image_generation"} & set(effective_required_capabilities)):
         return
-    skill_md_declares_model = bool(re.search(r"宿主|内置|配置模型|LLM|大语言|文本模型|图像模型|vision|TEXT_MODEL|IMAGE_MODEL", skill_md or "", re.IGNORECASE))
     if not _requires_configured_model_call(plan_entry=plan_entry):
-        # Keep backward compatibility for legacy generic scripts whose SKILL.md
-        # has no local SkillPlan block but clearly says the script is model-backed.
-        # Deterministic builders/exporters returned above, so global model prose
-        # still cannot force build_pdf.py to call LLM/IMAGE_MODEL.
-        if not (plan_entry and plan_entry.role == "generic_script" and skill_md_declares_model):
-            return
+        return
     if _script_uses_configured_model(content):
         return
     raise ValueError(
@@ -4408,6 +4324,45 @@ def _trial_run_generated_script(
                 skill_plan_entry=skill_plan_entry,
             )
 
+
+
+def _e2e_layer_from_errors(errors: list[str]) -> str:
+    for error in errors or []:
+        match = re.search(r"^E2E_LAYER=([^\n]+)", str(error), re.M)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _targeted_e2e_repair_hint(errors: list[str]) -> str:
+    layer = _e2e_layer_from_errors(errors)
+
+    if layer == "final_platform_output_contract":
+        return (
+            "当前失败只属于最终平台输出字段不对齐。"
+            "不要修改 SKILL.md，不要新增模型调用，不要改变已有业务字段。"
+            "请在最后一步脚本 stdout JSON 中增加一个合法平台字段："
+            "纯文本结果使用 text，Markdown 使用 markdown，图片使用 image_paths，"
+            "PDF/DOCX/PPTX/HTML 文件分别使用 pdf_path/docx_path/pptx_path/html_path。"
+            "如果现有 stdout 只有一个非空字符串字段，则保留它，并把相同内容映射到 text。"
+        )
+
+    if layer == "final_platform_output_value_invalid":
+        return (
+            "当前失败属于最终平台字段值类型不合法。"
+            "请保持字段名不变，但修正值类型："
+            "text/markdown/pdf_path/docx_path/pptx_path/html_path 必须是非空字符串；"
+            "image_paths/file_paths/file_outputs 必须是非空字符串列表。"
+        )
+
+    if layer in {"external_input_missing", "e2e_dataflow_missing"}:
+        return (
+            "当前失败属于命令占位符无法从 payload 或前序 stdout 解析。"
+            "优先修 SKILL.md 当前失败步骤的 JSON argv placeholder，"
+            "不要改已成功 trace 对应步骤。"
+        )
+
+    return ""
 
 
 def _failure_layer_from_error_text(error_text: str) -> str | None:
@@ -7755,6 +7710,7 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
+    targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
 
     e2e_tool_cards = ""
     if target_path.startswith("scripts/"):
@@ -7848,6 +7804,7 @@ async def _repair_existing_file_for_e2e_failure(
                 f"Skill 名称：{skill_name}\n"
                 f"当前需要修复的文件：{target_path}\n\n"
                 f"{target_rule}\n\n"
+                f"定向 E2E 修复提示：{targeted_e2e_hint or '无'}\n\n"
                 "端到端失败信息：\n"
                 f"{deterministic_error}\n\n"
                 "当前 SKILL.md：\n"
@@ -7881,8 +7838,11 @@ async def _repair_existing_file_for_e2e_failure(
     elif target_path.startswith("assets/"):
         _validate_asset_file_contract(target_path, sanitized)
     elif target_path.startswith("scripts/"):
-        _validate_script_against_existing_skill_contract(skill_name, target_path, sanitized)
-        _trial_run_generated_script(skill_name, target_path, sanitized)
+        _validate_e2e_script_static_preflight(
+            file_path=target_path,
+            content=sanitized,
+            skill_md=skill_md,
+        )
 
     target_file.parent.mkdir(parents=True, exist_ok=True)
     target_file.write_text(sanitized, encoding="utf-8")

@@ -627,14 +627,6 @@ def build_skill_plan_entry(
     allowed_capabilities = explicit_allowed_capabilities or []
     forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
     forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
-    if role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder"}:
-        # Document exporters are optional by default so text/image generation can
-        # be run on demand without forcing export.  An explicit blueprint/UI
-        # required=true still overrides this default by passing required=True
-        # with purpose text that says the user requested one-step export.
-        if not re.search(r"一步|一次性|直接导出|必须导出|必需导出|one[- ]?step|single[- ]?step|required", purpose or "", re.I):
-            required = False
-            can_skip = True
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language

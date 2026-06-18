@@ -244,8 +244,6 @@ def _script_path_has_concrete_contract(path: str, blueprint_text: str, purpose: 
     as `scripts/foo.py` entering the generation queue.
     """
     text = blueprint_text or ""
-    purpose_text = purpose or ""
-
     # Strong evidence: the path appears near explicit contract fields.
     for occurrence in re.finditer(re.escape(path), text):
         start = max(0, occurrence.start() - 500)
@@ -257,21 +255,6 @@ def _script_path_has_concrete_contract(path: str, blueprint_text: str, purpose: 
             re.IGNORECASE,
         ):
             return True
-        if re.search(
-            r"(职责|输入|输出|依赖|能力|调用|生成|构建|读取|写入)\s*[：:=]",
-            nearby,
-            re.IGNORECASE,
-        ):
-            return True
-
-    # Purpose from parsed section is concrete enough.
-    if re.search(
-        r"(生成|构建|读取|写入|合并|导出|调用|模型|图片|图像|PDF|文档|故事|文本|报告|role|inputs|outputs|capabilities)",
-        purpose_text,
-        re.IGNORECASE,
-    ):
-        return True
-
     # A real command line with JSON argv is concrete evidence.
     if re.search(
         rf"(?:python|python3|node|bash|sh)\s+{re.escape(path)}\s+['\"]?\{{",

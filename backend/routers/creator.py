@@ -2099,18 +2099,14 @@ def _build_script_file_contract_text(
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 generate_stable_diffusion_image helper，但不强制实现方式。")
     elif entry.role == "pdf_builder":
         lines.append(
-            "- stdout JSON 必须返回真实存在的 PDF 文件路径；禁止调用图片 helper；字段名由 workflow 决定。"
-            "本系统面向中文/UTF-8 场景，PDF builder 必须支持中文正文。"
-            "推荐 reportlab + UnicodeCIDFont('STSong-Light')，或 reportlab + TTFont，或 fpdf2 + add_font 加载 TTF/OTF。"
-            "禁止 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本；"
-            "禁止只写 canvas.setFont('STSong-Light') 但不先 registerFont(UnicodeCIDFont('STSong-Light'))；"
-            "禁止 raw %PDF 字符串拼接、空 PDF、假路径。"
+            "- stdout JSON 必须返回真实存在的文件产物路径；禁止调用未显式声明的模型/helper；字段名由 workflow 决定。"
+            "具体库、字体、编码和实现建议只能来自 Tool Registry snippets/function cards 或 reference guidance，不在 Creator 后台合同中硬编码。"
         )
     else:
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
 
     try:
-        workflow_commands = _extract_e2e_workflow_commands(blueprint_text or "")
+        workflow_commands = _extract_e2e_workflow_commands(Path("."), blueprint_text or "")
         script_commands = [cmd for cmd in workflow_commands if cmd.script_path == file_path]
         is_last_workflow_step = bool(script_commands and workflow_commands and script_commands[-1].ordinal == workflow_commands[-1].ordinal)
     except Exception:
@@ -2235,8 +2231,6 @@ def _ensure_reference_metadata_frontmatter(
     merged["loading"] = "metadata-first-body-on-demand"
 
     body = body.strip()
-    if not body:
-        body = "# 参考资料\n\n## 规范\n\n请根据蓝图补充任务规范。\n"
 
     yaml_text = yaml.safe_dump(
         merged,
@@ -2815,33 +2809,17 @@ def _script_uses_registry_helpers(content: str, capability: str) -> bool:
 
 
 def _script_satisfies_required_capability(content: str, capability: str) -> bool:
-    capability = capability.lower()
-    if _script_uses_registry_helpers(content, capability):
-        return True
-    if capability == "text_generation":
-        return bool(re.search(r"generate_text_with_llm|LLM_BASE_URL|TEXT_MODEL|chat/completions|complete_chat_once|stream_chat", content, re.IGNORECASE))
-    if capability == "image_generation":
-        # Direct image API usage is rejected later with a more specific error
-        # (for example VISION_MODEL misuse).  Treat it as an attempted image
-        # capability here so the repair loop sees the precise role/API failure
-        # instead of a generic "missing required_capabilities" message.
-        return bool(_PLATFORM_IMAGE_HELPER_RE.search(content) or _DIRECT_IMAGE_API_RE.search(content))
-    if capability == "pdf_generation":
-        return bool(re.search(r"create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|reportlab|fpdf|PyPDF2|pypdf|PdfWriter|write_bytes\s*\(\s*b?[\']%PDF-", content, re.IGNORECASE))
-    if capability == "docx_generation":
-        return bool(re.search(r"Document\(|python-docx|word/document.xml|ZipFile\(|build_docx", content, re.IGNORECASE))
-    if capability == "pptx_generation":
-        return bool(re.search(r"Presentation\(|python-pptx|ppt/presentation.xml|ZipFile\(|build_pptx", content, re.IGNORECASE))
-    if capability in {"html_generation", "html_asset_generation"}:
-        return bool(re.search(r"write_text|open\s*\(|<html|<!DOCTYPE html|outputs|build_html", content, re.IGNORECASE))
-    if capability == "file_output":
-        return bool(re.search(r"write_text|write_bytes|open\s*\(|fs\.writeFile|pdf\.output|prs\.save|ZipFile\(|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx", content, re.IGNORECASE))
-    cap = get_tool_capability(capability)
-    if cap and cap.helper_imports:
-        return False
-    # Unknown capabilities stay permissive so older plans are not rejected.
-    return True
+    """Statically enforce only helper_required capabilities.
 
+    helper_preferred/self_implementation_allowed capabilities are validated by
+    trial run, E2E stdout, and artifact existence checks instead of source-code
+    implementation regexes.
+    """
+    capability = capability.lower()
+    cap = get_tool_capability(capability)
+    if cap and cap.usage_policy == "helper_required":
+        return _script_uses_registry_helpers(content, capability)
+    return True
 
 
 _ARTIFACT_OUTPUT_KEYS = {"pdf_path", "docx_path", "pptx_path", "html_path", "file_paths"}
@@ -2849,21 +2827,14 @@ _ARTIFACT_CAPABILITIES = {"pdf_generation", "docx_generation", "pptx_generation"
 
 
 def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], capabilities: list[str]) -> bool:
-    declared_artifacts = _ARTIFACT_OUTPUT_KEYS & set(outputs or [])
-    required_artifacts = _ARTIFACT_CAPABILITIES & set(capabilities or [])
-    if not declared_artifacts and not required_artifacts:
-        return True
-    has_writer = bool(re.search(
-        r"write_text|write_bytes|open\s*\([^)]*,\s*[rbu'\"]*w|pdf\.output|prs\.save|ZipFile\s*\(|shutil\.copy|Path\([^)]*\)\.write_|build_(?:pdf|docx|pptx|html)|create_pdf|build_pdf_report|images_to_pdf|merge_pdfs|create_docx|create_pptx",
-        content,
-        re.IGNORECASE,
-    ))
-    returns_only_paths = bool(re.search(
-        r"return\s*\{[^}]*['\"](?:pdf_path|docx_path|pptx_path|html_path|file_paths)['\"][^}]*\}",
-        content,
-        re.IGNORECASE | re.DOTALL,
-    )) and not has_writer
-    return has_writer and not returns_only_paths
+    """Do not infer artifact implementation from source regexes.
+
+    Static validation keeps syntax/interface/capability boundaries; actual file
+    creation is verified by trial run/E2E artifact checks.
+    """
+    return True
+
+
 
 _MODEL_CAPABILITIES = {"text_generation", "image_generation"}
 _DETERMINISTIC_BUILDER_ROLES = {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
@@ -2887,118 +2858,6 @@ def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> l
 
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
-
-def _pdf_unicode_strategy_status(content: str) -> tuple[bool, str]:
-    """Detect whether a PDF builder has a real Chinese/UTF-8 text strategy.
-
-    This check intentionally does not require one fixed code structure.
-    It accepts:
-    - reportlab + UnicodeCIDFont('STSong-Light') registration
-    - reportlab + TTFont registration
-    - fpdf/fpdf2 + add_font
-    It rejects:
-    - FPDF core fonts for payload text
-    - reportlab setFont('STSong-Light') without registerFont
-    - raw hand-written %PDF bytes
-    """
-    stripped = content or ""
-
-    uses_fpdf = bool(re.search(
-        r"\bFPDF\b|from\s+fpdf\s+import|import\s+fpdf",
-        stripped,
-        re.I,
-    ))
-    uses_fpdf_core_font = bool(re.search(
-        r"\.set_font\s*\(\s*['\"](?:Helvetica|Arial|Times|Courier|Symbol|ZapfDingbats)['\"]",
-        stripped,
-        re.I,
-    ))
-    uses_fpdf_add_font = bool(re.search(
-        r"\.add_font\s*\(",
-        stripped,
-        re.I,
-    ))
-
-    uses_reportlab = bool(re.search(
-        r"reportlab|canvas\.Canvas",
-        stripped,
-        re.I,
-    ))
-    uses_stsong = bool(re.search(
-        r"STSong-Light",
-        stripped,
-        re.I,
-    ))
-    imports_unicode_cid_font = bool(re.search(
-        r"UnicodeCIDFont|reportlab\.pdfbase\.cidfonts",
-        stripped,
-        re.I,
-    ))
-    registers_stsong_cid = bool(re.search(
-        r"pdfmetrics\.registerFont\s*\(\s*UnicodeCIDFont\s*\(\s*['\"]STSong-Light['\"]\s*\)\s*\)",
-        stripped,
-        re.I,
-    ))
-
-    uses_ttf_registration = bool(re.search(
-        r"pdfmetrics\.registerFont\s*\(\s*TTFont\s*\(|TTFont\s*\(",
-        stripped,
-        re.I,
-    ))
-
-    raw_pdf_bytes = bool(re.search(
-        r"write_bytes\s*\(\s*b?[\"']%PDF-|open\s*\([^)]*['\"]wb['\"][^)]*\).*%PDF-",
-        stripped,
-        re.I | re.S,
-    ))
-
-    if raw_pdf_bytes:
-        return (
-            False,
-            "脚本疑似手写 raw %PDF 字节。PDF builder 必须用真实 PDF 库生成可用 PDF，不能拼接占位 PDF。",
-        )
-
-    if uses_fpdf:
-        if uses_fpdf_add_font:
-            return (
-                True,
-                "使用 fpdf/fpdf2 且调用 add_font，具备 Unicode 字体加载策略。",
-            )
-        if uses_fpdf_core_font:
-            return (
-                False,
-                "使用 FPDF 默认核心字体 Helvetica/Arial/Times/Courier 写正文，中文会触发 latin-1 UnicodeEncodeError。",
-            )
-        return (
-            False,
-            "使用 fpdf/fpdf2 但没有发现 add_font；中文/UTF-8 PDF 必须加载 TTF/OTF 字体后再 set_font。",
-        )
-
-    if uses_reportlab:
-        if uses_stsong and registers_stsong_cid and imports_unicode_cid_font:
-            return (
-                True,
-                "使用 reportlab 并注册 UnicodeCIDFont('STSong-Light')，支持中文。",
-            )
-        if uses_ttf_registration:
-            return (
-                True,
-                "使用 reportlab 并注册 TTFont，具备 Unicode 字体策略。",
-            )
-        if uses_stsong and not registers_stsong_cid:
-            return (
-                False,
-                "使用了 STSong-Light，但没有先 pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))，运行时会 KeyError: 'STSong-Light'。",
-            )
-        return (
-            False,
-            "使用 reportlab 写 PDF，但没有发现 UnicodeCIDFont 或 TTFont 注册；中文正文可能无法显示或运行时报错。",
-        )
-
-    return (
-        False,
-        "未发现可靠 PDF 中文字体方案。推荐 reportlab + UnicodeCIDFont('STSong-Light')，或 reportlab + TTFont，或 fpdf2 + add_font。",
-    )
 
 def _check_script_file_contract(
     file_path: str,
@@ -3282,23 +3141,17 @@ def _check_script_file_contract(
             )
         )
 
-    writes_pdf = bool(
-        re.search(
-            r"\.pdf[\"']|pdf_path|FPDF|reportlab|PdfWriter|write_bytes\s*\(\s*b?[\"']%PDF-",
-            stripped,
-            re.IGNORECASE,
-        )
-    )
+    uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
     if "pdf_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_pdf_generation",
-                passed=not writes_pdf,
+                passed=not uses_pdf_helper,
                 target=file_path,
                 message=(
-                    "脚本未调用 forbidden_capabilities 中禁止的 pdf_generation。"
-                    if not writes_pdf
-                    else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 pdf_generation，但源码包含 PDF 生成/输出逻辑。"
+                    "脚本未调用 forbidden_capabilities 中禁止的 pdf_generation helper。"
+                    if not uses_pdf_helper
+                    else f"{file_path} 的 SkillPlan forbidden_capabilities 包含 pdf_generation，但源码调用了 PDF helper。"
                 ),
                 expected="只有 required_capabilities 包含 pdf_generation 且未被 forbidden_capabilities 禁止时，脚本才可构建 PDF。",
                 minimal_edit="蓝图和 SKILL.md 确定后不要修改能力声明；修当前脚本：若当前脚本禁止 PDF 能力则移除 PDF 生成逻辑。",
@@ -3387,27 +3240,17 @@ def _check_script_file_contract(
             )
         )
 
-    pdf_outputs_declared = bool({"pdf_path", "file_paths"} & set(plan_entry.outputs or []))
-    pdf_required = "pdf_generation" in set(effective_required_capabilities)
-    is_pdf_builder = plan_entry.role == "pdf_builder" or pdf_outputs_declared or pdf_required
-
-    if is_pdf_builder:
-        uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
+    artifact_required = bool(_ARTIFACT_CAPABILITIES & set(effective_required_capabilities))
+    artifact_outputs_declared = bool(_ARTIFACT_OUTPUT_KEYS & set(plan_entry.outputs or []))
+    if artifact_required or artifact_outputs_declared:
         results.append(
             ContractCheckResult(
-                id="tool_usage_contract.pdf_helper_preferred",
+                id="tool_usage_contract.artifact_output_e2e",
                 passed=True,
                 target=file_path,
-                message=(
-                    "pdf_builder 已调用工具注册表允许的 PDF helper。"
-                    if uses_pdf_helper
-                    else f"{file_path} 是 pdf_builder 或声明 pdf_generation；PDF helper 为推荐项，允许自实现，最终由 E2E 校验产物。"
-                ),
-                expected="PDF builder 可优先调用 create_pdf/build_pdf_report/images_to_pdf/merge_pdfs；也可自实现，最终 PDF 产物与 stdout 字段必须通过 E2E。",
-                minimal_edit=(
-                    "若使用 helper，可 from backend.services.skill_runtime import create_pdf 或 build_pdf_report；"
-                    "若自实现，确保 stdout 返回真实存在的 pdf_path/file_paths/file_outputs。"
-                ),
+                message=f"{file_path} 的文件产物实现方式不由 Creator 后台源码正则判断；最终由试运行/E2E 校验真实产物与 stdout 字段。",
+                expected="文件产物脚本必须在运行时创建真实文件，并通过平台可消费字段返回路径。",
+                minimal_edit="保持 argv/stdout 协议，修复真实文件创建和路径返回；具体工具用法参考 Tool Registry snippets/function cards。",
             )
         )
 
@@ -3420,15 +3263,15 @@ def _check_script_file_contract(
         results.append(
             ContractCheckResult(
                 id="script.role.image_forbidden_pdf_only_outputs",
-                passed=not pdf_only and not writes_pdf,
+                passed=not pdf_only,
                 target=file_path,
                 message=(
                     "image_generator 未输出或生成 PDF-only 结果。"
-                    if not pdf_only and not writes_pdf
-                    else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出或 PDF 生成逻辑。"
+                    if not pdf_only
+                    else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出。"
                 ),
-                expected="image_generator 必须输出 image_paths，不得写 PDF 或只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
-                minimal_edit="返回 image_paths 并删除 PDF 写入逻辑；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
+                expected="image_generator 必须输出 image_paths，不得只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
+                minimal_edit="返回 image_paths；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
             )
         )
 
@@ -4015,23 +3858,8 @@ def _validate_script_against_existing_skill_contract(skill_name: str, file_path:
 
 
 def _sample_value_for_placeholder(key: str) -> str:
-    """Return realistic multilingual trial input.
-
-    Creator is primarily used in Chinese/UTF-8 scenarios.  Trial inputs must
-    include Chinese characters so PDF/FPDF/reportlab/font bugs are caught in the
-    first file-level validation round, instead of leaking to later E2E/runtime.
-    """
-    lowered = key.lower()
-
-    if any(token in lowered for token in ("prompt", "diffusion", "image", "picture", "photo", "scene")):
-        return "sample visual prompt for artifact generation"
-
-    if any(token in lowered for token in ("text", "content", "input", "query", "article", "story", "body", "summary")):
-        return "测试输入：包含中文、English words 和标点符号的正文，用于验证 UTF-8 与文件生成。"
-
-    if any(token in lowered for token in ("topic", "theme", "subject", "title", "name")):
-        return "中文主题：示例主题"
-    return f"sample {key}"
+    """Return a stable, generic multilingual trial value without field-name guessing."""
+    return "测试输入：包含中文、English words 和标点符号，用于验证 UTF-8 与真实执行。"
 
 
 def _render_trial_command_args(command: str, script_path: str) -> list[str] | None:
@@ -4066,26 +3894,8 @@ def _dedupe_trial_arg_sets(arg_sets: list[list[str]]) -> list[list[str]]:
 
 
 def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
-    """Add trial cases proving optional text can be omitted or empty."""
-    if len(args) != 1:
-        return []
-    try:
-        payload = json.loads(args[0])
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(payload, dict) or "text" not in payload:
-        return []
-
-    variants: list[list[str]] = []
-    without_text = dict(payload)
-    without_text.pop("text", None)
-    if without_text:
-        variants.append([json.dumps(without_text, ensure_ascii=False)])
-
-    empty_text = dict(payload)
-    empty_text["text"] = ""
-    variants.append([json.dumps(empty_text, ensure_ascii=False)])
-    return variants
+    """No field-name-specific trial variants; workflow/E2E validates payload flow."""
+    return []
 
 
 def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[list[str]]:
@@ -4097,9 +3907,12 @@ def _trial_args_for_script(skill_md: str, file_path: str, content: str) -> list[
             arg_sets.append(args)
     if not arg_sets and _script_reads_json_argv(content, runtime_for_language(language_for_path(file_path), file_type_for_path(file_path))):
         arg_sets = [[json.dumps({
-            "prompt": _sample_value_for_placeholder("prompt"),
-            "text": _sample_value_for_placeholder("text"),
-            "topic": _sample_value_for_placeholder("topic"),
+            "payload": {
+                "user_request": _sample_value_for_placeholder("payload"),
+                "fields": {},
+                "options": {},
+                "input_files": [],
+            }
         }, ensure_ascii=False)]]
     if not arg_sets:
         arg_sets = [[]]
@@ -4187,31 +4000,17 @@ def _validate_file_payload_shape(payload: dict[str, Any]) -> bool:
 
 
 
-_LEGACY_OUTPUT_ALIASES: dict[str, tuple[str, ...]] = {
-    "text": ("text_content", "story_text", "content"),
-    "image_paths": ("image_path", "images"),
-    "images": ("image_path", "image_paths"),
-    "pdf_path": ("file_path", "file_paths"),
-    "docx_path": ("file_path", "file_paths"),
-    "pptx_path": ("file_path", "file_paths"),
-    "html_path": ("file_path", "file_outputs"),
-    "file_paths": ("file_path", "pdf_path", "docx_path", "pptx_path"),
-}
+_LEGACY_OUTPUT_ALIASES: dict[str, tuple[str, ...]] = {}
 
 
 def _payload_has_declared_output(payload: dict[str, Any], output_key: str) -> bool:
-    if output_key in payload:
-        return True
-    return any(alias in payload for alias in _LEGACY_OUTPUT_ALIASES.get(output_key, ()))
+    """New Creator E2E requires exact declared output fields; no alias guessing."""
+    return output_key in payload
 
 
 def _payload_output_value(payload: dict[str, Any], output_key: str) -> Any:
-    if output_key in payload:
-        return payload.get(output_key)
-    for alias in _LEGACY_OUTPUT_ALIASES.get(output_key, ()):
-        if alias in payload:
-            return payload.get(alias)
-    return None
+    """Return exact declared output value only; aliases belong in migration/warnings."""
+    return payload.get(output_key) if output_key in payload else None
 
 def _json_value_non_empty(value: Any) -> bool:
     if value is None:
@@ -4260,8 +4059,8 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
 
     Creator trial runs execute generated scripts in a per-skill venv.  Scripts
     commonly import only ``backend.services.skill_runtime`` while the helper
-    itself lazy-imports packages such as reportlab/docx/pptx/pypdf.  Static
-    script import scanning cannot see those helper internals, so install the
+    itself lazy-imports optional runtime dependencies. Static script import
+    scanning cannot see those helper internals, so install the
     dependencies declared by the Creator tool registry before execution.
     """
     dependencies: list[str] = []
@@ -4708,44 +4507,6 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
         lower_error = error_text.lower()
 
         if (
-            "unicodeencodeerror" in lower_error
-            and "latin-1" in lower_error
-            and (
-                "fpdf" in lower_error
-                or "pdf.output" in lower_error
-                or "build_pdf" in lower_error
-                or file_path.endswith("build_pdf.py")
-            )
-        ):
-            return (
-                "这是 PDF 中文/UTF-8 编码根因错误，不是 stdout/ensure_ascii 问题。"
-                "当前失败来自 fpdf 默认核心字体（Helvetica/Arial/Times/Courier）只能写 latin-1，不能写中文。\n"
-                "必须修复真实 PDF 生成逻辑：\n"
-                "1. 禁止继续使用 FPDF 默认 Helvetica/Arial/Times/Courier 直接写 payload 文本；\n"
-                "2. 优先改用 reportlab.pdfgen.canvas，并注册 reportlab.pdfbase.cidfonts.UnicodeCIDFont('STSong-Light') 后 setFont('STSong-Light', size)；\n"
-                "3. 或使用 reportlab.pdfbase.ttfonts.TTFont / fpdf2 add_font 加载可用 TTF 字体后再写文本；\n"
-                "4. 保留 sys.argv[1] JSON 输入协议，继续读取现有 SkillPlan inputs，不要改 SKILL.md 或蓝图；\n"
-                "5. stdout 必须输出真实存在的 pdf_path/file_paths，且文件必须是合法 PDF；\n"
-                "6. 不允许通过 try/except 输出 {'error': ...}、{}、{'pdf_path': ''} 或空 file_paths 来绕过试运行；\n"
-                "7. 修复目标是让包含中文的 text/content 能成功写入 PDF。"
-            )
-
-        if (
-            "script.pdf_builder.unicode_text_supported" in error_text
-            or "latin-1 UnicodeEncodeError" in error_text
-            or "fpdf 默认核心字体" in error_text
-            or "PDF 构建脚本必须能处理中文" in error_text
-        ):
-            return (
-                "按 pdf_builder Unicode 合同修复："
-                "把 fpdf 默认字体方案替换为支持中文/UTF-8 的 PDF 方案。"
-                "推荐使用 reportlab + UnicodeCIDFont('STSong-Light')；"
-                "或 reportlab + TTFont；"
-                "或 fpdf2 + add_font 加载 TTF。"
-                "禁止只改 ensure_ascii、禁止吞异常输出 error/{}、禁止返回空 pdf_path。"
-            )
-
-        if (
             "stdout JSON 不得包含 error 字段" in error_text
             or "stdout JSON 至少需要一个非空字段" in error_text
             or "stdout={}" in error_text
@@ -4755,8 +4516,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             return (
                 "不要通过 try/except 输出 error、{}、空 pdf_path 或空 file_paths 来绕过试运行。"
                 "必须修复导致异常的真实代码路径，并输出真实存在的文件路径。"
-                "如果当前脚本是 PDF 构建脚本，重点检查是否仍在用 fpdf 默认 Helvetica/Arial/Times/Courier 写中文；"
-                "需要改为支持中文/UTF-8 的 PDF 生成方案。"
+                "如果当前脚本生成文件产物，请修复真实文件创建路径并返回平台可消费的文件字段。"
             )
 
         if "Markdown 代码块或多文件包" in error_text or "script.raw_source.single_file" in error_text:
@@ -4777,10 +4537,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的 SkillPlan role + 有效 required_capabilities 补齐真实能力边界：helper_required 能力必须调用对应平台 helper；image_generation/text_generation 可优先调用平台 helper，也可自实现；"
-                "pdf_builder/exporter 默认只需真实创建文件，并在 stdout JSON 任意业务字段中返回路径，不要因 SKILL.md 全局模型说明而补模型调用。"
-                "PDF 构建脚本必须支持中文/UTF-8 文本，禁止用 fpdf 默认核心字体写 payload 文本。"
-                "禁止返回固定 f-string/template-only 文本或 placeholder；蓝图和 SKILL.md 确定后只能修当前脚本。"
+                "按当前脚本的 SkillPlan role + 有效 required_capabilities 修复能力边界：helper_required 能力必须调用对应平台 helper；"
+                "helper_preferred/self_implementation_allowed 能力可自实现，最终由试运行/E2E stdout 和产物存在性校验。"
+                "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
 
         if "试运行" in error_text or "JSON 参数" in error_text or "合法 Python" in error_text:

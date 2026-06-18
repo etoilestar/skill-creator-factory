@@ -1505,3 +1505,27 @@ python scripts/write.py '{"topic":"{{topic}}"}'
 
     assert "skill_md.command_block.signature_parseable" not in failed
     assert "skill_md.command_block.json_argv_object" not in failed
+
+
+def test_validate_file_contract_entrypoint_uses_first_round_command_protocol():
+    from backend.routers.creator import validate_file_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: strict-command
+- scripts/: `scripts/write.py`
+  scripts/write.py role: text_generator inputs: topic outputs: text
+"""
+    skill_md = """---
+name: strict-command
+description: strict
+---
+# strict-command
+
+```bash
+python scripts/write.py --topic "{{topic}}"
+```
+"""
+    failed = {result.id for result in validate_file_contract(file_path="SKILL.md", content=skill_md, blueprint_text=blueprint) if not result.passed}
+
+    assert "skill_md.command_block.signature_parseable" in failed

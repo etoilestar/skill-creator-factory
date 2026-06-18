@@ -3493,6 +3493,15 @@ def validate_workflow_e2e(skill_name: str, *, external_context: dict[str, Any] |
     """Second-round Creator validator: execute SKILL.md workflow and check interfaces."""
     return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
 
+
+def _raise_file_contract_failures(results: list[ContractCheckResult]) -> None:
+    failed = [result for result in results if not result.passed]
+    if failed:
+        raise ContractValidationError(
+            "文件级合同校验未通过：\n" + _format_contract_checks(results, passed=False),
+            results,
+        )
+
 def _script_paths_in_shell_fenced_blocks(skill_md: str) -> set[str]:
     """Return scripts/*.py paths that appear inside shell fenced blocks."""
     paths: set[str] = set()
@@ -5751,6 +5760,15 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                 if request.file_path == "SKILL.md":
+                    # First round: file-level SKILL.md contract only. Cross-file
+                    # placeholder/dataflow closure is handled by validate_workflow_e2e().
+                    _raise_file_contract_failures(validate_file_contract(
+                        file_path=request.file_path,
+                        content=content,
+                        blueprint_text=request.blueprint_text,
+                        skill_plan_entry=request.skill_plan_entry,
+                    ))
+
                     # SKILL.md is generated before scripts/references are materialized.
                     # Validate against blueprint-declared plan, not disk existence.
                     _validate_skill_md_against_existing_files(
@@ -5769,13 +5787,21 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                 elif request.file_path.startswith("references/"):
-                    _validate_reference_file_contract(
-                        request.file_path,
-                        content,
-                        request.purpose or request.blueprint_text,
-                    )
+                    _raise_file_contract_failures(validate_file_contract(
+                        file_path=request.file_path,
+                        content=content,
+                        blueprint_text=request.blueprint_text,
+                        skill_plan_entry={**(request.skill_plan_entry or {}), "purpose": request.purpose or request.blueprint_text},
+                    ))
 
                 elif request.file_path.startswith("scripts/"):
+                    _raise_file_contract_failures(validate_file_contract(
+                        file_path=request.file_path,
+                        content=content,
+                        blueprint_text=request.blueprint_text,
+                        role=request.role,
+                        skill_plan_entry=request.skill_plan_entry,
+                    ))
                     _validate_script_against_existing_skill_contract(
                         skill_name,
                         request.file_path,
@@ -5977,6 +6003,15 @@ async def write_file(request: WriteFileRequest):
             )
 
         if request.file_path == "SKILL.md":
+            # First round: file-level SKILL.md contract only. Cross-file
+            # placeholder/dataflow closure is handled by validate_workflow_e2e().
+            _raise_file_contract_failures(validate_file_contract(
+                file_path=request.file_path,
+                content=content,
+                blueprint_text=request.blueprint_text or "",
+                skill_plan_entry=request.skill_plan_entry,
+            ))
+
             # write-file is still part of file-by-file creation.
             # scripts/references may not exist yet, so do not require disk existence.
             _validate_skill_md_against_existing_files(
@@ -5996,13 +6031,21 @@ async def write_file(request: WriteFileRequest):
                 )
 
         elif request.file_path.startswith("references/"):
-            _validate_reference_file_contract(
-                request.file_path,
-                content,
-                str(request.skill_plan_entry.get("purpose", "")) if request.skill_plan_entry else "",
-            )
+            _raise_file_contract_failures(validate_file_contract(
+                file_path=request.file_path,
+                content=content,
+                blueprint_text=request.blueprint_text or "",
+                skill_plan_entry=request.skill_plan_entry,
+            ))
 
         elif request.file_path.startswith("scripts/"):
+            _raise_file_contract_failures(validate_file_contract(
+                file_path=request.file_path,
+                content=content,
+                blueprint_text=request.blueprint_text or "",
+                role=request.role,
+                skill_plan_entry=request.skill_plan_entry,
+            ))
             _validate_script_against_existing_skill_contract(
                 skill_name,
                 request.file_path,
@@ -7575,7 +7618,7 @@ def _validate_skill_package_smoke(skill_name: str, *, mode: str = "trial", exter
     upstream stdout JSON is parsed and merged into payload, then used to render
     downstream JSON argv placeholders.
     """
-    return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+    return validate_workflow_e2e(skill_name, external_context=external_context)
 
 def _external_context_from_skill_action_request(request: SkillActionRequest) -> dict[str, Any]:
     return build_creator_external_input_context(
@@ -7612,7 +7655,7 @@ async def validate_skill(request: SkillActionRequest):
 
     while True:
         external_context = _external_context_from_skill_action_request(request)
-        e2e_errors = _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+        e2e_errors = validate_workflow_e2e(skill_name, external_context=external_context)
         if not e2e_errors:
             suffix = ""
             if repair_logs:

@@ -24,7 +24,7 @@ export async function analyzeBlueprintPlan(messages, model = null) {
   const resp = await fetch('/api/creator/analyze-blueprint', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, model }),
+    body: JSON.stringify({ messages, model, strict: true }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))

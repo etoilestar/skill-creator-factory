@@ -759,13 +759,15 @@ Phase 2 的任务是：
 
 【关键要求！】
 1. **必须先输出完整蓝图正文**，不要只输出确认问题。
-2. **蓝图格式必须严格按照 SKILL.md 中的模板**，包括：
-   - 必须包含 `## 📋 Skill 架构蓝图` 标记
-   - 必须明确列出 Skill 名称
-   - 必须包含 I/O 契约、目录结构、工作流逻辑
-   - 必须包含“宿主执行方式”，明确哪些任务直接回答，哪些任务需要输出标准 Markdown fenced block
-   - 如果涉及图像/多模态能力，必须明确使用宿主已配置模型，不要虚构 API 密钥、关键词数据库或占位图片脚本
-   - 如果涉及需要模型判断的开放式能力，优先设计为模型直接回答；若必须生成 scripts/，脚本必须区分模型来源：文本/语义使用 LLM_BASE_URL + TEXT_MODEL，看图理解使用 LLM_BASE_URL + VISION_MODEL，生成图片可使用 Stable Diffusion 图片运行时 IMAGE_BASE_URL + IMAGE_MODEL，并优先使用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`；确定性脚本必须实现真实算法，不得用固定模板/随机词表/ASCII 图冒充模型能力
+2. **蓝图格式必须严格遵守 Creator 平台硬协议**，包括：
+   - 标题必须逐字使用 `## 📋 Skill 架构蓝图`，不能替换为 ✅ 或其它标题。
+   - 必须包含 `### 目录结构`，列出 `SKILL.md`，并按需列出具体 `scripts/*`、`references/*`、`assets/*` 路径；不需要 references/assets 时也要写明“无需创建”。
+   - 必须包含 `### SkillPlan / 文件职责计划`，每个将创建的文件都必须有 `path`、`role`、`inputs`、`outputs`、`dependencies`、`required_capabilities`、`forbidden_capabilities`、`references`。
+   - `scripts/*` 的 role/capability 必须由你在 SkillPlan 中显式规划；Creator 后台不会根据业务词补 role/capability。
+   - `references/*.md` 是辅助资料文件，后续必须有 metadata + body，但 reference 正文不要变成第二套 SkillPlan。
+   - `assets/*` 只表示静态上传/预置素材；PDF、图片、docx、html 等运行时产物不能放入 assets 或 Creator 文件计划，只能通过脚本 stdout 平台字段表达。
+   - 必须包含 `### 宿主执行方式`，说明直接回答、需要脚本/命令、禁止隐式执行、执行后回答。需要脚本时，最终 SKILL.md 必须输出标准 ```bash fenced code block，命令直接调用 scripts/* 并传入 JSON object argv。
+   - 去词表化只针对业务判断；不能弱化蓝图 marker、目录结构、SkillPlan 文件计划、reference metadata/body、SKILL.md bash 执行块、stdout JSON、最终平台字段和 E2E 闭环这些平台协议。
 3. 完整蓝图之后，再输出一个 AskUserQuestion 确认问题。
 4. **AskUserQuestion 必须用 ```text 包裹**，严格按照模板格式
 5. **AskUserQuestion 选项必须使用以下三项原文**：

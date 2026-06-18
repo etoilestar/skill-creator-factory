@@ -32,7 +32,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..config import settings
-from ..services.blueprint_parser import BlueprintPlan, parse_blueprint
+from ..services.blueprint_parser import BlueprintPlan, BlueprintShapeError, parse_blueprint
 from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..services.llm_proxy import complete_chat_once, stream_chat
@@ -152,6 +152,7 @@ _LANG_LABELS: dict[str, str] = {
 class AnalyzeBlueprintRequest(BaseModel):
     messages: list[dict]
     model: Optional[str] = None
+    strict: bool = False
 
 class SkillMdBlueprintReviewRequest(BaseModel):
     skill_name: str
@@ -5348,7 +5349,10 @@ def _sse(data: dict) -> str:
 
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
-    plan: BlueprintPlan = parse_blueprint(request.messages)
+    try:
+        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
+    except BlueprintShapeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     entries_by_path = {entry.path: entry for entry in (plan.skill_plan.files if plan.skill_plan else [])}
 
     blueprint_text = "\n\n".join(

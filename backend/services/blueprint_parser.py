@@ -9,7 +9,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
+from .creator_tool_registry import get_tool_capability
+from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -24,6 +25,7 @@ class FileSpec:
     purpose: str       # human-readable description used as LLM prompt context
     required: bool = True
     can_skip: bool = False
+    asset_source: str = ""  # explicit platform source for assets: user_upload/bundled/none
 
 
 @dataclass
@@ -101,6 +103,198 @@ _SKIP_PHRASES: tuple[str, ...] = (
 # Maximum allowed length (chars) for a normalised Skill name.
 _MAX_SKILL_NAME_LENGTH = 64
 
+class BlueprintShapeError(ValueError):
+    """Raised when a confirmed Creator blueprint violates platform shape."""
+
+
+def _has_required_blueprint_marker(blueprint_text: str) -> bool:
+    return bool(re.search(r"(?m)^\s*##\s+📋\s*Skill\s+架构蓝图\s*$", blueprint_text or ""))
+
+
+def _section_exists(blueprint_text: str, title: str) -> bool:
+    return bool(re.search(rf"(?m)^\s*###\s+{re.escape(title)}\s*$", blueprint_text or ""))
+
+
+def _scalar_field_from_block(block: str, field: str) -> str:
+    match = re.search(rf"(?m)^\s*{re.escape(field)}\s*:\s*(.+?)\s*$", block or "")
+    if not match:
+        return ""
+    return match.group(1).strip().strip("`'\"，,。.;；")
+
+
+def _list_field_from_block(block: str, field: str) -> list[str]:
+    raw = _scalar_field_from_block(block, field)
+    if not raw:
+        return []
+    if raw.startswith("[") and "]" in raw:
+        raw = raw[1:raw.find("]")]
+    values: list[str] = []
+    for item in re.split(r"[,，、]\s*", raw):
+        value = item.strip().strip("`'\"，,。.;；")
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _normalized_asset_source_from_block(block: str) -> str:
+    source = _scalar_field_from_block(block, "source") or _scalar_field_from_block(block, "asset_source")
+    source = source.strip().lower().replace("-", "_")
+    aliases = {
+        "user_upload": "user_upload",
+        "upload": "user_upload",
+        "uploaded": "user_upload",
+        "bundled": "bundled",
+        "static": "bundled",
+        "none": "none",
+        "no_assets": "none",
+    }
+    return aliases.get(source, source)
+
+
+def _asset_block_mentions_runtime_artifact(block: str) -> bool:
+    return bool(re.search(r"运行时产物|运行时生成|脚本生成|最终产物|最终生成|runtime\s+artifact|generated\s+artifact", block or "", re.I))
+
+
+def _extract_skillplan_blocks(blueprint_text: str) -> dict[str, str]:
+    """Return SkillPlan YAML-ish blocks keyed by path without reading business text."""
+    blocks: dict[str, str] = {}
+    text = blueprint_text or ""
+    pattern = re.compile(r"(?ms)^\s*-\s*path\s*:\s*`?([^`\n]+)`?\s*\n(.*?)(?=^\s*-\s*path\s*:|^\s*###\s+|\Z)")
+    for match in pattern.finditer(text):
+        path = match.group(1).strip().strip("`'\"，,。.;；")
+        block = match.group(0)
+        if path:
+            blocks[path.replace("\\", "/")] = block
+    return blocks
+
+
+def _paths_declared_in_shape(blueprint_text: str) -> set[str]:
+    paths = {"SKILL.md"} if "SKILL.md" in (blueprint_text or "") else set()
+    for prefix in ("scripts", "references", "assets"):
+        paths.update(path for path in _extract_inline_paths(blueprint_text or "", prefix) if not _contains_path_wildcard(path))
+    for match in _TREE_FILE_RE.finditer(blueprint_text or ""):
+        tree_path = match.group(1).strip().strip("`'\"，,。.;；")
+        for prefix in ("scripts/", "references/", "assets/"):
+            idx = tree_path.find(prefix)
+            if idx >= 0:
+                candidate = tree_path[idx:]
+                if not _contains_path_wildcard(candidate):
+                    paths.add(candidate)
+                break
+    return {path.replace("\\", "/") for path in paths}
+
+
+def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
+    """Validate Creator platform blueprint shape, not business semantics.
+
+    This keeps strict product-package structure while avoiding role/capability
+    inference from business words.
+    """
+    text = blueprint_text or ""
+    issues: list[str] = []
+
+    if not _has_required_blueprint_marker(text):
+        if "✅ Skill 架构蓝图" in text or "Skill 架构蓝图" in text:
+            issues.append("蓝图 marker 必须是固定标题 `## 📋 Skill 架构蓝图`，不能替换为 ✅ 或其它标题。")
+        else:
+            issues.append("缺少固定蓝图标题 `## 📋 Skill 架构蓝图`。")
+
+    if not _section_exists(text, "目录结构"):
+        issues.append("缺少硬协议章节 `### 目录结构`。")
+    if "SKILL.md" not in text:
+        issues.append("目录结构必须列出 `SKILL.md`。")
+    if "references/" not in text and not re.search(r"references[^\n]*(无需创建|无需|不需要)|(?:无需创建|无需|不需要)[^\n]*references", text, re.I):
+        issues.append("目录结构必须列出具体 references/*，或明确写明 references/ 无需创建。")
+    if "assets/" not in text and not re.search(r"assets[^\n]*(无需创建|无需|不需要)|(?:无需创建|无需|不需要)[^\n]*assets", text, re.I):
+        issues.append("目录结构必须列出具体 assets/*，或明确写明 assets/ 无需创建。")
+    if not _section_exists(text, "SkillPlan / 文件职责计划"):
+        issues.append("缺少硬协议章节 `### SkillPlan / 文件职责计划`。")
+    if not _section_exists(text, "宿主执行方式"):
+        issues.append("缺少硬协议章节 `### 宿主执行方式`。")
+
+    path_blocks = _extract_skillplan_blocks(text)
+    if "SKILL.md" not in path_blocks:
+        issues.append("SkillPlan / 文件职责计划必须包含 `SKILL.md` 文件计划。")
+
+    declared_paths = _paths_declared_in_shape(text)
+    script_paths = {path for path in declared_paths if path.startswith("scripts/")}
+    reference_paths = {path for path in declared_paths if path.startswith("references/")}
+    asset_paths = {path for path in declared_paths if path.startswith("assets/")}
+
+    if re.search(r"(?m)^\s*-\s*scripts/\s*[：:]", text) and not script_paths and "无需" not in text:
+        issues.append("如需要 scripts/，目录结构或 SkillPlan 必须列出具体 `scripts/*.py` 路径。")
+
+    required_fields = [
+        "role",
+        "inputs",
+        "outputs",
+        "dependencies",
+        "required_capabilities",
+        "forbidden_capabilities",
+        "references",
+    ]
+    valid_roles = set(SCRIPT_ROLES) | set(RESOURCE_ROLES)
+    for path, block in path_blocks.items():
+        missing = [field for field in required_fields if not re.search(rf"(?m)^\s*{field}\s*:", block)]
+        if missing:
+            issues.append(f"{path} 文件计划缺少字段：{', '.join(missing)}。")
+
+        role = _scalar_field_from_block(block, "role")
+        if path.startswith("scripts/"):
+            if not role:
+                issues.append(f"scripts 文件计划 `{path}` 必须显式声明 role，strict 模式不能回退 generic_script。")
+            elif role not in SCRIPT_ROLES:
+                issues.append(f"scripts 文件计划 `{path}` 的 role `{role}` 不是平台注册 script role 枚举。")
+        elif path == "SKILL.md" and role and role != "skill_overview":
+            issues.append("SKILL.md role 必须是 skill_overview。")
+        elif path.startswith("references/") and role and role != "reference":
+            issues.append(f"reference 文件计划 `{path}` 的 role 必须是 reference。")
+        elif path.startswith("assets/") and role and role != "asset":
+            issues.append(f"asset 文件计划 `{path}` 的 role 必须是 asset。")
+        elif role and role not in valid_roles:
+            issues.append(f"{path} 的 role `{role}` 不是平台注册 role 枚举。")
+
+        required_caps = _list_field_from_block(block, "required_capabilities")
+        if required_caps and path.startswith("scripts/"):
+            allowed = ROLE_ALLOWED_CAPABILITIES.get(role, frozenset())
+            for capability in required_caps:
+                if get_tool_capability(capability) is None:
+                    issues.append(f"{path} required_capabilities 包含未注册 capability `{capability}`。")
+                elif capability not in allowed:
+                    issues.append(f"{path} role `{role}` 不允许 capability `{capability}`。")
+        elif required_caps and not path.startswith("scripts/"):
+            issues.append(f"资源文件 `{path}` 不能声明 runtime required_capabilities。")
+
+    for path in sorted(script_paths | reference_paths | asset_paths | {"SKILL.md"}):
+        if path not in path_blocks:
+            issues.append(f"目录结构声明了 `{path}`，但 SkillPlan / 文件职责计划缺少对应 path。")
+
+    for path in sorted(reference_paths):
+        block = path_blocks.get(path, "")
+        if block and not re.search(r"(?m)^\s*role\s*:\s*reference\s*$", block):
+            issues.append(f"reference 文件计划 `{path}` 的 role 必须是 reference。")
+
+    for path in sorted(asset_paths):
+        block = path_blocks.get(path, "")
+        source = _normalized_asset_source_from_block(block)
+        if source not in {"user_upload", "bundled"}:
+            issues.append(
+                f"asset 文件计划 `{path}` 必须显式声明 source=user_upload 或 source=bundled；"
+                "assets 只能是用户上传或预置静态资源。"
+            )
+        if _asset_block_mentions_runtime_artifact(block) or is_runtime_artifact_semantic(path, ""):
+            issues.append(
+                f"运行时产物 `{path}` 不能列入 assets/ 或 Creator 文件计划；"
+                "如为运行时生成文件，应放到脚本 outputs/stdout JSON；如需上传请声明 source=user_upload，内置静态资源声明 source=bundled。"
+            )
+
+    if script_paths and "```bash" not in text and "需要脚本/命令" not in text:
+        issues.append("需要脚本时，蓝图必须包含宿主执行方式说明，要求最终 SKILL.md 使用标准 ```bash fenced code block。")
+
+    if issues:
+        raise BlueprintShapeError("Creator 蓝图格式不符合平台硬协议：\n" + "\n".join(f"- {issue}" for issue in issues))
+
+
 # Valid extensions per directory
 _SCRIPT_EXTENSIONS: frozenset[str] = frozenset(
     {".py", ".js", ".ts", ".sh", ".bash", ".rb", ".mjs", ".cjs"}
@@ -129,8 +323,6 @@ def _script_path_has_concrete_contract(path: str, blueprint_text: str, purpose: 
     as `scripts/foo.py` entering the generation queue.
     """
     text = blueprint_text or ""
-    purpose_text = purpose or ""
-
     # Strong evidence: the path appears near explicit contract fields.
     for occurrence in re.finditer(re.escape(path), text):
         start = max(0, occurrence.start() - 500)
@@ -142,21 +334,6 @@ def _script_path_has_concrete_contract(path: str, blueprint_text: str, purpose: 
             re.IGNORECASE,
         ):
             return True
-        if re.search(
-            r"(职责|输入|输出|依赖|能力|调用|生成|构建|读取|写入)\s*[：:=]",
-            nearby,
-            re.IGNORECASE,
-        ):
-            return True
-
-    # Purpose from parsed section is concrete enough.
-    if re.search(
-        r"(生成|构建|读取|写入|合并|导出|调用|模型|图片|图像|PDF|文档|故事|文本|报告|role|inputs|outputs|capabilities)",
-        purpose_text,
-        re.IGNORECASE,
-    ):
-        return True
-
     # A real command line with JSON argv is concrete evidence.
     if re.search(
         rf"(?:python|python3|node|bash|sh)\s+{re.escape(path)}\s+['\"]?\{{",
@@ -287,6 +464,7 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
         *,
         required: bool = True,
         can_skip: bool = False,
+        asset_source: str = "",
     ) -> None:
         path = path.strip().replace("\\", "/").strip("`'\"，,。.;；")
         if not path:
@@ -308,7 +486,7 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
                 warnings.append(warning)
             return
 
-        if is_runtime_artifact_semantic(path, purpose):
+        if not (path.startswith("assets/") and asset_source in {"user_upload", "bundled"}) and is_runtime_artifact_semantic(path, purpose):
             warning = f"已忽略运行时产物文件计划项 {path}；脚本生成的结果只能声明在 outputs/stdout metadata 中，不能作为 Creator 待创建文件。"
             if warning not in warnings:
                 warnings.append(warning)
@@ -319,10 +497,32 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
 
         seen.add(path)
         files.append(
-            FileSpec(path=path, purpose=purpose, required=required, can_skip=can_skip)
+            FileSpec(path=path, purpose=purpose, required=required, can_skip=can_skip, asset_source=asset_source)
         )
 
-    # 1. SKILL.md is always required
+    # 1. SkillPlan / 文件职责计划 is the primary source of file contracts.
+    # Directory tree paths are only cross-check/display hints and must not
+    # overwrite explicit role/capability/input/output contracts.
+    path_blocks = _extract_skillplan_blocks(blueprint_text)
+    ordered_paths = sorted(
+        path_blocks,
+        key=lambda p: (
+            0 if p == "SKILL.md" else 1 if p.startswith("scripts/") else 2 if p.startswith("references/") else 3,
+            p,
+        ),
+    )
+    for path in ordered_paths:
+        source = _normalized_asset_source_from_block(path_blocks[path]) if path.startswith("assets/") else ""
+        _add(
+            path,
+            path_blocks[path],
+            required=not path.startswith(("references/", "assets/")) or source == "user_upload",
+            can_skip=path.startswith(("references/", "assets/")) and source != "user_upload",
+            asset_source=source,
+        )
+
+    # 1b. SKILL.md is always required for non-strict/legacy blueprints that do
+    # not yet contain an explicit SkillPlan file item.
     _add("SKILL.md", "Skill 核心说明文件，包含 YAML frontmatter 和执行规范")
 
     # ------------------------------------------------------------------
@@ -427,32 +627,9 @@ def parse_files_from_blueprint(blueprint_text: str) -> tuple[list[FileSpec], lis
     # ------------------------------------------------------------------
     # 9. assets/ section
     # ------------------------------------------------------------------
-    m_assets = _SECTION_ASSETS_RE.search(blueprint_text)
-    assets_desc = m_assets.group(1).strip() if m_assets else ""
-    if assets_desc and not _should_skip(assets_desc):
-        asset_files = _extract_inline_paths(blueprint_text, "assets")
-        for path in asset_files:
-            _add(path, assets_desc, required=False, can_skip=True)
-
-        for m_tree in _TREE_FILE_RE.finditer(blueprint_text):
-            tree_path = m_tree.group(1).strip().strip("`'\"，,。.;；")
-            for prefix in ("scripts/", "references/", "assets/"):
-                idx = tree_path.find(prefix)
-                if idx >= 0:
-                    tree_path = tree_path[idx:]
-                    break
-            if tree_path.startswith("assets/"):
-                _add(tree_path, assets_desc + "（从目录结构提取）", required=False, can_skip=True)
-
-        for m_bare in re.finditer(r"assets/(\S+\.\w+)", assets_desc):
-            _add("assets/" + m_bare.group(1), assets_desc, required=False, can_skip=True)
-
-        if not any(f.path.startswith("assets/") for f in files):
-            default_asset = "assets/template.md"
-            _add(default_asset, assets_desc, required=False, can_skip=True)
-            warnings.append(
-                f"模板/资源文件名未在蓝图中明确指定，已默认为 {default_asset}，请在面板中确认或修改。"
-            )
+    # Assets are parsed only from explicit SkillPlan file items with a platform
+    # source field. Directory tree mentions are display/cross-check hints and do
+    # not create upload requirements by themselves.
 
     return files, warnings
 
@@ -497,7 +674,7 @@ def build_skill_plan_from_files(
         for warning in skill_plan_field_declaration_warnings(
             file_path=file.path,
             purpose=file.purpose,
-            blueprint_summary=blueprint_text[:4000],
+            blueprint_summary=blueprint_text,
         ):
             if warning not in plan_warnings:
                 plan_warnings.append(warning)
@@ -508,7 +685,7 @@ def build_skill_plan_from_files(
             purpose=file.purpose,
             required=file.required,
             can_skip=file.can_skip,
-            blueprint_summary=blueprint_text[:4000],
+            blueprint_summary=blueprint_text,
             reference_files=refs_for_file,
         )
 
@@ -543,7 +720,7 @@ def build_skill_plan_from_files(
     return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues])
 
 
-def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
+def parse_blueprint(messages: list[dict], *, strict: bool = False) -> BlueprintPlan:
     """Parse a Skill blueprint from the conversation message history.
 
     Returns a BlueprintPlan with a best-effort file list and any warnings.
@@ -551,6 +728,11 @@ def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
     """
     blueprint_text = extract_blueprint_text(messages)
     if not blueprint_text:
+        if strict:
+            combined = "\n\n".join(str(message.get("content") or "") for message in messages if isinstance(message, dict))
+            if "✅ Skill 架构蓝图" in combined or "Skill 架构蓝图" in combined:
+                raise BlueprintShapeError("蓝图 marker 必须是固定标题 `## 📋 Skill 架构蓝图`，不能替换为 ✅ 或其它标题。")
+            raise BlueprintShapeError("未找到固定蓝图标题 `## 📋 Skill 架构蓝图`，确认创建阶段不能降级为最小 SKILL.md。")
         files = [FileSpec(path="SKILL.md", purpose="Skill 核心说明文件", required=True)]
         warnings = ["未在对话历史中找到蓝图，将创建最小 Skill 包（仅 SKILL.md）。"]
         return BlueprintPlan(
@@ -561,6 +743,9 @@ def parse_blueprint(messages: list[dict]) -> BlueprintPlan:
                 skill_name="new-skill", files=files, warnings=warnings, blueprint_text=""
             ),
         )
+
+    if strict:
+        validate_blueprint_shape_for_creator(blueprint_text)
 
     skill_name = parse_skill_name(blueprint_text)
     warnings: list[str] = []

@@ -1103,6 +1103,78 @@ def tool_snippet_prompt(snippets: list[dict[str, Any]]) -> str:
     return "当前脚本可用工具 Snippets：\n\n" + "\n\n---\n\n".join(str(item.get("formatted") or "") for item in snippets)
 
 
+
+
+def _as_list_attr(entry: Any, attr: str) -> list[str]:
+    raw = entry.get(attr) if isinstance(entry, dict) else getattr(entry, attr, None)
+    return [str(item) for item in raw or [] if item]
+
+
+def tool_layer_prompt_for_context(
+    *,
+    role: str = "",
+    required_capabilities: list[str] | None = None,
+    optional_capabilities: list[str] | None = None,
+    allowed_capabilities: list[str] | None = None,
+    forbidden_capabilities: list[str] | None = None,
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+) -> str:
+    """Return a layered tool recommendation prompt for Creator script generation/repair."""
+    required = [str(item) for item in required_capabilities or [] if item]
+    optional = [str(item) for item in optional_capabilities or [] if item]
+    allowed = [str(item) for item in allowed_capabilities or [] if item]
+    forbidden = [str(item) for item in forbidden_capabilities or [] if item]
+    visible_caps = required + optional + allowed
+
+    helper_required: list[str] = []
+    helper_preferred: list[str] = []
+    self_allowed: list[str] = []
+    model_caps = {"text_generation", "image_generation", "vision_understanding"} & set(required)
+    for name in visible_caps:
+        cap = get_tool_capability(name)
+        if not cap:
+            continue
+        if cap.usage_policy == "helper_required":
+            helper_required.append(name)
+        elif cap.usage_policy == "helper_preferred":
+            helper_preferred.append(name)
+        else:
+            self_allowed.append(name)
+
+    deterministic_examples = [
+        "datetime（当前时间、日期/时间格式化）",
+        "json/csv（结构化转换）",
+        "pathlib/os/shutil（路径整理与本地文件读写）",
+        "hashlib/zipfile（摘要与归档）",
+        "字符串格式化、Markdown/CSV/JSON 拼接",
+        "本地 PDF/docx/pptx/html/图片构建库（仅在当前能力允许产物时使用）",
+    ]
+
+    lines = [
+        "工具分层提示：",
+        "第一层：基础确定性工具层（普通编程任务默认使用，不需要 LLM）：",
+        "- " + "；".join(deterministic_examples),
+        "- 获取当前时间、数学计算、格式转换、路径整理、简单文本拼接、本地文件读取等确定性任务，应优先自实现。",
+        "第二层：平台 helper 层：",
+        f"- helper_required（必须调用）：{', '.join(helper_required) if helper_required else '无'}",
+        f"- helper_preferred（推荐调用，不强制）：{', '.join(helper_preferred) if helper_preferred else '无'}",
+        f"- self_implementation_allowed（允许自实现）：{', '.join(self_allowed) if self_allowed else '无'}",
+        "第三层：模型能力层：",
+        (
+            "- 当前脚本 required_capabilities 明确包含模型能力：" + ", ".join(sorted(model_caps)) + "；才可提示/调用对应模型。"
+            if model_caps
+            else "- 当前脚本未明确要求 text_generation/image_generation/vision_understanding；不要注入 LLM_BASE_URL、TEXT_MODEL、IMAGE_MODEL 或 VISION_MODEL。"
+        ),
+        "第四层：禁止能力层：",
+        f"- 当前 forbidden_capabilities：{', '.join(forbidden) if forbidden else '无'}。如脚本调用 forbidden helper，repair 应删除调用，不要扩大 SkillPlan。",
+    ]
+    if failure_layer:
+        lines.append(f"当前 failure_layer：{failure_layer}")
+    if error_text:
+        lines.append("错误摘要：" + str(error_text)[-1000:])
+    return "\n".join(lines)
+
 def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
     caps = []
@@ -1127,6 +1199,13 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
             if record.get("package"):
                 dependencies.append(record["package"])
     snippets = resolve_tool_snippets_for_context(role=role, capabilities=allowed_tools, tool_names=allowed_tools, file_path="", max_snippets=5)
+    layered_prompt = tool_layer_prompt_for_context(
+        role=role,
+        required_capabilities=_as_list_attr(entry, "required_capabilities"),
+        optional_capabilities=_as_list_attr(entry, "optional_capabilities"),
+        allowed_capabilities=_as_list_attr(entry, "allowed_capabilities"),
+        forbidden_capabilities=_as_list_attr(entry, "forbidden_capabilities"),
+    )
     return ToolResolveResult(
         allowed_tools=allowed_tools,
         allowed_helper_imports=[],
@@ -1134,7 +1213,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         forbidden_imports=[],
         tool_function_cards=[],
         tool_snippets=snippets,
-        tool_usage_prompt="通用工具平台：coder 生成 python_script，后端 runner 只负责执行和校验。\n" + tool_snippet_prompt(snippets),
+        tool_usage_prompt="通用工具平台：coder 生成 python_script，后端 runner 只负责执行和校验。\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
         warnings=warnings,
     )
 

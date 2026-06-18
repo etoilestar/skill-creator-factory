@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .creator_tool_registry import get_tool_capability
-from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
+from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, capability_layer, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -105,6 +105,83 @@ _MAX_SKILL_NAME_LENGTH = 64
 
 class BlueprintShapeError(ValueError):
     """Raised when a confirmed Creator blueprint violates platform shape."""
+
+
+_BLUEPRINT_UI_STOP_RE = re.compile(
+    r"(?m)^\s*(?:AskUserQuestion|确认问题|用户确认|请选择|选项|按钮状态|创建进度|文件生成进度)\b|^\s*```text\s*$",
+    re.I,
+)
+
+
+def clean_blueprint_body_text(blueprint_text: str) -> str:
+    """Return only the Skill blueprint body, excluding Creator confirmation UI.
+
+    The backend parser receives a business blueprint contract. Confirmation
+    questions, option labels, button states, and progress text belong to the
+    outer Creator UI/state envelope and must not become blueprint prose.
+    """
+    text = (blueprint_text or "").strip()
+    if not text:
+        return ""
+    marker = re.search(r"(?m)^\s*##?\s*📋\s*Skill\s+架构蓝图\s*$|📋\s*Skill\s+架构蓝图", text)
+    if marker:
+        text = text[marker.start():]
+    stop = _BLUEPRINT_UI_STOP_RE.search(text)
+    if stop:
+        text = text[: stop.start()]
+    return text.strip()
+
+
+def _format_capability_list(values: list[str]) -> str:
+    return "[" + ", ".join(values) + "]"
+
+
+def repair_blueprint_business_layers(blueprint_text: str) -> tuple[str, list[str]]:
+    """Locally repair layer-mixed SkillPlan capability fields.
+
+    This handles deterministic structure mistakes before strict validation:
+    platform protocol/safety names are removed from business capability fields
+    instead of causing an immediate 400. Platform-owned constraints remain
+    Creator/Kernel state and are not migrated into the business SkillPlan.
+    """
+    text = clean_blueprint_body_text(blueprint_text)
+    warnings: list[str] = []
+    repaired_lines: list[str] = []
+    current_path = ""
+
+    for line in text.splitlines():
+        path_match = re.match(r"^(\s*-\s*path\s*:\s*)`?([^`\n]+?)`?\s*$", line)
+        if path_match:
+            current_path = path_match.group(2).strip().strip("`'\"，,。.;；").replace("\\", "/")
+            repaired_lines.append(line)
+            continue
+
+        field_match = re.match(r"^(\s*)(required_capabilities|business_forbidden_capabilities|forbidden_capabilities)(\s*:\s*)(.*)$", line)
+        if not field_match:
+            repaired_lines.append(line)
+            continue
+
+        indent, field_name, sep, raw_value = field_match.groups()
+        values = _list_field_from_block(f"{field_name}: {raw_value}", field_name)
+        if field_name == "required_capabilities":
+            kept = [cap for cap in values if is_business_capability(cap)]
+            removed = [cap for cap in values if not is_business_capability(cap)]
+            if removed:
+                warnings.append(
+                    f"已从 {current_path or 'SkillPlan'} required_capabilities 移除平台协议/资源能力：{', '.join(removed)}。"
+                )
+            repaired_lines.append(f"{indent}{field_name}{sep}{_format_capability_list(kept)}")
+            continue
+
+        kept = [cap for cap in values if is_business_capability(cap)]
+        removed = [cap for cap in values if not is_business_capability(cap)]
+        if removed:
+            warnings.append(
+                f"已从 {current_path or 'SkillPlan'} business_forbidden_capabilities 移除平台安全/协议约束：{', '.join(removed)}。"
+            )
+        repaired_lines.append(f"{indent}business_forbidden_capabilities{sep}{_format_capability_list(kept)}")
+
+    return "\n".join(repaired_lines).strip(), warnings
 
 
 def _has_required_blueprint_marker(blueprint_text: str) -> bool:
@@ -230,12 +307,13 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
         "outputs",
         "dependencies",
         "required_capabilities",
-        "forbidden_capabilities",
         "references",
     ]
     valid_roles = set(SCRIPT_ROLES) | set(RESOURCE_ROLES)
     for path, block in path_blocks.items():
         missing = [field for field in required_fields if not re.search(rf"(?m)^\s*{field}\s*:", block)]
+        if not re.search(r"(?m)^\s*(?:business_forbidden_capabilities|forbidden_capabilities)\s*:", block):
+            missing.append("business_forbidden_capabilities")
         if missing:
             issues.append(f"{path} 文件计划缺少字段：{', '.join(missing)}。")
 
@@ -258,12 +336,20 @@ def validate_blueprint_shape_for_creator(blueprint_text: str) -> None:
         if required_caps and path.startswith("scripts/"):
             allowed = ROLE_ALLOWED_CAPABILITIES.get(role, frozenset())
             for capability in required_caps:
-                if get_tool_capability(capability) is None:
+                layer = capability_layer(capability)
+                if layer != "business_skill":
+                    issues.append(f"{path} required_capabilities 只能声明业务能力，不能包含 {layer} capability `{capability}`。")
+                elif get_tool_capability(capability) is None:
                     issues.append(f"{path} required_capabilities 包含未注册 capability `{capability}`。")
                 elif capability not in allowed:
                     issues.append(f"{path} role `{role}` 不允许 capability `{capability}`。")
         elif required_caps and not path.startswith("scripts/"):
             issues.append(f"资源文件 `{path}` 不能声明 runtime required_capabilities。")
+
+        forbidden_caps = _list_field_from_block(block, "business_forbidden_capabilities") or _list_field_from_block(block, "forbidden_capabilities")
+        for capability in forbidden_caps:
+            if not is_business_capability(capability):
+                issues.append(f"{path} business_forbidden_capabilities 只能声明业务禁止能力，不能包含平台安全/协议 `{capability}`。")
 
     for path in sorted(script_paths | reference_paths | asset_paths | {"SKILL.md"}):
         if path not in path_blocks:
@@ -412,7 +498,7 @@ def extract_blueprint_text(messages: list[dict]) -> str | None:
         if msg.get("role") == "assistant":
             content = msg.get("content") or ""
             if _BLUEPRINT_MARKER in content:
-                return content
+                return clean_blueprint_body_text(content)
     return None
 
 
@@ -744,11 +830,15 @@ def parse_blueprint(messages: list[dict], *, strict: bool = False) -> BlueprintP
             ),
         )
 
+    warnings: list[str] = []
     if strict:
+        blueprint_text, repair_warnings = repair_blueprint_business_layers(blueprint_text)
+        warnings.extend(repair_warnings)
         validate_blueprint_shape_for_creator(blueprint_text)
+    else:
+        blueprint_text = clean_blueprint_body_text(blueprint_text)
 
     skill_name = parse_skill_name(blueprint_text)
-    warnings: list[str] = []
     if skill_name is None:
         skill_name = "new-skill"
         warnings.append(

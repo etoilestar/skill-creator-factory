@@ -1529,3 +1529,121 @@ python scripts/write.py --topic "{{topic}}"
     failed = {result.id for result in validate_file_contract(file_path="SKILL.md", content=skill_md, blueprint_text=blueprint) if not result.passed}
 
     assert "skill_md.command_block.signature_parseable" in failed
+
+
+def test_skillplan_separates_platform_protocol_and_business_capabilities():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/run.py",
+        purpose=(
+            "role: generic_script inputs: payload outputs: result "
+            "required_capabilities: deterministic_execution, file_output "
+            "business_forbidden_capabilities: network_disabled, image_generation"
+        ),
+    )
+
+    assert entry.required_capabilities == ["file_output"]
+    assert entry.business_capabilities == ["file_output"]
+    assert entry.platform_capabilities == ["deterministic_execution"]
+    assert entry.business_forbidden_capabilities == ["image_generation"]
+    assert entry.platform_safety_constraints == ["network_disabled"]
+    assert entry.execution_contract == {"runtime": "python", "entrypoint": "scripts/run.py"}
+
+
+def test_strict_blueprint_repairs_platform_protocol_in_business_capabilities():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: layered-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/run.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/run.py`
+  role: generic_script
+  inputs: [payload]
+  outputs: [result]
+  dependencies: []
+  required_capabilities: [deterministic_execution, file_output]
+  business_forbidden_capabilities: [network_disabled]
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/run.py '{"payload":"{{payload}}"}'
+```
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}], strict=True)
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/run.py")
+
+    assert entry.required_capabilities == ["file_output"]
+    assert entry.platform_capabilities == []
+    assert entry.business_forbidden_capabilities == []
+    assert any("deterministic_execution" in warning for warning in plan.warnings)
+    assert any("network_disabled" in warning for warning in plan.warnings)
+
+
+
+def test_blueprint_parser_strips_confirmation_ui_from_blueprint_body():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    content = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: ui-clean-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/write.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/write.py`
+  role: text_generator
+  inputs: [topic]
+  outputs: [text]
+  dependencies: []
+  required_capabilities: [text_generation]
+  business_forbidden_capabilities: []
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/write.py '{"topic":"{{topic}}"}'
+```
+
+AskUserQuestion
+问题：是否确认？
+选项：对，开始做吧
+- path: `scripts/ui_leak.py`
+  role: generic_script
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": content}], strict=True)
+    paths = {file.path for file in plan.files}
+
+    assert "scripts/write.py" in paths
+    assert "scripts/ui_leak.py" not in paths

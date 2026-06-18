@@ -2166,33 +2166,16 @@ def _reference_metadata_defaults(
 ) -> dict[str, Any]:
     entry = skill_plan_entry or {}
     title = _slug_from_reference_path(file_path)
-
-    def as_list(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(v).strip() for v in value if str(v).strip()]
-        if isinstance(value, tuple):
-            return [str(v).strip() for v in value if str(v).strip()]
-        if isinstance(value, str):
-            return [v.strip() for v in re.split(r"[,，、\n]+", value) if v.strip()]
-        return [str(value).strip()] if str(value).strip() else []
-
+    description = (purpose or entry.get("purpose") or f"{file_path} reference").strip()
     return {
         "name": title,
-        "description": (purpose or entry.get("purpose") or f"{file_path} reference").strip(),
+        "description": description,
         "role": "reference",
         "type": "reference",
         "path": file_path,
         "scope": "skill-local",
         "loading": "metadata-first-body-on-demand",
         "when_to_use": (purpose or entry.get("purpose") or "按 SKILL.md 工作流需要读取正文").strip(),
-        "inputs": as_list(entry.get("inputs")),
-        "outputs": as_list(entry.get("outputs")),
-        "dependencies": as_list(entry.get("dependencies")),
-        "required_capabilities": as_list(entry.get("required_capabilities")),
-        "forbidden_capabilities": as_list(entry.get("forbidden_capabilities")),
-        "tags": ["creator-generated", "reference"],
     }
 
 
@@ -2340,12 +2323,6 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
             "scope": "skill-local",
             "loading": "metadata-first-body-on-demand",
             "when_to_use": purpose or "按 SKILL.md 工作流需要读取正文",
-            "inputs": [],
-            "outputs": [],
-            "dependencies": [],
-            "required_capabilities": [],
-            "forbidden_capabilities": [],
-            "tags": ["creator-generated", "reference"],
         },
         allow_unicode=True,
         sort_keys=False,
@@ -3800,7 +3777,13 @@ def _script_has_main_entry(content: str, runtime: str) -> bool:
     return True
 
 
-def _validate_script_contract_static(*, file_path: str, content: str, skill_md: str) -> None:
+def _validate_script_contract_static(
+    *,
+    file_path: str,
+    content: str,
+    skill_md: str,
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> None:
     """Validate script source against SKILL.md contract locally.
 
     Creator 单文件阶段只做脚本入口级校验：
@@ -3814,9 +3797,15 @@ def _validate_script_contract_static(*, file_path: str, content: str, skill_md: 
     """
     _reject_fake_script_implementation(file_path, content)
 
-    plan_entry = _skill_plan_entry_for_file(
-        file_path=file_path,
-        blueprint_text=skill_md,
+    explicit_entry = (
+        skill_plan_entry.__dict__
+        if isinstance(skill_plan_entry, SkillPlanEntry)
+        else skill_plan_entry
+    )
+    plan_entry = (
+        _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=explicit_entry)
+        if explicit_entry is not None
+        else _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
     )
 
     _validate_configured_model_usage_static(
@@ -4147,7 +4136,12 @@ def _trial_run_generated_script(
 
     skill_md_path = settings.skills_path / skill_name / "SKILL.md"
     skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
-    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+    _validate_script_contract_static(
+        file_path=file_path,
+        content=content,
+        skill_md=skill_md,
+        skill_plan_entry=skill_plan_entry,
+    )
 
     with tempfile.TemporaryDirectory(prefix="creator-script-trial-") as tmp:
         skill_dir = Path(tmp) / skill_name

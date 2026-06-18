@@ -434,7 +434,7 @@ function isMaterializedSkillFilePath(path) {
 
 function isAssetFile(file) {
   const path = normalizeSkillPath(file?.path)
-  return path.startsWith('assets/') && hasFileExtension(path)
+  return path.startsWith('assets/') && hasFileExtension(path) && file?.asset_source === 'user_upload'
 }
 
 function isReferenceFile(file) {

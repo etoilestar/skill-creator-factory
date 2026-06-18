@@ -192,7 +192,7 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
 ### SkillPlan / 文件职责计划
 > 每一个将被 Creator 创建的文件都必须在这里显式声明职责合同；scripts/ 文件必须选择一个 role，不要留空。
 > `required_capabilities` / `forbidden_capabilities` 必须由模型基于当前文件的真实运行需求显式声明；不要因为相邻概念、全局描述、文件名或业务描述自动扩展能力。后端只校验显式能力是否在当前 role 边界内，不会用业务词补 capability；资源文件（`SKILL.md`、`references/*.md`、`assets/*`）不声明 runtime capabilities。helper_required 能力必须调用平台 runtime helper；helper_preferred/self_implementation_allowed 能力可按 Tool Registry 指引使用 helper 或自实现。
-> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
+> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。目录结构只负责展示，真正驱动创建的是 SkillPlan 文件职责计划；目录结构中的路径不能覆盖 SkillPlan 同路径合同。`assets/*` 必须显式声明 `source: user_upload` 或 `source: bundled`；如不需要 assets，应明确写“无需创建”。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
 > `inputs` / `outputs` 必须是确定字段名列表，不要写候选字段、别名字段或组合表达；若存在多种可能，请先选定一个字段名。蓝图第一轮只检查文件边界、role/capability、安全边界、命令块基础格式和 JSON argv 可解析性，不在蓝图阶段要求脚本 output 必须被后续 input 静态同名消费；内部字段流转由第二轮 E2E 真实执行验证。
 
 - path: `SKILL.md`
@@ -218,7 +218,7 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
                           pdf_parsing | docx_parsing | pptx_parsing |
                           web_search | database_read |
                           wechat_draft | wechat_publish | deterministic_execution | file_output]
-  forbidden_capabilities: [例如 pdf_builder 禁止 image_generation；text_generator 禁止 pdf_generation/image_generation；未明确直接发布时禁止 wechat_publish]
+  forbidden_capabilities: [列出当前 role 边界内必须禁止的 runtime capability；不要用业务描述自动补充]
   references: [需要引用的 references/*.md]
 - path: `references/<name>.md`
   role: reference
@@ -230,6 +230,7 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
   references: []
 - path: `assets/<name.ext>`
   role: asset
+  source: <user_upload | bundled>
   inputs: []
   outputs: []
   dependencies: []

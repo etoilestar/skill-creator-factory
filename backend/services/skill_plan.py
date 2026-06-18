@@ -702,8 +702,12 @@ def _is_asset_upload_only(entry: SkillPlanEntry) -> bool:
     text = f"{entry.purpose}\n{' '.join(entry.inputs)}\n{' '.join(entry.outputs)}\n{' '.join(entry.dependencies)}"
     if entry.inputs or entry.outputs or entry.dependencies or entry.required_capabilities:
         return False
-    if is_dynamic_file_path(entry.path):
+    if is_dynamic_file_path(entry.path) or is_runtime_output_path(entry.path):
         return False
+    explicit_static_source = re.search(r"(?m)^\s*(?:source|asset_source)\s*:\s*(?:user_upload|upload|uploaded|bundled|static)\s*$", entry.purpose or "", re.I)
+    explicit_runtime_artifact = re.search(r"运行时产物|运行时生成|脚本生成|最终产物|最终生成|runtime\s+artifact|generated\s+artifact", entry.purpose or "", re.I)
+    if explicit_static_source and not explicit_runtime_artifact:
+        return True
     if is_runtime_artifact_semantic(entry.path, text):
         return False
     return True

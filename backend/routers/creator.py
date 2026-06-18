@@ -192,12 +192,21 @@ class FileSpecOut(BaseModel):
     confidence: float = 0.0
     reason: str = ""
     heuristic_signals: list[str] = Field(default_factory=list)
+    asset_source: str = ""
+
+
+class AssetRequirementOut(BaseModel):
+    path: str
+    source: str
+    required: bool = True
+    description: str = ""
 
 
 class AnalyzeBlueprintResponse(BaseModel):
     skill_name: str
     files: list[FileSpecOut]
     warnings: list[str]
+    asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -510,10 +519,10 @@ def _skill_plan_entry_for_file(
 
     _validate_file_path(file_path)
 
-    if file_path.startswith("assets/"):
+    if file_path.startswith("assets/") and (skill_plan_entry or {}).get("asset_source") != "bundled":
         raise HTTPException(
             status_code=400,
-            detail=f"{file_path} 属于 assets 静态素材目录，必须上传，不能生成",
+            detail=f"{file_path} 属于 assets 静态素材目录；source=user_upload 必须上传，只有 source=bundled 可作为预置静态资源写入",
         )
 
     data = _skill_plan_entry_defaults(
@@ -5369,7 +5378,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     extra_paths = []
     extra_path_warnings: list[str] = []
     for path in sorted(candidate_paths):
-        if path in base_paths or not (path.startswith("references/") or path.startswith("assets/")):
+        if path in base_paths or not path.startswith("references/"):
             continue
         if is_runtime_artifact_semantic(path, _local_blueprint_text_for_path(path, blueprint_text)):
             extra_path_warnings.append(
@@ -5434,6 +5443,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 confidence=entry.confidence if entry else 1.0,
                 reason=entry.reason if entry else "fallback path classification",
                 heuristic_signals=entry.heuristic_signals if entry else [],
+                asset_source=f.asset_source if f.path.startswith("assets/") else "",
             )
         )
 
@@ -5485,8 +5495,20 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 confidence=1.0,
                 reason="fallback path classification from declared blueprint path",
                 heuristic_signals=["declared_skill_path"],
+                asset_source="",
             )
         )
+
+    asset_requirements = [
+        AssetRequirementOut(
+            path=file_spec.path,
+            source=file_spec.asset_source,
+            required=file_spec.required,
+            description=file_spec.purpose,
+        )
+        for file_spec in files_out
+        if file_spec.path.startswith("assets/") and file_spec.asset_source == "user_upload"
+    ]
 
     available_tools = [tool_status(cap) for cap in list_tool_capabilities()]
     required_tool_names = {
@@ -5522,6 +5544,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         skill_name=plan.skill_name,
         files=files_out,
         warnings=warnings,
+        asset_requirements=asset_requirements,
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
     )
@@ -5597,10 +5620,10 @@ async def generate_file(request: GenerateFileRequest):
     skill_name = _validate_skill_name(request.skill_name)
     _validate_file_path(request.file_path)
 
-    if request.file_path.startswith("assets/"):
+    if request.file_path.startswith("assets/") and (request.skill_plan_entry or {}).get("asset_source") != "bundled":
         raise HTTPException(
             status_code=400,
-            detail=f"{request.file_path} 属于 assets 静态素材目录，必须上传，不能生成。",
+            detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可由 Creator 生成，source=user_upload 必须上传。",
         )
 
     async def event_stream():
@@ -5862,10 +5885,10 @@ async def write_file(request: WriteFileRequest):
     skill_name = _validate_skill_name(request.skill_name)
     _validate_file_path(request.file_path)
 
-    if request.file_path.startswith("assets/"):
+    if request.file_path.startswith("assets/") and (request.skill_plan_entry or {}).get("asset_source") != "bundled":
         raise HTTPException(
             status_code=400,
-            detail=f"{request.file_path} 属于 assets 静态素材目录，必须通过 /api/creator/upload-asset 上传，不能由模型写入。",
+            detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可写入，source=user_upload 必须通过 /api/creator/upload-asset 上传。",
         )
 
     skill_dir = settings.skills_path / skill_name

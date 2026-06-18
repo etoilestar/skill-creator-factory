@@ -765,6 +765,7 @@ class ContractCheckResult:
     minimal_edit: str
     matched_paths: list[str] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
+    layer: str = ""
 
 
 class ContractValidationError(ValueError):
@@ -839,42 +840,49 @@ def _creator_tool_context_for_script(
 
 
 def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
-    """Normalize a command block into runner/script/JSON-argv placeholder contract."""
+    """Normalize the single Creator SKILL.md command protocol.
+
+    First-round command validation intentionally allows exactly one protocol:
+    ``python scripts/<file>.py '<JSON object>'``.  It does not infer business
+    field correctness; E2E owns placeholder/dataflow validation.
+    """
     try:
         parts = shlex.split((command or "").strip())
     except ValueError:
         return None
+
     expected_script = script_path.replace("\\", "/")
-    for idx, part in enumerate(parts):
-        normalized_script = part.replace("\\", "/")
-        if normalized_script == expected_script or normalized_script.endswith("/" + expected_script):
-            if idx + 1 >= len(parts):
-                return {
-                    "runner": Path(parts[idx - 1]).name if idx > 0 else "",
-                    "script_path": expected_script,
-                    "keys": set(),
-                    "placeholders": {},
-                }
-            try:
-                payload = json.loads(parts[idx + 1])
-            except json.JSONDecodeError:
-                return None
-            if not isinstance(payload, dict):
-                return None
-            placeholders: dict[str, str] = {}
-            for key, value in payload.items():
-                if isinstance(value, str):
-                    match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w-]*)\s*\}\}", value.strip())
-                    placeholders[str(key)] = match.group(1) if match else value.strip()
-                else:
-                    placeholders[str(key)] = ""
-            return {
-                "runner": Path(parts[idx - 1]).name if idx > 0 else "",
-                "script_path": expected_script,
-                "keys": set(str(key) for key in payload.keys()),
-                "placeholders": placeholders,
-            }
-    return None
+    if len(parts) != 3:
+        return None
+    if Path(parts[0]).name not in {"python", "python3"}:
+        return None
+
+    normalized_script = parts[1].replace("\\", "/")
+    if normalized_script != expected_script:
+        return None
+    if not expected_script.startswith("scripts/") or Path(expected_script).suffix.lower() != ".py":
+        return None
+
+    try:
+        payload = json.loads(parts[2])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    placeholders: dict[str, str] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}", value.strip())
+            placeholders[str(key)] = match.group(1) if match else value.strip()
+        else:
+            placeholders[str(key)] = ""
+    return {
+        "runner": Path(parts[0]).name,
+        "script_path": expected_script,
+        "keys": set(str(key) for key in payload.keys()),
+        "placeholders": placeholders,
+    }
 
 
 def _command_template_equivalent(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
@@ -894,25 +902,18 @@ def _command_template_equivalent(command: str, script_path: str, entry: SkillPla
 
 
 def _command_payload_object(command: str, script_path: str) -> dict[str, Any] | None:
-    """Return the JSON argv object passed to script_path, or None if unparsable."""
+    """Return the JSON argv object for the strict Creator command protocol."""
+    if _command_signature(command, script_path) is None:
+        return None
     try:
         parts = shlex.split(command or "")
-    except ValueError:
+        payload = json.loads(parts[2])
+    except (ValueError, json.JSONDecodeError, IndexError):
         return None
-    expected = script_path.replace("\\", "/")
-    for idx, part in enumerate(parts):
-        normalized = part.replace("\\", "/")
-        if normalized == expected or normalized.endswith("/" + expected):
-            if idx + 1 >= len(parts):
-                return {}
-            try:
-                payload = json.loads(parts[idx + 1])
-            except json.JSONDecodeError:
-                return None
-            if not isinstance(payload, dict):
-                return None
-            return {str(key): value for key, value in payload.items()}
-    return None
+    if not isinstance(payload, dict):
+        return None
+    return {str(key): value for key, value in payload.items()}
+
 
 def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
     """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
@@ -1497,6 +1498,28 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
     return results
 
 
+
+def _contract_layer_for_check_id(check_id: str) -> str:
+    """Map deterministic validator check ids to repair layers."""
+    cid = check_id or ""
+    if cid.startswith("skill_md.frontmatter"):
+        return "skill_md_metadata"
+    if cid.startswith("skill_md.command_block") or cid.startswith("command_block"):
+        return "skill_md_command_block"
+    if cid.startswith("skill_md.reference"):
+        return "reference_metadata"
+    if cid.startswith("skill_md.asset"):
+        return "asset_source_contract"
+    if cid.startswith("skill_md.forbidden") or cid.startswith("skill_md.resource"):
+        return "skill_md_intent_alignment"
+    if cid.startswith("reference."):
+        return "reference_body"
+    if cid.startswith("asset."):
+        return "asset_source_contract"
+    if cid.startswith("script."):
+        return "script_static_contract"
+    return ""
+
 def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool) -> str:
     selected = [result for result in results if result.passed is passed]
     if not selected:
@@ -1508,8 +1531,10 @@ def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool)
             "\n  details: " + json.dumps(result.details, ensure_ascii=False, sort_keys=True)
             if result.details else ""
         )
+        layer = result.layer or _contract_layer_for_check_id(result.id)
+        layer_text = f" layer={layer}" if layer else ""
         lines.append(
-            f"- {result.id} target={result.target}: {result.message}\n"
+            f"- {result.id} target={result.target}{layer_text}: {result.message}\n"
             f"  expected: {result.expected}\n"
             f"  minimal_edit: {result.minimal_edit}"
             f"{matched}"
@@ -1699,8 +1724,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         "3. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境下提到某个 scripts/*.py、references/*.md 或 assets/*，该路径只是解释性示例，不是实际文件计划。\n"
         "4. 但是，如果某个路径出现在目录结构或 SkillPlan path 字段中，则必须视为真实文件，不能误杀。\n"
         "5. SKILL.md 生成阶段 scripts/references 可能尚未落盘；不要因为文件暂时不存在而判失败。\n"
-        "6. 对每个真实规划脚本，SKILL.md 必须有标准 ```bash fenced code block。\n"
-        "7. 命令块应传入 json.loads 可解析的 JSON object argv。\n"
+        "6. 对每个真实规划脚本，SKILL.md 必须有 ```bash fenced code block；只判断是否覆盖真实文件计划，不判断 shell 语法。\n"
+        "7. 命令语法、runner、JSON argv、--args/--key/--text_file 等格式问题只由确定性 parser 判断；你不得给出替代命令协议建议。\n"
         "8. 如果 SKILL.md 中给 stdout 示例、配置示例或机器可读数据，必须使用 ```json fenced code block。\n"
         "9. 不要要求文件末尾追加 ---；YAML frontmatter 只需要在文件开头关闭。\n"
         "10. assets/** 只能作为上传素材/静态资源引用，不能描述为模型生成。\n"
@@ -1710,7 +1735,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "你必须从以下角度审查：\n"
         "- intent_reviewer: 是否覆盖业务意图、输入、输出、触发方式、最终产物。\n"
         "- file_plan_reviewer: 是否覆盖真实 scripts/references/assets；是否误用了示例/反例路径。\n"
-        "- workflow_reviewer: 脚本顺序、命令块静态形态、JSON argv 和 external envelope 使用是否符合平台边界；不要审查前序 stdout 字段闭环。\n"
+        "- workflow_reviewer: 只看 SKILL.md 是否描述了必要脚本顺序和脚本用途；不得判断命令语法、argv 协议、--args/--key/--text_file，也不要审查前序 stdout 字段闭环。\n"
         "- capability_reviewer: required_capabilities 是否体现，forbidden_capabilities 是否被引入。\n"
         "- resource_reviewer: references/assets 的使用方式是否正确。\n"
         "- user_facing_reviewer: 是否是最终 Skill 使用说明，而不是 Creator 创建流程。\n\n"
@@ -3432,6 +3457,42 @@ def _validate_generated_file_content(file_path: str, content: str, role: str | N
         _validate_asset_file_contract(file_path, content)
         return
 
+
+def validate_file_contract(
+    *,
+    file_path: str,
+    content: str,
+    blueprint_text: str = "",
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """First-round Creator validator: only check one file's own contract.
+
+    This layer deliberately excludes cross-file placeholder/dataflow closure and
+    final platform-output checks. Those belong to ``validate_workflow_e2e``.
+    """
+    if file_path == "SKILL.md":
+        return _check_skill_md_contract(content, blueprint_text or content)
+    if file_path.startswith("scripts/"):
+        return _check_script_file_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
+    if file_path.startswith("references/"):
+        purpose = ""
+        if isinstance(skill_plan_entry, dict):
+            purpose = str(skill_plan_entry.get("purpose") or "")
+        return _check_reference_file_contract(file_path, content, purpose=purpose)
+    if file_path.startswith("assets/"):
+        try:
+            _validate_asset_file_contract(file_path, content)
+            return []
+        except ContractValidationError as exc:
+            return list(exc.results)
+    return []
+
+
+def validate_workflow_e2e(skill_name: str, *, external_context: dict[str, Any] | None = None) -> list[str]:
+    """Second-round Creator validator: execute SKILL.md workflow and check interfaces."""
+    return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+
 def _script_paths_in_shell_fenced_blocks(skill_md: str) -> set[str]:
     """Return scripts/*.py paths that appear inside shell fenced blocks."""
     paths: set[str] = set()
@@ -4326,7 +4387,11 @@ async def _repair_generated_file_with_feedback(
         )
     else:
         extra_rules = (
-            "如果蓝图包含 scripts/，必须包含调用对应 scripts/ 路径的 ```bash fenced code block；"
+            "你只修 SKILL.md；保持主体内容，不重写整个文件；"
+            "如果错误是命令格式，只修对应 bash command block；统一使用 python scripts/<file>.py '<JSON object>'；"
+            "不得使用 --args、--key value、--text_file、--image_file 或裸 JSON；"
+            "不要检查或修复上下游字段是否完全接上，那属于第二轮 E2E；"
+            "不要改变 workflow 主体、已通过命令块、未被错误指向的文件、role/capability；"
             "如果蓝图包含 references/，必须在正文中明确引用对应 reference 路径；"
             "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
         )
@@ -6365,12 +6430,6 @@ def _is_valid_e2e_script_path(script_path: str) -> bool:
 
     return path.suffix.lower() in {
         ".py",
-        ".js",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".sh",
-        ".bash",
     }
 
 def _parse_e2e_workflow_command(
@@ -6439,8 +6498,8 @@ def _parse_e2e_workflow_command(
         return None
 
     runner = Path(parts[0]).name
-    if runner not in {"python", "python3", "node", "bash", "sh"}:
-        # This is an explicitly marked shell block, but not a workflow step.
+    if runner not in {"python", "python3"}:
+        # Creator workflow E2E accepts one command protocol only.
         return None
 
     script_idx: int | None = None
@@ -6452,8 +6511,6 @@ def _parse_e2e_workflow_command(
         candidate = ""
         if normalized.startswith("scripts/"):
             candidate = normalized
-        elif "/scripts/" in normalized:
-            candidate = "scripts/" + normalized.rsplit("/scripts/", 1)[1]
 
         if not candidate:
             continue
@@ -6477,6 +6534,18 @@ def _parse_e2e_workflow_command(
                 message=(
                     f"{source_path} 第 {ordinal} 步 {script_path} 缺少 JSON argv。\n"
                     f"命令必须形如：python {script_path} '{{\"payload\":{{\"user_request\":\"{{{{user_request}}}}\"}}}}'\n"
+                    f"原始命令：{command}"
+                ),
+            )
+        )
+
+    if script_idx != 1:
+        raise ValueError(
+            _e2e_error(
+                target=source_path,
+                layer="command_protocol",
+                message=(
+                    f"{source_path} 第 {ordinal} 步必须直接调用 scripts/*.py：python {script_path} '<JSON object>'。\n"
                     f"原始命令：{command}"
                 ),
             )

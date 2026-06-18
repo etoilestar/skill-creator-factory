@@ -1456,3 +1456,52 @@ def test_skill_plan_ambiguous_inputs_outputs_are_not_concatenated_and_warn():
     assert "alias_onealias_two" not in entry.inputs
     assert "result_oneresult_two" not in entry.outputs
     assert any("skill_plan.field_ambiguous" in warning for warning in plan.skill_plan.warnings)
+
+
+def test_creator_first_round_rejects_non_python_json_command_protocol():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: strict-command
+- scripts/: `scripts/write.py`
+  scripts/write.py role: text_generator inputs: topic outputs: text
+"""
+    skill_md = """---
+name: strict-command
+description: strict
+---
+# strict-command
+
+```bash
+python scripts/write.py --topic "{{topic}}"
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.command_block.signature_parseable" in failed
+
+
+def test_creator_first_round_accepts_single_python_json_object_command():
+    from backend.routers.creator import _check_skill_md_contract
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: strict-command
+- scripts/: `scripts/write.py`
+  scripts/write.py role: text_generator inputs: topic outputs: text
+"""
+    skill_md = """---
+name: strict-command
+description: strict
+---
+# strict-command
+
+```bash
+python scripts/write.py '{"topic":"{{topic}}"}'
+```
+"""
+    failed = {result.id for result in _check_skill_md_contract(skill_md, blueprint) if not result.passed}
+
+    assert "skill_md.command_block.signature_parseable" not in failed
+    assert "skill_md.command_block.json_argv_object" not in failed

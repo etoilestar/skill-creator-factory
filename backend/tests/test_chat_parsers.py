@@ -3334,20 +3334,40 @@ def test_creator_validator_filters_model_invented_failed_checks():
     assert _filter_validator_failed_checks(model_checks, "") == []
 
 
-
-def test_creator_validator_filters_speculative_python_runtime_risks():
+def test_creator_validator_ignores_unconfirmed_model_issues():
     from backend.routers.creator import _filter_validator_model_call_misjudgements
 
     issues, instructions = _filter_validator_model_call_misjudgements(
         file_path="scripts/build.py",
-        deterministic_error="脚本试运行通过，只剩 deterministic contract",
+        deterministic_error="后端结构化检查结果",
         failed_checks_text="",
-        issues=["可能出现 unhashable type: dict", "真实问题"],
-        instructions="请修复 dict key 类型和可能不可哈希问题",
+        issues=["模型额外提出的未确认问题"],
+        instructions="模型解释文本",
     )
 
-    assert issues == ["真实问题"]
-    assert instructions == "脚本试运行通过，只剩 deterministic contract"
+    assert issues == []
+    assert instructions == "模型解释文本"
+
+
+def test_script_content_review_excludes_runtime_startup_checks():
+    from backend.routers.creator import _check_script_content_review_contract
+
+    results = _check_script_content_review_contract(
+        "scripts/build.py",
+        "import json\nif broken python",
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["text"],
+        },
+    )
+
+    result_ids = {result.id for result in results}
+    assert "script.source.syntax" not in result_ids
+    assert "script.runtime.entrypoint" not in result_ids
+    assert "script.json_argv.runtime" not in result_ids
+    assert "script.raw_source.single_file" in result_ids
 
 
 def test_script_contract_rejects_guessed_helper_import_without_function_card():

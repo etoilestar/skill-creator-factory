@@ -3348,6 +3348,50 @@ def _check_script_file_contract(
 
     return results
 
+
+_SCRIPT_CONTENT_REVIEW_CHECK_IDS = {
+    "script.raw_source.single_file",
+    "script.skillplan_inputs.used",
+    "script.required_capabilities.called",
+    "script.file_outputs.real_creation_logic",
+    "script.no_fake_implementation",
+    "script.capability.forbidden_image_generation",
+    "script.capability.forbidden_text_generation",
+    "script.capability.forbidden_pdf_generation",
+    "script.capability.forbidden_registry_helpers",
+    "tool_usage_contract.forbidden_direct_imports",
+    "tool_usage_contract.forbidden_helper_import",
+    "tool_usage_contract.undeclared_helper",
+    "script.database_read.readonly_sql",
+    "tool_usage_contract.artifact_output_e2e",
+    "script.role.image_forbidden_pdf_only_outputs",
+}
+
+
+def _check_script_content_review_contract(
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """First script phase: content/responsibility review only.
+
+    This deliberately excludes runtime-startup checks such as syntax, argv
+    parsing, entrypoint invocation, and stdout JSON. Those are owned by the
+    single-script smoke phase, which records failures with source=script_smoke.
+    """
+    return [
+        result
+        for result in _check_script_file_contract(
+            file_path,
+            content,
+            role=role,
+            skill_plan_entry=skill_plan_entry,
+        )
+        if result.id in _SCRIPT_CONTENT_REVIEW_CHECK_IDS
+    ]
+
+
 def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
     # Accept otherwise-valid raw source with a dangling orphan fence marker at
     # the boundary.  Full fenced/bundled responses are still rejected by the
@@ -4655,9 +4699,6 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
     if file_path.startswith("scripts/"):
         lower_error = error_text.lower()
 
-        if "ModuleNotFoundError: No module named 'pdf_generation'" in error_text or 'ModuleNotFoundError: No module named "pdf_generation"' in error_text:
-            return "该模块不可 import；如果 Tool Registry 没有明确 function card，请移除该 import，改为自实现。"
-
         if (
             "stdout JSON 不得包含 error 字段" in error_text
             or "stdout JSON 至少需要一个非空字段" in error_text
@@ -4753,8 +4794,8 @@ async def _run_generated_file_validator_round(
                 "不要使用 '''bash 或 '''json；不要把行内 scripts/*.py 当成执行命令。"
                 "SKILL.md YAML frontmatter 只需要在文件开头用 --- 开启，并在 metadata 后用 --- 关闭；"
                 "不要求整个文件末尾再出现 ---。"
-                "禁止报告推测性 Python 运行风险（例如 unhashable type: dict、深度序列化、dict key 类型、可能不可哈希等）；"
-                "真实运行错误只以单脚本 smoke traceback 为准。"
+                "禁止报告任何未经后端结构化检查确认的推测性运行风险；"
+                "真实运行错误只以单脚本 smoke 阶段结果为准。"
             ),
         },
         {
@@ -4838,31 +4879,15 @@ def _filter_validator_model_call_misjudgements(
     issues: list[Any],
     instructions: str,
 ) -> tuple[list[str], str]:
-    """Remove validator feedback that invents model-call requirements.
+    """Ignore model-invented blocking issues.
 
-    The validator model may over-generalize from SKILL.md prose. Only the
-    deterministic contract for this script may introduce required model calls.
+    The backend has already produced structured checks and filtered model
+    failed_checks to deterministic ids. Free-form model issues are kept out of
+    blocking/repair decisions so the model can explain existing results without
+    inventing new failure items.
     """
-    issue_strings = [str(item) for item in issues]
-    speculative_runtime_re = re.compile(r"unhashable type:? ?dict|不可哈希|unhashable|深度序列化|dict key|字典键|可能.*哈希", re.IGNORECASE)
-    issue_strings = [item for item in issue_strings if not speculative_runtime_re.search(item)]
-    if speculative_runtime_re.search(instructions or ""):
-        instructions = deterministic_error
-    if not file_path.startswith("scripts/"):
-        return issue_strings, instructions
-    deterministic_scope = f"{deterministic_error}\n{failed_checks_text}"
-    deterministic_mentions_model_requirement = bool(re.search(
-        r"text_generation|image_generation|generate_text_with_llm|generate_stable_diffusion_image|LLM|TEXT_MODEL|IMAGE_MODEL|模型",
-        deterministic_scope,
-        re.IGNORECASE,
-    ))
-    if deterministic_mentions_model_requirement:
-        return issue_strings, instructions
-    model_error_re = re.compile(r"必须.*(?:模型|LLM|TEXT_MODEL|IMAGE_MODEL|generate_text_with_llm|generate_stable_diffusion_image)|(?:未|没有)调用.*(?:模型|LLM|TEXT_MODEL|IMAGE_MODEL)", re.IGNORECASE)
-    filtered_issues = [item for item in issue_strings if not model_error_re.search(item)]
-    if model_error_re.search(instructions or ""):
-        instructions = deterministic_error
-    return filtered_issues, instructions
+    return [], instructions or deterministic_error
+
 
 def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
     issues = validator_report.get("issues") or []
@@ -5762,42 +5787,39 @@ async def upload_asset(
     )
 
 
-_STRICT_REWRITE_ERROR_MARKERS = (
-    "ast.parse",
-    "不是合法 Python 源码",
-    "script.source.syntax",
-    "script.runtime.entrypoint",
-    "缺少 python 入口",
-    "JSON argv",
-    "json_argv",
-    "stdout JSON",
-    "stdout 非 JSON",
-    "ImportError",
-    "ModuleNotFoundError",
-    "Traceback",
-    "脚本试运行失败",
-    "forbidden_helper",
-    "tool_usage_contract.forbidden_helper_import",
-    "helper_required",
-    "script.required_capabilities.called",
-)
+@dataclass
+class FileGenerationStageError(Exception):
+    """Structured failure source for first-round generation validation."""
+
+    source: str
+    layer: str
+    detail: str
+    original: Exception | None = None
+
+    def __str__(self) -> str:
+        return self.detail
 
 
-def _strict_contract_rewrite_allowed(error_text: str) -> bool:
-    return any(marker in (error_text or "") for marker in _STRICT_REWRITE_ERROR_MARKERS)
+def _contract_failure_layer(results: list[ContractCheckResult]) -> str:
+    failed = [result.id for result in results if not result.passed]
+    return failed[0] if failed else "content_review"
 
 
-def _repair_error_layer(error_text: str) -> str:
-    if "generation_empty" in (error_text or ""):
-        return "generation_empty"
-    layer = _failure_layer_from_error_text(error_text) or "contract"
-    match = re.search(r"(?:^|\n)-\s+([^\s]+)\s+target=", error_text or "")
-    if match:
-        return match.group(1)
-    if "ModuleNotFoundError" in (error_text or ""):
-        m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)", error_text)
-        return "ModuleNotFoundError:" + (m.group(1) if m else "unknown")
-    return layer
+def _stage_error_from_exception(source: str, exc: Exception, *, default_layer: str) -> FileGenerationStageError:
+    if isinstance(exc, FileGenerationStageError):
+        return exc
+    if isinstance(exc, ContractValidationError):
+        layer = _contract_failure_layer(exc.results) or default_layer
+    else:
+        layer = default_layer
+    return FileGenerationStageError(source=source, layer=layer, detail=str(exc), original=exc)
+
+
+def _strict_contract_rewrite_allowed(source: str) -> bool:
+    # Strict rewrites are allowed only when the backend has produced a
+    # deterministic first-round result. The decision is source-based rather
+    # than inferred from error-message text.
+    return source in {"content_review", "script_smoke"}
 
 
 @router.post("/generate-file")
@@ -5866,81 +5888,91 @@ async def generate_file(request: GenerateFileRequest):
         for attempt in range(1, _MAX_FILE_REPAIR_ATTEMPTS + 1):
             try:
                 if len(candidate or "") == 0:
-                    raise ValueError("generation_empty: 模型生成结果 content_chars=0，跳过 validator/repair；应直接重新生成一次或换模型。")
-
-                content = _sanitize_generated_file_content(
-                    request.file_path,
-                    candidate,
-                    role=request.role,
-                    skill_plan_entry=request.skill_plan_entry,
-                )
-
-                if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":
-                    content = _ensure_reference_metadata_frontmatter(
-                        file_path=request.file_path,
-                        content=content,
-                        purpose=request.purpose,
-                        skill_plan_entry=request.skill_plan_entry,
+                    raise FileGenerationStageError(
+                        source="generation_empty",
+                        layer="generation_empty",
+                        detail="generation_empty: 模型生成结果 content_chars=0，跳过 validator/repair；应直接重新生成一次或换模型。",
                     )
 
-                if request.file_path == "SKILL.md":
-                    # First round: file-level SKILL.md contract only. Cross-file
-                    # placeholder/dataflow closure is handled by validate_workflow_e2e().
-                    _raise_file_contract_failures(validate_file_contract(
-                        file_path=request.file_path,
-                        content=content,
-                        blueprint_text=request.blueprint_text,
-                        skill_plan_entry=request.skill_plan_entry,
-                    ))
-
-                    # SKILL.md is generated before scripts/references are materialized.
-                    # Validate against blueprint-declared plan, not disk existence.
-                    _validate_skill_md_against_existing_files(
-                        skill_name,
-                        content,
-                        blueprint_text=request.blueprint_text,
-                        require_existing=False,
-                    )
-
-                    await _validate_skill_md_blueprint_alignment(
-                        skill_name=skill_name,
-                        content=content,
-                        blueprint_text=request.blueprint_text,
-                        skill_plan_entry=request.skill_plan_entry,
-                        model=request.model or route.model,
-                    )
-
-                elif request.file_path.startswith("references/"):
-                    _raise_file_contract_failures(validate_file_contract(
-                        file_path=request.file_path,
-                        content=content,
-                        blueprint_text=request.blueprint_text,
-                        skill_plan_entry={**(request.skill_plan_entry or {}), "purpose": request.purpose or request.blueprint_text},
-                    ))
-
-                elif request.file_path.startswith("scripts/"):
-                    _raise_file_contract_failures(validate_file_contract(
-                        file_path=request.file_path,
-                        content=content,
-                        blueprint_text=request.blueprint_text,
-                        role=request.role,
-                        skill_plan_entry=request.skill_plan_entry,
-                    ))
-                    _validate_script_against_existing_skill_contract(
-                        skill_name,
+                try:
+                    content = _sanitize_generated_file_content(
                         request.file_path,
-                        content,
-                    )
-                    _trial_run_generated_script_with_plan(
-                        skill_name,
-                        request.file_path,
-                        content,
+                        candidate,
                         role=request.role,
                         skill_plan_entry=request.skill_plan_entry,
                     )
 
-                if not content.strip():
-                    raise ValueError(f"{request.file_path} 生成内容为空。")
+                    if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":
+                        content = _ensure_reference_metadata_frontmatter(
+                            file_path=request.file_path,
+                            content=content,
+                            purpose=request.purpose,
+                            skill_plan_entry=request.skill_plan_entry,
+                        )
+
+                    if not content.strip():
+                        raise FileGenerationStageError(
+                            source="content_review",
+                            layer="content_empty",
+                            detail=f"{request.file_path} 生成内容为空。",
+                        )
+
+                    if request.file_path == "SKILL.md":
+                        # First round: file-level SKILL.md contract only. Cross-file
+                        # placeholder/dataflow closure is handled by validate_workflow_e2e().
+                        _raise_file_contract_failures(validate_file_contract(
+                            file_path=request.file_path,
+                            content=content,
+                            blueprint_text=request.blueprint_text,
+                            skill_plan_entry=request.skill_plan_entry,
+                        ))
+
+                        # SKILL.md is generated before scripts/references are materialized.
+                        # Validate against blueprint-declared plan, not disk existence.
+                        _validate_skill_md_against_existing_files(
+                            skill_name,
+                            content,
+                            blueprint_text=request.blueprint_text,
+                            require_existing=False,
+                        )
+
+                        await _validate_skill_md_blueprint_alignment(
+                            skill_name=skill_name,
+                            content=content,
+                            blueprint_text=request.blueprint_text,
+                            skill_plan_entry=request.skill_plan_entry,
+                            model=request.model or route.model,
+                        )
+
+                    elif request.file_path.startswith("references/"):
+                        _raise_file_contract_failures(validate_file_contract(
+                            file_path=request.file_path,
+                            content=content,
+                            blueprint_text=request.blueprint_text,
+                            skill_plan_entry={**(request.skill_plan_entry or {}), "purpose": request.purpose or request.blueprint_text},
+                        ))
+
+                    elif request.file_path.startswith("scripts/"):
+                        _raise_file_contract_failures(_check_script_content_review_contract(
+                            request.file_path,
+                            content,
+                            role=request.role,
+                            skill_plan_entry=request.skill_plan_entry,
+                        ))
+                except Exception as exc:
+                    raise _stage_error_from_exception("content_review", exc, default_layer="content_review") from exc
+
+                if request.file_path.startswith("scripts/"):
+                    try:
+                        _trial_run_generated_script_with_plan(
+                            skill_name,
+                            request.file_path,
+                            content,
+                            role=request.role,
+                            skill_plan_entry=request.skill_plan_entry,
+                        )
+                    except Exception as exc:
+                        raise _stage_error_from_exception("script_smoke", exc, default_layer="script_smoke") from exc
 
                 logger.info(
                     "[Creator][generate_file] validation passed file=%s role=%s content_chars=%d",
@@ -5970,11 +6002,13 @@ async def generate_file(request: GenerateFileRequest):
                 return
 
             except Exception as exc:
-                deterministic_error = str(exc)
-                error_layer = _repair_error_layer(deterministic_error)
+                stage_error = exc if isinstance(exc, FileGenerationStageError) else _stage_error_from_exception("content_review", exc, default_layer="content_review")
+                deterministic_error = str(stage_error)
+                error_source = stage_error.source
+                error_layer = f"{stage_error.source}:{stage_error.layer}"
                 repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
-                if error_layer == "generation_empty":
+                if error_source == "generation_empty":
                     if repair_counts_by_layer[error_layer] > 1:
                         yield _sse({
                             "type": "file_done",
@@ -5992,7 +6026,7 @@ async def generate_file(request: GenerateFileRequest):
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
-                        "validation": {"status": "regenerating", "attempt": attempt, "error": deterministic_error},
+                        "validation": {"status": "regenerating", "attempt": attempt, "source": error_source, "layer": stage_error.layer, "error": deterministic_error},
                     })
                     candidate = await complete_chat_once(prompt_messages, route.model)
                     continue
@@ -6004,7 +6038,7 @@ async def generate_file(request: GenerateFileRequest):
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
-                        "error": f"文件内容生成失败：同一错误层 {error_layer} 已修复 2 次仍未通过。最后错误：{deterministic_error}",
+                        "error": f"文件内容生成失败：同一阶段/层 {error_layer} 已修复 2 次仍未通过。最后错误：{deterministic_error}",
                         "done": True,
                     })
                     return
@@ -6040,9 +6074,10 @@ async def generate_file(request: GenerateFileRequest):
 
                 passed_checks_text = ""
                 failed_checks_text = ""
-                if isinstance(exc, ContractValidationError):
-                    passed_checks_text = _format_contract_checks(exc.results, passed=True)
-                    failed_checks_text = _format_contract_checks(exc.results, passed=False)
+                original_exc = stage_error.original
+                if isinstance(original_exc, ContractValidationError):
+                    passed_checks_text = _format_contract_checks(original_exc.results, passed=True)
+                    failed_checks_text = _format_contract_checks(original_exc.results, passed=False)
 
                 if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                     error_message = (
@@ -6078,6 +6113,8 @@ async def generate_file(request: GenerateFileRequest):
                     "validation": {
                         "status": "repairing",
                         "attempt": attempt,
+                        "source": error_source,
+                        "layer": stage_error.layer,
                         "error": deterministic_error,
                     }
                 })
@@ -6093,7 +6130,7 @@ async def generate_file(request: GenerateFileRequest):
                     failed_checks_text=failed_checks_text,
                     repair_mode=(
                         "strict_contract_rewrite"
-                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(deterministic_error)
+                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(error_source)
                         else "minimal_edit"
                     ),
                 )
@@ -6116,7 +6153,7 @@ async def generate_file(request: GenerateFileRequest):
                     failed_checks_text=failed_checks_text,
                     repair_mode=(
                         "strict_contract_rewrite"
-                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(deterministic_error)
+                        if attempt >= 2 and request.file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(error_source)
                         else "minimal_edit"
                     ),
                     skill_plan_entry=request.skill_plan_entry,

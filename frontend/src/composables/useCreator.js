@@ -5,6 +5,16 @@
  * backend/routers/creator.py.
  */
 
+
+function blueprintBodyOnly(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const marker = raw.search(/(^|\n)\s*#{0,2}\s*📋\s*Skill\s+架构蓝图/)
+  const fromMarker = marker >= 0 ? raw.slice(marker).trim() : raw
+  const stop = fromMarker.search(/(^|\n)\s*(AskUserQuestion|确认问题|用户确认|请选择|选项|按钮状态|创建进度|文件生成进度)\b|(^|\n)\s*```text\s*$/i)
+  return (stop >= 0 ? fromMarker.slice(0, stop) : fromMarker).trim()
+}
+
 function assertActionSuccess(payload, fallbackMessage) {
   if (!payload || payload.success !== true) {
     throw new Error(payload?.message || fallbackMessage)
@@ -91,7 +101,7 @@ export async function* generateFileStream({
       skill_name: skillName,
       file_path: filePath,
       purpose,
-      blueprint_text: blueprintText,
+      blueprint_text: blueprintBodyOnly(blueprintText),
       conversation_history: conversationHistory,
       model,
       role,

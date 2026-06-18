@@ -107,6 +107,83 @@ class BlueprintShapeError(ValueError):
     """Raised when a confirmed Creator blueprint violates platform shape."""
 
 
+_BLUEPRINT_UI_STOP_RE = re.compile(
+    r"(?m)^\s*(?:AskUserQuestion|确认问题|用户确认|请选择|选项|按钮状态|创建进度|文件生成进度)\b|^\s*```text\s*$",
+    re.I,
+)
+
+
+def clean_blueprint_body_text(blueprint_text: str) -> str:
+    """Return only the Skill blueprint body, excluding Creator confirmation UI.
+
+    The backend parser receives a business blueprint contract. Confirmation
+    questions, option labels, button states, and progress text belong to the
+    outer Creator UI/state envelope and must not become blueprint prose.
+    """
+    text = (blueprint_text or "").strip()
+    if not text:
+        return ""
+    marker = re.search(r"(?m)^\s*##?\s*📋\s*Skill\s+架构蓝图\s*$|📋\s*Skill\s+架构蓝图", text)
+    if marker:
+        text = text[marker.start():]
+    stop = _BLUEPRINT_UI_STOP_RE.search(text)
+    if stop:
+        text = text[: stop.start()]
+    return text.strip()
+
+
+def _format_capability_list(values: list[str]) -> str:
+    return "[" + ", ".join(values) + "]"
+
+
+def repair_blueprint_business_layers(blueprint_text: str) -> tuple[str, list[str]]:
+    """Locally repair layer-mixed SkillPlan capability fields.
+
+    This handles deterministic structure mistakes before strict validation:
+    platform protocol/safety names are removed from business capability fields
+    instead of causing an immediate 400. Platform-owned constraints remain
+    Creator/Kernel state and are not migrated into the business SkillPlan.
+    """
+    text = clean_blueprint_body_text(blueprint_text)
+    warnings: list[str] = []
+    repaired_lines: list[str] = []
+    current_path = ""
+
+    for line in text.splitlines():
+        path_match = re.match(r"^(\s*-\s*path\s*:\s*)`?([^`\n]+?)`?\s*$", line)
+        if path_match:
+            current_path = path_match.group(2).strip().strip("`'\"，,。.;；").replace("\\", "/")
+            repaired_lines.append(line)
+            continue
+
+        field_match = re.match(r"^(\s*)(required_capabilities|business_forbidden_capabilities|forbidden_capabilities)(\s*:\s*)(.*)$", line)
+        if not field_match:
+            repaired_lines.append(line)
+            continue
+
+        indent, field_name, sep, raw_value = field_match.groups()
+        values = _list_field_from_block(f"{field_name}: {raw_value}", field_name)
+        if field_name == "required_capabilities":
+            kept = [cap for cap in values if is_business_capability(cap)]
+            removed = [cap for cap in values if not is_business_capability(cap)]
+            if removed:
+                warnings.append(
+                    f"已从 {current_path or 'SkillPlan'} required_capabilities 移除平台协议/资源能力：{', '.join(removed)}。"
+                )
+            repaired_lines.append(f"{indent}{field_name}{sep}{_format_capability_list(kept)}")
+            continue
+
+        kept = [cap for cap in values if is_business_capability(cap)]
+        removed = [cap for cap in values if not is_business_capability(cap)]
+        if removed:
+            warnings.append(
+                f"已从 {current_path or 'SkillPlan'} business_forbidden_capabilities 移除平台安全/协议约束：{', '.join(removed)}。"
+            )
+        repaired_lines.append(f"{indent}business_forbidden_capabilities{sep}{_format_capability_list(kept)}")
+
+    return "\n".join(repaired_lines).strip(), warnings
+
+
 def _has_required_blueprint_marker(blueprint_text: str) -> bool:
     return bool(re.search(r"(?m)^\s*##\s+📋\s*Skill\s+架构蓝图\s*$", blueprint_text or ""))
 
@@ -421,7 +498,7 @@ def extract_blueprint_text(messages: list[dict]) -> str | None:
         if msg.get("role") == "assistant":
             content = msg.get("content") or ""
             if _BLUEPRINT_MARKER in content:
-                return content
+                return clean_blueprint_body_text(content)
     return None
 
 
@@ -753,11 +830,15 @@ def parse_blueprint(messages: list[dict], *, strict: bool = False) -> BlueprintP
             ),
         )
 
+    warnings: list[str] = []
     if strict:
+        blueprint_text, repair_warnings = repair_blueprint_business_layers(blueprint_text)
+        warnings.extend(repair_warnings)
         validate_blueprint_shape_for_creator(blueprint_text)
+    else:
+        blueprint_text = clean_blueprint_body_text(blueprint_text)
 
     skill_name = parse_skill_name(blueprint_text)
-    warnings: list[str] = []
     if skill_name is None:
         skill_name = "new-skill"
         warnings.append(

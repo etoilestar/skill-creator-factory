@@ -5368,6 +5368,18 @@ def _script_local_contract_payload(
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the only business contract a script-generation prompt should need."""
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+    raw_strategies = [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])]
+    if tool_resolve.allowed_tools:
+        implementation_mode = "use_registered_tool"
+        strategies = raw_strategies or [{"strategy": "use_registered_tool", "tool_id": tool_resolve.allowed_tools[0]}]
+    else:
+        implementation_mode = "local_code"
+        strategies = [
+            {**strategy, "strategy": "local_code" if strategy.get("strategy") == "generate_code" else strategy.get("strategy", "local_code")}
+            for strategy in raw_strategies
+            if isinstance(strategy, dict)
+        ] or [{"strategy": "local_code", "reason": "No selected Tool Registry tool; implement with standard library/local code."}]
     return {
         "file_path": file_path,
         "file_kind": getattr(plan_entry, "file_kind", plan_entry.file_type),
@@ -5380,7 +5392,9 @@ def _script_local_contract_payload(
         "dependencies": list(plan_entry.dependencies or []),
         "side_effects": list(getattr(plan_entry, "side_effects", []) or []),
         "required_tool_slots": [getattr(slot, "__dict__", slot) for slot in (getattr(plan_entry, "required_tool_slots", []) or [])],
-        "implementation_strategy": [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])],
+        "implementation_mode": implementation_mode,
+        "selected_tools": list(tool_resolve.allowed_tools),
+        "implementation_strategy": strategies,
         "stdout_schema": stdout_schema,
         "runtime_contract": getattr(plan_entry, "runtime_contract", {}) or {"runtime": plan_entry.runtime, "entrypoint": plan_entry.entrypoint or file_path},
         "artifact_contract": getattr(plan_entry, "artifact_contract", {}) or {"stdout_fields": list(plan_entry.outputs or [])},
@@ -5431,6 +5445,7 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
+    implementation_mode = str(local_contract.get("implementation_mode") or "local_code")
     tool_usage_prompt = ""
     script_skeleton_text = ""
     if variant == "standard":
@@ -5465,7 +5480,13 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
-        "只根据 required_tool_slots 与 implementation_strategy 实现接口能力；role/capability 只是 hint，不得当作硬协议或自行选择未声明工具。",
+        "只根据 required_tool_slots、implementation_strategy、selected_tools、runtime_contract、artifact_contract 实现接口能力；role/capability 只是 hint。",
+        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。local_code 模式下允许使用标准库和本地代码。",
+        (
+            "当前实现模式：use_registered_tool。必须调用 selected_tools 中列出的工具；不要自造 import path；不要使用未声明 helper。"
+            if implementation_mode == "use_registered_tool"
+            else "当前实现模式：local_code。没有合适平台工具，允许使用目标语言标准库和本地代码实现；不需要外部工具；不要调用平台 helper；不要调用外部服务；允许本地文件读写但必须遵守输出目录限制；如需第三方库，只能使用 declared_dependencies 中声明的库。required_tool_slots=[] 表示无外部工具依赖，可本地实现。"
+        ),
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
@@ -5699,7 +5720,11 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
     except BlueprintShapeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    entries_by_path = {entry.path: entry for entry in (plan.skill_plan.files if plan.skill_plan else [])}
+    entries_by_path = {
+        entry.path: entry
+        for entry in (plan.skill_plan.files if plan.skill_plan else [])
+        if not _is_directory_like_skill_path(entry.path)
+    }
 
     blueprint_text = "\n\n".join(
         str(message.get("content") or "")
@@ -5707,9 +5732,15 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         if isinstance(message, dict)
     )
 
-    base_paths = {f.path for f in plan.files}
+    def is_directory_placeholder(path: str) -> bool:
+        normalized = _normalize_skill_path(path)
+        return not normalized or normalized in {"assets", "assets/"} or normalized.endswith("/") or (
+            normalized.startswith(("assets/", "references/", "scripts/")) and not _has_file_extension(normalized)
+        )
 
-    candidate_paths: set[str] = set(_extract_declared_skill_paths(blueprint_text))
+    base_paths = {f.path for f in plan.files if not is_directory_placeholder(f.path)}
+
+    candidate_paths: set[str] = {path for path in _extract_declared_skill_paths(blueprint_text) if not is_directory_placeholder(path)}
     candidate_paths.update(entries_by_path.keys())
 
     extra_paths = []
@@ -5748,7 +5779,18 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 
     files_out: list[FileSpecOut] = []
 
+    directory_asset_requirements: list[AssetRequirementOut] = []
     for f in plan.files:
+        if is_directory_placeholder(f.path):
+            local_context = _local_blueprint_text_for_path(f.path, blueprint_text) or f.purpose or blueprint_text
+            if _normalize_skill_path(f.path).startswith("assets") and re.search(r"上传|user[_ -]?upload|素材|图片|image|asset", local_context, re.IGNORECASE) and not re.search(r"无需|不需要|不用|无需创建|不生成", local_context):
+                directory_asset_requirements.append(AssetRequirementOut(
+                    path="assets/",
+                    source="user_upload",
+                    required=getattr(f, "required", True),
+                    description=f.purpose or "需要用户上传素材",
+                ))
+            continue
         entry = entries_by_path.get(f.path)
         role = entry.role if entry else fallback_role(f.path)
         file_type = entry.file_type if entry else fallback_file_type(f.path)
@@ -5839,7 +5881,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
         for file_spec in files_out
         if file_spec.path.startswith("assets/") and file_spec.asset_source == "user_upload"
-    ]
+    ] + directory_asset_requirements
 
     available_tools = [tool_status(cap) for cap in list_tool_capabilities()]
     required_tool_names = {
@@ -5848,7 +5890,30 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         for capability in file_spec.required_capabilities
     }
     missing_tool_configs = []
-    warnings = [*list(plan.warnings), *extra_path_warnings]
+    def warning_text(item: Any) -> str:
+        if isinstance(item, dict):
+            if item.get("severity") != "user_warning":
+                return ""
+            return str(item.get("message") or "")
+        text = str(item or "")
+        internal_markers = (
+            "required_capabilities 已降级",
+            "forbidden_capabilities",
+            "raw_capability_hints",
+            "role 降级",
+            "platform capability",
+            "目录占位",
+        )
+        return "" if any(marker in text for marker in internal_markers) else text
+
+    warnings = []
+    seen_warning_keys: set[str] = set()
+    for raw_warning in [*list(plan.warnings), *extra_path_warnings]:
+        text = warning_text(raw_warning).strip()
+        if not text or text in seen_warning_keys:
+            continue
+        seen_warning_keys.add(text)
+        warnings.append(text)
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
         if not cap or cap.category == "resource":
@@ -6048,6 +6113,22 @@ async def generate_file(request: GenerateFileRequest):
         raise HTTPException(
             status_code=400,
             detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可由 Creator 生成，source=user_upload 必须上传。",
+        )
+    if request.file_path.startswith("scripts/") and not (
+        isinstance(request.skill_plan_entry, dict)
+        and request.skill_plan_entry.get("path") == request.file_path
+        and request.skill_plan_entry.get("file_kind", request.skill_plan_entry.get("file_type")) in {"script", None}
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "contract_unresolved",
+                "severity": "user_warning",
+                "source": "generator",
+                "path": request.file_path,
+                "field": "skill_plan_entry",
+                "message": f"{request.file_path} 缺少 normalized skill_plan_entry；已停止生成，避免退化为 payload->text 泛型脚本。",
+            },
         )
 
     async def event_stream():

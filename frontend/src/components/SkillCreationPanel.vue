@@ -32,8 +32,8 @@
     </div>
 
     <!-- Warnings from blueprint parser -->
-    <div v-if="warnings.length" class="warnings">
-      <div v-for="(w, i) in warnings" :key="i" class="warning-item">⚠️ {{ w }}</div>
+    <div v-if="visibleWarnings.length" class="warnings">
+      <div v-for="(w, i) in visibleWarnings" :key="i" class="warning-item">⚠️ {{ warningMessage(w) }}</div>
     </div>
 
     <!-- File list -->
@@ -327,6 +327,35 @@ const localSkillName = ref(props.skillName)
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
+
+const visibleWarnings = computed(() => {
+  const internalMarkers = [
+    'required_capabilities 已降级',
+    'forbidden_capabilities',
+    'raw_capability_hints',
+    'role 降级',
+    'platform capability',
+    '目录占位',
+  ]
+  const seen = new Set()
+  return (props.warnings || []).filter((warning) => {
+    if (warning && typeof warning === 'object' && warning.severity !== 'user_warning') return false
+    const message = warningMessage(warning)
+    if (!message || internalMarkers.some(marker => message.includes(marker))) return false
+    const key = warning && typeof warning === 'object'
+      ? [warning.source, warning.path, warning.field, warning.code].filter(Boolean).join(':')
+      : message
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+})
+
+function warningMessage(warning) {
+  return warning && typeof warning === 'object'
+    ? String(warning.message || warning.code || '')
+    : String(warning || '')
+}
 
 const phase = ref('idle')   // idle | running | paused | validating | packaging | complete | failed
 const paused = ref(false)

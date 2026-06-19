@@ -54,35 +54,6 @@ _PLATFORM_SAFETY_CAPABILITIES: frozenset[str] = frozenset({
     "approval_required",
 })
 
-ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
-    "text_generator": frozenset({"text_generation", "file_output"}),
-    "image_generator": frozenset({"image_generation", "file_output"}),
-    "composite_generator": frozenset({
-        "text_generation",
-        "image_generation",
-        "pdf_generation",
-        "docx_generation",
-        "pptx_generation",
-        "file_output",
-    }),
-    "pdf_builder": frozenset({"pdf_generation", "file_output"}),
-    "docx_builder": frozenset({"docx_generation", "file_output"}),
-    "pptx_builder": frozenset({"pptx_generation", "file_output"}),
-    "pdf_parser": frozenset({"pdf_parsing", "file_output"}),
-    "docx_parser": frozenset({"docx_parsing", "file_output"}),
-    "pptx_parser": frozenset({"pptx_parsing", "file_output"}),
-    "spreadsheet_reader": frozenset({"spreadsheet_read", "file_output"}),
-    "vision_analyzer": frozenset({"vision_understanding", "file_output"}),
-    "search_reader": frozenset({"web_search", "text_generation", "file_output"}),
-    "database_reader": frozenset({"database_read", "text_generation", "file_output"}),
-    "wechat_draft_creator": frozenset({"wechat_draft", "file_output"}),
-    "wechat_publisher": frozenset({"wechat_publish", "file_output"}),
-    "html_asset_builder": frozenset({"html_asset_generation", "file_output"}),
-    "asset_builder": frozenset({"asset_generation", "file_output"}),
-    "generic_script": frozenset({"deterministic_execution", "file_output"}),
-}
-
-
 def capability_layer(capability: str) -> str:
     """Classify a declared capability by ownership layer."""
     name = re.sub(r"[^A-Za-z0-9_-]", "", str(capability or "").strip())
@@ -127,32 +98,13 @@ def normalize_required_capabilities(
     required_capabilities: list[str],
     user_blueprint_text: str = "",
 ) -> list[str]:
-    """Keep only explicitly declared runtime capabilities allowed for the role.
+    """Deprecated compatibility shim: capabilities are hints, not contracts.
 
-    ``user_blueprint_text`` is accepted for backwards compatibility with older
-    callers, but is intentionally ignored. Creator backend must not infer
-    business capabilities from blueprint prose, purpose text, or file names.
+    Creator normalized plans keep model-provided capability names in
+    ``raw_capability_hints`` for diagnostics only. They must not drive role
+    validation, tool-slot inference, implementation strategy, or script prompts.
     """
-    normalized_role = (role or "").strip()
-    normalized_path = (path or "").strip().replace("\\", "/")
-    if is_resource_role(normalized_role) or normalized_path == "SKILL.md" or normalized_path.startswith(("references/", "assets/")):
-        return []
-
-    allowed = ROLE_ALLOWED_CAPABILITIES.get(normalized_role)
-    requested = _dedupe_capabilities(required_capabilities)
-    if allowed is not None:
-        requested = [capability for capability in requested if capability in allowed]
-
-    runtime_only: list[str] = []
-    for capability in requested:
-        cap = get_tool_capability(capability)
-        if cap and cap.category == "resource":
-            continue
-        if capability_layer(capability) != "business_skill":
-            continue
-        runtime_only.append(capability)
-
-    return runtime_only
+    return []
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
@@ -235,6 +187,7 @@ class SkillPlanEntry:
     default_values: dict[str, object] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
+    raw_capability_hints: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)
     allowed_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
@@ -665,11 +618,16 @@ def file_role_classifier(
 
 
 def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    """Return neutral structural defaults, independent of component hints.
+    """Backward-compatible neutral default; role never decides IO."""
+    return [], []
 
-    Role/component_hint must not decide IO. Callers should prefer explicit
-    normalized inputs/outputs parsed from the blueprint.
-    """
+
+def default_io_for_file_kind(file_kind: FileKind) -> tuple[list[str], list[str]]:
+    """Conservative IO defaults derived only from file kind."""
+    if file_kind == "script":
+        return ["payload"], []
+    if file_kind == "skill_doc":
+        return ["user_request"], ["workflow"]
     return [], []
 
 
@@ -703,7 +661,8 @@ def build_skill_plan_entry(
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    default_inputs, default_outputs = default_io_for_role(role)
+    file_kind = file_kind_for_path(file_path)
+    default_inputs, default_outputs = default_io_for_file_kind(file_kind)
     inputs = explicit_inputs if explicit_inputs is not None else default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
     outputs = explicit_outputs if explicit_outputs is not None else default_outputs
@@ -716,13 +675,9 @@ def build_skill_plan_entry(
     explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
     raw_required_capabilities = explicit_required_capabilities or []
-    platform_capabilities = [cap for cap in _dedupe_capabilities(raw_required_capabilities) if capability_layer(cap) == "platform_protocol"]
-    required_capabilities = normalize_required_capabilities(
-        role=role,
-        path=file_path,
-        required_capabilities=raw_required_capabilities,
-        user_blueprint_text=f"{purpose}\n{blueprint_summary}",
-    )
+    raw_capability_hints = _dedupe_capabilities(raw_required_capabilities)
+    platform_capabilities = [cap for cap in raw_capability_hints if capability_layer(cap) == "platform_protocol"]
+    required_capabilities: list[str] = []
     optional_capabilities = [cap for cap in (explicit_optional_capabilities or []) if is_business_capability(cap)]
     allowed_capabilities = [cap for cap in (explicit_allowed_capabilities or []) if is_business_capability(cap)]
     explicit_forbidden = (
@@ -735,7 +690,6 @@ def build_skill_plan_entry(
         capability for capability in _dedupe_capabilities(raw_forbidden_capabilities)
         if is_business_capability(capability) and capability not in required_capabilities
     ]
-    file_kind = file_kind_for_path(file_path)
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
@@ -755,6 +709,7 @@ def build_skill_plan_entry(
         dependencies=dependencies,
         side_effects=explicit_side_effects,
         required_capabilities=required_capabilities,
+        raw_capability_hints=raw_capability_hints,
         optional_capabilities=optional_capabilities,
         allowed_capabilities=allowed_capabilities,
         forbidden_capabilities=forbidden_capabilities,
@@ -904,12 +859,8 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
                 continue
             seen_skill_md = True
 
-        normalized_required = normalize_required_capabilities(
-            role=entry.role,
-            path=path,
-            required_capabilities=list(entry.required_capabilities or []),
-            user_blueprint_text=entry.purpose,
-        )
+        raw_capability_hints = _dedupe_capabilities(list(entry.raw_capability_hints or entry.required_capabilities or []))
+        normalized_required: list[str] = []
         dependencies = [dep for dep in _dedupe_paths(list(entry.dependencies or [])) if not dependency_is_output_semantic(dep, prior_outputs)]
         removed_deps = set(entry.dependencies or []) - set(dependencies)
         for dep in sorted(removed_deps):
@@ -921,9 +872,10 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             file_kind=file_kind_for_path(path),
             component_hint=entry.component_hint or entry.role,
             required_capabilities=normalized_required,
+            raw_capability_hints=raw_capability_hints,
             dependencies=dependencies,
             forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
-            business_capabilities=normalized_required,
+            business_capabilities=[],
             platform_capabilities=[cap for cap in entry.platform_capabilities if capability_layer(cap) == "platform_protocol"],
             business_forbidden_capabilities=[cap for cap in entry.business_forbidden_capabilities or entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
             platform_safety_constraints=[cap for cap in entry.platform_safety_constraints if is_platform_safety_constraint(cap)],
@@ -936,7 +888,7 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             if not _is_asset_upload_only(cleaned):
                 warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
                 continue
-            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], business_capabilities=[], platform_capabilities=[], runtime="none", entrypoint="", command_template="", execution_contract={}, layer="static_resource")
+            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], raw_capability_hints=[], optional_capabilities=[], allowed_capabilities=[], business_capabilities=[], platform_capabilities=[], runtime="none", entrypoint="", command_template="", execution_contract={}, layer="static_resource")
 
         if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
             cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")

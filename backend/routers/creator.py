@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, BlueprintShapeError, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -417,24 +417,21 @@ def _skill_plan_entry_defaults(
     language = language_for_path(file_path)
     runtime = runtime_for_language(language, file_type)
 
-    required_capabilities, forbidden_capabilities = capabilities_for_role(resolved_role)
-    inputs, outputs = default_io_for_role(resolved_role)
-
-    required_capabilities = list(required_capabilities or [])
-    forbidden_capabilities = [
-        cap for cap in list(forbidden_capabilities or [])
-        if cap not in required_capabilities
-    ]
+    required_capabilities, forbidden_capabilities = [], []
+    file_kind = file_kind_for_path(file_path)
+    inputs, outputs = default_io_for_file_kind(file_kind)
 
     return {
         "path": file_path,
         "purpose": purpose or f"{file_path} 的职责说明",
         "file_type": file_type,
+        "file_kind": file_kind,
         "role": resolved_role,
         "inputs": list(inputs or []),
         "outputs": list(outputs or []),
         "dependencies": [],
         "required_capabilities": required_capabilities,
+        "raw_capability_hints": list(required_capabilities or []),
         "forbidden_capabilities": forbidden_capabilities,
         "reference_files": [],
         "skill_local_references": [],
@@ -557,9 +554,7 @@ def _skill_plan_entry_for_file(
     # over-broad SkillPlan capabilities do not leak into runtime warnings.
     required = list(data.get("required_capabilities") or [])
     forbidden = list(data.get("forbidden_capabilities") or [])
-    if not required and not forbidden:
-        required, forbidden = capabilities_for_role(data["role"])
-
+    data["raw_capability_hints"] = list(data.get("raw_capability_hints") or required or [])
     required = normalize_required_capabilities(
         role=str(data.get("role") or ""),
         path=file_path,
@@ -573,7 +568,7 @@ def _skill_plan_entry_for_file(
     ]
 
     if not data.get("inputs") or not data.get("outputs"):
-        default_inputs, default_outputs = default_io_for_role(data["role"])
+        default_inputs, default_outputs = default_io_for_file_kind(file_kind_for_path(file_path))
         data["inputs"] = list(data.get("inputs") or default_inputs or [])
         data["outputs"] = list(data.get("outputs") or default_outputs or [])
 
@@ -1664,6 +1659,7 @@ def _collect_blueprint_skillplan_constraints(
         "declared_references": sorted(set(declared_references)),
         "declared_assets": sorted(set(declared_assets)),
         "required_capabilities": required_capabilities,
+        "raw_capability_hints": list(required_capabilities or []),
         "forbidden_capabilities": forbidden_capabilities,
         "inputs": inputs,
         "outputs": outputs,
@@ -3138,6 +3134,7 @@ def _check_script_file_contract(
         )
     )
 
+    capability_contract_enforced = False  # required_capabilities/forbidden_capabilities are hints, not script-contract gates.
     uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
     if plan_entry.role in {
         "pdf_builder",
@@ -3161,7 +3158,7 @@ def _check_script_file_contract(
             )
         )
 
-    if uses_image_helper and "image_generation" not in (plan_entry.required_capabilities or []):
+    if capability_contract_enforced and uses_image_helper and "image_generation" not in (plan_entry.required_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
@@ -3173,7 +3170,7 @@ def _check_script_file_contract(
             )
         )
 
-    if "image_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
@@ -3196,7 +3193,7 @@ def _check_script_file_contract(
             re.IGNORECASE,
         )
     )
-    if uses_text_helper and "text_generation" not in (plan_entry.required_capabilities or []):
+    if capability_contract_enforced and uses_text_helper and "text_generation" not in (plan_entry.required_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_text_generation",
@@ -3208,7 +3205,7 @@ def _check_script_file_contract(
             )
         )
 
-    if "text_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "text_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_text_generation",
@@ -3225,7 +3222,7 @@ def _check_script_file_contract(
         )
 
     uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
-    if "pdf_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "pdf_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_pdf_generation",
@@ -5794,14 +5791,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         runtime = runtime_for_language(language, file_type or "")
         is_asset = path.startswith("assets/")
 
-        required_capabilities, forbidden_capabilities = capabilities_for_role(role or "generic_script")
-        required_capabilities = normalize_required_capabilities(
-            role=role or "generic_script",
-            path=path,
-            required_capabilities=list(required_capabilities or []),
-            user_blueprint_text=blueprint_text,
-        )
-        inputs, outputs = default_io_for_role(role or "generic_script")
+        required_capabilities, forbidden_capabilities = [], []
+        inputs, outputs = default_io_for_file_kind(file_kind_for_path(path))
 
         files_out.append(
             FileSpecOut(

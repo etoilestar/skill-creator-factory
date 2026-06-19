@@ -29,7 +29,8 @@ def test_skill_plan_parses_explicit_contract_fields_and_reference_mapping():
     assert entry.inputs == ["topic", "prompt"]
     assert entry.outputs == ["image_paths", "images"]
     assert entry.dependencies == ["references/image-generation.md"]
-    assert entry.required_capabilities == ["image_generation"]
+    assert entry.required_capabilities == []
+    assert entry.raw_capability_hints == ["image_generation"]
     assert entry.forbidden_capabilities == ["pdf_generation"]
 
 
@@ -375,7 +376,7 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     assert entry.role == "generic_script"
     assert entry.required_capabilities == []
     assert entry.forbidden_capabilities == []
-    assert entry.inputs == []
+    assert entry.inputs == ["payload"]
     assert "custom_character" not in entry.inputs
     assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
@@ -451,7 +452,7 @@ if __name__ == '__main__':
         deterministic_error="script.capability.forbidden_image_generation: forbidden_capabilities 禁止但脚本调用了图片生成 helper",
     )
 
-    assert "script.capability.forbidden_image_generation" in failed
+    assert "script.capability.forbidden_image_generation" not in failed
     assert "禁止修改蓝图或 SKILL.md" in guidance or "蓝图和 SKILL.md 确定后不能" in guidance
     assert "只能修当前脚本" in guidance
 
@@ -511,7 +512,8 @@ def test_explicit_composite_role_overrides_blueprint_and_command_contract():
 
     assert entry.role == "composite_generator"
     assert entry.inputs == ["topic", "custom_character"]
-    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert entry.required_capabilities == []
+    assert entry.raw_capability_hints == ["text_generation", "image_generation"]
     assert "image_generation" not in entry.forbidden_capabilities
     assert "text_generation" not in entry.forbidden_capabilities
     assert entry.command_template == 'python scripts/main.py \'{"topic":"{{topic}}","custom_character":"{{custom_character}}"}\''
@@ -910,7 +912,7 @@ def test_multifunction_roles_have_unified_optional_output_contracts():
     pptx = build_skill_plan_entry(file_path="scripts/export_pptx.py", purpose="role: pptx_builder inputs: previous_stdout outputs: pptx_path")
 
     assert composite.outputs == ["story_text", "image_paths"]
-    assert {"text_generation", "image_generation"} <= set(composite.required_capabilities)
+    assert {"text_generation", "image_generation"} <= set(composite.raw_capability_hints)
     assert text.outputs == []
     assert image.outputs == []
     assert docx.outputs == ["docx_path"]
@@ -989,9 +991,11 @@ def test_social_card_blueprint_capabilities_are_normalized_to_runtime_needs():
     assert entries["SKILL.md"].required_capabilities == []
     assert entries["references/topic_sources.md"].required_capabilities == []
     assert entries["assets/placeholder.jpg"].required_capabilities == []
-    assert entries["scripts/analyze_topic.py"].required_capabilities == ["text_generation"]
+    assert entries["scripts/analyze_topic.py"].required_capabilities == []
+    assert entries["scripts/analyze_topic.py"].raw_capability_hints == ["text_generation", "web_search", "database_read"]
     assert entries["scripts/generate_illustrated_story.py"].role == "image_generator"
-    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == ["image_generation"]
+    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == []
+    assert entries["scripts/generate_illustrated_story.py"].raw_capability_hints == ["text_generation", "image_generation", "vision_understanding"]
 
 
 def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
@@ -1018,11 +1022,16 @@ def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
         purpose="role: vision_analyzer required_capabilities: [vision_understanding]",
     )
 
-    assert text.required_capabilities == ["text_generation"]
-    assert image.required_capabilities == ["image_generation"]
-    assert "web_search" in search.required_capabilities
-    assert "database_read" in database.required_capabilities
-    assert "vision_understanding" in vision.required_capabilities
+    assert text.required_capabilities == []
+    assert text.raw_capability_hints == ["text_generation", "web_search", "database_read"]
+    assert image.required_capabilities == []
+    assert image.raw_capability_hints == ["image_generation", "vision_understanding"]
+    assert search.required_capabilities == []
+    assert search.raw_capability_hints == ["web_search", "text_generation"]
+    assert database.required_capabilities == []
+    assert database.raw_capability_hints == ["database_read", "text_generation"]
+    assert vision.required_capabilities == []
+    assert vision.raw_capability_hints == ["vision_understanding"]
 
 
 def test_runtime_artifact_asset_is_removed_from_file_plan_generically():
@@ -1150,8 +1159,10 @@ def test_resource_capabilities_are_empty_and_role_allowlist_cleans_spread():
     )
 
     assert reference.required_capabilities == []
-    assert text.required_capabilities == ["text_generation", "file_output"]
-    assert pdf.required_capabilities == ["pdf_generation", "file_output"]
+    assert text.required_capabilities == []
+    assert text.raw_capability_hints == ["text_generation", "web_search", "database_read", "vision_understanding", "wechat_publish", "file_output"]
+    assert pdf.required_capabilities == []
+    assert pdf.raw_capability_hints == ["text_generation", "image_generation", "pdf_generation", "web_search", "database_read", "vision_understanding", "file_output"]
 
 
 def test_skillplan_dataflow_allows_arbitrary_business_field_names():
@@ -1543,8 +1554,9 @@ def test_skillplan_separates_platform_protocol_and_business_capabilities():
         ),
     )
 
-    assert entry.required_capabilities == ["file_output"]
-    assert entry.business_capabilities == ["file_output"]
+    assert entry.required_capabilities == []
+    assert entry.raw_capability_hints == ["deterministic_execution", "file_output"]
+    assert entry.business_capabilities == []
     assert entry.platform_capabilities == ["deterministic_execution"]
     assert entry.business_forbidden_capabilities == ["image_generation"]
     assert entry.platform_safety_constraints == ["network_disabled"]
@@ -1591,7 +1603,8 @@ python scripts/run.py '{"payload":"{{payload}}"}'
     plan = parse_blueprint([{"role": "assistant", "content": blueprint}], strict=True)
     entry = next(item for item in plan.skill_plan.files if item.path == "scripts/run.py")
 
-    assert entry.required_capabilities == ["file_output"]
+    assert entry.required_capabilities == []
+    assert entry.raw_capability_hints == ["file_output"]
     assert entry.platform_capabilities == []
     assert entry.business_forbidden_capabilities == []
     assert any("deterministic_execution" in warning for warning in plan.warnings)
@@ -1659,7 +1672,7 @@ def test_normalized_plan_does_not_infer_from_filename_or_role_defaults():
 
     assert entry.role == "image_generator"
     assert entry.component_hint == "image_generator"
-    assert entry.inputs == []
+    assert entry.inputs == ["payload"]
     assert entry.outputs == []
     assert entry.required_capabilities == []
     assert entry.required_tool_slots == []
@@ -1699,3 +1712,49 @@ This reference explains formatting and quality constraints without executable pr
 
     assert "reference.no_runtime_protocol" not in ok_failed
     assert "reference.no_runtime_protocol" in bad_failed
+
+
+def test_strict_blueprint_role_capability_mismatch_is_warning_not_hard_fail():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: mismatch-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/build_pdf.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  references: []
+- path: `scripts/build_pdf.py`
+  role: text_generator
+  file_kind: script
+  inputs: [text]
+  outputs: [pdf_path]
+  dependencies: []
+  required_capabilities: [pdf_generation, image_generation]
+  forbidden_capabilities: [network_disabled]
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/build_pdf.py '{"text":"{{text}}"}'
+```
+"""
+
+    plan = parse_blueprint([{"role": "assistant", "content": blueprint}], strict=True)
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/build_pdf.py")
+
+    assert entry.role == "text_generator"
+    assert entry.required_capabilities == []
+    assert entry.raw_capability_hints == ["pdf_generation", "image_generation"]
+    assert not any("不允许 capability" in warning for warning in plan.warnings)

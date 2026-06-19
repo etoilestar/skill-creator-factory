@@ -9,8 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .creator_tool_registry import get_tool_capability
-from .skill_plan import ROLE_ALLOWED_CAPABILITIES, RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, capability_layer, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
+from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -773,6 +772,16 @@ def build_skill_plan_from_files(
                 "且文件名像示例占位符。请先确认职责、输入、输出和能力后再添加。"
             )
             continue
+
+        if entry.raw_capability_hints:
+            warning = f"{file.path} required_capabilities 已降级为 hint，不参与 hard validation、tool_slot 推断或脚本合同。"
+            if warning not in plan_warnings:
+                plan_warnings.append(warning)
+
+        if entry.raw_capability_hints:
+            plan_warnings.append(
+                f"{file.path} required_capabilities 已作为 raw_capability_hints 保留；不会参与 hard validation、tool slot 推断或脚本生成合同。"
+            )
 
         entries.append(entry)
 

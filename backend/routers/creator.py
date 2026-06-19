@@ -5804,6 +5804,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     for f in plan.files:
         if is_directory_placeholder(f.path):
             local_context = _local_blueprint_text_for_path(f.path, blueprint_text) or f.purpose or blueprint_text
+            # TODO: move directory-level upload needs into the normalized plan so
+            # asset_requirements are explicit and no longer inferred from text.
             if _normalize_skill_path(f.path).startswith("assets") and re.search(r"上传|user[_ -]?upload|素材|图片|image|asset", local_context, re.IGNORECASE) and not re.search(r"无需|不需要|不用|无需创建|不生成", local_context):
                 directory_asset_requirements.append(AssetRequirementOut(
                     path="assets/",
@@ -6156,10 +6158,14 @@ async def generate_file(request: GenerateFileRequest):
             status_code=400,
             detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可由 Creator 生成，source=user_upload 必须上传。",
         )
+    script_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else {}
+    artifact_contract = script_entry.get("artifact_contract") if isinstance(script_entry.get("artifact_contract"), dict) else {}
+    has_script_outputs = bool(script_entry.get("outputs") or artifact_contract.get("stdout_fields"))
     if request.file_path.startswith("scripts/") and not (
-        isinstance(request.skill_plan_entry, dict)
-        and request.skill_plan_entry.get("path") == request.file_path
-        and request.skill_plan_entry.get("file_kind", request.skill_plan_entry.get("file_type")) in {"script", None}
+        script_entry
+        and script_entry.get("path") == request.file_path
+        and script_entry.get("file_kind", script_entry.get("file_type")) in {"script", None}
+        and has_script_outputs
     ):
         raise HTTPException(
             status_code=422,
@@ -6169,7 +6175,7 @@ async def generate_file(request: GenerateFileRequest):
                 "source": "generator",
                 "path": request.file_path,
                 "field": "skill_plan_entry",
-                "message": f"{request.file_path} 缺少 normalized skill_plan_entry；已停止生成，避免退化为 payload->text 泛型脚本。",
+                "message": f"{request.file_path} 缺少 normalized skill_plan_entry 或 outputs/artifact_contract.stdout_fields；已停止生成，避免退化为 payload->text 泛型脚本。",
             },
         )
 

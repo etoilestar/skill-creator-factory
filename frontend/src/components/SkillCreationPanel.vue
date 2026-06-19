@@ -66,20 +66,8 @@
 
         <!-- Action buttons -->
         <span class="file-actions">
-          <template v-if="looksLikeDirectoryPath(file.path)">
-              <span class="file-meta muted">目录路径，无需上传</span>
-
-              <button
-                v-if="canRemoveFile(file)"
-                class="btn-small btn-remove"
-                @click="removeFile(idx)"
-              >
-                移除
-              </button>
-            </template>
-
-            <!-- 具体 assets 文件：必须由用户上传 -->
-            <template v-else-if="isAssetFile(file)">
+          <!-- 具体 assets 文件 / asset_requirement：必须由用户上传 -->
+          <template v-if="isAssetFile(file)">
               <input
                 type="file"
                 class="btn-small"
@@ -105,6 +93,18 @@
                 移除
               </button>
           </template>
+
+          <template v-else-if="looksLikeDirectoryPath(file.path)">
+              <span class="file-meta muted">目录路径，无需上传</span>
+
+              <button
+                v-if="canRemoveFile(file)"
+                class="btn-small btn-remove"
+                @click="removeFile(idx)"
+              >
+                移除
+              </button>
+            </template>
 
           <!-- 其他文件保持生成/写入按钮 -->
           <template v-else>

@@ -175,11 +175,20 @@ class FileSpecOut(BaseModel):
     required: bool
     can_skip: bool
     file_type: Optional[str] = None
+    file_kind: str = "config"
     role: Optional[str] = None
+    component_hint: str = ""
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
+    side_effects: list[str] = Field(default_factory=list)
+    required_tool_slots: list[dict[str, Any]] = Field(default_factory=list)
+    implementation_strategy: list[dict[str, Any]] = Field(default_factory=list)
+    selected_tools: list[str] = Field(default_factory=list)
+    runtime_contract: dict[str, Any] = Field(default_factory=dict)
+    artifact_contract: dict[str, Any] = Field(default_factory=dict)
     required_capabilities: list[str] = Field(default_factory=list)
+    raw_capability_hints: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)
     reference_files: list[str] = Field(default_factory=list)
     skill_local_references: list[str] = Field(default_factory=list)
@@ -206,7 +215,7 @@ class AssetRequirementOut(BaseModel):
 class AnalyzeBlueprintResponse(BaseModel):
     skill_name: str
     files: list[FileSpecOut]
-    warnings: list[str]
+    warnings: list[Any]
     asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
@@ -5777,6 +5786,18 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             return "asset"
         return None
 
+    def serialize_plan_items(items: Any) -> list[dict[str, Any]]:
+        return [
+            dict(getattr(item, "__dict__", item))
+            for item in (items or [])
+            if isinstance(getattr(item, "__dict__", item), dict)
+        ]
+
+    def selected_tools_for_entry(entry: SkillPlanEntry | None) -> list[str]:
+        if not entry:
+            return []
+        return list(resolve_tools_for_skill_plan_entry(entry).allowed_tools or [])
+
     files_out: list[FileSpecOut] = []
 
     directory_asset_requirements: list[AssetRequirementOut] = []
@@ -5804,11 +5825,20 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required=f.required,
                 can_skip=f.can_skip,
                 file_type=file_type,
+                file_kind=entry.file_kind if entry else file_kind_for_path(f.path),
                 role=role,
+                component_hint=entry.component_hint if entry else (role or ""),
                 inputs=entry.inputs if entry else [],
                 outputs=entry.outputs if entry else [],
                 dependencies=entry.dependencies if entry else [],
+                side_effects=entry.side_effects if entry else [],
+                required_tool_slots=serialize_plan_items(entry.required_tool_slots) if entry else [],
+                implementation_strategy=serialize_plan_items(entry.implementation_strategy) if entry else [],
+                selected_tools=selected_tools_for_entry(entry),
+                runtime_contract=entry.runtime_contract if entry else {},
+                artifact_contract=entry.artifact_contract if entry else {},
                 required_capabilities=entry.required_capabilities if entry else [],
+                raw_capability_hints=entry.raw_capability_hints if entry else [],
                 forbidden_capabilities=entry.forbidden_capabilities if entry else [],
                 reference_files=entry.reference_files if entry else [],
                 skill_local_references=entry.skill_local_references if entry else [],
@@ -5847,11 +5877,20 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required=True,
                 can_skip=False,
                 file_type=file_type,
+                file_kind=file_kind_for_path(path),
                 role=role,
+                component_hint=role or "",
                 inputs=list(inputs or []),
                 outputs=list(outputs or []),
                 dependencies=[],
+                side_effects=[],
+                required_tool_slots=[],
+                implementation_strategy=[],
+                selected_tools=[],
+                runtime_contract={},
+                artifact_contract={},
                 required_capabilities=list(required_capabilities or []),
+                raw_capability_hints=[],
                 forbidden_capabilities=[
                     cap for cap in list(forbidden_capabilities or [])
                     if cap not in set(required_capabilities or [])
@@ -5890,30 +5929,39 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         for capability in file_spec.required_capabilities
     }
     missing_tool_configs = []
-    def warning_text(item: Any) -> str:
+    def normalize_warning(item: Any) -> dict[str, Any] | None:
         if isinstance(item, dict):
-            if item.get("severity") != "user_warning":
-                return ""
-            return str(item.get("message") or "")
-        text = str(item or "")
-        internal_markers = (
-            "required_capabilities 已降级",
-            "forbidden_capabilities",
-            "raw_capability_hints",
-            "role 降级",
-            "platform capability",
-            "目录占位",
-        )
-        return "" if any(marker in text for marker in internal_markers) else text
+            return {
+                "severity": str(item.get("severity") or "normalization_note"),
+                "code": str(item.get("code") or "normalization_note"),
+                "source": str(item.get("source") or "skill_plan"),
+                "path": str(item.get("path") or ""),
+                "field": str(item.get("field") or ""),
+                "message": str(item.get("message") or ""),
+            }
+        text = str(item or "").strip()
+        if not text:
+            return None
+        return {
+            "severity": "normalization_note",
+            "code": "normalization_note",
+            "source": "skill_plan",
+            "path": "",
+            "field": "",
+            "message": text,
+        }
 
     warnings = []
     seen_warning_keys: set[str] = set()
     for raw_warning in [*list(plan.warnings), *extra_path_warnings]:
-        text = warning_text(raw_warning).strip()
-        if not text or text in seen_warning_keys:
+        warning = normalize_warning(raw_warning)
+        if not warning:
             continue
-        seen_warning_keys.add(text)
-        warnings.append(text)
+        key = ":".join(str(warning.get(part) or "") for part in ("source", "path", "field", "code"))
+        if key in seen_warning_keys:
+            continue
+        seen_warning_keys.add(key)
+        warnings.append(warning)
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
         if not cap or cap.category == "resource":
@@ -5922,17 +5970,11 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         missing_runtime_helpers = status.get("missing_runtime_helpers") or []
         missing_dependencies = status.get("missing_dependencies") or []
         if not status["creator_available"]:
-            warnings.append(
-                f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_unavailable", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"})
         if missing_runtime_helpers:
-            warnings.append(
-                f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_runtime_helper_missing", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"})
         if missing_dependencies:
-            warnings.append(
-                f"工具能力 {capability_name} 缺少 runtime dependency: {', '.join(missing_dependencies)}。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_runtime_dependency_missing", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 缺少 runtime dependency: {', '.join(missing_dependencies)}。"})
         if not status["configured"] or missing_runtime_helpers or missing_dependencies or not status["creator_available"]:
             missing_tool_configs.append(status)
 

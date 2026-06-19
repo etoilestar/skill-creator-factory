@@ -1296,8 +1296,34 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
             raw = raw_attr(attr)
             if isinstance(raw, list):
                 caps.extend(str(item) for item in raw if item)
-    if not caps and role == "pdf_builder":
-        caps.append("pdf_generation")
+    if not caps:
+        outputs = set(str(item) for item in (raw_attr("outputs") or []) if item)
+        artifact_contract = raw_attr("artifact_contract") if isinstance(raw_attr("artifact_contract"), dict) else {}
+        artifact_fields = set(str(item) for item in (artifact_contract.get("stdout_fields") or artifact_contract.get("file_fields") or []) if item)
+        side_effects = set(str(item) for item in (raw_attr("side_effects") or []) if item)
+        wanted_fields = outputs | artifact_fields
+        scored: list[tuple[int, str]] = []
+        for candidate in list_tool_capabilities():
+            if not candidate.enabled_by_default or not candidate.allow_creator_use:
+                continue
+            candidate_fields: set[str] = set()
+            for fn in candidate.functions:
+                props = (fn.output_schema or {}).get("properties") if isinstance(fn.output_schema, dict) else {}
+                if isinstance(props, dict):
+                    candidate_fields.update(str(key) for key in props)
+                candidate_fields.update(str(item) for item in ((fn.output_schema or {}).get("required") or []) if item)
+            props = (candidate.output_schema or {}).get("properties") if isinstance(candidate.output_schema, dict) else {}
+            if isinstance(props, dict):
+                candidate_fields.update(str(key) for key in props)
+            candidate_fields.update(str(item) for item in ((candidate.output_schema or {}).get("required") or []) if item)
+            score = len(wanted_fields & candidate_fields) * 10
+            if side_effects and candidate.allow_external_side_effect:
+                score += 1
+            if role and role in candidate.roles:
+                score += 1  # weak hint only; never enough without structural match
+            if score >= 10:
+                scored.append((score, candidate.name))
+        caps.extend(name for _, name in sorted(scored, reverse=True))
     allowed_tools = []
     cards: list[str] = []
     dependencies: list[str] = []

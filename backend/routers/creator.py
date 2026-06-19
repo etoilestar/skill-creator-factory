@@ -6215,42 +6215,34 @@ async def generate_file(request: GenerateFileRequest):
                 if error_source == "generation_empty":
                     empty_retry_index = repair_counts_by_layer[error_layer]
                     if empty_retry_index >= len(_EMPTY_GENERATION_PROMPT_VARIANTS):
-                        fallback_route = route_model("code", requested_model=request.model, reason="creator empty generation fallback code model")
-                        fallback_variant = "minimal"
-                        fallback_messages = (
-                            _build_script_generate_file_prompt_variant(
-                                file_path=request.file_path,
-                                skill_name=skill_name,
-                                purpose=request.purpose,
-                                blueprint_text=request.blueprint_text,
-                                role=request.role,
-                                skill_plan_entry=request.skill_plan_entry,
-                                variant=fallback_variant,
-                            )
-                            if request.file_path.startswith("scripts/")
-                            else prompt_messages
+                        logger.warning(
+                            "[Creator][generate_file][model_empty_content] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d raw_content_length=%d variants=%s error_type=%s",
+                            skill_name,
+                            request.file_path,
+                            route.model,
+                            prompt_variant,
+                            empty_retry_index,
+                            _prompt_chars(prompt_messages),
+                            len(candidate or ""),
+                            "->".join(_EMPTY_GENERATION_PROMPT_VARIANTS),
+                            "model_empty_content",
                         )
-                        fallback_candidate = await _complete_creator_file_generation(
-                            messages=fallback_messages,
-                            model=fallback_route.model,
-                            skill_name=skill_name,
-                            file_path=request.file_path,
-                            prompt_variant=f"{fallback_variant}:fallback_code_model",
-                            retry_index=empty_retry_index,
-                        )
-                        if fallback_candidate:
-                            candidate = fallback_candidate
-                            prompt_messages = fallback_messages
-                            route = fallback_route
-                            prompt_variant = fallback_variant
-                            continue
                         yield _sse({
                             "type": "file_done",
                             "status": "error",
                             "success": False,
                             "file_path": request.file_path,
                             "role": request.role,
-                            "error": "文件内容生成失败：standard/simplified/minimal 与 fallback code model 后仍为空，请换模型或重新生成。",
+                            "error_type": "model_empty_content",
+                            "error": "文件内容生成失败：same-model prompt degradation 已尝试 standard -> simplified -> minimal 后仍为空。",
+                            "diagnostics": {
+                                "model": route.model,
+                                "prompt_variant": prompt_variant,
+                                "retry_index": empty_retry_index,
+                                "prompt_chars": _prompt_chars(prompt_messages),
+                                "raw_content_length": len(candidate or ""),
+                                "prompt_variants": list(_EMPTY_GENERATION_PROMPT_VARIANTS),
+                            },
                             "done": True,
                         })
                         return

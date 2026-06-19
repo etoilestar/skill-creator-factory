@@ -539,6 +539,8 @@ def test_creator_prompt_injects_kernel_references_for_scripts():
         [],
         skill_plan_entry=entry,
     )
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert len(messages[0]["content"]) < 120
     prompt = messages[-1]["content"]
 
     assert "Creator internal-only kernel guidance" in prompt

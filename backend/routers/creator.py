@@ -5428,6 +5428,45 @@ def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any
     }
 
 
+def _creator_file_generation_messages(task_content: str, *, system_rule: str | None = None) -> list[dict]:
+    """Return Creator generation messages with the concrete task in user role."""
+    rule = system_rule or "你是 Creator 文件内容生成器。只遵守用户消息中的当前文件生成任务；只输出目标文件内容。"
+    return [
+        {"role": "system", "content": rule},
+        {"role": "user", "content": task_content},
+    ]
+
+
+def _ensure_user_visible_task_message(messages: list[dict]) -> list[dict]:
+    """Guarantee same-model retries always include a user-visible task message."""
+    if any(isinstance(message, dict) and message.get("role") == "user" and str(message.get("content") or "").strip() for message in messages):
+        return messages
+    task_content = "\n\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if isinstance(message, dict) and str(message.get("content") or "").strip()
+    )
+    return _creator_file_generation_messages(task_content)
+
+
+def _message_role_counts(messages: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown")
+        counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
+def _message_role_chars(messages: list[dict], role: str) -> int:
+    return sum(
+        len(str(message.get("content") or ""))
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == role
+    )
+
+
 def _build_script_generate_file_prompt_variant(
     *,
     file_path: str,
@@ -5508,7 +5547,10 @@ def _build_script_generate_file_prompt_variant(
         instruction.extend(["固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：", script_skeleton_text])
     if variant == "minimal":
         instruction.append("极简要求：返回可运行脚本源码，解析 JSON argv，真实处理输入，打印满足 stdout_schema 的 JSON object。")
-    return [{"role": "system", "content": "\n\n".join(instruction)}]
+    return _creator_file_generation_messages(
+        "\n\n".join(instruction),
+        system_rule="你是 Creator 脚本文件生成器。只输出单个目标脚本源码；禁止解释、Markdown fence 或多文件包。",
+    )
 
 def _build_generate_file_prompt(
     file_path: str,
@@ -5683,11 +5725,11 @@ def _build_generate_file_prompt(
             f"蓝图：\n\n{clean_blueprint_text}"
         )
 
-    messages: list[dict] = [{"role": "system", "content": instruction}]
+    messages: list[dict] = _creator_file_generation_messages(instruction)
 
     if file_path.startswith("scripts/"):
-        # Scripts are generated from the system instruction plus the confirmed
-        # blueprint only.  Do not append conversation history: recent Creator UI
+        # Scripts are generated from a short system rule plus a user-visible concrete task.
+        # Do not append conversation history: recent Creator UI
         # copy (file-list previews, confirmation instructions, panel messages)
         # has repeatedly polluted first-pass script output.
         return messages
@@ -6089,15 +6131,19 @@ async def _complete_creator_file_generation(
     retry_index: int,
 ) -> str:
     """Call the file-generation model with minimum diagnostic logging."""
+    messages = _ensure_user_visible_task_message(messages)
     prompt_text = "\n".join(str(message.get("content") or "") for message in messages if isinstance(message, dict))
     logger.info(
-        "[Creator][generate_file][llm_request] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d uses_full_blueprint=%s uses_platform_protocol_text=%s",
+        "[Creator][generate_file][llm_request] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d message_roles=%s system_chars=%d user_chars=%d uses_full_blueprint=%s uses_platform_protocol_text=%s",
         skill_name,
         file_path,
         model,
         prompt_variant,
         retry_index,
         _prompt_chars(messages),
+        json.dumps(_message_role_counts(messages), ensure_ascii=False, sort_keys=True),
+        _message_role_chars(messages, "system"),
+        _message_role_chars(messages, "user"),
         "已确认的蓝图" in prompt_text or "Skill 架构蓝图" in prompt_text,
         any(
             marker in prompt_text
@@ -6108,23 +6154,28 @@ async def _complete_creator_file_generation(
         content = await complete_chat_once(messages, model)
     except Exception as exc:
         logger.exception(
-            "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d error_type=%s",
+            "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d message_roles=%s system_chars=%d user_chars=%d error_type=%s",
             skill_name,
             file_path,
             model,
             prompt_variant,
             retry_index,
+            json.dumps(_message_role_counts(messages), ensure_ascii=False, sort_keys=True),
+            _message_role_chars(messages, "system"),
+            _message_role_chars(messages, "user"),
             type(exc).__name__,
         )
         raise
     logger.info(
-        "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d raw_finish_reason=%s completion_tokens=%s raw_content_length=%d error_type=%s",
+        "[Creator][generate_file][llm_response] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d message_roles=%s system_chars=%d user_chars=%d finish_reason=%s content_len=%d error_type=%s",
         skill_name,
         file_path,
         model,
         prompt_variant,
         retry_index,
-        "unknown",
+        json.dumps(_message_role_counts(messages), ensure_ascii=False, sort_keys=True),
+        _message_role_chars(messages, "system"),
+        _message_role_chars(messages, "user"),
         "unknown",
         len(content or ""),
         "",
@@ -6356,15 +6407,20 @@ async def generate_file(request: GenerateFileRequest):
                 if error_source == "model_empty_content":
                     empty_retry_index = repair_counts_by_layer[error_layer]
                     if empty_retry_index >= len(_EMPTY_GENERATION_PROMPT_VARIANTS):
+                        prompt_messages = _ensure_user_visible_task_message(prompt_messages)
                         logger.warning(
-                            "[Creator][generate_file][model_empty_content] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d raw_content_length=%d variants=%s error_type=%s",
+                            "[Creator][generate_file][model_empty_content] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d message_roles=%s system_chars=%d user_chars=%d content_len=%d finish_reason=%s variants=%s error_type=%s",
                             skill_name,
                             request.file_path,
                             route.model,
                             prompt_variant,
                             empty_retry_index,
                             _prompt_chars(prompt_messages),
+                            json.dumps(_message_role_counts(prompt_messages), ensure_ascii=False, sort_keys=True),
+                            _message_role_chars(prompt_messages, "system"),
+                            _message_role_chars(prompt_messages, "user"),
                             len(candidate or ""),
+                            "unknown",
                             "->".join(_EMPTY_GENERATION_PROMPT_VARIANTS),
                             "model_empty_content",
                         )
@@ -6381,7 +6437,11 @@ async def generate_file(request: GenerateFileRequest):
                                 "prompt_variant": prompt_variant,
                                 "retry_index": empty_retry_index,
                                 "prompt_chars": _prompt_chars(prompt_messages),
-                                "raw_content_length": len(candidate or ""),
+                                "content_len": len(candidate or ""),
+                                "message_roles": _message_role_counts(prompt_messages),
+                                "system_chars": _message_role_chars(prompt_messages, "system"),
+                                "user_chars": _message_role_chars(prompt_messages, "user"),
+                                "finish_reason": "unknown",
                                 "prompt_variants": list(_EMPTY_GENERATION_PROMPT_VARIANTS),
                             },
                             "done": True,

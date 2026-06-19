@@ -1295,7 +1295,7 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
         blueprint_text="## 📋 Skill 架构蓝图\n### 宿主执行方式\n- 需要脚本/命令",
         conversation_history=[],
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "宿主 Markdown 执行说明" in prompt
     assert "普通 Markdown 说明书" in prompt
@@ -1487,7 +1487,7 @@ def test_creator_script_prompt_requires_platform_image_runtime_helper():
         conversation_history=[],
         role="image_generator",
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "LLM_BASE_URL" in prompt
     assert "IMAGE_BASE_URL" in prompt
@@ -1883,7 +1883,7 @@ def test_creator_script_prompt_includes_generated_file_contract():
         conversation_history=[],
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "必须满足以下脚本文件合同" in prompt
     assert "scripts/generate_story_and_image.py" in prompt
     assert "读取 sys.argv[1] 并 json.loads" in prompt
@@ -1904,8 +1904,9 @@ def test_creator_script_prompt_uses_skeleton_and_ignores_history():
         ],
     )
 
-    assert len(messages) == 1
-    prompt = messages[0]["content"]
+    assert len(messages) == 2
+    assert [message["role"] for message in messages] == ["system", "user"]
+    prompt = messages[-1]["content"]
     assert "固定脚本骨架" in prompt
     assert "def parse_args()" in prompt
     assert "def run(payload: dict)" in prompt or "def build_image_prompt(payload: dict)" in prompt
@@ -2006,7 +2007,7 @@ def test_creator_reference_prompt_includes_generated_file_contract():
         conversation_history=[],
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "必须满足以下参考资料文件合同" in prompt
     assert "references/style.md" in prompt
     assert "故事写作风格参考" in prompt
@@ -2109,7 +2110,7 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
         conversation_history=conversation_history,
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "```bash fenced code block" in prompt
     assert "必须满足以下 SKILL.md 合同" in prompt
     assert "scripts/generate_nursery_rhyme.py" in prompt
@@ -2126,7 +2127,8 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     assert "不要逐字复制这些约束" in prompt
     assert "若当前无误" not in prompt
     assert "确认项列表" not in prompt
-    assert len(messages) == 1
+    assert len(messages) == 2
+    assert [message["role"] for message in messages[:2]] == ["system", "user"]
 
 
 def test_creator_skill_md_contract_rejects_flow_leak_missing_bash_and_reference():
@@ -2782,7 +2784,7 @@ def test_creator_skill_md_prompt_requires_composite_orchestration():
         blueprint_text="scripts/a.py role: text_generator\nreferences/a.md",
         conversation_history=[],
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "复合任务 orchestrator" in prompt
     assert "执行顺序" in prompt

@@ -175,11 +175,20 @@ class FileSpecOut(BaseModel):
     required: bool
     can_skip: bool
     file_type: Optional[str] = None
+    file_kind: str = "config"
     role: Optional[str] = None
+    component_hint: str = ""
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
+    side_effects: list[str] = Field(default_factory=list)
+    required_tool_slots: list[dict[str, Any]] = Field(default_factory=list)
+    implementation_strategy: list[dict[str, Any]] = Field(default_factory=list)
+    selected_tools: list[str] = Field(default_factory=list)
+    runtime_contract: dict[str, Any] = Field(default_factory=dict)
+    artifact_contract: dict[str, Any] = Field(default_factory=dict)
     required_capabilities: list[str] = Field(default_factory=list)
+    raw_capability_hints: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)
     reference_files: list[str] = Field(default_factory=list)
     skill_local_references: list[str] = Field(default_factory=list)
@@ -206,7 +215,7 @@ class AssetRequirementOut(BaseModel):
 class AnalyzeBlueprintResponse(BaseModel):
     skill_name: str
     files: list[FileSpecOut]
-    warnings: list[str]
+    warnings: list[Any]
     asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
@@ -5368,6 +5377,18 @@ def _script_local_contract_payload(
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the only business contract a script-generation prompt should need."""
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+    raw_strategies = [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])]
+    if tool_resolve.allowed_tools:
+        implementation_mode = "use_registered_tool"
+        strategies = raw_strategies or [{"strategy": "use_registered_tool", "tool_id": tool_resolve.allowed_tools[0]}]
+    else:
+        implementation_mode = "local_code"
+        strategies = [
+            {**strategy, "strategy": "local_code" if strategy.get("strategy") == "generate_code" else strategy.get("strategy", "local_code")}
+            for strategy in raw_strategies
+            if isinstance(strategy, dict)
+        ] or [{"strategy": "local_code", "reason": "No selected Tool Registry tool; implement with standard library/local code."}]
     return {
         "file_path": file_path,
         "file_kind": getattr(plan_entry, "file_kind", plan_entry.file_type),
@@ -5380,7 +5401,9 @@ def _script_local_contract_payload(
         "dependencies": list(plan_entry.dependencies or []),
         "side_effects": list(getattr(plan_entry, "side_effects", []) or []),
         "required_tool_slots": [getattr(slot, "__dict__", slot) for slot in (getattr(plan_entry, "required_tool_slots", []) or [])],
-        "implementation_strategy": [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])],
+        "implementation_mode": implementation_mode,
+        "selected_tools": list(tool_resolve.allowed_tools),
+        "implementation_strategy": strategies,
         "stdout_schema": stdout_schema,
         "runtime_contract": getattr(plan_entry, "runtime_contract", {}) or {"runtime": plan_entry.runtime, "entrypoint": plan_entry.entrypoint or file_path},
         "artifact_contract": getattr(plan_entry, "artifact_contract", {}) or {"stdout_fields": list(plan_entry.outputs or [])},
@@ -5431,6 +5454,7 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
+    implementation_mode = str(local_contract.get("implementation_mode") or "local_code")
     tool_usage_prompt = ""
     script_skeleton_text = ""
     if variant == "standard":
@@ -5465,7 +5489,13 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
-        "只根据 required_tool_slots 与 implementation_strategy 实现接口能力；role/capability 只是 hint，不得当作硬协议或自行选择未声明工具。",
+        "只根据 required_tool_slots、implementation_strategy、selected_tools、runtime_contract、artifact_contract 实现接口能力；role/capability 只是 hint。",
+        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。local_code 模式下允许使用标准库和本地代码。",
+        (
+            "当前实现模式：use_registered_tool。必须调用 selected_tools 中列出的工具；不要自造 import path；不要使用未声明 helper。"
+            if implementation_mode == "use_registered_tool"
+            else "当前实现模式：local_code。没有合适平台工具，允许使用目标语言标准库和本地代码实现；不需要外部工具；不要调用平台 helper；不要调用外部服务；允许本地文件读写但必须遵守输出目录限制；如需第三方库，只能使用 declared_dependencies 中声明的库。required_tool_slots=[] 表示无外部工具依赖，可本地实现。"
+        ),
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
@@ -5699,7 +5729,11 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
     except BlueprintShapeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    entries_by_path = {entry.path: entry for entry in (plan.skill_plan.files if plan.skill_plan else [])}
+    entries_by_path = {
+        entry.path: entry
+        for entry in (plan.skill_plan.files if plan.skill_plan else [])
+        if not _is_directory_like_skill_path(entry.path)
+    }
 
     blueprint_text = "\n\n".join(
         str(message.get("content") or "")
@@ -5707,9 +5741,15 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         if isinstance(message, dict)
     )
 
-    base_paths = {f.path for f in plan.files}
+    def is_directory_placeholder(path: str) -> bool:
+        normalized = _normalize_skill_path(path)
+        return not normalized or normalized in {"assets", "assets/"} or normalized.endswith("/") or (
+            normalized.startswith(("assets/", "references/", "scripts/")) and not _has_file_extension(normalized)
+        )
 
-    candidate_paths: set[str] = set(_extract_declared_skill_paths(blueprint_text))
+    base_paths = {f.path for f in plan.files if not is_directory_placeholder(f.path)}
+
+    candidate_paths: set[str] = {path for path in _extract_declared_skill_paths(blueprint_text) if not is_directory_placeholder(path)}
     candidate_paths.update(entries_by_path.keys())
 
     extra_paths = []
@@ -5746,9 +5786,34 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             return "asset"
         return None
 
+    def serialize_plan_items(items: Any) -> list[dict[str, Any]]:
+        return [
+            dict(getattr(item, "__dict__", item))
+            for item in (items or [])
+            if isinstance(getattr(item, "__dict__", item), dict)
+        ]
+
+    def selected_tools_for_entry(entry: SkillPlanEntry | None) -> list[str]:
+        if not entry:
+            return []
+        return list(resolve_tools_for_skill_plan_entry(entry).allowed_tools or [])
+
     files_out: list[FileSpecOut] = []
 
+    directory_asset_requirements: list[AssetRequirementOut] = []
     for f in plan.files:
+        if is_directory_placeholder(f.path):
+            local_context = _local_blueprint_text_for_path(f.path, blueprint_text) or f.purpose or blueprint_text
+            # TODO: move directory-level upload needs into the normalized plan so
+            # asset_requirements are explicit and no longer inferred from text.
+            if _normalize_skill_path(f.path).startswith("assets") and re.search(r"上传|user[_ -]?upload|素材|图片|image|asset", local_context, re.IGNORECASE) and not re.search(r"无需|不需要|不用|无需创建|不生成", local_context):
+                directory_asset_requirements.append(AssetRequirementOut(
+                    path="assets/",
+                    source="user_upload",
+                    required=getattr(f, "required", True),
+                    description=f.purpose or "需要用户上传素材",
+                ))
+            continue
         entry = entries_by_path.get(f.path)
         role = entry.role if entry else fallback_role(f.path)
         file_type = entry.file_type if entry else fallback_file_type(f.path)
@@ -5762,11 +5827,20 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required=f.required,
                 can_skip=f.can_skip,
                 file_type=file_type,
+                file_kind=entry.file_kind if entry else file_kind_for_path(f.path),
                 role=role,
+                component_hint=entry.component_hint if entry else (role or ""),
                 inputs=entry.inputs if entry else [],
                 outputs=entry.outputs if entry else [],
                 dependencies=entry.dependencies if entry else [],
+                side_effects=entry.side_effects if entry else [],
+                required_tool_slots=serialize_plan_items(entry.required_tool_slots) if entry else [],
+                implementation_strategy=serialize_plan_items(entry.implementation_strategy) if entry else [],
+                selected_tools=selected_tools_for_entry(entry),
+                runtime_contract=entry.runtime_contract if entry else {},
+                artifact_contract=entry.artifact_contract if entry else {},
                 required_capabilities=entry.required_capabilities if entry else [],
+                raw_capability_hints=entry.raw_capability_hints if entry else [],
                 forbidden_capabilities=entry.forbidden_capabilities if entry else [],
                 reference_files=entry.reference_files if entry else [],
                 skill_local_references=entry.skill_local_references if entry else [],
@@ -5805,11 +5879,20 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
                 required=True,
                 can_skip=False,
                 file_type=file_type,
+                file_kind=file_kind_for_path(path),
                 role=role,
+                component_hint=role or "",
                 inputs=list(inputs or []),
                 outputs=list(outputs or []),
                 dependencies=[],
+                side_effects=[],
+                required_tool_slots=[],
+                implementation_strategy=[],
+                selected_tools=[],
+                runtime_contract={},
+                artifact_contract={},
                 required_capabilities=list(required_capabilities or []),
+                raw_capability_hints=[],
                 forbidden_capabilities=[
                     cap for cap in list(forbidden_capabilities or [])
                     if cap not in set(required_capabilities or [])
@@ -5839,7 +5922,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
         for file_spec in files_out
         if file_spec.path.startswith("assets/") and file_spec.asset_source == "user_upload"
-    ]
+    ] + directory_asset_requirements
 
     available_tools = [tool_status(cap) for cap in list_tool_capabilities()]
     required_tool_names = {
@@ -5848,7 +5931,39 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         for capability in file_spec.required_capabilities
     }
     missing_tool_configs = []
-    warnings = [*list(plan.warnings), *extra_path_warnings]
+    def normalize_warning(item: Any) -> dict[str, Any] | None:
+        if isinstance(item, dict):
+            return {
+                "severity": str(item.get("severity") or "normalization_note"),
+                "code": str(item.get("code") or "normalization_note"),
+                "source": str(item.get("source") or "skill_plan"),
+                "path": str(item.get("path") or ""),
+                "field": str(item.get("field") or ""),
+                "message": str(item.get("message") or ""),
+            }
+        text = str(item or "").strip()
+        if not text:
+            return None
+        return {
+            "severity": "normalization_note",
+            "code": "normalization_note",
+            "source": "skill_plan",
+            "path": "",
+            "field": "",
+            "message": text,
+        }
+
+    warnings = []
+    seen_warning_keys: set[str] = set()
+    for raw_warning in [*list(plan.warnings), *extra_path_warnings]:
+        warning = normalize_warning(raw_warning)
+        if not warning:
+            continue
+        key = ":".join(str(warning.get(part) or "") for part in ("source", "path", "field", "code"))
+        if key in seen_warning_keys:
+            continue
+        seen_warning_keys.add(key)
+        warnings.append(warning)
     for capability_name in sorted(required_tool_names):
         cap = get_tool_capability(capability_name)
         if not cap or cap.category == "resource":
@@ -5857,17 +5972,11 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         missing_runtime_helpers = status.get("missing_runtime_helpers") or []
         missing_dependencies = status.get("missing_dependencies") or []
         if not status["creator_available"]:
-            warnings.append(
-                f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_unavailable", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 已被禁用或不允许 Creator 使用，相关脚本不会默认获得该能力。"})
         if missing_runtime_helpers:
-            warnings.append(
-                f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_runtime_helper_missing", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 缺少 runtime helper: {', '.join(missing_runtime_helpers)}。"})
         if missing_dependencies:
-            warnings.append(
-                f"工具能力 {capability_name} 缺少 runtime dependency: {', '.join(missing_dependencies)}。"
-            )
+            warnings.append({"severity": "user_warning", "code": "tool_runtime_dependency_missing", "source": "generator", "path": "", "field": "required_capabilities", "message": f"工具能力 {capability_name} 缺少 runtime dependency: {', '.join(missing_dependencies)}。"})
         if not status["configured"] or missing_runtime_helpers or missing_dependencies or not status["creator_available"]:
             missing_tool_configs.append(status)
 
@@ -6048,6 +6157,26 @@ async def generate_file(request: GenerateFileRequest):
         raise HTTPException(
             status_code=400,
             detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可由 Creator 生成，source=user_upload 必须上传。",
+        )
+    script_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else {}
+    artifact_contract = script_entry.get("artifact_contract") if isinstance(script_entry.get("artifact_contract"), dict) else {}
+    has_script_outputs = bool(script_entry.get("outputs") or artifact_contract.get("stdout_fields"))
+    if request.file_path.startswith("scripts/") and not (
+        script_entry
+        and script_entry.get("path") == request.file_path
+        and script_entry.get("file_kind", script_entry.get("file_type")) in {"script", None}
+        and has_script_outputs
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "contract_unresolved",
+                "severity": "user_warning",
+                "source": "generator",
+                "path": request.file_path,
+                "field": "skill_plan_entry",
+                "message": f"{request.file_path} 缺少 normalized skill_plan_entry 或 outputs/artifact_contract.stdout_fields；已停止生成，避免退化为 payload->text 泛型脚本。",
+            },
         )
 
     async def event_stream():

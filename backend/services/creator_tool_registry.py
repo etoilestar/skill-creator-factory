@@ -209,7 +209,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "http_request": _simple_cap("http_request", "HTTP/API 请求", "retrieval", ["search_reader", "generic_script"], prompt="Metadata only. Generated scripts implement HTTP themselves when permissions.network=true."),
     "network_read": _simple_cap("network_read", "网络资源读取", "retrieval", ["search_reader", "generic_script"]),
     "web_search": _simple_cap("web_search", "网页搜索", "retrieval", ["search_reader"], required_env=["SEARCHXNG_BASE_URL"]),
-    "database_read": _simple_cap("database_read", "数据库只读查询", "retrieval", ["database_reader"], required_secrets=["DATABASE_URL"]),
+    "database_read": _simple_cap("database_read", "数据库只读查询", "retrieval", ["database_reader"], required_secrets=["DATABASE_URL"], helper_imports=["query_database_readonly"]),
     "wechat_draft": _simple_cap("wechat_draft", "微信公众号草稿", "publisher", ["wechat_draft_creator"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"]),
     "wechat_publish": _simple_cap("wechat_publish", "微信公众号发布", "publisher", ["wechat_publisher"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"], allow_external_side_effect=True, enabled=False),
     "deterministic_execution": _simple_cap("deterministic_execution", "确定性脚本执行", "common", ["generic_script"]),
@@ -219,6 +219,82 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "authoring_dependency_check": _simple_cap("authoring_dependency_check", "Authoring 依赖检测", "authoring", ["tool_authoring"], allow_creator_use=False),
     "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
+
+# Built-in document helpers are real callable functions, not just capability
+# labels. Keep their manifest next to the registry entry so Creator can inject a
+# safe import/call card only when implementation resolution selects the tool.
+BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["pdf_generation"],
+    helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
+    functions=[
+        ToolFunctionManifest(
+            function_name="create_pdf",
+            import_path="backend.services.runtime_tools",
+            short_description="Create a Unicode-capable PDF from text and return artifact paths.",
+            when_to_use="Use for scripts that need to produce a PDF artifact from text content.",
+            signature="create_pdf(text: str | Iterable[Any], *, filename: str = 'output.pdf', output_dir: str | None = None, title: str | None = None) -> dict[str, Any]",
+            input_schema={
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "filename": {"type": "string"},
+                    "output_dir": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+            },
+            output_schema={
+                "type": "object",
+                "required": ["pdf_path", "file_outputs"],
+                "properties": {
+                    "pdf_path": {"type": "string"},
+                    "file_paths": {"type": "array", "items": {"type": "string"}},
+                    "file_outputs": {"type": "array"},
+                },
+            },
+            example_call=(
+                "from backend.services.runtime_tools import create_pdf\n\n"
+                "result = create_pdf(\n"
+                "    text=payload[\"text_content\"],\n"
+                "    filename=payload.get(\"output_filename\") or \"output.pdf\",\n"
+                ")"
+            ),
+            usage_policy="helper_preferred",
+            allowed_roles=["pdf_builder", "composite_generator"],
+            required_capabilities=["pdf_generation"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="pdf_generation.create_pdf",
+            title="Create a simple PDF",
+            applies_to={"roles": ["pdf_builder", "composite_generator"], "capabilities": ["pdf_generation"]},
+            description="Use the platform PDF helper for text-to-PDF artifact generation.",
+            code=(
+                "from backend.services.runtime_tools import create_pdf\n\n"
+                "text = str(payload.get('text_content') or payload.get('text') or '')\n"
+                "result = create_pdf(text=text, filename=payload.get('output_filename') or 'output.pdf')\n"
+                "return {\n"
+                "    'pdf_path': result['pdf_path'],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['pdf_path']],\n"
+                "}"
+            ),
+            expected_input_shape={"text_content": "string", "output_filename": "string?"},
+            expected_output_shape={"pdf_path": "string", "file_outputs": ["string"]},
+            return_rule="Return pdf_path and file_outputs from create_pdf.",
+            anti_patterns=[
+                "Do not return {'pdf_path': result}; create_pdf returns a dict, not a string.",
+                "Do not invent an import path.",
+                "Do not use `from  import run`.",
+                "Do not write outside OUTPUT_DIR.",
+            ],
+            requires=["pdf_generation"],
+            usage_policy="helper_preferred",
+            priority=120,
+        )
+    ],
+    usage_policy="helper_preferred",
+)
 
 
 def _utc_now() -> str:
@@ -977,7 +1053,11 @@ def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tu
     caps = list_tool_capabilities()
     if only_creator_enabled:
         caps = [cap for cap in caps if cap.enabled_by_default and cap.allow_creator_use]
+    if role == "search_reader" and not any(cap.name == "web_search" for cap in caps):
+        return [], list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
     required = [cap.name for cap in caps if (role or "").strip() in cap.roles]
+    if role == "search_reader":
+        required = [name for name in required if name == "web_search"]
     if role == "generic_script" and "deterministic_execution" not in required:
         required.append("deterministic_execution")
     return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
@@ -1006,8 +1086,9 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "missing_secrets": missing_secrets,
         "missing_dependencies": missing_dependencies,
         "missing_runtime_helpers": [],
-        "runtime_helpers_available": [],
+        "runtime_helpers_available": sorted(set([*cap.helper_imports, *[fn.function_name for fn in cap.functions if fn.function_name]])),
         "runtime_type": "python_script",
+        "override_persistence": TOOL_OVERRIDE_PERSISTENCE,
     }
 
 
@@ -1079,7 +1160,25 @@ def set_tool_snippets(name: str, snippets: list[ToolSnippet]) -> ToolCapability 
 
 
 def function_cards_for_tool(capability: ToolCapability) -> list[str]:
-    return [f"Tool: {capability.name}.{fn.function_name}\nSignature: {fn.signature}\nRuntime: python_script" for fn in capability.functions]
+    cards: list[str] = []
+    for fn in capability.functions:
+        if not fn.import_path or not fn.function_name:
+            continue
+        cards.append("\n".join([
+            f"Tool: {capability.name}.{fn.function_name}",
+            f"Function: {fn.function_name}",
+            f"Import: from {fn.import_path} import {fn.function_name}",
+            f"Signature: {fn.signature}",
+            f"usage_policy={fn.usage_policy or capability.usage_policy}",
+            "Input schema:",
+            json.dumps(fn.input_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Output schema:",
+            json.dumps(fn.output_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Example call:",
+            (fn.example_call or f"from {fn.import_path} import {fn.function_name}\nresult = {fn.function_name}(...)").strip(),
+            "Runtime: python_script",
+        ]))
+    return cards
 
 
 def resolve_tool_snippets_for_context(*, role: str, capabilities: list[str], tool_names: list[str], file_path: str, failure_layer: str | None = None, error_text: str | None = None, max_snippets: int = 5) -> list[dict[str, Any]]:
@@ -1171,23 +1270,83 @@ def tool_layer_prompt_for_context(
 
 def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
-    caps = []
-    for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
-        raw = entry.get(attr) if isinstance(entry, dict) else getattr(entry, attr, None)
-        if isinstance(raw, list):
-            caps.extend(str(item) for item in raw if item)
+    def raw_attr(name: str) -> Any:
+        return entry.get(name) if isinstance(entry, dict) else getattr(entry, name, None)
+
+    selected = [str(item) for item in (raw_attr("selected_tools") or []) if item]
+    strategies = raw_attr("implementation_strategy") or []
+    slots = raw_attr("required_tool_slots") or []
+    caps = list(selected)
+    for strategy in strategies:
+        data = strategy if isinstance(strategy, dict) else getattr(strategy, "__dict__", {})
+        if str(data.get("strategy") or "") in {"use_registered_tool", "registered_tool"} and data.get("tool_id"):
+            caps.append(str(data["tool_id"]))
+        elif str(data.get("strategy") or "") == "generate_code":
+            # Backwards-compatible spelling; generation treats it as local_code.
+            continue
+    for slot in slots:
+        data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
+        for value in [data.get("slot_id"), data.get("tool_id"), data.get("capability")]:
+            if value:
+                caps.append(str(value))
+    # Compatibility only: raw capabilities are hints, but use them if no
+    # normalized implementation data was supplied at all.
+    if not caps:
+        for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
+            raw = raw_attr(attr)
+            if isinstance(raw, list):
+                caps.extend(str(item) for item in raw if item)
+    if not caps:
+        outputs = set(str(item) for item in (raw_attr("outputs") or []) if item)
+        artifact_contract = raw_attr("artifact_contract") if isinstance(raw_attr("artifact_contract"), dict) else {}
+        artifact_fields = set(str(item) for item in (artifact_contract.get("stdout_fields") or artifact_contract.get("file_fields") or []) if item)
+        side_effects = set(str(item) for item in (raw_attr("side_effects") or []) if item)
+        wanted_fields = outputs | artifact_fields
+        scored: list[tuple[int, str]] = []
+        for candidate in list_tool_capabilities():
+            if not candidate.enabled_by_default or not candidate.allow_creator_use:
+                continue
+            candidate_fields: set[str] = set()
+            for fn in candidate.functions:
+                props = (fn.output_schema or {}).get("properties") if isinstance(fn.output_schema, dict) else {}
+                if isinstance(props, dict):
+                    candidate_fields.update(str(key) for key in props)
+                candidate_fields.update(str(item) for item in ((fn.output_schema or {}).get("required") or []) if item)
+            props = (candidate.output_schema or {}).get("properties") if isinstance(candidate.output_schema, dict) else {}
+            if isinstance(props, dict):
+                candidate_fields.update(str(key) for key in props)
+            candidate_fields.update(str(item) for item in ((candidate.output_schema or {}).get("required") or []) if item)
+            score = len(wanted_fields & candidate_fields) * 10
+            if side_effects and candidate.allow_external_side_effect:
+                score += 1
+            if role and role in candidate.roles:
+                score += 1  # weak hint only; never enough without structural match
+            if score >= 10:
+                scored.append((score, candidate.name))
+        caps.extend(name for _, name in sorted(scored, reverse=True))
     allowed_tools = []
+    cards: list[str] = []
     dependencies: list[str] = []
+    forbidden_imports: list[str] = []
     warnings: list[str] = []
     for name in caps:
         cap = get_tool_capability(name)
         if not cap:
             warnings.append(f"unknown capability {name!r}")
             continue
+        if not cap.enabled_by_default or not cap.allow_creator_use:
+            warnings.append(f"tool {name} is disabled or not allowed for Creator")
+            continue
         if cap.roles and role and role not in cap.roles and name != "file_output":
             warnings.append(f"tool {name} is not allowed for role {role}")
             continue
+        if cap.name in allowed_tools:
+            continue
         allowed_tools.append(name)
+        cards.extend(function_cards_for_tool(cap))
+        forbidden_imports.extend(list(cap.forbidden_direct_imports or []))
+        for fn in cap.functions:
+            forbidden_imports.extend(list(fn.forbidden_imports or []))
         for dep in cap.dependencies or []:
             record = _normalize_dependency_record(dep)
             if record.get("package"):
@@ -1202,12 +1361,21 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     )
     return ToolResolveResult(
         allowed_tools=allowed_tools,
-        allowed_helper_imports=[],
+        allowed_helper_imports=sorted(set([
+            helper
+            for name in allowed_tools
+            for cap in [get_tool_capability(name)]
+            if cap
+            for helper in [*cap.helper_imports, *[fn.function_name for fn in cap.functions if fn.function_name]]
+            if helper
+        ])),
         required_dependencies=sorted(set(dependencies)),
-        forbidden_imports=[],
-        tool_function_cards=[],
+        forbidden_imports=sorted(set(forbidden_imports)),
+        tool_function_cards=cards,
         tool_snippets=snippets,
-        tool_usage_prompt="通用工具平台：工具选择只来自显式 role/capabilities/forbidden_capabilities 与 registry 元数据；禁止根据业务关键词、文件名、purpose、蓝图正文或 reference 正文推断工具。\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
+        tool_usage_prompt="通用工具平台：工具选择来自 normalized plan 的 required_tool_slots / implementation_strategy / selected_tools / runtime_contract / artifact_contract；只有 selected tools 会注入 prompt；helper_preferred 不强制实现方式。\n"
+        + ("\n\nSelected tool function cards:\n\n" + "\n\n---\n\n".join(cards) if cards else "\n\nSelected tool function cards: 无")
+        + "\n\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
         warnings=warnings,
     )
 

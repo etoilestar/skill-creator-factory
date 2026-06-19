@@ -65,6 +65,7 @@
             :conversation-history="chatHistory"
             :model="null"
             :warnings="creationPlan.warnings"
+            :asset-requirements="creationPlan.asset_requirements || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />

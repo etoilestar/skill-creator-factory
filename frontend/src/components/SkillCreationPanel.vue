@@ -32,8 +32,8 @@
     </div>
 
     <!-- Warnings from blueprint parser -->
-    <div v-if="warnings.length" class="warnings">
-      <div v-for="(w, i) in warnings" :key="i" class="warning-item">⚠️ {{ w }}</div>
+    <div v-if="visibleWarnings.length" class="warnings">
+      <div v-for="(w, i) in visibleWarnings" :key="i" class="warning-item">⚠️ {{ warningMessage(w) }}</div>
     </div>
 
     <!-- File list -->
@@ -66,20 +66,8 @@
 
         <!-- Action buttons -->
         <span class="file-actions">
-          <template v-if="looksLikeDirectoryPath(file.path)">
-              <span class="file-meta muted">目录路径，无需上传</span>
-
-              <button
-                v-if="canRemoveFile(file)"
-                class="btn-small btn-remove"
-                @click="removeFile(idx)"
-              >
-                移除
-              </button>
-            </template>
-
-            <!-- 具体 assets 文件：必须由用户上传 -->
-            <template v-else-if="isAssetFile(file)">
+          <!-- 具体 assets 文件 / asset_requirement：必须由用户上传 -->
+          <template v-if="isAssetFile(file)">
               <input
                 type="file"
                 class="btn-small"
@@ -105,6 +93,18 @@
                 移除
               </button>
           </template>
+
+          <template v-else-if="looksLikeDirectoryPath(file.path)">
+              <span class="file-meta muted">目录路径，无需上传</span>
+
+              <button
+                v-if="canRemoveFile(file)"
+                class="btn-small btn-remove"
+                @click="removeFile(idx)"
+              >
+                移除
+              </button>
+            </template>
 
           <!-- 其他文件保持生成/写入按钮 -->
           <template v-else>
@@ -288,6 +288,7 @@ const props = defineProps({
   conversationHistory: { type: Array, default: () => [] },
   model: { type: String, default: null },
   warnings: { type: Array, default: () => [] },
+  assetRequirements: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -298,8 +299,34 @@ const emit = defineEmits(['creation-complete', 'creation-error'])
 
 // File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error'
 const localFiles = ref(
-  props.files
-    .filter(f => isMaterializedSkillFilePath(f.path))
+  [
+    ...props.files,
+    ...props.assetRequirements.map((requirement, index) => ({
+      path: normalizeAssetRequirementPath(requirement, index),
+      purpose: requirement.description || '需要用户上传素材',
+      required: requirement.required !== false,
+      can_skip: requirement.required === false,
+      file_type: 'asset',
+      file_kind: 'asset',
+      role: 'asset',
+      component_hint: 'asset_requirement',
+      inputs: [],
+      outputs: [],
+      dependencies: [],
+      side_effects: [],
+      required_tool_slots: [],
+      implementation_strategy: [{ strategy: 'require_user_asset', reason: requirement.description || '用户上传素材' }],
+      selected_tools: [],
+      runtime_contract: {},
+      artifact_contract: {},
+      required_capabilities: [],
+      raw_capability_hints: [],
+      forbidden_capabilities: [],
+      asset_source: 'user_upload',
+      asset_requirement: true,
+    })),
+  ]
+    .filter(f => f.asset_requirement || isMaterializedSkillFilePath(f.path))
     .map(f => ({
       ...f,
       role: f.role || (
@@ -327,6 +354,27 @@ const localSkillName = ref(props.skillName)
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
+
+const visibleWarnings = computed(() => {
+  const seen = new Set()
+  return (props.warnings || []).filter((warning) => {
+    if (!warning || typeof warning !== 'object' || warning.severity !== 'user_warning') return false
+    const message = warningMessage(warning)
+    if (!message) return false
+    const key = warning && typeof warning === 'object'
+      ? [warning.source, warning.path, warning.field, warning.code].filter(Boolean).join(':')
+      : message
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+})
+
+function warningMessage(warning) {
+  return warning && typeof warning === 'object'
+    ? String(warning.message || warning.code || '')
+    : String(warning || '')
+}
 
 const phase = ref('idle')   // idle | running | paused | validating | packaging | complete | failed
 const paused = ref(false)
@@ -432,9 +480,15 @@ function isMaterializedSkillFilePath(path) {
   )
 }
 
+function normalizeAssetRequirementPath(requirement, index) {
+  const path = normalizeSkillPath(requirement?.path)
+  if (path && path.startsWith('assets/') && hasFileExtension(path)) return path
+  return `assets/__upload_required_${index + 1}__`
+}
+
 function isAssetFile(file) {
   const path = normalizeSkillPath(file?.path)
-  return path.startsWith('assets/') && hasFileExtension(path) && file?.asset_source === 'user_upload'
+  return path.startsWith('assets/') && (hasFileExtension(path) || file?.asset_requirement) && file?.asset_source === 'user_upload'
 }
 
 function isReferenceFile(file) {
@@ -513,11 +567,20 @@ function addFile() {
     required: path === 'SKILL.md',
     can_skip: path !== 'SKILL.md',
     file_type: path === 'SKILL.md' ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
+    file_kind: path === 'SKILL.md' ? 'skill_doc' : (path.startsWith('scripts/') ? 'script' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'config'))),
     role: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'generic_script')),
+    component_hint: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('scripts/') ? 'generic_script' : ''),
     inputs: [],
     outputs: [],
     dependencies: [],
+    side_effects: [],
+    required_tool_slots: [],
+    implementation_strategy: path.startsWith('scripts/') ? [{ strategy: 'local_code', reason: 'Manually added script defaults to local code until normalized.' }] : [],
+    selected_tools: [],
+    runtime_contract: {},
+    artifact_contract: {},
     required_capabilities: [],
+    raw_capability_hints: [],
     forbidden_capabilities: [],
     reference_files: [],
     references: [],
@@ -569,11 +632,16 @@ async function handleAssetUpload(fileItem, event) {
   fileItem.error = ''
 
   try {
+    const uploadPath = fileItem.asset_requirement && !hasFileExtension(fileItem.path)
+      ? `assets/${selected.name}`
+      : fileItem.path
     const result = await uploadAssetAPI({
       skillName: localSkillName.value,
-      filePath: fileItem.path,
+      filePath: uploadPath,
       file: selected,
     })
+    fileItem.path = uploadPath
+    fileItem.asset_requirement = false
     fileItem.status = 'done'
     fileItem.uploaded = true
     fileItem.bytesWritten = result.size

@@ -126,7 +126,7 @@ def test_reference_contract_requires_subtask_contract_sections():
     results = _check_reference_file_contract("references/text-generation.md", content, purpose="text_generator 子任务执行参考")
     failed_ids = {result.id for result in results if not result.passed}
 
-    assert "reference.role_sections" in failed_ids
+    assert "reference.no_runtime_protocol" not in failed_ids
 
 
 def test_skill_plan_runtime_defaults_python_and_supports_node_bash():
@@ -285,13 +285,14 @@ def test_role_skeletons_inject_platform_calls_for_python_node_bash():
     image_entry = build_skill_plan_entry(file_path="scripts/render.js", purpose="role: image_generator inputs: topic")
     pdf_entry = build_skill_plan_entry(file_path="scripts/pdf.sh", purpose="role: pdf_builder inputs: text runtime: bash")
 
-    assert "generate_text_with_llm" in _script_generation_skeleton("scripts/write.py", "", "", skill_plan_entry=text_entry.__dict__)
+    text_skeleton = _script_generation_skeleton("scripts/write.py", "", "", skill_plan_entry=text_entry.__dict__)
+    assert "generate_text_with_llm" not in text_skeleton
     image_skeleton = _script_generation_skeleton("scripts/render.js", "", "", skill_plan_entry=image_entry.__dict__)
     assert "process.argv[2]" in image_skeleton
-    assert "generate_stable_diffusion_image" in image_skeleton
+    assert "generate_stable_diffusion_image" not in image_skeleton
     pdf_skeleton = _script_generation_skeleton("scripts/pdf.sh", "", "", skill_plan_entry=pdf_entry.__dict__)
     assert "$1" in pdf_skeleton
-    assert "pdf_path" in pdf_skeleton
+    assert "create_pdf" not in pdf_skeleton
 
 
 def test_required_capability_contract_allows_helper_preferred_text_self_implementation():
@@ -371,11 +372,10 @@ def test_image_and_text_named_script_is_promoted_to_composite_generator_contract
     plan = parse_blueprint([{"role": "assistant", "content": blueprint}])
     entry = next(item for item in plan.skill_plan.files if item.path == "scripts/generate_fairy_tale_with_images.py")
 
-    assert entry.role == "composite_generator"
-    assert entry.required_capabilities == ["text_generation", "image_generation"]
-    assert "text_generation" not in entry.forbidden_capabilities
-    assert "pdf_generation" in entry.forbidden_capabilities
-    assert entry.inputs == ["payload"]
+    assert entry.role == "generic_script"
+    assert entry.required_capabilities == []
+    assert entry.forbidden_capabilities == []
+    assert entry.inputs == []
     assert "custom_character" not in entry.inputs
     assert entry.outputs == []
     assert entry.command_template.startswith("python scripts/generate_fairy_tale_with_images.py")
@@ -488,8 +488,8 @@ if __name__ == '__main__':
 
     assert "script.required_capabilities.called" not in failed
     assert "script.capability.forbidden_image_generation" not in failed
-    assert "generate_text_with_llm" in skeleton
-    assert "generate_stable_diffusion_image" in skeleton
+    assert "generate_text_with_llm" not in skeleton
+    assert "generate_stable_diffusion_image" not in skeleton
 
 
 def test_explicit_composite_role_overrides_blueprint_and_command_contract():
@@ -690,7 +690,7 @@ required_capabilities: text_generation
 """
     failed = {r.id for r in _check_reference_file_contract("references/best-practices.md", content, purpose=purpose) if not r.passed}
 
-    assert "reference.role_sections" in failed
+    assert "reference.no_runtime_protocol" not in failed
     assert "reference.role.matches_skillplan" not in failed
 
 
@@ -728,8 +728,8 @@ def test_required_text_and_image_capabilities_normalize_to_composite_generator()
         purpose="role: generic_script inputs: topic outputs: text, image_paths required_capabilities: text_generation, image_generation",
     )
 
-    assert entry.role == "composite_generator"
-    assert entry.required_capabilities == ["text_generation", "image_generation"]
+    assert entry.role == "generic_script"
+    assert entry.required_capabilities == []
     assert "image_generation" not in entry.forbidden_capabilities
     assert entry.command_template == 'python scripts/main.py \'{"topic":"{{topic}}"}\''
 
@@ -930,10 +930,10 @@ def test_export_builder_skeletons_consume_previous_stdout_without_generation_hel
     pptx_skeleton = _script_generation_skeleton("scripts/export_pptx.py", "", "", skill_plan_entry=pptx_entry.__dict__)
 
     assert "previous_stdout" in docx_skeleton
-    assert "from backend.services.skill_runtime import create_docx, print_json" in docx_skeleton
-    assert "return create_docx(text, filename='output.docx')" in docx_skeleton
-    assert "from backend.services.skill_runtime import create_pptx, print_json" in pptx_skeleton
-    assert "return create_pptx(text, filename='output.pptx')" in pptx_skeleton
+    assert "from backend.services.skill_runtime import create_docx, print_json" not in docx_skeleton
+    assert "return create_docx(text, filename='output.docx')" not in docx_skeleton
+    assert "from backend.services.skill_runtime import create_pptx, print_json" not in pptx_skeleton
+    assert "return create_pptx(text, filename='output.pptx')" not in pptx_skeleton
     assert "generate_text_with_llm" not in docx_skeleton
     assert "generate_stable_diffusion_image" not in docx_skeleton
     assert "generate_text_with_llm" not in pptx_skeleton
@@ -990,8 +990,8 @@ def test_social_card_blueprint_capabilities_are_normalized_to_runtime_needs():
     assert entries["references/topic_sources.md"].required_capabilities == []
     assert entries["assets/placeholder.jpg"].required_capabilities == []
     assert entries["scripts/analyze_topic.py"].required_capabilities == ["text_generation"]
-    assert entries["scripts/generate_illustrated_story.py"].role == "composite_generator"
-    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == ["text_generation", "image_generation"]
+    assert entries["scripts/generate_illustrated_story.py"].role == "image_generator"
+    assert entries["scripts/generate_illustrated_story.py"].required_capabilities == ["image_generation"]
 
 
 def test_role_capability_allowlist_keeps_high_risk_tools_on_dedicated_roles():
@@ -1647,3 +1647,55 @@ AskUserQuestion
 
     assert "scripts/write.py" in paths
     assert "scripts/ui_leak.py" not in paths
+
+
+def test_normalized_plan_does_not_infer_from_filename_or_role_defaults():
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/generate_story_with_images.py",
+        purpose="role: image_generator",
+    )
+
+    assert entry.role == "image_generator"
+    assert entry.component_hint == "image_generator"
+    assert entry.inputs == []
+    assert entry.outputs == []
+    assert entry.required_capabilities == []
+    assert entry.required_tool_slots == []
+
+
+def test_tool_slots_are_not_stdout_and_resolution_uses_slot_contract():
+    from backend.services.skill_plan import SkillPlan, build_skill_plan_entry, implementation_resolution, normalize_skill_plan
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/fetch.py",
+        purpose="inputs: query outputs: rows side_effects: external_api",
+    )
+    plan = normalize_skill_plan(SkillPlan(skill_name="demo", files=[entry]))
+    script = plan.files[0]
+
+    assert script.runtime_contract["argv"] == "json_object"
+    assert script.artifact_contract["stdout_fields"] == ["rows"]
+    assert all("stdout" not in slot.slot_id for slot in script.required_tool_slots)
+    assert script.required_tool_slots[0].side_effects == ["external_api"]
+    assert script.implementation_strategy[0].strategy == "require_external_config"
+    assert implementation_resolution(plan) == []
+
+
+def test_reference_contract_is_weak_and_rejects_runtime_protocol_only():
+    from backend.routers.creator import _check_reference_file_contract
+
+    content = """
+---
+title: Guide
+---
+This reference explains formatting and quality constraints without executable protocol.
+"""
+    bad = content + "\nruntime_contract: {runtime: python}\n"
+
+    ok_failed = {r.id for r in _check_reference_file_contract("references/guide.md", content) if not r.passed}
+    bad_failed = {r.id for r in _check_reference_file_contract("references/guide.md", bad) if not r.passed}
+
+    assert "reference.no_runtime_protocol" not in ok_failed
+    assert "reference.no_runtime_protocol" in bad_failed

@@ -2452,16 +2452,14 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         purpose=purpose,
     ))
 
-    expected_role = _declared_role_in_text(purpose or "")
-    body_role = _declared_role_in_text(stripped)
-    role_sections_ok = bool(expected_role) and body_role is None and bool(re.search(r"(?im)^#{1,3}\s*(规范|示例|反例|约束)", stripped)) and not re.search(r"text_generator|image_generator|pdf_builder|generic_script|required_capabilities", stripped, re.I)
+    declares_runtime_protocol = bool(re.search(r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]", stripped))
     results.append(ContractCheckResult(
-        id="reference.role_sections",
-        passed=role_sections_ok,
+        id="reference.no_runtime_protocol",
+        passed=not declares_runtime_protocol,
         target=file_path,
-        message=("reference 仅保留文档章节，未重定义脚本 role/capability。" if role_sections_ok else f"{file_path} 必须作为 reference 文档服务于 SkillPlan，而不能省略/重定义脚本 role/capability 合同。"),
-        expected="reference 应包含规范/示例/反例/约束等文档章节，但不得声明 role 或 required_capabilities。",
-        minimal_edit="删除 role/capability 字段，围绕 SkillPlan 目标补充规范、示例、反例和约束章节。",
+        message=("reference 未声明运行时协议。" if not declares_runtime_protocol else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"),
+        expected="reference 只提供文档上下文；运行时协议属于 normalized plan / scripts。",
+        minimal_edit="删除 runtime_contract、artifact_contract、required_tool_slots、implementation_strategy 或 command_template 等运行时协议字段。",
     ))
 
     results.extend([
@@ -5286,19 +5284,8 @@ def _script_generation_skeleton(
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
     bash_stdout_expr = "{" + ", ".join(f"{key!r}: value" for key in output_keys) + "}"
 
-    capability_hints = set(getattr(plan_entry, "required_capabilities", []) or []) | set(getattr(plan_entry, "business_capabilities", []) or [])
     component_hint = getattr(plan_entry, "component_hint", "") or getattr(plan_entry, "role", "")
     helper_hint = f"# component_hint: {component_hint}\n"
-    if "text_generation" in capability_hints:
-        helper_hint += "# registered helper hint: generate_text_with_llm\n"
-    if "image_generation" in capability_hints:
-        helper_hint += "# registered helper hint: generate_stable_diffusion_image\n"
-    if "pdf_generation" in capability_hints:
-        helper_hint += "# registered helper hint: create_pdf, print_json\n"
-    if "docx_generation" in capability_hints:
-        helper_hint += "# registered helper hint: from backend.services.skill_runtime import create_docx, print_json\n# return create_docx(text, filename='output.docx')\n"
-    if "pptx_generation" in capability_hints:
-        helper_hint += "# registered helper hint: from backend.services.skill_runtime import create_pptx, print_json\n# return create_pptx(text, filename='output.pptx')\n"
 
     if plan_entry.runtime == "node":
         return (
@@ -5394,6 +5381,7 @@ def _script_local_contract_payload(
         "inputs": list(plan_entry.inputs or []),
         "outputs": list(plan_entry.outputs or []),
         "dependencies": list(plan_entry.dependencies or []),
+        "side_effects": list(getattr(plan_entry, "side_effects", []) or []),
         "required_tool_slots": [getattr(slot, "__dict__", slot) for slot in (getattr(plan_entry, "required_tool_slots", []) or [])],
         "implementation_strategy": [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])],
         "stdout_schema": stdout_schema,

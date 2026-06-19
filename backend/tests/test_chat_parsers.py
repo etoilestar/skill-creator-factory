@@ -2705,7 +2705,7 @@ def test_creator_skeleton_uses_role_not_blueprint_global_image_keyword():
 
     assert "pdf_builder" in skeleton
     assert "generate_stable_diffusion_image" not in skeleton
-    assert "pdf_path" in skeleton
+    assert "pdf_path" not in skeleton
 
 
 def test_blueprint_plan_adds_per_file_roles_and_contracts():

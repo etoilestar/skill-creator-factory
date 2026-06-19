@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.blueprint_parser import BlueprintPlan, BlueprintShapeError, parse_blueprint
-from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_role, file_role_classifier, file_type_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
+from ..services.skill_plan import SkillPlanEntry, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
 from ..services.creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..services.llm_proxy import complete_chat_once, stream_chat
 from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -417,24 +417,21 @@ def _skill_plan_entry_defaults(
     language = language_for_path(file_path)
     runtime = runtime_for_language(language, file_type)
 
-    required_capabilities, forbidden_capabilities = capabilities_for_role(resolved_role)
-    inputs, outputs = default_io_for_role(resolved_role)
-
-    required_capabilities = list(required_capabilities or [])
-    forbidden_capabilities = [
-        cap for cap in list(forbidden_capabilities or [])
-        if cap not in required_capabilities
-    ]
+    required_capabilities, forbidden_capabilities = [], []
+    file_kind = file_kind_for_path(file_path)
+    inputs, outputs = default_io_for_file_kind(file_kind)
 
     return {
         "path": file_path,
         "purpose": purpose or f"{file_path} 的职责说明",
         "file_type": file_type,
+        "file_kind": file_kind,
         "role": resolved_role,
         "inputs": list(inputs or []),
         "outputs": list(outputs or []),
         "dependencies": [],
         "required_capabilities": required_capabilities,
+        "raw_capability_hints": list(required_capabilities or []),
         "forbidden_capabilities": forbidden_capabilities,
         "reference_files": [],
         "skill_local_references": [],
@@ -557,9 +554,7 @@ def _skill_plan_entry_for_file(
     # over-broad SkillPlan capabilities do not leak into runtime warnings.
     required = list(data.get("required_capabilities") or [])
     forbidden = list(data.get("forbidden_capabilities") or [])
-    if not required and not forbidden:
-        required, forbidden = capabilities_for_role(data["role"])
-
+    data["raw_capability_hints"] = list(data.get("raw_capability_hints") or required or [])
     required = normalize_required_capabilities(
         role=str(data.get("role") or ""),
         path=file_path,
@@ -573,7 +568,7 @@ def _skill_plan_entry_for_file(
     ]
 
     if not data.get("inputs") or not data.get("outputs"):
-        default_inputs, default_outputs = default_io_for_role(data["role"])
+        default_inputs, default_outputs = default_io_for_file_kind(file_kind_for_path(file_path))
         data["inputs"] = list(data.get("inputs") or default_inputs or [])
         data["outputs"] = list(data.get("outputs") or default_outputs or [])
 
@@ -1664,6 +1659,7 @@ def _collect_blueprint_skillplan_constraints(
         "declared_references": sorted(set(declared_references)),
         "declared_assets": sorted(set(declared_assets)),
         "required_capabilities": required_capabilities,
+        "raw_capability_hints": list(required_capabilities or []),
         "forbidden_capabilities": forbidden_capabilities,
         "inputs": inputs,
         "outputs": outputs,
@@ -2452,6 +2448,16 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         purpose=purpose,
     ))
 
+    declares_runtime_protocol = bool(re.search(r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]", stripped))
+    results.append(ContractCheckResult(
+        id="reference.no_runtime_protocol",
+        passed=not declares_runtime_protocol,
+        target=file_path,
+        message=("reference 未声明运行时协议。" if not declares_runtime_protocol else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"),
+        expected="reference 只提供文档上下文；运行时协议属于 normalized plan / scripts。",
+        minimal_edit="删除 runtime_contract、artifact_contract、required_tool_slots、implementation_strategy 或 command_template 等运行时协议字段。",
+    ))
+
     results.extend([
         ContractCheckResult(
             id="reference.not_empty",
@@ -3019,12 +3025,13 @@ def _check_script_file_contract(
         # First-round validation only proves the script file itself can run as
         # a standalone argv/stdout program. Whether each declared input is
         # actually produced by an upstream step belongs to second-round E2E.
+        missing_inputs = [key for key in (plan_entry.inputs or []) if key and key not in stripped]
         results.append(
             ContractCheckResult(
                 id="script.skillplan_inputs.used",
-                passed=True,
+                passed=not missing_inputs,
                 target=file_path,
-                message="第一轮不静态要求源码逐字出现每个 SkillPlan input；declared inputs 用于构造 smoke payload。",
+                message=("脚本源码引用了声明输入。" if not missing_inputs else f"脚本未引用声明输入：{', '.join(missing_inputs)}。"),
                 expected="第一轮只检查脚本自身入口、JSON argv、stdout JSON、非空壳、非 mock、helper_required 和 forbidden capability。",
                 minimal_edit="如 E2E 发现字段未接上，再修 SKILL.md 命令或脚本字段映射。",
             )
@@ -3127,6 +3134,7 @@ def _check_script_file_contract(
         )
     )
 
+    capability_contract_enforced = False  # required_capabilities/forbidden_capabilities are hints, not script-contract gates.
     uses_image_helper = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
     if plan_entry.role in {
         "pdf_builder",
@@ -3150,7 +3158,7 @@ def _check_script_file_contract(
             )
         )
 
-    if uses_image_helper and "image_generation" not in (plan_entry.required_capabilities or []):
+    if capability_contract_enforced and uses_image_helper and "image_generation" not in (plan_entry.required_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
@@ -3162,7 +3170,7 @@ def _check_script_file_contract(
             )
         )
 
-    if "image_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "image_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
@@ -3185,7 +3193,7 @@ def _check_script_file_contract(
             re.IGNORECASE,
         )
     )
-    if uses_text_helper and "text_generation" not in (plan_entry.required_capabilities or []):
+    if capability_contract_enforced and uses_text_helper and "text_generation" not in (plan_entry.required_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_text_generation",
@@ -3197,7 +3205,7 @@ def _check_script_file_contract(
             )
         )
 
-    if "text_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "text_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_text_generation",
@@ -3214,7 +3222,7 @@ def _check_script_file_contract(
         )
 
     uses_pdf_helper = _script_uses_registry_helpers(stripped, "pdf_generation")
-    if "pdf_generation" in (plan_entry.forbidden_capabilities or []):
+    if capability_contract_enforced and "pdf_generation" in (plan_entry.forbidden_capabilities or []):
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_pdf_generation",
@@ -5273,9 +5281,13 @@ def _script_generation_skeleton(
     bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
     bash_stdout_expr = "{" + ", ".join(f"{key!r}: value" for key in output_keys) + "}"
 
+    component_hint = getattr(plan_entry, "component_hint", "") or getattr(plan_entry, "role", "")
+    helper_hint = f"# component_hint: {component_hint}\n"
+
     if plan_entry.runtime == "node":
         return (
             "协议骨架（只约束 argv/run/stdout；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
+            + helper_hint +
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
             f"  const value = String({js_value_expr}).trim();\n"
@@ -5290,6 +5302,7 @@ def _script_generation_skeleton(
         helper = "import json,sys; p=json.loads(sys.argv[1] or '{}'); value=str(" + bash_py_expr + "); print(json.dumps(" + bash_stdout_expr + ", ensure_ascii=False))"
         return (
             "协议骨架（只约束 $1 JSON argv 与 stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
+            + helper_hint +
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "payload_json=${1:-'{}'}\n"
@@ -5298,6 +5311,7 @@ def _script_generation_skeleton(
 
     return (
         "协议骨架（只约束 parse_args/run/main/stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
+        + helper_hint +
         "import json\n"
         "import sys\n\n"
         "def parse_args() -> dict:\n"
@@ -5355,19 +5369,21 @@ def _script_local_contract_payload(
 ) -> dict[str, Any]:
     """Return the only business contract a script-generation prompt should need."""
     return {
-        "path": file_path,
-        "role": plan_entry.role,
+        "file_path": file_path,
+        "file_kind": getattr(plan_entry, "file_kind", plan_entry.file_type),
+        "component_hint": getattr(plan_entry, "component_hint", plan_entry.role),
         "runtime": plan_entry.runtime,
         "language": plan_entry.language,
         "entrypoint": plan_entry.entrypoint or file_path,
-        "purpose": purpose or plan_entry.purpose,
         "inputs": list(plan_entry.inputs or []),
         "outputs": list(plan_entry.outputs or []),
         "dependencies": list(plan_entry.dependencies or []),
-        "required_capabilities": list(plan_entry.required_capabilities or []),
-        "forbidden_capabilities": list(plan_entry.forbidden_capabilities or []),
-        "reference_files": list(plan_entry.reference_files or []),
+        "side_effects": list(getattr(plan_entry, "side_effects", []) or []),
+        "required_tool_slots": [getattr(slot, "__dict__", slot) for slot in (getattr(plan_entry, "required_tool_slots", []) or [])],
+        "implementation_strategy": [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])],
         "stdout_schema": stdout_schema,
+        "runtime_contract": getattr(plan_entry, "runtime_contract", {}) or {"runtime": plan_entry.runtime, "entrypoint": plan_entry.entrypoint or file_path},
+        "artifact_contract": getattr(plan_entry, "artifact_contract", {}) or {"stdout_fields": list(plan_entry.outputs or [])},
     }
 
 
@@ -5449,13 +5465,15 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
-        "只有 required_capabilities/forbidden_capabilities 和 available tools 允许的能力可以使用；不要猜测平台 helper/import path。",
+        "只根据 required_tool_slots 与 implementation_strategy 实现接口能力；role/capability 只是 hint，不得当作硬协议或自行选择未声明工具。",
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
     ]
     if tool_usage_prompt:
         instruction.extend(["available tools / snippets（如与自我猜测冲突，以 snippet 为准）：", tool_usage_prompt])
+    if variant == "standard":
+        instruction.extend(["Creator internal-only kernel guidance", "INTERNAL-ONLY kernel/references/best-practices.md; INTERNAL-ONLY kernel/references/output-patterns.md（摘要省略；只作为局部生成提示，不注入完整 kernel 文档。）"] )
     if script_skeleton_text:
         instruction.extend(["固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：", script_skeleton_text])
     if variant == "minimal":
@@ -5773,14 +5791,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         runtime = runtime_for_language(language, file_type or "")
         is_asset = path.startswith("assets/")
 
-        required_capabilities, forbidden_capabilities = capabilities_for_role(role or "generic_script")
-        required_capabilities = normalize_required_capabilities(
-            role=role or "generic_script",
-            path=path,
-            required_capabilities=list(required_capabilities or []),
-            user_blueprint_text=blueprint_text,
-        )
-        inputs, outputs = default_io_for_role(role or "generic_script")
+        required_capabilities, forbidden_capabilities = [], []
+        inputs, outputs = default_io_for_file_kind(file_kind_for_path(path))
 
         files_out.append(
             FileSpecOut(
@@ -5970,14 +5982,14 @@ async def _complete_creator_file_generation(
     """Call the file-generation model with minimum diagnostic logging."""
     prompt_text = "\n".join(str(message.get("content") or "") for message in messages if isinstance(message, dict))
     logger.info(
-        "[Creator][generate_file][llm_request] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d contains_full_blueprint=%s contains_platform_protocol=%s",
+        "[Creator][generate_file][llm_request] skill=%s file_path=%s model=%s prompt_variant=%s retry_index=%d prompt_chars=%d uses_full_blueprint=%s uses_platform_protocol_text=%s",
         skill_name,
         file_path,
         model,
         prompt_variant,
         retry_index,
         _prompt_chars(messages),
-        "已确认的蓝图" in prompt_text,
+        "已确认的蓝图" in prompt_text or "Skill 架构蓝图" in prompt_text,
         any(
             marker in prompt_text
             for marker in ("宿主 Markdown 执行说明", "SKILL.md workflow", "第二轮 E2E", "平台执行协议")
@@ -6093,9 +6105,9 @@ async def generate_file(request: GenerateFileRequest):
             try:
                 if len(candidate or "") == 0:
                     raise FileGenerationStageError(
-                        source="generation_empty",
-                        layer="generation_empty",
-                        detail="generation_empty: 模型生成结果 content_chars=0，跳过 validator/repair；应直接重新生成一次或换模型。",
+                        source="model_empty_content",
+                        layer="file_generation",
+                        detail="model_empty_content: 模型生成结果 content_chars=0，跳过 validator/repair；进入 prompt 降级重试。",
                     )
 
                 try:
@@ -6212,7 +6224,7 @@ async def generate_file(request: GenerateFileRequest):
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
                 repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
-                if error_source == "generation_empty":
+                if error_source == "model_empty_content":
                     empty_retry_index = repair_counts_by_layer[error_layer]
                     if empty_retry_index >= len(_EMPTY_GENERATION_PROMPT_VARIANTS):
                         logger.warning(

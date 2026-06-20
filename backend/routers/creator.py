@@ -40,7 +40,14 @@ from ..services.model_router import VALIDATOR_TASK, route_creator_file_model, ro
 from ..services.skill_executor import _build_script_runtime_env, run_action
 from ..services.skill_creator_dry_run import build_creator_external_input_context
 from ..services.artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
-from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
+from ..services.creator_contracts import (
+    compile_canonical_file_contract,
+    contract_payload,
+    refine_contract_with_resolution,
+    resolve_implementation,
+    validate_python_evidence,
+)
+from .chat_utils import _get_skill_venv_python
 
 logger = logging.getLogger(__name__)
 
@@ -2164,7 +2171,7 @@ def _build_script_file_contract_text(
         )
 
     lines.append("D. 能力边界:")
-    lines.append("- required_capabilities / forbidden_capabilities 只声明能力边界；helper_required 能力必须使用平台 helper，其余能力可优先使用推荐 helper或自实现。")
+    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：mode=use_registered_tool 时必须调用 selected_tools，mode=creator_implemented 时才允许本地实现。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
@@ -4008,6 +4015,31 @@ def _validate_script_contract_static(
         if explicit_entry is not None
         else _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
     )
+    stdout_schema = _script_stdout_schema_for_entry(plan_entry)
+    canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    logger.info(
+        "[Creator][script_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        file_path,
+        json.dumps(canonical_contract.inputs, ensure_ascii=False),
+        json.dumps(canonical_contract.outputs, ensure_ascii=False),
+        json.dumps(canonical_contract.artifact_contract, ensure_ascii=False, sort_keys=True),
+        json.dumps([req.__dict__ for req in canonical_contract.capability_requirements], ensure_ascii=False, sort_keys=True),
+        implementation_resolution.mode,
+        json.dumps([tool.tool_id for tool in implementation_resolution.selected_tools], ensure_ascii=False),
+        json.dumps(implementation_resolution.required_evidence, ensure_ascii=False),
+        json.dumps(implementation_resolution.allowed_imports, ensure_ascii=False),
+        json.dumps(implementation_resolution.declared_dependencies, ensure_ascii=False),
+        implementation_resolution.reason,
+    )
+    evidence_issues = validate_python_evidence(content, canonical_contract, implementation_resolution)
+    if evidence_issues:
+        raise ValueError(
+            f"{file_path} implementation evidence validation failed "
+            f"(mode={implementation_resolution.mode}): " + "; ".join(evidence_issues)
+        )
 
     _validate_configured_model_usage_static(
         file_path=file_path,
@@ -4226,7 +4258,7 @@ def _json_value_non_empty(value: Any) -> bool:
     return True
 
 
-def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None, canonical_contract: Any | None = None) -> None:
     """Validate trial stdout with dynamic, field-name-agnostic rules.
 
     SkillPlan.outputs is a blueprint hint, not the sole runtime contract.  The
@@ -4247,6 +4279,25 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
     if not any(_json_value_non_empty(value) for value in payload.values()):
         raise ValueError(f"脚本试运行 stdout JSON 至少需要一个非空字段：argv={args!r} stdout={stripped[-4000:]}")
+    if canonical_contract is not None:
+        stdout_schema = getattr(canonical_contract, "stdout_schema", {}) or {}
+        required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
+        missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
+        if missing:
+            raise ValueError(
+                "stdout_contract: 脚本试运行 stdout 缺少 refined canonical stdout_schema.required 非空字段："
+                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+            )
+    elif skill_plan_entry is not None:
+        entry = _skill_plan_entry_for_file(file_path=str((skill_plan_entry or {}).get("path") or "scripts/main.py"), skill_plan_entry=skill_plan_entry)
+        stdout_schema = _script_stdout_schema_for_entry(entry)
+        required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
+        missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
+        if missing:
+            raise ValueError(
+                "stdout_contract: 脚本试运行 stdout 缺少 canonical stdout_schema.required 非空字段："
+                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+            )
 
     try:
         if skill_dir is not None:
@@ -4272,13 +4323,18 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
         if capability is None:
             continue
         for dependency in capability.dependencies or []:
-            if dependency and dependency not in seen:
-                seen.add(dependency)
-                dependencies.append(dependency)
+            package = str(dependency.get("package") or dependency.get("name") or "") if isinstance(dependency, dict) else str(dependency or "")
+            if package and package not in seen:
+                seen.add(package)
+                dependencies.append(package)
 
+    _install_declared_dependency_packages(venv_python, dependencies, source_label="capability")
+
+
+def _install_declared_dependency_packages(venv_python: Path, dependencies: list[str], *, source_label: str = "declared") -> None:
+    dependencies = [str(item).strip() for item in dependencies or [] if str(item).strip()]
     if not dependencies:
         return
-
     missing: list[str] = []
     dependency_import_names = {"python-docx": "docx", "python-pptx": "pptx"}
     for dependency in dependencies:
@@ -4299,7 +4355,7 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
     if not missing:
         return
 
-    logger.info("skill-env: pip installing capability deps into venv: %s", missing)
+    logger.info("skill-env: pip installing %s deps into venv: %s", source_label, missing)
     result = subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--quiet", *missing],
         timeout=180,
@@ -4307,7 +4363,22 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"安装 capability 依赖失败 ({', '.join(missing)}): {result.stderr[:500]}")
+        raise RuntimeError(f"安装 {source_label} 依赖失败 ({', '.join(missing)}): {result.stderr[:500]}")
+
+
+def _contract_resolution_for_trial(file_path: str, skill_md: str, role: str | None, skill_plan_entry: dict[str, Any] | None) -> tuple[Any, Any]:
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        blueprint_text=skill_md,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+    stdout_schema = _script_stdout_schema_for_entry(entry)
+    contract = compile_canonical_file_contract(entry, stdout_schema)
+    resolution = resolve_implementation(entry, contract)
+    refined_contract = refine_contract_with_resolution(contract, resolution)
+    resolution = resolve_implementation(entry, refined_contract)
+    return refined_contract, resolution
 
 
 def _trial_run_generated_script_with_plan(
@@ -4339,10 +4410,8 @@ def _trial_run_generated_script(
     """Run a generated Python script before accepting it from Creator.
 
     Python scripts are executed in a temporary per-skill virtual environment.
-    Before each trial run, imports are statically scanned and missing common
-    third-party packages are installed into that venv, matching sandbox runtime
-    behavior and allowing generation-test-repair-test loops to focus on real
-    script defects instead of missing packages.
+    Trial runs install only dependencies declared by selected capabilities /
+    canonical contracts; arbitrary third-party imports must fail validation.
     """
     if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
         return
@@ -4376,7 +4445,12 @@ def _trial_run_generated_script(
                 skill_plan_entry=skill_plan_entry,
             )
             _install_capability_dependencies(venv_python, entry.required_capabilities)
-            _scan_and_install_python_deps(script_path, venv_python)
+            refined_contract, resolution = _contract_resolution_for_trial(file_path, skill_md, role, skill_plan_entry)
+            _install_declared_dependency_packages(
+                venv_python,
+                list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []),
+                source_label="implementation_resolution",
+            )
         except RuntimeError as exc:
             raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc
 
@@ -4412,6 +4486,7 @@ def _trial_run_generated_script(
                 role=inferred_role,
                 skill_dir=skill_dir,
                 skill_plan_entry=skill_plan_entry,
+                canonical_contract=refined_contract,
             )
 
 
@@ -4748,8 +4823,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的 SkillPlan role + 有效 required_capabilities 修复能力边界：helper_required 能力必须调用对应平台 helper；"
-                "helper_preferred/self_implementation_allowed 能力可自实现，最终由试运行/E2E stdout 和产物存在性校验。"
+                "按当前脚本的 canonical_contract + implementation_resolution 修复能力边界："
+                "mode=use_registered_tool 时必须调用 selected_tools；mode=creator_implemented 时才允许标准库/本地实现；"
+                "最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
                 "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
 
@@ -5283,12 +5359,6 @@ def _script_generation_skeleton(
     output_keys = [key for key in (plan_entry.outputs or []) if isinstance(key, str) and key.strip()]
     if not output_keys:
         output_keys = ["text"]
-    py_output_lines = "\n".join(f"        {key!r}: value," for key in output_keys)
-    js_output_lines = "\n".join(f"    {json.dumps(key)}: value," for key in output_keys)
-    py_value_expr = " or ".join(f"payload.get({key!r})" for key in input_keys) + " or ''"
-    js_value_expr = " || ".join(f"payload[{json.dumps(key)}]" for key in input_keys) + " || ''"
-    bash_py_expr = " or ".join(f"p.get({key!r})" for key in input_keys) + " or ''"
-    bash_stdout_expr = "{" + ", ".join(f"{key!r}: value" for key in output_keys) + "}"
 
     component_hint = getattr(plan_entry, "component_hint", "") or getattr(plan_entry, "role", "")
     helper_hint = f"# component_hint: {component_hint}\n"
@@ -5299,16 +5369,15 @@ def _script_generation_skeleton(
             + helper_hint +
             "const payload = process.argv[2] ? JSON.parse(process.argv[2]) : {};\n"
             "function run(payload) {\n"
-            f"  const value = String({js_value_expr}).trim();\n"
-            "  return {\n"
-            f"{js_output_lines}\n"
-            "  };\n"
+            "  // TODO: implement the canonical contract using selected tools or real local logic.\n"
+            "  // Return an object containing every required stdout field.\n"
+            "  return {};\n"
             "}\n"
             "console.log(JSON.stringify(run(payload)));"
         )
 
     if plan_entry.runtime in {"bash", "shell"}:
-        helper = "import json,sys; p=json.loads(sys.argv[1] or '{}'); value=str(" + bash_py_expr + "); print(json.dumps(" + bash_stdout_expr + ", ensure_ascii=False))"
+        helper = "import json,sys; json.loads(sys.argv[1] or '{}'); print(json.dumps({}))"
         return (
             "协议骨架（只约束 $1 JSON argv 与 stdout JSON；具体工具调用必须来自 Tool Registry snippets/function cards）：\n"
             + helper_hint +
@@ -5331,10 +5400,9 @@ def _script_generation_skeleton(
         "        raise ValueError('argv JSON must be an object')\n"
         "    return data\n\n"
         "def run(payload: dict) -> dict:\n"
-        f"    value = str({py_value_expr}).strip()\n"
-        "    return {\n"
-        f"{py_output_lines}\n"
-        "    }\n\n"
+        "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
+        "    # Return an object containing every required stdout field.\n"
+        "    return {}\n\n"
         "def main() -> None:\n"
         "    print(json.dumps(run(parse_args()), ensure_ascii=False))\n\n"
         "if __name__ == '__main__':\n"
@@ -5377,37 +5445,22 @@ def _script_local_contract_payload(
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Return the only business contract a script-generation prompt should need."""
-    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
-    raw_strategies = [getattr(strategy, "__dict__", strategy) for strategy in (getattr(plan_entry, "implementation_strategy", []) or [])]
-    if tool_resolve.allowed_tools:
-        implementation_mode = "use_registered_tool"
-        strategies = raw_strategies or [{"strategy": "use_registered_tool", "tool_id": tool_resolve.allowed_tools[0]}]
-    else:
-        implementation_mode = "local_code"
-        strategies = [
-            {**strategy, "strategy": "local_code" if strategy.get("strategy") == "generate_code" else strategy.get("strategy", "local_code")}
-            for strategy in raw_strategies
-            if isinstance(strategy, dict)
-        ] or [{"strategy": "local_code", "reason": "No selected Tool Registry tool; implement with standard library/local code."}]
-    return {
+    canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    payload = contract_payload(canonical_contract, implementation_resolution)
+    payload.update({
         "file_path": file_path,
-        "file_kind": getattr(plan_entry, "file_kind", plan_entry.file_type),
-        "component_hint": getattr(plan_entry, "component_hint", plan_entry.role),
         "runtime": plan_entry.runtime,
         "language": plan_entry.language,
         "entrypoint": plan_entry.entrypoint or file_path,
-        "inputs": list(plan_entry.inputs or []),
-        "outputs": list(plan_entry.outputs or []),
-        "dependencies": list(plan_entry.dependencies or []),
-        "side_effects": list(getattr(plan_entry, "side_effects", []) or []),
-        "required_tool_slots": [getattr(slot, "__dict__", slot) for slot in (getattr(plan_entry, "required_tool_slots", []) or [])],
-        "implementation_mode": implementation_mode,
-        "selected_tools": list(tool_resolve.allowed_tools),
-        "implementation_strategy": strategies,
         "stdout_schema": stdout_schema,
-        "runtime_contract": getattr(plan_entry, "runtime_contract", {}) or {"runtime": plan_entry.runtime, "entrypoint": plan_entry.entrypoint or file_path},
-        "artifact_contract": getattr(plan_entry, "artifact_contract", {}) or {"stdout_fields": list(plan_entry.outputs or [])},
-    }
+        "artifact_contract": canonical_contract.artifact_contract,
+        "implementation_mode": implementation_resolution.mode,
+        "selected_tools": [tool.tool_id for tool in implementation_resolution.selected_tools],
+    })
+    return payload
 
 
 def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any]:
@@ -5493,7 +5546,21 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
-    implementation_mode = str(local_contract.get("implementation_mode") or "local_code")
+    implementation_mode = str(local_contract.get("implementation_mode") or "creator_implemented")
+    if implementation_mode == "unresolved":
+        reason = ((local_contract.get("implementation_resolution") or {}).get("reason") if isinstance(local_contract.get("implementation_resolution"), dict) else "") or "canonical contract unresolved"
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "severity": "user_warning",
+                "code": "contract_unresolved",
+                "source": "implementation_resolution",
+                "path": file_path,
+                "field": "implementation_resolution.mode",
+                "message": reason,
+                "repair": "补齐脚本 inputs/outputs/stdout_schema/artifact_contract 或注册真实 callable tool manifest 后再生成。",
+            },
+        )
     tool_usage_prompt = ""
     script_skeleton_text = ""
     if variant == "standard":
@@ -5518,6 +5585,25 @@ def _build_script_generate_file_prompt_variant(
             role=plan_entry.role,
             skill_plan_entry=skill_plan_entry,
         )
+    resolution_payload = local_contract.get("implementation_resolution") if isinstance(local_contract.get("implementation_resolution"), dict) else {}
+    canonical_payload = local_contract.get("canonical_contract") if isinstance(local_contract.get("canonical_contract"), dict) else {}
+    selected_tools_payload = resolution_payload.get("selected_tools") if isinstance(resolution_payload, dict) else []
+    logger.info(
+        "[Creator][script_generation_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        file_path,
+        json.dumps(canonical_payload.get("inputs") or [], ensure_ascii=False),
+        json.dumps(canonical_payload.get("outputs") or [], ensure_ascii=False),
+        json.dumps(canonical_payload.get("artifact_contract") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(canonical_payload.get("capability_requirements") or [], ensure_ascii=False, sort_keys=True),
+        implementation_mode,
+        json.dumps([tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)], ensure_ascii=False),
+        tool_usage_prompt.count("Tool: "),
+        tool_usage_prompt.count("[Tool Snippet]"),
+        json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
+        json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
+        json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
+        str(resolution_payload.get("reason") or ""),
+    )
 
     instruction = [
         f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。',
@@ -5528,12 +5614,17 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
-        "只根据 required_tool_slots、implementation_strategy、selected_tools、runtime_contract、artifact_contract 实现接口能力；role/capability 只是 hint。",
-        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。local_code 模式下允许使用标准库和本地代码。",
+        "只根据 canonical_contract 与 implementation_resolution 实现接口能力；raw role/capability 只能作为 hint，不能当硬合同。",
+        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。creator_implemented 模式下允许使用标准库、声明依赖和本地代码。",
         (
-            "当前实现模式：use_registered_tool。必须调用 selected_tools 中列出的工具；不要自造 import path；不要使用未声明 helper。"
+            "当前实现模式：use_registered_tool。必须调用 implementation_resolution.selected_tools 中的真实 callable；不得绕过 selected_tools 自己模拟同类能力；stdout_schema.required 字段必须来自 selected tool 返回值或真实产物；不得使用未声明依赖替代 selected tool。"
+            "如果 implementation_resolution.output_mappings 非空，必须按 source_tool_field → target_stdout_field 把工具返回字段映射到 canonical stdout 字段。"
             if implementation_mode == "use_registered_tool"
-            else "当前实现模式：local_code。没有合适平台工具，允许使用目标语言标准库和本地代码实现；不需要外部工具；不要调用平台 helper；不要调用外部服务；允许本地文件读写但必须遵守输出目录限制；如需第三方库，只能使用 declared_dependencies 中声明的库。required_tool_slots=[] 表示无外部工具依赖，可本地实现。"
+            else (
+                "当前实现模式：creator_implemented。没有匹配的现成工具，Creator 需要自行实现；允许使用标准库、本地代码、平台允许 adapter、declared_dependencies；必须真实满足 canonical_contract；不得返回固定模板、简单拼接、字段包装来冒充实现；如果声明 artifact，必须真实创建 artifact；如果声明转换或处理逻辑，必须有真实处理过程。"
+                if implementation_mode == "creator_implemented"
+                else "当前实现模式：unresolved。不要生成脚本；返回结构化错误。"
+            )
         ),
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
@@ -5673,12 +5764,12 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
-            "7. 生成脚本前必须阅读统一 Tool Registry 上下文；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。\n"
+            "7. 生成脚本前必须阅读 canonical_contract 与 implementation_resolution；mode=use_registered_tool 时 selected_tools 是硬合同，mode=creator_implemented 时才允许本地实现。不要自己发明未配置的外部 API。\n"
             "7a. 硬规则：不要猜测平台 helper/import path；只有 Tool Registry 明确提供 import path 和 call signature 时才能 import。否则使用自包含实现或可用标准库。\n"
             "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
-            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
+            "11. 所有导入只能来自 Python 标准库、declared_dependencies、selected_tools dependencies 或允许的内部模块；Creator 不会自动安装模型随手 import 的第三方库，脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
             "生成前必须先隐式检查以下 Tool Resolve 与 Tool Snippets；在调用任何工具前必须优先参考 Snippet，不要根据函数名猜参数，不要根据直觉猜返回值；如果 snippet 和自己的猜测冲突，以 snippet 为准；helper 返回标准 stdout dict 时，直接 return result 或 {**result, ...}：\n"
@@ -7591,6 +7682,7 @@ def _parse_e2e_stdout_json(
         )
 
     try:
+        refined_contract, _resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, entry.role, entry.__dict__)
         _validate_trial_stdout_json(
             stdout=proc.stdout,
             content=content,
@@ -7598,6 +7690,7 @@ def _parse_e2e_stdout_json(
             role=entry.role,
             skill_dir=trial_skill_dir,
             skill_plan_entry=entry.__dict__,
+            canonical_contract=refined_contract,
         )
     except ValueError as exc:
         raise ValueError(
@@ -7826,9 +7919,11 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
                             blueprint_text=trial_skill_md,
                         )
                         _install_capability_dependencies(venv_python, entry.required_capabilities)
-                        _scan_and_install_python_deps(
-                            trial_skill_dir / command.script_path,
+                        refined_contract, resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, None, None)
+                        _install_declared_dependency_packages(
                             venv_python,
+                            list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []),
+                            source_label="implementation_resolution",
                         )
             except RuntimeError as exc:
                 return [

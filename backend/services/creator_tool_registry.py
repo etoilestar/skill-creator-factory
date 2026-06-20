@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
+from .creator_tool_discovery import discover_creator_tool_records
+
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
 SnippetKind = Literal[
@@ -53,6 +55,7 @@ CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "c
 _TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
 _TOOL_AUTHORING_CONFIG_LOADED = False
 _REGISTERED_TOOL_CAPABILITIES: dict[str, "ToolCapability"] = {}
+_DISCOVERED_TOOL_CAPABILITIES: dict[str, "ToolCapability"] = {}
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 
 _ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
@@ -97,6 +100,8 @@ class ToolFunctionManifest:
     signature: str
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     return_contract: str = "Returns a dict that conforms to output_schema."
     example_call: str = ""
     example_return: str = ""
@@ -136,6 +141,8 @@ class ToolCapability:
     safety_level: str = "standard"
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     trial_mode: Literal["none", "mock", "minimal_file"] = "mock"
     validator_kind: str = "generic_python_script"
     prompt_guidance: str = ""
@@ -969,6 +976,13 @@ def _with_overrides(capability: ToolCapability) -> ToolCapability:
 
 
 def _load_registered_tools_from_disk() -> None:
+    _DISCOVERED_TOOL_CAPABILITIES.clear()
+    for record in discover_creator_tool_records():
+        try:
+            cap = _capability_from_dict(record)
+            _DISCOVERED_TOOL_CAPABILITIES[cap.name] = cap
+        except Exception:
+            continue
     if not CUSTOM_TOOL_REGISTRY_PATH.exists():
         return
     try:
@@ -994,11 +1008,17 @@ def persist_registered_tools() -> None:
 
 
 def list_tool_capabilities() -> list[ToolCapability]:
-    return [_with_overrides(cap) for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]]
+    merged = {
+        **BUILTIN_TOOL_CAPABILITIES,
+        **_DISCOVERED_TOOL_CAPABILITIES,
+        **_REGISTERED_TOOL_CAPABILITIES,
+    }
+    return [_with_overrides(cap) for cap in merged.values()]
 
 
 def get_tool_capability(name: str) -> ToolCapability | None:
-    cap = BUILTIN_TOOL_CAPABILITIES.get((name or "").strip()) or _REGISTERED_TOOL_CAPABILITIES.get((name or "").strip())
+    key = (name or "").strip()
+    cap = BUILTIN_TOOL_CAPABILITIES.get(key) or _DISCOVERED_TOOL_CAPABILITIES.get(key) or _REGISTERED_TOOL_CAPABILITIES.get(key)
     return _with_overrides(cap) if cap else None
 
 
@@ -1026,7 +1046,7 @@ def set_tool_capability_override(name: str, *, enabled: bool | None = None, allo
 
 
 def roles() -> list[str]:
-    return sorted({role for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()] for role in cap.roles})
+    return sorted({role for cap in list_tool_capabilities() for role in cap.roles})
 
 
 def get_script_roles() -> list[str]:
@@ -1174,6 +1194,10 @@ def function_cards_for_tool(capability: ToolCapability) -> list[str]:
             json.dumps(fn.input_schema or {}, ensure_ascii=False, sort_keys=True),
             "Output schema:",
             json.dumps(fn.output_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Artifact outputs:",
+            json.dumps(fn.artifact_outputs or capability.artifact_outputs or [], ensure_ascii=False, sort_keys=True),
+            "Side effects:",
+            json.dumps(fn.side_effects or capability.side_effects or [], ensure_ascii=False, sort_keys=True),
             "Example call:",
             (fn.example_call or f"from {fn.import_path} import {fn.function_name}\nresult = {fn.function_name}(...)").strip(),
             "Runtime: python_script",

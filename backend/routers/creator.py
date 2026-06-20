@@ -43,6 +43,7 @@ from ..services.artifact_validator import validate_stdout_file_outputs, FileOutp
 from ..services.creator_contracts import (
     compile_canonical_file_contract,
     contract_payload,
+    refine_contract_with_resolution,
     resolve_implementation,
     validate_python_evidence,
 )
@@ -4017,6 +4018,22 @@ def _validate_script_contract_static(
     stdout_schema = _script_stdout_schema_for_entry(plan_entry)
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    logger.info(
+        "[Creator][script_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        file_path,
+        json.dumps(canonical_contract.inputs, ensure_ascii=False),
+        json.dumps(canonical_contract.outputs, ensure_ascii=False),
+        json.dumps(canonical_contract.artifact_contract, ensure_ascii=False, sort_keys=True),
+        json.dumps([req.__dict__ for req in canonical_contract.capability_requirements], ensure_ascii=False, sort_keys=True),
+        implementation_resolution.mode,
+        json.dumps([tool.tool_id for tool in implementation_resolution.selected_tools], ensure_ascii=False),
+        json.dumps(implementation_resolution.required_evidence, ensure_ascii=False),
+        json.dumps(implementation_resolution.allowed_imports, ensure_ascii=False),
+        json.dumps(implementation_resolution.declared_dependencies, ensure_ascii=False),
+        implementation_resolution.reason,
+    )
     evidence_issues = validate_python_evidence(content, canonical_contract, implementation_resolution)
     if evidence_issues:
         raise ValueError(
@@ -5396,6 +5413,8 @@ def _script_local_contract_payload(
     """Return the only business contract a script-generation prompt should need."""
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
+    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
     payload = contract_payload(canonical_contract, implementation_resolution)
     payload.update({
         "file_path": file_path,
@@ -5532,6 +5551,25 @@ def _build_script_generate_file_prompt_variant(
             role=plan_entry.role,
             skill_plan_entry=skill_plan_entry,
         )
+    resolution_payload = local_contract.get("implementation_resolution") if isinstance(local_contract.get("implementation_resolution"), dict) else {}
+    canonical_payload = local_contract.get("canonical_contract") if isinstance(local_contract.get("canonical_contract"), dict) else {}
+    selected_tools_payload = resolution_payload.get("selected_tools") if isinstance(resolution_payload, dict) else []
+    logger.info(
+        "[Creator][script_generation_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        file_path,
+        json.dumps(canonical_payload.get("inputs") or [], ensure_ascii=False),
+        json.dumps(canonical_payload.get("outputs") or [], ensure_ascii=False),
+        json.dumps(canonical_payload.get("artifact_contract") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(canonical_payload.get("capability_requirements") or [], ensure_ascii=False, sort_keys=True),
+        implementation_mode,
+        json.dumps([tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)], ensure_ascii=False),
+        tool_usage_prompt.count("Tool: "),
+        tool_usage_prompt.count("[Tool Snippet]"),
+        json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
+        json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
+        json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
+        str(resolution_payload.get("reason") or ""),
+    )
 
     instruction = [
         f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。',

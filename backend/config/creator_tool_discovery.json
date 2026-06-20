@@ -3,6 +3,13 @@
     "backend/config/tool_registry.custom.json"
   ],
   "modules": [
-    "backend.services.runtime_tools.custom_tools.https_google_serper_dev_search"
+    "backend.services.runtime_tools",
+    "backend.services.runtime_tools.api_tools",
+    "backend.services.runtime_tools.document_tools",
+    "backend.services.runtime_tools.retrieval_tools",
+    "backend.services.runtime_tools.vision_tools",
+    "backend.services.runtime_tools.wechat_tools",
+    "backend.services.runtime_tools.custom_tools.https_google_serper_dev_search",
+    "backend.services.skill_runtime"
   ]
 }

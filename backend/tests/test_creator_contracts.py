@@ -104,3 +104,24 @@ def test_configured_discovery_adapter_loads_callable_manifests():
     assert all(record.get("functions") for record in records)
     assert all("input_schema" in record and "output_schema" in record for record in records)
     assert all("artifact_outputs" in record and "side_effects" in record for record in records)
+
+
+def test_selected_tool_schema_refines_canonical_contract():
+    from backend.services.creator_contracts import refine_contract_with_resolution
+
+    entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["text"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["text"], "properties": {"text": {}}})
+    resolution = resolve_implementation(entry, contract)
+    refined = refine_contract_with_resolution(contract, resolution)
+
+    assert resolution.mode == "use_registered_tool"
+    assert "pdf_path" in refined.outputs
+    assert "file_outputs" in refined.stdout_schema["required"]
+
+
+def test_references_and_assets_are_not_script_io_keys():
+    entry = _entry(inputs=["payload", "references/guide.md", "assets/source.png"], outputs=["result", "assets/generated/out.png"])
+    contract = compile_canonical_file_contract(entry, _schema())
+
+    assert contract.inputs == ["payload"]
+    assert contract.outputs == ["result"]

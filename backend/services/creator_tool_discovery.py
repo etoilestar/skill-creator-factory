@@ -139,15 +139,18 @@ def _record_from_module(module_name: str) -> dict[str, Any] | None:
     if isinstance(manifest, dict):
         return normalize_tool_record(manifest)
 
-    # Initial adaptation for modules that expose explicit per-function manifest
-    # metadata. Signature/docstring are descriptive only; schemas must be
-    # provided structurally by the tool module and are never inferred from names.
+    # Initial adaptation for modules without a whole-module manifest. Signature
+    # and docstring are descriptive; schema shape is adapted from type
+    # annotations when present and never from function names/business keywords.
     functions: list[dict[str, Any]] = []
     for _, obj in inspect.getmembers(module, inspect.isfunction):
         raw = getattr(obj, "__creator_tool_manifest__", None)
-        if not isinstance(raw, dict):
+        if isinstance(raw, dict):
+            fn = dict(raw)
+        else:
+            fn = _manifest_from_signature(module.__name__, obj)
+        if not isinstance(fn, dict):
             continue
-        fn = dict(raw)
         fn.setdefault("function_name", obj.__name__)
         fn.setdefault("import_path", module.__name__)
         fn.setdefault("signature", str(inspect.signature(obj)))
@@ -166,6 +169,60 @@ def _record_from_module(module_name: str) -> dict[str, Any] | None:
         "side_effects": functions[0].get("side_effects") or [],
         "dependencies": functions[0].get("dependencies") or [],
     })
+
+
+def _manifest_from_signature(module_name: str, func: Any) -> dict[str, Any] | None:
+    if getattr(func, "__name__", "").startswith("_"):
+        return None
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for name, param in signature.parameters.items():
+        if name in {"self", "cls"}:
+            continue
+        properties[name] = _schema_from_annotation(param.annotation)
+        if param.default is inspect.Signature.empty:
+            required.append(name)
+    if not properties:
+        return None
+    return_schema = _schema_from_annotation(signature.return_annotation)
+    if not return_schema:
+        return None
+    return {
+        "function_name": func.__name__,
+        "import_path": module_name,
+        "input_schema": {"type": "object", "properties": properties, "required": required},
+        "output_schema": return_schema,
+        "artifact_outputs": [],
+        "side_effects": [],
+        "dependencies": [],
+        "when_to_use": inspect.getdoc(func) or "",
+        "short_description": (inspect.getdoc(func) or func.__name__).splitlines()[0],
+    }
+
+
+def _schema_from_annotation(annotation: Any) -> dict[str, Any]:
+    if annotation is inspect.Signature.empty:
+        return {"type": "any"}
+    origin = getattr(annotation, "__origin__", None)
+    args = getattr(annotation, "__args__", ())
+    if annotation in {str, "str"}:
+        return {"type": "string"}
+    if annotation in {int, "int"}:
+        return {"type": "integer"}
+    if annotation in {float, "float"}:
+        return {"type": "number"}
+    if annotation in {bool, "bool"}:
+        return {"type": "boolean"}
+    if annotation in {dict, "dict"} or origin is dict:
+        return {"type": "object", "additionalProperties": True}
+    if annotation in {list, "list", tuple, "tuple", set, "set"} or origin in {list, tuple, set}:
+        item_schema = _schema_from_annotation(args[0]) if args else {"type": "any"}
+        return {"type": "array", "items": item_schema}
+    return {"type": "any"}
 
 
 def _resolve_project_path(raw_path: str | Path) -> Path:

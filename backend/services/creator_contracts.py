@@ -11,10 +11,9 @@ from __future__ import annotations
 import ast
 import sys
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
-from .creator_tool_registry import ToolCapability, get_tool_capability, resolve_tools_for_skill_plan_entry
+from .creator_tool_registry import ToolCapability, list_tool_capabilities
 from .skill_plan import SkillPlanEntry
 
 ImplementationMode = Literal["use_registered_tool", "creator_implemented", "unresolved"]
@@ -138,13 +137,17 @@ def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[s
 
 
 def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContract) -> ImplementationResolution:
-    resolved = resolve_tools_for_skill_plan_entry(entry)
     manifests: list[CallableToolManifest] = []
-    for name in resolved.allowed_tools or []:
-        cap = get_tool_capability(name)
-        if not cap:
+    capability_ids = {req.capability_id for req in contract.capability_requirements if req.capability_id}
+    for cap in list_tool_capabilities():
+        if not cap.enabled_by_default or not cap.allow_creator_use:
             continue
-        manifests.extend(callable_manifest_from_capability(cap))
+        cap_manifests = callable_manifest_from_capability(cap)
+        if not cap_manifests:
+            continue
+        if not _capability_matches_contract(cap, capability_ids, contract):
+            continue
+        manifests.extend(cap_manifests)
     if manifests:
         imports = [m.import_path.split(".")[0] for m in manifests if m.import_path]
         deps = sorted({d for m in manifests for d in m.dependencies})
@@ -168,6 +171,30 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
             reason="No callable tool manifest matched; Creator may implement with standard library/local code subject to evidence validation.",
         )
     return ImplementationResolution(mode="unresolved", local_fallback_allowed=False, required_evidence=[], reason="Canonical contract is incomplete.")
+
+
+def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], contract: CanonicalFileContract) -> bool:
+    """Structurally match tool manifests to the canonical contract.
+
+    Capability ids are structured hints from SkillPlan; schema compatibility is
+    checked against output requirements. This intentionally avoids file names,
+    business keywords, and role-specific special cases.
+    """
+    tool_ids = {cap.name, *cap.required_capabilities, *cap.optional_capabilities}
+    fn_required_caps = {item for fn in cap.functions for item in (fn.required_capabilities or [])}
+    if capability_ids and not (capability_ids & (tool_ids | fn_required_caps)):
+        return False
+    required_stdout = set(_schema_required(contract.stdout_schema) or contract.outputs)
+    if not required_stdout:
+        return True
+    tool_output_fields: set[str] = set()
+    for fn in cap.functions or []:
+        schema = fn.output_schema or cap.output_schema or {}
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        if isinstance(props, dict):
+            tool_output_fields.update(str(key) for key in props.keys())
+        tool_output_fields.update(_schema_required(schema))
+    return bool(required_stdout & tool_output_fields) or bool(capability_ids & (tool_ids | fn_required_caps))
 
 
 def contract_payload(contract: CanonicalFileContract, resolution: ImplementationResolution) -> dict[str, Any]:

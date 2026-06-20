@@ -93,3 +93,14 @@ def run(payload):
 """
 
     assert any(issue.startswith("declared_dependency_only") for issue in validate_python_evidence(code, contract, resolution))
+
+
+def test_configured_discovery_adapter_loads_callable_manifests():
+    from backend.services.creator_tool_discovery import discover_creator_tool_records
+
+    records = discover_creator_tool_records({"registries": ["backend/config/tool_registry.custom.json"], "modules": []})
+
+    assert records
+    assert all(record.get("functions") for record in records)
+    assert all("input_schema" in record and "output_schema" in record for record in records)
+    assert all("artifact_outputs" in record and "side_effects" in record for record in records)

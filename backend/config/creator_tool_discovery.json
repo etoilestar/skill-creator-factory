@@ -1,0 +1,8 @@
+{
+  "registries": [
+    "backend/config/tool_registry.custom.json"
+  ],
+  "modules": [
+    "backend.services.runtime_tools.custom_tools.https_google_serper_dev_search"
+  ]
+}

@@ -1031,7 +1031,6 @@ def register_tool_capability(capability: ToolCapability) -> ToolCapability:
 
 def clear_registered_tool_capabilities() -> None:
     _REGISTERED_TOOL_CAPABILITIES.clear()
-    _DISCOVERED_TOOL_CAPABILITIES.clear()
 
 
 def set_tool_capability_override(name: str, *, enabled: bool | None = None, allow_creator_use: bool | None = None) -> ToolCapability | None:

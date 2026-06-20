@@ -254,13 +254,25 @@ def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], 
     if not required_stdout:
         return True
     tool_output_fields: set[str] = set()
+    has_generic_capability_manifest = False
+    artifact_fields: set[str] = set()
     for fn in cap.functions or []:
         schema = fn.output_schema or cap.output_schema or {}
         props = schema.get("properties") if isinstance(schema, dict) else {}
         if isinstance(props, dict):
             tool_output_fields.update(str(key) for key in props.keys())
         tool_output_fields.update(_schema_required(schema))
-    return bool(required_stdout & tool_output_fields) or bool(capability_ids & (tool_ids | fn_required_caps))
+        if isinstance(schema, dict) and schema.get("type") == "object" and not props and schema.get("additionalProperties") is True:
+            has_generic_capability_manifest = True
+        for artifact in (fn.artifact_outputs or cap.artifact_outputs or []):
+            if isinstance(artifact, dict) and artifact.get("field"):
+                artifact_fields.add(str(artifact.get("field")))
+    if required_stdout.issubset(tool_output_fields):
+        return True
+    if required_stdout and required_stdout.issubset(artifact_fields):
+        return True
+    has_capability_hint = bool(capability_ids & (tool_ids | fn_required_caps))
+    return bool(has_capability_hint and has_generic_capability_manifest)
 
 
 def _creator_can_implement(contract: CanonicalFileContract) -> tuple[bool, str]:

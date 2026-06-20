@@ -47,7 +47,7 @@ from ..services.creator_contracts import (
     resolve_implementation,
     validate_python_evidence,
 )
-from .chat_utils import _get_skill_venv_python, _scan_and_install_python_deps
+from .chat_utils import _get_skill_venv_python
 
 logger = logging.getLogger(__name__)
 
@@ -4382,10 +4382,8 @@ def _trial_run_generated_script(
     """Run a generated Python script before accepting it from Creator.
 
     Python scripts are executed in a temporary per-skill virtual environment.
-    Before each trial run, imports are statically scanned and missing common
-    third-party packages are installed into that venv, matching sandbox runtime
-    behavior and allowing generation-test-repair-test loops to focus on real
-    script defects instead of missing packages.
+    Trial runs install only dependencies declared by selected capabilities /
+    canonical contracts; arbitrary third-party imports must fail validation.
     """
     if not file_path.startswith("scripts/") or Path(file_path).suffix.lower() != ".py":
         return
@@ -5734,7 +5732,7 @@ def _build_generate_file_prompt(
             "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
             "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
-            "11. 所有导入的第三方库必须真实存在且常见；Creator 保存前会先扫描 Python import 并安装缺失依赖，再按“生成→测试→修复生成→再测试”的闭环试运行；脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
+            "11. 所有导入只能来自 Python 标准库、declared_dependencies、selected_tools dependencies 或允许的内部模块；Creator 不会自动安装模型随手 import 的第三方库，脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
             "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
             f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
             "生成前必须先隐式检查以下 Tool Resolve 与 Tool Snippets；在调用任何工具前必须优先参考 Snippet，不要根据函数名猜参数，不要根据直觉猜返回值；如果 snippet 和自己的猜测冲突，以 snippet 为准；helper 返回标准 stdout dict 时，直接 return result 或 {**result, ...}：\n"
@@ -7882,10 +7880,6 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
                             blueprint_text=trial_skill_md,
                         )
                         _install_capability_dependencies(venv_python, entry.required_capabilities)
-                        _scan_and_install_python_deps(
-                            trial_skill_dir / command.script_path,
-                            venv_python,
-                        )
             except RuntimeError as exc:
                 return [
                     _e2e_error(

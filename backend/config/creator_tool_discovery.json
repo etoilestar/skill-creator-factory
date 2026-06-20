@@ -1,5 +1,6 @@
 {
   "registries": [
+    "backend/config/creator_system_tool_manifests.json",
     "backend/config/tool_registry.custom.json"
   ],
   "modules": [

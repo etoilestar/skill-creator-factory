@@ -109,8 +109,8 @@ def test_configured_discovery_adapter_loads_callable_manifests():
 def test_selected_tool_schema_refines_canonical_contract():
     from backend.services.creator_contracts import refine_contract_with_resolution
 
-    entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["text"])
-    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["text"], "properties": {"text": {}}})
+    entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["pdf_path"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["pdf_path"], "properties": {"pdf_path": {}}})
     resolution = resolve_implementation(entry, contract)
     refined = refine_contract_with_resolution(contract, resolution)
 
@@ -125,3 +125,26 @@ def test_references_and_assets_are_not_script_io_keys():
 
     assert contract.inputs == ["payload"]
     assert contract.outputs == ["result"]
+
+
+def test_system_manifest_selects_text_generation_tool():
+    entry = _entry(role="text_generator", required_capabilities=["text_generation"], outputs=["text"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}})
+    resolution = resolve_implementation(entry, contract)
+
+    assert resolution.mode == "use_registered_tool"
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+
+
+def test_system_manifest_selects_image_generation_artifact_tool():
+    from backend.services.creator_contracts import refine_contract_with_resolution
+
+    entry = _entry(role="image_generator", required_capabilities=["image_generation"], outputs=["image_path"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["image_path"], "properties": {"image_path": {"type": "string"}}})
+    resolution = resolve_implementation(entry, contract)
+    refined = refine_contract_with_resolution(contract, resolution)
+
+    assert resolution.mode == "use_registered_tool"
+    assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.selected_tools)
+    assert "artifact_created" in resolution.required_evidence
+    assert refined.artifact_contract.get("tool_artifact_outputs")

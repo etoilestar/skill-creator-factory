@@ -2171,7 +2171,7 @@ def _build_script_file_contract_text(
         )
 
     lines.append("D. 能力边界:")
-    lines.append("- required_capabilities / forbidden_capabilities 只声明能力边界；helper_required 能力必须使用平台 helper，其余能力可优先使用推荐 helper或自实现。")
+    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：mode=use_registered_tool 时必须调用 selected_tools，mode=creator_implemented 时才允许本地实现。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
@@ -4258,7 +4258,7 @@ def _json_value_non_empty(value: Any) -> bool:
     return True
 
 
-def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], role: str | None = None, skill_dir: Path | None = None, skill_plan_entry: dict[str, Any] | None = None, canonical_contract: Any | None = None) -> None:
     """Validate trial stdout with dynamic, field-name-agnostic rules.
 
     SkillPlan.outputs is a blueprint hint, not the sole runtime contract.  The
@@ -4279,7 +4279,16 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         raise ValueError(f"脚本试运行 stdout JSON 不得包含 error 字段：argv={args!r} stdout={stripped[-4000:]}")
     if not any(_json_value_non_empty(value) for value in payload.values()):
         raise ValueError(f"脚本试运行 stdout JSON 至少需要一个非空字段：argv={args!r} stdout={stripped[-4000:]}")
-    if skill_plan_entry is not None:
+    if canonical_contract is not None:
+        stdout_schema = getattr(canonical_contract, "stdout_schema", {}) or {}
+        required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
+        missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
+        if missing:
+            raise ValueError(
+                "stdout_contract: 脚本试运行 stdout 缺少 refined canonical stdout_schema.required 非空字段："
+                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+            )
+    elif skill_plan_entry is not None:
         entry = _skill_plan_entry_for_file(file_path=str((skill_plan_entry or {}).get("path") or "scripts/main.py"), skill_plan_entry=skill_plan_entry)
         stdout_schema = _script_stdout_schema_for_entry(entry)
         required = stdout_schema.get("required") if isinstance(stdout_schema, dict) else []
@@ -4477,6 +4486,7 @@ def _trial_run_generated_script(
                 role=inferred_role,
                 skill_dir=skill_dir,
                 skill_plan_entry=skill_plan_entry,
+                canonical_contract=refined_contract,
             )
 
 
@@ -4813,8 +4823,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的 SkillPlan role + 有效 required_capabilities 修复能力边界：helper_required 能力必须调用对应平台 helper；"
-                "helper_preferred/self_implementation_allowed 能力可自实现，最终由试运行/E2E stdout 和产物存在性校验。"
+                "按当前脚本的 canonical_contract + implementation_resolution 修复能力边界："
+                "mode=use_registered_tool 时必须调用 selected_tools；mode=creator_implemented 时才允许标准库/本地实现；"
+                "最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
                 "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
 
@@ -5753,7 +5764,7 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
-            "7. 生成脚本前必须阅读统一 Tool Registry 上下文；除 usage_policy=helper_required 的能力外，不强制 helper 或内部实现方式。不要自己发明未配置的外部 API。\n"
+            "7. 生成脚本前必须阅读 canonical_contract 与 implementation_resolution；mode=use_registered_tool 时 selected_tools 是硬合同，mode=creator_implemented 时才允许本地实现。不要自己发明未配置的外部 API。\n"
             "7a. 硬规则：不要猜测平台 helper/import path；只有 Tool Registry 明确提供 import path 和 call signature 时才能 import。否则使用自包含实现或可用标准库。\n"
             "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
@@ -7671,6 +7682,7 @@ def _parse_e2e_stdout_json(
         )
 
     try:
+        refined_contract, _resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, entry.role, entry.__dict__)
         _validate_trial_stdout_json(
             stdout=proc.stdout,
             content=content,
@@ -7678,6 +7690,7 @@ def _parse_e2e_stdout_json(
             role=entry.role,
             skill_dir=trial_skill_dir,
             skill_plan_entry=entry.__dict__,
+            canonical_contract=refined_contract,
         )
     except ValueError as exc:
         raise ValueError(

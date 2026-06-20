@@ -173,3 +173,21 @@ def test_single_text_output_mapping_allows_business_stdout_field():
     assert resolution.output_mappings == [{"source_tool_field": "text", "target_stdout_field": "article_body"}]
     assert refined.stdout_schema["required"] == ["article_body"]
     assert "text" not in refined.outputs
+
+
+def test_trial_stdout_uses_refined_contract_required_fields():
+    from backend.routers.creator import _validate_trial_stdout_json
+    from backend.services.creator_contracts import refine_contract_with_resolution
+
+    entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["pdf_path"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["pdf_path"], "properties": {"pdf_path": {"type": "string"}}})
+    resolution = resolve_implementation(entry, contract)
+    refined = refine_contract_with_resolution(contract, resolution)
+
+    assert "file_outputs" in refined.stdout_schema["required"]
+    try:
+        _validate_trial_stdout_json(stdout='{"pdf_path":"outputs/a.pdf"}', content="", args=["{}"], canonical_contract=refined)
+    except ValueError as exc:
+        assert "file_outputs" in str(exc)
+    else:
+        raise AssertionError("refined stdout_schema.required was not enforced")

@@ -148,3 +148,13 @@ def test_system_manifest_selects_image_generation_artifact_tool():
     assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.selected_tools)
     assert "artifact_created" in resolution.required_evidence
     assert refined.artifact_contract.get("tool_artifact_outputs")
+
+
+def test_raw_capability_hints_are_candidate_signals_for_tool_resolution():
+    entry = _entry(role="text_generator", required_capabilities=[], raw_capability_hints=["text_generation"], outputs=["text"])
+    contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}})
+    resolution = resolve_implementation(entry, contract)
+
+    assert any(req.capability_id == "text_generation" and req.source == "raw_capability_hints" and not req.required for req in contract.capability_requirements)
+    assert resolution.mode == "use_registered_tool"
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)

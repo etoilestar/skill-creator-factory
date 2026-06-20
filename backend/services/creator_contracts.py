@@ -118,7 +118,7 @@ def callable_manifest_from_capability(cap: ToolCapability) -> list[CallableToolM
 
 
 def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[str, Any]) -> CanonicalFileContract:
-    requirements = [CapabilityRequirement(str(c)) for c in (entry.required_capabilities or []) if c]
+    requirements = _capability_requirements_from_entry(entry)
     artifact_contract = getattr(entry, "artifact_contract", {}) or {"stdout_fields": list(entry.outputs or [])}
     inputs = [key for key in (entry.inputs or []) if _is_script_io_key(key)]
     outputs = [key for key in (entry.outputs or []) if _is_script_io_key(key)]
@@ -136,6 +136,52 @@ def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[s
         upstream_dependencies=list(getattr(entry, "upstream_dependencies", []) or []),
         downstream_consumers=list(getattr(entry, "downstream_consumers", []) or []),
     )
+
+
+def _capability_requirements_from_entry(entry: SkillPlanEntry) -> list[CapabilityRequirement]:
+    out: list[CapabilityRequirement] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(values: Any, *, source: str, required: bool) -> None:
+        for raw in _iter_capability_values(values):
+            key = (raw, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(CapabilityRequirement(raw, source=source, required=required))
+
+    add(getattr(entry, "required_capabilities", []) or [], source="skill_plan", required=True)
+    add(getattr(entry, "raw_capability_hints", []) or [], source="raw_capability_hints", required=False)
+    add(getattr(entry, "optional_capabilities", []) or [], source="optional_capabilities", required=False)
+    add(getattr(entry, "allowed_capabilities", []) or [], source="allowed_capabilities", required=False)
+    for slot in getattr(entry, "required_tool_slots", []) or []:
+        add(getattr(slot, "slot_id", "") if not isinstance(slot, dict) else slot.get("slot_id"), source="required_tool_slots", required=False)
+        runtime_requirements = getattr(slot, "runtime_requirements", {}) if not isinstance(slot, dict) else slot.get("runtime_requirements", {})
+        if isinstance(runtime_requirements, dict):
+            add(runtime_requirements.get("capabilities") or runtime_requirements.get("required_capabilities") or [], source="required_tool_slots.runtime_requirements", required=False)
+    for strategy in getattr(entry, "implementation_strategy", []) or []:
+        add(getattr(strategy, "tool_id", "") if not isinstance(strategy, dict) else strategy.get("tool_id"), source="implementation_strategy", required=False)
+    return out
+
+
+def _iter_capability_values(values: Any) -> list[str]:
+    if values in (None, "", False):
+        return []
+    if isinstance(values, str):
+        return [values.strip()] if values.strip() else []
+    if isinstance(values, dict):
+        candidates: list[str] = []
+        for key in ("capability", "capability_id", "tool_id", "name", "slot_id"):
+            value = values.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        return candidates
+    if isinstance(values, (list, tuple, set)):
+        out: list[str] = []
+        for item in values:
+            out.extend(_iter_capability_values(item))
+        return out
+    return []
 
 
 def _is_script_io_key(value: Any) -> bool:

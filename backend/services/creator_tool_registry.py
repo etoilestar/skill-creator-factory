@@ -97,6 +97,8 @@ class ToolFunctionManifest:
     signature: str
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     return_contract: str = "Returns a dict that conforms to output_schema."
     example_call: str = ""
     example_return: str = ""
@@ -136,6 +138,8 @@ class ToolCapability:
     safety_level: str = "standard"
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     trial_mode: Literal["none", "mock", "minimal_file"] = "mock"
     validator_kind: str = "generic_python_script"
     prompt_guidance: str = ""
@@ -252,6 +256,11 @@ BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
                     "file_outputs": {"type": "array"},
                 },
             },
+            artifact_outputs=[
+                {"field": "pdf_path", "type": "file_path", "extensions": [".pdf"], "root": "outputs"},
+                {"field": "file_outputs", "type": "file_paths", "root": "outputs"},
+            ],
+            side_effects=["write_output_file"],
             example_call=(
                 "from backend.services.runtime_tools import create_pdf\n\n"
                 "result = create_pdf(\n"
@@ -1174,6 +1183,10 @@ def function_cards_for_tool(capability: ToolCapability) -> list[str]:
             json.dumps(fn.input_schema or {}, ensure_ascii=False, sort_keys=True),
             "Output schema:",
             json.dumps(fn.output_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Artifact outputs:",
+            json.dumps(fn.artifact_outputs or capability.artifact_outputs or [], ensure_ascii=False, sort_keys=True),
+            "Side effects:",
+            json.dumps(fn.side_effects or capability.side_effects or [], ensure_ascii=False, sort_keys=True),
             "Example call:",
             (fn.example_call or f"from {fn.import_path} import {fn.function_name}\nresult = {fn.function_name}(...)").strip(),
             "Runtime: python_script",

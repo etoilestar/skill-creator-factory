@@ -158,3 +158,18 @@ def test_raw_capability_hints_are_candidate_signals_for_tool_resolution():
     assert any(req.capability_id == "text_generation" and req.source == "raw_capability_hints" and not req.required for req in contract.capability_requirements)
     assert resolution.mode == "use_registered_tool"
     assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+
+
+def test_single_text_output_mapping_allows_business_stdout_field():
+    from backend.services.creator_contracts import refine_contract_with_resolution
+
+    entry = _entry(role="text_generator", required_capabilities=[], raw_capability_hints=["text_generation"], outputs=["article_body"])
+    schema = {"type": "object", "required": ["article_body"], "properties": {"article_body": {"type": "string"}}}
+    contract = compile_canonical_file_contract(entry, schema)
+    resolution = resolve_implementation(entry, contract)
+    refined = refine_contract_with_resolution(contract, resolution)
+
+    assert resolution.mode == "use_registered_tool"
+    assert resolution.output_mappings == [{"source_tool_field": "text", "target_stdout_field": "article_body"}]
+    assert refined.stdout_schema["required"] == ["article_body"]
+    assert "text" not in refined.outputs

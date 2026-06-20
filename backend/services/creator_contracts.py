@@ -61,6 +61,7 @@ class ImplementationResolution:
     mode: ImplementationMode
     selected_tools: list[CallableToolManifest] = field(default_factory=list)
     selected_adapters: list[str] = field(default_factory=list)
+    output_mappings: list[dict[str, str]] = field(default_factory=list)
     local_fallback_allowed: bool = True
     allowed_imports: list[str] = field(default_factory=list)
     declared_dependencies: list[str] = field(default_factory=list)
@@ -191,6 +192,7 @@ def _is_script_io_key(value: Any) -> bool:
 
 def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContract) -> ImplementationResolution:
     manifests: list[CallableToolManifest] = []
+    output_mappings: list[dict[str, str]] = []
     capability_ids = {req.capability_id for req in contract.capability_requirements if req.capability_id}
     for cap in list_tool_capabilities():
         if not cap.enabled_by_default or not cap.allow_creator_use:
@@ -198,9 +200,11 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
         cap_manifests = callable_manifest_from_capability(cap)
         if not cap_manifests:
             continue
-        if not _capability_matches_contract(cap, capability_ids, contract):
+        matched, mappings = _capability_matches_contract(cap, capability_ids, contract)
+        if not matched:
             continue
         manifests.extend(cap_manifests)
+        output_mappings.extend(mappings)
     if manifests:
         imports = [m.import_path.split(".")[0] for m in manifests if m.import_path]
         deps = sorted({d for m in manifests for d in m.dependencies})
@@ -210,6 +214,7 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
         return ImplementationResolution(
             mode="use_registered_tool",
             selected_tools=manifests,
+            output_mappings=output_mappings,
             local_fallback_allowed=False,
             allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "backend", *imports, *deps}),
             declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
@@ -246,14 +251,18 @@ def refine_contract_with_resolution(contract: CanonicalFileContract, resolution:
     output_required: list[str] = []
     artifact_outputs: list[dict[str, Any]] = []
     side_effects = list(contract.side_effects)
+    mapped_sources = {item.get("source_tool_field"): item.get("target_stdout_field") for item in resolution.output_mappings if item.get("source_tool_field") and item.get("target_stdout_field")}
     for tool in resolution.selected_tools:
         schema = tool.output_schema or {}
         props = schema.get("properties") if isinstance(schema, dict) else {}
         if isinstance(props, dict):
-            output_props.update(props)
+            for key, spec in props.items():
+                target = mapped_sources.get(str(key), str(key))
+                output_props[target] = spec
         for key in _schema_required(schema):
-            if key not in output_required:
-                output_required.append(key)
+            target = mapped_sources.get(key, key)
+            if target not in output_required:
+                output_required.append(target)
         for artifact in tool.artifact_outputs or []:
             if isinstance(artifact, dict):
                 artifact_outputs.append(dict(artifact))
@@ -285,7 +294,7 @@ def refine_contract_with_resolution(contract: CanonicalFileContract, resolution:
     )
 
 
-def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], contract: CanonicalFileContract) -> bool:
+def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], contract: CanonicalFileContract) -> tuple[bool, list[dict[str, str]]]:
     """Structurally match tool manifests to the canonical contract.
 
     Capability ids are structured hints from SkillPlan; schema compatibility is
@@ -295,13 +304,15 @@ def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], 
     tool_ids = {cap.name, *cap.required_capabilities, *cap.optional_capabilities}
     fn_required_caps = {item for fn in cap.functions for item in (fn.required_capabilities or [])}
     if capability_ids and not (capability_ids & (tool_ids | fn_required_caps)):
-        return False
+        return False, []
     required_stdout = set(_schema_required(contract.stdout_schema) or contract.outputs)
     if not required_stdout:
-        return True
+        return True, []
     tool_output_fields: set[str] = set()
     has_generic_capability_manifest = False
     artifact_fields: set[str] = set()
+    mappings: list[dict[str, str]] = []
+    has_capability_hint = bool(capability_ids & (tool_ids | fn_required_caps))
     for fn in cap.functions or []:
         schema = fn.output_schema or cap.output_schema or {}
         props = schema.get("properties") if isinstance(schema, dict) else {}
@@ -310,15 +321,41 @@ def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], 
         tool_output_fields.update(_schema_required(schema))
         if isinstance(schema, dict) and schema.get("type") == "object" and not props and schema.get("additionalProperties") is True:
             has_generic_capability_manifest = True
+        mapping = _single_scalar_output_mapping(
+            tool_schema=schema if isinstance(schema, dict) else {},
+            stdout_schema=contract.stdout_schema,
+            capability_matched=has_capability_hint,
+        )
+        if mapping:
+            mappings.append(mapping)
         for artifact in (fn.artifact_outputs or cap.artifact_outputs or []):
             if isinstance(artifact, dict) and artifact.get("field"):
                 artifact_fields.add(str(artifact.get("field")))
     if required_stdout.issubset(tool_output_fields):
-        return True
+        return True, []
     if required_stdout and required_stdout.issubset(artifact_fields):
-        return True
-    has_capability_hint = bool(capability_ids & (tool_ids | fn_required_caps))
-    return bool(has_capability_hint and has_generic_capability_manifest)
+        return True, []
+    if mappings:
+        return True, mappings
+    return bool(has_capability_hint and has_generic_capability_manifest), []
+
+
+def _single_scalar_output_mapping(*, tool_schema: dict[str, Any], stdout_schema: dict[str, Any], capability_matched: bool) -> dict[str, str] | None:
+    if not capability_matched:
+        return None
+    tool_required = _schema_required(tool_schema)
+    stdout_required = _schema_required(stdout_schema)
+    if len(tool_required) != 1 or len(stdout_required) != 1:
+        return None
+    tool_props = tool_schema.get("properties") if isinstance(tool_schema.get("properties"), dict) else {}
+    stdout_props = stdout_schema.get("properties") if isinstance(stdout_schema.get("properties"), dict) else {}
+    source = tool_required[0]
+    target = stdout_required[0]
+    tool_type = (tool_props.get(source) or {}).get("type") if isinstance(tool_props.get(source), dict) else None
+    stdout_type = (stdout_props.get(target) or {}).get("type") if isinstance(stdout_props.get(target), dict) else None
+    if tool_type == "string" and stdout_type in {"string", None, "any"}:
+        return {"source_tool_field": source, "target_stdout_field": target}
+    return None
 
 
 def _creator_can_implement(contract: CanonicalFileContract) -> tuple[bool, str]:

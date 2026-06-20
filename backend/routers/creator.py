@@ -4319,9 +4319,13 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
                 seen.add(package)
                 dependencies.append(package)
 
+    _install_declared_dependency_packages(venv_python, dependencies, source_label="capability")
+
+
+def _install_declared_dependency_packages(venv_python: Path, dependencies: list[str], *, source_label: str = "declared") -> None:
+    dependencies = [str(item).strip() for item in dependencies or [] if str(item).strip()]
     if not dependencies:
         return
-
     missing: list[str] = []
     dependency_import_names = {"python-docx": "docx", "python-pptx": "pptx"}
     for dependency in dependencies:
@@ -4342,7 +4346,7 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
     if not missing:
         return
 
-    logger.info("skill-env: pip installing capability deps into venv: %s", missing)
+    logger.info("skill-env: pip installing %s deps into venv: %s", source_label, missing)
     result = subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--quiet", *missing],
         timeout=180,
@@ -4350,7 +4354,22 @@ def _install_capability_dependencies(venv_python: Path, required_capabilities: l
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"安装 capability 依赖失败 ({', '.join(missing)}): {result.stderr[:500]}")
+        raise RuntimeError(f"安装 {source_label} 依赖失败 ({', '.join(missing)}): {result.stderr[:500]}")
+
+
+def _contract_resolution_for_trial(file_path: str, skill_md: str, role: str | None, skill_plan_entry: dict[str, Any] | None) -> tuple[Any, Any]:
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        blueprint_text=skill_md,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+    stdout_schema = _script_stdout_schema_for_entry(entry)
+    contract = compile_canonical_file_contract(entry, stdout_schema)
+    resolution = resolve_implementation(entry, contract)
+    refined_contract = refine_contract_with_resolution(contract, resolution)
+    resolution = resolve_implementation(entry, refined_contract)
+    return refined_contract, resolution
 
 
 def _trial_run_generated_script_with_plan(
@@ -4417,6 +4436,12 @@ def _trial_run_generated_script(
                 skill_plan_entry=skill_plan_entry,
             )
             _install_capability_dependencies(venv_python, entry.required_capabilities)
+            refined_contract, resolution = _contract_resolution_for_trial(file_path, skill_md, role, skill_plan_entry)
+            _install_declared_dependency_packages(
+                venv_python,
+                list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []),
+                source_label="implementation_resolution",
+            )
         except RuntimeError as exc:
             raise ValueError(f"脚本试运行环境准备失败：{exc}") from exc
 
@@ -5582,6 +5607,7 @@ def _build_script_generate_file_prompt_variant(
         "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。creator_implemented 模式下允许使用标准库、声明依赖和本地代码。",
         (
             "当前实现模式：use_registered_tool。必须调用 implementation_resolution.selected_tools 中的真实 callable；不得绕过 selected_tools 自己模拟同类能力；stdout_schema.required 字段必须来自 selected tool 返回值或真实产物；不得使用未声明依赖替代 selected tool。"
+            "如果 implementation_resolution.output_mappings 非空，必须按 source_tool_field → target_stdout_field 把工具返回字段映射到 canonical stdout 字段。"
             if implementation_mode == "use_registered_tool"
             else (
                 "当前实现模式：creator_implemented。没有匹配的现成工具，Creator 需要自行实现；允许使用标准库、本地代码、平台允许 adapter、declared_dependencies；必须真实满足 canonical_contract；不得返回固定模板、简单拼接、字段包装来冒充实现；如果声明 artifact，必须真实创建 artifact；如果声明转换或处理逻辑，必须有真实处理过程。"
@@ -7880,6 +7906,12 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
                             blueprint_text=trial_skill_md,
                         )
                         _install_capability_dependencies(venv_python, entry.required_capabilities)
+                        refined_contract, resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, None, None)
+                        _install_declared_dependency_packages(
+                            venv_python,
+                            list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []),
+                            source_label="implementation_resolution",
+                        )
             except RuntimeError as exc:
                 return [
                     _e2e_error(

@@ -1325,22 +1325,34 @@ description: demo
         _sanitize_generated_file_content("SKILL.md", skill_md)
 
 
-def test_creator_rejects_placeholder_image_script():
+def test_creator_allows_placeholder_words_until_trial_run_contract():
     from backend.routers.creator import _sanitize_generated_file_content
 
-    script = """import os
+    script = """import json
+import sys
+import os
 
 def main():
+    payload = json.loads(sys.argv[1])
     os.makedirs('generated_images', exist_ok=True)
     with open('generated_images/demo.png', 'w') as f:
         f.write('placeholder for image')
+    print(json.dumps({'image_path': 'generated_images/demo.png', 'text': str(payload.get('prompt', ''))}))
 
 if __name__ == '__main__':
     main()
 """
 
-    with pytest.raises(ValueError, match="占位|placeholder"):
-        _sanitize_generated_file_content("scripts/generate_image.py", script)
+    assert _sanitize_generated_file_content(
+        "scripts/generate_image.py",
+        script,
+        skill_plan_entry={
+            "path": "scripts/generate_image.py",
+            "role": "image_generator",
+            "inputs": ["prompt"],
+            "outputs": ["image_path"],
+        },
+    ) == script.strip()
 
 
 def test_creator_rejects_model_declared_script_without_model_call():
@@ -3351,7 +3363,7 @@ def test_creator_validator_ignores_unconfirmed_model_issues():
     assert instructions == "模型解释文本"
 
 
-def test_script_content_review_excludes_runtime_startup_checks():
+def test_script_content_review_includes_only_minimal_protocol_security_checks():
     from backend.routers.creator import _check_script_content_review_contract
 
     results = _check_script_content_review_contract(
@@ -3366,10 +3378,51 @@ def test_script_content_review_excludes_runtime_startup_checks():
     )
 
     result_ids = {result.id for result in results}
-    assert "script.source.syntax" not in result_ids
-    assert "script.runtime.entrypoint" not in result_ids
-    assert "script.json_argv.runtime" not in result_ids
-    assert "script.raw_source.single_file" in result_ids
+    assert result_ids == {
+        "script.raw_source.single_file",
+        "script.source.syntax",
+        "script.json_argv.runtime",
+        "script.runtime.entrypoint",
+        "script.security.dangerous_operations",
+    }
+    assert all(
+        not result.id.startswith(("script.capability.", "tool_usage_contract.", "script.no_fake_implementation"))
+        for result in results
+    )
+
+
+def test_generated_script_content_uses_content_review_not_full_source_contract(monkeypatch):
+    from backend.routers import creator
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("_validate_script_file_source_contract should not be called for scripts/** first-round validation")
+
+    monkeypatch.setattr(creator, "_validate_script_file_source_contract", fail_if_called)
+
+    content = """import json
+import sys
+
+def run(payload):
+    # placeholder/mock/template words are not first-round hard gates.
+    return {"text": str(payload.get("payload", "placeholder"))}
+
+def main():
+    print(json.dumps(run(json.loads(sys.argv[1]))))
+
+if __name__ == "__main__":
+    main()
+"""
+
+    assert creator._sanitize_generated_file_content(
+        "scripts/build.py",
+        content,
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["text"],
+        },
+    ) == content.strip()
 
 
 def test_script_contract_rejects_guessed_helper_import_without_function_card():

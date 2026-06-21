@@ -3585,7 +3585,17 @@ def _validate_generated_file_content(file_path: str, content: str, role: str | N
         return
 
     if file_path.startswith("scripts/"):
-        _validate_script_file_source_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
+        results = _check_script_content_review_contract(
+            file_path,
+            content,
+            role=role,
+            skill_plan_entry=skill_plan_entry,
+        )
+        if any(not result.passed for result in results):
+            raise ContractValidationError(
+                _format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"),
+                results,
+            )
         return
 
     if file_path.startswith("references/"):

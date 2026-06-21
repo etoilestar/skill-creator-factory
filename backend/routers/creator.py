@@ -2171,7 +2171,7 @@ def _build_script_file_contract_text(
         )
 
     lines.append("D. 能力边界:")
-    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：mode=use_registered_tool 时必须调用 selected_tools；mode=tool_assisted_creator_implemented 时必须按 selected tool slots 调工具并本地组合；mode=creator_implemented 时才允许纯本地实现。")
+    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：统一按 script_composition 理解；available_tools 只是候选工具，代码模型根据 script_goal/inputs/outputs/output_contract 自行组合工具与本地逻辑。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
@@ -4021,14 +4021,14 @@ def _validate_script_contract_static(
     canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
     logger.info(
-        "[Creator][script_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        "[Creator][script_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
         file_path,
         json.dumps(canonical_contract.inputs, ensure_ascii=False),
         json.dumps(canonical_contract.outputs, ensure_ascii=False),
         json.dumps(canonical_contract.artifact_contract, ensure_ascii=False, sort_keys=True),
-        json.dumps([req.__dict__ for req in canonical_contract.capability_requirements], ensure_ascii=False, sort_keys=True),
+        json.dumps(canonical_contract.resource_refs, ensure_ascii=False, sort_keys=True),
         implementation_resolution.mode,
-        json.dumps([tool.tool_id for tool in implementation_resolution.selected_tools], ensure_ascii=False),
+        json.dumps([tool.tool_id for tool in implementation_resolution.available_tools], ensure_ascii=False),
         json.dumps(implementation_resolution.required_evidence, ensure_ascii=False),
         json.dumps(implementation_resolution.allowed_imports, ensure_ascii=False),
         json.dumps(implementation_resolution.declared_dependencies, ensure_ascii=False),
@@ -4823,9 +4823,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的 canonical_contract + implementation_resolution 修复能力边界："
-                "mode=use_registered_tool 时必须调用 selected_tools；mode=creator_implemented 时才允许标准库/本地实现；"
-                "最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
+                "按当前脚本的轻量 script_composition 上下文修复能力边界："
+                "根据 script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules 组合工具与本地逻辑；"
+                "available_tools 只是候选，最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
                 "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"
             )
 
@@ -5447,20 +5447,45 @@ def _script_local_contract_payload(
     """Return the only business contract a script-generation prompt should need."""
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
-    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    payload = contract_payload(canonical_contract, implementation_resolution)
-    payload.update({
+    available_tools = []
+    for tool in implementation_resolution.available_tools or implementation_resolution.selected_tools:
+        available_tools.append({
+            "tool_id": tool.tool_id,
+            "description": tool.description,
+            "call_template": (tool.example_call or f"from {tool.import_path} import {tool.function_name}\nresult = {tool.function_name}(...)").strip(),
+            "input_schema": tool.input_schema,
+            "output_schema": tool.output_schema,
+            "artifact_outputs": tool.artifact_outputs,
+        })
+    return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
         "language": plan_entry.language,
-        "entrypoint": plan_entry.entrypoint or file_path,
-        "stdout_schema": stdout_schema,
-        "artifact_contract": canonical_contract.artifact_contract,
-        "implementation_mode": implementation_resolution.mode,
-        "selected_tools": [tool.tool_id for tool in implementation_resolution.selected_tools],
-    })
-    return payload
+        "script_goal": purpose,
+        "inputs": canonical_contract.inputs,
+        "outputs": canonical_contract.outputs,
+        "available_tools": available_tools,
+        "resource_refs": canonical_contract.resource_refs,
+        "output_contract": {
+            "stdout_schema": stdout_schema,
+            "artifact_contract": canonical_contract.artifact_contract,
+        },
+        "rules": [
+            "Use script_composition: combine argv inputs, local logic, and any available_tools needed for the goal.",
+            "available_tools are recalled candidates only; decide which to call based on the script goal and contracts.",
+            "Only import a tool using its exact call_template import path; never guess backend imports.",
+            "References/assets are resource_refs only, not pip/install/import dependencies.",
+            "First round fixes only the current script; end-to-end chain repair happens later.",
+        ],
+        "implementation_resolution": {
+            "mode": implementation_resolution.mode,
+            "available_tools": available_tools,
+            "allowed_imports": implementation_resolution.allowed_imports,
+            "declared_dependencies": implementation_resolution.declared_dependencies,
+            "required_evidence": implementation_resolution.required_evidence,
+            "reason": implementation_resolution.reason,
+        },
+    }
 
 
 def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any]:
@@ -5546,7 +5571,7 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
-    implementation_mode = str(local_contract.get("implementation_mode") or "creator_implemented")
+    implementation_mode = str((local_contract.get("implementation_resolution") or {}).get("mode") or "script_composition")
     if implementation_mode == "unresolved":
         reason = ((local_contract.get("implementation_resolution") or {}).get("reason") if isinstance(local_contract.get("implementation_resolution"), dict) else "") or "canonical contract unresolved"
         raise HTTPException(
@@ -5564,12 +5589,6 @@ def _build_script_generate_file_prompt_variant(
     tool_usage_prompt = ""
     script_skeleton_text = ""
     if variant == "standard":
-        tool_usage_prompt = _creator_tool_context_for_script(
-            file_path=file_path,
-            skill_plan_entry=plan_entry,
-            blueprint_text="",
-            include_snippets=True,
-        )
         script_skeleton_text = _script_generation_skeleton(
             file_path,
             purpose,
@@ -5586,19 +5605,19 @@ def _build_script_generate_file_prompt_variant(
             skill_plan_entry=skill_plan_entry,
         )
     resolution_payload = local_contract.get("implementation_resolution") if isinstance(local_contract.get("implementation_resolution"), dict) else {}
-    canonical_payload = local_contract.get("canonical_contract") if isinstance(local_contract.get("canonical_contract"), dict) else {}
-    selected_tools_payload = resolution_payload.get("selected_tools") if isinstance(resolution_payload, dict) else []
+    canonical_payload = local_contract
+    selected_tools_payload = resolution_payload.get("available_tools") if isinstance(resolution_payload, dict) else []
     logger.info(
-        "[Creator][script_generation_contract] file_path=%s canonical_inputs=%s canonical_outputs=%s artifact_contract=%s capability_requirements=%s mode=%s selected_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_import_roots=%s declared_dependencies=%s reason=%s",
+        "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
         file_path,
         json.dumps(canonical_payload.get("inputs") or [], ensure_ascii=False),
         json.dumps(canonical_payload.get("outputs") or [], ensure_ascii=False),
-        json.dumps(canonical_payload.get("artifact_contract") or {}, ensure_ascii=False, sort_keys=True),
-        json.dumps(canonical_payload.get("capability_requirements") or [], ensure_ascii=False, sort_keys=True),
+        json.dumps(canonical_payload.get("output_contract") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(canonical_payload.get("resource_refs") or [], ensure_ascii=False, sort_keys=True),
         implementation_mode,
         json.dumps([tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)], ensure_ascii=False),
-        tool_usage_prompt.count("Tool: "),
-        tool_usage_prompt.count("[Tool Snippet]"),
+        0,
+        0,
         json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
         json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
         json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
@@ -5614,30 +5633,17 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
-        "只根据 canonical_contract 与 implementation_resolution 实现接口能力；raw role/capability 只能作为 hint，不能当硬合同。",
-        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具；不允许自己猜 backend import。creator_implemented 模式下允许使用标准库、声明依赖和本地代码。",
-        (
-            "当前实现模式：use_registered_tool。必须调用 implementation_resolution.selected_tools 中的真实 callable；不得绕过 selected_tools 自己模拟同类能力；stdout_schema.required 字段必须来自 selected tool 返回值或真实产物；不得使用未声明依赖替代 selected tool。"
-            "如果 implementation_resolution.output_mappings 非空，必须按 source_tool_field → target_stdout_field 把工具返回字段映射到 canonical stdout 字段。"
-            if implementation_mode == "use_registered_tool"
-            else (
-                "当前实现模式：tool_assisted_creator_implemented。必须只使用 implementation_resolution.tool_slots 中选定的工具和 call_template 完成对应 functional_requirements；工具结果必须被本地逻辑消费/转换为 canonical stdout；工具只做局部步骤，不等于最终裁决；禁止猜测未列出的 backend import。"
-                if implementation_mode == "tool_assisted_creator_implemented"
-                else (
-                    "当前实现模式：creator_implemented。没有匹配的现成工具，Creator 需要自行实现；允许使用标准库、本地代码、平台允许 adapter、declared_dependencies；必须真实满足 canonical_contract；不得返回固定模板、简单拼接、字段包装来冒充实现；如果声明 artifact，必须真实创建 artifact；如果声明转换或处理逻辑，必须有真实处理过程。"
-                    if implementation_mode == "creator_implemented"
-                    else "当前实现模式：unresolved。不要生成脚本；返回结构化错误。"
-                )
-            )
-        ),
+        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。raw role/capability 只能作为 hint，不能当硬合同。",
+        "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑和 available_tools。",
+        "available_tools 只是 embedding/结构化召回的候选工具，不是最终裁决；只有确实需要时才调用。",
+        "如调用工具，只能照 available_tools.call_template 中的精确 import/call 方式使用；禁止猜测 backend import 或调用未列出的平台 helper。",
+        "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。",
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
     ]
-    if tool_usage_prompt:
-        instruction.extend(["selected tool slots / call templates / snippets（只能使用列出的 import 与 call_template；如与自我猜测冲突，以 tool_slot/snippet 为准）：", tool_usage_prompt])
     if variant == "standard":
-        instruction.extend(["Creator internal-only kernel guidance", "INTERNAL-ONLY kernel/references/best-practices.md; INTERNAL-ONLY kernel/references/output-patterns.md（摘要省略；只作为局部生成提示，不注入完整 kernel 文档。）"] )
+        instruction.append("不注入完整蓝图、kernel 文档或额外工具清单；只使用上面的轻量上下文。")
     if script_skeleton_text:
         instruction.extend(["固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：", script_skeleton_text])
     if variant == "minimal":
@@ -5690,12 +5696,7 @@ def _build_generate_file_prompt(
         if file_path == "SKILL.md"
         else ""
     )
-    tool_usage_prompt = _creator_tool_context_for_script(
-        file_path=file_path,
-        skill_plan_entry=plan_entry,
-        blueprint_text=blueprint_text,
-        include_snippets=True,
-    ) if file_path.startswith("scripts/") else ""
+    tool_usage_prompt = ""
     script_skeleton_text = _script_generation_skeleton(
         file_path,
         purpose,
@@ -5756,35 +5757,24 @@ def _build_generate_file_prompt(
             f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
         )
     elif file_path.startswith("scripts/"):
+        local_contract = _script_local_contract_payload(
+            file_path=file_path,
+            purpose=purpose,
+            plan_entry=plan_entry,
+            stdout_schema=_script_stdout_schema_for_entry(plan_entry),
+        )
         instruction = (
-            f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
-            f"职责说明：{purpose}\n"
-            f"{plan_summary}\n\n"
-            "你是文件内容生成器，不是聊天助手；当前输出会被直接写入目标文件。\n"
-            "要求：\n"
-            f"1. 只输出完整可运行的 {lang} 文件字节内容本身，不要任何说明文字。\n"
-            "2. 禁止 Markdown，禁止 ```，禁止‘下面是代码’，禁止文件名标题，禁止多文件输出；如果输出包含 ```，系统会判定失败。\n"
-            "3. 脚本的命令行参数、stdin/stdout 接口必须与蓝图和 SKILL.md 里的 Markdown 命令示例一致。\n"
-            "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
-            "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
-            "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
-            "7. 生成脚本前必须阅读 canonical_contract 与 implementation_resolution；mode=use_registered_tool 时 selected_tools 直接覆盖最终输出；mode=tool_assisted_creator_implemented 时 selected tool slots 完成局部 functional_requirements 并由本地逻辑消费结果；mode=creator_implemented 时才允许纯本地实现。不要自己发明未配置的外部 API。\n"
-            "7a. 硬规则：不要猜测平台 helper/import path；只有 Tool Registry 明确提供 import path 和 call signature 时才能 import。否则使用自包含实现或可用标准库。\n"
-            "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
-            "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"
-            "10. stdout 必须输出结构化 JSON；内部中间字段名由当前 Skill 自行确定，但必须与后续命令 placeholder 真实对齐，最终产物仍必须使用平台标准输出字段和 OUTPUT_DIR/outputs 路径协议。\n"
-            "11. 所有导入只能来自 Python 标准库、declared_dependencies、selected_tools dependencies 或允许的内部模块；Creator 不会自动安装模型随手 import 的第三方库，脚本仍必须包含必要的错误处理逻辑（如参数校验、文件不存在提示等）。\n"
-            "12. 必须基于下方固定骨架生成：默认优先 Python；若 SkillPlan.runtime 为 node/bash，则使用对应骨架并保留入口、参数解析和 JSON stdout。\n"
-            f"13. 最终响应必须是单个 {plan_entry.language} 源码文件；去掉 Markdown fence、说明文字、文件路径标题和多文件包。\n"
-            "生成前必须先隐式检查以下 Tool Resolve 与 Tool Snippets；在调用任何工具前必须优先参考 Snippet，不要根据函数名猜参数，不要根据直觉猜返回值；如果 snippet 和自己的猜测冲突，以 snippet 为准；helper 返回标准 stdout dict 时，直接 return result 或 {**result, ...}：\n"
-            f"{tool_usage_prompt}\n\n"
-            "必须满足以下脚本文件合同：\n"
-            "生成前请先隐式检查以下脚本合同，最终输出必须逐项满足：\n"
-            f"{generated_file_contract_text}\n\n"
-            f"固定脚本骨架（仅用于约束生成结构；输出时应是补全后的源码，不要保留空实现）：\n{script_skeleton_text}\n\n"
-            f"Creator internal-only kernel guidance（只可指导生成，禁止把以下 kernel 路径、文件名或组织结构复制到最终业务 SKILL.md / references / assets）：\n{kernel_reference_context}\n\n"
-            f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
-            f"以下是已确认的蓝图（scripts/ 生成不会追加聊天历史，只使用本蓝图）：\n\n{clean_blueprint_text}"
+            f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。\n\n'
+            "只输出完整可运行源码本身；禁止 Markdown fence、解释、文件名标题或多文件输出。\n"
+            "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。\n"
+            "生成前只使用以下轻量上下文：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。\n"
+            "统一按 script_composition 理解：根据功能目标组合 argv 输入、本地逻辑和 available_tools；available_tools 只做候选召回，不是最终裁决。\n"
+            "如调用工具，只能使用 available_tools.call_template 中的精确 import/call；禁止猜测 backend import 或调用未列出的平台 helper。\n"
+            "references/assets 只能作为 resource_refs/asset_refs 读取，不能作为 dependencies、allowed_imports 或 pip install 依赖。\n"
+            "生成后会反向校验 tool_call、tool_result_used、input_dependency、nontrivial_transform、stdout_contract、artifact_created、declared_dependency_only、no_shell_template。\n\n"
+            "轻量脚本上下文：\n"
+            f"{json.dumps(local_contract, ensure_ascii=False, indent=2)}\n\n"
+            f"固定脚本骨架（仅约束入口/JSON stdout；输出时补全为可运行源码）：\n{script_skeleton_text}"
         )
     elif file_path.startswith("references/"):
         instruction = (

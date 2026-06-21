@@ -20,7 +20,7 @@ from backend.config import settings
 from .creator_tool_registry import ToolCapability, list_tool_capabilities
 from .skill_plan import SkillPlanEntry
 
-ImplementationMode = Literal["use_registered_tool", "tool_assisted_creator_implemented", "creator_implemented", "unresolved"]
+ImplementationMode = Literal["script_composition", "unresolved"]
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +65,8 @@ class CanonicalFileContract:
 @dataclass(frozen=True)
 class ImplementationResolution:
     mode: ImplementationMode
-    selected_tools: list[CallableToolManifest] = field(default_factory=list)
+    selected_tools: list[CallableToolManifest] = field(default_factory=list)  # compatibility: same tools as available_tools
+    available_tools: list[CallableToolManifest] = field(default_factory=list)
     selected_adapters: list[str] = field(default_factory=list)
     output_mappings: list[dict[str, str]] = field(default_factory=list)
     tool_slots: list[dict[str, Any]] = field(default_factory=list)
@@ -222,8 +223,7 @@ def _is_declared_dependency(value: Any) -> bool:
 
 
 def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContract) -> ImplementationResolution:
-    manifests: list[CallableToolManifest] = []
-    partial_manifests: list[CallableToolManifest] = []
+    available_manifests: list[CallableToolManifest] = []
     output_mappings: list[dict[str, str]] = []
     capability_ids = {req.capability_id for req in contract.capability_requirements if req.capability_id}
     embedded_candidates = _embedding_candidate_tool_ids(contract.functional_requirements)
@@ -235,116 +235,41 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
             continue
         matched, mappings = _capability_matches_contract(cap, capability_ids, contract)
         capability_hint_matched = bool(capability_ids & ({cap.name, *cap.required_capabilities, *cap.optional_capabilities} | {item for fn in cap.functions for item in (fn.required_capabilities or [])}))
-        if matched and _tool_directly_covers_stdout(cap, contract, mappings):
-            manifests.extend(cap_manifests)
+        if matched or capability_hint_matched or any(m.tool_id in embedded_candidates or cap.name in embedded_candidates for m in cap_manifests):
+            available_manifests.extend(cap_manifests)
             output_mappings.extend(mappings)
-        elif matched or capability_hint_matched or any(m.tool_id in embedded_candidates or cap.name in embedded_candidates for m in cap_manifests):
-            partial_manifests.extend(cap_manifests)
-    if manifests:
-        imports = [m.import_path.split(".")[0] for m in manifests if m.import_path]
-        deps = sorted({d for m in manifests for d in m.dependencies})
-        required_evidence = ["tool_call", "stdout_from_tool", "declared_dependency_only", "stdout_contract", "no_shell_template"]
-        if any(m.artifact_outputs for m in manifests) or _contract_declares_artifact(contract):
-            required_evidence.append("artifact_created")
-        return ImplementationResolution(
-            mode="use_registered_tool",
-            selected_tools=manifests,
-            output_mappings=output_mappings,
-            tool_slots=_tool_slots_for_requirements(contract, manifests, output_mappings),
-            local_fallback_allowed=False,
-            allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "backend", *imports, *deps}),
-            declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
-            required_evidence=required_evidence,
-            reason="Callable Tool Registry manifest satisfies the canonical capability contract.",
-        )
-    if partial_manifests:
-        deps = sorted({d for m in partial_manifests for d in m.dependencies})
-        imports = [m.import_path.split(".")[0] for m in partial_manifests if m.import_path]
-        required_evidence = ["tool_call", "tool_result_used", "input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
-        if _contract_declares_artifact(contract) or any(m.artifact_outputs for m in partial_manifests):
-            required_evidence.append("artifact_created")
-        return ImplementationResolution(
-            mode="tool_assisted_creator_implemented",
-            selected_tools=partial_manifests,
-            tool_slots=_tool_slots_for_requirements(contract, partial_manifests, []),
-            local_fallback_allowed=True,
-            allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "datetime", "csv", "math", "statistics", "re", "html", "hashlib", "itertools", "collections", "backend", *imports, *deps, *contract.declared_dependencies}),
-            declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
-            required_evidence=required_evidence,
-            reason="Callable tools satisfy local functional requirements; Creator must compose their results with local logic for final stdout.",
-        )
     local_ok, local_reason = _creator_can_implement(contract)
-    if local_ok:
-        required_evidence = ["declared_dependency_only", "input_dependency", "nontrivial_transform", "stdout_contract", "no_shell_template"]
-        if _contract_declares_artifact(contract):
+    if local_ok or available_manifests:
+        deps = sorted({d for m in available_manifests for d in m.dependencies if _is_declared_dependency(d)})
+        import_paths = sorted({m.import_path for m in available_manifests if m.import_path})
+        required_evidence = ["tool_call", "tool_result_used", "input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
+        if not available_manifests:
+            required_evidence = ["input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
+        if _contract_declares_artifact(contract) or any(m.artifact_outputs for m in available_manifests):
             required_evidence.append("artifact_created")
         return ImplementationResolution(
-            mode="creator_implemented",
-            selected_tools=[],
+            mode="script_composition",
+            selected_tools=available_manifests,
+            available_tools=available_manifests,
+            output_mappings=output_mappings,
+            tool_slots=_tool_slots_for_requirements(contract, available_manifests, output_mappings),
             local_fallback_allowed=True,
-            allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "datetime", "csv", "math", "statistics", "re", "html", "hashlib", "itertools", "collections", *contract.declared_dependencies}),
-            declared_dependencies=list(contract.declared_dependencies),
+            allowed_imports=import_paths,
+            declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
             required_evidence=required_evidence,
-            reason="No callable tool manifest matched; Creator may implement with standard library/local code subject to evidence validation.",
+            reason="Generate the script by composing argv inputs, local logic, and any recalled available_tools; embeddings only recalled candidates.",
         )
     return ImplementationResolution(mode="unresolved", local_fallback_allowed=False, required_evidence=[], reason=local_reason or "Canonical contract is incomplete.")
 
 
 def refine_contract_with_resolution(contract: CanonicalFileContract, resolution: ImplementationResolution) -> CanonicalFileContract:
-    """Return a tool-schema-refined canonical contract.
+    """Keep the canonical stdout contract stable for script_composition.
 
-    The first contract pass is compiled from normalized structural plan data.
-    After implementation resolution selects concrete callable tools, their
-    schemas become the stronger IO truth for script generation/validation.
+    Tool schemas are exposed as lightweight available_tools context and must not
+    replace the script stdout contract before generation. The generated script is
+    validated after the fact against stdout/artifact/evidence rules.
     """
-    if resolution.mode != "use_registered_tool" or not resolution.selected_tools:
-        return contract
-    output_props: dict[str, Any] = {}
-    output_required: list[str] = []
-    artifact_outputs: list[dict[str, Any]] = []
-    side_effects = list(contract.side_effects)
-    mapped_sources = {item.get("source_tool_field"): item.get("target_stdout_field") for item in resolution.output_mappings if item.get("source_tool_field") and item.get("target_stdout_field")}
-    for tool in resolution.selected_tools:
-        schema = tool.output_schema or {}
-        props = schema.get("properties") if isinstance(schema, dict) else {}
-        if isinstance(props, dict):
-            for key, spec in props.items():
-                target = mapped_sources.get(str(key), str(key))
-                output_props[target] = spec
-        for key in _schema_required(schema):
-            target = mapped_sources.get(key, key)
-            if target not in output_required:
-                output_required.append(target)
-        for artifact in tool.artifact_outputs or []:
-            if isinstance(artifact, dict):
-                artifact_outputs.append(dict(artifact))
-        for effect in tool.side_effects or []:
-            if effect not in side_effects:
-                side_effects.append(effect)
-    if not output_props and not output_required and not artifact_outputs:
-        return contract
-    required = output_required or list(contract.stdout_schema.get("required") or contract.outputs)
-    props = dict(contract.stdout_schema.get("properties") or {})
-    props.update(output_props)
-    outputs = list(dict.fromkeys([*contract.outputs, *required, *output_props.keys()]))
-    artifact_contract = dict(contract.artifact_contract or {})
-    if artifact_outputs:
-        artifact_contract["tool_artifact_outputs"] = artifact_outputs
-    return CanonicalFileContract(
-        file_path=contract.file_path,
-        file_kind=contract.file_kind,
-        inputs=contract.inputs,
-        outputs=outputs,
-        stdout_schema={**contract.stdout_schema, "required": required, "properties": props},
-        artifact_contract=artifact_contract,
-        functional_requirements=contract.functional_requirements,
-        capability_requirements=contract.capability_requirements,
-        side_effects=side_effects,
-        resource_refs=contract.resource_refs,
-        declared_dependencies=contract.declared_dependencies,
-        upstream_dependencies=contract.upstream_dependencies,
-        downstream_consumers=contract.downstream_consumers,
-    )
+    return contract
 
 
 def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], contract: CanonicalFileContract) -> tuple[bool, list[dict[str, str]]]:
@@ -391,28 +316,6 @@ def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], 
     if mappings:
         return True, mappings
     return bool(has_capability_hint and has_generic_capability_manifest), []
-
-
-def _tool_directly_covers_stdout(cap: ToolCapability, contract: CanonicalFileContract, mappings: list[dict[str, str]]) -> bool:
-    """True only when a tool can provide the final stdout contract directly."""
-    required_stdout = set(_schema_required(contract.stdout_schema) or contract.outputs)
-    if not required_stdout:
-        return False
-    mapped_targets = {item.get("target_stdout_field") for item in mappings if item.get("target_stdout_field")}
-    if required_stdout and required_stdout.issubset(mapped_targets):
-        return True
-    tool_output_fields: set[str] = set()
-    artifact_fields: set[str] = set()
-    for fn in cap.functions or []:
-        schema = fn.output_schema or cap.output_schema or {}
-        props = schema.get("properties") if isinstance(schema, dict) else {}
-        if isinstance(props, dict):
-            tool_output_fields.update(str(key) for key in props)
-        tool_output_fields.update(_schema_required(schema))
-        for artifact in (fn.artifact_outputs or cap.artifact_outputs or []):
-            if isinstance(artifact, dict) and artifact.get("field"):
-                artifact_fields.add(str(artifact.get("field")))
-    return required_stdout.issubset(tool_output_fields) or required_stdout.issubset(artifact_fields)
 
 
 def _tool_slots_for_requirements(contract: CanonicalFileContract, manifests: list[CallableToolManifest], mappings: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -551,6 +454,7 @@ class _EvidenceVisitor(ast.NodeVisitor):
     def __init__(self, resolution: ImplementationResolution):
         self.resolution = resolution
         self.import_roots: set[str] = set()
+        self.import_modules: set[str] = set()
         self.calls: set[str] = set()
         self.has_file_write = False
         self.has_transform_call = False
@@ -575,16 +479,18 @@ class _EvidenceVisitor(ast.NodeVisitor):
         for alias in node.names:
             if alias.name:
                 self.import_roots.add(alias.name.split(".")[0])
+                self.import_modules.add(alias.name)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> Any:
         if node.module:
             self.import_roots.add(node.module.split(".")[0])
+            self.import_modules.add(node.module)
 
     def visit_Call(self, node: ast.Call) -> Any:
         name = _call_name(node.func)
         if name:
             self.calls.add(name)
-            if name.split(".")[-1] in {"write", "write_text", "write_bytes", "open", "dump", "dumps", "loads", "join", "format", "append", "extend", "update", "read", "read_text", "read_bytes"}:
+            if name.split(".")[-1] in {"write", "write_text", "write_bytes", "open", "dump", "dumps", "loads", "join", "format", "append", "extend", "update", "read", "read_text", "read_bytes", "str", "int", "float", "len", "sorted"}:
                 self.has_transform_call = True
             if name.split(".")[-1] in {"write", "write_text", "write_bytes"}:
                 self.has_file_write = True
@@ -642,8 +548,15 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
     visitor.visit(tree)
     issues: list[str] = []
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
-    allowed = set(resolution.allowed_imports) | {d.split(".")[0].replace("-", "_") for d in resolution.declared_dependencies}
-    undeclared = sorted(root for root in visitor.import_roots if root not in stdlib and root not in allowed)
+    allowed_exact = set(resolution.allowed_imports)
+    allowed_dependency_roots = {d.split(".")[0].replace("-", "_") for d in resolution.declared_dependencies if _is_declared_dependency(d)}
+    undeclared = []
+    for module in visitor.import_modules:
+        root = module.split(".")[0]
+        if root in stdlib or root in allowed_dependency_roots or module in allowed_exact:
+            continue
+        undeclared.append(module)
+    undeclared = sorted(set(undeclared))
     if undeclared:
         issues.append("declared_dependency_only: undeclared imports " + ", ".join(undeclared))
     required = set(_schema_required(contract.stdout_schema) or contract.outputs)
@@ -654,7 +567,7 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
             issues.append("stdout_contract: source does not mention required stdout fields " + ", ".join(missing))
     selected_functions = {m.function_name for m in resolution.selected_tools if m.function_name}
     selected_imports = {m.import_path for m in resolution.selected_tools if m.import_path}
-    if resolution.mode in {"use_registered_tool", "tool_assisted_creator_implemented"}:
+    if selected_functions:
         has_tool_call = bool(selected_functions & {c.split(".")[-1] for c in visitor.calls})
         has_tool_import = any(path.split(".")[0] in visitor.import_roots or path in content for path in selected_imports)
         if not (has_tool_call and has_tool_import):
@@ -663,11 +576,10 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
             issues.append("tool_result_used: selected tool result does not appear to feed stdout/local transform")
         elif visitor.nonconstants_in_returns == 0:
             issues.append("tool_result_used: stdout does not appear to depend on computed/tool values")
-    if resolution.mode in {"creator_implemented", "tool_assisted_creator_implemented"}:
-        if visitor.input_refs == 0:
-            issues.append("input_dependency: outputs do not appear to depend on argv/payload input")
-        if not (visitor.has_transform_call or visitor.has_file_write):
-            issues.append("nontrivial_transform: no parsing/transformation/file-processing evidence found")
+    if visitor.input_refs == 0:
+        issues.append("input_dependency: outputs do not appear to depend on argv/payload input")
+    if not (visitor.has_transform_call or visitor.has_file_write):
+        issues.append("nontrivial_transform: no parsing/transformation/file-processing evidence found")
     if visitor.nonconstants_in_returns == 0 and visitor.constants_in_returns > 0:
         issues.append("no_shell_template: required outputs appear to be literal-only")
     return issues

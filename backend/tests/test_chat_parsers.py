@@ -3463,6 +3463,26 @@ def test_trial_stdout_missing_required_output_blocks():
         )
 
 
+def test_validator_repair_instructions_do_not_enter_repair_feedback():
+    from backend.routers.creator import _format_file_validator_feedback
+
+    feedback = _format_file_validator_feedback(
+        "stdout_contract: missing text",
+        {
+            "model": "validator-model",
+            "issues": [],
+            "failed_checks": [],
+            "repair_instructions": "旧规则：请修改 SkillPlan required_capabilities 并禁止调用未声明 helper",
+        },
+        targeted_repair="只修当前脚本 stdout required outputs",
+    )
+
+    assert "旧规则" not in feedback
+    assert "修改 SkillPlan" not in feedback
+    assert "只修当前脚本 stdout required outputs" in feedback
+    assert "repair_instructions 不进入 repair prompt" in feedback
+
+
 def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
     from backend.routers.creator import _validate_trial_stdout_json
 

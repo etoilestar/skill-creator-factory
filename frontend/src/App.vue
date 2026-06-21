@@ -43,12 +43,15 @@ const llmLabel = ref('LLM 状态后台检查中…')
 onMounted(async () => {
   try {
     const data = await fetchLlmHealth()
-    if (data.connected) {
+    if (data.connected === true) {
       llmStatus.value = 'ok'
       llmLabel.value = data.stale ? `LLM 已连接（缓存）` : `LLM 已连接`
-    } else {
+    } else if (data.connected === false) {
       llmStatus.value = 'err'
       llmLabel.value = data.stale ? 'LLM 离线（缓存）' : 'LLM 离线'
+    } else {
+      llmStatus.value = 'unknown'
+      llmLabel.value = data.refreshing ? 'LLM 状态检查中…' : 'LLM 状态未知'
     }
   } catch {
     llmStatus.value = 'err'

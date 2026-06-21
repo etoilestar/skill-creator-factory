@@ -4980,10 +4980,9 @@ def _format_file_validator_feedback(deterministic_error: str, validator_report: 
         + f"校验模型：{validator_report.get('model', '')}\n"
         "校验模型问题列表：\n"
         f"{issue_text}\n\n"
-        "校验模型结构化 failed_checks：\n"
+        "校验模型结构化 failed_checks（已按后端确定性失败过滤）：\n"
         f"{failed_check_text}\n\n"
-        "校验模型给 coder 的修复意见：\n"
-        f"{validator_report.get('repair_instructions') or deterministic_error}"
+        "说明：校验模型 repair_instructions 不进入 repair prompt；只允许后端确定性错误和确定性修复指令驱动修复。"
     )
 
 

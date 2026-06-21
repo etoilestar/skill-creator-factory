@@ -43,6 +43,8 @@ def test_selected_tool_prompt_contains_schema_and_snippet():
     assert "Tool Snippet" in text
     assert "helper returns str" in text.lower()
     assert "Do not use result.get('text')" in text
+    assert '"type": "string"' in text
+    assert "Raw helper return value" in text
 
 
 def test_structural_fallback_preserves_tool_io_and_snippets(monkeypatch):

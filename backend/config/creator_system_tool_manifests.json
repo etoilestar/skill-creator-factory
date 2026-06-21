@@ -68,15 +68,8 @@
             }
           },
           "output_schema": {
-            "type": "object",
-            "required": [
-              "text"
-            ],
-            "properties": {
-              "text": {
-                "type": "string"
-              }
-            }
+            "type": "string",
+            "description": "Raw helper return value. generate_text_with_llm returns a Python str; script stdout may wrap this string as {\"text\": text}."
           },
           "artifact_outputs": [],
           "side_effects": [],

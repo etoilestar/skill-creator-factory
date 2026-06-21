@@ -3,7 +3,7 @@ from backend.services.creator_contracts import (
     resolve_implementation,
     validate_python_evidence,
 )
-from backend.services.skill_plan import SkillPlanEntry
+from backend.services.skill_plan import SkillPlanEntry, ToolSlot
 
 
 def _entry(**kw):
@@ -26,7 +26,7 @@ def _schema():
     return {"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}}
 
 
-def test_creator_implemented_rejects_literal_shell_script():
+def test_script_composition_rejects_literal_shell_script():
     entry = _entry()
     contract = compile_canonical_file_contract(entry, _schema())
     resolution = resolve_implementation(entry, contract)
@@ -38,12 +38,12 @@ def run(payload):
 
     issues = validate_python_evidence(code, contract, resolution)
 
-    assert resolution.mode == "creator_implemented"
+    assert resolution.mode == "script_composition"
     assert any(issue.startswith("input_dependency") for issue in issues)
     assert any(issue.startswith("nontrivial_transform") for issue in issues)
 
 
-def test_creator_implemented_accepts_input_dependent_transform():
+def test_script_composition_accepts_input_dependent_transform():
     entry = _entry()
     contract = compile_canonical_file_contract(entry, _schema())
     resolution = resolve_implementation(entry, contract)
@@ -59,15 +59,18 @@ def run(payload):
     assert validate_python_evidence(code, contract, resolution) == []
 
 
-def test_registered_tool_requires_selected_call():
+def test_available_tool_is_not_forced_but_used_tool_is_validated():
     entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["pdf_path", "file_outputs"])
     schema = {"type": "object", "required": ["pdf_path", "file_outputs"], "properties": {}}
     contract = compile_canonical_file_contract(entry, schema)
     resolution = resolve_implementation(entry, contract)
 
-    assert resolution.mode == "use_registered_tool"
-    issues = validate_python_evidence("def run(payload):\n    return {'pdf_path': 'x.pdf', 'file_outputs': ['x.pdf']}\n", contract, resolution)
-    assert any(issue.startswith("tool_call") for issue in issues)
+    assert resolution.mode == "script_composition"
+    no_tool_code = "def run(payload):\n    value = str(payload.get('payload', ''))\n    return {'pdf_path': value + '.pdf', 'file_outputs': [value]}\n"
+    assert not any(issue.startswith("tool_call") for issue in validate_python_evidence(no_tool_code, contract, resolution))
+
+    imported_not_called = "from backend.services.runtime_tools import create_pdf\ndef run(payload):\n    value = str(payload.get('payload', ''))\n    return {'pdf_path': value, 'file_outputs': [value]}\n"
+    assert any(issue.startswith("tool_call") for issue in validate_python_evidence(imported_not_called, contract, resolution))
 
     ok_code = """
 from backend.services.runtime_tools import create_pdf
@@ -106,7 +109,7 @@ def test_configured_discovery_adapter_loads_callable_manifests():
     assert all("artifact_outputs" in record and "side_effects" in record for record in records)
 
 
-def test_selected_tool_schema_refines_canonical_contract():
+def test_available_tool_schema_does_not_replace_canonical_contract():
     from backend.services.creator_contracts import refine_contract_with_resolution
 
     entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["pdf_path"])
@@ -114,17 +117,22 @@ def test_selected_tool_schema_refines_canonical_contract():
     resolution = resolve_implementation(entry, contract)
     refined = refine_contract_with_resolution(contract, resolution)
 
-    assert resolution.mode == "use_registered_tool"
+    assert resolution.mode == "script_composition"
     assert "pdf_path" in refined.outputs
-    assert "file_outputs" in refined.stdout_schema["required"]
+    assert refined.stdout_schema["required"] == ["pdf_path"]
 
 
 def test_references_and_assets_are_not_script_io_keys():
-    entry = _entry(inputs=["payload", "references/guide.md", "assets/source.png"], outputs=["result", "assets/generated/out.png"])
+    entry = _entry(
+        inputs=["payload", "references/guide.md", "assets/source.png"],
+        outputs=["result", "assets/generated/out.png"],
+        dependencies=["requests", "references/guide.md", "assets/source.png"],
+    )
     contract = compile_canonical_file_contract(entry, _schema())
 
     assert contract.inputs == ["payload"]
     assert contract.outputs == ["result"]
+    assert contract.declared_dependencies == ["requests"]
 
 
 def test_system_manifest_selects_text_generation_tool():
@@ -132,8 +140,8 @@ def test_system_manifest_selects_text_generation_tool():
     contract = compile_canonical_file_contract(entry, {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}})
     resolution = resolve_implementation(entry, contract)
 
-    assert resolution.mode == "use_registered_tool"
-    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+    assert resolution.mode == "script_composition"
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.available_tools)
 
 
 def test_system_manifest_selects_image_generation_artifact_tool():
@@ -144,10 +152,10 @@ def test_system_manifest_selects_image_generation_artifact_tool():
     resolution = resolve_implementation(entry, contract)
     refined = refine_contract_with_resolution(contract, resolution)
 
-    assert resolution.mode == "use_registered_tool"
-    assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.selected_tools)
+    assert resolution.mode == "script_composition"
+    assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.available_tools)
     assert "artifact_created" in resolution.required_evidence
-    assert refined.artifact_contract.get("tool_artifact_outputs")
+    assert not refined.artifact_contract.get("tool_artifact_outputs")
 
 
 def test_raw_capability_hints_are_candidate_signals_for_tool_resolution():
@@ -156,8 +164,8 @@ def test_raw_capability_hints_are_candidate_signals_for_tool_resolution():
     resolution = resolve_implementation(entry, contract)
 
     assert any(req.capability_id == "text_generation" and req.source == "raw_capability_hints" and not req.required for req in contract.capability_requirements)
-    assert resolution.mode == "use_registered_tool"
-    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+    assert resolution.mode == "script_composition"
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.available_tools)
 
 
 def test_single_text_output_mapping_allows_business_stdout_field():
@@ -169,13 +177,13 @@ def test_single_text_output_mapping_allows_business_stdout_field():
     resolution = resolve_implementation(entry, contract)
     refined = refine_contract_with_resolution(contract, resolution)
 
-    assert resolution.mode == "use_registered_tool"
+    assert resolution.mode == "script_composition"
     assert resolution.output_mappings == [{"source_tool_field": "text", "target_stdout_field": "article_body"}]
     assert refined.stdout_schema["required"] == ["article_body"]
     assert "text" not in refined.outputs
 
 
-def test_trial_stdout_uses_refined_contract_required_fields():
+def test_trial_stdout_keeps_canonical_required_fields():
     from backend.routers.creator import _validate_trial_stdout_json
     from backend.services.creator_contracts import refine_contract_with_resolution
 
@@ -184,10 +192,46 @@ def test_trial_stdout_uses_refined_contract_required_fields():
     resolution = resolve_implementation(entry, contract)
     refined = refine_contract_with_resolution(contract, resolution)
 
-    assert "file_outputs" in refined.stdout_schema["required"]
+    assert refined.stdout_schema["required"] == ["pdf_path"]
+    _validate_trial_stdout_json(stdout='{"pdf_path":"outputs/a.pdf"}', content="", args=["{}"], canonical_contract=refined)
+
+
+def test_partial_tool_schema_becomes_available_tool_candidate():
+    from backend.services.creator_tool_registry import ToolCapability, ToolFunctionManifest, clear_registered_tool_capabilities, register_tool_capability
+
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="lookup_helper",
+        display_name="Lookup Helper",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools",
+            short_description="Lookup one source value.",
+            when_to_use="Use for the lookup functional step.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["source_value"], "properties": {"source_value": {"type": "string"}}},
+            required_capabilities=["lookup_helper"],
+        )],
+    ))
     try:
-        _validate_trial_stdout_json(stdout='{"pdf_path":"outputs/a.pdf"}', content="", args=["{}"], canonical_contract=refined)
-    except ValueError as exc:
-        assert "file_outputs" in str(exc)
-    else:
-        raise AssertionError("refined stdout_schema.required was not enforced")
+        entry = _entry(
+            raw_capability_hints=["lookup_helper"],
+            outputs=["final_answer", "confidence"],
+            required_tool_slots=[ToolSlot(slot_id="lookup", functional_requirement="lookup source data")],
+        )
+        schema = {"type": "object", "required": ["final_answer", "confidence"], "properties": {"final_answer": {"type": "string"}, "confidence": {"type": "number"}}}
+        contract = compile_canonical_file_contract(entry, schema)
+        resolution = resolve_implementation(entry, contract)
+
+        assert contract.functional_requirements == ["lookup source data"]
+        assert resolution.mode == "script_composition"
+        assert resolution.available_tools[0].tool_id == "lookup_helper.lookup_value"
+        assert resolution.tool_slots[0]["tool_id"] == "lookup_helper.lookup_value"
+        assert "tool_result_used" not in resolution.required_evidence
+        assert resolution.selected_tools == []
+        assert resolution.allowed_imports == ["backend.services.runtime_tools"]
+    finally:
+        clear_registered_tool_capabilities()

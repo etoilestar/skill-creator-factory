@@ -149,6 +149,11 @@ class ToolSlot:
     """Structured interface need resolved after blueprint normalization."""
 
     slot_id: str
+    functional_requirement: str = ""
+    tool_id: str = ""
+    call_template: dict[str, object] = field(default_factory=dict)
+    input_construction: dict[str, object] = field(default_factory=dict)
+    output_consumption: dict[str, object] = field(default_factory=dict)
     input_contract: dict[str, object] = field(default_factory=dict)
     output_contract: dict[str, object] = field(default_factory=dict)
     input_modality: str = "json"

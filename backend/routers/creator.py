@@ -3049,7 +3049,7 @@ def _check_script_file_contract(
                 passed=not missing_inputs,
                 target=file_path,
                 message=("脚本源码引用了声明输入。" if not missing_inputs else f"脚本未引用声明输入：{', '.join(missing_inputs)}。"),
-                expected="第一轮只检查脚本自身入口、JSON argv、stdout JSON、非空壳、非 mock、helper_required 和 forbidden capability。",
+                expected="第一轮只检查脚本自身闭环：argv JSON、run(payload)、stdout JSON object、required outputs、artifact、imports/dependencies、输入使用、非 mock/固定模板和单文件 trial run。",
                 minimal_edit="如 E2E 发现字段未接上，再修 SKILL.md 命令或脚本字段映射。",
             )
         )
@@ -3076,15 +3076,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="tool_usage_contract.forbidden_helper_import",
-            passed=not guessed_helper_imports,
+            passed=True,
             target=file_path,
             message=(
-                "脚本未猜测未在 Tool Registry function card 中明确给出的 helper import path。"
+                "脚本未发现疑似猜测 helper import path。"
                 if not guessed_helper_imports
-                else f"{file_path} import 了未由 Tool Registry function card 明确提供 import path 和调用签名的 helper：{', '.join(guessed_helper_imports)}。"
+                else f"warning: {file_path} import 了未由 Tool Registry function card 明确提供 import path 和调用签名的 helper：{', '.join(guessed_helper_imports)}；第一轮不因此阻断，实际以 import/trial run 结果为准。"
             ),
-            expected="只有 Tool Registry function card 明确给出 import_path 和 signature 时才可 import helper；否则必须自包含实现或使用标准库。",
-            minimal_edit="该模块不可 import；如果 Tool Registry 没有明确 function card，请移除该 import，改为自实现。",
+            expected="第一轮不按 helper import 路线做 hard validation；仅在 import 失败、调用失败或 stdout/artifact 不满足合同时失败。",
+            minimal_edit="如 trial run/import 失败，只修当前脚本的 import/call；不要修改 SkillPlan、capability 声明或 workflow。",
         )
     )
 
@@ -3100,15 +3100,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.required_capabilities.called",
-            passed=not missing_capabilities,
+            passed=True,
             target=file_path,
             message=(
-                "helper_required 能力已调用对应平台 helper；其他 required_capabilities 只作为声明边界，不强制实现方式。"
+                "第一轮不强制 helper_required/required_capabilities 的具体工具路线。"
                 if not missing_capabilities
-                else f"脚本没有调用这些 helper_required 能力对应接口：{', '.join(missing_capabilities)}。"
+                else f"warning: 脚本未调用这些 helper_required 能力对应接口：{', '.join(missing_capabilities)}；第一轮不阻断，实际以 stdout/artifact/trial run 闭环为准。"
             ),
-            expected="第一轮只强制 helper_required 能力调用平台 helper；helper_preferred/self_implementation_allowed 能力由第二轮 E2E 验证 stdout/artifact。",
-            minimal_edit="仅对 usage_policy=helper_required 的能力注入对应平台 helper；其余能力保证最终 stdout/artifact 协议合法。",
+            expected="scripts/** 可按责任模块自主组合已有工具；第一轮不使用 required/optional/allowed_capabilities 卡死实现路线。",
+            minimal_edit="repair 阶段只修当前脚本的 argv/run/stdout/artifact/import/输入使用/真实实现问题；不要修 SkillPlan 或 capability 声明。",
         )
     )
 
@@ -3264,15 +3264,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.capability.forbidden_registry_helpers",
-            passed=not registry_forbidden_helper_hits,
+            passed=True,
             target=file_path,
             message=(
                 "脚本未调用 forbidden_capabilities 中禁止的 registry helper。"
                 if not registry_forbidden_helper_hits
                 else f"{file_path} 调用了这些 forbidden_capabilities 对应的 registry helper：{', '.join(registry_forbidden_helper_hits)}。"
             ),
-            expected="脚本只能调用 SkillPlan required/optional/allowed capabilities 对应的平台 helper。",
-            minimal_edit="移除被 forbidden_capabilities 禁止的 helper 调用，或在蓝图阶段明确声明该能力。",
+            expected="第一轮不按 capability 路线阻断；仅记录 helper/capability 风险，真实失败以 import、调用、stdout、artifact、fake implementation 为准。",
+            minimal_edit="如该 helper 导致运行失败，只修当前脚本；不要扩大 SkillPlan/capability 声明。",
         )
     )
 
@@ -3283,15 +3283,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="tool_usage_contract.forbidden_direct_imports",
-            passed=not forbidden_direct_hits,
+            passed=True,
             target=file_path,
             message=(
                 "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
                 if not forbidden_direct_hits
                 else f"{file_path} 直接调用了 Tool Resolve 禁止的底层工具/库：{', '.join(forbidden_direct_hits)}。"
             ),
-            expected="脚本只能调用工具注册表允许的 backend.services.skill_runtime helper；不得手写底层 PDF/外部 API/数据库实现。",
-            minimal_edit="修当前脚本：删除底层 import/调用，保留 parse_args/run/main/print_json，改为调用平台 helper 并返回 helper stdout JSON。",
+            expected="第一轮不因工具路线选择阻断；底层库是否可用由 dependency/import/trial run 和 artifact 合同验证。",
+            minimal_edit="如 dependency/import/trial run 失败，只修当前脚本依赖和调用路径。",
         )
     )
 
@@ -3303,15 +3303,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="tool_usage_contract.undeclared_helper",
-            passed=not undeclared_helper_hits,
+            passed=True,
             target=file_path,
             message=(
-                "脚本调用的 registry helper 均有 SkillPlan capability 声明。"
+                "脚本未调用未声明 registry helper，或无需记录 warning。"
                 if not undeclared_helper_hits
-                else f"{file_path} 调用了未在 required/optional/allowed_capabilities 声明的工具能力：{', '.join(undeclared_helper_hits)}。"
+                else f"warning: {file_path} 调用了未在 required/optional/allowed_capabilities 声明的工具能力：{', '.join(undeclared_helper_hits)}；第一轮不阻断。"
             ),
-            expected="required_capabilities/allowed_capabilities 必须与实际 helper 调用一致。",
-            minimal_edit="若能力确实需要，应修 SkillPlan；若蓝图已确定，则修脚本删除未声明 helper。",
+            expected="undeclared_helper 降级为 warning；scripts/** 可根据自身责任自主组合已有工具。",
+            minimal_edit="不要修 SkillPlan、capability 声明或 workflow；仅当调用本身失败或 stdout/artifact 不满足合同时修当前脚本。",
         )
     )
 
@@ -4814,8 +4814,8 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
 
         if "forbidden_image_generation" in error_text or "调用了图片生成 helper" in error_text:
             return (
-                "当前脚本的 SkillPlan forbidden_capabilities 禁止 image_generation，因此 validator 禁止调用 generate_stable_diffusion_image。"
-                "蓝图和 SKILL.md 确定后不能由后台修复流程修改；只能修当前脚本，使其与既有 role、required_capabilities 和 SKILL.md 数据流一致。"
+                "第一轮不因 required/optional/allowed_capabilities 工具路线阻断。"
+                "如调用导致 import/运行/stdout/artifact 失败，repair 只能修当前脚本，不能修改 SkillPlan、capability 声明或 workflow。"
             )
 
         if (
@@ -4824,7 +4824,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "没有调用这些 required_capabilities" in error_text
         ):
             return (
-                "按当前脚本的轻量 script_composition 上下文修复能力边界："
+                "按当前脚本的轻量 script_composition 上下文修复脚本闭环："
                 "根据 script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules 组合工具与本地逻辑；"
                 "available_tools 只是候选，最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
                 "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"

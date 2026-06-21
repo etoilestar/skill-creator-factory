@@ -1953,13 +1953,12 @@ async def _validate_skill_md_blueprint_alignment(
     skill_plan_entry: dict[str, Any] | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
-    """Validate SKILL.md against blueprint intent.
+    """Validate SKILL.md with deterministic hard gates.
 
-    设计目标：
-    - 校验不通过时，抛出可被外层自动修复循环捕获的异常；
-    - 校验器自身异常时，也包装成普通 ValueError，避免直接崩溃；
-    - 模型审查通过后，仍然执行 fenced command 后置校验；
-    - 后置校验失败也进入自动修复，而不是静默放过。
+    Model intent review is advisory only: it may emit warnings for logs/UI, but
+    it cannot block first-round generation or trigger repair. Hard failures are
+    limited to deterministic parser/contract checks such as frontmatter,
+    non-empty markdown, fenced bash command parsing, and scripts/*.py JSON argv.
     """
 
     # 1. 基础硬格式 / 资源边界校验
@@ -1990,35 +1989,33 @@ async def _validate_skill_md_blueprint_alignment(
         )
         raise ContractValidationError(message, hard_results)
 
-    # 2. 模型蓝图语义审查
+    # 2. 模型蓝图语义审查（warning only; never a hard gate）
+    review: dict[str, Any] = {
+        "passed": True,
+        "issues": [],
+        "warning_only": True,
+    }
     try:
-        review = await _review_skill_md_blueprint_intent_with_model(
+        model_review = await _review_skill_md_blueprint_intent_with_model(
             skill_name=skill_name,
             content=content,
             blueprint_text=blueprint_text,
             skill_plan_entry=skill_plan_entry,
             model=model,
         )
+        if isinstance(model_review, dict):
+            review.update(model_review)
+            review["model_passed"] = bool(model_review.get("passed", model_review.get("valid", False)))
+        else:
+            review["model_warning"] = f"SKILL.md intent review returned {type(model_review).__name__}, ignored as warning."
     except Exception as exc:
         logger.exception(
-            "[Creator][skill_md] model blueprint intent review crashed skill=%s",
+            "[Creator][skill_md] model blueprint intent review crashed; ignored as warning skill=%s",
             skill_name,
         )
-        raise ValueError(
-            "SKILL.md 蓝图意图审查调用异常，已转为可修复错误。\n"
-            f"错误：{exc}\n"
-            "请检查审查模型返回 JSON、蓝图文件计划、SKILL.md workflow 和资源说明。"
-        ) from exc
+        review["model_warning"] = f"SKILL.md intent review crashed and was ignored: {exc}"
 
-    if not isinstance(review, dict):
-        raise ValueError(
-            "SKILL.md 蓝图意图审查返回类型错误。\n"
-            f"expected: dict JSON object\n"
-            f"actual: {type(review).__name__}\n"
-            "请重新审查 SKILL.md，并返回 passed/issues/required_script_paths 等字段。"
-        )
-
-    if review.get("passed") is not True:
+    if review.get("model_passed") is False:
         try:
             message = _format_skill_md_intent_review_failure(review)
         except Exception as exc:
@@ -2033,16 +2030,16 @@ async def _validate_skill_md_blueprint_alignment(
             )
 
         logger.info(
-            "[Creator][skill_md] model blueprint intent review failed skill=%s message=\n%s",
+            "[Creator][skill_md] model blueprint intent review warning skill=%s message=\n%s",
             skill_name,
             message,
         )
-        raise ValueError(message)
+        review["model_warning"] = message
 
     # 3. fenced command 后置校验
     required_script_paths = [
         path
-        for path in review.get("required_script_paths", [])
+        for path in _extract_declared_skill_paths(blueprint_text)
         if isinstance(path, str) and path.startswith("scripts/")
     ]
 
@@ -3394,22 +3391,16 @@ def _check_script_file_contract(
 
 
 _SCRIPT_CONTENT_REVIEW_CHECK_IDS = {
+    # First-round scripts/** hard gates are intentionally minimal and
+    # deterministic: raw source shape, syntax/argv/entrypoint protocol, and
+    # dangerous-operation security checks. Tool route, capability, role,
+    # placeholder/mock/template, and static artifact implementation opinions are
+    # not hard gates; trial run/stdout/artifact validation owns runtime truth.
     "script.raw_source.single_file",
-    "script.skillplan_inputs.used",
-    "script.required_capabilities.called",
-    "script.file_outputs.real_creation_logic",
-    "script.no_fake_implementation",
-    "script.capability.forbidden_image_generation",
-    "script.capability.forbidden_text_generation",
-    "script.capability.forbidden_pdf_generation",
-    "script.capability.forbidden_registry_helpers",
-    "tool_usage_contract.forbidden_direct_imports",
-    "tool_usage_contract.forbidden_helper_import",
-    "tool_usage_contract.undeclared_helper",
-    "script.database_read.readonly_sql",
-    "tool_usage_contract.artifact_output_e2e",
+    "script.source.syntax",
+    "script.json_argv.runtime",
+    "script.runtime.entrypoint",
     "script.security.dangerous_operations",
-    "script.role.image_forbidden_pdf_only_outputs",
 }
 
 
@@ -3419,11 +3410,11 @@ def _check_script_content_review_contract(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> list[ContractCheckResult]:
-    """First script phase: content/responsibility review only.
+    """First script phase: deterministic protocol/security review only.
 
-    This deliberately excludes runtime-startup checks such as syntax, argv
-    parsing, entrypoint invocation, and stdout JSON. Those are owned by the
-    single-script smoke phase, which records failures with source=script_smoke.
+    Runtime truth still comes from the single-script smoke phase, but syntax,
+    JSON argv parsing shape, entrypoint shape, and dangerous operations are cheap
+    deterministic gates before trial execution.
     """
     return [
         result
@@ -4579,8 +4570,9 @@ async def _repair_generated_file_with_feedback(
         ) if plan_entry is not None else ""
         extra_rules = (
             "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
-            "修复只能基于当前验证错误、显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 上下文；"
+            "修复只能基于当前确定性验证错误、当前脚本合同与必要 Tool Snippet；"
             "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
+            "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
             "不要生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
             f"\n统一 Tool Registry 上下文：\n{tool_context}"
         )
@@ -4608,7 +4600,7 @@ async def _repair_generated_file_with_feedback(
             max_snippets=5,
         )
         repair_snippet_text = tool_snippet_prompt(snippets)
-    previous_for_prompt = previous_content[-16000:]
+    previous_for_prompt = previous_content[-8000:] if is_script else previous_content[-16000:]
     previous_label = "待编辑草稿"
     if is_script and repair_mode == "strict_contract_rewrite":
         previous_for_prompt = (_extract_probable_python_source(previous_content) if repair_language == "python" else _drop_common_non_code_lines(_extract_single_wrapping_fence(previous_content) or previous_content)) or ""
@@ -4642,8 +4634,8 @@ async def _repair_generated_file_with_feedback(
             f"{extra_rules}\n\n"
             f"错误信息：\n{validation_error}"
             + ("\n\n本次失败涉及以下工具；请优先按相关 Tool Snippet 修复，不要继续猜工具调用方式：\n" + repair_snippet_text if repair_snippet_text else "")
-            + (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else "")
-            + (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else "")
+            + ("" if is_script else (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else ""))
+            + ("" if is_script else (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else ""))
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
             + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
@@ -4847,7 +4839,21 @@ async def _run_generated_file_validator_round(
     failed_checks_text: str = "",
     repair_mode: str = "minimal_edit",
 ) -> dict:
-    """Ask the validator model for actionable repair feedback for the coder."""
+    """Ask the validator model for advisory explanations only.
+
+    The validator model must never be a hard gate. This function is only called
+    after deterministic backend checks or a trial run have already produced a
+    real failure, and its output is filtered to the deterministic failure set.
+    """
+    if not str(deterministic_error or "").strip():
+        return {
+            "passed": True,
+            "issues": [],
+            "failed_checks": [],
+            "preserve": [],
+            "repair_instructions": "",
+            "model": "",
+        }
     route = route_model(
         VALIDATOR_TASK,
         requested_model=requested_model,
@@ -4864,14 +4870,16 @@ async def _run_generated_file_validator_round(
             "role": "system",
             "content": (
                 "你是 Creator 生成文件校验模型，只输出严格 JSON object。"
-                "你不改代码，只给 coder 可执行的局部修复意见。"
+                "你不决定 passed/failed；后端确定性检查和 trial run 才是唯一裁决。"
+                "你只解释后端已经给出的真实错误，并给 coder 可执行的局部修复意见。"
                 "重要规则：Markdown 执行命令必须使用标准 ```bash fenced code block；"
                 "机器可读 JSON 示例必须使用标准 ```json fenced code block；"
                 "不要使用 '''bash 或 '''json；不要把行内 scripts/*.py 当成执行命令。"
                 "SKILL.md YAML frontmatter 只需要在文件开头用 --- 开启，并在 metadata 后用 --- 关闭；"
                 "不要求整个文件末尾再出现 ---。"
                 "禁止报告任何未经后端结构化检查确认的推测性运行风险；"
-                "真实运行错误只以单脚本 smoke 阶段结果为准。"
+                "禁止新增 failed_checks，禁止猜输入字段，禁止要求修改 SkillPlan/capability/workflow；"
+                "真实运行错误只以后端确定性检查和单脚本 smoke 阶段结果为准。"
             ),
         },
         {
@@ -4880,20 +4888,19 @@ async def _run_generated_file_validator_round(
                 f"目标文件：{file_path}\n"
                 "后端确定性校验/试运行错误：\n"
                 f"{deterministic_error}\n\n"
-                + (f"完整 contract：\n{contract_text}\n\n" if contract_text else "")
-                + (f"已通过检查（repair 时必须保留）：\n{passed_checks_text}\n\n" if passed_checks_text else "")
-                + (f"未通过检查（repair 只修这些项）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
+                + (f"当前脚本合同/输入输出/产物摘要：\n{contract_text[-4000:]}\n\n" if contract_text else "")
+                + (f"后端确定性 failed_checks（只能解释这些，不能新增）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
                 + (f"本轮修复模式：{repair_mode}\n\n" if repair_mode else "")
                 + (f"后端根据该错误生成的必做修复步骤：\n{targeted_repair}\n\n" if targeted_repair else "")
-                + "候选内容：\n"
+                + "当前代码（尾部截断，仅供定位）：\n"
                 "```text\n"
-                f"{content[-12000:]}\n"
+                f"{content[-8000:]}\n"
                 "```\n\n"
                 "请输出 JSON："
                 "{\"passed\": false, \"issues\": [\"...\"], "
-                "\"failed_checks\": [{\"id\": \"...\", \"target\": \"...\", \"expected\": \"...\", \"minimal_edit\": \"...\"}], "
+                "\"failed_checks\": [], "
                 "\"preserve\": [\"已通过检查对应内容\"], "
-                "\"repair_instructions\": \"给 coder 的局部修改指令；如果上方有必做修复步骤，必须复述并细化这些步骤，不得改用其它占位符或省略必需的 fenced block。若有 Markdown fence/多文件包，明确要求只返回目标脚本源码本身，不要 fence/说明/写入文件标签。\"}"
+                "\"repair_instructions\": \"只针对后端真实错误的局部修改指令；不得引入 LLM 推测、SkillPlan/capability/workflow 修改或工具路线重规划。\"}"
             ),
         },
     ]
@@ -4936,12 +4943,16 @@ async def _run_generated_file_validator_round(
         issues=issues,
         instructions=instructions,
     )
+    deterministic_failed = bool(str(deterministic_error or "").strip())
     return {
-        "passed": bool(data.get("passed", data.get("valid", False))) and not filtered_issues and not failed_checks,
-        "issues": filtered_issues,
-        "failed_checks": failed_checks,
+        # LLM validator is advisory only. It cannot decide pass/fail and cannot
+        # create new blocking failures; deterministic backend checks/trial run
+        # are the sole source of truth.
+        "passed": not deterministic_failed,
+        "issues": filtered_issues if deterministic_failed else [],
+        "failed_checks": failed_checks if deterministic_failed else [],
         "preserve": [str(item) for item in preserve],
-        "repair_instructions": instructions,
+        "repair_instructions": instructions if deterministic_failed else "",
         "model": route.model,
     }
 
@@ -4966,23 +4977,13 @@ def _filter_validator_model_call_misjudgements(
 
 
 def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
-    issues = validator_report.get("issues") or []
-    issue_text = "\n".join(f"- {issue}" for issue in issues) if issues else "- （校验模型未返回额外问题）"
-    failed_checks = validator_report.get("failed_checks") or []
-    failed_check_text = (
-        "\n".join(f"- {json.dumps(check, ensure_ascii=False)}" for check in failed_checks)
-        if failed_checks else "- （校验模型未返回结构化 failed_checks）"
-    )
     return (
         "后端确定性校验/试运行错误：\n"
         f"{deterministic_error}\n\n"
         + (f"后端确定性修复指令：\n{targeted_repair}\n\n" if targeted_repair else "")
         + f"校验模型：{validator_report.get('model', '')}\n"
-        "校验模型问题列表：\n"
-        f"{issue_text}\n\n"
-        "校验模型结构化 failed_checks（已按后端确定性失败过滤）：\n"
-        f"{failed_check_text}\n\n"
-        "说明：校验模型 repair_instructions 不进入 repair prompt；只允许后端确定性错误和确定性修复指令驱动修复。"
+        "说明：校验模型仅作为真实失败后的解释辅助；其 issues、failed_checks 和 repair_instructions "
+        "不进入 repair prompt。repair 只允许后端确定性错误和确定性修复指令驱动。"
     )
 
 
@@ -6789,10 +6790,9 @@ async def write_file(request: WriteFileRequest):
             ))
 
         elif request.file_path.startswith("scripts/"):
-            _raise_file_contract_failures(validate_file_contract(
-                file_path=request.file_path,
-                content=content,
-                blueprint_text=request.blueprint_text or "",
+            _raise_file_contract_failures(_check_script_content_review_contract(
+                request.file_path,
+                content,
                 role=request.role,
                 skill_plan_entry=request.skill_plan_entry,
             ))

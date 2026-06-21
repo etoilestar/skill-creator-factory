@@ -46,6 +46,7 @@ from ..services.creator_contracts import (
     refine_contract_with_resolution,
     resolve_implementation,
     validate_python_evidence,
+    call_template_for_tool,
 )
 from .chat_utils import _get_skill_venv_python
 
@@ -5452,7 +5453,7 @@ def _script_local_contract_payload(
         available_tools.append({
             "tool_id": tool.tool_id,
             "description": tool.description,
-            "call_template": (tool.example_call or f"from {tool.import_path} import {tool.function_name}\nresult = {tool.function_name}(...)").strip(),
+            "call_template": call_template_for_tool(tool),
             "input_schema": tool.input_schema,
             "output_schema": tool.output_schema,
             "artifact_outputs": tool.artifact_outputs,

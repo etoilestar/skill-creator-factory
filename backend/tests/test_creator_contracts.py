@@ -59,15 +59,18 @@ def run(payload):
     assert validate_python_evidence(code, contract, resolution) == []
 
 
-def test_registered_tool_requires_selected_call():
+def test_available_tool_is_not_forced_but_used_tool_is_validated():
     entry = _entry(role="pdf_builder", required_capabilities=["pdf_generation"], outputs=["pdf_path", "file_outputs"])
     schema = {"type": "object", "required": ["pdf_path", "file_outputs"], "properties": {}}
     contract = compile_canonical_file_contract(entry, schema)
     resolution = resolve_implementation(entry, contract)
 
     assert resolution.mode == "script_composition"
-    issues = validate_python_evidence("def run(payload):\n    return {'pdf_path': 'x.pdf', 'file_outputs': ['x.pdf']}\n", contract, resolution)
-    assert any(issue.startswith("tool_call") for issue in issues)
+    no_tool_code = "def run(payload):\n    value = str(payload.get('payload', ''))\n    return {'pdf_path': value + '.pdf', 'file_outputs': [value]}\n"
+    assert not any(issue.startswith("tool_call") for issue in validate_python_evidence(no_tool_code, contract, resolution))
+
+    imported_not_called = "from backend.services.runtime_tools import create_pdf\ndef run(payload):\n    value = str(payload.get('payload', ''))\n    return {'pdf_path': value, 'file_outputs': [value]}\n"
+    assert any(issue.startswith("tool_call") for issue in validate_python_evidence(imported_not_called, contract, resolution))
 
     ok_code = """
 from backend.services.runtime_tools import create_pdf
@@ -138,7 +141,7 @@ def test_system_manifest_selects_text_generation_tool():
     resolution = resolve_implementation(entry, contract)
 
     assert resolution.mode == "script_composition"
-    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.available_tools)
 
 
 def test_system_manifest_selects_image_generation_artifact_tool():
@@ -150,7 +153,7 @@ def test_system_manifest_selects_image_generation_artifact_tool():
     refined = refine_contract_with_resolution(contract, resolution)
 
     assert resolution.mode == "script_composition"
-    assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.selected_tools)
+    assert any(tool.function_name == "generate_stable_diffusion_image" for tool in resolution.available_tools)
     assert "artifact_created" in resolution.required_evidence
     assert not refined.artifact_contract.get("tool_artifact_outputs")
 
@@ -162,7 +165,7 @@ def test_raw_capability_hints_are_candidate_signals_for_tool_resolution():
 
     assert any(req.capability_id == "text_generation" and req.source == "raw_capability_hints" and not req.required for req in contract.capability_requirements)
     assert resolution.mode == "script_composition"
-    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.selected_tools)
+    assert any(tool.function_name == "generate_text_with_llm" for tool in resolution.available_tools)
 
 
 def test_single_text_output_mapping_allows_business_stdout_field():
@@ -227,7 +230,8 @@ def test_partial_tool_schema_becomes_available_tool_candidate():
         assert resolution.mode == "script_composition"
         assert resolution.available_tools[0].tool_id == "lookup_helper.lookup_value"
         assert resolution.tool_slots[0]["tool_id"] == "lookup_helper.lookup_value"
-        assert "tool_result_used" in resolution.required_evidence
+        assert "tool_result_used" not in resolution.required_evidence
+        assert resolution.selected_tools == []
         assert resolution.allowed_imports == ["backend.services.runtime_tools"]
     finally:
         clear_registered_tool_capabilities()

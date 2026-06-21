@@ -65,7 +65,7 @@ class CanonicalFileContract:
 @dataclass(frozen=True)
 class ImplementationResolution:
     mode: ImplementationMode
-    selected_tools: list[CallableToolManifest] = field(default_factory=list)  # compatibility: same tools as available_tools
+    selected_tools: list[CallableToolManifest] = field(default_factory=list)  # compatibility; not populated for candidate-only available_tools
     available_tools: list[CallableToolManifest] = field(default_factory=list)
     selected_adapters: list[str] = field(default_factory=list)
     output_mappings: list[dict[str, str]] = field(default_factory=list)
@@ -222,6 +222,37 @@ def _is_declared_dependency(value: Any) -> bool:
     return bool(text) and not text.startswith(("references/", "assets/")) and text not in {"references", "assets", "assets/"}
 
 
+def _filter_available_tools(manifests: list[CallableToolManifest], contract: CanonicalFileContract, *, limit: int = 5) -> list[CallableToolManifest]:
+    """Apply a small deterministic filter after structural/embedding recall."""
+    del contract  # reserved for future schema-aware filters; keep filtering generic.
+    out: list[CallableToolManifest] = []
+    seen: set[str] = set()
+    for manifest in manifests:
+        if not manifest.tool_id or not manifest.import_path or not manifest.function_name:
+            continue
+        if manifest.tool_id in seen:
+            continue
+        seen.add(manifest.tool_id)
+        out.append(manifest)
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+def call_template_for_tool(tool: CallableToolManifest) -> str:
+    """Return a local import/call template without stdout/return policy."""
+    if tool.example_call:
+        lines = []
+        for line in tool.example_call.strip().splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("return ", "print(", "sys.stdout", "raise ")):
+                continue
+            lines.append(line.rstrip())
+        if lines:
+            return "\n".join(lines)
+    return f"from {tool.import_path} import {tool.function_name}\nresult = {tool.function_name}(...)"
+
+
 def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContract) -> ImplementationResolution:
     available_manifests: list[CallableToolManifest] = []
     output_mappings: list[dict[str, str]] = []
@@ -240,16 +271,15 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
             output_mappings.extend(mappings)
     local_ok, local_reason = _creator_can_implement(contract)
     if local_ok or available_manifests:
+        available_manifests = _filter_available_tools(available_manifests, contract)
         deps = sorted({d for m in available_manifests for d in m.dependencies if _is_declared_dependency(d)})
         import_paths = sorted({m.import_path for m in available_manifests if m.import_path})
-        required_evidence = ["tool_call", "tool_result_used", "input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
-        if not available_manifests:
-            required_evidence = ["input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
+        required_evidence = ["input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
         if _contract_declares_artifact(contract) or any(m.artifact_outputs for m in available_manifests):
             required_evidence.append("artifact_created")
         return ImplementationResolution(
             mode="script_composition",
-            selected_tools=available_manifests,
+            selected_tools=[],
             available_tools=available_manifests,
             output_mappings=output_mappings,
             tool_slots=_tool_slots_for_requirements(contract, available_manifests, output_mappings),
@@ -257,7 +287,7 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
             allowed_imports=import_paths,
             declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
             required_evidence=required_evidence,
-            reason="Generate the script by composing argv inputs, local logic, and any recalled available_tools; embeddings only recalled candidates.",
+            reason="Generate the script by composing argv inputs, local logic, and filtered available_tools candidates; embeddings only recall candidates.",
         )
     return ImplementationResolution(mode="unresolved", local_fallback_allowed=False, required_evidence=[], reason=local_reason or "Canonical contract is incomplete.")
 
@@ -327,7 +357,7 @@ def _tool_slots_for_requirements(contract: CanonicalFileContract, manifests: lis
             "slot_id": f"tool_slot_{idx + 1}",
             "functional_requirement": req,
             "tool_id": tool.tool_id,
-            "call_template": (tool.example_call or f"from {tool.import_path} import {tool.function_name}\nresult = {tool.function_name}(...)").strip(),
+            "call_template": call_template_for_tool(tool),
             "input_construction": {"source": "argv/payload", "schema": tool.input_schema},
             "output_consumption": {"schema": tool.output_schema, "mappings": mappings, "rule": "Use the tool result as evidence for this requirement; map or transform it locally into the canonical stdout fields."},
         })
@@ -467,7 +497,7 @@ class _EvidenceVisitor(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> Any:
         call = node.value if isinstance(node.value, ast.Call) else None
         call_name = _call_name(call.func) if call is not None else ""
-        selected = {tool.function_name for tool in self.resolution.selected_tools if tool.function_name}
+        selected = {tool.function_name for tool in self.resolution.available_tools if tool.function_name}
         if call_name and call_name.split(".")[-1] in selected:
             for target in node.targets:
                 root = _name_root(target)
@@ -565,15 +595,15 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
         missing = [key for key in required if key not in source]
         if missing:
             issues.append("stdout_contract: source does not mention required stdout fields " + ", ".join(missing))
-    selected_functions = {m.function_name for m in resolution.selected_tools if m.function_name}
-    selected_imports = {m.import_path for m in resolution.selected_tools if m.import_path}
-    if selected_functions:
-        has_tool_call = bool(selected_functions & {c.split(".")[-1] for c in visitor.calls})
-        has_tool_import = any(path.split(".")[0] in visitor.import_roots or path in content for path in selected_imports)
-        if not (has_tool_call and has_tool_import):
-            issues.append("tool_call: selected callable tool was not imported and called")
+    available_functions = {m.function_name for m in resolution.available_tools if m.function_name}
+    available_imports = {m.import_path for m in resolution.available_tools if m.import_path}
+    called_tools = available_functions & {c.split(".")[-1] for c in visitor.calls}
+    imported_tool_modules = available_imports & visitor.import_modules
+    if imported_tool_modules and not called_tools:
+        issues.append("tool_call: imported an available tool module but did not call an available tool")
+    if called_tools:
         if visitor.tool_result_names and not (visitor.tool_result_names & visitor.return_name_roots):
-            issues.append("tool_result_used: selected tool result does not appear to feed stdout/local transform")
+            issues.append("tool_result_used: called tool result does not appear to feed stdout/local transform")
         elif visitor.nonconstants_in_returns == 0:
             issues.append("tool_result_used: stdout does not appear to depend on computed/tool values")
     if visitor.input_refs == 0:

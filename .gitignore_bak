@@ -13,5 +13,6 @@ skills/*/
 .skill-governance/
 
 .DS_Store
+docker-compose.yml
 backend/config.py
 bge-large-zh-v1.5

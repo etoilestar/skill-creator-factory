@@ -59,6 +59,20 @@ def _coerce_lines(text: str | Iterable[Any]) -> list[str]:
 
 
 
+def create_text_file(
+    text: str,
+    filename: str | None = None,
+    output_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Create a UTF-8 TXT file and return JSON-serializable artifact paths."""
+    safe_name = _safe_filename(filename or "output.txt", "output.txt")
+    if not safe_name.lower().endswith(".txt"):
+        safe_name = f"{safe_name}.txt"
+    text_path = _output_path(output_path=None, output_dir=output_dir, filename=safe_name)
+    text_path.write_text(str(text or ""), encoding="utf-8")
+    return {"text_path": str(text_path), "file_paths": [str(text_path)], "file_outputs": [str(text_path)]}
+
+
 def _write_minimal_trial_pdf(path: Path) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")

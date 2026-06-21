@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from typing import Any
+from pathlib import Path
 
 import requests
 
@@ -30,7 +31,27 @@ AUTH_HEADER_NAME = os.getenv(AUTH_HEADER_ENV, 'X-API-KEY')
 BODY_TEMPLATE = json.loads(os.getenv(BODY_TEMPLATE_ENV, '{"q": "apple inc"}'))
 QUERY_TEMPLATE = json.loads(os.getenv(QUERY_TEMPLATE_ENV, '{}'))
 HEADERS_TEMPLATE = json.loads(os.getenv(HEADERS_TEMPLATE_ENV, '{"Content-Type": "application/json"}'))
-MANIFEST_DATA = json.loads('{"adapter_path": "backend/services/runtime_tools/custom_tools/https_google_serper_dev_search.py", "allowed_roles": ["generic_script", "search_reader"], "approval_status": "draft", "authoring_context": {}, "category": "external_api", "dependencies": ["requests"], "description": "使用 Serper API 执行网络搜索并返回结构化结果。", "display_name": "使用 Serper API 执行网络搜索并返回结构化结果。", "enabled": false, "enabled_by_default": false, "functions": [{"allowed_roles": ["generic_script", "search_reader"], "common_mistakes": ["Do not pass API keys in payload.", "Do not call external network when SKILL_TRIAL_RUN=1.", "Do not require provider raw response fields as top-level adapter outputs.", "Do not write or expect files outside OUTPUT_DIR."], "example_call": "from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\\nresult = https_google_serper_dev_search(payload)\\nreturn result", "example_stdout": "return result", "forbidden_imports": ["ftplib", "paramiko", "shutil", "socket", "subprocess", "telnetlib"], "forbidden_side_effects": ["leak secrets", "undeclared network access"], "function_name": "https_google_serper_dev_search", "import_path": "backend.services.runtime_tools.custom_tools.https_google_serper_dev_search", "input_schema": {"properties": {"query": {"description": "Search query or API input.", "type": "string"}}, "required": ["query"], "type": "object"}, "output_schema": {"properties": {"answerBox": {"type": "object"}, "error": {"type": "string"}, "knowledgeGraph": {"type": "object"}, "raw": {"type": "object"}, "relatedSearches": {"items": {"type": "object"}, "type": "array"}, "response_preview": {"type": "string"}, "results": {"items": {"type": "object"}, "type": "array"}, "status_code": {"type": "integer"}, "success": {"type": "boolean"}, "total": {"type": "integer"}, "trial_run": {"type": "boolean"}}, "required": ["success", "results", "total"], "type": "object"}, "required_capabilities": ["https_google_serper_dev_search"], "required_env": ["TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON"], "required_secrets": ["TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"], "return_contract": "Returns a normalized adapter result with success/results/total. Provider raw response may be included under raw.", "safety_notes": ["Reads API secret from platform-scoped environment only.", "External API network access is declared."], "short_description": "使用 Serper API 执行网络搜索并返回结构化结果。", "signature": "https_google_serper_dev_search(payload: dict) -> dict", "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, return deterministic mock output matching output_schema.", "usage_policy": "helper_preferred", "when_to_use": "Use 使用 Serper API 执行网络搜索并返回结构化结果。 when this external API is needed."}], "generates_file": false, "high_risk": false, "input_description": "搜索关键词及可选参数如结果数量、搜索引擎类型。", "input_schema": {"properties": {"query": {"description": "Search query or API input.", "type": "string"}}, "required": ["query"], "type": "object"}, "name": "https_google_serper_dev_search", "needs_external_network": true, "needs_secret": true, "output_description": "返回包含搜索结果的 JSON 数据，包含标题、描述、链接等。", "output_schema": {"properties": {"answerBox": {"type": "object"}, "error": {"type": "string"}, "knowledgeGraph": {"type": "object"}, "raw": {"type": "object"}, "relatedSearches": {"items": {"type": "object"}, "type": "array"}, "response_preview": {"type": "string"}, "results": {"items": {"type": "object"}, "type": "array"}, "status_code": {"type": "integer"}, "success": {"type": "boolean"}, "total": {"type": "integer"}, "trial_run": {"type": "boolean"}}, "required": ["success", "results", "total"], "type": "object"}, "required_capabilities": ["https_google_serper_dev_search"], "required_env": ["TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BASE_URL", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_METHOD", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_AUTH_HEADER", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_BODY_TEMPLATE_JSON", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_QUERY_TEMPLATE_JSON", "TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_HEADERS_TEMPLATE_JSON"], "required_secrets": ["TOOLCFG_HTTPS_GOOGLE_SERPER_DEV_SEARCH_SECRET"], "roles": ["generic_script", "search_reader"], "safety_level": "medium", "snippets": [], "test_status": "untested", "tool_name": "serper_search", "tool_type": "custom_adapter", "usage_policy": "helper_preferred", "version": "1.0.0"}')
+
+def _load_manifest_from_registry() -> dict[str, Any]:
+    """Load manifest from the custom registry; wrapper code is runtime-only."""
+    registry_path = Path(__file__).resolve().parents[3] / "config" / "tool_registry.custom.json"
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    records = payload.get("tools") if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        return {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        names = {str(record.get(key) or "") for key in ("name", "tool_name", "tool_id")}
+        if FUNCTION_NAME in names or "serper_search" in names:
+            return record
+    return {}
+
+
+MANIFEST_DATA = _load_manifest_from_registry()
 
 
 def _flatten(prefix: str, value: Any, out: dict[str, Any]) -> None:

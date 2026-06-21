@@ -227,6 +227,47 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
 
+BUILTIN_TOOL_CAPABILITIES["file_output"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["file_output"],
+    helper_imports=["create_text_file"],
+    functions=[
+        ToolFunctionManifest(
+            function_name="create_text_file",
+            import_path="backend.services.runtime_tools",
+            short_description="Create a UTF-8 TXT file and return artifact paths.",
+            when_to_use="Use for scripts that need to persist plain text as a .txt output artifact.",
+            signature="create_text_file(text: str, filename: str | None = None, output_dir: str | None = None) -> dict[str, Any]",
+            input_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}, "filename": {"type": "string"}, "output_dir": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["text_path", "file_outputs"], "properties": {"text_path": {"type": "string"}, "file_paths": {"type": "array", "items": {"type": "string"}}, "file_outputs": {"type": "array", "items": {"type": "string"}}}},
+            artifact_outputs=[{"field": "text_path", "type": "file_path", "extensions": [".txt"], "root": "outputs"}],
+            side_effects=["write_output_file"],
+            return_contract="Returns {'text_path': path, 'file_paths': [path], 'file_outputs': [path]}; script stdout must preserve file_outputs.",
+            example_call="from backend.services.runtime_tools import create_text_file\nresult = create_text_file(text=payload.get('text') or '', filename=payload.get('filename') or 'output.txt')",
+            common_mistakes=["Do not use Path(...).write_text(...) directly when this helper is selected.", "Do not omit file_outputs from stdout."],
+            usage_policy="helper_preferred",
+            required_capabilities=["file_output"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="file_output.create_text_file",
+            title="Create TXT artifact",
+            kind="file_output_usage",
+            applies_to={"capabilities": ["file_output"]},
+            description="Use the platform helper for TXT file outputs.",
+            code="from backend.services.runtime_tools import create_text_file\n\nresult = create_text_file(text=str(payload.get('text') or payload.get('content') or ''), filename=payload.get('filename') or 'output.txt')\nreturn {'text_path': result['text_path'], 'file_outputs': result['file_outputs']}",
+            expected_input_shape={"text": "string", "filename": "string?"},
+            expected_output_shape={"text_path": "string", "file_outputs": ["string"]},
+            return_rule="Return text_path and file_outputs from create_text_file.",
+            anti_patterns=["Do not hand-write files with Path(...).write_text(...) when this helper is available.", "Do not omit file_outputs."],
+            requires=["file_output"],
+            usage_policy="helper_preferred",
+            priority=120,
+        )
+    ],
+    usage_policy="helper_preferred",
+)
+
 # Built-in document helpers are real callable functions, not just capability
 # labels. Keep their manifest next to the registry entry so Creator can inject a
 # safe import/call card only when implementation resolution selects the tool.
@@ -1194,6 +1235,18 @@ def function_cards_for_tool(capability: ToolCapability) -> list[str]:
             json.dumps(fn.input_schema or {}, ensure_ascii=False, sort_keys=True),
             "Output schema:",
             json.dumps(fn.output_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Return contract:",
+            fn.return_contract or "Returns a JSON-serializable value matching output_schema.",
+            "Example return:",
+            fn.example_return or "",
+            "Example stdout:",
+            fn.example_stdout or "",
+            "Common mistakes:",
+            json.dumps(fn.common_mistakes or [], ensure_ascii=False, sort_keys=True),
+            "Required env:",
+            json.dumps(fn.required_env or capability.required_env or [], ensure_ascii=False, sort_keys=True),
+            "Required secrets:",
+            json.dumps(fn.required_secrets or capability.required_secrets or [], ensure_ascii=False, sort_keys=True),
             "Artifact outputs:",
             json.dumps(fn.artifact_outputs or capability.artifact_outputs or [], ensure_ascii=False, sort_keys=True),
             "Side effects:",

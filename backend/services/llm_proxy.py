@@ -341,10 +341,14 @@ async def check_connection(*, deep: bool = False) -> dict:
     cached = _llm_health_cache.get("result")
     age = time.monotonic() - float(_llm_health_cache.get("checked_at") or 0.0)
 
-    if deep or cached is None:
+    if deep:
         if _llm_health_lock.locked() and cached is not None:
             return {**cached, "stale": True, "refreshing": True}
         return await _refresh_llm_health_cache()
+
+    if cached is None:
+        _schedule_llm_health_refresh()
+        return {"connected": None, "models": [], "stale": True, "refreshing": True, "status": "unknown"}
 
     if age <= ttl:
         return {**cached, "stale": False, "refreshing": False}

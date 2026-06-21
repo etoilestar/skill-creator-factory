@@ -3264,7 +3264,7 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.capability.forbidden_registry_helpers",
-            passed=True,
+            passed=not registry_forbidden_helper_hits,
             target=file_path,
             message=(
                 "脚本未调用 forbidden_capabilities 中禁止的 registry helper。"
@@ -3283,7 +3283,7 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="tool_usage_contract.forbidden_direct_imports",
-            passed=True,
+            passed=not forbidden_direct_hits,
             target=file_path,
             message=(
                 "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
@@ -3312,6 +3312,26 @@ def _check_script_file_contract(
             ),
             expected="undeclared_helper 降级为 warning；scripts/** 可根据自身责任自主组合已有工具。",
             minimal_edit="不要修 SkillPlan、capability 声明或 workflow；仅当调用本身失败或 stdout/artifact 不满足合同时修当前脚本。",
+        )
+    )
+
+
+    dangerous_import_hits = sorted(set(re.findall(r"^\s*(?:import|from)\s+(paramiko|ftplib|telnetlib|subprocess)\b", stripped, re.MULTILINE)))
+    dangerous_call_hits = sorted(set(re.findall(r"\b(?:os\.system|subprocess\.(?:run|Popen|call|check_call|check_output))\b", stripped)))
+    forbidden_path_hits = sorted(set(re.findall(r"[\'\"]((?:/etc/passwd|/etc/shadow|/root/\.ssh/[^\'\"]*|~/.ssh/[^\'\"]*|\.\./[^\'\"]*))[\'\"]", stripped)))
+    security_hits = [*dangerous_import_hits, *dangerous_call_hits, *forbidden_path_hits]
+    results.append(
+        ContractCheckResult(
+            id="script.security.dangerous_operations",
+            passed=not security_hits,
+            target=file_path,
+            message=(
+                "脚本未包含危险 import、恶意 shell 调用或禁止路径访问。"
+                if not security_hits
+                else f"{file_path} 包含危险操作或禁止路径：{', '.join(security_hits)}。"
+            ),
+            expected="第一轮不审查工具路线，但安全风险、危险 import、禁止路径和恶意 shell 必须阻断。",
+            minimal_edit="移除危险 import/shell/禁止路径访问；只保留当前脚本职责所需的安全本地逻辑或受控 helper 调用。",
         )
     )
 
@@ -3390,6 +3410,7 @@ _SCRIPT_CONTENT_REVIEW_CHECK_IDS = {
     "tool_usage_contract.undeclared_helper",
     "script.database_read.readonly_sql",
     "tool_usage_contract.artifact_output_e2e",
+    "script.security.dangerous_operations",
     "script.role.image_forbidden_pdf_only_outputs",
 }
 

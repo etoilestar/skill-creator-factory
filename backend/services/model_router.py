@@ -136,33 +136,46 @@ def _image_keywords() -> list[str]:
 
 
 def infer_creator_file_task(file_path: str, purpose: str = "") -> str:
-    """Infer task kind for creator file generation from file path/purpose."""
+    """Infer model task for Creator file generation.
+
+    Creator file generation is path-first: SKILL.md, references, config,
+    metadata, and other non-script files are text generation, regardless of
+    purpose wording. Only generated scripts/code files use CODE_TASK. Image
+    generation belongs to runtime tools, not file-generation LLM routing.
+    """
     routes = _configured_routes()
     path_routes = routes.get("creator_paths") if isinstance(routes.get("creator_paths"), dict) else {}
     for pattern, task_or_model in path_routes.items():
         if fnmatch.fnmatch(file_path, str(pattern)):
-            # If a custom path maps to a known task name, return it; otherwise
-            # treat it as code/text later via route_creator_file_model.
-            if task_or_model in {TEXT_TASK, CODE_TASK, IMAGE_TASK, VISION_TASK, PLANNER_TASK, VALIDATOR_TASK}:
+            # Creator file generation must never route to image/vision models.
+            if task_or_model == CODE_TASK:
+                return CODE_TASK
+            if task_or_model in {TEXT_TASK, PLANNER_TASK, VALIDATOR_TASK}:
                 return str(task_or_model)
             return TEXT_TASK
 
-    lowered = f"{file_path}\n{purpose}".lower()
     suffix = "." + file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
     if file_path.startswith("scripts/") or suffix in _code_extensions():
         return CODE_TASK
-    if any(keyword in lowered for keyword in _image_keywords()):
-        return IMAGE_TASK
+
+    # SKILL.md, references/*.md, json/yaml/txt and other Creator files are text.
+    # Do not inspect purpose for image keywords here: mentioning image/illustration
+    # describes a Skill capability, not the model used to write this file.
     return TEXT_TASK
 
 
-def route_creator_file_model(
+def route_creator_file_generation_model(
     *,
     file_path: str,
     purpose: str = "",
     requested_model: str | None = None,
 ) -> ModelRoute:
-    """Resolve model for creator single-file generation."""
+    """Resolve model for Creator single-file generation.
+
+    This route only returns text/code/planner/validator tasks. Runtime image or
+    vision model routing must use a separate tool/runtime route, never Creator
+    source-file generation.
+    """
     routes = _configured_routes()
     path_routes = routes.get("creator_paths") if isinstance(routes.get("creator_paths"), dict) else {}
     for pattern, task_or_model in path_routes.items():
@@ -183,6 +196,20 @@ def route_creator_file_model(
 
     task = infer_creator_file_task(file_path, purpose)
     return route_model(task, requested_model=requested_model, reason=f"creator file {file_path}")
+
+
+def route_creator_file_model(
+    *,
+    file_path: str,
+    purpose: str = "",
+    requested_model: str | None = None,
+) -> ModelRoute:
+    """Backward-compatible alias for Creator file-generation routing."""
+    return route_creator_file_generation_model(
+        file_path=file_path,
+        purpose=purpose,
+        requested_model=requested_model,
+    )
 
 
 _IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".svg"}

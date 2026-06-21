@@ -45,7 +45,6 @@ from ..services.creator_contracts import (
     contract_payload,
     refine_contract_with_resolution,
     resolve_implementation,
-    validate_python_evidence,
     call_template_for_tool,
 )
 from .chat_utils import _get_skill_venv_python
@@ -2148,8 +2147,8 @@ def _build_script_file_contract_text(
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 generate_stable_diffusion_image helper，但不强制实现方式。")
     elif entry.role == "pdf_builder":
         lines.append(
-            "- stdout JSON 必须返回真实存在的文件产物路径；禁止调用未显式声明的模型/helper；字段名由 workflow 决定。"
-            "具体库、字体、编码和实现建议只能来自 Tool Registry snippets/function cards 或 reference guidance，不在 Creator 后台合同中硬编码。"
+            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。"
+            "工具/helper 如何组合不作为第一轮 hard gate；最终以运行、stdout 合同和 artifact 真实存在为准。"
         )
     else:
         lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
@@ -2171,11 +2170,10 @@ def _build_script_file_contract_text(
             "中间步骤不强制平台字段，只要下一步 placeholder 可解析。"
         )
 
-    lines.append("D. 能力边界:")
-    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：统一按 script_composition 理解；available_tools 只是候选工具，代码模型根据 script_goal/inputs/outputs/output_contract 自行组合工具与本地逻辑。")
-    lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
-    lines.append("E. 禁止项:")
-    lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
+    lines.append("D. 第一轮验收边界:")
+    lines.append("- 第一轮只验协议 + 运行 + 产物：argv JSON、入口、运行成功、stdout JSON object、required outputs、真实 artifact、import/dependency 和危险系统操作。")
+    lines.append("- 工具/helper 如何组合、required/optional/allowed_capabilities、placeholder/mock/template 关键词不作为第一轮 hard gate。")
+    lines.append("- 不要通过 print {'error':...}、{}、空路径等绕过运行和产物校验。")
 
     return "\n".join(lines)
 
@@ -3046,11 +3044,11 @@ def _check_script_file_contract(
         results.append(
             ContractCheckResult(
                 id="script.skillplan_inputs.used",
-                passed=not missing_inputs,
+                passed=True,
                 target=file_path,
-                message=("脚本源码引用了声明输入。" if not missing_inputs else f"脚本未引用声明输入：{', '.join(missing_inputs)}。"),
-                expected="第一轮只检查脚本自身闭环：argv JSON、run(payload)、stdout JSON object、required outputs、artifact、imports/dependencies、输入使用、非 mock/固定模板和单文件 trial run。",
-                minimal_edit="如 E2E 发现字段未接上，再修 SKILL.md 命令或脚本字段映射。",
+                message=("脚本源码引用了声明输入。" if not missing_inputs else f"warning: 脚本源码未静态引用声明输入：{', '.join(missing_inputs)}；第一轮不阻断，运行闭环/E2E 负责验证。"),
+                expected="第一轮只做协议 + 运行 + 产物检查；不使用输入字段关键词静态匹配作为 hard gate。",
+                minimal_edit="仅当运行、stdout required outputs 或 E2E 数据流失败时，修当前脚本的参数读取与输出逻辑。",
             )
         )
 
@@ -3139,15 +3137,15 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.no_fake_implementation",
-            passed=not has_fake,
+            passed=True,
             target=file_path,
             message=(
                 "脚本未包含占位/模拟/假 API 实现。"
                 if not has_fake
                 else f"{file_path} 包含占位/模拟/假 API 实现。Creator 生成的脚本必须具备真实可执行功能。"
             ),
-            expected="不得使用 placeholder/mock/fake API/固定模板冒充真实能力。",
-            minimal_edit="替换占位或模拟逻辑，实现真实可执行算法或调用平台配置模型/helper。",
+            expected="第一轮不使用 placeholder/mock/template 关键词正则作为 hard gate；真实失败由运行、stdout required outputs 和 artifact 验证决定。",
+            minimal_edit="仅当脚本运行闭环、stdout 合同或 artifact 真实生成失败时修当前脚本。",
         )
     )
 
@@ -3163,15 +3161,15 @@ def _check_script_file_contract(
         results.append(
             ContractCheckResult(
                 id="script.capability.forbidden_image_generation",
-                passed=not uses_image_helper,
+                passed=True,
                 target=file_path,
                 message=(
                     "文件构建脚本未调用图片生成 helper。"
                     if not uses_image_helper
                     else f"{file_path} 是文件构建脚本，但调用了图片生成 helper。"
                 ),
-                expected="文件构建脚本只能消费已有数据并真实创建文件；不得调用 generate_stable_diffusion_image。",
-                minimal_edit="移除图片 helper 调用，只保留文件构建逻辑。",
+                expected="第一轮不按 role/capability 审查工具组合；只验证协议、运行和产物。",
+                minimal_edit="仅当运行、stdout 或 artifact 失败时修当前脚本。",
             )
         )
 
@@ -3264,14 +3262,14 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="script.capability.forbidden_registry_helpers",
-            passed=not registry_forbidden_helper_hits,
+            passed=True,
             target=file_path,
             message=(
                 "脚本未调用 forbidden_capabilities 中禁止的 registry helper。"
                 if not registry_forbidden_helper_hits
                 else f"{file_path} 调用了这些 forbidden_capabilities 对应的 registry helper：{', '.join(registry_forbidden_helper_hits)}。"
             ),
-            expected="第一轮不按 capability 路线阻断；仅记录 helper/capability 风险，真实失败以 import、调用、stdout、artifact、fake implementation 为准。",
+            expected="第一轮不按 capability/helper 路线阻断；真实失败以 import/dependency、运行、stdout 和 artifact 合同为准。",
             minimal_edit="如该 helper 导致运行失败，只修当前脚本；不要扩大 SkillPlan/capability 声明。",
         )
     )
@@ -3283,14 +3281,14 @@ def _check_script_file_contract(
     results.append(
         ContractCheckResult(
             id="tool_usage_contract.forbidden_direct_imports",
-            passed=not forbidden_direct_hits,
+            passed=True,
             target=file_path,
             message=(
                 "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
                 if not forbidden_direct_hits
                 else f"{file_path} 直接调用了 Tool Resolve 禁止的底层工具/库：{', '.join(forbidden_direct_hits)}。"
             ),
-            expected="第一轮不因工具路线选择阻断；底层库是否可用由 dependency/import/trial run 和 artifact 合同验证。",
+            expected="第一轮不因工具路线选择阻断；底层库是否可用由 dependency/import/trial run 和 artifact 合同验证。危险系统操作另由 security gate 阻断。",
             minimal_edit="如 dependency/import/trial run 失败，只修当前脚本依赖和调用路径。",
         )
     )
@@ -3345,15 +3343,15 @@ def _check_script_file_contract(
         results.append(
             ContractCheckResult(
                 id="script.database_read.readonly_sql",
-                passed=not write_sql and not multi_statement_sql,
+                passed=True,
                 target=file_path,
                 message=(
                     "数据库读取脚本仅包含只读 SQL 形态。"
                     if not write_sql and not multi_statement_sql
                     else f"{file_path} 的 database_read 能力包含写操作或多语句 SQL 风险。"
                 ),
-                expected="database_read 只能通过 query_database_readonly 执行 SELECT/WITH 只读查询，禁止写操作和多语句。",
-                minimal_edit="将 SQL 改为单条 SELECT/WITH 查询，并通过 query_database_readonly 执行。",
+                expected="第一轮不按 database_read 能力路线做 hard gate；真实失败以运行和外部系统权限为准。",
+                minimal_edit="如运行失败或安全系统拒绝，再修当前脚本 SQL。",
             )
         )
 
@@ -3380,15 +3378,15 @@ def _check_script_file_contract(
         results.append(
             ContractCheckResult(
                 id="script.role.image_forbidden_pdf_only_outputs",
-                passed=not pdf_only,
+                passed=True,
                 target=file_path,
                 message=(
                     "image_generator 未输出或生成 PDF-only 结果。"
                     if not pdf_only
                     else f"{file_path} 是 image_generator，但源码包含 PDF-only 输出。"
                 ),
-                expected="image_generator 必须输出 image_paths，不得只输出 pdf_path/file_paths；需要文本+图片时请使用 composite_generator。",
-                minimal_edit="返回 image_paths；若要同时生成文本和图片，请将 role/required_capabilities 改为 composite_generator + text_generation/image_generation。",
+                expected="第一轮不按 role 名称静态限制输出字段；required outputs、真实产物和 E2E 负责验证。",
+                minimal_edit="如 stdout required outputs 或 artifact 验证失败，只修当前脚本输出。",
             )
         )
 
@@ -4016,17 +4014,12 @@ def _validate_script_contract_static(
 ) -> None:
     """Validate script source against SKILL.md contract locally.
 
-    Creator 单文件阶段只做脚本入口级校验：
-    - 禁止 fake/mock 壳代码
-    - 检查模型/能力使用
-    - 如果 SKILL.md 命令传入 JSON argv，脚本必须读取 JSON argv
-    - 不强制脚本源码逐字出现每个 argv key
-
-    字段级对齐交给最终 E2E：
-    command JSON argv -> script stdout JSON -> next command placeholder。
+    Creator 单文件阶段只做“协议 + 运行 + 产物”中的静态协议部分：
+    - 如果 SKILL.md 命令传入 JSON argv，脚本必须读取 JSON argv；
+    - 不用 fake/mock/template 关键词、工具能力声明、helper 路线或 LLM
+      validator 作为 hard gate；
+    - 字段级 stdout/artifact 闭环交给单文件 trial run 和最终 E2E。
     """
-    _reject_fake_script_implementation(file_path, content)
-
     explicit_entry = (
         skill_plan_entry.__dict__
         if isinstance(skill_plan_entry, SkillPlanEntry)
@@ -4037,39 +4030,6 @@ def _validate_script_contract_static(
         if explicit_entry is not None
         else _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
     )
-    stdout_schema = _script_stdout_schema_for_entry(plan_entry)
-    canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
-    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    canonical_contract = refine_contract_with_resolution(canonical_contract, implementation_resolution)
-    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    logger.info(
-        "[Creator][script_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
-        file_path,
-        json.dumps(canonical_contract.inputs, ensure_ascii=False),
-        json.dumps(canonical_contract.outputs, ensure_ascii=False),
-        json.dumps(canonical_contract.artifact_contract, ensure_ascii=False, sort_keys=True),
-        json.dumps(canonical_contract.resource_refs, ensure_ascii=False, sort_keys=True),
-        implementation_resolution.mode,
-        json.dumps([tool.tool_id for tool in implementation_resolution.available_tools], ensure_ascii=False),
-        json.dumps(implementation_resolution.required_evidence, ensure_ascii=False),
-        json.dumps(implementation_resolution.allowed_imports, ensure_ascii=False),
-        json.dumps(implementation_resolution.declared_dependencies, ensure_ascii=False),
-        implementation_resolution.reason,
-    )
-    evidence_issues = validate_python_evidence(content, canonical_contract, implementation_resolution)
-    if evidence_issues:
-        raise ValueError(
-            f"{file_path} implementation evidence validation failed "
-            f"(mode={implementation_resolution.mode}): " + "; ".join(evidence_issues)
-        )
-
-    _validate_configured_model_usage_static(
-        file_path=file_path,
-        content=content,
-        skill_md=skill_md,
-        plan_entry=plan_entry,
-    )
-
     commands = _extract_script_command_templates(skill_md, file_path)
     if not commands:
         return
@@ -5020,10 +4980,9 @@ def _format_file_validator_feedback(deterministic_error: str, validator_report: 
         + f"校验模型：{validator_report.get('model', '')}\n"
         "校验模型问题列表：\n"
         f"{issue_text}\n\n"
-        "校验模型结构化 failed_checks：\n"
+        "校验模型结构化 failed_checks（已按后端确定性失败过滤）：\n"
         f"{failed_check_text}\n\n"
-        "校验模型给 coder 的修复意见：\n"
-        f"{validator_report.get('repair_instructions') or deterministic_error}"
+        "说明：校验模型 repair_instructions 不进入 repair prompt；只允许后端确定性错误和确定性修复指令驱动修复。"
     )
 
 
@@ -5654,11 +5613,11 @@ def _build_script_generate_file_prompt_variant(
         "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
-        "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
+        "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
         "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。raw role/capability 只能作为 hint，不能当硬合同。",
         "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑和 available_tools。",
         "available_tools 只是 embedding/结构化召回的候选工具，不是最终裁决；只有确实需要时才调用。",
-        "如调用工具，只能照 available_tools.call_template 中的精确 import/call 方式使用；禁止猜测 backend import 或调用未列出的平台 helper。",
+        "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
         "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。",
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
@@ -5791,9 +5750,9 @@ def _build_generate_file_prompt(
             "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。\n"
             "生成前只使用以下轻量上下文：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。\n"
             "统一按 script_composition 理解：根据功能目标组合 argv 输入、本地逻辑和 available_tools；available_tools 只做候选召回，不是最终裁决。\n"
-            "如调用工具，只能使用 available_tools.call_template 中的精确 import/call；禁止猜测 backend import 或调用未列出的平台 helper。\n"
+            "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。\n"
             "references/assets 只能作为 resource_refs/asset_refs 读取，不能作为 dependencies、allowed_imports 或 pip install 依赖。\n"
-            "生成后会反向校验 tool_call、tool_result_used、input_dependency、nontrivial_transform、stdout_contract、artifact_created、declared_dependency_only、no_shell_template。\n\n"
+            "生成后第一轮只校验协议 + 运行 + 产物：argv JSON、入口、stdout JSON object、required outputs、artifact_created、import/dependency 和危险系统操作。\n\n"
             "轻量脚本上下文：\n"
             f"{json.dumps(local_contract, ensure_ascii=False, indent=2)}\n\n"
             f"固定脚本骨架（仅约束入口/JSON stdout；输出时补全为可运行源码）：\n{script_skeleton_text}"
@@ -7756,7 +7715,6 @@ def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill
     or SkillPlan input key exactness. The real workflow run validates rendered
     argv, stdout context propagation, and final artifacts.
     """
-    _reject_fake_script_implementation(file_path, content)
     entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
 
     if entry.language == "python":

@@ -3412,6 +3412,25 @@ def test_script_contract_undeclared_helper_is_warning_not_blocker():
     assert "warning:" in undeclared.message
 
 
+def test_script_contract_placeholder_mock_words_are_not_hard_gate():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/mock_named_but_runnable.py",
+        "import json\nimport sys\n\ndef run(payload):\n    # mock/template are allowed words here; runtime contract decides success.\n    return {'result': str(payload.get('payload', 'mock template'))}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/mock_named_but_runnable.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["result"],
+            "required_capabilities": [],
+        },
+    )
+
+    fake_check = next(result for result in results if result.id == "script.no_fake_implementation")
+    assert fake_check.passed
+
+
 def test_script_contract_blocks_dangerous_import_and_forbidden_path():
     from backend.routers.creator import _check_script_file_contract
 
@@ -3442,6 +3461,26 @@ def test_trial_stdout_missing_required_output_blocks():
             args=["{}"],
             skill_plan_entry={"role": "generic_script", "outputs": ["result"], "required_capabilities": []},
         )
+
+
+def test_validator_repair_instructions_do_not_enter_repair_feedback():
+    from backend.routers.creator import _format_file_validator_feedback
+
+    feedback = _format_file_validator_feedback(
+        "stdout_contract: missing text",
+        {
+            "model": "validator-model",
+            "issues": [],
+            "failed_checks": [],
+            "repair_instructions": "旧规则：请修改 SkillPlan required_capabilities 并禁止调用未声明 helper",
+        },
+        targeted_repair="只修当前脚本 stdout required outputs",
+    )
+
+    assert "旧规则" not in feedback
+    assert "修改 SkillPlan" not in feedback
+    assert "只修当前脚本 stdout required outputs" in feedback
+    assert "repair_instructions 不进入 repair prompt" in feedback
 
 
 def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):

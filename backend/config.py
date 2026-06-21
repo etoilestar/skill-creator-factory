@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     # action classification in code while SKILL.md only describes what to do.
     text_model: Optional[str] = Field("qwen3:30b", validation_alias=AliasChoices("TEXT_MODEL", "text_model"))
     code_model: Optional[str] = Field("qwen3-coder:30b", validation_alias=AliasChoices("CODE_MODEL", "code_model"))
+    embedding_model: Optional[str] = Field("bge-m3:latest", validation_alias=AliasChoices("EMBEDDING_MODEL", "embedding_model"))
     #image_model: Optional[str] = Field("qwen3-vl:32b", validation_alias=AliasChoices("IMAGE_MODEL", "image_model"))
     # Optional vision-language model for understanding uploaded images/screenshots.
     #vision_model: Optional[str] = Field("qwen3-vl:32b", validation_alias=AliasChoices("VISION_MODEL", "vision_model"))

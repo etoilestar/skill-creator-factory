@@ -9,14 +9,19 @@ Python source with AST evidence rather than business field names.
 from __future__ import annotations
 
 import ast
+import logging
+import math
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
+import httpx
 
+from backend.config import settings
 from .creator_tool_registry import ToolCapability, list_tool_capabilities
 from .skill_plan import SkillPlanEntry
 
-ImplementationMode = Literal["use_registered_tool", "creator_implemented", "unresolved"]
+ImplementationMode = Literal["use_registered_tool", "tool_assisted_creator_implemented", "creator_implemented", "unresolved"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,7 @@ class CanonicalFileContract:
     outputs: list[str] = field(default_factory=list)
     stdout_schema: dict[str, Any] = field(default_factory=dict)
     artifact_contract: dict[str, Any] = field(default_factory=dict)
+    functional_requirements: list[str] = field(default_factory=list)
     capability_requirements: list[CapabilityRequirement] = field(default_factory=list)
     side_effects: list[str] = field(default_factory=list)
     resource_refs: list[str] = field(default_factory=list)
@@ -62,6 +68,7 @@ class ImplementationResolution:
     selected_tools: list[CallableToolManifest] = field(default_factory=list)
     selected_adapters: list[str] = field(default_factory=list)
     output_mappings: list[dict[str, str]] = field(default_factory=list)
+    tool_slots: list[dict[str, Any]] = field(default_factory=list)
     local_fallback_allowed: bool = True
     allowed_imports: list[str] = field(default_factory=list)
     declared_dependencies: list[str] = field(default_factory=list)
@@ -130,13 +137,32 @@ def compile_canonical_file_contract(entry: SkillPlanEntry, stdout_schema: dict[s
         outputs=outputs,
         stdout_schema=stdout_schema,
         artifact_contract=artifact_contract,
+        functional_requirements=_functional_requirements_from_entry(entry),
         capability_requirements=requirements,
         side_effects=list(getattr(entry, "side_effects", []) or []),
         resource_refs=[getattr(r, "path", str(r)) for r in (getattr(entry, "resources", []) or [])],
-        declared_dependencies=list(entry.dependencies or []),
+        declared_dependencies=[str(dep) for dep in (entry.dependencies or []) if _is_declared_dependency(dep)],
         upstream_dependencies=list(getattr(entry, "upstream_dependencies", []) or []),
         downstream_consumers=list(getattr(entry, "downstream_consumers", []) or []),
     )
+
+
+def _functional_requirements_from_entry(entry: SkillPlanEntry) -> list[str]:
+    out: list[str] = []
+    for slot in getattr(entry, "required_tool_slots", []) or []:
+        if isinstance(slot, dict):
+            text = slot.get("functional_requirement") or slot.get("purpose") or slot.get("slot_id")
+        else:
+            text = getattr(slot, "functional_requirement", "") or getattr(slot, "slot_id", "")
+        if str(text or "").strip():
+            out.append(str(text).strip())
+    for strategy in getattr(entry, "implementation_strategy", []) or []:
+        reason = strategy.get("reason") if isinstance(strategy, dict) else getattr(strategy, "reason", "")
+        if str(reason or "").strip():
+            out.append(str(reason).strip())
+    if not out and str(getattr(entry, "purpose", "") or "").strip():
+        out.append(str(entry.purpose).strip())
+    return list(dict.fromkeys(out))
 
 
 def _capability_requirements_from_entry(entry: SkillPlanEntry) -> list[CapabilityRequirement]:
@@ -190,10 +216,17 @@ def _is_script_io_key(value: Any) -> bool:
     return bool(text) and not text.startswith(("references/", "assets/")) and text not in {"references", "assets", "assets/"}
 
 
+def _is_declared_dependency(value: Any) -> bool:
+    text = str(value or "").replace("\\", "/").strip()
+    return bool(text) and not text.startswith(("references/", "assets/")) and text not in {"references", "assets", "assets/"}
+
+
 def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContract) -> ImplementationResolution:
     manifests: list[CallableToolManifest] = []
+    partial_manifests: list[CallableToolManifest] = []
     output_mappings: list[dict[str, str]] = []
     capability_ids = {req.capability_id for req in contract.capability_requirements if req.capability_id}
+    embedded_candidates = _embedding_candidate_tool_ids(contract.functional_requirements)
     for cap in list_tool_capabilities():
         if not cap.enabled_by_default or not cap.allow_creator_use:
             continue
@@ -201,10 +234,12 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
         if not cap_manifests:
             continue
         matched, mappings = _capability_matches_contract(cap, capability_ids, contract)
-        if not matched:
-            continue
-        manifests.extend(cap_manifests)
-        output_mappings.extend(mappings)
+        capability_hint_matched = bool(capability_ids & ({cap.name, *cap.required_capabilities, *cap.optional_capabilities} | {item for fn in cap.functions for item in (fn.required_capabilities or [])}))
+        if matched and _tool_directly_covers_stdout(cap, contract, mappings):
+            manifests.extend(cap_manifests)
+            output_mappings.extend(mappings)
+        elif matched or capability_hint_matched or any(m.tool_id in embedded_candidates or cap.name in embedded_candidates for m in cap_manifests):
+            partial_manifests.extend(cap_manifests)
     if manifests:
         imports = [m.import_path.split(".")[0] for m in manifests if m.import_path]
         deps = sorted({d for m in manifests for d in m.dependencies})
@@ -215,11 +250,28 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
             mode="use_registered_tool",
             selected_tools=manifests,
             output_mappings=output_mappings,
+            tool_slots=_tool_slots_for_requirements(contract, manifests, output_mappings),
             local_fallback_allowed=False,
             allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "backend", *imports, *deps}),
             declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
             required_evidence=required_evidence,
             reason="Callable Tool Registry manifest satisfies the canonical capability contract.",
+        )
+    if partial_manifests:
+        deps = sorted({d for m in partial_manifests for d in m.dependencies})
+        imports = [m.import_path.split(".")[0] for m in partial_manifests if m.import_path]
+        required_evidence = ["tool_call", "tool_result_used", "input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
+        if _contract_declares_artifact(contract) or any(m.artifact_outputs for m in partial_manifests):
+            required_evidence.append("artifact_created")
+        return ImplementationResolution(
+            mode="tool_assisted_creator_implemented",
+            selected_tools=partial_manifests,
+            tool_slots=_tool_slots_for_requirements(contract, partial_manifests, []),
+            local_fallback_allowed=True,
+            allowed_imports=sorted({"json", "sys", "os", "pathlib", "typing", "datetime", "csv", "math", "statistics", "re", "html", "hashlib", "itertools", "collections", "backend", *imports, *deps, *contract.declared_dependencies}),
+            declared_dependencies=sorted(set(contract.declared_dependencies + deps)),
+            required_evidence=required_evidence,
+            reason="Callable tools satisfy local functional requirements; Creator must compose their results with local logic for final stdout.",
         )
     local_ok, local_reason = _creator_can_implement(contract)
     if local_ok:
@@ -285,6 +337,7 @@ def refine_contract_with_resolution(contract: CanonicalFileContract, resolution:
         outputs=outputs,
         stdout_schema={**contract.stdout_schema, "required": required, "properties": props},
         artifact_contract=artifact_contract,
+        functional_requirements=contract.functional_requirements,
         capability_requirements=contract.capability_requirements,
         side_effects=side_effects,
         resource_refs=contract.resource_refs,
@@ -338,6 +391,113 @@ def _capability_matches_contract(cap: ToolCapability, capability_ids: set[str], 
     if mappings:
         return True, mappings
     return bool(has_capability_hint and has_generic_capability_manifest), []
+
+
+def _tool_directly_covers_stdout(cap: ToolCapability, contract: CanonicalFileContract, mappings: list[dict[str, str]]) -> bool:
+    """True only when a tool can provide the final stdout contract directly."""
+    required_stdout = set(_schema_required(contract.stdout_schema) or contract.outputs)
+    if not required_stdout:
+        return False
+    mapped_targets = {item.get("target_stdout_field") for item in mappings if item.get("target_stdout_field")}
+    if required_stdout and required_stdout.issubset(mapped_targets):
+        return True
+    tool_output_fields: set[str] = set()
+    artifact_fields: set[str] = set()
+    for fn in cap.functions or []:
+        schema = fn.output_schema or cap.output_schema or {}
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        if isinstance(props, dict):
+            tool_output_fields.update(str(key) for key in props)
+        tool_output_fields.update(_schema_required(schema))
+        for artifact in (fn.artifact_outputs or cap.artifact_outputs or []):
+            if isinstance(artifact, dict) and artifact.get("field"):
+                artifact_fields.add(str(artifact.get("field")))
+    return required_stdout.issubset(tool_output_fields) or required_stdout.issubset(artifact_fields)
+
+
+def _tool_slots_for_requirements(contract: CanonicalFileContract, manifests: list[CallableToolManifest], mappings: list[dict[str, str]]) -> list[dict[str, Any]]:
+    slots: list[dict[str, Any]] = []
+    requirements = contract.functional_requirements or ["final stdout contract"]
+    for idx, tool in enumerate(manifests):
+        req = requirements[min(idx, len(requirements) - 1)]
+        slots.append({
+            "slot_id": f"tool_slot_{idx + 1}",
+            "functional_requirement": req,
+            "tool_id": tool.tool_id,
+            "call_template": (tool.example_call or f"from {tool.import_path} import {tool.function_name}\nresult = {tool.function_name}(...)").strip(),
+            "input_construction": {"source": "argv/payload", "schema": tool.input_schema},
+            "output_consumption": {"schema": tool.output_schema, "mappings": mappings, "rule": "Use the tool result as evidence for this requirement; map or transform it locally into the canonical stdout fields."},
+        })
+    return slots
+
+
+_EMBEDDING_INDEX_CACHE: tuple[tuple[str, ...], list[tuple[str, list[float]]]] | None = None
+
+
+def _tool_card_text(cap: ToolCapability, manifest: CallableToolManifest) -> str:
+    return "\n".join([
+        cap.name,
+        cap.display_name,
+        cap.category,
+        manifest.tool_id,
+        manifest.description,
+        str(manifest.input_schema),
+        str(manifest.output_schema),
+    ])
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    model = settings.embedding_model or ""
+    if not model:
+        raise RuntimeError("EMBEDDING_MODEL is not configured")
+    url = f"{settings.llm_base_url.rstrip('/')}/v1/embeddings"
+    headers = {"Content-Type": "application/json"}
+    key = settings.openai_api_key or settings.llm_api_key
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(url, headers=headers, json={"model": model, "input": texts})
+        response.raise_for_status()
+        data = response.json().get("data") or []
+    return [list(map(float, item.get("embedding") or [])) for item in data]
+
+
+def _embedding_candidate_tool_ids(requirements: list[str], *, top_k: int = 5) -> set[str]:
+    """Return semantic-recall candidates only; failures intentionally fall back to no candidates."""
+    global _EMBEDDING_INDEX_CACHE
+    reqs = [r for r in requirements if r]
+    if not reqs:
+        return set()
+    try:
+        cards: list[tuple[str, str]] = []
+        for cap in list_tool_capabilities():
+            if not cap.enabled_by_default or not cap.allow_creator_use:
+                continue
+            for manifest in callable_manifest_from_capability(cap):
+                cards.append((manifest.tool_id, _tool_card_text(cap, manifest)))
+        sig = tuple(text for _, text in cards)
+        if _EMBEDDING_INDEX_CACHE is None or _EMBEDDING_INDEX_CACHE[0] != sig:
+            embeddings = _embed_texts([text for _, text in cards])
+            _EMBEDDING_INDEX_CACHE = (sig, [(cards[i][0], emb) for i, emb in enumerate(embeddings) if emb])
+        query_embeddings = _embed_texts(reqs)
+        scored: list[tuple[float, str]] = []
+        for q in query_embeddings:
+            for tool_id, emb in _EMBEDDING_INDEX_CACHE[1]:
+                scored.append((_cosine(q, emb), tool_id))
+        return {tool_id for _, tool_id in sorted(scored, reverse=True)[:max(1, top_k)]}
+    except Exception as exc:
+        logger.warning("Creator tool embedding recall unavailable; falling back to structural matching: %s", exc)
+        return set()
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return -1.0
+    dot = sum(x * y for x, y in zip(a, b))
+    denom = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / denom if denom else -1.0
 
 
 def _single_scalar_output_mapping(*, tool_schema: dict[str, Any], stdout_schema: dict[str, Any], capability_matched: bool) -> dict[str, str] | None:
@@ -494,16 +654,16 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
             issues.append("stdout_contract: source does not mention required stdout fields " + ", ".join(missing))
     selected_functions = {m.function_name for m in resolution.selected_tools if m.function_name}
     selected_imports = {m.import_path for m in resolution.selected_tools if m.import_path}
-    if resolution.mode == "use_registered_tool":
+    if resolution.mode in {"use_registered_tool", "tool_assisted_creator_implemented"}:
         has_tool_call = bool(selected_functions & {c.split(".")[-1] for c in visitor.calls})
         has_tool_import = any(path.split(".")[0] in visitor.import_roots or path in content for path in selected_imports)
         if not (has_tool_call and has_tool_import):
             issues.append("tool_call: selected callable tool was not imported and called")
         if visitor.tool_result_names and not (visitor.tool_result_names & visitor.return_name_roots):
-            issues.append("stdout_from_tool: selected tool result does not appear to feed stdout")
+            issues.append("tool_result_used: selected tool result does not appear to feed stdout/local transform")
         elif visitor.nonconstants_in_returns == 0:
-            issues.append("stdout_from_tool: stdout does not appear to depend on computed/tool values")
-    elif resolution.mode == "creator_implemented":
+            issues.append("tool_result_used: stdout does not appear to depend on computed/tool values")
+    if resolution.mode in {"creator_implemented", "tool_assisted_creator_implemented"}:
         if visitor.input_refs == 0:
             issues.append("input_dependency: outputs do not appear to depend on argv/payload input")
         if not (visitor.has_transform_call or visitor.has_file_write):

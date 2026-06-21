@@ -2171,7 +2171,7 @@ def _build_script_file_contract_text(
         )
 
     lines.append("D. 能力边界:")
-    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：mode=use_registered_tool 时必须调用 selected_tools，mode=creator_implemented 时才允许本地实现。")
+    lines.append("- required_capabilities / forbidden_capabilities 只提供候选能力边界；最终以 implementation_resolution 为准：mode=use_registered_tool 时必须调用 selected_tools；mode=tool_assisted_creator_implemented 时必须按 selected tool slots 调工具并本地组合；mode=creator_implemented 时才允许纯本地实现。")
     lines.append("- 内部 workflow 字段名不强制，但 SKILL.md/reference 与脚本读取必须自洽。")
     lines.append("E. 禁止项:")
     lines.append("- 不输出 placeholder/mock/fake API；不要通过 print {'error':...}、{}、空路径等绕过校验。")
@@ -5615,15 +5615,19 @@ def _build_script_generate_file_prompt_variant(
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须使用用户输入或上游输入生成结果；禁止固定示例、placeholder/mock/fake API、空文件或空路径。",
         "只根据 canonical_contract 与 implementation_resolution 实现接口能力；raw role/capability 只能作为 hint，不能当硬合同。",
-        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具。creator_implemented 模式下允许使用标准库、声明依赖和本地代码。",
+        "不要调用未声明的平台 helper、外部服务或未选择的 Tool Registry 工具；不允许自己猜 backend import。creator_implemented 模式下允许使用标准库、声明依赖和本地代码。",
         (
             "当前实现模式：use_registered_tool。必须调用 implementation_resolution.selected_tools 中的真实 callable；不得绕过 selected_tools 自己模拟同类能力；stdout_schema.required 字段必须来自 selected tool 返回值或真实产物；不得使用未声明依赖替代 selected tool。"
             "如果 implementation_resolution.output_mappings 非空，必须按 source_tool_field → target_stdout_field 把工具返回字段映射到 canonical stdout 字段。"
             if implementation_mode == "use_registered_tool"
             else (
-                "当前实现模式：creator_implemented。没有匹配的现成工具，Creator 需要自行实现；允许使用标准库、本地代码、平台允许 adapter、declared_dependencies；必须真实满足 canonical_contract；不得返回固定模板、简单拼接、字段包装来冒充实现；如果声明 artifact，必须真实创建 artifact；如果声明转换或处理逻辑，必须有真实处理过程。"
-                if implementation_mode == "creator_implemented"
-                else "当前实现模式：unresolved。不要生成脚本；返回结构化错误。"
+                "当前实现模式：tool_assisted_creator_implemented。必须只使用 implementation_resolution.tool_slots 中选定的工具和 call_template 完成对应 functional_requirements；工具结果必须被本地逻辑消费/转换为 canonical stdout；工具只做局部步骤，不等于最终裁决；禁止猜测未列出的 backend import。"
+                if implementation_mode == "tool_assisted_creator_implemented"
+                else (
+                    "当前实现模式：creator_implemented。没有匹配的现成工具，Creator 需要自行实现；允许使用标准库、本地代码、平台允许 adapter、declared_dependencies；必须真实满足 canonical_contract；不得返回固定模板、简单拼接、字段包装来冒充实现；如果声明 artifact，必须真实创建 artifact；如果声明转换或处理逻辑，必须有真实处理过程。"
+                    if implementation_mode == "creator_implemented"
+                    else "当前实现模式：unresolved。不要生成脚本；返回结构化错误。"
+                )
             )
         ),
         f"prompt_variant: {variant}",
@@ -5631,7 +5635,7 @@ def _build_script_generate_file_prompt_variant(
         json.dumps(local_contract, ensure_ascii=False, indent=2),
     ]
     if tool_usage_prompt:
-        instruction.extend(["available tools / snippets（如与自我猜测冲突，以 snippet 为准）：", tool_usage_prompt])
+        instruction.extend(["selected tool slots / call templates / snippets（只能使用列出的 import 与 call_template；如与自我猜测冲突，以 tool_slot/snippet 为准）：", tool_usage_prompt])
     if variant == "standard":
         instruction.extend(["Creator internal-only kernel guidance", "INTERNAL-ONLY kernel/references/best-practices.md; INTERNAL-ONLY kernel/references/output-patterns.md（摘要省略；只作为局部生成提示，不注入完整 kernel 文档。）"] )
     if script_skeleton_text:
@@ -5764,7 +5768,7 @@ def _build_generate_file_prompt(
             "4. 如果命令示例传入 JSON 字符串参数，脚本必须按 SkillPlan.runtime 解析；Python 默认读取 sys.argv[1] 并 json.loads 解析，Node 使用 process.argv[2]+JSON.parse，Bash 使用 $1 JSON。\n"
             "5. 必须实际使用用户可变参数生成结果；禁止把示例结果、示例标题、示例图片路径硬编码成固定输出。\n"
             "6. 是否允许模型、网络、外部副作用或平台 helper，只由当前脚本显式 SkillPlan role/capabilities/forbidden_capabilities 与 Tool Registry 决定；不要从蓝图业务词、文件名或输出类型推断。\n"
-            "7. 生成脚本前必须阅读 canonical_contract 与 implementation_resolution；mode=use_registered_tool 时 selected_tools 是硬合同，mode=creator_implemented 时才允许本地实现。不要自己发明未配置的外部 API。\n"
+            "7. 生成脚本前必须阅读 canonical_contract 与 implementation_resolution；mode=use_registered_tool 时 selected_tools 直接覆盖最终输出；mode=tool_assisted_creator_implemented 时 selected tool slots 完成局部 functional_requirements 并由本地逻辑消费结果；mode=creator_implemented 时才允许纯本地实现。不要自己发明未配置的外部 API。\n"
             "7a. 硬规则：不要猜测平台 helper/import path；只有 Tool Registry 明确提供 import path 和 call signature 时才能 import。否则使用自包含实现或可用标准库。\n"
             "8. 如果没有显式模型能力，不要引入 LLM、图片模型、视觉模型或检索模型调用；如果没有显式外部副作用能力，不要引入外部副作用。\n"
             "9. 如果脚本只做确定性计算、转换、文件处理或格式化，必须实现真实算法并使用用户输入；禁止假 API、placeholder 文件、纯色/空白图片或 ASCII 图冒充输出。\n"

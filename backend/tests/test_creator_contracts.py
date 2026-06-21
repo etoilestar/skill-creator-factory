@@ -3,7 +3,7 @@ from backend.services.creator_contracts import (
     resolve_implementation,
     validate_python_evidence,
 )
-from backend.services.skill_plan import SkillPlanEntry
+from backend.services.skill_plan import SkillPlanEntry, ToolSlot
 
 
 def _entry(**kw):
@@ -120,11 +120,16 @@ def test_selected_tool_schema_refines_canonical_contract():
 
 
 def test_references_and_assets_are_not_script_io_keys():
-    entry = _entry(inputs=["payload", "references/guide.md", "assets/source.png"], outputs=["result", "assets/generated/out.png"])
+    entry = _entry(
+        inputs=["payload", "references/guide.md", "assets/source.png"],
+        outputs=["result", "assets/generated/out.png"],
+        dependencies=["requests", "references/guide.md", "assets/source.png"],
+    )
     contract = compile_canonical_file_contract(entry, _schema())
 
     assert contract.inputs == ["payload"]
     assert contract.outputs == ["result"]
+    assert contract.declared_dependencies == ["requests"]
 
 
 def test_system_manifest_selects_text_generation_tool():
@@ -191,3 +196,41 @@ def test_trial_stdout_uses_refined_contract_required_fields():
         assert "file_outputs" in str(exc)
     else:
         raise AssertionError("refined stdout_schema.required was not enforced")
+
+
+def test_partial_tool_schema_becomes_tool_assisted_not_unusable():
+    from backend.services.creator_tool_registry import ToolCapability, ToolFunctionManifest, clear_registered_tool_capabilities, register_tool_capability
+
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="lookup_helper",
+        display_name="Lookup Helper",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools",
+            short_description="Lookup one source value.",
+            when_to_use="Use for the lookup functional step.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["source_value"], "properties": {"source_value": {"type": "string"}}},
+            required_capabilities=["lookup_helper"],
+        )],
+    ))
+    try:
+        entry = _entry(
+            raw_capability_hints=["lookup_helper"],
+            outputs=["final_answer", "confidence"],
+            required_tool_slots=[ToolSlot(slot_id="lookup", functional_requirement="lookup source data")],
+        )
+        schema = {"type": "object", "required": ["final_answer", "confidence"], "properties": {"final_answer": {"type": "string"}, "confidence": {"type": "number"}}}
+        contract = compile_canonical_file_contract(entry, schema)
+        resolution = resolve_implementation(entry, contract)
+
+        assert contract.functional_requirements == ["lookup source data"]
+        assert resolution.mode == "tool_assisted_creator_implemented"
+        assert resolution.tool_slots[0]["tool_id"] == "lookup_helper.lookup_value"
+        assert "tool_result_used" in resolution.required_evidence
+    finally:
+        clear_registered_tool_capabilities()

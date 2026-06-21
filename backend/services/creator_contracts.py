@@ -36,6 +36,15 @@ class CallableToolManifest:
     function_name: str = ""
     dependencies: list[str] = field(default_factory=list)
     example_call: str = ""
+    signature: str = ""
+    return_contract: str = ""
+    example_return: str = ""
+    example_stdout: str = ""
+    common_mistakes: list[str] = field(default_factory=list)
+    snippets: list[dict[str, Any]] = field(default_factory=list)
+    usage_policy: str = ""
+    required_env: list[str] = field(default_factory=list)
+    required_secrets: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -122,6 +131,15 @@ def callable_manifest_from_capability(cap: ToolCapability) -> list[CallableToolM
             function_name=fn.function_name,
             dependencies=deps,
             example_call=fn.example_call,
+            signature=fn.signature,
+            return_contract=fn.return_contract,
+            example_return=fn.example_return,
+            example_stdout=fn.example_stdout,
+            common_mistakes=list(fn.common_mistakes or []),
+            snippets=[asdict(snippet) for snippet in (cap.snippets or []) if fn.function_name in str(snippet.code or "") or fn.function_name in str(snippet.id or "")],
+            usage_policy=fn.usage_policy or cap.usage_policy,
+            required_env=list(fn.required_env or cap.required_env or []),
+            required_secrets=list(fn.required_secrets or cap.required_secrets or []),
         ))
     return manifests
 

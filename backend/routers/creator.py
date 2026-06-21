@@ -5429,15 +5429,38 @@ def _script_local_contract_payload(
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
     available_tools = []
+    tool_function_cards: list[str] = []
+    selected_tool_names: list[str] = []
     for tool in implementation_resolution.available_tools or implementation_resolution.selected_tools:
+        capability_name = str(tool.tool_id).split(".")[0]
+        selected_tool_names.append(capability_name)
+        cap = get_tool_capability(capability_name)
+        if cap is not None:
+            tool_function_cards.extend(function_cards_for_tool(cap))
         available_tools.append({
             "tool_id": tool.tool_id,
             "description": tool.description,
             "call_template": call_template_for_tool(tool),
+            "signature": tool.signature,
             "input_schema": tool.input_schema,
             "output_schema": tool.output_schema,
+            "return_contract": tool.return_contract,
+            "example_return": tool.example_return,
+            "example_stdout": tool.example_stdout,
+            "common_mistakes": tool.common_mistakes,
+            "snippets": tool.snippets,
+            "usage_policy": tool.usage_policy,
+            "required_env": tool.required_env,
+            "required_secrets": tool.required_secrets,
             "artifact_outputs": tool.artifact_outputs,
         })
+    tool_snippets = resolve_tool_snippets_for_context(
+        role=plan_entry.role or "",
+        capabilities=list(dict.fromkeys([req.capability_id for req in canonical_contract.capability_requirements if req.capability_id])),
+        tool_names=list(dict.fromkeys(selected_tool_names)),
+        file_path=file_path,
+        max_snippets=8,
+    )
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
@@ -5446,6 +5469,9 @@ def _script_local_contract_payload(
         "inputs": canonical_contract.inputs,
         "outputs": canonical_contract.outputs,
         "available_tools": available_tools,
+        "tool_function_cards": tool_function_cards,
+        "tool_snippets": tool_snippets,
+        "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
         "resource_refs": canonical_contract.resource_refs,
         "output_contract": {
             "stdout_schema": stdout_schema,
@@ -5461,6 +5487,9 @@ def _script_local_contract_payload(
         "implementation_resolution": {
             "mode": implementation_resolution.mode,
             "available_tools": available_tools,
+            "tool_function_cards": tool_function_cards,
+            "tool_snippets": tool_snippets,
+            "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
             "allowed_imports": implementation_resolution.allowed_imports,
             "declared_dependencies": implementation_resolution.declared_dependencies,
             "required_evidence": implementation_resolution.required_evidence,
@@ -5588,6 +5617,8 @@ def _build_script_generate_file_prompt_variant(
     resolution_payload = local_contract.get("implementation_resolution") if isinstance(local_contract.get("implementation_resolution"), dict) else {}
     canonical_payload = local_contract
     selected_tools_payload = resolution_payload.get("available_tools") if isinstance(resolution_payload, dict) else []
+    tool_function_cards = local_contract.get("tool_function_cards") if isinstance(local_contract.get("tool_function_cards"), list) else []
+    tool_snippets = local_contract.get("tool_snippets") if isinstance(local_contract.get("tool_snippets"), list) else []
     logger.info(
         "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
         file_path,
@@ -5597,8 +5628,8 @@ def _build_script_generate_file_prompt_variant(
         json.dumps(canonical_payload.get("resource_refs") or [], ensure_ascii=False, sort_keys=True),
         implementation_mode,
         json.dumps([tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)], ensure_ascii=False),
-        0,
-        0,
+        len(tool_function_cards),
+        len(tool_snippets),
         json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
         json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
         json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
@@ -5614,7 +5645,7 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
-        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。raw role/capability 只能作为 hint，不能当硬合同。",
+        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、rules。raw role/capability 只能作为 hint，不能当硬合同。",
         "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑和 available_tools。",
         "available_tools 只是 embedding/结构化召回的候选工具，不是最终裁决；只有确实需要时才调用。",
         "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
@@ -5622,6 +5653,10 @@ def _build_script_generate_file_prompt_variant(
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
+        "动态工具函数卡片（从 registry/manifest 读取，不硬编码工具名）：",
+        "\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无",
+        "动态工具 Snippet 指南（从 registry/manifest 读取，不硬编码工具名）：",
+        str(local_contract.get("tool_snippet_prompt") or "当前脚本可用工具 Snippets: 无"),
     ]
     if variant == "standard":
         instruction.append("不注入完整蓝图、kernel 文档或额外工具清单；只使用上面的轻量上下文。")

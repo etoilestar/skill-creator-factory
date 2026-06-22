@@ -15,13 +15,16 @@
  *
  * @param {string} url  - POST endpoint (e.g. /api/chat/creator)
  * @param {object} body - { messages: [{role, content}], model?, execution_mode? }
+ * @param {object} [options] - Optional fetch options
+ * @param {AbortSignal} [options.signal] - AbortSignal to cancel the request
  * @yields {string | {type: string, data: object}}
  */
-export async function* streamChat(url, body) {
+export async function* streamChat(url, body, { signal } = {}) {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   })
 
   if (!response.ok) {

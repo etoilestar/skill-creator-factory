@@ -12,8 +12,10 @@ from .skill_metadata import parse_skill_frontmatter
 # Scope resolution follows OpenClaw-style precedence: workspace overrides shared,
 # shared overrides managed, and bundled provides the lowest-priority fallback.
 SCOPE_PRIORITY = ["workspace", "shared", "managed", "bundled"]
-# Only approved skills are executable in governed runtime paths.
-EXECUTABLE_STATUSES = {"approved"}
+# Approved and draft skills are executable in sandbox/runtime paths.
+# Draft skills need testing before approval; blocking them from sandbox
+# defeats the purpose of the test panel.
+EXECUTABLE_STATUSES = {"approved", "draft"}
 # Managed skills are editable in this app; all other scopes are treated as
 # imported or externally managed sources and are therefore read-only.
 NON_EDITABLE_SCOPES = {"workspace", "shared", "bundled"}

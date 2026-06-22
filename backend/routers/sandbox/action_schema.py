@@ -240,8 +240,8 @@ def _validate_action_schema_entries(entries: list[dict]) -> tuple[list[dict], li
     for script_path, script_entries in by_script.items():
         distinct_commands = {str(item.get("command") or "").strip() for item in script_entries}
         if len(distinct_commands) > 1:
-            errors.append({
-                "error": "同一 script 存在多个不一致执行入口",
+            warnings.append({
+                "warning": "同一 script 存在多个不同调用方式（如不同子命令），runtime 将按首个声明执行；模型可根据用户需求选择合适的调用方式",
                 "script_path": script_path,
                 "sources": [item.get("source_path") for item in script_entries],
             })

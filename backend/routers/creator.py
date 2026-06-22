@@ -46,6 +46,7 @@ from ..services.creator_contracts import (
     refine_contract_with_resolution,
     resolve_implementation,
     call_template_for_tool,
+    validate_script_functional_evidence,
 )
 from .chat_utils import _get_skill_venv_python
 
@@ -4211,6 +4212,31 @@ def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stde
     )
 
 
+def _format_script_functional_issues(issues: list[dict[str, Any]]) -> str:
+    lines = ["script_functional 校验未通过："]
+    for issue in issues:
+        lines.append(
+            "- {id}\n"
+            "  failed_file: {failed_file}\n"
+            "  failed_function: {failed_function}\n"
+            "  code_region: {code_region}\n"
+            "  reason: {reason}\n"
+            "  minimal_edit: {minimal_edit}\n"
+            "  allowed_scope: {allowed_scope}\n"
+            "  forbidden_scope: {forbidden_scope}".format(
+                id=issue.get("id", "script_functional.unknown"),
+                failed_file=issue.get("failed_file", ""),
+                failed_function=issue.get("failed_function", ""),
+                code_region=issue.get("code_region", ""),
+                reason=issue.get("reason", ""),
+                minimal_edit=issue.get("minimal_edit", ""),
+                allowed_scope=issue.get("allowed_scope", ""),
+                forbidden_scope=issue.get("forbidden_scope", ""),
+            )
+        )
+    return "\n".join(lines)
+
+
 def _validate_image_payload_shape(payload: dict[str, Any]) -> bool:
     image_path = payload.get("image_path")
     if isinstance(image_path, str) and image_path.strip():
@@ -4654,6 +4680,24 @@ def _trial_run_generated_script(
                 skill_plan_entry=skill_plan_entry,
                 canonical_contract=refined_contract,
             )
+            stdout_payload = json.loads((proc.stdout or "{}").strip())
+            argv_payload: dict[str, Any] = {}
+            if args:
+                try:
+                    parsed_argv = json.loads(args[0])
+                    if isinstance(parsed_argv, dict):
+                        argv_payload = parsed_argv
+                except Exception:
+                    argv_payload = {}
+            functional_issues = validate_script_functional_evidence(
+                content=content,
+                stdout_payload=stdout_payload,
+                argv_payload=argv_payload,
+                contract=refined_contract,
+                resolution=resolution,
+            )
+            if functional_issues:
+                raise ValueError(_format_script_functional_issues(functional_issues))
             return _build_script_runtime_spec_from_trial(
                 file_path=file_path,
                 entry=inferred_entry,
@@ -5108,8 +5152,12 @@ async def _run_generated_file_validator_round(
                 "请输出 JSON："
                 "{\"passed\": false, \"issues\": [\"...\"], "
                 "\"failed_checks\": [], "
+                "\"localization\": [{\"failed_file\": \"当前文件路径\", \"failed_function\": \"函数名或 main/run/stdout\", "
+                "\"line_region\": \"行号或代码区域\", \"reason\": \"为什么未完成职责\", "
+                "\"minimal_edit\": \"最小修改建议\", \"allowed_scope\": \"只允许改哪里\", "
+                "\"forbidden_scope\": \"不能改哪里\"}], "
                 "\"preserve\": [\"已通过检查对应内容\"], "
-                "\"repair_instructions\": \"只针对后端真实错误的局部修改指令；不得引入 LLM 推测、SkillPlan/capability/workflow 修改或工具路线重规划。\"}"
+                "\"repair_instructions\": \"只针对后端真实错误的局部修改指令；必须说明失败文件、失败函数、行号/区域、原因、最小修改建议、允许/禁止修改范围；不得引入 LLM 推测、SkillPlan/capability/workflow 修改或工具路线重规划。\"}"
             ),
         },
     ]
@@ -6559,10 +6607,11 @@ def _build_skill_md_model_finalizer_prompt(
 
 
 def _strict_contract_rewrite_allowed(source: str) -> bool:
-    # Strict rewrites are allowed only when the backend has produced a
-    # deterministic first-round result. The decision is source-based rather
-    # than inferred from error-message text.
-    return source in {"content_review", "script_smoke"}
+    # First-round repairs must stay localized: the validator identifies the
+    # failed function/region, and the repair model edits only that region while
+    # preserving entrypoints, JSON argv parsing, stdout fields, and artifact
+    # protocol.  Do not escalate script failures into full rewrites.
+    return source in {"content_review"}
 
 
 
@@ -8205,6 +8254,7 @@ def _parse_e2e_stdout_json(
     command: E2EWorkflowCommand,
     proc: subprocess.CompletedProcess[str],
     trial_skill_dir: Path,
+    trial_skill_md: str,
     content: str,
     entry: SkillPlanEntry,
     rendered_payload: dict[str, Any],
@@ -8533,6 +8583,7 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
                     command=command,
                     proc=proc,
                     trial_skill_dir=trial_skill_dir,
+                    trial_skill_md=trial_skill_md,
                     content=content,
                     entry=entry,
                     rendered_payload=rendered_payload,
@@ -8941,7 +8992,21 @@ async def validate_skill(request: SkillActionRequest):
 
     while True:
         external_context = _external_context_from_skill_action_request(request)
-        e2e_errors = validate_workflow_e2e(skill_name, external_context=external_context)
+        try:
+            e2e_errors = validate_workflow_e2e(skill_name, external_context=external_context)
+        except Exception as exc:
+            logger.exception("validate-skill e2e validator crashed skill=%s", skill_name)
+            e2e_errors = [
+                _e2e_error(
+                    target="SKILL.md",
+                    layer="e2e_internal_exception",
+                    message=(
+                        "严格端到端工作流校验内部异常，已按校验失败返回而不是 HTTP 500。\n"
+                        f"exception_type={type(exc).__name__}\n"
+                        f"exception={exc}"
+                    ),
+                )
+            ]
         if not e2e_errors:
             suffix = ""
             if repair_logs:

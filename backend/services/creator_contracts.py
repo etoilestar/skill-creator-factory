@@ -9,6 +9,7 @@ Python source with AST evidence rather than business field names.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import math
 import sys
@@ -631,3 +632,132 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
     if visitor.nonconstants_in_returns == 0 and visitor.constants_in_returns > 0:
         issues.append("no_shell_template: required outputs appear to be literal-only")
     return issues
+
+
+def validate_script_functional_evidence(
+    *,
+    content: str,
+    stdout_payload: dict[str, Any],
+    argv_payload: dict[str, Any],
+    contract: CanonicalFileContract,
+    resolution: ImplementationResolution,
+) -> list[dict[str, Any]]:
+    """Validate first-round single-script functional closure.
+
+    This check is intentionally local to one generated script.  It combines
+    static AST evidence with the actual trial-run stdout payload to ensure the
+    script can stand alone against its own SkillPlan purpose/role/outputs and
+    artifact contract, without judging cross-script workflow dataflow.
+    """
+    issues: list[dict[str, Any]] = []
+    for issue in validate_python_evidence(content, contract, resolution):
+        issues.append({
+            "id": "script_functional." + issue.split(":", 1)[0],
+            "failed_file": contract.file_path,
+            "failed_function": "main/run/stdout construction",
+            "code_region": "script body and final stdout construction",
+            "reason": issue,
+            "minimal_edit": "只修改当前脚本中读取输入、调用工具/本地处理、组织 stdout 或写入产物的失败区域；保留入口、JSON argv 解析、stdout 字段和文件输出协议。",
+            "allowed_scope": contract.file_path,
+            "forbidden_scope": "不得修改其它脚本、SKILL.md、SkillPlan、workflow；不得全量重写或通过 try/except 输出假成功。",
+        })
+
+    required = _schema_required(contract.stdout_schema) or contract.outputs
+    missing = [key for key in required if key not in stdout_payload or not _json_value_non_empty(stdout_payload.get(key))]
+    if missing:
+        issues.append({
+            "id": "script_functional.required_outputs",
+            "failed_file": contract.file_path,
+            "failed_function": "stdout JSON construction",
+            "code_region": "return/print(json.dumps(...)) near final output",
+            "reason": "stdout 缺少非空 required outputs: " + ", ".join(missing),
+            "minimal_edit": "只补齐当前脚本 stdout JSON 中缺失的 required output 字段，并让字段值来自真实输入/处理结果。",
+            "allowed_scope": contract.file_path,
+            "forbidden_scope": "不得改 SKILL.md、其它脚本或 SkillPlan；不得输出空模板/假数据。",
+        })
+
+    argv_values = [
+        value.strip()
+        for value in _flatten_strings(argv_payload)
+        if isinstance(value, str) and value.strip()
+    ]
+    stdout_text = json_dumps_safe(stdout_payload)
+    if argv_values and not any(value in stdout_text for value in argv_values):
+        issues.append({
+            "id": "script_functional.input_used_in_output",
+            "failed_file": contract.file_path,
+            "failed_function": "business processing/output assembly",
+            "code_region": "input parsing through stdout/artifact generation path",
+            "reason": "试运行 stdout/产物证据没有体现输入值，脚本可能未真实使用 argv JSON。",
+            "minimal_edit": "只修改当前脚本处理逻辑，让输出或生成产物真实依赖 argv JSON 中的输入值。",
+            "allowed_scope": contract.file_path,
+            "forbidden_scope": "不得用固定模板、占位内容或 try/except 假成功替代真实处理。",
+        })
+
+    if _contract_declares_artifact(contract):
+        artifact_fields = _artifact_field_names(contract.artifact_contract)
+        produced = [field for field in artifact_fields if _json_value_non_empty(stdout_payload.get(field))]
+        if not produced:
+            issues.append({
+                "id": "script_functional.artifact_declared",
+                "failed_file": contract.file_path,
+                "failed_function": "artifact/file output generation",
+                "code_region": "file creation and stdout file field assignment",
+                "reason": "artifact_contract 声明文件产物，但 stdout 未返回对应非空产物字段。",
+                "minimal_edit": "只修当前脚本的文件生成和 stdout 产物字段赋值，确保试运行真实创建文件。",
+                "allowed_scope": contract.file_path,
+                "forbidden_scope": "不得删除产物声明或改 workflow；不得返回不存在路径。",
+            })
+
+    return issues
+
+
+def _json_value_non_empty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_json_value_non_empty(item) for item in value)
+    if isinstance(value, dict):
+        return any(_json_value_non_empty(item) for item in value.values())
+    return True
+
+
+def _flatten_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for item in value.values():
+            out.extend(_flatten_strings(item))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_flatten_strings(item))
+        return out
+    return []
+
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _artifact_field_names(contract: dict[str, Any]) -> list[str]:
+    fields: list[str] = []
+    for key in ("artifact_fields", "file_fields", "file_outputs", "output_fields"):
+        raw = contract.get(key) if isinstance(contract, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            fields.append(raw.strip())
+        elif isinstance(raw, list):
+            fields.extend(str(item).strip() for item in raw if str(item).strip())
+    for item in (contract.get("artifact_outputs") if isinstance(contract, dict) else []) or []:
+        if isinstance(item, dict):
+            field_name = str(item.get("field") or item.get("name") or "").strip()
+            if field_name:
+                fields.append(field_name)
+    return list(dict.fromkeys(fields))

@@ -192,6 +192,8 @@ class ScriptRuntimeSpec:
     actual_stdout_fields: list[str] = field(default_factory=list)
     artifact_fields: list[str] = field(default_factory=list)
     file_outputs: list[str] = field(default_factory=list)
+    stdout_json: dict[str, object] = field(default_factory=dict)
+    artifact_paths: list[str] = field(default_factory=list)
     command_template: str = ""
 
 

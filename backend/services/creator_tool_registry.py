@@ -227,6 +227,31 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
 
+BUILTIN_TOOL_CAPABILITIES["text_generation"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["text_generation"],
+    helper_imports=["generate_text_with_llm"],
+    input_schema={"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}}},
+    output_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
+    functions=[
+        ToolFunctionManifest(
+            function_name="generate_text_with_llm",
+            import_path="backend.services.skill_runtime",
+            short_description="Generate text with the host-configured language model.",
+            when_to_use="Use when a script declares text_generation and needs open-ended text output from the host model.",
+            signature="generate_text_with_llm(prompt: str, *, system: str = '', temperature: float = 0.7) -> str",
+            input_schema={"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}, "system": {"type": "string"}, "temperature": {"type": "number"}}},
+            output_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
+            return_contract="Returns generated text as a string; script stdout must map it into the declared output field.",
+            example_call="from backend.services.skill_runtime import generate_text_with_llm\ntext = generate_text_with_llm(prompt=str(payload.get('prompt') or payload.get('text') or payload.get('user_request') or ''))",
+            common_mistakes=["Do not call the helper and then ignore the returned text.", "Do not replace generated text with a fixed template."],
+            usage_policy="helper_preferred",
+            required_capabilities=["text_generation"],
+        )
+    ],
+    usage_policy="helper_preferred",
+    prompt_guidance="需要文本生成时，可优先使用 backend.services.skill_runtime.generate_text_with_llm；模型配置由宿主运行时注入。",
+)
+
 BUILTIN_TOOL_CAPABILITIES["file_output"] = replace(
     BUILTIN_TOOL_CAPABILITIES["file_output"],
     helper_imports=["create_text_file"],

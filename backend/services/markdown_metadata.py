@@ -75,6 +75,75 @@ def validate_reference_frontmatter(frontmatter: dict[str, Any] | None) -> list[s
     return validate_generic_frontmatter(frontmatter, allowed=_ALLOWED_REFERENCE_TOP_LEVEL, forbidden=_FORBIDDEN_REFERENCE_TOP_LEVEL, allow_missing=True)
 
 
+
+def _clean_metadata_creator(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        creator = value.get("creator")
+        if isinstance(creator, dict):
+            return {str(k): v for k, v in creator.items() if v not in (None, "", [], {})}
+    return {}
+
+
+def canonicalize_skill_frontmatter(frontmatter: dict[str, Any] | None, *, default_name: str = "", default_description: str = "") -> dict[str, Any]:
+    """Return SKILL.md frontmatter with only allowed top-level keys.
+
+    Unknown/Creator planning keys are preserved under metadata.creator so the
+    Markdown body does not need to be rewritten to remove them.
+    """
+    source = frontmatter if isinstance(frontmatter, dict) else {}
+    canonical: dict[str, Any] = {}
+    for key in ("name", "description", "license", "allowed-tools"):
+        if source.get(key) not in (None, "", [], {}):
+            canonical[key] = source[key]
+    canonical.setdefault("name", default_name or "skill")
+    canonical.setdefault("description", default_description or canonical.get("name") or "Skill description")
+
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    clean_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    creator = _clean_metadata_creator(clean_metadata)
+    for key, value in source.items():
+        if key in _ALLOWED_SKILL_TOP_LEVEL or value in (None, "", [], {}):
+            continue
+        creator[str(key)] = value
+    if creator:
+        clean_metadata["creator"] = creator
+    if clean_metadata:
+        canonical["metadata"] = clean_metadata
+    return canonical
+
+
+def canonicalize_reference_frontmatter(frontmatter: dict[str, Any] | None, *, file_path: str = "", purpose: str = "") -> dict[str, Any] | None:
+    """Return reference frontmatter with only allowed document metadata keys.
+
+    Missing reference frontmatter stays missing. Disallowed path/purpose/planning
+    keys are moved under metadata.creator when frontmatter exists.
+    """
+    if frontmatter is None:
+        return None
+    source = frontmatter if isinstance(frontmatter, dict) else {}
+    canonical: dict[str, Any] = {}
+    for key in ("title", "description", "source", "license"):
+        if source.get(key) not in (None, "", [], {}):
+            canonical[key] = source[key]
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    clean_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    creator = _clean_metadata_creator(clean_metadata)
+    if file_path:
+        creator.setdefault("path", file_path)
+    if purpose:
+        creator.setdefault("purpose", purpose)
+    for key, value in source.items():
+        if key in _ALLOWED_REFERENCE_TOP_LEVEL or value in (None, "", [], {}):
+            continue
+        creator[str(key)] = value
+    if creator:
+        clean_metadata["creator"] = creator
+    if clean_metadata:
+        canonical["metadata"] = clean_metadata
+    if not canonical:
+        return None
+    return canonical
+
 def apply_frontmatter_patch(markdown: str, new_frontmatter: dict[str, Any] | None) -> str:
     """Replace only the YAML frontmatter, preserving body byte-for-byte text."""
     _old, body, had = parse_frontmatter(markdown)

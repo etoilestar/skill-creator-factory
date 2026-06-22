@@ -44,6 +44,9 @@ from ..services.markdown_metadata import (
     parse_frontmatter,
     validate_skill_frontmatter,
     validate_reference_frontmatter,
+    canonicalize_skill_frontmatter,
+    canonicalize_reference_frontmatter,
+    apply_frontmatter_patch,
 )
 from ..services.creator_contracts import (
     compile_canonical_file_contract,
@@ -1321,6 +1324,37 @@ def _has_valid_skill_md_frontmatter(content: str) -> bool:
     return not _skill_md_frontmatter_errors(content)
 
 
+
+def _canonicalize_markdown_frontmatter_for_file(
+    *,
+    file_path: str,
+    content: str,
+    skill_name: str = "",
+    purpose: str = "",
+) -> tuple[str, bool]:
+    """Deterministically fix metadata schema errors by replacing frontmatter only."""
+    if file_path == "SKILL.md":
+        meta, _body, _had = parse_frontmatter(content)
+        if not validate_skill_frontmatter(meta):
+            return content, False
+        canonical = canonicalize_skill_frontmatter(
+            meta,
+            default_name=skill_name,
+            default_description=purpose or "Skill description",
+        )
+        patched = apply_frontmatter_patch(content, canonical)
+        return patched, patched != content
+
+    if file_path.startswith("references/") and Path(file_path).suffix.lower() == ".md":
+        meta, _body, had = parse_frontmatter(content)
+        if not had or not validate_reference_frontmatter(meta):
+            return content, False
+        canonical = canonicalize_reference_frontmatter(meta, file_path=file_path, purpose=purpose)
+        patched = apply_frontmatter_patch(content, canonical)
+        return patched, patched != content
+
+    return content, False
+
 def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Validate SKILL.md command placeholders against parsed SkillPlan dataflow."""
     try:
@@ -2251,27 +2285,6 @@ def _reference_frontmatter_metadata(content: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
-def _reference_metadata_defaults(
-    *,
-    file_path: str,
-    purpose: str = "",
-    skill_plan_entry: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    entry = skill_plan_entry or {}
-    title = _slug_from_reference_path(file_path)
-    description = (purpose or entry.get("purpose") or f"{file_path} reference").strip()
-    return {
-        "title": title,
-        "description": description,
-        "metadata": {
-            "creator": {
-                "path": file_path,
-                "purpose": (purpose or entry.get("purpose") or "按 SKILL.md 工作流需要读取正文").strip(),
-            }
-        },
-    }
-
-
 def _ensure_reference_metadata_frontmatter(
     *,
     file_path: str,
@@ -2279,36 +2292,25 @@ def _ensure_reference_metadata_frontmatter(
     purpose: str = "",
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Ensure references/*.md has YAML frontmatter metadata.
+    """Canonicalize references/*.md frontmatter without preserving illegal keys.
 
-    This supports metadata-first loading: loader can inspect frontmatter before
-    reading the full body.
+    References may omit frontmatter. If frontmatter exists (or this helper is
+    asked to add one for generation UX), only document metadata keys remain at
+    the top level; role/type/path/scope/loading/when_to_use and other Creator
+    planning fields are moved under metadata.creator.
     """
     if not file_path.startswith("references/") or Path(file_path).suffix.lower() != ".md":
         return content
 
-    defaults = _reference_metadata_defaults(
+    meta, _body, had_frontmatter = parse_frontmatter(content)
+    if not had_frontmatter:
+        return content
+    canonical = canonicalize_reference_frontmatter(
+        meta,
         file_path=file_path,
-        purpose=purpose,
-        skill_plan_entry=skill_plan_entry,
+        purpose=purpose or str((skill_plan_entry or {}).get("purpose") or ""),
     )
-    meta, body = _reference_frontmatter_metadata(content)
-
-    merged = dict(defaults)
-    for key, value in meta.items():
-        if value not in (None, "", [], {}):
-            merged[key] = value
-
-    body = body.strip()
-
-    yaml_text = yaml.safe_dump(
-        merged,
-        allow_unicode=True,
-        sort_keys=False,
-        default_flow_style=False,
-    ).strip()
-
-    return f"---\n{yaml_text}\n---\n\n{body}\n"
+    return apply_frontmatter_patch(content, canonical)
 
 
 def _reference_metadata_contract_checks(
@@ -2369,14 +2371,14 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
 
     metadata_example = yaml.safe_dump(
         {
-            "name": _slug_from_reference_path(file_path),
+            "title": _slug_from_reference_path(file_path),
             "description": purpose or f"{file_path} reference",
-            "role": "reference",
-            "type": "reference",
-            "path": file_path,
-            "scope": "skill-local",
-            "loading": "metadata-first-body-on-demand",
-            "when_to_use": purpose or "按 SKILL.md 工作流需要读取正文",
+            "metadata": {
+                "creator": {
+                    "path": file_path,
+                    "purpose": purpose or "按 SKILL.md 工作流需要读取正文",
+                }
+            },
         },
         allow_unicode=True,
         sort_keys=False,
@@ -2387,12 +2389,10 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         f"必须满足以下参考资料文件合同：{file_path}",
         "A. 输出形态:",
         "- 只输出该 reference 的 Markdown 文档内容，不要写入文件标签、Creator 流程说明或多文件包。",
-        "- 文件必须以 YAML frontmatter metadata 开始，metadata 后才是正文。",
-        "- metadata 用于运行时 metadata-first 加载；正文只在需要时按需读取。",
-        "- metadata 必须至少包含：name、description、role、type、path、scope、loading、when_to_use。",
-        "- metadata.role 必须是 reference；metadata.type 必须是 reference；metadata.path 必须等于当前文件路径。",
-        "- metadata.loading 必须是 metadata-first-body-on-demand。",
-        "metadata 示例:",
+        "- references/*.md 可以没有 YAML frontmatter；如果有 frontmatter，只能包含普通文档元数据。",
+        "- 允许的 frontmatter 顶层字段只有：title、description、source、license、metadata。",
+        "- path/purpose/role/type/scope/loading/when_to_use 等 Creator 内部信息不得作为顶层字段；如需保留，只能放在 metadata.creator 下。",
+        "可选 metadata 示例:",
         "---",
         metadata_example,
         "---",
@@ -4893,16 +4893,15 @@ async def _repair_generated_file_with_feedback(
         "bash": "Bash: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
         "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
-    output_contract = (
-        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
-        if is_script
-        else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
-    )
-    local_edit_scope = (
-        "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
-        if is_script
-        else "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
-    )
+    if is_script:
+        output_contract = f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
+        local_edit_scope = "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
+    elif file_path.startswith("references/"):
+        output_contract = "最终只返回当前 reference Markdown 正文；不要在文件外层套 Markdown 代码块。references/*.md 可无 frontmatter；如有 frontmatter，顶层只允许 title/description/source/license/metadata，内部 path/purpose 放 metadata.creator。"
+        local_edit_scope = "保留已经正确的正文、代码块和参考资料内容；metadata schema 错误优先只替换 frontmatter。"
+    else:
+        output_contract = "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
+        local_edit_scope = "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
     if is_script:
         tool_context = _creator_tool_context_for_script(
             file_path=file_path,
@@ -4918,6 +4917,15 @@ async def _repair_generated_file_with_feedback(
             "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
             "不要生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
             f"\n统一 Tool Registry 上下文：\n{tool_context}"
+        )
+    elif file_path.startswith("references/"):
+        extra_rules = (
+            "你只修当前 reference Markdown；保持正文内容，不重写整个文件；"
+            "如果错误是 frontmatter schema，只修 frontmatter；references/*.md 可以没有 frontmatter；"
+            "如有 frontmatter，顶层只允许 title/description/source/license/metadata；"
+            "path/purpose/role/type/scope/loading/when_to_use 等内部字段必须删除或移动到 metadata.creator；"
+            "不要添加脚本命令块，不要重新定义 workflow、role、inputs、outputs 或 capabilities；"
+            "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
         )
     else:
         extra_rules = (
@@ -7082,7 +7090,7 @@ async def generate_file(request: GenerateFileRequest):
     - The frontend expects streamed content and then calls /write-file.
     - assets/** are upload-only and must never be generated by model.
     - SKILL.md must pass blueprint-intent alignment before returned.
-    - references/*.md must contain YAML metadata frontmatter.
+    - references/*.md may omit YAML frontmatter; if present it must use ordinary document metadata only.
     """
     skill_name = _validate_skill_name(request.skill_name)
     _validate_file_path(request.file_path)
@@ -7179,6 +7187,13 @@ async def generate_file(request: GenerateFileRequest):
                         candidate,
                         role=request.role,
                         skill_plan_entry=request.skill_plan_entry,
+                    )
+
+                    content, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
+                        file_path=request.file_path,
+                        content=content,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
                     )
 
                     if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":
@@ -7441,10 +7456,9 @@ async def generate_file(request: GenerateFileRequest):
 
                 if request.file_path.startswith("references/"):
                     targeted_repair += (
-                        "\n\n额外修复目标：reference Markdown 必须以 YAML frontmatter metadata 开始，"
-                        "metadata 必须包含 name/description/role/type/path/scope/loading/when_to_use，"
-                        "其中 role/type=reference，path 等于当前文件路径，"
-                        "loading=metadata-first-body-on-demand。"
+                        "\n\n额外修复目标：references/*.md 可以没有 YAML frontmatter；"
+                        "如果有 frontmatter，顶层只允许 title/description/source/license/metadata。"
+                        "role/type/path/scope/loading/when_to_use 等内部字段必须删除或移动到 metadata.creator。"
                     )
 
                 contract_text = _build_generated_file_contract_text(
@@ -7576,6 +7590,13 @@ async def write_file(request: WriteFileRequest):
             request.content,
             role=request.role,
             skill_plan_entry=request.skill_plan_entry,
+        )
+
+        content, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
+            file_path=request.file_path,
+            content=content,
+            skill_name=skill_name,
+            purpose=getattr(request, "purpose", "") or "",
         )
 
         if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":

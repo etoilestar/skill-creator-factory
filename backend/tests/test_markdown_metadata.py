@@ -1,5 +1,7 @@
 from backend.services.markdown_metadata import (
     apply_frontmatter_patch,
+    canonicalize_reference_frontmatter,
+    canonicalize_skill_frontmatter,
     parse_frontmatter,
     validate_reference_frontmatter,
     validate_skill_frontmatter,
@@ -43,3 +45,32 @@ def test_apply_frontmatter_patch_preserves_body_and_code_blocks():
     patched = apply_frontmatter_patch(original, {"name": "new", "description": "new"})
     assert "trigger: bad" not in patched.split("---", 2)[1]
     assert "# Body\n```yaml\ntrigger: keep in code\n```\n" in patched
+
+
+def test_reference_canonicalize_moves_internal_fields_to_metadata_creator():
+    canonical = canonicalize_reference_frontmatter(
+        {
+            "title": "Ref",
+            "description": "Doc",
+            "role": "reference",
+            "type": "reference",
+            "path": "wrong.md",
+            "scope": "skill-local",
+            "loading": "metadata-first-body-on-demand",
+            "when_to_use": "needed",
+        },
+        file_path="references/ref.md",
+        purpose="purpose",
+    )
+    assert set(canonical) == {"title", "description", "metadata"}
+    assert canonical["metadata"]["creator"]["role"] == "reference"
+    assert canonical["metadata"]["creator"]["path"] == "wrong.md"
+    assert canonical["metadata"]["creator"]["purpose"] == "purpose"
+
+
+def test_skill_canonicalize_moves_forbidden_keys_to_metadata_creator():
+    canonical = canonicalize_skill_frontmatter(
+        {"name": "demo", "description": "ok", "trigger": "x", "inputs": ["topic"]}
+    )
+    assert set(canonical) == {"name", "description", "metadata"}
+    assert canonical["metadata"]["creator"] == {"trigger": "x", "inputs": ["topic"]}

@@ -144,6 +144,9 @@ export async function* generateFileStream({
           yield { validation: parsed.validation }
           continue
         }
+        if (parsed.runtime_spec) {
+          yield { runtimeSpec: parsed.runtime_spec }
+        }
         if (typeof parsed.content === 'string') {
           yield parsed.content
         }
@@ -152,6 +155,39 @@ export async function* generateFileStream({
       }
     }
   }
+}
+
+
+/**
+ * Finalize SKILL.md from verified script runtime specs; this does not call the LLM.
+ */
+export async function finalizeSkillMd({
+  skillName,
+  description = '',
+  blueprintText = '',
+  references = [],
+  assets = [],
+  scriptRuntimeSpecs = [],
+  finalOutputs = [],
+}) {
+  const resp = await fetch('/api/creator/finalize-skill-md', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      skill_name: skillName,
+      description,
+      blueprint_text: blueprintBodyOnly(blueprintText),
+      references,
+      assets,
+      script_runtime_specs: scriptRuntimeSpecs,
+      final_outputs: finalOutputs,
+    }),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+    throw new Error(err.detail || 'SKILL.md 最终生成失败')
+  }
+  return resp.json()
 }
 
 /**

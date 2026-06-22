@@ -397,17 +397,17 @@ def render_script_command_from_skill_plan(
     """
     if runtime_spec is not None:
         if isinstance(runtime_spec, ScriptRuntimeSpec):
-            if runtime_spec.command_template:
-                return runtime_spec.command_template
             if runtime_spec.accepted_sample_argv:
                 return _render_command(runtime_spec.script_path or entry.path, runtime_spec.runtime or entry.runtime, dict(runtime_spec.accepted_sample_argv))
+            if runtime_spec.command_template:
+                return runtime_spec.command_template
         elif isinstance(runtime_spec, dict):
-            template = str(runtime_spec.get("command_template") or "")
-            if template:
-                return template
             accepted = runtime_spec.get("accepted_sample_argv")
             if isinstance(accepted, dict) and accepted:
                 return _render_command(str(runtime_spec.get("script_path") or entry.path), str(runtime_spec.get("runtime") or entry.runtime), dict(accepted))
+            template = str(runtime_spec.get("command_template") or "")
+            if template:
+                return template
 
     payload = _command_args_from_runtime_contract(entry.runtime_contract)
     if payload:

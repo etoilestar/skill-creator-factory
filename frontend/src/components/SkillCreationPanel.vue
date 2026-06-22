@@ -271,6 +271,7 @@ import { ref, computed, nextTick } from 'vue'
 import {
   initSkill,
   generateFileStream,
+  finalizeSkillMd,
   writeFile,
   validateSkill,
   packageSkill,
@@ -353,6 +354,7 @@ const localFiles = ref(
 )
 
 const localSkillName = ref(props.skillName)
+const scriptRuntimeSpecs = ref([])
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
@@ -664,6 +666,21 @@ async function handleAssetUpload(fileItem, event) {
     event.target.value = ''
   }
 }
+
+function upsertRuntimeSpec(spec) {
+  if (!spec?.script_path) return
+  const idx = scriptRuntimeSpecs.value.findIndex(item => item.script_path === spec.script_path)
+  if (idx >= 0) scriptRuntimeSpecs.value[idx] = spec
+  else scriptRuntimeSpecs.value.push(spec)
+}
+
+function collectFinalOutputs() {
+  const lastScript = [...localFiles.value].reverse().find(f => normalizeSkillPath(f.path).startsWith('scripts/'))
+  if (Array.isArray(lastScript?.outputs) && lastScript.outputs.length) return lastScript.outputs
+  const lastSpec = scriptRuntimeSpecs.value[scriptRuntimeSpecs.value.length - 1]
+  return Array.isArray(lastSpec?.actual_stdout_fields) ? lastSpec.actual_stdout_fields : []
+}
+
 // ---------------------------------------------------------------------------
 // Per-file generation & writing
 // ---------------------------------------------------------------------------
@@ -676,6 +693,24 @@ async function generateOneFile(idx) {
   file.repairMessage = ''
 
   try {
+    if (file.path === 'SKILL.md') {
+      const result = await finalizeSkillMd({
+        skillName: localSkillName.value,
+        description: file.purpose || props.skillName,
+        blueprintText: props.blueprintText,
+        references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
+        assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
+        scriptRuntimeSpecs: scriptRuntimeSpecs.value,
+        finalOutputs: collectFinalOutputs(),
+      })
+      file.generatedContent = result.content || ''
+      if (!file.generatedContent.trim()) {
+        throw new Error('SKILL.md finalizer 未返回任何内容')
+      }
+      file.repairMessage = ''
+      file.status = 'preview'
+      return
+    }
     for await (const chunk of generateFileStream({
       skillName: localSkillName.value,
       filePath: file.path,
@@ -697,6 +732,9 @@ async function generateOneFile(idx) {
       } else if (chunk?.validation) {
         const statusText = chunk.validation.status === 'failed' ? '自动修复失败' : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
+      } else if (chunk?.runtimeSpec) {
+        upsertRuntimeSpec(chunk.runtimeSpec)
+        file.runtime_spec = chunk.runtimeSpec
       } else if (chunk?.error) {
         throw new Error(chunk.error)
       }
@@ -731,6 +769,10 @@ async function writeOneFile(idx) {
       file
     )
     if (!result.success) throw new Error(result.message)
+    if (result.runtime_spec) {
+      upsertRuntimeSpec(result.runtime_spec)
+      file.runtime_spec = result.runtime_spec
+    }
     file.status = 'done'
     file.bytesWritten = result.bytes || 0
   } catch (err) {

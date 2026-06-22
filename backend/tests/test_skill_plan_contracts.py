@@ -1775,3 +1775,133 @@ python scripts/build_pdf.py '{"text":"{{text}}"}'
     assert entry.required_capabilities == []
     assert entry.raw_capability_hints == ["pdf_generation", "image_generation"]
     assert not any("不允许 capability" in warning for warning in plan.warnings)
+
+
+def test_runtime_spec_command_prefers_accepted_argv_over_old_template():
+    from backend.services.skill_plan import SkillPlanEntry, ScriptRuntimeSpec, command_payload_placeholders, render_script_command_from_skill_plan
+
+    entry = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["legacy"],
+        outputs=["text"],
+        command_template="python scripts/run.py '{\"legacy\":\"{{legacy}}\"}'",
+    )
+    spec = ScriptRuntimeSpec(
+        script_path="scripts/run.py",
+        runtime="python",
+        role="generic_script",
+        responsibility="generic",
+        input_policy="json",
+        accepted_sample_argv={"verified": "{{verified}}"},
+        command_template="python scripts/run.py '{\"legacy\":\"{{legacy}}\"}'",
+    )
+
+    command = render_script_command_from_skill_plan(entry, runtime_spec=spec)
+
+    assert command_payload_placeholders(command, "scripts/run.py") == {"verified": "verified"}
+
+
+def test_trial_run_generated_script_returns_runtime_spec(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.routers import creator
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n", encoding="utf-8")
+    content = """
+import json, sys
+
+def main():
+    argv = json.loads(sys.argv[1])
+    print(json.dumps({"text": argv.get("payload", "ok")}, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+"""
+    entry = {
+        "path": "scripts/main.py",
+        "file_type": "script",
+        "file_kind": "script",
+        "role": "generic_script",
+        "purpose": "echo payload",
+        "runtime": "python",
+        "inputs": ["payload"],
+        "outputs": ["text"],
+    }
+
+    spec = creator._trial_run_generated_script("demo-skill", "scripts/main.py", content, skill_plan_entry=entry)
+
+    assert spec is not None
+    assert spec.script_path == "scripts/main.py"
+    assert spec.accepted_sample_argv["payload"]
+    assert spec.actual_stdout_fields == ["text"]
+    assert spec.command_template.startswith("python scripts/main.py")
+
+
+def test_finalize_skill_md_uses_runtime_specs_without_internal_contracts():
+    from backend.routers.creator import finalize_skill_md_from_runtime_specs
+
+    content = finalize_skill_md_from_runtime_specs(
+        skill_name="demo-skill",
+        description="Demo skill",
+        blueprint_summary="Summarize data.",
+        references=["references/guide.md"],
+        assets=["assets/logo.png"],
+        script_runtime_specs=[{
+            "script_path": "scripts/main.py",
+            "runtime": "python",
+            "responsibility": "Summarize the input.",
+            "accepted_sample_argv": {"payload": "{{user_request}}"},
+        }],
+        final_outputs=["text"],
+    )
+
+    assert "```bash\npython scripts/main.py" in content
+    assert "references/guide.md" in content
+    assert "assets/logo.png" in content
+    assert "runtime_contract" not in content
+    assert "required_outputs" not in content
+
+
+def test_required_output_missing_error_and_repair_hint_are_output_focused():
+    import json
+    import pytest
+    from backend.routers.creator import _targeted_generated_file_repair_instructions, _validate_trial_stdout_json
+
+    entry = {"path": "scripts/main.py", "outputs": ["text"], "runtime": "python", "role": "generic_script"}
+    with pytest.raises(ValueError) as excinfo:
+        _validate_trial_stdout_json(stdout=json.dumps({"other": "value"}), content="", args=["{}"], skill_plan_entry=entry)
+
+    error = str(excinfo.value)
+    assert "stdout_required_outputs_missing" in error
+    assert "missing=['text']" in error
+    hint = _targeted_generated_file_repair_instructions(file_path="scripts/main.py", deterministic_error=error)
+    assert "不要改 SKILL.md" in hint
+    assert "对齐 SKILL.md argv keys" not in hint
+
+
+@pytest.mark.asyncio
+async def test_generate_file_rejects_user_upload_assets_before_model_call():
+    import pytest
+    from fastapi import HTTPException
+    from backend.routers.creator import GenerateFileRequest, generate_file
+
+    request = GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="assets/photo.png",
+        purpose="user supplied photo",
+        blueprint_text="",
+        conversation_history=[],
+        skill_plan_entry={"asset_source": "user_upload"},
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await generate_file(request)
+
+    assert excinfo.value.status_code == 400
+    assert "必须上传" in str(excinfo.value.detail)

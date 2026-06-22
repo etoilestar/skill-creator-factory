@@ -159,12 +159,13 @@ export async function* generateFileStream({
 
 
 /**
- * Finalize SKILL.md from verified script runtime specs; this does not call the LLM.
+ * Finalize SKILL.md with the model using verified script runtime specs as bash-block references.
  */
 export async function finalizeSkillMd({
   skillName,
   description = '',
   blueprintText = '',
+  model = null,
   references = [],
   assets = [],
   scriptRuntimeSpecs = [],
@@ -177,6 +178,7 @@ export async function finalizeSkillMd({
       skill_name: skillName,
       description,
       blueprint_text: blueprintBodyOnly(blueprintText),
+      model,
       references,
       assets,
       script_runtime_specs: scriptRuntimeSpecs,
@@ -185,7 +187,11 @@ export async function finalizeSkillMd({
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
-    throw new Error(err.detail || 'SKILL.md 最终生成失败')
+    const detail = err.detail || 'SKILL.md 最终生成失败'
+    const message = typeof detail === 'string' ? detail : (detail.message || JSON.stringify(detail))
+    const error = new Error(message)
+    error.detail = detail
+    throw error
   }
   return resp.json()
 }

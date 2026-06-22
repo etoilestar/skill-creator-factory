@@ -683,6 +683,7 @@ async function generateOneFile(idx) {
         skillName: localSkillName.value,
         description: file.purpose || props.skillName,
         blueprintText: props.blueprintText,
+        model: props.model,
         references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
         assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
         scriptRuntimeSpecs: scriptRuntimeSpecs.value,
@@ -692,7 +693,7 @@ async function generateOneFile(idx) {
       if (!file.generatedContent.trim()) {
         throw new Error('SKILL.md finalizer 未返回任何内容')
       }
-      file.repairMessage = ''
+      file.repairMessage = result.repair_attempts ? `SKILL.md 已完成 ${result.repair_attempts} 轮模型修复并通过校验。` : ''
       file.status = 'preview'
       return
     }
@@ -733,7 +734,10 @@ async function generateOneFile(idx) {
     file.status = 'preview'
   } catch (err) {
     file.status = 'error'
-    file.error = err.message || String(err)
+    const failedChecks = Array.isArray(err?.detail?.failed_checks)
+      ? err.detail.failed_checks.map(item => `${item.id || 'check'}: ${item.message || ''}`).join('\n')
+      : ''
+    file.error = failedChecks || err.message || String(err)
 
     if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
       file.showPreview = true

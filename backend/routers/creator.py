@@ -178,6 +178,7 @@ class SkillMdBlueprintReviewResponse(BaseModel):
 
 class FileSpecOut(BaseModel):
     path: str
+    generation_order: int = 0
     purpose: str
     required: bool
     can_skip: bool
@@ -212,8 +213,50 @@ class FileSpecOut(BaseModel):
     asset_source: str = ""
 
 
+
+
+def _generation_order_for_file(path: str, asset_source: str = "") -> int:
+    normalized = _normalize_skill_path(path)
+    if normalized.startswith("references/"):
+        return 0
+    if normalized.startswith("scripts/"):
+        return 1
+    if normalized.startswith("assets/") and asset_source != "user_upload":
+        return 2
+    if normalized.startswith("assets/") and asset_source == "user_upload":
+        return 3
+    if normalized == "SKILL.md":
+        return 4
+    return 2
+
+
+def _final_outputs_from_plan_entries(entries: list[SkillPlanEntry]) -> list[str]:
+    for entry in entries or []:
+        contract = entry.artifact_contract or {}
+        explicit = contract.get("final_output") or contract.get("final_outputs")
+        if isinstance(explicit, str) and explicit.strip():
+            return [explicit.strip()]
+        if isinstance(explicit, list):
+            values = [str(item).strip() for item in explicit if str(item).strip()]
+            if values:
+                return values
+    final_entries = [entry for entry in entries or [] if bool((entry.artifact_contract or {}).get("final"))]
+    for entry in reversed(final_entries or entries or []):
+        contract = entry.artifact_contract or {}
+        for key in ("stdout_fields", "artifact_fields", "file_fields", "file_outputs"):
+            raw = contract.get(key)
+            if isinstance(raw, list):
+                values = [str(item).strip() for item in raw if str(item).strip()]
+                if values:
+                    return values
+        if entry.outputs:
+            return list(entry.outputs)
+    return []
+
+
 class AssetRequirementOut(BaseModel):
     path: str
+    generation_order: int = 3
     source: str
     required: bool = True
     description: str = ""
@@ -224,6 +267,7 @@ class AnalyzeBlueprintResponse(BaseModel):
     files: list[FileSpecOut]
     warnings: list[Any]
     asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
+    final_outputs: list[str] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -1375,7 +1419,7 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
         produced.update(entry.outputs or [])
         available_values.update(entry.outputs or [])
 
-    final_outputs = set(entries[-1].outputs or []) if entries else set()
+    final_outputs = set(_final_outputs_from_plan_entries(entries))
     for output in sorted(produced - consumed - final_outputs):
         results.append(ContractCheckResult(
             id="skill_md.dataflow.output_consumed_or_final",
@@ -1390,6 +1434,25 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
 
 
 
+
+
+SKILL_MD_FINALIZER_TEMPLATE = {
+    "sections": {
+        "scenario": "# 适用场景",
+        "inputs": "# 用户需要提供什么",
+        "workflow": "# 自动执行流程",
+        "resources": "# references/assets 使用说明",
+        "outputs": "# 最终产物",
+        "notes": "# 注意事项",
+    },
+    "default_input_bullets": [
+        "按命令块中的 JSON argv 提供请求内容、选项和必要输入文件。",
+    ],
+    "asset_input_bullet": "按资源说明准备或上传 assets/ 下的静态素材。",
+    "default_note_bullets": [
+        "不要修改 scripts/ 路径结构；如更换素材，请保持 assets/ 路径与命令参数一致。",
+    ],
+}
 
 def finalize_skill_md_from_runtime_specs(
     *,
@@ -1414,15 +1477,15 @@ def finalize_skill_md_from_runtime_specs(
         f"description: {description or blueprint_summary or safe_name}",
         "---",
         "",
-        "# 适用场景",
+        SKILL_MD_FINALIZER_TEMPLATE["sections"]["scenario"],
         blueprint_summary or description or "用于完成本 Skill 规划的自动化任务。",
         "",
-        "# 用户需要提供什么",
-        "- 按命令块中的 JSON argv 提供请求内容、选项和必要输入文件。",
+        SKILL_MD_FINALIZER_TEMPLATE["sections"]["inputs"],
+        *[f"- {bullet}" for bullet in SKILL_MD_FINALIZER_TEMPLATE["default_input_bullets"]],
     ]
     if assets:
-        lines.append("- 按资源说明准备或上传 assets/ 下的静态素材。")
-    lines.extend(["", "# 自动执行流程"])
+        lines.append(f"- {SKILL_MD_FINALIZER_TEMPLATE['asset_input_bullet']}")
+    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["workflow"]])
     specs = script_runtime_specs or []
     if not specs:
         lines.append("- 按下方说明运行 Skill。")
@@ -1446,19 +1509,21 @@ def finalize_skill_md_from_runtime_specs(
             "```",
             "",
         ])
-    lines.extend(["# references/assets 使用说明"])
+    lines.extend([SKILL_MD_FINALIZER_TEMPLATE["sections"]["resources"]])
     for ref in references or []:
         lines.append(f"- 参考资料：`{ref}`。")
     for asset in assets or []:
         lines.append(f"- 静态/上传素材：`{asset}`。")
     if not (references or assets):
         lines.append("- 本 Skill 不需要额外静态资源。")
-    lines.extend(["", "# 最终产物"])
+    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["outputs"]])
     if final_outputs:
         lines.extend([f"- {item}" for item in final_outputs])
     else:
         lines.append("- 脚本 stdout JSON 会返回可供平台识别的最终结果或文件路径。")
-    lines.extend(["", "# 注意事项", "- 不要修改 scripts/ 路径结构；如更换素材，请保持 assets/ 路径与命令参数一致。", ""])
+    lines.extend(["", SKILL_MD_FINALIZER_TEMPLATE["sections"]["notes"]])
+    lines.extend([f"- {bullet}" for bullet in SKILL_MD_FINALIZER_TEMPLATE["default_note_bullets"]])
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -4453,15 +4518,52 @@ def _contract_resolution_for_trial(file_path: str, skill_md: str, role: str | No
 
 
 
-def _looks_like_file_output_field(key: str, value: str) -> bool:
-    lowered_key = str(key or "").lower()
-    lowered_value = str(value or "").lower()
-    return (
-        lowered_key.endswith("_path")
-        or lowered_key.endswith("_paths")
-        or lowered_key in {"file_outputs", "file_paths", "image_path", "image_paths"}
-        or lowered_value.startswith(("assets/", "outputs/", "references/"))
-    )
+def _artifact_fields_from_contract_dict(contract: dict[str, Any] | None) -> list[str]:
+    fields: list[str] = []
+    contract = contract or {}
+    for key in ("artifact_fields", "file_fields", "stdout_fields", "file_outputs", "output_fields"):
+        raw = contract.get(key)
+        if isinstance(raw, str) and raw.strip():
+            fields.append(raw.strip())
+        elif isinstance(raw, list):
+            fields.extend(str(item).strip() for item in raw if str(item).strip())
+    raw_outputs = contract.get("artifact_outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            if isinstance(item, dict):
+                field = str(item.get("field") or item.get("name") or "").strip()
+                if field:
+                    fields.append(field)
+    return list(dict.fromkeys(fields))
+
+
+def _artifact_fields_from_tool_manifests(entry: SkillPlanEntry) -> list[str]:
+    fields: list[str] = []
+    for capability_name in list(entry.required_capabilities or []) + list(entry.selected_tools if hasattr(entry, "selected_tools") else []):
+        cap = get_tool_capability(str(capability_name))
+        if not cap:
+            continue
+        for output in getattr(cap, "artifact_outputs", []) or []:
+            if isinstance(output, dict):
+                field = str(output.get("field") or output.get("name") or "").strip()
+                if field:
+                    fields.append(field)
+        for fn in getattr(cap, "functions", []) or []:
+            for output in getattr(fn, "artifact_outputs", []) or []:
+                if isinstance(output, dict):
+                    field = str(output.get("field") or output.get("name") or "").strip()
+                    if field:
+                        fields.append(field)
+    return list(dict.fromkeys(fields))
+
+
+def _artifact_fields_for_entry(entry: SkillPlanEntry, canonical_contract: Any | None = None) -> list[str]:
+    fields: list[str] = []
+    fields.extend(_artifact_fields_from_contract_dict(entry.artifact_contract))
+    if canonical_contract is not None:
+        fields.extend(_artifact_fields_from_contract_dict(getattr(canonical_contract, "artifact_contract", {}) or {}))
+    fields.extend(_artifact_fields_from_tool_manifests(entry))
+    return list(dict.fromkeys(field for field in fields if field))
 
 
 def _script_runtime_spec_to_dict(spec: ScriptRuntimeSpec | None) -> dict[str, Any] | None:
@@ -4489,6 +4591,7 @@ def _build_script_runtime_spec_from_trial(
     args: list[str],
     stdout: str,
     skill_dir: Path,
+    canonical_contract: Any | None = None,
 ) -> ScriptRuntimeSpec:
     accepted: dict[str, Any] = {}
     if args:
@@ -4502,15 +4605,14 @@ def _build_script_runtime_spec_from_trial(
     payload = json.loads((stdout or "{}").strip())
     actual_fields = list(payload.keys()) if isinstance(payload, dict) else []
     file_outputs: list[str] = []
-    artifact_fields: list[str] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
+    artifact_fields: list[str] = _artifact_fields_for_entry(entry, canonical_contract)
+    if isinstance(payload, dict) and artifact_fields:
+        for key in artifact_fields:
+            value = payload.get(key)
             values = value if isinstance(value, list) else [value]
             for item in values:
-                if isinstance(item, str) and item.strip() and _looks_like_file_output_field(key, item):
-                    artifact_fields.append(str(key))
+                if isinstance(item, str) and item.strip():
                     file_outputs.append(item.strip())
-                    break
 
     command_template = render_script_command_from_skill_plan(
         entry,
@@ -4648,6 +4750,7 @@ def _trial_run_generated_script(
                 args=args,
                 stdout=proc.stdout,
                 skill_dir=skill_dir,
+                canonical_contract=refined_contract,
             )
 
     return None
@@ -6149,6 +6252,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             if _normalize_skill_path(f.path).startswith("assets") and re.search(r"上传|user[_ -]?upload|素材|图片|image|asset", local_context, re.IGNORECASE) and not re.search(r"无需|不需要|不用|无需创建|不生成", local_context):
                 directory_asset_requirements.append(AssetRequirementOut(
                     path="assets/",
+                    generation_order=_generation_order_for_file("assets/", "user_upload"),
                     source="user_upload",
                     required=getattr(f, "required", True),
                     description=f.purpose or "需要用户上传素材",
@@ -6163,6 +6267,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files_out.append(
             FileSpecOut(
                 path=f.path,
+                generation_order=_generation_order_for_file(f.path, f.asset_source if f.path.startswith("assets/") else ""),
                 purpose=f.purpose,
                 required=f.required,
                 can_skip=f.can_skip,
@@ -6211,6 +6316,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files_out.append(
             FileSpecOut(
                 path=path,
+                generation_order=_generation_order_for_file(path, ""),
                 purpose=(
                     f"用户上传的静态素材：{path}"
                     if is_asset
@@ -6256,6 +6362,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     asset_requirements = [
         AssetRequirementOut(
             path=file_spec.path,
+            generation_order=file_spec.generation_order,
             source=file_spec.asset_source,
             required=file_spec.required,
             description=file_spec.purpose,
@@ -6325,6 +6432,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         files=files_out,
         warnings=warnings,
         asset_requirements=asset_requirements,
+        final_outputs=_final_outputs_from_plan_entries(list(entries_by_path.values())),
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
     )

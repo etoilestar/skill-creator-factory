@@ -1905,3 +1905,49 @@ async def test_generate_file_rejects_user_upload_assets_before_model_call():
 
     assert excinfo.value.status_code == 400
     assert "必须上传" in str(excinfo.value.detail)
+
+
+def test_runtime_spec_artifact_fields_come_from_contract_not_field_name(tmp_path):
+    import json
+    from backend.routers.creator import _build_script_runtime_spec_from_trial
+    from backend.services.skill_plan import SkillPlanEntry
+
+    entry = SkillPlanEntry(
+        path="scripts/main.py",
+        file_type="script",
+        role="generic_script",
+        purpose="build artifact",
+        runtime="python",
+        outputs=["download"],
+        artifact_contract={"artifact_fields": ["download"]},
+    )
+
+    spec = _build_script_runtime_spec_from_trial(
+        file_path="scripts/main.py",
+        entry=entry,
+        args=[json.dumps({"payload": "x"})],
+        stdout=json.dumps({"download": "outputs/report.custom"}),
+        skill_dir=tmp_path,
+    )
+
+    assert spec.artifact_fields == ["download"]
+    assert spec.file_outputs == ["outputs/report.custom"]
+
+
+def test_analyze_blueprint_returns_generation_order_and_final_outputs():
+    from backend.routers.creator import FileSpecOut, _final_outputs_from_plan_entries
+    from backend.services.skill_plan import SkillPlanEntry
+
+    file_out = FileSpecOut(path="SKILL.md", generation_order=4, purpose="doc", required=True, can_skip=False)
+    assert file_out.generation_order == 4
+
+    entry = SkillPlanEntry(
+        path="scripts/final.py",
+        file_type="script",
+        role="generic_script",
+        purpose="final",
+        runtime="python",
+        outputs=["legacy_guess"],
+        artifact_contract={"final_output": ["pdf_path"]},
+    )
+    assert _final_outputs_from_plan_entries([entry]) == ["pdf_path"]

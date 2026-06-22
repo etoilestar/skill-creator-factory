@@ -290,6 +290,7 @@ const props = defineProps({
   model: { type: String, default: null },
   warnings: { type: Array, default: () => [] },
   assetRequirements: { type: Array, default: () => [] },
+  finalOutputs: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -304,6 +305,7 @@ const localFiles = ref(
     ...props.files,
     ...props.assetRequirements.map((requirement, index) => ({
       path: normalizeAssetRequirementPath(requirement, index),
+      generation_order: Number.isFinite(requirement.generation_order) ? requirement.generation_order : 3,
       purpose: requirement.description || '需要用户上传素材',
       required: requirement.required !== false,
       can_skip: requirement.required === false,
@@ -328,7 +330,7 @@ const localFiles = ref(
     })),
   ]
     .filter(f => f.asset_requirement || isMaterializedSkillFilePath(f.path))
-    .sort((a, b) => generationOrder(a) - generationOrder(b) || String(a.path || '').localeCompare(String(b.path || '')))
+    .sort((a, b) => (Number(a.generation_order ?? 99) - Number(b.generation_order ?? 99)) || String(a.path || '').localeCompare(String(b.path || '')))
     .map(f => ({
       ...f,
       role: f.role || (
@@ -449,16 +451,6 @@ function hasFileExtension(path) {
 
   const dotIndex = name.lastIndexOf('.')
   return dotIndex > 0 && dotIndex < name.length - 1
-}
-
-function generationOrder(file) {
-  const path = normalizeSkillPath(file?.path)
-  if (path.startsWith('references/')) return 0
-  if (path.startsWith('scripts/')) return 1
-  if (path.startsWith('assets/') && file?.asset_source !== 'user_upload') return 2
-  if (path.startsWith('assets/') && file?.asset_source === 'user_upload') return 3
-  if (path === 'SKILL.md') return 4
-  return 2
 }
 
 function looksLikeDirectoryPath(path) {
@@ -674,13 +666,6 @@ function upsertRuntimeSpec(spec) {
   else scriptRuntimeSpecs.value.push(spec)
 }
 
-function collectFinalOutputs() {
-  const lastScript = [...localFiles.value].reverse().find(f => normalizeSkillPath(f.path).startsWith('scripts/'))
-  if (Array.isArray(lastScript?.outputs) && lastScript.outputs.length) return lastScript.outputs
-  const lastSpec = scriptRuntimeSpecs.value[scriptRuntimeSpecs.value.length - 1]
-  return Array.isArray(lastSpec?.actual_stdout_fields) ? lastSpec.actual_stdout_fields : []
-}
-
 // ---------------------------------------------------------------------------
 // Per-file generation & writing
 // ---------------------------------------------------------------------------
@@ -701,7 +686,7 @@ async function generateOneFile(idx) {
         references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
         assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
         scriptRuntimeSpecs: scriptRuntimeSpecs.value,
-        finalOutputs: collectFinalOutputs(),
+        finalOutputs: props.finalOutputs,
       })
       file.generatedContent = result.content || ''
       if (!file.generatedContent.trim()) {

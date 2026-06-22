@@ -1378,6 +1378,79 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
     return results
 
 
+
+
+def finalize_skill_md_from_runtime_specs(
+    *,
+    skill_name: str,
+    description: str,
+    blueprint_summary: str = "",
+    references: list[str] | None = None,
+    assets: list[str] | None = None,
+    script_runtime_specs: list[Any] | None = None,
+    final_outputs: list[str] | None = None,
+) -> str:
+    """Build final SKILL.md usage docs from already-validated script specs.
+
+    The generated Markdown intentionally describes how to use the Skill and its
+    scripts. It does not expose runtime_contract, required_outputs, ToolSlot,
+    or implementation_strategy internals.
+    """
+    safe_name = re.sub(r"[^a-z0-9-]", "-", (skill_name or "skill").lower()).strip("-") or "skill"
+    lines = [
+        "---",
+        f"name: {safe_name}",
+        f"description: {description or blueprint_summary or safe_name}",
+        "---",
+        "",
+        "# 适用场景",
+        blueprint_summary or description or "用于完成本 Skill 规划的自动化任务。",
+        "",
+        "# 用户需要提供什么",
+        "- 按命令块中的 JSON argv 提供请求内容、选项和必要输入文件。",
+    ]
+    if assets:
+        lines.append("- 按资源说明准备或上传 assets/ 下的静态素材。")
+    lines.extend(["", "# 自动执行流程"])
+    specs = script_runtime_specs or []
+    if not specs:
+        lines.append("- 按下方说明运行 Skill。")
+    for idx, spec in enumerate(specs, start=1):
+        getter = (lambda key, default="": getattr(spec, key, default) if not isinstance(spec, dict) else spec.get(key, default))
+        script_path = str(getter("script_path", "")).strip()
+        responsibility = str(getter("responsibility", "处理本步骤任务")).strip() or "处理本步骤任务"
+        command = str(getter("command_template", "")).strip()
+        if not command:
+            runtime = str(getter("runtime", "python"))
+            argv = getter("accepted_sample_argv", {}) or {"payload": "{{user_request}}", "fields": {}, "options": {}, "input_files": []}
+            runner = "python" if runtime == "python" else "node" if runtime == "node" else "bash" if runtime in {"bash", "shell"} else ""
+            payload = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+            command = f"{runner + ' ' if runner else ''}{script_path} '{payload}'"
+        lines.extend([
+            f"## 步骤 {idx}: `{script_path}`",
+            responsibility,
+            "",
+            "```bash",
+            command,
+            "```",
+            "",
+        ])
+    lines.extend(["# references/assets 使用说明"])
+    for ref in references or []:
+        lines.append(f"- 参考资料：`{ref}`。")
+    for asset in assets or []:
+        lines.append(f"- 静态/上传素材：`{asset}`。")
+    if not (references or assets):
+        lines.append("- 本 Skill 不需要额外静态资源。")
+    lines.extend(["", "# 最终产物"])
+    if final_outputs:
+        lines.extend([f"- {item}" for item in final_outputs])
+    else:
+        lines.append("- 脚本 stdout JSON 会返回可供平台识别的最终结果或文件路径。")
+    lines.extend(["", "# 注意事项", "- 不要修改 scripts/ 路径结构；如更换素材，请保持 assets/ 路径与命令参数一致。", ""])
+    return "\n".join(lines)
+
+
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Hard format checks for SKILL.md.
 
@@ -2131,9 +2204,10 @@ def _build_script_file_contract_text(
         f"declared_outputs: {', '.join(entry.outputs)}",
         "A. 输出形态:",
         "- 单文件源码，Python 脚本必须通过 ast.parse。",
-        "B. 参数接口:",
-        "- 默认 JSON argv，字段名由 workflow 决定，不强制 SkillPlan inputs。",
-        "- 必须读取 SKILL.md/reference 命令块传入的 keys。",
+        "B. 参数接口（输入宽松）:",
+        "- 脚本必须能读取一个 JSON argv object。",
+        "- 可以宽松兼容 payload / fields / options / input_files / 上游 stdout 字段。",
+        "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
         "- 内部 workflow 字段名可用 payload/context 或上游 stdout 字段。",
         "C. 角色输出合同:",
     ]
@@ -4268,8 +4342,9 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
         if missing:
             raise ValueError(
-                "stdout_contract: 脚本试运行 stdout 缺少 refined canonical stdout_schema.required 非空字段："
-                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+                "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"
+                f" missing={missing!r} actual={list(payload.keys())!r} required={list(required or [])!r} "
+                f"argv={args!r} stdout={stripped[-4000:]}"
             )
     elif skill_plan_entry is not None:
         entry = _skill_plan_entry_for_file(file_path=str((skill_plan_entry or {}).get("path") or "scripts/main.py"), skill_plan_entry=skill_plan_entry)
@@ -4278,8 +4353,9 @@ def _validate_trial_stdout_json(*, stdout: str, content: str, args: list[str], r
         missing = [str(key) for key in required or [] if str(key) not in payload or not _json_value_non_empty(payload.get(str(key)))]
         if missing:
             raise ValueError(
-                "stdout_contract: 脚本试运行 stdout 缺少 canonical stdout_schema.required 非空字段："
-                f"{', '.join(missing)} argv={args!r} stdout={stripped[-4000:]}"
+                "stdout_required_outputs_missing: 当前脚本 stdout 缺少 required_outputs。"
+                f" missing={missing!r} actual={list(payload.keys())!r} required={list(required or [])!r} "
+                f"argv={args!r} stdout={stripped[-4000:]}"
             )
 
     try:
@@ -4735,6 +4811,13 @@ _MISSING_SKILL_REFERENCE_RE = re.compile(
 def _targeted_generated_file_repair_instructions(*, file_path: str, deterministic_error: str) -> str:
     """Return deterministic, actionable instructions for recurring validation failures."""
     error_text = deterministic_error or ""
+
+    if "stdout_required_outputs_missing" in error_text:
+        return (
+            "当前脚本 stdout 缺少 required_outputs。不要改 SKILL.md；不要为了适配所有输入参数重写逻辑。"
+            "只修改当前脚本 run()/main() 的输出组织。必须返回 deterministic error 中 missing 列出的字段，且值非空；"
+            "保留已有核心业务逻辑和宽松 JSON argv 读取，不要新增“对齐 SKILL.md argv keys”的改动。"
+        )
 
     if file_path == "SKILL.md":
         if (

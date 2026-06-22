@@ -327,6 +327,7 @@ const localFiles = ref(
     })),
   ]
     .filter(f => f.asset_requirement || isMaterializedSkillFilePath(f.path))
+    .sort((a, b) => generationOrder(a) - generationOrder(b) || String(a.path || '').localeCompare(String(b.path || '')))
     .map(f => ({
       ...f,
       role: f.role || (
@@ -340,7 +341,8 @@ const localFiles = ref(
                 ? 'generic_script'
                 : null
       ),
-      status: 'pending',
+      status: f.path === 'SKILL.md' ? 'pending' : 'pending',
+      pendingLabel: f.path === 'SKILL.md' ? '待最终生成 / finalize pending' : '',
       generatedContent: '',
       bytesWritten: 0,
       error: '',
@@ -445,6 +447,16 @@ function hasFileExtension(path) {
 
   const dotIndex = name.lastIndexOf('.')
   return dotIndex > 0 && dotIndex < name.length - 1
+}
+
+function generationOrder(file) {
+  const path = normalizeSkillPath(file?.path)
+  if (path.startsWith('references/')) return 0
+  if (path.startsWith('scripts/')) return 1
+  if (path.startsWith('assets/') && file?.asset_source !== 'user_upload') return 2
+  if (path.startsWith('assets/') && file?.asset_source === 'user_upload') return 3
+  if (path === 'SKILL.md') return 4
+  return 2
 }
 
 function looksLikeDirectoryPath(path) {

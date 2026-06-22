@@ -1393,7 +1393,7 @@ python scripts/second.py '{"missing_value":"{{missing_value}}"}'
     assert "command_block.skillplan_inputs.exact" not in failed
 
 
-def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
+def test_render_script_command_from_skill_plan_uses_runtime_contract_before_inputs():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_skill_plan, command_payload_placeholders
 
     entry = SkillPlanEntry(
@@ -1410,9 +1410,24 @@ def test_render_script_command_from_skill_plan_uses_only_entry_inputs():
 
     assert command.startswith("python scripts/run.py")
     assert command_payload_placeholders(command, "scripts/run.py") == {
-        "free_name": "free_name",
-        "another_name": "another_name",
+        "payload": "user_request",
+        "fields": "",
+        "options": "",
+        "input_files": "",
     }
+
+    entry_with_args = SkillPlanEntry(
+        path="scripts/run.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+        inputs=["free_name"],
+        outputs=["result_name"],
+        runtime_contract={"command_args": {"accepted": "{{accepted}}"}},
+    )
+    command = render_script_command_from_skill_plan(entry_with_args)
+    assert command_payload_placeholders(command, "scripts/run.py") == {"accepted": "accepted"}
 
 
 def test_skill_md_markdown_execution_guide_uses_external_envelope_example():

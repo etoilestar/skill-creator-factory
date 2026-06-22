@@ -4843,7 +4843,7 @@ async def _repair_generated_file_with_feedback(
         "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
     }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
     output_contract = (
-        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Align JSON argv keys with the existing SKILL.md command placeholders; do not change the blueprint or SKILL.md. {runtime_rule}"
+        f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
         if is_script
         else "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
     )
@@ -4861,7 +4861,7 @@ async def _repair_generated_file_with_feedback(
             include_snippets=True,
         ) if plan_entry is not None else ""
         extra_rules = (
-            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv，并且 JSON argv keys 匹配现有 SKILL.md 命令占位符；"
+            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv；输入解析应宽松兼容 payload / fields / options / input_files / 上游 stdout 字段；"
             "修复只能基于当前确定性验证错误、当前脚本合同与必要 Tool Snippet；"
             "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
             "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
@@ -4931,7 +4931,7 @@ async def _repair_generated_file_with_feedback(
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
             + ("\n- minimal_edit：只做最小编辑；strict_contract_rewrite：上一轮仍未通过同一 contract，必须重写目标小节但保留已通过项。")
-            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, align JSON argv keys with SkillPlan inputs." if is_script else "")
+            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, keep JSON argv parsing broad and preserve required stdout outputs." if is_script else "")
             + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是当前 runtime 的源码字符，全文不得出现 ``` 或 ~~~。" if is_script and repair_mode == "strict_contract_rewrite" else "")
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),

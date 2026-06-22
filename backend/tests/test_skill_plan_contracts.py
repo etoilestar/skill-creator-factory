@@ -1951,3 +1951,15 @@ def test_analyze_blueprint_returns_generation_order_and_final_outputs():
         artifact_contract={"final_output": ["pdf_path"]},
     )
     assert _final_outputs_from_plan_entries([entry]) == ["pdf_path"]
+
+
+def test_repair_prompt_does_not_request_argv_key_alignment():
+    import inspect
+    from backend.routers.creator import _repair_generated_file_with_feedback
+
+    source = inspect.getsource(_repair_generated_file_with_feedback)
+
+    assert "Align JSON argv keys with the existing SKILL.md command placeholders" not in source
+    assert "JSON argv keys 匹配现有 SKILL.md 命令占位符" not in source
+    assert "align JSON argv keys with SkillPlan inputs" not in source
+    assert "keep JSON argv parsing broad" in source

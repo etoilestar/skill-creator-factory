@@ -9,7 +9,6 @@ Python source with AST evidence rather than business field names.
 from __future__ import annotations
 
 import ast
-import json
 import logging
 import math
 import sys
@@ -676,23 +675,27 @@ def validate_script_functional_evidence(
             "forbidden_scope": "不得改 SKILL.md、其它脚本或 SkillPlan；不得输出空模板/假数据。",
         })
 
-    argv_values = [
-        value.strip()
-        for value in _flatten_strings(argv_payload)
-        if isinstance(value, str) and value.strip()
-    ]
-    stdout_text = json_dumps_safe(stdout_payload)
-    if argv_values and not any(value in stdout_text for value in argv_values):
-        issues.append({
-            "id": "script_functional.input_used_in_output",
-            "failed_file": contract.file_path,
-            "failed_function": "business processing/output assembly",
-            "code_region": "input parsing through stdout/artifact generation path",
-            "reason": "试运行 stdout/产物证据没有体现输入值，脚本可能未真实使用 argv JSON。",
-            "minimal_edit": "只修改当前脚本处理逻辑，让输出或生成产物真实依赖 argv JSON 中的输入值。",
-            "allowed_scope": contract.file_path,
-            "forbidden_scope": "不得用固定模板、占位内容或 try/except 假成功替代真实处理。",
-        })
+    for argv_key, argv_value in argv_payload.items():
+        if not isinstance(argv_value, list) or not argv_value:
+            continue
+        matching_outputs = [
+            (out_key, out_value)
+            for out_key, out_value in stdout_payload.items()
+            if isinstance(out_value, list)
+        ]
+        if not matching_outputs:
+            continue
+        if not any(len(out_value) == len(argv_value) for _out_key, out_value in matching_outputs):
+            issues.append({
+                "id": "script_functional.list_cardinality",
+                "failed_file": contract.file_path,
+                "failed_function": "batch/map processing",
+                "code_region": "for/foreach loop and result collection",
+                "reason": f"argv 字段 {argv_key!r} 是长度 {len(argv_value)} 的 list，但 stdout 中 list 输出没有保持相同长度，脚本可能只处理了部分元素或返回固定假列表。",
+                "minimal_edit": "只修改当前脚本的循环/收集逻辑，确保对输入 list 逐项处理，并输出等长结果列表。",
+                "allowed_scope": contract.file_path,
+                "forbidden_scope": "不得硬编码固定输出长度；不得改 SKILL.md、其它脚本或 SkillPlan。",
+            })
 
     if _contract_declares_artifact(contract):
         artifact_fields = _artifact_field_names(contract.artifact_contract)
@@ -722,29 +725,6 @@ def _json_value_non_empty(value: Any) -> bool:
     if isinstance(value, dict):
         return any(_json_value_non_empty(item) for item in value.values())
     return True
-
-
-def _flatten_strings(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        out: list[str] = []
-        for item in value.values():
-            out.extend(_flatten_strings(item))
-        return out
-    if isinstance(value, (list, tuple, set)):
-        out: list[str] = []
-        for item in value:
-            out.extend(_flatten_strings(item))
-        return out
-    return []
-
-
-def json_dumps_safe(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        return str(value)
 
 
 def _artifact_field_names(contract: dict[str, Any]) -> list[str]:

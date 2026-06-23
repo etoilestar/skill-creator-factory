@@ -75,10 +75,7 @@ from .sop_planner import (
 )
 from .action_schema import _build_runtime_action_schema
 from .runtime_planner import _run_skill_runtime_planner_round, _run_supplementary_plan_round
-from .final_answer import (
-    _generate_final_answer_from_observation,
-    _run_block_planner_round,
-)
+from .final_answer import _generate_final_answer_from_observation
 from .workflow_detection import (
     _execution_requires_run_command_observation,
     _has_successful_run_command_observation,
@@ -102,10 +99,59 @@ from .error_correction import (
     _get_llm_error_correction,
     _apply_error_correction,
 )
+from ...services.creator_tool_registry import (
+    list_tool_capabilities,
+    snippets_for_tool,
+    format_tool_snippet,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _compose_platform_tools_prompt() -> str:
+    """动态查询平台工具注册表，使用与 Creator 相同的 [Tool Snippet] 格式生成工具能力描述。"""
+    capabilities = list_tool_capabilities()
+
+    snippet_texts = []
+    for cap in capabilities:
+        if not cap.enabled_by_default:
+            continue
+        for snippet in snippets_for_tool(cap):
+            snippet_texts.append(format_tool_snippet(cap, snippet))
+
+    snippets_block = "\n\n---\n\n".join(snippet_texts) if snippet_texts else "（暂无已启用工具）"
+
+    return (
+        "## 平台内置工具能力\n\n"
+        "除了 SKILL.md 中声明的脚本外，你可以使用以下平台内置工具能力。"
+        "当 SKILL.md 中的脚本缺少依赖、或需要补充功能时，应主动调用这些工具完成任务。\n\n"
+        "在调用任何工具前必须优先参考以下 Snippet，不要根据函数名猜参数，不要根据直觉猜返回值；"
+        "如果 snippet 和自己的猜测冲突，以 snippet 为准；"
+        "helper 返回标准 stdout dict 时，直接 return result 或 {**result, ...}：\n\n"
+        "当前可用工具 Snippets：\n\n"
+        f"{snippets_block}\n\n"
+        "### 工具调用方式\n\n"
+        "1. **在生成的 Python 脚本中调用**（通过 run_command 执行）：\n"
+        "   按上方 Snippet 的 Correct usage 示例编写脚本，用 `python scripts/xxx.py` 或 heredoc 方式执行。\n\n"
+        "2. **生成临时 Python 脚本**（heredoc 语法）：\n"
+        "   ```bash\n"
+        "   python - <<'PY'\n"
+        "   from backend.services.skill_runtime import query_database_readonly\n"
+        '   result = query_database_readonly("SELECT 1")\n'
+        "   print(result)\n"
+        "   PY\n"
+        "   ```\n\n"
+        "3. **写入文件**（当 skill 脚本依赖的配置文件不存在时）：\n"
+        "   在 fenced code block 前写 `写入文件：<path>`，文件内容放在紧随其后的 fenced code block 内。\n\n"
+        "### 使用原则\n\n"
+        "1. 优先使用 SKILL.md 中声明的脚本和命令\n"
+        "2. 当脚本依赖缺失（如配置文件不存在）时，主动使用 write_file 创建缺失的依赖\n"
+        "3. 当 skill 没有所需工具时，使用平台内置工具或生成临时脚本\n"
+        "4. 数据库连接信息等配置应从用户对话中获取，不要编造\n"
+        "5. 当工具执行失败时，如实告知用户失败原因，不要编造结果\n"
+    )
 
 
 def _step_skipped(step: StepName, reason: str) -> str:
@@ -1307,6 +1353,12 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 {
                     "role": "system",
                     "content": body_prompt,
+                }
+            )
+            final_messages.append(
+                {
+                    "role": "system",
+                    "content": _compose_platform_tools_prompt(),
                 }
             )
 

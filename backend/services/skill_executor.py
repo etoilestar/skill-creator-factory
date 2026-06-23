@@ -386,6 +386,11 @@ def build_skill_runtime_env(
     if session_input_dir is not None:
         env["INPUT_SESSION_DIR"] = str(session_input_dir)
 
+    # 沙盒流程不应继承进程级 SKILL_TRIAL_RUN，显式设置为 "0"。
+    # Creator 流程的试运行会在调用点单独覆盖为 "1"（见 creator.py 中
+    # env={..., "SKILL_TRIAL_RUN": "1"} 的调用点）。
+    env["SKILL_TRIAL_RUN"] = "0"
+
     return env
 
 

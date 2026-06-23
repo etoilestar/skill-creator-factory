@@ -198,14 +198,30 @@
               <!-- 左侧：对话主区（toolbar + messages + input） -->
               <div class="chat-main">
               <!-- 对话面板顶部工具栏 -->
-              <div class="chat-toolbar">
-                <span class="chat-toolbar-title">技能对话测试</span>
+              <div class="chat-toolbar" :class="{ 'refine-mode': chatMode === 'refine' }">
+                <span class="chat-toolbar-title">
+                  {{ chatMode === 'refine' ? '🔧 修改模式' : '技能对话测试' }}
+                </span>
                 <div class="chat-toolbar-actions">
                   <button class="btn-text" @click="clearChat" :disabled="streaming || chatMessages.length === 0">清空对话</button>
                   <button class="btn-text" @click="resetChat" :disabled="streaming">重置会话</button>
                   <button class="btn-text" @click="exportChat" :disabled="chatMessages.length === 0">导出对话</button>
                 </div>
                 <div class="chat-toolbar-right">
+                  <button
+                    v-if="chatMode === 'refine'"
+                    class="btn-ghost btn-sm"
+                    @click="switchToSandboxMode"
+                    :disabled="streaming"
+                    title="返回测试模式"
+                  >◀ 返回测试</button>
+                  <button
+                    v-else
+                    class="btn-ghost btn-sm"
+                    @click="switchToRefineMode"
+                    :disabled="streaming || chatMessages.length === 0"
+                    title="根据测试反馈修改技能并保存新版本"
+                  >🔧 修改技能</button>
                   <button
                     class="btn-ghost btn-sm"
                     :class="{ active: showThoughts }"
@@ -253,8 +269,13 @@
                 </div>
 
                 <template v-for="(msg, i) in chatMessages" :key="i">
+                  <!-- 模式切换系统消息 -->
+                  <div v-if="msg.role === 'system' && msg.isModeSwitch" class="action-card isModeSwitch">
+                    <span class="action-icon">🔧</span>
+                    <span class="action-msg">{{ msg.content }}</span>
+                  </div>
                   <!-- 脚本执行结果卡片 -->
-                  <div v-if="msg.role === 'system'" class="action-card" :class="msg.success ? 'ok' : 'fail'">
+                  <div v-else-if="msg.role === 'system'" class="action-card" :class="msg.success ? 'ok' : 'fail'">
                     <span class="action-icon">{{ msg.success ? '✅' : '❌' }}</span>
                     <span class="action-label">{{ actionLabel(msg.action) }}</span>
                     <span class="action-name">{{ msg.name }}</span>
@@ -358,10 +379,12 @@
                   <textarea
                     v-model="chatInput"
                     rows="4"
-                    placeholder="向已加载的 Skill 发送测试消息…（Ctrl+Enter 发送 / Enter 换行）"
+                    :placeholder="chatMode === 'refine'
+                      ? '描述你想如何修改这个技能…（Ctrl+Enter 发送 / Enter 换行）'
+                      : '向已加载的 Skill 发送测试消息…（Ctrl+Enter 发送 / Enter 换行）'"
                     @keydown.ctrl.enter.prevent="sendChat"
                     @keydown.escape="chatInput = ''"
-                    :disabled="streaming || !selected.can_execute"
+                    :disabled="streaming || (chatMode === 'sandbox' && !selected.can_execute)"
                   />
                   <div class="chat-actions">
                     <input ref="chatFileInputEl" type="file" multiple style="display:none;" @change="onChatFileSelected" />
@@ -554,6 +577,7 @@ const skills = ref([])
 const selected = ref(null)
 const listCollapsed = ref(false)
 const loading = ref(true)
+const chatMode = ref('sandbox')  // 'sandbox' | 'refine'
 const editing = ref(false)
 const editName = ref('')
 const editContent = ref('')
@@ -857,7 +881,7 @@ async function sendChat() {
   if (!text) { showToast('请输入消息内容', 'error'); return }
   if (streaming.value) { showToast('正在生成中，请等待', 'error'); return }
   if (!selected.value) { showToast('请先选择一个技能', 'error'); return }
-  if (!selected.value.can_execute) {
+  if (chatMode.value === 'sandbox' && !selected.value.can_execute) {
     showToast(`技能状态为 ${selected.value.status}，不可执行`, 'error')
     return
   }
@@ -888,15 +912,30 @@ async function sendChat() {
   abortController.value = controller
 
   try {
-    const url = `/api/chat/sandbox/${encodeURIComponent(selected.value.name)}`
-    const body = {
-      messages: chatMessages.value
-        .filter((m) => m.role !== 'system')
-        .map((m) => ({ role: m.role, content: m.content })),
-      execution_mode: 'execute',
-      sandbox_session_id: sessionId.value,
+    let url, body
+
+    if (chatMode.value === 'refine') {
+      // 修改模式：发送到 refine 端点
+      url = `/api/skills/${encodeURIComponent(selected.value.name)}/refine`
+      body = {
+        messages: chatMessages.value
+          .filter((m) => m.role !== 'system')
+          .map((m) => ({ role: m.role, content: m.content })),
+        modification_request: text,
+        sandbox_session_id: sessionId.value,
+      }
+    } else {
+      // 测试模式：发送到 sandbox 端点
+      url = `/api/chat/sandbox/${encodeURIComponent(selected.value.name)}`
+      body = {
+        messages: chatMessages.value
+          .filter((m) => m.role !== 'system')
+          .map((m) => ({ role: m.role, content: m.content })),
+        execution_mode: 'execute',
+        sandbox_session_id: sessionId.value,
+      }
+      if (fileSnapshot.length) body.input_files = fileSnapshot
     }
-    if (fileSnapshot.length) body.input_files = fileSnapshot
 
     for await (const chunk of streamChat(url, body, { signal: controller.signal })) {
       if (controller.signal.aborted) break
@@ -906,6 +945,16 @@ async function sendChat() {
         await scrollChatBottom()
       } else if (chunk.type === 'status') {
         currentStatus.value = chunk.data
+      } else if (chunk.type === 'refine_result') {
+        // 修改完成：刷新技能数据，切回测试模式
+        const result = chunk.data
+        showToast(`技能已更新至 v${result.new_version}`, 'info')
+        await select(selected.value.name)
+        chatMode.value = 'sandbox'
+        // 延迟重置会话，让用户看到修改结果
+        setTimeout(() => {
+          resetChat()
+        }, 1500)
       } else if (chunk.type === 'action_result') {
         const r = chunk.data
         chatMessages.value.push({
@@ -988,6 +1037,21 @@ async function sendChat() {
     abortController.value = null
     await scrollChatBottom()
   }
+}
+
+// 模式切换
+function switchToRefineMode() {
+  chatMode.value = 'refine'
+  chatMessages.value.push({
+    role: 'system',
+    content: '已进入技能修改模式。请描述你希望如何修改这个技能，系统将根据你的测试反馈修改 SKILL.md 并保存为新版本。',
+    isModeSwitch: true,
+  })
+  scrollChatBottom()
+}
+
+function switchToSandboxMode() {
+  chatMode.value = 'sandbox'
 }
 
 // P4: 消息操作
@@ -1747,8 +1811,14 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid #2A2F3A;
   flex-shrink: 0;
   background: #1A1E28;
+  transition: background 0.2s, border-color 0.2s;
+}
+.chat-toolbar.refine-mode {
+  background: #1E1A14;
+  border-bottom-color: #4A3D10;
 }
 .chat-toolbar-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
+.chat-toolbar.refine-mode .chat-toolbar-title { color: #E8A830; }
 .chat-toolbar-actions { display: flex; gap: 4px; flex: 1; }
 .chat-toolbar-right { display: flex; gap: 6px; }
 
@@ -1843,6 +1913,8 @@ onBeforeUnmount(() => {
 }
 .action-card.ok { background: #0F2A1A; border-color: #1A4A2A; color: #6EE7A0; }
 .action-card.fail { background: #2A0F0F; border-color: #4A1A1A; color: #FCA5A5; }
+/* 模式切换系统消息 */
+.action-card.isModeSwitch { background: #1E1A14; border-color: #4A3D10; color: #E8A830; }
 .action-icon { font-size: 13px; }
 .action-label { font-weight: 600; }
 .action-name { font-family: monospace; background: rgba(255,255,255,0.07); padding: 1px 6px; border-radius: 4px; }

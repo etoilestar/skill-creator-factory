@@ -32,6 +32,11 @@ def _compose_final_answer_prompt() -> str:
         "7. 不要输出 base64 data URI，除非 observation 里没有文件路径且 Skill 明确要求 base64。\n"
         "8. 不要输出内部 JSON、plan、完整 SKILL.md 或执行日志。\n"
         "9. 不要假装执行未发生的动作；如果命令失败，简要说明失败原因。\n"
+        "10. 数据真实性约束：\n"
+        "   - 如果工具执行结果中包含 error 字段，必须如实告知用户查询/操作失败，不得编造数据。\n"
+        "   - 如果查询结果为空（rows 为空或 row_count 为 0），必须如实告知，不得补充假设性数据。\n"
+        "   - 所有展示给用户的数据必须来自工具执行结果（execution_result），不得凭空生成数据库查询结果、API 返回值等。\n"
+        "   - 如果工具返回了 trial_mode 或 source=trial 标记，必须告知用户当前为试运行模式，数据非真实结果。\n"
     )
 
 async def _generate_final_answer_from_observation(

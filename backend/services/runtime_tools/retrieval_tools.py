@@ -109,16 +109,19 @@ def _database_url() -> str:
 
 def _validate_sql(sql: str) -> str:
     statement = str(sql or "").strip().rstrip(";")
-    if not re.match(r"^(select|with)\b", statement, re.I):
-        raise ValueError("Only SELECT/WITH readonly statements are allowed")
+    if not re.match(r"^(select|with|show|describe|explain)\b", statement, re.I):
+        raise ValueError("Only readonly statements are allowed (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)")
     if ";" in statement or _FORBIDDEN_SQL.search(statement):
-        raise ValueError("Only a single readonly SELECT/WITH statement is allowed")
+        raise ValueError("Only a single readonly statement is allowed")
     return statement
 
 
 def _limited_sql(sql: str, limit: int) -> str:
     limit = max(1, min(int(limit or 100), 1000))
     if re.search(r"\blimit\s+\d+\b", sql, re.I):
+        return sql
+    # SHOW/DESCRIBE/EXPLAIN are metadata queries that don't support LIMIT
+    if re.match(r"^(show|describe|explain)\b", sql, re.I):
         return sql
     return f"{sql} LIMIT {limit}"
 
@@ -131,7 +134,10 @@ def query_database_readonly(sql: str, params: dict | None = None, limit: int = 1
         return {"columns": ["id", "name"], "rows": [{"id": 1, "name": "mock"}], "row_count": 1, "truncated": False}
     url = _database_url()
     if not url:
-        raise RuntimeError("DATABASE_URL or DB_* environment variables are not set")
+        return {
+            "columns": [], "rows": [], "row_count": 0, "truncated": False,
+            "error": "DATABASE_URL or DB_* environment variables are not set. 无法连接数据库，请配置数据库连接信息。",
+        }
     try:
         if url.startswith("sqlite:///"):
             db_path = url.removeprefix("sqlite:///")
@@ -150,7 +156,10 @@ def query_database_readonly(sql: str, params: dict | None = None, limit: int = 1
             columns = list(result.keys())
         return {"columns": columns, "rows": [dict(row._mapping) for row in rows[:limit]], "row_count": min(len(rows), limit), "truncated": len(rows) > limit}
     except Exception as exc:
-        raise RuntimeError("readonly database query failed") from exc
+        return {
+            "columns": [], "rows": [], "row_count": 0, "truncated": False,
+            "error": f"数据库查询失败: {exc}",
+        }
 
 
 def list_database_tables() -> dict[str, Any]:

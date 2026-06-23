@@ -451,6 +451,8 @@ def _validate_referenced_assets_in_texts(texts: list[tuple[str, str]], *, execut
             rel_path = match.group("path")
             if not rel_path.startswith("assets/") or rel_path in seen:
                 continue
+            if rel_path.endswith("/"):
+                continue
             seen.add(rel_path)
             try:
                 _validate_runtime_asset_contract((root / rel_path).resolve(), root=root)

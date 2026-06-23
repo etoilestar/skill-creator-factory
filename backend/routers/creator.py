@@ -2199,8 +2199,16 @@ def _build_script_file_contract_text(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry)
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
     recommended_command = _script_command_template(file_path, blueprint_text, entry)
+
+    declared_stdout_fields = [str(item).strip() for item in (entry.outputs or []) if str(item).strip()]
+    declared_stdout_text = ", ".join(declared_stdout_fields) if declared_stdout_fields else "无显式声明"
 
     lines = [
         f"脚本合同：{file_path}",
@@ -2210,50 +2218,98 @@ def _build_script_file_contract_text(
         f"entrypoint: {entry.entrypoint or file_path}",
         f"recommended_command_template: {recommended_command}",
         f"suggested_inputs: {', '.join(entry.inputs or ['payload'])}",
-        f"declared_outputs: {', '.join(entry.outputs)}",
+        f"declared_stdout_fields: {declared_stdout_text}",
+        "",
         "A. 输出形态:",
         "- 单文件源码，Python 脚本必须通过 ast.parse。",
+        "- 最终只能输出当前脚本源码本身，不要 Markdown fence、文件标题、写入文件标签或多文件包。",
+        "",
         "B. 参数接口（输入宽松）:",
         "- 脚本必须能读取一个 JSON argv object。",
-        "- 可以宽松兼容 payload / fields / options / input_files / 上游 stdout 字段。",
+        "- 可以宽松兼容 payload / user_request / input / text / fields / options / input_files / files / 上游 stdout 字段。",
         "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
-        "- 内部 workflow 字段名可用 payload/context 或上游 stdout 字段。",
-        "C. 角色输出合同:",
+        "- 但是，脚本不得用与任务无关的默认 prompt、固定示例值、固定模板或常量结果替代核心业务输入。",
+        "- 如果核心输入缺失，可以从 payload/user_request/input/text/fields/options/input_files 或上游 stdout 中选择最合理来源；不要静默退回到无关任务。",
+        "",
+        "C. stdout 字段语义:",
+        "- declared_stdout_fields 只表示 stdout JSON 中应出现的业务字段，不等于文件路径字段。",
+        "- 普通 stdout 字段只做 JSON required/non-empty/type 校验，并由内容职责审查判断是否真正完成业务职责。",
+        "- 只有 artifact_fields、file_fields、file_outputs、artifact_outputs，或字段名本身具有 artifact/path/file 语义时，才按文件产物路径检查。",
+        "- 不要把普通业务字段的字符串值或字符串列表当成文件路径。",
+        "",
+        "D. 输出来源 / provenance:",
+        "- declared_stdout_fields 中的核心业务字段必须由 argv JSON、上游 stdout、reference 内容、uploaded assets、工具结果、模型结果或确定性计算推导出来。",
+        "- 不得为了满足 required_outputs 返回固定示例值、固定模板、无关默认值或与输入无关的常量。",
+        "- 如果使用 generate_text_with_llm、图像 helper、文档 helper 或其它工具，工具返回结果必须参与核心 declared_stdout_fields 的构造。",
+        "- 如果 declared_stdout_fields 包含多个结构化业务字段，优先让写作模型返回严格 JSON object，再解析为 stdout JSON；不要只把模型结果放到 text 字段，再硬编码其它字段。",
+        "- 如果只需要自由文本输出，可以返回 text/markdown 等文本字段；如果需要结构化字段，应让模型或确定性逻辑直接产生这些字段。",
+        "- 只有 SkillPlan 或输入明确声明为 constant/default/config 的字段，才允许固定值。",
+        "",
+        "E. 角色输出合同:",
     ]
 
     if entry.role == "text_generator":
-        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 text_generation helper，但不强制实现方式。")
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 如果 declared_stdout_fields 多于一个普通业务字段，应优先使用结构化生成模式：让文本模型返回 JSON object，并将解析结果作为 stdout。",
+            "- 可以调用 text_generation helper，但 helper 结果必须参与核心 stdout 字段构造；不得把 helper 调用当作装饰后再用固定值补其它字段。",
+        ])
     elif entry.role == "image_generator":
-        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定；可优先调用 generate_stable_diffusion_image helper，但不强制实现方式。")
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 可优先调用 generate_stable_diffusion_image helper，但不强制具体实现方式。",
+            "- 如果输出图片路径，必须返回具有 artifact/path 语义的平台字段，例如 image_path 或 image_paths，且真实文件存在性由试运行/E2E 校验。",
+            "- 如果还输出普通业务字段，这些字段仍然是 stdout data fields，不自动当作文件路径。",
+        ])
     elif entry.role == "pdf_builder":
-        lines.append(
-            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。"
-            "工具/helper 如何组合不作为第一轮 hard gate；最终以运行、stdout 合同和 artifact 真实存在为准。"
-        )
+        lines.extend([
+            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。",
+            "- 推荐使用 pdf_path 或 file_paths/file_outputs 等具有 artifact/path 语义的字段。",
+            "- 工具/helper 如何组合不作为第一轮 hard gate；最终以运行、stdout 合同和 artifact 真实存在为准。",
+            "- PDF 内容必须来自输入、上游 stdout、reference/assets、工具结果或确定性组装；不得生成空壳 PDF 或无关固定模板。",
+        ])
+    elif entry.role in {"docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
+        lines.extend([
+            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。",
+            "- 推荐使用 docx_path、pptx_path、html_path、file_paths 或 file_outputs 等具有 artifact/path 语义的字段。",
+            "- 文件内容必须来自输入、上游 stdout、reference/assets、工具结果或确定性组装；不得生成空壳文件或无关固定模板。",
+        ])
     else:
-        lines.append("- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。")
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 如果 stdout 字段是普通业务数据，不要把它写成文件路径；如果 stdout 字段是文件产物路径，字段名应具备 artifact/path/file 语义。",
+        ])
 
     try:
         workflow_commands = _extract_e2e_workflow_commands(Path("."), blueprint_text or "")
         script_commands = [cmd for cmd in workflow_commands if cmd.script_path == file_path]
-        is_last_workflow_step = bool(script_commands and workflow_commands and script_commands[-1].ordinal == workflow_commands[-1].ordinal)
+        is_last_workflow_step = bool(
+            script_commands
+            and workflow_commands
+            and script_commands[-1].ordinal == workflow_commands[-1].ordinal
+        )
     except Exception:
         is_last_workflow_step = False
 
     if is_last_workflow_step:
-        lines.append(
-            "- 这是 SKILL.md workflow 的最后一步：stdout JSON 必须至少包含一个 sandbox 平台最终字段："
-            "text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。"
-        )
-        lines.append(
-            "- 可以同时保留业务内部字段，例如 {\"time_output\": \"12:00:00\", \"text\": \"当前时间：12:00:00\"}；"
-            "中间步骤不强制平台字段，只要下一步 placeholder 可解析。"
-        )
+        lines.extend([
+            "",
+            "F. 最后一步平台输出合同:",
+            "- 这是 SKILL.md workflow 的最后一步：stdout JSON 必须至少包含一个 sandbox 平台最终字段：",
+            "  text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。",
+            "- 可以同时保留业务内部字段，例如 {\"time_output\": \"12:00:00\", \"text\": \"当前时间：12:00:00\"}。",
+            "- 中间步骤不强制平台最终字段，只要下一步 placeholder 可解析。",
+            "- 平台最终字段只用于最终展示/下载；普通业务字段仍然不自动成为文件路径。",
+        ])
 
-    lines.append("D. 第一轮验收边界:")
-    lines.append("- 第一轮只验协议 + 运行 + 产物：argv JSON、入口、运行成功、stdout JSON object、required outputs、真实 artifact、import/dependency 和危险系统操作。")
-    lines.append("- 工具/helper 如何组合、required/optional/allowed_capabilities、placeholder/mock/template 关键词不作为第一轮 hard gate。")
-    lines.append("- 不要通过 print {'error':...}、{}、空路径等绕过运行和产物校验。")
+    lines.extend([
+        "",
+        "G. 第一轮验收边界:",
+        "- 第一轮 deterministic 校验只验协议 + 运行 + 产物：argv JSON、入口、运行成功、stdout JSON object、required outputs、真实 artifact、import/dependency 和危险系统操作。",
+        "- 工具/helper 如何组合、required/optional/allowed_capabilities、placeholder/mock/template 关键词不作为第一轮源码正则 hard gate。",
+        "- 但内容职责审查模型可以 hard veto：如果脚本只凑字段、返回固定示例值、没有使用核心输入、模型/工具结果没有参与核心输出构造，则视为当前脚本内容职责失败。",
+        "- 不要通过 print {'error':...}、{}、空路径、空文件、固定模板或 mock 数据绕过运行和产物校验。",
+    ])
 
     return "\n".join(lines)
 
@@ -2319,38 +2375,66 @@ def _reference_metadata_contract_checks(
     content: str,
     purpose: str = "",
 ) -> list[ContractCheckResult]:
-    """Validate references/*.md frontmatter without requiring it.
+    """Validate Creator-generated references/*.md frontmatter.
 
-    references may omit frontmatter. If present, only ordinary document metadata
-    is allowed; Creator internal planning fields must not leak here. Body is not
-    rewritten by metadata repair.
+    references/*.md 是正式 Markdown 参考资料文件，不是轻量片段。
+    Creator 生成的 reference 必须像 SKILL.md 一样有基础 metadata，
+    但 schema 使用 reference 自己的普通文档元数据 schema。
     """
     meta, body, had_frontmatter = parse_frontmatter(content)
-    metadata_errors = validate_reference_frontmatter(meta)
+    metadata_errors = validate_reference_frontmatter(meta) if had_frontmatter else []
     results: list[ContractCheckResult] = []
+
+    missing_required: list[str] = []
+    if not had_frontmatter:
+        missing_required.append("frontmatter")
+    else:
+        for key in ("title", "description"):
+            value = meta.get(key) if isinstance(meta, dict) else None
+            if not isinstance(value, str) or not value.strip():
+                missing_required.append(key)
+
+    passed = had_frontmatter and not metadata_errors and not missing_required
 
     results.append(ContractCheckResult(
         id="reference.metadata.frontmatter_schema",
-        passed=not metadata_errors,
+        passed=passed,
         target=file_path,
         message=(
-            "reference frontmatter schema 合格（或未提供 frontmatter）。"
-            if not metadata_errors
-            else "reference frontmatter 只能包含普通文档元数据。错误：" + "; ".join(metadata_errors)
+            "reference frontmatter schema 合格。"
+            if passed
+            else "reference 必须包含普通文档 frontmatter，且 title/description 必须非空。错误："
+                 + "; ".join([*metadata_errors, *(f"missing {item}" for item in missing_required)])
         ),
-        expected="references/*.md 可无 frontmatter；如有，只允许 title、description、source、license、metadata。",
-        minimal_edit="只修当前 reference md 的 YAML frontmatter；不改正文内容，不改其它文件。",
-        details={"had_frontmatter": had_frontmatter},
+        expected=(
+            "references/*.md 必须以 YAML frontmatter 开头；"
+            "顶层只允许 title、description、source、license、metadata；"
+            "title 和 description 必须非空。"
+        ),
+        minimal_edit=(
+            "只修当前 reference md 的 YAML frontmatter；"
+            "添加非空 title/description；"
+            "删除 role/path/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
+            "required_tool_slots/implementation_strategy/command_template 等 Creator 内部顶层字段；"
+            "如需保留内部信息，只能放到 metadata.creator 下。"
+        ),
+        details={
+            "had_frontmatter": had_frontmatter,
+            "missing_required": missing_required,
+            "metadata_errors": metadata_errors,
+        },
     ))
 
+    body_text = body.strip() if had_frontmatter else (content or "").strip()
     results.append(ContractCheckResult(
         id="reference.metadata.body_exists",
-        passed=bool(body.strip() if had_frontmatter else (content or "").strip()),
+        passed=bool(body_text),
         target=file_path,
-        message=("reference 存在 Markdown 正文。" if (body.strip() if had_frontmatter else (content or "").strip()) else "reference 正文为空。"),
-        expected="reference 作为辅助上下文必须有非空 Markdown 正文，但正文结构不强制固定章节。",
-        minimal_edit="补充非空 reference 正文。",
+        message=("reference 存在 Markdown 正文。" if body_text else "reference 正文为空。"),
+        expected="frontmatter 后必须输出该 reference 的 Markdown 正文。",
+        minimal_edit="补充非空 reference 正文；正文必须是可复用参考资料，不是聊天问题、确认选项或状态说明。",
     ))
+
     return results
 
 def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
@@ -2361,13 +2445,15 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
         if file_path in entry.reference_files or not entry.reference_files:
             script_lines.extend([
-                f"- 本 reference 是 {script_path} 的辅助资料；不要重新定义该脚本的 role/inputs/outputs/capabilities/command_template。",
-                f"- 如果 SKILL.md 已包含 {script_path} 的可执行命令块，本 reference 不要再写命令块。",
-                "- reference 正文可以自由组织，只要提供有用参考信息且不成为第二套 SkillPlan。",
+                f"- 本 reference 可以为 {script_path} 提供内容规范、格式规则、风格要求、质量标准、示例或反例；但不要重新定义该脚本的 role/inputs/outputs/capabilities/command_template。",
+                f"- 如果 SKILL.md 已包含 {script_path} 的可执行命令块，本 reference 不要再写可执行命令块。",
+                "- reference 正文可以提到相关脚本路径、阶段名或模块名，但不能把其它文件完整打包进来。",
             ])
 
     if not script_lines:
-        script_lines.append("- 本 reference 对应一个独立子任务/模块；正文必须非空并提供有用参考信息，但不强制固定章节结构。")
+        script_lines.append(
+            "- 本 reference 对应一个独立子任务/模块；正文必须提供可复用参考资料，而不是聊天回复、确认问题、状态说明或创建计划。"
+        )
 
     metadata_example = yaml.safe_dump(
         {
@@ -2387,27 +2473,37 @@ def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_
 
     return "\n".join([
         f"必须满足以下参考资料文件合同：{file_path}",
-        "A. 输出形态:",
-        "- 只输出该 reference 的 Markdown 文档内容，不要写入文件标签、Creator 流程说明或多文件包。",
-        "- references/*.md 可以没有 YAML frontmatter；如果有 frontmatter，只能包含普通文档元数据。",
-        "- 允许的 frontmatter 顶层字段只有：title、description、source、license、metadata。",
-        "- path/purpose/role/type/scope/loading/when_to_use 等 Creator 内部信息不得作为顶层字段；如需保留，只能放在 metadata.creator 下。",
-        "可选 metadata 示例:",
+        "",
+        "A. YAML frontmatter（硬格式要求）:",
+        "- 文件必须以 YAML frontmatter 开头，和 SKILL.md 一样必须有明确 metadata 区。",
+        "- frontmatter 顶层只允许：title、description、source、license、metadata。",
+        "- title 和 description 必须非空。",
+        "- path/purpose/role/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
+        "required_tool_slots/implementation_strategy/command_template 等 Creator 内部信息不得作为顶层字段；"
+        "如需保留，只能放在 metadata.creator 下。",
+        "metadata 示例:",
         "---",
         metadata_example,
         "---",
         "",
-        "B. 内容职责:",
+        "B. Markdown 正文格式（硬格式要求）:",
+        "- frontmatter 后必须有 Markdown 正文。",
+        "- 正文必须使用 Markdown 文档结构，至少包含一个 # 或 ## 标题。",
+        "- 正文可以包含段落、列表、表格、json/text 示例、质量检查项等。",
+        "- 不要把整个文件包裹在 ```markdown 代码块里；最终输出就是当前 .md 文件内容本身。",
+        "",
+        "C. 内容职责（参考价值要求）:",
         f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
+        "- reference 正文必须是参考资料本身，而不是对用户的澄清问题、确认选项、聊天回复、状态说明或计划询问。",
+        "- 正文必须提供可复用的规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。",
         "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
         "- 正文是辅助参考资料；不要重新定义 SkillPlan 的 role/capability/input/output 合同；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
         "- 不要重新定义 role / inputs / outputs / capabilities / command_template。",
         *script_lines,
-        "- 内容必须是有实际指导价值的参考资料，不是对‘将要生成参考资料’的再描述。",
-        "- 正文必须非空并提供有用参考信息；不要求固定章节、示例、反例、步骤清单或输入输出段落。",
-        "C. 禁止项:",
+        "",
+        "D. 禁止项:",
         "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
-        "- 不要包含其它 SKILL.md/scripts/assets/references 文件的打包内容。",
+        "- 不要包含其它 SKILL.md/scripts/assets/references 文件的完整打包内容。",
         "- 不要包含 placeholder/TODO/待补充等占位文本。",
     ])
 
@@ -2445,13 +2541,15 @@ def _build_generated_file_contract_text(
 
 
 def _check_reference_file_contract(file_path: str, content: str, purpose: str = "") -> list[ContractCheckResult]:
-    """Validate reference markdown as documentation/resource only.
+    """Validate reference markdown as a formal documentation/resource file.
 
-    Reference design:
-    - references/*.md can provide rules, examples, anti-examples and quality checks.
-    - references/*.md must not define executable workflow steps.
-    - references/*.md must not redefine scripts/*.py SkillPlan capabilities.
-    - E2E never executes reference command examples.
+    references/*.md 的第一轮硬校验包含三层：
+    1. metadata/frontmatter schema；
+    2. Markdown 文档格式；
+    3. 正文基本参考价值。
+
+    这里不做脚本接口、stdout、artifact、workflow、E2E 判断。
+    reference 可以在正文中提到 scripts/*.py，但不能变成多文件包或第二套 SkillPlan。
     """
     content = _ensure_reference_metadata_frontmatter(
         file_path=file_path,
@@ -2459,74 +2557,202 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         purpose=purpose,
         skill_plan_entry=None,
     )
-    meta, body = _reference_frontmatter_metadata(content)
-    stripped = body.strip()
+    meta, body, had_frontmatter = parse_frontmatter(content)
+    stripped = (body if had_frontmatter else content or "").strip()
+    full_text = content.strip()
 
     results: list[ContractCheckResult] = []
 
+    # 1. metadata / frontmatter
     results.extend(_reference_metadata_contract_checks(
         file_path=file_path,
         content=content,
         purpose=purpose,
     ))
 
-    declares_runtime_protocol = bool(re.search(r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]", stripped))
+    # 2. raw Markdown shape
+    wrapped_entire_file = bool(re.match(r"^\s*(```|~~~)", full_text)) and bool(re.search(r"(```|~~~)\s*$", full_text))
+    results.append(ContractCheckResult(
+        id="reference.markdown.raw_file_not_fenced",
+        passed=not wrapped_entire_file,
+        target=file_path,
+        message=(
+            "reference 是原始 Markdown 文件内容。"
+            if not wrapped_entire_file
+            else f"{file_path} 被整体包裹在 Markdown fenced code block 中。"
+        ),
+        expected="最终输出应是 references/*.md 文件正文自身，不要外层 ```markdown fence。",
+        minimal_edit="删除最外层 Markdown fence，只保留 frontmatter 和正文。",
+    ))
+
+    fence_markers = re.findall(r"(?m)^\s*(```|~~~)", stripped)
+    balanced_fences = len(fence_markers) % 2 == 0
+    results.append(ContractCheckResult(
+        id="reference.markdown.fences_balanced",
+        passed=balanced_fences,
+        target=file_path,
+        message=(
+            "reference Markdown fence 成对闭合。"
+            if balanced_fences
+            else f"{file_path} 存在未闭合的 Markdown fenced code block。"
+        ),
+        expected="Markdown fenced code block 必须成对闭合。",
+        minimal_edit="补齐或删除未闭合的 ```/~~~ fenced block。",
+    ))
+
+    declares_runtime_protocol = bool(re.search(
+        r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]",
+        stripped,
+    ))
     results.append(ContractCheckResult(
         id="reference.no_runtime_protocol",
         passed=not declares_runtime_protocol,
         target=file_path,
-        message=("reference 未声明运行时协议。" if not declares_runtime_protocol else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"),
+        message=(
+            "reference 未声明运行时协议。"
+            if not declares_runtime_protocol
+            else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"
+        ),
         expected="reference 只提供文档上下文；运行时协议属于 normalized plan / scripts。",
         minimal_edit="删除 runtime_contract、artifact_contract、required_tool_slots、implementation_strategy 或 command_template 等运行时协议字段。",
     ))
 
-    results.extend([
-        ContractCheckResult(
-            id="reference.not_empty",
-            passed=bool(stripped),
-            target=file_path,
-            message=("参考资料正文非空。" if stripped else f"{file_path} 参考资料正文为空。"),
-            expected="frontmatter 后必须输出该 reference 的 Markdown 正文。",
-            minimal_edit="补充有实际指导价值的 Markdown 参考资料正文。",
+    results.append(ContractCheckResult(
+        id="reference.not_empty",
+        passed=bool(stripped),
+        target=file_path,
+        message=("参考资料正文非空。" if stripped else f"{file_path} 参考资料正文为空。"),
+        expected="frontmatter 后必须输出该 reference 的 Markdown 正文。",
+        minimal_edit="补充有实际指导价值的 Markdown 参考资料正文。",
+    ))
+
+    has_heading = bool(re.search(r"(?m)^#{1,6}\s+\S", stripped))
+    results.append(ContractCheckResult(
+        id="reference.markdown_document_heading",
+        passed=has_heading,
+        target=file_path,
+        message=(
+            "reference 正文包含 Markdown 文档标题。"
+            if has_heading
+            else f"{file_path} 正文不像 reference 文档：缺少 Markdown 标题。"
         ),
-        ContractCheckResult(
-            id="reference.no_creator_flow",
-            passed=not bool(_CREATOR_FLOW_LEAK_RE.search(content)),
-            target=file_path,
-            message=(
-                "未包含 Creator 创建流程文案。"
-                if not _CREATOR_FLOW_LEAK_RE.search(content)
-                else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
-            ),
-            expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
-            minimal_edit="删除平台创建流程文案，只保留 metadata 和参考资料正文。",
-        ),
-        ContractCheckResult(
-            id="reference.single_file",
-            passed=not bool(_MULTI_FILE_MARKER_RE.search(content)) and not bool(re.search(r"(?im)^\s*写入文件[:：]", content)),
-            target=file_path,
-            message=(
-                "参考资料是单文件内容。"
-                if not _MULTI_FILE_MARKER_RE.search(content) and not re.search(r"(?im)^\s*写入文件[:：]", content)
-                else f"{file_path} 包含多文件包、其它文件路径标题或写入文件标签。"
-            ),
-            expected="只输出当前 reference 文件内容，不要包含 SKILL.md/scripts/assets/references 的多文件包。",
-            minimal_edit="删除其它文件内容、路径标题和写入文件标签，只保留当前 reference metadata 和正文。",
-        ),
+        expected="reference 正文必须使用 Markdown 文档结构，至少包含一个 #/## 标题。",
+        minimal_edit="把正文改写为真正的参考资料文档，添加标题，并围绕当前 purpose 提供规则、示例、约束或质量标准。",
+    ))
+
+    # 3. minimum reference-value gate
+    compact_body = re.sub(r"\s+", "", stripped)
+    nonempty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    paragraph_count = len([
+        chunk for chunk in re.split(r"\n\s*\n", stripped)
+        if chunk.strip() and not chunk.strip().startswith("#")
     ])
+    has_list = bool(re.search(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+\S", stripped))
+    has_table = bool(re.search(r"(?m)^\s*\|.+\|\s*$", stripped))
+    has_fenced_block = "```" in stripped or "~~~" in stripped
+    has_subheading = bool(re.search(r"(?m)^#{2,6}\s+\S", stripped))
 
-    # references/*.md are auxiliary context, not executable contracts.
-    # Keep validation intentionally light: readable non-empty Markdown plus
-    # safety checks below, but no fixed section/metadata richness requirements.
+    has_reference_value = (
+        has_heading
+        and len(compact_body) >= 160
+        and (
+            has_subheading
+            or has_list
+            or has_table
+            or has_fenced_block
+            or paragraph_count >= 2
+            or len(nonempty_lines) >= 6
+        )
+    )
+    results.append(ContractCheckResult(
+        id="reference.content.has_reference_value",
+        passed=has_reference_value,
+        target=file_path,
+        message=(
+            "reference 正文具备基本参考资料结构和信息量。"
+            if has_reference_value
+            else f"{file_path} 正文信息量或文档结构不足，不应作为 reference 通过。"
+        ),
+        expected=(
+            "reference 必须是可复用参考资料；"
+            "应包含 Markdown 标题，并提供规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。"
+        ),
+        minimal_edit=(
+            "将当前正文改写为真正的参考资料文档；"
+            "不要输出聊天式澄清、确认选项、状态说明或计划询问；"
+            "正文应围绕当前 reference purpose 提供可复用规则、示例、约束或质量标准。"
+        ),
+        details={
+            "body_chars_without_space": len(compact_body),
+            "nonempty_lines": len(nonempty_lines),
+            "paragraph_count": paragraph_count,
+            "has_heading": has_heading,
+            "has_subheading": has_subheading,
+            "has_list": has_list,
+            "has_table": has_table,
+            "has_fenced_block": has_fenced_block,
+        },
+    ))
 
-    # references may mention scripts/** in prose, but should not preserve executable shell blocks.
+    creator_flow_leak = bool(_CREATOR_FLOW_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="reference.no_creator_flow",
+        passed=not creator_flow_leak,
+        target=file_path,
+        message=(
+            "未包含 Creator 创建流程文案。"
+            if not creator_flow_leak
+            else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
+        ),
+        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        minimal_edit="删除平台创建流程文案，只保留 metadata 和参考资料正文。",
+    ))
+
+    # 允许正文提到 scripts/*.py；只禁止真正的多文件打包/写入文件标签。
+    # 注意：这里只扫描 frontmatter 之后的正文 stripped，不能扫描完整 content。
+    # 否则 metadata.creator.path: references/... 会被误判为“写入文件标签”。
+    # 同时不要使用 (?i) 忽略大小写，否则 YAML 小写 path 会命中 Path。
+    has_write_file_label = bool(re.search(
+        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)",
+        stripped,
+    ))
+    has_packaged_file_block = False
+    lines = stripped.splitlines()
+    for idx, line in enumerate(lines):
+        line_text = line.strip()
+        if re.match(
+            r"^(?:#{1,6}\s*)?(?:SKILL\.md|scripts/[^\s]+|references/[^\s]+|assets/[^\s]+)\s*$",
+            line_text,
+        ):
+            following = "\n".join(lines[idx + 1: idx + 4])
+            if "```" in following or "~~~" in following:
+                has_packaged_file_block = True
+                break
+
+    single_file_ok = not has_write_file_label and not has_packaged_file_block
+    results.append(ContractCheckResult(
+        id="reference.single_file",
+        passed=single_file_ok,
+        target=file_path,
+        message=(
+            "参考资料是单文件内容。"
+            if single_file_ok
+            else f"{file_path} 包含多文件包、其它文件完整内容或写入文件标签。"
+        ),
+        expected=(
+            "只输出当前 reference 文件内容；"
+            "reference 正文可以提到相关脚本路径，但不能包含其它文件的完整内容或写入文件标签。"
+        ),
+        minimal_edit="删除其它文件完整内容和写入文件标签，只保留当前 reference metadata 和正文。",
+    ))
+
     executable_reference_blocks: list[str] = []
-    for info, body in _iter_markdown_fenced_blocks(stripped):
+    for info, fenced_body in _iter_markdown_fenced_blocks(stripped):
         if _is_shell_fence_info(info) and re.search(
             r"(?m)^\s*(?:python|python3|node|bash|sh)\s+scripts/[A-Za-z0-9_./-]+\b",
-            body,
+            fenced_body,
         ):
-            executable_reference_blocks.append(body.strip())
+            executable_reference_blocks.append(fenced_body.strip())
 
     results.append(ContractCheckResult(
         id="reference.no_executable_script_blocks",
@@ -2544,7 +2770,6 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
         minimal_edit="把 reference 中的可执行命令示例改为 ```text，或改写为普通说明，不要使用 bash/sh/shell fence。",
     ))
 
-    # references must not redefine script capability contracts.
     capability_contract_patterns = [
         r"(?i)\brequired_capabilities\b",
         r"(?i)\bforbidden_capabilities\b",
@@ -4071,10 +4296,84 @@ def _validate_script_against_existing_skill_contract(skill_name: str, file_path:
     skill_md = skill_md_path.read_text(encoding="utf-8")
     _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
 
+def _creator_smoke_sample_file_paths(
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> list[str]:
+    """Return explicitly declared smoke sample files.
+
+    不再把 /app/backend/samples/sample.png 注入到所有脚本。
+    sample 文件必须由当前 file plan 显式声明，例如：
+      smoke_sample_files: ["/app/backend/samples/sample.png"]
+
+    这样 png 只会用于真正需要外部样例文件的脚本，不会污染 text_generator。
+    """
+    raw: Any = None
+
+    if isinstance(skill_plan_entry, dict):
+        raw = (
+            skill_plan_entry.get("smoke_sample_files")
+            or skill_plan_entry.get("trial_sample_files")
+            or skill_plan_entry.get("sample_files")
+        )
+    elif skill_plan_entry is not None:
+        raw = (
+            getattr(skill_plan_entry, "smoke_sample_files", None)
+            or getattr(skill_plan_entry, "trial_sample_files", None)
+            or getattr(skill_plan_entry, "sample_files", None)
+        )
+
+    if raw is None:
+        return []
+
+    values = raw if isinstance(raw, list) else [raw]
+    paths: list[str] = []
+
+    for value in values:
+        path = Path(str(value or "").strip())
+        if not str(path):
+            continue
+        if path.is_file():
+            paths.append(str(path))
+
+    return list(dict.fromkeys(paths))
+
+
+def _creator_smoke_external_envelope(
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> dict[str, Any]:
+    """Generic external input envelope for trial runs.
+
+    只有当前脚本显式声明 smoke_sample_files / trial_sample_files / sample_files
+    时才提供外部样例文件。不要把平台样例文件注入所有脚本。
+    """
+    sample_files = _creator_smoke_sample_file_paths(skill_plan_entry)
+    if not sample_files:
+        return {}
+
+    file_cards = [
+        {
+            "path": path,
+            "name": Path(path).name,
+            "source": "creator_smoke_fixture",
+        }
+        for path in sample_files
+    ]
+
+    return {
+        "input_files": sample_files,
+        "files": file_cards,
+        "resources": {
+            "files": file_cards,
+        },
+    }
 
 def _sample_value_for_placeholder(key: str) -> str:
-    """Return a stable, generic multilingual trial value without field-name guessing."""
-    return "测试输入：包含中文、English words 和标点符号，用于验证 UTF-8 与真实执行。"
+    """Return a stable, generic multilingual trial value without field-name guessing.
+
+    不根据 key 做词表判断。
+    外部文件样例由 _creator_smoke_external_envelope() 统一注入。
+    """
+    return "测试输入：包含中文、English words 和标点符号，用于验证 UTF-8、业务处理和真实执行。"
 
 
 def _render_trial_command_args(command: str, script_path: str) -> list[str] | None:
@@ -4113,43 +4412,72 @@ def _json_argv_text_optional_variants(args: list[str]) -> list[list[str]]:
     return []
 
 
-def _trial_args_for_script(skill_md: str, file_path: str, content: str, skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None) -> list[list[str]]:
+def _trial_args_for_script(
+    skill_md: str,
+    file_path: str,
+    content: str,
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> list[list[str]]:
     commands = _extract_script_command_templates(skill_md, file_path)
     arg_sets: list[list[str]] = []
+
+    entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry)
+    external_envelope = _creator_smoke_external_envelope(skill_plan_entry or entry)
+
     for cmd in commands:
         args = _render_trial_command_args(cmd, file_path)
         if args is not None:
             arg_sets.append(args)
-    if not arg_sets and _script_reads_json_argv(content, runtime_for_language(language_for_path(file_path), file_type_for_path(file_path))):
-        entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry)
-        payload = {
+
+    def augment_json_argv_with_external_envelope(args: list[str]) -> list[str]:
+        if not args or not external_envelope:
+            return args
+
+        try:
+            payload = json.loads(args[0])
+        except Exception:
+            return args
+
+        if not isinstance(payload, dict):
+            return args
+
+        for key, value in external_envelope.items():
+            payload.setdefault(key, value)
+
+        return [json.dumps(payload, ensure_ascii=False), *args[1:]]
+
+    if not arg_sets and _script_reads_json_argv(
+        content,
+        runtime_for_language(language_for_path(file_path), file_type_for_path(file_path)),
+    ):
+        payload: dict[str, Any] = {
             "payload": _sample_value_for_placeholder("payload"),
             "user_request": _sample_value_for_placeholder("user_request"),
             "fields": {},
             "options": {},
-            "input_files": [],
         }
+
+        if external_envelope:
+            payload.update(external_envelope)
+
         for key in entry.inputs or []:
             if key in payload:
                 continue
-            if key.endswith("_path") or key in {"image_path", "pdf_path", "docx_path", "pptx_path", "html_path"}:
-                payload[key] = "inputs/sample.txt"
-            elif key.endswith("_paths") or key in {"image_paths", "file_paths"}:
-                payload[key] = ["inputs/sample.txt"]
-            elif key.startswith("structured_") or key.endswith("_data") or key.endswith("_json"):
-                payload[key] = {"title": "试运行样例", "items": ["示例"]}
-            else:
-                payload[key] = _sample_value_for_placeholder(key)
+            payload[key] = _sample_value_for_placeholder(str(key))
+
         arg_sets = [[json.dumps(payload, ensure_ascii=False)]]
+
     if not arg_sets:
         arg_sets = [[]]
+
+    arg_sets = [augment_json_argv_with_external_envelope(args) for args in arg_sets]
 
     expanded: list[list[str]] = []
     for args in arg_sets:
         expanded.append(args)
         expanded.extend(_json_argv_text_optional_variants(args))
-    return _dedupe_trial_arg_sets(expanded)
 
+    return _dedupe_trial_arg_sets(expanded)
 
 def _format_trial_failure(*, args: list[str], returncode: int, stdout: str, stderr: str) -> str:
     return (
@@ -4195,7 +4523,7 @@ class ScriptFunctionalValidationError(ValueError):
         self.layer = layer
 
 
-def _stage_error_for_script_functional(exc: Exception) -> FileGenerationStageError:
+def _stage_error_for_script_functional(exc: Exception):
     layer = getattr(exc, "layer", None) or _failure_layer_from_error_text(str(exc)) or "responsibility"
     return FileGenerationStageError(
         source="script_functional",
@@ -4540,14 +4868,57 @@ def _contract_resolution_for_trial(file_path: str, skill_md: str, role: str | No
 
 
 def _artifact_fields_from_contract_dict(contract: dict[str, Any] | None) -> list[str]:
+    """Return only fields that are semantically artifact/file outputs.
+
+    Creator 中需要严格区分两类字段：
+
+    1. stdout data fields:
+       普通 stdout JSON 业务字段，只表示脚本输出的数据结构。
+       例如任何业务字段、结构化内容字段、统计字段、描述字段等。
+       这些字段只应接受 JSON required/non-empty/type/provenance 校验，
+       不能被当作文件路径检查。
+
+    2. artifact/file fields:
+       文件产物路径字段，字段值应指向真实生成的文件。
+       这些字段才进入 artifact existence/content evidence 校验。
+
+    因此：
+    - artifact_fields / file_fields / file_outputs 是显式文件产物字段，可以直接采纳。
+    - artifact_outputs 是显式 artifact manifest，也可以采纳。
+    - stdout_fields / output_fields 只是普通 stdout 字段集合，不能整体提升为 artifact。
+      只有字段名本身具备 runtime artifact 语义时，才可作为 artifact 字段。
+    """
     fields: list[str] = []
     contract = contract or {}
-    for key in ("artifact_fields", "file_fields", "stdout_fields", "file_outputs", "output_fields"):
+
+    # 显式声明为文件产物的字段，直接采纳。
+    for key in ("artifact_fields", "file_fields", "file_outputs"):
         raw = contract.get(key)
         if isinstance(raw, str) and raw.strip():
             fields.append(raw.strip())
         elif isinstance(raw, list):
             fields.extend(str(item).strip() for item in raw if str(item).strip())
+
+    # stdout_fields / output_fields 是 stdout JSON 字段，不等于 artifact 字段。
+    # 只有字段名本身具备平台 runtime artifact 语义时，才提升为 artifact。
+    for key in ("stdout_fields", "output_fields"):
+        raw = contract.get(key)
+        candidates: list[str] = []
+
+        if isinstance(raw, str) and raw.strip():
+            candidates.append(raw.strip())
+        elif isinstance(raw, list):
+            candidates.extend(str(item).strip() for item in raw if str(item).strip())
+
+        for field_name in candidates:
+            try:
+                if is_runtime_artifact_semantic(field_name):
+                    fields.append(field_name)
+            except Exception:
+                # 语义判断 helper 异常时，宁可不把普通 stdout 字段误判为 artifact。
+                continue
+
+    # 显式 artifact_outputs manifest 继续采纳。
     raw_outputs = contract.get("artifact_outputs")
     if isinstance(raw_outputs, list):
         for item in raw_outputs:
@@ -4555,6 +4926,7 @@ def _artifact_fields_from_contract_dict(contract: dict[str, Any] | None) -> list
                 field = str(item.get("field") or item.get("name") or "").strip()
                 if field:
                     fields.append(field)
+
     return list(dict.fromkeys(fields))
 
 
@@ -4778,23 +5150,42 @@ def _trial_run_generated_script(
                         argv_payload = parsed_argv
                 except Exception:
                     argv_payload = {}
-            functional_issues = validate_script_functional_evidence(
-                content=content,
-                stdout_payload=stdout_payload,
-                argv_payload=argv_payload,
-                contract=refined_contract,
-                resolution=resolution,
-            )
-            functional_issues.extend(_validate_artifact_content_evidence(
+            # pre-smoke 已经由 _run_script_responsibility_review 做内容职责 hard gate。
+            # 这里的 smoke 阶段只保留确定性运行 / stdout / artifact 检查。
+            # validate_script_functional_evidence 产生的 tool_result_used/list_cardinality
+            # 属于功能性/启发式证据，不再作为 post-smoke hard gate，否则会和
+            # responsibility_review 以及通用 smoke envelope 发生冲突。
+            try:
+                advisory_functional_issues = validate_script_functional_evidence(
+                    content=content,
+                    stdout_payload=stdout_payload,
+                    argv_payload=argv_payload,
+                    contract=refined_contract,
+                    resolution=resolution,
+                )
+                if advisory_functional_issues:
+                    logger.info(
+                        "[Creator][script_functional][post_smoke_advisory_ignored] file=%s issues=%s",
+                        file_path,
+                        json.dumps(advisory_functional_issues, ensure_ascii=False, default=str)[:1200],
+                    )
+            except Exception as exc:
+                logger.info(
+                    "[Creator][script_functional][post_smoke_advisory_exception_ignored] file=%s error=%s",
+                    file_path,
+                    exc,
+                )
+
+            artifact_issues = _validate_artifact_content_evidence(
                 stdout_payload=stdout_payload,
                 argv_payload=argv_payload,
                 entry=inferred_entry,
                 skill_dir=skill_dir,
                 canonical_contract=refined_contract,
-            ))
-            if functional_issues:
-                layer = str(functional_issues[0].get("id") or "responsibility").split(".", 2)[-1]
-                raise ScriptFunctionalValidationError(functional_issues, layer=layer)
+            )
+            if artifact_issues:
+                layer = str(artifact_issues[0].get("id") or "artifact_evidence").split(".", 2)[-1]
+                raise ScriptFunctionalValidationError(artifact_issues, layer=layer)
             return _build_script_runtime_spec_from_trial(
                 file_path=file_path,
                 entry=inferred_entry,
@@ -4897,8 +5288,20 @@ async def _repair_generated_file_with_feedback(
         output_contract = f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
         local_edit_scope = "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
     elif file_path.startswith("references/"):
-        output_contract = "最终只返回当前 reference Markdown 正文；不要在文件外层套 Markdown 代码块。references/*.md 可无 frontmatter；如有 frontmatter，顶层只允许 title/description/source/license/metadata，内部 path/purpose 放 metadata.creator。"
-        local_edit_scope = "保留已经正确的正文、代码块和参考资料内容；metadata schema 错误优先只替换 frontmatter。"
+        output_contract = (
+            "最终只返回当前 reference Markdown 文件内容；不要在文件外层套 Markdown 代码块。"
+            "references/*.md 必须包含 YAML frontmatter，且 title/description 非空；"
+            "frontmatter 顶层只允许 title/description/source/license/metadata；"
+            "metadata.creator.path / metadata.creator.purpose 是允许的内部记录，不要因其出现 references/ 路径而删除。"
+            "frontmatter 后必须有 Markdown 正文，正文必须包含标题，并提供可复用参考信息。"
+            "references/*.md 可以包含非执行性的 ```json 或 ```text 示例。"
+        )
+        local_edit_scope = (
+            "优先按失败项局部修复：metadata schema 错误只替换 frontmatter；"
+            "正文格式/参考价值错误只重写当前 reference 正文；"
+            "普通 ```json/```text 示例不是错误，不要为了修复而删除。"
+            "不要修改其它文件，不要添加可执行脚本命令块，不要重新定义 workflow/role/inputs/outputs/capabilities。"
+        )
     else:
         output_contract = "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
         local_edit_scope = "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
@@ -4916,15 +5319,27 @@ async def _repair_generated_file_with_feedback(
             "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
             "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
             "不要生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
+            "调用平台工具、模型 helper 或外部 helper 后，必须按 Tool Registry / Tool Snippet 声明的返回类型使用；"
+            "如果返回类型不确定，应在当前脚本内做通用类型适配，兼容 str/dict/list/None；"
+            "不得假设所有工具返回值都是 dict，也不得假设所有工具返回值都有 text 字段；"
+            "如果 deterministic_error 指出对象类型与访问方式不匹配，必须修复该访问方式，而不是 try/except 吞错。"
             f"\n统一 Tool Registry 上下文：\n{tool_context}"
         )
     elif file_path.startswith("references/"):
         extra_rules = (
-            "你只修当前 reference Markdown；保持正文内容，不重写整个文件；"
-            "如果错误是 frontmatter schema，只修 frontmatter；references/*.md 可以没有 frontmatter；"
+            "你只修当前 reference Markdown 文件；不要修改其它文件。"
+            "references/*.md 必须有 YAML frontmatter，且 title/description 非空；"
+            "如果错误是 frontmatter schema，只修 frontmatter。"
             "如有 frontmatter，顶层只允许 title/description/source/license/metadata；"
-            "path/purpose/role/type/scope/loading/when_to_use 等内部字段必须删除或移动到 metadata.creator；"
-            "不要添加脚本命令块，不要重新定义 workflow、role、inputs、outputs 或 capabilities；"
+            "path/purpose/role/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
+            "required_tool_slots/implementation_strategy/command_template 等内部字段不能作为 frontmatter 顶层字段；"
+            "如需保留 path/purpose，只允许放在 metadata.creator 下，metadata.creator.path 是合法字段。"
+            "如果错误是正文格式或参考价值不足，必须把正文修成真正的 Markdown 参考资料文档："
+            "至少包含标题，并围绕当前 purpose 提供可复用规则、示例、约束、格式说明、风格要求或质量标准。"
+            "references/*.md 可以包含非执行性的 ```json/```text 示例；普通 JSON 示例块不是错误，不要删除。"
+            "只有 bash/sh/shell fenced block 中调用 scripts/** 的可执行命令块、写入文件标签、多文件打包才需要删除。"
+            "不要输出聊天式澄清问题、确认选项、状态说明或计划询问。"
+            "不要添加可执行脚本命令块，不要重新定义 workflow、role、inputs、outputs 或 capabilities；"
             "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
         )
     else:
@@ -4967,18 +5382,27 @@ async def _repair_generated_file_with_feedback(
         ),
     })
     edit_strategy = (
-        "这是 scripts/ 首次失败后的严格重写：不要走 minimal_edit，不要修补错误外壳；"
+        "这是 scripts/ content_review 失败后的严格重写：不要走 minimal_edit，不要修补错误外壳；"
         "请根据合同、蓝图和骨架重新输出完整可运行源码。"
         if is_script and repair_mode == "strict_contract_rewrite"
         else (
-            "这是 script_functional 职责失败后的 localized_patch："
-            "只能修改校验模型/确定性证据指出的函数、行号或代码区域；"
-            "必须保留已通过的 import、parse_args、main 入口、JSON argv 协议、stdout 字段名和文件输出协议。"
-            if is_script and repair_mode == "localized_patch"
+            "这是 script_smoke 确定性失败后的 strict_patch："
+            "必须只修改 traceback / deterministic_error / validator localization 指出的失败行附近代码；"
+            "如果 localization 给出 minimal_edit，必须落实该最小修改；"
+            "修复后不得保留已被 deterministic_error 指出的错误访问方式或错误表达式；"
+            "不得重写 SKILL.md、workflow、其它脚本、stdout schema、argv 协议或 E2E 映射；"
+            "不得把运行错误改成 try/except 静默吞掉并返回假成功。"
+            if is_script and repair_mode == "strict_patch"
             else (
-                "请优先做局部修改：只修改校验意见指出的最小错误片段，"
-                f"{local_edit_scope}"
-                "修改完成后可以整合输出。"
+                "这是 script_functional 职责失败后的 localized_patch："
+                "只能修改校验模型/确定性证据指出的函数、行号或代码区域；"
+                "必须保留已通过的 import、parse_args、main 入口、JSON argv 协议、stdout 字段名和文件输出协议。"
+                if is_script and repair_mode == "localized_patch"
+                else (
+                    "请优先做局部修改：只修改校验意见指出的最小错误片段，"
+                    f"{local_edit_scope}"
+                    "修改完成后可以整合输出。"
+                )
             )
         )
     )
@@ -4995,8 +5419,7 @@ async def _repair_generated_file_with_feedback(
             + ("" if is_script else (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else ""))
             + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
             + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
-            + ("\n- minimal_edit：只做最小编辑；localized_patch：只修失败函数/行号/区域；strict_contract_rewrite：仅 content_review 允许重写目标小节且必须保留已通过项。")
-            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, keep JSON argv parsing broad and preserve required stdout outputs." if is_script else "")
+            + ("\n- minimal_edit：只做最小编辑；localized_patch：只修失败函数/行号/区域；strict_patch：只修 deterministic_error/localization 指出的失败行附近代码；strict_contract_rewrite：仅 content_review 允许重写目标小节且必须保留已通过项。")            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, keep JSON argv parsing broad and preserve required stdout outputs." if is_script else "")
             + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是当前 runtime 的源码字符，全文不得出现 ``` 或 ~~~。" if is_script and repair_mode == "strict_contract_rewrite" else "")
             + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
         ),
@@ -5088,16 +5511,20 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             "当前脚本 stdout 缺少 required_outputs。不要改 SKILL.md；不要为了适配所有输入参数重写逻辑。"
             "只修改当前脚本 run()/main() 的输出组织。必须返回 deterministic error 中 missing 列出的字段，且值非空；"
             "保留已有核心业务逻辑和宽松 JSON argv 读取，不要把修复方向转向输入参数重命名。"
+            "补齐字段时必须保持 output provenance：字段值必须来自 argv JSON、上游 stdout、reference/assets、"
+            "工具结果、模型结果或确定性计算。不得用固定示例值、固定模板、无关默认值或与输入无关的常量凑 required_outputs。"
+            "如果当前脚本需要开放式写作或结构化内容生成，应让文本模型返回包含 required_outputs 的 JSON object，"
+            "或从模型结果中解析/组织出这些字段；不要只把模型结果放到 text 后再硬编码其它字段。"
         )
 
     if file_path == "SKILL.md":
         if (
-                "workflow_missing" in error_text
-                or "没有可执行 bash/sh/shell 命令块" in error_text
-                or "缺少调用" in error_text
-                or "script_command.exists" in error_text
-                or "command_block.fenced_exists" in error_text
-                or "fenced code block" in error_text
+            "workflow_missing" in error_text
+            or "没有可执行 bash/sh/shell 命令块" in error_text
+            or "缺少调用" in error_text
+            or "script_command.exists" in error_text
+            or "command_block.fenced_exists" in error_text
+            or "fenced code block" in error_text
         ):
             return (
                 "按严格 Markdown 执行规范修复 SKILL.md："
@@ -5130,13 +5557,34 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
     if file_path.startswith("scripts/"):
         lower_error = error_text.lower()
 
-        if "script_functional" in error_text or "职责" in error_text or "responsibility" in lower_error:
+        if (
+            "script_functional.artifact_evidence.missing" in error_text
+            or "artifact_evidence.missing" in error_text
+            or "stdout 声明产物" in error_text
+        ):
             return (
-                "当前失败属于 script_functional 职责闭环失败，不是 script_smoke 运行失败。"
+                "当前失败属于文件产物证据失败，只能针对真正具有 artifact/file/path 语义的 stdout 字段修复。"
+                "不要把普通业务 stdout 字段改造成文件路径；不要为了通过 artifact 校验把业务数据写成无意义文件。"
+                "如果失败字段确实是 pdf_path/image_path/docx_path/pptx_path/html_path/file_paths/file_outputs 等产物字段，"
+                "请只修当前脚本的真实文件写入路径和 stdout 路径映射，确保返回路径对应的文件真实存在且内容非空。"
+                "如果当前脚本只输出普通业务数据，则应保持普通 JSON 字段，并等待后端 artifact 字段语义修复；不要改 SKILL.md、SkillPlan 或其它脚本。"
+            )
+
+        if (
+            "script_functional" in error_text
+            or "职责" in error_text
+            or "responsibility" in lower_error
+            or "content_responsibility" in lower_error
+        ):
+            return (
+                "当前失败属于 script_functional 内容职责闭环失败，不是 script_smoke 运行失败。"
                 "只修当前脚本中校验信息指出的函数、行号或代码区域；"
                 "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
                 "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
+                "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"
+                "如果脚本调用了模型/工具，模型/工具结果必须参与核心 declared_stdout_fields 或文件产物内容构造；"
+                "不得只调用工具生成一个 text，然后硬编码其它业务字段。"
             )
 
         if (
@@ -5148,8 +5596,10 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
         ):
             return (
                 "不要通过 try/except 输出 error、{}、空 pdf_path 或空 file_paths 来绕过试运行。"
-                "必须修复导致异常的真实代码路径，并输出真实存在的文件路径。"
+                "必须修复导致异常的真实代码路径，并输出真实存在的文件路径或真实业务 stdout 数据。"
                 "如果当前脚本生成文件产物，请修复真实文件创建路径并返回平台可消费的文件字段。"
+                "如果当前脚本输出普通业务字段，请确保字段值来自输入、上游 stdout、reference/assets、工具结果、模型结果或确定性计算，"
+                "不得返回固定示例值或无关默认值。"
             )
 
         if "Markdown 代码块或多文件包" in error_text or "script.raw_source.single_file" in error_text:
@@ -5174,6 +5624,8 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "根据 script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules 组合工具与本地逻辑；"
                 "available_tools 只是候选，最终由单文件 evidence/stdout/artifact 校验和 E2E 数据流校验共同验证。"
                 "禁止返回固定 template-only 文本、placeholder、空对象或空路径；蓝图和 SKILL.md 确定后只能修当前脚本。"
+                "如果 required outputs 是普通业务 stdout 字段，它们必须来自输入、上游 stdout、工具结果、模型结果或确定性计算，"
+                "不能用固定示例值凑字段。"
             )
 
         if "试运行" in error_text or "JSON 参数" in error_text or "合法 Python" in error_text:
@@ -5182,6 +5634,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "如果 SKILL.md 命令传 JSON，脚本必须读取 sys.argv[1] 并 json.loads，stdout 输出结构化 JSON，至少包含一个非空字段；"
                 "字段名由现有 SKILL.md 变量消费关系决定，不要修改蓝图或 SKILL.md。"
                 "不要通过 try/except 输出 error、{}、空路径来掩盖真实异常；必须修复导致试运行失败的代码。"
+                "修复后输出字段不能是无关固定示例值；核心业务字段必须由输入、上游 stdout、reference/assets、工具结果、模型结果或确定性计算推导。"
             )
 
     if file_path.startswith("assets/"):
@@ -5192,13 +5645,73 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             )
 
     if file_path.startswith("references/"):
-        if "contract 未通过" in error_text or "多文件包" in error_text or "Creator" in error_text:
+        if (
+            "contract 未通过" in error_text
+            or "reference." in error_text
+            or "frontmatter" in error_text
+            or "Markdown" in error_text
+            or "参考资料" in error_text
+            or "多文件包" in error_text
+            or "Creator" in error_text
+        ):
             return (
-                "按 reference 合同修复：只输出当前参考资料 Markdown 正文；"
-                "删除 Creator 流程、写入文件标签、多文件包和其它文件路径标题。"
+                "按 reference 合同修复：当前文件必须是一份正式 Markdown 参考资料文档。"
+                "必须包含 YAML frontmatter，且 title/description 非空；"
+                "frontmatter 顶层只允许 title、description、source、license、metadata。"
+                "正文必须包含 Markdown 标题，并提供可复用的规则、示例、约束、格式说明、风格要求或质量标准。"
+                "不要输出聊天式澄清问题、确认选项、状态说明或计划询问。"
+                "不要添加脚本命令块，不要重新定义 workflow、role、inputs、outputs 或 capabilities。"
+                "删除 Creator 流程、写入文件标签和多文件包；"
+                "reference 正文可以提到相关脚本路径，但不能把其它文件的完整内容打包进来。"
             )
 
     return ""
+
+def _safe_validator_localizations(
+    validator_data: dict[str, Any],
+    *,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Extract safe localization hints from validator output.
+
+    validator 不能新增失败范围，只能解释后端 deterministic_error。
+    因此这里只保留当前文件的定位字段和 minimal_edit，不传 issues /
+    failed_checks / 全局 repair_instructions 给 repair 模型。
+    """
+    raw_items = validator_data.get("localization")
+    if not isinstance(raw_items, list):
+        return []
+
+    safe_items: list[dict[str, Any]] = []
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        failed_file = str(item.get("failed_file") or "").strip()
+        if failed_file and failed_file != file_path:
+            continue
+
+        safe_item = {
+            "failed_file": failed_file or file_path,
+            "failed_function": item.get("failed_function"),
+            "line_region": item.get("line_region"),
+            "reason": item.get("reason"),
+            "minimal_edit": item.get("minimal_edit"),
+            "allowed_scope": item.get("allowed_scope"),
+            "forbidden_scope": item.get("forbidden_scope"),
+        }
+
+        safe_item = {
+            key: value
+            for key, value in safe_item.items()
+            if value not in (None, "", [], {})
+        }
+
+        if safe_item:
+            safe_items.append(safe_item)
+
+    return safe_items
 
 async def _run_generated_file_validator_round(
     *,
@@ -5212,21 +5725,22 @@ async def _run_generated_file_validator_round(
     failed_checks_text: str = "",
     repair_mode: str = "minimal_edit",
 ) -> dict:
-    """Ask the validator model for advisory explanations only.
+    """Ask the validator model for advisory localization only.
 
-    The validator model must never be a hard gate. This function is only called
-    after deterministic backend checks or a trial run have already produced a
-    real failure, and its output is filtered to the deterministic failure set.
+    后端 deterministic checks / trial run 是唯一裁决来源。
+    validator 不创建新失败，不扩大修复范围，只对真实失败做定位说明。
     """
     if not str(deterministic_error or "").strip():
         return {
             "passed": True,
             "issues": [],
             "failed_checks": [],
+            "localization": [],
             "preserve": [],
             "repair_instructions": "",
             "model": "",
         }
+
     route = route_model(
         VALIDATOR_TASK,
         requested_model=requested_model,
@@ -5238,49 +5752,73 @@ async def _run_generated_file_validator_round(
         route=route,
         extra=f"requested_generation_model={requested_model} repair_mode={repair_mode} content_chars={len(content)}",
     )
+
     messages = [
         {
             "role": "system",
             "content": (
                 "你是 Creator 生成文件校验模型，只输出严格 JSON object。"
                 "你不决定 passed/failed；后端确定性检查和 trial run 才是唯一裁决。"
-                "你只解释后端已经给出的真实错误，并给 coder 可执行的局部修复意见。"
-                "重要规则：Markdown 执行命令必须使用标准 ```bash fenced code block；"
-                "机器可读 JSON 示例必须使用标准 ```json fenced code block；"
-                "不要使用 '''bash 或 '''json；不要把行内 scripts/*.py 当成执行命令。"
-                "SKILL.md YAML frontmatter 只需要在文件开头用 --- 开启，并在 metadata 后用 --- 关闭；"
-                "不要求整个文件末尾再出现 ---。"
-                "禁止报告任何未经后端结构化检查确认的推测性运行风险；"
-                "禁止新增 failed_checks，禁止猜输入字段，禁止要求修改 SkillPlan/capability/workflow；"
-                "真实运行错误只以后端确定性检查和单脚本 smoke 阶段结果为准。"
+                "你只解释后端已经给出的真实错误，并给 coder 可执行的局部定位。"
+
+                "禁止新增 failed_checks。"
+                "禁止猜输入字段。"
+                "禁止要求修改 SkillPlan、capability、workflow、其它脚本或 E2E。"
+                "禁止报告任何未经后端结构化检查确认的推测性运行风险。"
+
+                "你的 localization 必须只围绕 deterministic_error。"
+                "如果 deterministic_error 是运行时异常，你只能定位导致该异常的当前文件代码区域。"
+                "如果 deterministic_error 是 stdout/schema/artifact 确定性失败，你只能定位当前文件中对应输出组织或产物创建区域。"
+                "如果无法定位，localization 返回空数组。"
+
+                "返回 JSON object，字段包括："
+                "passed, issues, failed_checks, localization, preserve, repair_instructions。"
+                "其中 passed 必须为 false，因为后端已经确认真实失败。"
+                "failed_checks 必须为空数组，除非后端 failed_checks_text 明确给出。"
+
+                "如果 failed_checks_text 为空，你不得提出新的 failed_checks，也不得提出 tool_result_used、list_cardinality、required_outputs 等新问题；"
+                "只能围绕 deterministic_error 的 traceback、stdout_required_outputs_missing、artifact evidence 等后端已经写明的错误定位当前代码。\n"
+                "input_files/files/resources 可能是 Creator smoke 自动注入的通用 envelope；"
+                "除非 deterministic_error 明确提到这些字段属于 required input 或 failed check，否则不得要求脚本遍历处理它们。\n"
             ),
         },
         {
             "role": "user",
             "content": (
-                f"目标文件：{file_path}\n"
-                "后端确定性校验/试运行错误：\n"
+                f"目标文件：{file_path}\n\n"
+                "后端确定性校验/试运行错误，这是唯一真实失败来源：\n"
                 f"{deterministic_error}\n\n"
                 + (f"当前脚本合同/输入输出/产物摘要：\n{contract_text[-4000:]}\n\n" if contract_text else "")
                 + (f"后端确定性 failed_checks（只能解释这些，不能新增）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
                 + (f"本轮修复模式：{repair_mode}\n\n" if repair_mode else "")
-                + (f"后端根据该错误生成的必做修复步骤：\n{targeted_repair}\n\n" if targeted_repair else "")
+                + (f"后端根据该错误生成的修复边界：\n{targeted_repair}\n\n" if targeted_repair else "")
                 + "当前代码（尾部截断，仅供定位）：\n"
                 "```text\n"
                 f"{content[-8000:]}\n"
                 "```\n\n"
-                "请输出 JSON："
-                "{\"passed\": false, \"issues\": [\"...\"], "
-                "\"failed_checks\": [], "
-                "\"localization\": [{\"failed_file\": \"当前文件路径\", \"failed_function\": \"函数名或 main/run/stdout\", "
-                "\"line_region\": \"行号或代码区域\", \"reason\": \"为什么未完成职责\", "
-                "\"minimal_edit\": \"最小修改建议\", \"allowed_scope\": \"只允许改哪里\", "
-                "\"forbidden_scope\": \"不能改哪里\"}], "
-                "\"preserve\": [\"已通过检查对应内容\"], "
-                "\"repair_instructions\": \"只针对后端真实错误的局部修改指令；必须说明失败文件、失败函数、行号/区域、原因、最小修改建议、允许/禁止修改范围；不得引入 LLM 推测、SkillPlan/capability/workflow 修改或工具路线重规划。\"}"
+                "请输出严格 JSON object：\n"
+                "{\n"
+                "  \"passed\": false,\n"
+                "  \"issues\": [\"只解释 deterministic_error，不新增问题\"],\n"
+                "  \"failed_checks\": [],\n"
+                "  \"localization\": [\n"
+                "    {\n"
+                "      \"failed_file\": \"当前文件路径\",\n"
+                "      \"failed_function\": \"函数名或 main/run/stdout\",\n"
+                "      \"line_region\": \"行号或代码区域\",\n"
+                "      \"reason\": \"为什么该区域导致 deterministic_error\",\n"
+                "      \"minimal_edit\": \"只修复 deterministic_error 的最小修改建议\",\n"
+                "      \"allowed_scope\": \"只允许改哪里\",\n"
+                "      \"forbidden_scope\": \"不能改哪里\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"preserve\": [\"已通过且应保留的局部结构\"],\n"
+                "  \"repair_instructions\": \"只针对 deterministic_error 的局部修改指令；不得要求修改 SkillPlan/capability/workflow/E2E/其它脚本。\"\n"
+                "}\n"
             ),
         },
     ]
+
     try:
         text = await complete_chat_once(messages, route.model)
         logger.info(
@@ -5290,46 +5828,55 @@ async def _run_generated_file_validator_round(
             len(text or ""),
             repair_mode,
         )
-    except Exception as exc:  # pragma: no cover - defensive fallback
+    except Exception as exc:
         logger.warning("Creator file validator failed; using deterministic feedback: %s", exc)
         return {
             "passed": False,
             "issues": [deterministic_error],
-            "repair_instructions": deterministic_error,
+            "failed_checks": [],
+            "localization": [],
+            "preserve": [],
+            "repair_instructions": "",
             "model": route.model,
         }
 
     data = _parse_validator_json_object(text)
-    if not data:
+    if not isinstance(data, dict) or not data:
         return {
             "passed": False,
             "issues": [deterministic_error],
-            "repair_instructions": deterministic_error,
+            "failed_checks": [],
+            "localization": [],
+            "preserve": [],
+            "repair_instructions": "",
             "model": route.model,
         }
 
     issues = data.get("issues") if isinstance(data.get("issues"), list) else []
     raw_failed_checks = data.get("failed_checks") if isinstance(data.get("failed_checks"), list) else []
     failed_checks = _filter_validator_failed_checks(raw_failed_checks, failed_checks_text)
-    preserve = data.get("preserve") if isinstance(data.get("preserve"), list) else []
-    instructions = str(data.get("repair_instructions") or data.get("feedback") or deterministic_error)
-    filtered_issues, instructions = _filter_validator_model_call_misjudgements(
+
+    instructions = str(data.get("repair_instructions") or data.get("feedback") or "")
+    filtered_issues, filtered_instructions = _filter_validator_model_call_misjudgements(
         file_path=file_path,
         deterministic_error=deterministic_error,
         failed_checks_text=failed_checks_text,
         issues=issues,
         instructions=instructions,
     )
+
+    localization = _safe_validator_localizations(data, file_path=file_path)
+
     deterministic_failed = bool(str(deterministic_error or "").strip())
     return {
-        # LLM validator is advisory only. It cannot decide pass/fail and cannot
-        # create new blocking failures; deterministic backend checks/trial run
-        # are the sole source of truth.
         "passed": not deterministic_failed,
         "issues": filtered_issues if deterministic_failed else [],
         "failed_checks": failed_checks if deterministic_failed else [],
-        "preserve": [str(item) for item in preserve],
-        "repair_instructions": instructions if deterministic_failed else "",
+        "localization": localization if deterministic_failed else [],
+        # preserve 不传给 repair 使用，只保留给日志/调试，避免 validator 通过 preserve 发明约束。
+        "preserve": [str(item) for item in data.get("preserve", [])] if isinstance(data.get("preserve"), list) else [],
+        # repair_instructions 也不直接进入 repair prompt；真正进入的是 localization.minimal_edit。
+        "repair_instructions": filtered_instructions if deterministic_failed else "",
         "model": route.model,
     }
 
@@ -5353,29 +5900,188 @@ def _filter_validator_model_call_misjudgements(
     return [], instructions or deterministic_error
 
 
-def _format_file_validator_feedback(deterministic_error: str, validator_report: dict, targeted_repair: str = "") -> str:
-    return (
-        "后端确定性校验/试运行错误：\n"
-        f"{deterministic_error}\n\n"
-        + (f"后端确定性修复指令：\n{targeted_repair}\n\n" if targeted_repair else "")
-        + f"校验模型：{validator_report.get('model', '')}\n"
-        "说明：校验模型仅作为真实失败后的解释辅助；其 issues、failed_checks 和 repair_instructions "
-        "不进入 repair prompt。repair 只允许后端确定性错误和确定性修复指令驱动。"
-    )
+def _format_file_validator_feedback(
+    deterministic_error: str,
+    validator_report: dict,
+    targeted_repair: str = "",
+    file_path: str | None = None,
+) -> str:
+    """Build safe repair feedback.
 
+    原则：
+    - deterministic_error 是唯一真实失败来源；
+    - validator 不能新增失败范围；
+    - 只允许把当前文件 localization/minimal_edit 作为定位辅助传给 repair；
+    - 不传全量 issues / failed_checks / repair_instructions，避免校验模型发明问题。
+    """
+    parts = [
+        "后端确定性校验/试运行错误，这是本轮唯一需要修复的真实失败：",
+        str(deterministic_error or ""),
+    ]
+
+    if targeted_repair:
+        parts.extend([
+            "",
+            "后端确定性修复边界：",
+            str(targeted_repair),
+        ])
+
+    safe_localizations: list[dict[str, Any]] = []
+
+    if isinstance(validator_report, dict):
+        raw_localization = validator_report.get("localization")
+        if isinstance(raw_localization, list):
+            for item in raw_localization:
+                if not isinstance(item, dict):
+                    continue
+
+                failed_file = str(item.get("failed_file") or "").strip()
+                if file_path and failed_file and failed_file != file_path:
+                    continue
+
+                safe_item = {
+                    "failed_file": failed_file or file_path or "",
+                    "failed_function": item.get("failed_function"),
+                    "line_region": item.get("line_region"),
+                    "reason": item.get("reason"),
+                    "minimal_edit": item.get("minimal_edit"),
+                    "allowed_scope": item.get("allowed_scope"),
+                    "forbidden_scope": item.get("forbidden_scope"),
+                }
+
+                safe_item = {
+                    key: value
+                    for key, value in safe_item.items()
+                    if value not in (None, "", [], {})
+                }
+
+                if safe_item:
+                    safe_localizations.append(safe_item)
+
+    if safe_localizations:
+        parts.extend([
+            "",
+            "校验模型对上述真实失败的定位信息，仅用于帮助修复 deterministic_error，不得新增失败范围：",
+            json.dumps(safe_localizations, ensure_ascii=False, indent=2, default=str),
+        ])
+
+    parts.extend([
+        "",
+        "严格修复规则：",
+        "1. 只修复上面的 deterministic_error。",
+        "2. validator localization 只能作为定位和 minimal_edit 参考，不能作为新的失败来源。",
+        "3. 不得根据 validator 自行扩展问题范围。",
+        "4. 不得修改 SKILL.md、workflow、其它脚本、stdout schema、argv 协议或 E2E 映射。",
+        "5. 如果 localization 给出了 minimal_edit，优先落实该最小修改。",
+        "6. 如果 minimal_edit 和 deterministic_error 冲突，以 deterministic_error 为准。",
+    ])
+
+    return "\n".join(parts)
+
+def _normalize_responsibility_review_issues(
+    review: dict[str, Any],
+    *,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """只接收“当前文件内容职责未完成”的模型判断。
+
+    不做词表过滤，不判断具体单词。
+    只看模型是否明确声明：
+    - issue_type == "content_responsibility"
+    - scope == "current_file_only"
+
+    接口、stdout、artifact、metadata、workflow、E2E 之类问题不应该由这个 review 返回为 hard issue。
+    """
+    raw_issues = review.get("issues")
+    if not isinstance(raw_issues, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+
+    for raw in raw_issues:
+        if not isinstance(raw, dict):
+            continue
+
+        if raw.get("issue_type") != "content_responsibility":
+            continue
+
+        if raw.get("scope") != "current_file_only":
+            continue
+
+        problem = str(raw.get("problem") or "").strip()
+        evidence = str(raw.get("evidence") or "").strip()
+        minimal_edit = str(raw.get("minimal_edit") or "").strip()
+
+        if not problem or not evidence or not minimal_edit:
+            continue
+
+        normalized.append({
+            "id": "script_functional.responsibility",
+            "failed_file": file_path,
+            "failed_function": str(
+                raw.get("function")
+                or raw.get("failed_function")
+                or "run"
+            ),
+            "code_region": str(
+                raw.get("line_region")
+                or raw.get("code_region")
+                or "current file business logic"
+            ),
+            "reason": problem,
+            "minimal_edit": minimal_edit,
+            "allowed_scope": str(
+                raw.get("allowed_scope")
+                or "只允许修改当前脚本中未完成内容职责的业务逻辑区域。"
+            ),
+            "forbidden_scope": str(
+                raw.get("forbidden_scope")
+                or "不得修改 SKILL.md、SkillPlan、workflow、其它脚本、stdout schema、argv 协议、artifact 校验或 E2E 映射。"
+            ),
+            "details": {
+                "issue_type": raw.get("issue_type"),
+                "scope": raw.get("scope"),
+                "evidence": evidence,
+                "raw": raw,
+            },
+        })
+
+    return normalized
 
 async def _run_script_responsibility_review(
     *,
     file_path: str,
     script_content: str,
     skill_plan_entry: SkillPlanEntry,
-    runtime_spec: ScriptRuntimeSpec,
-    stdout_json: dict[str, Any],
-    artifact_paths: list[str],
-    deterministic_issues: list[dict[str, Any]],
-    requested_model: str | None,
+    runtime_spec: ScriptRuntimeSpec | None = None,
+    stdout_json: dict[str, Any] | None = None,
+    artifact_paths: list[str] | None = None,
+    deterministic_issues: list[dict[str, Any]] | None = None,
+    requested_model: str | None = None,
 ) -> dict[str, Any]:
-    """Hard-gate model review for one script's own responsibility only."""
+    """只验收当前脚本的“内容职责是否完成”。
+
+    通用原则：
+    - 这是单文件生成闭环中的 pre-smoke hard gate；
+    - 只判断当前脚本是否真正完成 SkillPlanEntry.purpose；
+    - 不判断运行协议、stdout schema、artifact 路径、跨文件数据流或最终 E2E；
+    - 不绑定任何具体业务类型、字段词表或专用工具名称；
+    - 允许脚本使用现有一个或多个工具、标准库、本地 helper 组合实现职责。
+    """
+    deterministic_issues = deterministic_issues or []
+    stdout_json = stdout_json if isinstance(stdout_json, dict) else {}
+    artifact_paths = artifact_paths if isinstance(artifact_paths, list) else []
+    review_phase = "pre_smoke" if runtime_spec is None else "post_smoke"
+    runtime_spec_payload = _script_runtime_spec_to_dict(runtime_spec) if runtime_spec is not None else {}
+
+    if deterministic_issues:
+        return {
+            "passed": False,
+            "issues": deterministic_issues,
+            "repair_instructions": "按后端确定性 script_functional evidence 修复当前脚本失败区域。",
+            "model": "deterministic",
+        }
+
     route = route_model(
         VALIDATOR_TASK,
         requested_model=requested_model,
@@ -5387,54 +6093,178 @@ async def _run_script_responsibility_review(
         route=route,
         model=requested_model,
     )
+
+    declared_stdout_fields = [
+        str(item).strip()
+        for item in (getattr(skill_plan_entry, "outputs", []) or [])
+        if str(item).strip()
+    ]
+
     messages = [
         {
             "role": "system",
             "content": (
-                "你是 Creator 第一轮单脚本职责验收模型，只输出严格 JSON object。"
-                "你是 hard gate：必须判断当前脚本单独拿出来是否完成 SkillPlanEntry 的 purpose/role/outputs/capabilities。"
-                "禁止判断上下游脚本是否接上；禁止判断整个 SKILL.md workflow；禁止要求修改其它脚本、SKILL.md 或 SkillPlan。"
-                "职责失败时必须定位函数、行号或代码区域，并给出局部 minimal_edit。"
+                "你是 Creator 第一轮单脚本内容职责验收模型，只输出严格 JSON object。\n\n"
+
+                "你的 hard veto 权力只限于当前脚本的内容职责。"
+                "你不是接口校验器、stdout schema 校验器、artifact 路径校验器、metadata 校验器或 E2E 校验器。\n\n"
+
+                "你只判断一件事：当前脚本是否完成了 SkillPlanEntry 定义的单文件职责。"
+                "不要根据固定业务类型、字段词表或某个专用工具名称做判断；"
+                "必须结合 purpose、inputs、outputs、resource_refs、available_tools、脚本源码中的数据流来判断。\n\n"
+
+                "通用实现原则：\n"
+                "- 平台工具只是基础能力候选，不是完整业务方案枚举。\n"
+                "- 当前脚本可以使用一个或多个 available_tools，也可以使用标准库、运行环境已有通用库和本地 helper 进行组合、适配、转换、排版、文件处理或产物组装。\n"
+                "- 不得要求脚本必须调用某个特定专用工具；也不得因为脚本没有调用某个特定工具名而判失败。\n"
+                "- 不得因为脚本组合了多个工具、多个 helper 或标准库逻辑而判失败。\n"
+                "- 关键判断是：当前脚本是否让合同中的核心输入、资源或工具/模型结果真实影响核心输出字段或产物内容。\n\n"
+
+                "可以判失败的通用情况：\n"
+                "- 源码证据表明当前脚本没有实现 purpose 要求的核心业务转换或内容构造；\n"
+                "- 合同中的核心输入被完全忽略，或只被读取但没有影响输出/产物内容；\n"
+                "- 输出字段虽然齐全，但核心值由固定示例、默认常量、空壳模板或与输入无关的内容凑出；\n"
+                "- 调用了模型或工具，但返回结果没有参与核心输出字段或产物内容构造；\n"
+                "- 声称生成文件/产物，但产物内容没有来自输入、上游 stdout、reference/assets、工具结果、模型结果或确定性组装；\n"
+                "- 当前脚本只做协议壳、演示壳或占位壳，不能从源码数据流看出它完成了单文件职责。\n\n"
+                "- 如果脚本已经读取核心输入，并让输入、工具结果、模型结果或本地处理结果影响了 SkillPlanEntry.outputs 中的主要业务字段，即使解析策略较简单，也应判 passed=true；解析鲁棒性、stdout required、字段是否为空交给 smoke/确定性检查。\n\n"
+
+                "不能判失败的情况：\n"
+                "- stdout 字段是否严格匹配、是否允许额外字段；\n"
+                "- argv / JSON 参数协议是否正确；\n"
+                "- path/file/artifact 字段是否绝对路径、文件是否存在、产物是否为空；\n"
+                "- import/dependency 是否正确；\n"
+                "- 是否需要 try/except、exists、assert 等运行防护；\n"
+                "- SKILL.md/frontmatter/metadata 是否正确；\n"
+                "- workflow mapping、上下游字段映射、跨脚本数据流、最终 E2E 是否闭环；\n"
+                "- 当前脚本是否应该和其它脚本重排、合并或拆分；\n"
+                "- 当前脚本选择了哪条工具路线、是否缺少某个专用工具。\n\n"
+                "- 解析方式是否足够鲁棒、是否必须使用 JSON 输出、是否必须使用正则/结构化解析；\n"
+                "- 是否显式读取某个 reference 文档，除非 SkillPlanEntry 明确声明该 reference 是当前脚本必需输入；\n"
+                "- 输出是否包含辅助字段，例如 text/raw_text/debug_text；只要核心业务字段已由输入、工具结果、模型结果或本地处理构造，辅助字段不构成职责失败；\n"
+                "- smoke 自动注入的 input_files/files/resources 是否被处理；除非这些字段是 SkillPlanEntry.inputs 明确声明的业务输入，否则不能据此判失败；\n"
+
+                "这些接口、协议、路径、产物、metadata、跨文件数据流、E2E 问题由后端确定性检查、单脚本 smoke 和最终 E2E 处理。"
+                "如果你发现的问题不属于当前脚本内容职责失败，必须返回 passed=true，并把观察放到 advisory_notes。\n\n"
+
+                "字段语义边界：\n"
+                "- declared_stdout_fields 表示 stdout JSON 中应出现的业务字段，不等于文件路径字段。\n"
+                "- 普通业务字段不需要被当作文件路径检查。\n"
+                "- 你只判断这些字段是否体现了当前脚本的内容职责，尤其是是否具有来源和业务关联。\n"
+                "- 来源可以来自 argv JSON、上游 stdout、reference 内容、uploaded assets、工具结果、模型结果或确定性计算。\n"
+                "- 不得要求普通业务字段变成 artifact 文件路径；artifact 路径存在性不是你的职责。\n\n"
+
+                "只有内容职责失败时，issues 里才能返回 hard issue，并且每个 hard issue 必须包含：\n"
+                "- issue_type: \"content_responsibility\"\n"
+                "- scope: \"current_file_only\"\n"
+                "- problem\n"
+                "- evidence\n"
+                "- minimal_edit\n\n"
+
+                "如果无法确认是内容职责失败，返回 passed=true。"
             ),
         },
         {
             "role": "user",
             "content": (
                 f"目标脚本：{file_path}\n"
+                f"审查阶段：{review_phase}。pre_smoke 只判断当前脚本核心内容职责是否完成，不检查运行协议或 E2E。\n\n"
                 "SkillPlanEntry 摘要：\n"
                 f"{json.dumps(skill_plan_entry.__dict__, ensure_ascii=False, default=str)[:6000]}\n\n"
-                "runtime_spec：\n"
-                f"{json.dumps(_script_runtime_spec_to_dict(runtime_spec), ensure_ascii=False, default=str)}\n\n"
-                "stdout_json：\n"
+                "declared_stdout_fields（只表示 stdout JSON 业务字段，不等于 artifact 路径字段）：\n"
+                f"{json.dumps(declared_stdout_fields, ensure_ascii=False)}\n\n"
+                "runtime_spec（pre_smoke 通常为空；只用于理解脚本上下文，不可据此判断接口错误）：\n"
+                f"{json.dumps(runtime_spec_payload, ensure_ascii=False, default=str)}\n\n"
+                "stdout_json（只用于理解已产生的业务结果，不可据此判断 stdout schema）：\n"
                 f"{json.dumps(stdout_json, ensure_ascii=False, default=str)}\n\n"
-                "artifact_paths：\n"
+                "artifact_paths（只用于理解产物，不可据此要求脚本检查路径或文件存在）：\n"
                 f"{json.dumps(artifact_paths, ensure_ascii=False)}\n\n"
-                "deterministic_evidence_result：\n"
-                f"{json.dumps(deterministic_issues, ensure_ascii=False, default=str)}\n\n"
                 "当前脚本源码（带行号）：\n"
                 f"{_numbered_source(script_content)[-12000:]}\n\n"
-                "只判断当前脚本：是否完成 purpose、符合 role、消费 inputs、产生 outputs、满足 required capabilities、真实生成 artifact、没有 fake/mock/template-only 行为、工具/模型结果是否进入 stdout 或产物。\n"
-                "返回 JSON 格式："
-                "{\"passed\": false, \"issues\": [{\"severity\": \"error\", \"function\": \"run\", "
-                "\"line_start\": 20, \"line_end\": 38, \"code_pattern\": \"return {...}\", "
-                "\"problem\": \"...\", \"expected\": \"...\", "
-                "\"minimal_edit\": \"只修改 run() 中组织输出的部分，不要改 parse_args/main/stdout 字段\"}], "
-                "\"repair_instructions\": \"只允许局部修改失败区域\"}"
+                "审查要求：\n"
+                "1. 只判断当前脚本内容职责是否完成。\n"
+                "2. 不要使用业务类型特殊规则或字段词表；从 SkillPlanEntry 和源码数据流判断。\n"
+                "3. 如果核心输入/资源/工具结果没有影响核心输出字段或产物内容，应该判失败。\n"
+                "4. 如果脚本通过现有工具、标准库、本地 helper 或它们的组合完成职责，不要判失败。\n"
+                "5. 如果问题只是 argv/stdout schema/path/artifact/E2E/import/dependency，不要判失败。\n\n"
+                "返回 JSON object。\n\n"
+                "如果内容职责完成，返回：\n"
+                "{\n"
+                "  \"passed\": true,\n"
+                "  \"issues\": [],\n"
+                "  \"advisory_notes\": []\n"
+                "}\n\n"
+                "如果当前脚本内容职责没有完成，返回：\n"
+                "{\n"
+                "  \"passed\": false,\n"
+                "  \"issues\": [\n"
+                "    {\n"
+                "      \"issue_type\": \"content_responsibility\",\n"
+                "      \"scope\": \"current_file_only\",\n"
+                "      \"severity\": \"error\",\n"
+                "      \"function\": \"run\",\n"
+                "      \"line_region\": \"业务逻辑相关区域\",\n"
+                "      \"problem\": \"当前脚本没有完成自身内容职责\",\n"
+                "      \"evidence\": \"引用源码证据说明为什么内容职责未完成，例如核心输入没有影响输出、工具结果未参与产物内容、只返回固定示例等\",\n"
+                "      \"expected\": \"它应该完成的内容职责\",\n"
+                "      \"minimal_edit\": \"只修改内容职责相关业务逻辑；可使用现有工具、标准库和本地 helper 组合实现；不得改接口/stdout/schema/path/E2E\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"repair_instructions\": \"只允许修复当前脚本的内容职责问题\"\n"
+                "}\n"
             ),
         },
     ]
-    text = await complete_chat_once(messages, route.model)
+
+    try:
+        text = await complete_chat_once(messages, route.model)
+    except Exception as exc:
+        logger.warning(
+            "[Creator][script_functional][responsibility_review_unavailable] file=%s error=%s",
+            file_path,
+            exc,
+        )
+        return {
+            "passed": True,
+            "issues": [],
+            "repair_instructions": "",
+            "model": route.model,
+            "warning": f"职责验收模型不可用，已降级为 advisory：{type(exc).__name__}: {exc}",
+        }
+
     data = _parse_validator_json_object(text) or {}
     if not isinstance(data, dict):
-        data = {}
-    passed = bool(data.get("passed")) and not deterministic_issues
-    issues = data.get("issues") if isinstance(data.get("issues"), list) else []
-    if deterministic_issues:
-        issues = [*deterministic_issues, *issues]
+        logger.warning(
+            "[Creator][script_functional][responsibility_review_invalid_json] file=%s raw=%s",
+            file_path,
+            str(text or "")[:1000],
+        )
+        return {
+            "passed": True,
+            "issues": [],
+            "repair_instructions": "",
+            "model": route.model,
+            "warning": "职责验收模型返回非 JSON object，已降级为 advisory。",
+        }
+
+    hard_issues = _normalize_responsibility_review_issues(data, file_path=file_path)
+
+    if not hard_issues:
+        return {
+            "passed": True,
+            "issues": [],
+            "repair_instructions": "",
+            "model": route.model,
+            "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
+        }
+
     return {
-        "passed": passed,
-        "issues": issues,
-        "repair_instructions": str(data.get("repair_instructions") or "只允许局部修改失败区域"),
+        "passed": False,
+        "issues": hard_issues,
+        "repair_instructions": str(
+            data.get("repair_instructions")
+            or "只允许局部修改当前脚本的内容职责失败区域；可使用现有工具、标准库和本地 helper 组合实现；不得修改接口、stdout、schema、path、workflow 或 E2E。"
+        ),
         "model": route.model,
     }
 
@@ -5882,18 +6712,27 @@ def _script_local_contract_payload(
     plan_entry: SkillPlanEntry,
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return the only business contract a script-generation prompt should need."""
+    """Return the only business contract a script-generation prompt should need.
+
+    通用原则：
+    - available_tools 只是基础能力候选，不是完整业务方案枚举；
+    - 没有召回到专用工具，不代表脚本不能实现；
+    - script 可以通过标准库、本地 helper、一个或多个基础工具组合完成职责。
+    """
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    available_tools = []
+
+    available_tools: list[dict[str, Any]] = []
     tool_function_cards: list[str] = []
     selected_tool_names: list[str] = []
-    for tool in implementation_resolution.available_tools or implementation_resolution.selected_tools:
+
+    for tool in (implementation_resolution.available_tools or implementation_resolution.selected_tools or []):
         capability_name = str(tool.tool_id).split(".")[0]
         selected_tool_names.append(capability_name)
         cap = get_tool_capability(capability_name)
         if cap is not None:
             tool_function_cards.extend(function_cards_for_tool(cap))
+
         available_tools.append({
             "tool_id": tool.tool_id,
             "description": tool.description,
@@ -5911,13 +6750,19 @@ def _script_local_contract_payload(
             "required_secrets": tool.required_secrets,
             "artifact_outputs": tool.artifact_outputs,
         })
+
     tool_snippets = resolve_tool_snippets_for_context(
         role=plan_entry.role or "",
-        capabilities=list(dict.fromkeys([req.capability_id for req in canonical_contract.capability_requirements if req.capability_id])),
+        capabilities=list(dict.fromkeys([
+            req.capability_id
+            for req in canonical_contract.capability_requirements
+            if req.capability_id
+        ])),
         tool_names=list(dict.fromkeys(selected_tool_names)),
         file_path=file_path,
         max_snippets=8,
     )
+
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
@@ -5934,10 +6779,24 @@ def _script_local_contract_payload(
             "stdout_schema": stdout_schema,
             "artifact_contract": canonical_contract.artifact_contract,
         },
+        "runtime_envelope": {
+            "description": (
+                "Creator/Skill runtime may provide a generic JSON argv envelope. "
+                "Scripts should read explicit contract fields when present, and may also use "
+                "generic envelope fields such as payload, user_request, fields, options, "
+                "input_files, files, and resources when they need external user inputs or files."
+            ),
+            "generic_fields": ["payload", "user_request", "fields", "options", "input_files", "files", "resources"],
+            "smoke_note": (
+                "Smoke test may provide real sample files through input_files/files/resources. "
+                "Do not hardcode sample paths; read them from argv if needed."
+            ),
+        },
         "rules": [
-            "Use script_composition: combine argv inputs, local logic, and any available_tools needed for the goal.",
-            "available_tools are recalled candidates only; decide which to call based on the script goal and contracts.",
-            "Only import a tool using its exact call_template import path; never guess backend imports.",
+            "Use script_composition: combine argv inputs, local logic, standard library, and any useful available_tools to satisfy this single script goal.",
+            "available_tools are recalled base capabilities, not an exhaustive list of business solutions; the script may implement composition/adaptation locally instead of waiting for a specialized tool.",
+            "Only import a platform tool using its exact call_template import path; never guess backend imports.",
+            "Standard-library imports and already-available runtime libraries may be used for local composition.",
             "References/assets are resource_refs only, not pip/install/import dependencies.",
             "First round fixes only the current script; end-to-end chain repair happens later.",
         ],
@@ -5956,14 +6815,19 @@ def _script_local_contract_payload(
 
 
 def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any]:
-    """Build a deterministic stdout schema from the per-file output contract."""
+    """Build a deterministic stdout schema from the per-file output contract.
+
+    注意：
+    - 只有 SkillPlanEntry.outputs 明确声明的字段才作为 required；
+    - outputs 为空时，不要伪造 required=["text"]；
+    - stdout 至少一个非空字段由 _validate_trial_stdout_json 的通用规则保证。
+    """
     properties = {
         key: {"description": f"Non-empty value for declared output field {key}."}
         for key in (plan_entry.outputs or [])
         if isinstance(key, str) and key.strip()
     }
-    if not properties:
-        properties = {"text": {"type": "string", "description": "Non-empty human-readable result."}}
+
     return {
         "type": "object",
         "required": list(properties.keys()),
@@ -6029,7 +6893,11 @@ def _build_script_generate_file_prompt_variant(
     parsing; the model only implements this one file's internals.
     """
     plan_entry = _skill_plan_entry_for_file(
-        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
     )
     stdout_schema = _script_stdout_schema_for_entry(plan_entry)
     local_contract = _script_local_contract_payload(
@@ -6038,24 +6906,33 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
-    implementation_mode = str((local_contract.get("implementation_resolution") or {}).get("mode") or "script_composition")
+
+    implementation_payload = (
+        local_contract.get("implementation_resolution")
+        if isinstance(local_contract.get("implementation_resolution"), dict)
+        else {}
+    )
+    implementation_mode = str(implementation_payload.get("mode") or "script_composition")
+
     if implementation_mode == "unresolved":
-        reason = ((local_contract.get("implementation_resolution") or {}).get("reason") if isinstance(local_contract.get("implementation_resolution"), dict) else "") or "canonical contract unresolved"
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "severity": "user_warning",
-                "code": "contract_unresolved",
-                "source": "implementation_resolution",
-                "path": file_path,
-                "field": "implementation_resolution.mode",
-                "message": reason,
-                "repair": "补齐脚本 inputs/outputs/stdout_schema/artifact_contract 或注册真实 callable tool manifest 后再生成。",
-            },
+        # unresolved 只能说明“没有召回到完整专用工具方案”，不能说明脚本无法实现。
+        # Creator 的定位是：平台提供基础工具与运行环境，script 通过标准库、本地 helper、
+        # 一个或多个基础工具组合完成业务职责。
+        logger.warning(
+            "[Creator][script_generation_contract][implementation_unresolved_downgraded] file_path=%s reason=%s",
+            file_path,
+            str(implementation_payload.get("reason") or ""),
         )
-    tool_usage_prompt = ""
+        implementation_mode = "script_composition"
+        implementation_payload["mode"] = "script_composition"
+        implementation_payload["unresolved_advisory"] = (
+            implementation_payload.get("reason")
+            or "no specialized tool resolution; use script composition"
+        )
+        local_contract["implementation_resolution"] = implementation_payload
+
     script_skeleton_text = ""
-    if variant == "standard":
+    if variant in {"standard", "simplified"}:
         script_skeleton_text = _script_generation_skeleton(
             file_path,
             purpose,
@@ -6063,28 +6940,40 @@ def _build_script_generate_file_prompt_variant(
             role=plan_entry.role,
             skill_plan_entry=skill_plan_entry,
         )
-    elif variant == "simplified":
-        script_skeleton_text = _script_generation_skeleton(
-            file_path,
-            purpose,
-            "",
-            role=plan_entry.role,
-            skill_plan_entry=skill_plan_entry,
-        )
-    resolution_payload = local_contract.get("implementation_resolution") if isinstance(local_contract.get("implementation_resolution"), dict) else {}
-    canonical_payload = local_contract
-    selected_tools_payload = resolution_payload.get("available_tools") if isinstance(resolution_payload, dict) else []
-    tool_function_cards = local_contract.get("tool_function_cards") if isinstance(local_contract.get("tool_function_cards"), list) else []
-    tool_snippets = local_contract.get("tool_snippets") if isinstance(local_contract.get("tool_snippets"), list) else []
+
+    resolution_payload = (
+        local_contract.get("implementation_resolution")
+        if isinstance(local_contract.get("implementation_resolution"), dict)
+        else {}
+    )
+    selected_tools_payload = (
+        resolution_payload.get("available_tools")
+        if isinstance(resolution_payload, dict)
+        else []
+    )
+    tool_function_cards = (
+        local_contract.get("tool_function_cards")
+        if isinstance(local_contract.get("tool_function_cards"), list)
+        else []
+    )
+    tool_snippets = (
+        local_contract.get("tool_snippets")
+        if isinstance(local_contract.get("tool_snippets"), list)
+        else []
+    )
+
     logger.info(
         "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
         file_path,
-        json.dumps(canonical_payload.get("inputs") or [], ensure_ascii=False),
-        json.dumps(canonical_payload.get("outputs") or [], ensure_ascii=False),
-        json.dumps(canonical_payload.get("output_contract") or {}, ensure_ascii=False, sort_keys=True),
-        json.dumps(canonical_payload.get("resource_refs") or [], ensure_ascii=False, sort_keys=True),
+        json.dumps(local_contract.get("inputs") or [], ensure_ascii=False),
+        json.dumps(local_contract.get("outputs") or [], ensure_ascii=False),
+        json.dumps(local_contract.get("output_contract") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(local_contract.get("resource_refs") or [], ensure_ascii=False, sort_keys=True),
         implementation_mode,
-        json.dumps([tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)], ensure_ascii=False),
+        json.dumps(
+            [tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)],
+            ensure_ascii=False,
+        ),
         len(tool_function_cards),
         len(tool_snippets),
         json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
@@ -6102,10 +6991,15 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
-        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、rules。raw role/capability 只能作为 hint，不能当硬合同。",
-        "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑和 available_tools。",
-        "available_tools 只是 embedding/结构化召回的候选工具，不是最终裁决；只有确实需要时才调用。",
-        "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
+        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
+        "raw role/capability 只能作为 hint，不能当硬合同。",
+        "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑、标准库和 available_tools。",
+        "available_tools 是基础能力候选，不是完整业务方案枚举；不要因为缺少某个专用工具就放弃实现当前脚本职责。",
+        "当前脚本可以定义局部 helper，使用标准库或运行环境中已有通用库做字段适配、内容组织、格式转换、文件处理和产物组装。",
+        "可以调用一个或多个 available_tools，也可以完全用本地确定性逻辑实现；关键是核心输入必须影响核心输出或产物内容。",
+        "工具/helper/标准库如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
+        "如果当前脚本需要外部文件或用户上传资源，应从 JSON argv 的显式合同字段或通用 envelope 字段读取，例如 input_files/files/resources；不要在源码中写死 smoke 样例路径。",
+        "Creator smoke 可能会在 input_files/files/resources 中提供真实样例文件，用于验证脚本是否能处理外部文件；这只是试运行输入，不是业务逻辑常量。",
         "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。",
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
@@ -6115,12 +7009,19 @@ def _build_script_generate_file_prompt_variant(
         "动态工具 Snippet 指南（从 registry/manifest 读取，不硬编码工具名）：",
         str(local_contract.get("tool_snippet_prompt") or "当前脚本可用工具 Snippets: 无"),
     ]
+
     if variant == "standard":
         instruction.append("不注入完整蓝图、kernel 文档或额外工具清单；只使用上面的轻量上下文。")
+
     if script_skeleton_text:
-        instruction.extend(["固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：", script_skeleton_text])
+        instruction.extend([
+            "固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：",
+            script_skeleton_text,
+        ])
+
     if variant == "minimal":
         instruction.append("极简要求：返回可运行脚本源码，解析 JSON argv，真实处理输入，打印满足 stdout_schema 的 JSON object。")
+
     return _creator_file_generation_messages(
         "\n\n".join(instruction),
         system_rule="你是 Creator 脚本文件生成器。只输出单个目标脚本源码；禁止解释、Markdown fence 或多文件包。",
@@ -6823,10 +7724,22 @@ def _strict_contract_rewrite_allowed(source: str) -> bool:
 
 
 def _repair_mode_for_first_round(*, source: str, file_path: str, attempt: int) -> str:
+    """Choose repair mode for generation-loop failures.
+
+    - script_functional：模型功能性校验失败，说明职能未完成，局部修业务逻辑；
+    - script_smoke：确定性运行/stdout/artifact 失败，第一次 minimal_edit，
+      第二次开始 strict_patch，只修 traceback/localization 指出的失败行附近；
+    - content_review：仍按原有 strict_contract_rewrite 策略。
+    """
     if source == "script_functional" and file_path.startswith("scripts/"):
         return "localized_patch"
+
+    if source == "script_smoke" and file_path.startswith("scripts/"):
+        return "strict_patch" if attempt >= 2 else "minimal_edit"
+
     if attempt >= 2 and file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(source):
         return "strict_contract_rewrite"
+
     return "minimal_edit"
 
 
@@ -7080,7 +7993,6 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
         },
     )
 
-
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
     """Generate one Creator file and stream it back as SSE.
@@ -7100,24 +8012,23 @@ async def generate_file(request: GenerateFileRequest):
             status_code=400,
             detail=f"{request.file_path} 属于 assets 静态素材目录；只有 source=bundled 的预置静态资源可由 Creator 生成，source=user_upload 必须上传。",
         )
-    script_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else {}
-    artifact_contract = script_entry.get("artifact_contract") if isinstance(script_entry.get("artifact_contract"), dict) else {}
-    has_script_outputs = bool(script_entry.get("outputs") or artifact_contract.get("stdout_fields"))
-    if request.file_path.startswith("scripts/") and not (
-        script_entry
-        and script_entry.get("path") == request.file_path
-        and script_entry.get("file_kind", script_entry.get("file_type")) in {"script", None}
-        and has_script_outputs
-    ):
+
+    # request.skill_plan_entry 来自前端请求态，只能作为 hint，不能作为唯一可信合同。
+    # 这里不再因为 outputs/artifact_contract/file_kind 不完整而在生成循环外 422；
+    # 真正的单文件合同会在 event_stream 内由后端基于 file_path、role、purpose、SKILL.md/blueprint 重新归一化。
+    # 只有明确的 path 冲突才属于不可恢复请求错误。
+    raw_skill_plan_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else {}
+    raw_entry_path = str(raw_skill_plan_entry.get("path") or "").strip()
+    if request.file_path.startswith("scripts/") and raw_entry_path and raw_entry_path != request.file_path:
         raise HTTPException(
             status_code=422,
             detail={
-                "code": "contract_unresolved",
+                "code": "contract_path_mismatch",
                 "severity": "user_warning",
                 "source": "generator",
                 "path": request.file_path,
-                "field": "skill_plan_entry",
-                "message": f"{request.file_path} 缺少 normalized skill_plan_entry 或 outputs/artifact_contract.stdout_fields；已停止生成，避免退化为 payload->text 泛型脚本。",
+                "field": "skill_plan_entry.path",
+                "message": f"skill_plan_entry.path={raw_entry_path} 与当前 file_path={request.file_path} 不一致。",
             },
         )
 
@@ -7135,6 +8046,26 @@ async def generate_file(request: GenerateFileRequest):
                 route=route,
             )
 
+            effective_skill_plan_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else None
+            if request.file_path.startswith("scripts/"):
+                # 后端生成阶段重新构建 canonical entry，避免依赖前端传来的不完整 entry。
+                # 这仍然是单文件合同，不做跨文件 E2E 判断。
+                skill_md_for_entry = (
+                    (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
+                    if (settings.skills_path / skill_name / "SKILL.md").is_file()
+                    else request.blueprint_text
+                )
+                entry_obj = _skill_plan_entry_for_file(
+                    file_path=request.file_path,
+                    purpose=request.purpose,
+                    blueprint_text=skill_md_for_entry or request.blueprint_text,
+                    role=request.role,
+                    skill_plan_entry=effective_skill_plan_entry,
+                )
+                effective_skill_plan_entry = dict(getattr(entry_obj, "__dict__", {}) or {})
+                effective_skill_plan_entry.setdefault("path", request.file_path)
+                effective_skill_plan_entry.setdefault("purpose", request.purpose)
+
             prompt_messages = _build_generate_file_prompt(
                 request.file_path,
                 skill_name,
@@ -7142,7 +8073,7 @@ async def generate_file(request: GenerateFileRequest):
                 request.blueprint_text,
                 request.conversation_history,
                 role=request.role,
-                skill_plan_entry=request.skill_plan_entry,
+                skill_plan_entry=effective_skill_plan_entry,
             )
             prompt_variant = "standard"
         except Exception as exc:
@@ -7155,6 +8086,7 @@ async def generate_file(request: GenerateFileRequest):
 
         candidate = ""
         repair_counts_by_layer: dict[str, int] = {}
+
         try:
             candidate = await _complete_creator_file_generation(
                 messages=prompt_messages,
@@ -7186,7 +8118,7 @@ async def generate_file(request: GenerateFileRequest):
                         request.file_path,
                         candidate,
                         role=request.role,
-                        skill_plan_entry=request.skill_plan_entry,
+                        skill_plan_entry=effective_skill_plan_entry,
                     )
 
                     content, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
@@ -7201,7 +8133,7 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                             content=content,
                             purpose=request.purpose,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                         )
 
                     if not content.strip():
@@ -7212,17 +8144,13 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                     if request.file_path == "SKILL.md":
-                        # First round: file-level SKILL.md contract only. Cross-file
-                        # placeholder/dataflow closure is handled by validate_workflow_e2e().
                         _raise_file_contract_failures(validate_file_contract(
                             file_path=request.file_path,
                             content=content,
                             blueprint_text=request.blueprint_text,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                         ))
 
-                        # SKILL.md is generated before scripts/references are materialized.
-                        # Validate against blueprint-declared plan, not disk existence.
                         _validate_skill_md_against_existing_files(
                             skill_name,
                             content,
@@ -7234,7 +8162,7 @@ async def generate_file(request: GenerateFileRequest):
                             skill_name=skill_name,
                             content=content,
                             blueprint_text=request.blueprint_text,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                             model=request.model or route.model,
                         )
 
@@ -7243,7 +8171,10 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                             content=content,
                             blueprint_text=request.blueprint_text,
-                            skill_plan_entry={**(request.skill_plan_entry or {}), "purpose": request.purpose or request.blueprint_text},
+                            skill_plan_entry={
+                                **(effective_skill_plan_entry or {}),
+                                "purpose": request.purpose or request.blueprint_text,
+                            },
                         ))
 
                     elif request.file_path.startswith("scripts/"):
@@ -7251,66 +8182,74 @@ async def generate_file(request: GenerateFileRequest):
                             request.file_path,
                             content,
                             role=request.role,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                         ))
+
                 except Exception as exc:
                     raise _stage_error_from_exception("content_review", exc, default_layer="content_review") from exc
 
                 runtime_spec: ScriptRuntimeSpec | None = None
                 if request.file_path.startswith("scripts/"):
+                    # 单文件闭环分层：
+                    # 1) content_review：只验单文件源码/文档合同；
+                    # 2) responsibility pre-smoke：先验当前脚本是否完成自身内容职责；
+                    # 3) script_smoke：再验当前脚本是否能按 argv/stdout/artifact 协议跑通。
+                    # 跨脚本数据流、最终产物闭环、workflow E2E 不在这里判断，留给独立 E2E。
+                    try:
+                        skill_md = (
+                            (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
+                            if (settings.skills_path / skill_name / "SKILL.md").is_file()
+                            else ""
+                        )
+                        entry = _skill_plan_entry_for_file(
+                            file_path=request.file_path,
+                            blueprint_text=skill_md,
+                            role=request.role,
+                            skill_plan_entry=effective_skill_plan_entry,
+                        )
+
+                        review = await _run_script_responsibility_review(
+                            file_path=request.file_path,
+                            script_content=content,
+                            skill_plan_entry=entry,
+                            runtime_spec=None,
+                            stdout_json={},
+                            artifact_paths=[],
+                            deterministic_issues=[],
+                            requested_model=None,
+                        )
+
+                        if not review.get("passed"):
+                            issues = review.get("issues") if isinstance(review.get("issues"), list) else []
+                            hard_issues = [
+                                issue for issue in issues
+                                if isinstance(issue, dict)
+                                and issue.get("details", {}).get("issue_type") == "content_responsibility"
+                                and issue.get("details", {}).get("scope") == "current_file_only"
+                            ]
+
+                            if hard_issues:
+                                raise ScriptFunctionalValidationError(hard_issues, layer="responsibility")
+
+                            logger.info(
+                                "[Creator][script_functional][responsibility_review_advisory_ignored] file=%s review=%s",
+                                request.file_path,
+                                json.dumps(review, ensure_ascii=False, default=str)[:1200],
+                            )
+
+                    except ScriptFunctionalValidationError as exc:
+                        raise _stage_error_for_script_functional(exc) from exc
+                    except Exception as exc:
+                        raise _stage_error_from_exception("script_functional", exc, default_layer="responsibility") from exc
+
                     try:
                         runtime_spec = _trial_run_generated_script_with_plan(
                             skill_name,
                             request.file_path,
                             content,
                             role=request.role,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                         )
-                        if runtime_spec is not None:
-                            entry = _skill_plan_entry_for_file(
-                                file_path=request.file_path,
-                                blueprint_text=(settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
-                                if (settings.skills_path / skill_name / "SKILL.md").is_file()
-                                else "",
-                                role=request.role,
-                                skill_plan_entry=request.skill_plan_entry,
-                            )
-                            try:
-                                review = await _run_script_responsibility_review(
-                                    file_path=request.file_path,
-                                    script_content=content,
-                                    skill_plan_entry=entry,
-                                    runtime_spec=runtime_spec,
-                                    stdout_json=runtime_spec.stdout_json,
-                                    artifact_paths=runtime_spec.artifact_paths,
-                                    deterministic_issues=[],
-                                    requested_model=request.model or route.model,
-                                )
-                            except Exception as exc:
-                                raise ScriptFunctionalValidationError([{
-                                    "id": "script_functional.responsibility_review_unavailable",
-                                    "failed_file": request.file_path,
-                                    "failed_function": "model responsibility review",
-                                    "code_region": "responsibility hard gate",
-                                    "reason": f"职责验收模型不可用或返回异常：{type(exc).__name__}: {exc}",
-                                    "minimal_edit": "稍后重试职责验收；不要把职责验收异常归类为脚本运行失败。",
-                                    "allowed_scope": request.file_path,
-                                    "forbidden_scope": "不得改 SKILL.md、其它脚本或 SkillPlan 来绕过职责验收。",
-                                }], layer="responsibility") from exc
-                            if not review.get("passed"):
-                                issues = review.get("issues") if isinstance(review.get("issues"), list) else []
-                                if not issues:
-                                    issues = [{
-                                        "id": "script_functional.responsibility_review",
-                                        "failed_file": request.file_path,
-                                        "failed_function": "model responsibility review",
-                                        "code_region": "purpose/role/output/capability implementation",
-                                        "reason": review.get("repair_instructions") or "职责验收模型判定当前脚本未完成自身职责。",
-                                        "minimal_edit": "只根据职责验收模型意见局部修复当前脚本失败区域。",
-                                        "allowed_scope": request.file_path,
-                                        "forbidden_scope": "不得修改其它脚本、SKILL.md 或 SkillPlan。",
-                                    }]
-                                raise ScriptFunctionalValidationError(issues, layer="responsibility")
                     except ScriptFunctionalValidationError as exc:
                         raise _stage_error_for_script_functional(exc) from exc
                     except Exception as exc:
@@ -7345,7 +8284,11 @@ async def generate_file(request: GenerateFileRequest):
                 return
 
             except Exception as exc:
-                stage_error = exc if isinstance(exc, FileGenerationStageError) else _stage_error_from_exception("content_review", exc, default_layer="content_review")
+                stage_error = (
+                    exc
+                    if isinstance(exc, FileGenerationStageError)
+                    else _stage_error_from_exception("content_review", exc, default_layer="content_review")
+                )
                 deterministic_error = str(stage_error)
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
@@ -7394,6 +8337,7 @@ async def generate_file(request: GenerateFileRequest):
                             "done": True,
                         })
                         return
+
                     next_variant = _EMPTY_GENERATION_PROMPT_VARIANTS[empty_retry_index]
                     next_messages = (
                         _build_script_generate_file_prompt_variant(
@@ -7402,20 +8346,28 @@ async def generate_file(request: GenerateFileRequest):
                             purpose=request.purpose,
                             blueprint_text=request.blueprint_text,
                             role=request.role,
-                            skill_plan_entry=request.skill_plan_entry,
+                            skill_plan_entry=effective_skill_plan_entry,
                             variant=next_variant,
                         )
                         if request.file_path.startswith("scripts/")
                         else prompt_messages
                     )
+
                     yield _sse({
                         "type": "validation",
                         "status": "regenerating",
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
-                        "validation": {"status": "regenerating", "attempt": attempt, "source": error_source, "layer": stage_error.layer, "error": deterministic_error},
+                        "validation": {
+                            "status": "regenerating",
+                            "attempt": attempt,
+                            "source": error_source,
+                            "layer": stage_error.layer,
+                            "error": deterministic_error,
+                        },
                     })
+
                     candidate = await _complete_creator_file_generation(
                         messages=next_messages,
                         model=route.model,
@@ -7456,9 +8408,11 @@ async def generate_file(request: GenerateFileRequest):
 
                 if request.file_path.startswith("references/"):
                     targeted_repair += (
-                        "\n\n额外修复目标：references/*.md 可以没有 YAML frontmatter；"
-                        "如果有 frontmatter，顶层只允许 title/description/source/license/metadata。"
-                        "role/type/path/scope/loading/when_to_use 等内部字段必须删除或移动到 metadata.creator。"
+                        "\n\n额外修复目标：references/*.md 必须是一份正式 Markdown 参考资料文档。"
+                        "必须包含 YAML frontmatter，且 title/description 非空；"
+                        "frontmatter 顶层只允许 title、description、source、license、metadata。"
+                        "frontmatter 后必须有 Markdown 正文，正文必须包含标题，并提供可复用参考内容。"
+                        "不要输出聊天式澄清问题、确认选项、状态说明或计划询问。"
                     )
 
                 contract_text = _build_generated_file_contract_text(
@@ -7466,7 +8420,7 @@ async def generate_file(request: GenerateFileRequest):
                     request.blueprint_text,
                     request.purpose,
                     role=request.role,
-                    skill_plan_entry=request.skill_plan_entry,
+                    skill_plan_entry=effective_skill_plan_entry,
                 )
 
                 passed_checks_text = ""
@@ -7513,7 +8467,7 @@ async def generate_file(request: GenerateFileRequest):
                         "source": error_source,
                         "layer": stage_error.layer,
                         "error": deterministic_error,
-                    }
+                    },
                 })
 
                 validator_report = await _run_generated_file_validator_round(
@@ -7536,9 +8490,16 @@ async def generate_file(request: GenerateFileRequest):
                     deterministic_error,
                     validator_report,
                     targeted_repair=targeted_repair,
+                    file_path=request.file_path,
                 )
 
-                candidate = await _repair_generated_file_with_feedback(
+                repair_mode = _repair_mode_for_first_round(
+                    source=error_source,
+                    file_path=request.file_path,
+                    attempt=attempt,
+                )
+
+                repaired_candidate = await _repair_generated_file_with_feedback(
                     prompt_messages=prompt_messages,
                     model=route.model,
                     file_path=request.file_path,
@@ -7548,13 +8509,40 @@ async def generate_file(request: GenerateFileRequest):
                     contract_text=contract_text,
                     passed_checks_text=passed_checks_text,
                     failed_checks_text=failed_checks_text,
-                    repair_mode=_repair_mode_for_first_round(
-                        source=error_source,
-                        file_path=request.file_path,
-                        attempt=attempt,
-                    ),
-                    skill_plan_entry=request.skill_plan_entry,
+                    repair_mode=repair_mode,
+                    skill_plan_entry=effective_skill_plan_entry,
                 )
+
+                if request.file_path.startswith("scripts/") and repaired_candidate.strip() == (candidate or "").strip():
+                    logger.warning(
+                        "[Creator][generate_file][repair_noop] file=%s source=%s layer=%s attempt=%d repair_mode=%s",
+                        request.file_path,
+                        error_source,
+                        stage_error.layer,
+                        attempt,
+                        repair_mode,
+                    )
+
+                    repaired_candidate = await _repair_generated_file_with_feedback(
+                        prompt_messages=prompt_messages,
+                        model=route.model,
+                        file_path=request.file_path,
+                        previous_content=candidate,
+                        validation_error=(
+                            feedback
+                            + "\n\n上一轮 repair 没有改变文件内容，这是无效修复。"
+                            + "现在必须执行 strict_patch：只修改 deterministic_error / localization 指出的失败行附近代码，"
+                            + "必须落实 localization.minimal_edit，不得保留 traceback 指出的错误表达式。"
+                        ),
+                        targeted_repair=targeted_repair,
+                        contract_text=contract_text,
+                        passed_checks_text=passed_checks_text,
+                        failed_checks_text=failed_checks_text,
+                        repair_mode="strict_patch",
+                        skill_plan_entry=effective_skill_plan_entry,
+                    )
+
+                candidate = repaired_candidate
 
     return StreamingResponse(
         event_stream(),
@@ -7565,10 +8553,20 @@ async def generate_file(request: GenerateFileRequest):
         },
     )
 
-
-@router.post("/write-file", response_model=WriteFileResponse)
+@router.post("/write-file")
 async def write_file(request: WriteFileRequest):
-    """Write generated file content to disk after deterministic validation."""
+    """Write already-validated generated content to disk.
+
+    /write-file 是纯落盘阶段：
+    - 不再做 content contract 校验；
+    - 不再做 script responsibility review；
+    - 不再做 script smoke trial run；
+    - 不再做 SKILL.md 蓝图一致性或跨文件检查。
+
+    所有“生成内容是否合格”的问题都必须在 /generate-file 的
+    生成 → 单文件合同校验 → 职责完成度校验 → smoke 试跑 → repair 循环中解决。
+    跨脚本数据流和最终产物闭环留给独立 E2E/validate-skill 阶段。
+    """
     skill_name = _validate_skill_name(request.skill_name)
     _validate_file_path(request.file_path)
 
@@ -7582,140 +8580,10 @@ async def write_file(request: WriteFileRequest):
     if not skill_dir.exists():
         raise HTTPException(status_code=404, detail=f"Skill 不存在：{skill_name}")
 
-    runtime_spec: ScriptRuntimeSpec | None = None
-
-    try:
-        content = _sanitize_generated_file_content(
-            request.file_path,
-            request.content,
-            role=request.role,
-            skill_plan_entry=request.skill_plan_entry,
-        )
-
-        content, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
-            file_path=request.file_path,
-            content=content,
-            skill_name=skill_name,
-            purpose=getattr(request, "purpose", "") or "",
-        )
-
-        if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":
-            content = _ensure_reference_metadata_frontmatter(
-                file_path=request.file_path,
-                content=content,
-                purpose=getattr(request, "purpose", "") or "",
-                skill_plan_entry=request.skill_plan_entry,
-            )
-
-        if request.file_path == "SKILL.md":
-            # First round: file-level SKILL.md contract only. Cross-file
-            # placeholder/dataflow closure is handled by validate_workflow_e2e().
-            _raise_file_contract_failures(validate_file_contract(
-                file_path=request.file_path,
-                content=content,
-                blueprint_text=request.blueprint_text or "",
-                skill_plan_entry=request.skill_plan_entry,
-            ))
-
-            # write-file is still part of file-by-file creation.
-            # scripts/references may not exist yet, so do not require disk existence.
-            _validate_skill_md_against_existing_files(
-                skill_name,
-                content,
-                blueprint_text=request.blueprint_text or "",
-                require_existing=False,
-            )
-
-            if request.blueprint_text:
-                await _validate_skill_md_blueprint_alignment(
-                    skill_name=skill_name,
-                    content=content,
-                    blueprint_text=request.blueprint_text,
-                    skill_plan_entry=request.skill_plan_entry,
-                    model=None,
-                )
-
-        elif request.file_path.startswith("references/"):
-            _raise_file_contract_failures(validate_file_contract(
-                file_path=request.file_path,
-                content=content,
-                blueprint_text=request.blueprint_text or "",
-                skill_plan_entry=request.skill_plan_entry,
-            ))
-
-        elif request.file_path.startswith("scripts/"):
-            _raise_file_contract_failures(_check_script_content_review_contract(
-                request.file_path,
-                content,
-                role=request.role,
-                skill_plan_entry=request.skill_plan_entry,
-            ))
-            _validate_script_against_existing_skill_contract(
-                skill_name,
-                request.file_path,
-                content,
-            )
-            runtime_spec = _trial_run_generated_script_with_plan(
-                skill_name,
-                request.file_path,
-                content,
-                role=request.role,
-                skill_plan_entry=request.skill_plan_entry,
-            )
-            if runtime_spec is not None:
-                skill_md = (
-                    (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-                    if (skill_dir / "SKILL.md").is_file()
-                    else ""
-                )
-                entry = _skill_plan_entry_for_file(
-                    file_path=request.file_path,
-                    blueprint_text=skill_md,
-                    role=request.role,
-                    skill_plan_entry=request.skill_plan_entry,
-                )
-                try:
-                    review = await _run_script_responsibility_review(
-                        file_path=request.file_path,
-                        script_content=content,
-                        skill_plan_entry=entry,
-                        runtime_spec=runtime_spec,
-                        stdout_json=runtime_spec.stdout_json,
-                        artifact_paths=runtime_spec.artifact_paths,
-                        deterministic_issues=[],
-                        requested_model=None,
-                    )
-                except Exception as exc:
-                    raise ScriptFunctionalValidationError([{
-                        "id": "script_functional.responsibility_review_unavailable",
-                        "failed_file": request.file_path,
-                        "failed_function": "model responsibility review",
-                        "code_region": "responsibility hard gate",
-                        "reason": f"职责验收模型不可用或返回异常：{type(exc).__name__}: {exc}",
-                        "minimal_edit": "稍后重试职责验收；不要把职责验收异常归类为脚本运行失败。",
-                        "allowed_scope": request.file_path,
-                        "forbidden_scope": "不得改 SKILL.md、其它脚本或 SkillPlan 来绕过职责验收。",
-                    }], layer="responsibility") from exc
-                if not review.get("passed"):
-                    issues = review.get("issues") if isinstance(review.get("issues"), list) else []
-                    if not issues:
-                        issues = [{
-                            "id": "script_functional.responsibility_review",
-                            "failed_file": request.file_path,
-                            "failed_function": "model responsibility review",
-                            "code_region": "purpose/role/output/capability implementation",
-                            "reason": review.get("repair_instructions") or "职责验收模型判定当前脚本未完成自身职责。",
-                            "minimal_edit": "只根据职责验收模型意见局部修复当前脚本失败区域。",
-                            "allowed_scope": request.file_path,
-                            "forbidden_scope": "不得修改其它脚本、SKILL.md 或 SkillPlan。",
-                        }]
-                    raise ScriptFunctionalValidationError(issues, layer="responsibility")
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{request.file_path} 写入前校验失败：{exc}",
-        ) from exc
+    # 不在写入阶段重新 sanitize/canonicalize/validate。
+    # generate-file 已经返回经过单文件闭环校验和必要规范化后的 content；
+    # write-file 如果再次改写，会造成“前端展示内容”和“实际落盘内容”不一致。
+    content = request.content or ""
 
     target_path = skill_dir / request.file_path
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7726,7 +8594,7 @@ async def write_file(request: WriteFileRequest):
         path=str(target_path),
         bytes=len(content.encode("utf-8")),
         message=f"已写入：{request.file_path}",
-        runtime_spec=_script_runtime_spec_to_dict(runtime_spec) if request.file_path.startswith("scripts/") else None,
+        runtime_spec=None,
     )
 
 @dataclass(frozen=True)
@@ -8636,11 +9504,21 @@ def _parse_e2e_stdout_json(
     command: E2EWorkflowCommand,
     proc: subprocess.CompletedProcess[str],
     trial_skill_dir: Path,
-    trial_skill_md: str,
     content: str,
     entry: SkillPlanEntry,
     rendered_payload: dict[str, Any],
+    trial_skill_md: str | None = None,
 ) -> dict[str, Any]:
+    """Parse and validate one E2E step stdout.
+
+    This function must not depend on an outer-scope ``trial_skill_md`` variable.
+    Older callers may not pass trial_skill_md, so we recover it from the copied
+    trial Skill directory when missing.
+    """
+    if trial_skill_md is None:
+        skill_md_path = trial_skill_dir / "SKILL.md"
+        trial_skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+
     if proc.returncode != 0:
         raise ValueError(_format_e2e_failure(E2EFailure(
             failed_step_index=command.ordinal,
@@ -8659,7 +9537,12 @@ def _parse_e2e_stdout_json(
         )))
 
     try:
-        refined_contract, _resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, entry.role, entry.__dict__)
+        refined_contract, _resolution = _contract_resolution_for_trial(
+            command.script_path,
+            trial_skill_md,
+            entry.role,
+            entry.__dict__,
+        )
         _validate_trial_stdout_json(
             stdout=proc.stdout,
             content=content,
@@ -8680,9 +9563,13 @@ def _parse_e2e_stdout_json(
             stdout=(proc.stdout or "")[-4000:],
             stderr=(proc.stderr or "")[-4000:],
             return_code=proc.returncode,
-            expected="stdout 必须是合法 JSON object，required outputs 存在，文件产物真实存在。",
+            expected="stdout 必须是合法 JSON object，required outputs 存在；只有真正 artifact/path/file 语义字段才检查文件产物真实存在。",
             actual=f"stdout_contract_error={exc}",
-            repair_instruction=f"只修改 {command.script_path} 的 stdout/artifact 输出逻辑，不修改其它文件。",
+            repair_instruction=(
+                f"只修改 {command.script_path} 的 stdout/artifact 输出逻辑，不修改其它文件。"
+                "如果失败字段是普通业务 stdout 字段，不要把它改成文件路径；"
+                "如果失败字段是 pdf_path/image_path/file_outputs 等产物字段，则确保真实写入文件并返回正确路径。"
+            ),
             layer="stdout_contract",
         ))) from exc
 
@@ -8695,7 +9582,7 @@ def _parse_e2e_stdout_json(
                 layer="stdout_json_parse",
                 message=(
                     f"第 {command.ordinal} 步 {command.script_path} stdout 不是合法 JSON。\n"
-                    f"stdout={proc.stdout[-4000:]}"
+                    f"stdout={(proc.stdout or '')[-4000:]}"
                 ),
             )
         ) from exc

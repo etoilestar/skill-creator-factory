@@ -494,7 +494,16 @@ function normalizeAssetRequirementPath(requirement, index) {
 
 function isAssetFile(file) {
   const path = normalizeSkillPath(file?.path)
-  return path.startsWith('assets/') && (hasFileExtension(path) || file?.asset_requirement) && file?.asset_source === 'user_upload'
+
+  if (!path.startsWith('assets/')) return false
+
+  // assets/** 在 Creator 中默认是素材文件。
+  // 只要是具体 assets 文件或 asset_requirement，都应走上传流程，
+  // 不要求后端必须把 asset_source 标成 user_upload。
+  //
+  // 这样可以避免后端旧解析把 asset_source 误写成 bundled/空字符串后，
+  // 前端不显示上传按钮的问题。
+  return hasFileExtension(path) || Boolean(file?.asset_requirement)
 }
 
 function isReferenceFile(file) {
@@ -550,38 +559,89 @@ function commitName() {
 function addFile() {
   const path = newFilePath.value.trim()
   if (!path) return
+
   const allowed = ['SKILL.md', 'scripts/', 'references/', 'assets/']
   if (!allowed.some(p => path === p || path.startsWith(p))) {
     alert('路径必须是 SKILL.md 或 scripts/*、references/*、assets/* 下的文件')
     return
   }
+
   if (looksLikeDirectoryPath(path)) {
     alert('目录路径不需要加入待生成列表；请只添加具体文件，例如 assets/template.pdf')
     return
   }
+
   if (localFiles.value.some(f => f.path === path)) {
     alert('该文件路径已存在')
     return
   }
+
+  const isSkillMd = path === 'SKILL.md'
+  const isScript = path.startsWith('scripts/')
+  const isReference = path.startsWith('references/')
+  const isAsset = path.startsWith('assets/')
+
   localFiles.value.push({
     path,
     purpose: newFilePurpose.value.trim() || (
-        path === 'SKILL.md'
+      isSkillMd
         ? 'Skill 核心说明文件'
-        : `${path} 的职责待确认；请补充 role/inputs/outputs/capabilities 后再生成`
+        : isAsset
+          ? '用户上传素材文件'
+          : `${path} 的职责待确认；请补充 role/inputs/outputs/capabilities 后再生成`
     ),
-    required: path === 'SKILL.md',
-    can_skip: path !== 'SKILL.md',
-    file_type: path === 'SKILL.md' ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
-    file_kind: path === 'SKILL.md' ? 'skill_doc' : (path.startsWith('scripts/') ? 'script' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'config'))),
-    role: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'generic_script')),
-    component_hint: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('scripts/') ? 'generic_script' : ''),
+    required: isSkillMd || isAsset,
+    can_skip: !isSkillMd && !isAsset,
+    file_type: isSkillMd ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
+    file_kind: isSkillMd
+      ? 'skill_doc'
+      : (
+          isScript
+            ? 'script'
+            : (
+                isReference
+                  ? 'reference'
+                  : (
+                      isAsset
+                        ? 'asset'
+                        : 'config'
+                    )
+              )
+        ),
+    role: isSkillMd
+      ? 'skill_overview'
+      : (
+          isReference
+            ? 'reference'
+            : (
+                isAsset
+                  ? 'asset'
+                  : 'generic_script'
+              )
+        ),
+    component_hint: isSkillMd
+      ? 'skill_overview'
+      : (
+          isScript
+            ? 'generic_script'
+            : (
+                isAsset
+                  ? 'asset_requirement'
+                  : ''
+              )
+        ),
     inputs: [],
     outputs: [],
     dependencies: [],
     side_effects: [],
     required_tool_slots: [],
-    implementation_strategy: path.startsWith('scripts/') ? [{ strategy: 'local_code', reason: 'Manually added script defaults to local code until normalized.' }] : [],
+    implementation_strategy: isScript
+      ? [{ strategy: 'local_code', reason: 'Manually added script defaults to local code until normalized.' }]
+      : (
+          isAsset
+            ? [{ strategy: 'require_user_asset', reason: 'assets 素材必须由用户上传，不能由模型生成。' }]
+            : []
+        ),
     selected_tools: [],
     runtime_contract: {},
     artifact_contract: {},
@@ -590,7 +650,9 @@ function addFile() {
     forbidden_capabilities: [],
     reference_files: [],
     references: [],
-    low_confidence: path.startsWith('scripts/'),
+    low_confidence: isScript,
+    asset_source: isAsset ? 'user_upload' : '',
+    asset_requirement: isAsset,
     status: 'pending',
     generatedContent: '',
     bytesWritten: 0,
@@ -599,6 +661,7 @@ function addFile() {
     repairMessage: '',
     uploaded: false,
   })
+
   newFilePath.value = ''
   newFilePurpose.value = ''
   addFilePrompt.value = false

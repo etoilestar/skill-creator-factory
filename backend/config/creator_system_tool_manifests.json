@@ -1,0 +1,341 @@
+{
+  "tools": [
+    {
+      "name": "system_text_generation",
+      "tool_id": "system_text_generation",
+      "description": "Generate text with the platform-configured language model helper.",
+      "display_name": "System text generation helper",
+      "category": "generation",
+      "roles": [],
+      "enabled": true,
+      "allow_creator_use": true,
+      "required_capabilities": [
+        "text_generation"
+      ],
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string"
+          },
+          "system": {
+            "type": "string"
+          },
+          "temperature": {
+            "type": "number"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "artifact_outputs": [],
+      "side_effects": [],
+      "dependencies": [],
+      "functions": [
+        {
+          "function_name": "generate_text_with_llm",
+          "import_path": "backend.services.skill_runtime",
+          "short_description": "Generate text with the platform text model.",
+          "when_to_use": "Use when the canonical contract requires text_generation.",
+          "signature": "generate_text_with_llm(prompt: str, *, system: str = '', temperature: float = 0.7) -> str",
+          "input_schema": {
+            "type": "object",
+            "required": [
+              "prompt"
+            ],
+            "properties": {
+              "prompt": {
+                "type": "string"
+              },
+              "system": {
+                "type": "string"
+              },
+              "temperature": {
+                "type": "number"
+              }
+            }
+          },
+          "output_schema": {
+            "type": "string",
+            "description": "Raw helper return value. generate_text_with_llm returns a Python str; script stdout may wrap this string as {\"text\": text}."
+          },
+          "artifact_outputs": [],
+          "side_effects": [],
+          "dependencies": [],
+          "required_capabilities": [
+            "text_generation"
+          ],
+          "example_call": "from backend.services.skill_runtime import generate_text_with_llm\ntext = generate_text_with_llm(prompt=str(payload.get('prompt') or payload.get('user_request') or ''))\nreturn {'text': text}",
+          "return_contract": "Helper returns str. The raw return value of generate_text_with_llm is a Python str; only the script stdout should wrap it in JSON such as {\"text\": text}.",
+          "example_return": "\"Generated text content\"",
+          "example_stdout": "{\"text\":\"Generated text content\"}",
+          "common_mistakes": [
+            "Do not call .get('text') on generate_text_with_llm result; helper returns str.",
+            "Do not subscript result['text']; wrap the str into stdout JSON yourself."
+          ]
+        }
+      ],
+      "snippets": [
+        {
+          "id": "system_text_generation.generate_text_with_llm.str_return",
+          "title": "Generate text and wrap stdout JSON",
+          "kind": "minimal_usage",
+          "applies_to": {
+            "capabilities": [
+              "text_generation"
+            ]
+          },
+          "description": "Use the platform text helper; helper returns str, script stdout wraps JSON.",
+          "code": "from backend.services.skill_runtime import generate_text_with_llm\n\nprompt = str(payload.get('prompt') or payload.get('user_request') or '')\ntext = generate_text_with_llm(prompt=prompt)\nreturn {'text': text}",
+          "expected_input_shape": {
+            "prompt": "string"
+          },
+          "expected_output_shape": {
+            "text": "string"
+          },
+          "return_rule": "generate_text_with_llm returns str; return/print a JSON object that contains that str.",
+          "anti_patterns": [
+            "Do not use result.get('text').",
+            "Do not use result['text']."
+          ],
+          "requires": [
+            "text_generation"
+          ],
+          "usage_policy": "helper_preferred",
+          "priority": 130
+        }
+      ]
+    },
+    {
+      "name": "system_image_generation",
+      "tool_id": "system_image_generation",
+      "description": "Generate an image artifact with the platform-configured image helper.",
+      "display_name": "System image generation helper",
+      "category": "generation",
+      "roles": [],
+      "enabled": true,
+      "allow_creator_use": true,
+      "required_capabilities": [
+        "image_generation"
+      ],
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "topic"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "filename_prefix": {
+            "type": "string"
+          },
+          "output_dir": {
+            "type": "string"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "required": [
+          "image_path",
+          "file_outputs",
+          "prompt",
+          "source"
+        ],
+        "properties": {
+          "image_path": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "file_outputs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "artifact_outputs": [
+        {
+          "field": "image_path",
+          "type": "file_path",
+          "extensions": [
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp"
+          ],
+          "root": "outputs"
+        }
+      ],
+      "side_effects": [
+        "write_output_file"
+      ],
+      "dependencies": [],
+      "functions": [
+        {
+          "function_name": "generate_stable_diffusion_image",
+          "import_path": "backend.services.skill_runtime",
+          "short_description": "Generate an image artifact with the platform image model.",
+          "when_to_use": "Use when the canonical contract requires image_generation.",
+          "signature": "generate_stable_diffusion_image(topic: str, *, filename_prefix: str = 'generated', output_dir: str | None = None) -> dict[str, Any]",
+          "input_schema": {
+            "type": "object",
+            "required": [
+              "topic"
+            ],
+            "properties": {
+              "topic": {
+                "type": "string"
+              },
+              "filename_prefix": {
+                "type": "string"
+              },
+              "output_dir": {
+                "type": "string"
+              }
+            }
+          },
+          "output_schema": {
+            "type": "object",
+            "required": [
+              "image_path",
+              "file_outputs",
+              "prompt",
+              "source"
+            ],
+            "properties": {
+              "image_path": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "file_outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "artifact_outputs": [
+            {
+              "field": "image_path",
+              "type": "file_path",
+              "extensions": [
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp"
+              ],
+              "root": "outputs"
+            }
+          ],
+          "side_effects": [
+            "write_output_file"
+          ],
+          "dependencies": [],
+          "required_capabilities": [
+            "image_generation"
+          ],
+          "example_call": "from backend.services.skill_runtime import generate_stable_diffusion_image\nresult = generate_stable_diffusion_image(topic=str(payload.get('topic') or payload.get('prompt') or payload.get('user_request') or ''))\nreturn {'image_path': result['image_path'], 'prompt': result.get('prompt')}",
+          "return_contract": "Returns a dict with image_path, file_outputs, prompt, and source. Preserve file_outputs in script stdout.",
+          "example_return": "{\"image_path\":\"outputs/generated.png\",\"file_outputs\":[\"outputs/generated.png\"],\"prompt\":\"...\",\"source\":\"stable_diffusion\"}",
+          "common_mistakes": [
+            "Do not drop file_outputs from stdout.",
+            "Do not treat the helper return as a string path only."
+          ]
+        }
+      ],
+      "snippets": [
+        {
+          "id": "system_image_generation.generate_stable_diffusion_image.file_output",
+          "title": "Generate image with file_outputs",
+          "kind": "file_output_usage",
+          "applies_to": {
+            "capabilities": [
+              "image_generation"
+            ]
+          },
+          "description": "Use platform image helper and preserve artifact fields.",
+          "code": "from backend.services.skill_runtime import generate_stable_diffusion_image\n\ntopic = str(payload.get('topic') or payload.get('prompt') or payload.get('user_request') or '')\nresult = generate_stable_diffusion_image(topic=topic, filename_prefix=payload.get('filename_prefix') or 'generated')\nreturn {\n    'image_path': result['image_path'],\n    'file_outputs': result.get('file_outputs') or [result['image_path']],\n    'prompt': result.get('prompt') or topic,\n    'source': result.get('source') or 'stable_diffusion',\n}",
+          "expected_input_shape": {
+            "type": "object",
+            "required": [
+              "topic"
+            ],
+            "properties": {
+              "topic": {
+                "type": "string"
+              },
+              "filename_prefix": {
+                "type": "string"
+              },
+              "output_dir": {
+                "type": "string"
+              }
+            }
+          },
+          "expected_output_shape": {
+            "type": "object",
+            "required": [
+              "image_path",
+              "file_outputs",
+              "prompt",
+              "source"
+            ],
+            "properties": {
+              "image_path": {
+                "type": "string"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "file_outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "return_rule": "Return image_path, file_outputs, prompt, and source from the helper result.",
+          "anti_patterns": [
+            "Do not omit file_outputs.",
+            "Do not write image files manually when helper is available."
+          ],
+          "requires": [
+            "image_generation"
+          ],
+          "usage_policy": "helper_preferred",
+          "priority": 130
+        }
+      ]
+    }
+  ]
+}

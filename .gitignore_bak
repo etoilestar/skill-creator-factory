@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 .env
 backend/.env
-backend/Dockerfile
+
 node_modules/
 frontend/dist/
 frontend/.env*.local
@@ -13,5 +13,6 @@ skills/*/
 .skill-governance/
 
 .DS_Store
+docker-compose.yml
 backend/config.py
 bge-large-zh-v1.5

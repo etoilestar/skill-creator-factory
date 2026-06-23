@@ -191,8 +191,8 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
 
 ### SkillPlan / 文件职责计划
 > 每一个将被 Creator 创建的文件都必须在这里显式声明职责合同；scripts/ 文件必须选择一个 role，不要留空。
-> `required_capabilities` 只填写当前文件真实需要的平台能力边界；helper_required 能力必须调用平台 runtime helper，helper_preferred/self_implementation_allowed 能力可优先使用 helper 或自实现。不要因为平台支持某个 capability 就预填；不要给 `SKILL.md`、`references/*.md`、`assets/*` 填写 runtime capabilities。读取本地 `references/*.md` 不等于 `web_search`；没有明确数据库连接/SQL/业务表读取需求，不要填写 `database_read`；生成图片不等于 `vision_understanding`（该能力只用于看图、OCR、截图理解、图片内容分析）。如果脚本同时生成文本和图片，role 必须选择 `composite_generator`，`required_capabilities` 为 `[text_generation, image_generation]`。社交媒体格式优化不等于 `wechat_draft`/`wechat_publish`，只有用户明确要求创建公众号草稿或直接发布时才声明。
-> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
+> `required_capabilities` / `forbidden_capabilities` 必须由模型基于当前文件的真实运行需求显式声明；不要因为相邻概念、全局描述、文件名或业务描述自动扩展能力。后端只校验显式能力是否在当前 role 边界内，不会用业务词补 capability；资源文件（`SKILL.md`、`references/*.md`、`assets/*`）不声明 runtime capabilities。helper_required 能力必须调用平台 runtime helper；helper_preferred/self_implementation_allowed 能力可按 Tool Registry 指引使用 helper 或自实现。
+> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。目录结构只负责展示，真正驱动创建的是 SkillPlan 文件职责计划；目录结构中的路径不能覆盖 SkillPlan 同路径合同。`assets/*` 必须显式声明 `source: user_upload` 或 `source: bundled`；如不需要 assets，应明确写“无需创建”。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
 > `inputs` / `outputs` 必须是确定字段名列表，不要写候选字段、别名字段或组合表达；若存在多种可能，请先选定一个字段名。蓝图第一轮只检查文件边界、role/capability、安全边界、命令块基础格式和 JSON argv 可解析性，不在蓝图阶段要求脚本 output 必须被后续 input 静态同名消费；内部字段流转由第二轮 E2E 真实执行验证。
 
 - path: `SKILL.md`
@@ -218,18 +218,19 @@ description: 高效技能创建指南。适用于用户想要新建技能、更�
                           pdf_parsing | docx_parsing | pptx_parsing |
                           web_search | database_read |
                           wechat_draft | wechat_publish | deterministic_execution | file_output]
-  forbidden_capabilities: [例如 pdf_builder 禁止 image_generation；text_generator 禁止 pdf_generation/image_generation；未明确直接发布时禁止 wechat_publish]
+  forbidden_capabilities: [列出当前 role 边界内必须禁止的 runtime capability；不要用业务描述自动补充]
   references: [需要引用的 references/*.md]
 - path: `references/<name>.md`
   role: reference
   inputs: []
-  outputs: [non_empty_markdown, required_sections]
+  outputs: [reference_metadata, reference_body]
   dependencies: []
   required_capabilities: []
   forbidden_capabilities: [runtime_execution, image_generation]
   references: []
 - path: `assets/<name.ext>`
   role: asset
+  source: <user_upload | bundled>
   inputs: []
   outputs: []
   dependencies: []
@@ -340,7 +341,7 @@ description: 清晰描述 Skill 功能和触发场景。
 6. **标准 Markdown Block 触发执行**：如果 Skill 需要脚本、命令或写文件，SKILL.md 必须保持普通 Markdown 写法，并明确要求 assistant 在运行时输出标准 fenced code block；宿主不会因为 SKILL.md 中出现 `scripts/...` 行内路径就自动执行。
 7. **不要自定义协议**：不要在生成的 SKILL.md 中加入 `Runtime Contract` JSON、action DSL 或自定义标签；用自然 Markdown 段落、列表和 ```bash 示例说明动作。
 8. **不要假装执行**：SKILL.md 必须要求 assistant 等待宿主 observation，再基于 stdout/stderr/输出文件回答用户。
-9. **不要生成假实现**：脚本必须有真实可执行逻辑；涉及图像/多模态时，优先说明使用宿主已配置模型能力，不要写 API key、关键词数据库、placeholder 图片或“模拟 AI 绘图”脚本。需要模型判断的开放式 Skill 优先直接由模型回答；如必须包含脚本，脚本必须区分模型来源：文本/语义使用 `LLM_BASE_URL` + `TEXT_MODEL`，看图理解/OCR/多模态问答使用 `LLM_BASE_URL` + `VISION_MODEL`，生成图片使用 Stable Diffusion 图片运行时 `IMAGE_BASE_URL` + `IMAGE_MODEL`，不得用 `VISION_MODEL` 生成图片；图片脚本应调用平台 helper `backend.services.skill_runtime.generate_stable_diffusion_image`，由平台侧静默完成中文 topic 到英文 Stable Diffusion prompt 的转换、b64_json 解析与 `OUTPUT_DIR` 落盘，不要把翻译细节写进创建出来的 Skill；确定性脚本必须实现真实算法，不得用固定模板、随机词表或 ASCII 图冒充模型能力。
+9. **不要生成假实现**：脚本必须有真实可执行逻辑；模型、网络、外部副作用、文件产物等能力只能在当前脚本 SkillPlan 显式声明且 Tool Registry 允许时使用。具体 helper、环境变量、返回结构以 Tool Registry snippets/function cards 为准；不得用固定模板、随机词表、placeholder、mock API 或空文件冒充真实能力。
 
 #### 标准 Markdown 执行说明模板
 

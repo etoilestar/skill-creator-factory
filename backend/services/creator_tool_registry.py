@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
+from .creator_tool_discovery import discover_creator_tool_records
+
 
 UsagePolicy = Literal["helper_required", "helper_preferred", "self_implementation_allowed"]
 SnippetKind = Literal[
@@ -53,6 +55,7 @@ CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "c
 _TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
 _TOOL_AUTHORING_CONFIG_LOADED = False
 _REGISTERED_TOOL_CAPABILITIES: dict[str, "ToolCapability"] = {}
+_DISCOVERED_TOOL_CAPABILITIES: dict[str, "ToolCapability"] = {}
 _TOOL_OVERRIDES: dict[str, dict[str, bool]] = {}
 
 _ALLOWED_USAGE_POLICIES = {"helper_required", "helper_preferred", "self_implementation_allowed"}
@@ -97,6 +100,8 @@ class ToolFunctionManifest:
     signature: str
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     return_contract: str = "Returns a dict that conforms to output_schema."
     example_call: str = ""
     example_return: str = ""
@@ -136,6 +141,8 @@ class ToolCapability:
     safety_level: str = "standard"
     input_schema: dict[str, Any] = field(default_factory=dict)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    artifact_outputs: list[dict[str, Any]] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
     trial_mode: Literal["none", "mock", "minimal_file"] = "mock"
     validator_kind: str = "generic_python_script"
     prompt_guidance: str = ""
@@ -209,7 +216,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "http_request": _simple_cap("http_request", "HTTP/API 请求", "retrieval", ["search_reader", "generic_script"], prompt="Metadata only. Generated scripts implement HTTP themselves when permissions.network=true."),
     "network_read": _simple_cap("network_read", "网络资源读取", "retrieval", ["search_reader", "generic_script"]),
     "web_search": _simple_cap("web_search", "网页搜索", "retrieval", ["search_reader"], required_env=["SEARCHXNG_BASE_URL"]),
-    "database_read": _simple_cap("database_read", "数据库只读查询", "retrieval", ["database_reader"], required_secrets=["DATABASE_URL"]),
+    "database_read": _simple_cap("database_read", "数据库只读查询", "retrieval", ["database_reader"], required_secrets=["DATABASE_URL"], helper_imports=["query_database_readonly"]),
     "wechat_draft": _simple_cap("wechat_draft", "微信公众号草稿", "publisher", ["wechat_draft_creator"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"]),
     "wechat_publish": _simple_cap("wechat_publish", "微信公众号发布", "publisher", ["wechat_publisher"], required_secrets=["WECHAT_APP_ID", "WECHAT_APP_SECRET"], allow_external_side_effect=True, enabled=False),
     "deterministic_execution": _simple_cap("deterministic_execution", "确定性脚本执行", "common", ["generic_script"]),
@@ -219,6 +226,148 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "authoring_dependency_check": _simple_cap("authoring_dependency_check", "Authoring 依赖检测", "authoring", ["tool_authoring"], allow_creator_use=False),
     "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
+
+BUILTIN_TOOL_CAPABILITIES["text_generation"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["text_generation"],
+    helper_imports=["generate_text_with_llm"],
+    input_schema={"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}}},
+    output_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
+    functions=[
+        ToolFunctionManifest(
+            function_name="generate_text_with_llm",
+            import_path="backend.services.skill_runtime",
+            short_description="Generate text with the host-configured language model.",
+            when_to_use="Use when a script declares text_generation and needs open-ended text output from the host model.",
+            signature="generate_text_with_llm(prompt: str, *, system: str = '', temperature: float = 0.7) -> str",
+            input_schema={"type": "object", "required": ["prompt"], "properties": {"prompt": {"type": "string"}, "system": {"type": "string"}, "temperature": {"type": "number"}}},
+            output_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
+            return_contract="Returns generated text as a string; script stdout must map it into the declared output field.",
+            example_call="from backend.services.skill_runtime import generate_text_with_llm\ntext = generate_text_with_llm(prompt=str(payload.get('prompt') or payload.get('text') or payload.get('user_request') or ''))",
+            common_mistakes=["Do not call the helper and then ignore the returned text.", "Do not replace generated text with a fixed template."],
+            usage_policy="helper_preferred",
+            required_capabilities=["text_generation"],
+        )
+    ],
+    usage_policy="helper_preferred",
+    prompt_guidance="需要文本生成时，可优先使用 backend.services.skill_runtime.generate_text_with_llm；模型配置由宿主运行时注入。",
+)
+
+BUILTIN_TOOL_CAPABILITIES["file_output"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["file_output"],
+    helper_imports=["create_text_file"],
+    functions=[
+        ToolFunctionManifest(
+            function_name="create_text_file",
+            import_path="backend.services.runtime_tools",
+            short_description="Create a UTF-8 TXT file and return artifact paths.",
+            when_to_use="Use for scripts that need to persist plain text as a .txt output artifact.",
+            signature="create_text_file(text: str, filename: str | None = None, output_dir: str | None = None) -> dict[str, Any]",
+            input_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}, "filename": {"type": "string"}, "output_dir": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["text_path", "file_outputs"], "properties": {"text_path": {"type": "string"}, "file_paths": {"type": "array", "items": {"type": "string"}}, "file_outputs": {"type": "array", "items": {"type": "string"}}}},
+            artifact_outputs=[{"field": "text_path", "type": "file_path", "extensions": [".txt"], "root": "outputs"}],
+            side_effects=["write_output_file"],
+            return_contract="Returns {'text_path': path, 'file_paths': [path], 'file_outputs': [path]}; script stdout must preserve file_outputs.",
+            example_call="from backend.services.runtime_tools import create_text_file\nresult = create_text_file(text=payload.get('text') or '', filename=payload.get('filename') or 'output.txt')",
+            common_mistakes=["Do not use Path(...).write_text(...) directly when this helper is selected.", "Do not omit file_outputs from stdout."],
+            usage_policy="helper_preferred",
+            required_capabilities=["file_output"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="file_output.create_text_file",
+            title="Create TXT artifact",
+            kind="file_output_usage",
+            applies_to={"capabilities": ["file_output"]},
+            description="Use the platform helper for TXT file outputs.",
+            code="from backend.services.runtime_tools import create_text_file\n\nresult = create_text_file(text=str(payload.get('text') or payload.get('content') or ''), filename=payload.get('filename') or 'output.txt')\nreturn {'text_path': result['text_path'], 'file_outputs': result['file_outputs']}",
+            expected_input_shape={"text": "string", "filename": "string?"},
+            expected_output_shape={"text_path": "string", "file_outputs": ["string"]},
+            return_rule="Return text_path and file_outputs from create_text_file.",
+            anti_patterns=["Do not hand-write files with Path(...).write_text(...) when this helper is available.", "Do not omit file_outputs."],
+            requires=["file_output"],
+            usage_policy="helper_preferred",
+            priority=120,
+        )
+    ],
+    usage_policy="helper_preferred",
+)
+
+# Built-in document helpers are real callable functions, not just capability
+# labels. Keep their manifest next to the registry entry so Creator can inject a
+# safe import/call card only when implementation resolution selects the tool.
+BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["pdf_generation"],
+    helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
+    functions=[
+        ToolFunctionManifest(
+            function_name="create_pdf",
+            import_path="backend.services.runtime_tools",
+            short_description="Create a Unicode-capable PDF from text and return artifact paths.",
+            when_to_use="Use for scripts that need to produce a PDF artifact from text content.",
+            signature="create_pdf(text: str | Iterable[Any], *, filename: str = 'output.pdf', output_dir: str | None = None, title: str | None = None) -> dict[str, Any]",
+            input_schema={
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "filename": {"type": "string"},
+                    "output_dir": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+            },
+            output_schema={
+                "type": "object",
+                "required": ["pdf_path", "file_outputs"],
+                "properties": {
+                    "pdf_path": {"type": "string"},
+                    "file_paths": {"type": "array", "items": {"type": "string"}},
+                    "file_outputs": {"type": "array"},
+                },
+            },
+            example_call=(
+                "from backend.services.runtime_tools import create_pdf\n\n"
+                "result = create_pdf(\n"
+                "    text=payload[\"text_content\"],\n"
+                "    filename=payload.get(\"output_filename\") or \"output.pdf\",\n"
+                ")"
+            ),
+            usage_policy="helper_preferred",
+            allowed_roles=["pdf_builder", "composite_generator"],
+            required_capabilities=["pdf_generation"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="pdf_generation.create_pdf",
+            title="Create a simple PDF",
+            applies_to={"roles": ["pdf_builder", "composite_generator"], "capabilities": ["pdf_generation"]},
+            description="Use the platform PDF helper for text-to-PDF artifact generation.",
+            code=(
+                "from backend.services.runtime_tools import create_pdf\n\n"
+                "text = str(payload.get('text_content') or payload.get('text') or '')\n"
+                "result = create_pdf(text=text, filename=payload.get('output_filename') or 'output.pdf')\n"
+                "return {\n"
+                "    'pdf_path': result['pdf_path'],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['pdf_path']],\n"
+                "}"
+            ),
+            expected_input_shape={"text_content": "string", "output_filename": "string?"},
+            expected_output_shape={"pdf_path": "string", "file_outputs": ["string"]},
+            return_rule="Return pdf_path and file_outputs from create_pdf.",
+            anti_patterns=[
+                "Do not return {'pdf_path': result}; create_pdf returns a dict, not a string.",
+                "Do not invent an import path.",
+                "Do not use `from  import run`.",
+                "Do not write outside OUTPUT_DIR.",
+            ],
+            requires=["pdf_generation"],
+            usage_policy="helper_preferred",
+            priority=120,
+        )
+    ],
+    usage_policy="helper_preferred",
+)
 
 
 def _utc_now() -> str:
@@ -893,6 +1042,13 @@ def _with_overrides(capability: ToolCapability) -> ToolCapability:
 
 
 def _load_registered_tools_from_disk() -> None:
+    _DISCOVERED_TOOL_CAPABILITIES.clear()
+    for record in discover_creator_tool_records():
+        try:
+            cap = _capability_from_dict(record)
+            _DISCOVERED_TOOL_CAPABILITIES[cap.name] = cap
+        except Exception:
+            continue
     if not CUSTOM_TOOL_REGISTRY_PATH.exists():
         return
     try:
@@ -918,11 +1074,17 @@ def persist_registered_tools() -> None:
 
 
 def list_tool_capabilities() -> list[ToolCapability]:
-    return [_with_overrides(cap) for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()]]
+    merged = {
+        **BUILTIN_TOOL_CAPABILITIES,
+        **_DISCOVERED_TOOL_CAPABILITIES,
+        **_REGISTERED_TOOL_CAPABILITIES,
+    }
+    return [_with_overrides(cap) for cap in merged.values()]
 
 
 def get_tool_capability(name: str) -> ToolCapability | None:
-    cap = BUILTIN_TOOL_CAPABILITIES.get((name or "").strip()) or _REGISTERED_TOOL_CAPABILITIES.get((name or "").strip())
+    key = (name or "").strip()
+    cap = BUILTIN_TOOL_CAPABILITIES.get(key) or _DISCOVERED_TOOL_CAPABILITIES.get(key) or _REGISTERED_TOOL_CAPABILITIES.get(key)
     return _with_overrides(cap) if cap else None
 
 
@@ -950,7 +1112,7 @@ def set_tool_capability_override(name: str, *, enabled: bool | None = None, allo
 
 
 def roles() -> list[str]:
-    return sorted({role for cap in [*BUILTIN_TOOL_CAPABILITIES.values(), *_REGISTERED_TOOL_CAPABILITIES.values()] for role in cap.roles})
+    return sorted({role for cap in list_tool_capabilities() for role in cap.roles})
 
 
 def get_script_roles() -> list[str]:
@@ -977,7 +1139,11 @@ def capabilities_for_role(role: str, *, only_creator_enabled: bool = True) -> tu
     caps = list_tool_capabilities()
     if only_creator_enabled:
         caps = [cap for cap in caps if cap.enabled_by_default and cap.allow_creator_use]
+    if role == "search_reader" and not any(cap.name == "web_search" for cap in caps):
+        return [], list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
     required = [cap.name for cap in caps if (role or "").strip() in cap.roles]
+    if role == "search_reader":
+        required = [name for name in required if name == "web_search"]
     if role == "generic_script" and "deterministic_execution" not in required:
         required.append("deterministic_execution")
     return required, list(_ROLE_FORBIDDEN_CAPABILITIES.get((role or "").strip(), []))
@@ -1006,8 +1172,9 @@ def tool_status(capability: ToolCapability) -> dict[str, Any]:
         "missing_secrets": missing_secrets,
         "missing_dependencies": missing_dependencies,
         "missing_runtime_helpers": [],
-        "runtime_helpers_available": [],
+        "runtime_helpers_available": sorted(set([*cap.helper_imports, *[fn.function_name for fn in cap.functions if fn.function_name]])),
         "runtime_type": "python_script",
+        "override_persistence": TOOL_OVERRIDE_PERSISTENCE,
     }
 
 
@@ -1079,7 +1246,41 @@ def set_tool_snippets(name: str, snippets: list[ToolSnippet]) -> ToolCapability 
 
 
 def function_cards_for_tool(capability: ToolCapability) -> list[str]:
-    return [f"Tool: {capability.name}.{fn.function_name}\nSignature: {fn.signature}\nRuntime: python_script" for fn in capability.functions]
+    cards: list[str] = []
+    for fn in capability.functions:
+        if not fn.import_path or not fn.function_name:
+            continue
+        cards.append("\n".join([
+            f"Tool: {capability.name}.{fn.function_name}",
+            f"Function: {fn.function_name}",
+            f"Import: from {fn.import_path} import {fn.function_name}",
+            f"Signature: {fn.signature}",
+            f"usage_policy={fn.usage_policy or capability.usage_policy}",
+            "Input schema:",
+            json.dumps(fn.input_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Output schema:",
+            json.dumps(fn.output_schema or {}, ensure_ascii=False, sort_keys=True),
+            "Return contract:",
+            fn.return_contract or "Returns a JSON-serializable value matching output_schema.",
+            "Example return:",
+            fn.example_return or "",
+            "Example stdout:",
+            fn.example_stdout or "",
+            "Common mistakes:",
+            json.dumps(fn.common_mistakes or [], ensure_ascii=False, sort_keys=True),
+            "Required env:",
+            json.dumps(fn.required_env or capability.required_env or [], ensure_ascii=False, sort_keys=True),
+            "Required secrets:",
+            json.dumps(fn.required_secrets or capability.required_secrets or [], ensure_ascii=False, sort_keys=True),
+            "Artifact outputs:",
+            json.dumps(fn.artifact_outputs or capability.artifact_outputs or [], ensure_ascii=False, sort_keys=True),
+            "Side effects:",
+            json.dumps(fn.side_effects or capability.side_effects or [], ensure_ascii=False, sort_keys=True),
+            "Example call:",
+            (fn.example_call or f"from {fn.import_path} import {fn.function_name}\nresult = {fn.function_name}(...)").strip(),
+            "Runtime: python_script",
+        ]))
+    return cards
 
 
 def resolve_tool_snippets_for_context(*, role: str, capabilities: list[str], tool_names: list[str], file_path: str, failure_layer: str | None = None, error_text: str | None = None, max_snippets: int = 5) -> list[dict[str, Any]]:
@@ -1103,38 +1304,180 @@ def tool_snippet_prompt(snippets: list[dict[str, Any]]) -> str:
     return "当前脚本可用工具 Snippets：\n\n" + "\n\n---\n\n".join(str(item.get("formatted") or "") for item in snippets)
 
 
+
+
+def _as_list_attr(entry: Any, attr: str) -> list[str]:
+    raw = entry.get(attr) if isinstance(entry, dict) else getattr(entry, attr, None)
+    return [str(item) for item in raw or [] if item]
+
+
+def tool_layer_prompt_for_context(
+    *,
+    role: str = "",
+    required_capabilities: list[str] | None = None,
+    optional_capabilities: list[str] | None = None,
+    allowed_capabilities: list[str] | None = None,
+    forbidden_capabilities: list[str] | None = None,
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+) -> str:
+    """Return a layered tool recommendation prompt for Creator script generation/repair."""
+    required = [str(item) for item in required_capabilities or [] if item]
+    optional = [str(item) for item in optional_capabilities or [] if item]
+    allowed = [str(item) for item in allowed_capabilities or [] if item]
+    forbidden = [str(item) for item in forbidden_capabilities or [] if item]
+    visible_caps = required + optional + allowed
+
+    helper_required: list[str] = []
+    helper_preferred: list[str] = []
+    self_allowed: list[str] = []
+    model_caps = {"text_generation", "image_generation", "vision_understanding"} & set(required)
+    for name in visible_caps:
+        cap = get_tool_capability(name)
+        if not cap:
+            continue
+        if cap.usage_policy == "helper_required":
+            helper_required.append(name)
+        elif cap.usage_policy == "helper_preferred":
+            helper_preferred.append(name)
+        else:
+            self_allowed.append(name)
+
+    lines = [
+        "工具上下文（仅由显式 SkillPlan 能力合同解析，禁止按业务关键词扩权）：",
+        f"- 显式 role：{role or '未声明'}",
+        f"- 显式 required_capabilities：{', '.join(required) if required else '无'}",
+        f"- 显式 optional_capabilities：{', '.join(optional) if optional else '无'}",
+        f"- 显式 allowed_capabilities：{', '.join(allowed) if allowed else '无'}",
+        "基础确定性实现能力：",
+        "- 当前脚本可使用目标语言标准库完成确定性计算、解析、格式化、本地文件处理和结构转换。",
+        "平台 helper 层：",
+        f"- helper_required（必须调用）：{', '.join(helper_required) if helper_required else '无'}",
+        f"- helper_preferred（推荐调用，不强制）：{', '.join(helper_preferred) if helper_preferred else '无'}",
+        f"- self_implementation_allowed（允许自实现）：{', '.join(self_allowed) if self_allowed else '无'}",
+        "第三层：模型能力层：",
+        (
+            "- 当前脚本 required_capabilities 明确包含模型能力：" + ", ".join(sorted(model_caps)) + "；才可提示/调用对应模型。"
+            if model_caps
+            else "- 当前脚本未明确要求 text_generation/image_generation/vision_understanding；不要注入 LLM_BASE_URL、TEXT_MODEL、IMAGE_MODEL 或 VISION_MODEL。"
+        ),
+        "第四层：禁止能力层：",
+        f"- 当前 forbidden_capabilities：{', '.join(forbidden) if forbidden else '无'}。如脚本调用 forbidden helper，repair 应删除调用，不要扩大 SkillPlan。",
+    ]
+    if failure_layer:
+        lines.append(f"当前 failure_layer：{failure_layer}")
+    if error_text:
+        lines.append("错误摘要：" + str(error_text)[-1000:])
+    return "\n".join(lines)
+
 def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
     role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
-    caps = []
-    for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
-        raw = entry.get(attr) if isinstance(entry, dict) else getattr(entry, attr, None)
-        if isinstance(raw, list):
-            caps.extend(str(item) for item in raw if item)
+    def raw_attr(name: str) -> Any:
+        return entry.get(name) if isinstance(entry, dict) else getattr(entry, name, None)
+
+    selected = [str(item) for item in (raw_attr("selected_tools") or []) if item]
+    strategies = raw_attr("implementation_strategy") or []
+    slots = raw_attr("required_tool_slots") or []
+    caps = list(selected)
+    for strategy in strategies:
+        data = strategy if isinstance(strategy, dict) else getattr(strategy, "__dict__", {})
+        if str(data.get("strategy") or "") in {"use_registered_tool", "registered_tool"} and data.get("tool_id"):
+            caps.append(str(data["tool_id"]))
+        elif str(data.get("strategy") or "") == "generate_code":
+            # Backwards-compatible spelling; generation treats it as local_code.
+            continue
+    for slot in slots:
+        data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
+        for value in [data.get("slot_id"), data.get("tool_id"), data.get("capability")]:
+            if value:
+                caps.append(str(value))
+    # Compatibility only: raw capabilities are hints, but use them if no
+    # normalized implementation data was supplied at all.
+    if not caps:
+        for attr in ("required_capabilities", "optional_capabilities", "allowed_capabilities"):
+            raw = raw_attr(attr)
+            if isinstance(raw, list):
+                caps.extend(str(item) for item in raw if item)
+    if not caps:
+        outputs = set(str(item) for item in (raw_attr("outputs") or []) if item)
+        artifact_contract = raw_attr("artifact_contract") if isinstance(raw_attr("artifact_contract"), dict) else {}
+        artifact_fields = set(str(item) for item in (artifact_contract.get("stdout_fields") or artifact_contract.get("file_fields") or []) if item)
+        side_effects = set(str(item) for item in (raw_attr("side_effects") or []) if item)
+        wanted_fields = outputs | artifact_fields
+        scored: list[tuple[int, str]] = []
+        for candidate in list_tool_capabilities():
+            if not candidate.enabled_by_default or not candidate.allow_creator_use:
+                continue
+            candidate_fields: set[str] = set()
+            for fn in candidate.functions:
+                props = (fn.output_schema or {}).get("properties") if isinstance(fn.output_schema, dict) else {}
+                if isinstance(props, dict):
+                    candidate_fields.update(str(key) for key in props)
+                candidate_fields.update(str(item) for item in ((fn.output_schema or {}).get("required") or []) if item)
+            props = (candidate.output_schema or {}).get("properties") if isinstance(candidate.output_schema, dict) else {}
+            if isinstance(props, dict):
+                candidate_fields.update(str(key) for key in props)
+            candidate_fields.update(str(item) for item in ((candidate.output_schema or {}).get("required") or []) if item)
+            score = len(wanted_fields & candidate_fields) * 10
+            if side_effects and candidate.allow_external_side_effect:
+                score += 1
+            if role and role in candidate.roles:
+                score += 1  # weak hint only; never enough without structural match
+            if score >= 10:
+                scored.append((score, candidate.name))
+        caps.extend(name for _, name in sorted(scored, reverse=True))
     allowed_tools = []
+    cards: list[str] = []
     dependencies: list[str] = []
+    forbidden_imports: list[str] = []
     warnings: list[str] = []
     for name in caps:
         cap = get_tool_capability(name)
         if not cap:
             warnings.append(f"unknown capability {name!r}")
             continue
+        if not cap.enabled_by_default or not cap.allow_creator_use:
+            warnings.append(f"tool {name} is disabled or not allowed for Creator")
+            continue
         if cap.roles and role and role not in cap.roles and name != "file_output":
             warnings.append(f"tool {name} is not allowed for role {role}")
             continue
+        if cap.name in allowed_tools:
+            continue
         allowed_tools.append(name)
+        cards.extend(function_cards_for_tool(cap))
+        forbidden_imports.extend(list(cap.forbidden_direct_imports or []))
+        for fn in cap.functions:
+            forbidden_imports.extend(list(fn.forbidden_imports or []))
         for dep in cap.dependencies or []:
             record = _normalize_dependency_record(dep)
             if record.get("package"):
                 dependencies.append(record["package"])
     snippets = resolve_tool_snippets_for_context(role=role, capabilities=allowed_tools, tool_names=allowed_tools, file_path="", max_snippets=5)
+    layered_prompt = tool_layer_prompt_for_context(
+        role=role,
+        required_capabilities=_as_list_attr(entry, "required_capabilities"),
+        optional_capabilities=_as_list_attr(entry, "optional_capabilities"),
+        allowed_capabilities=_as_list_attr(entry, "allowed_capabilities"),
+        forbidden_capabilities=_as_list_attr(entry, "forbidden_capabilities"),
+    )
     return ToolResolveResult(
         allowed_tools=allowed_tools,
-        allowed_helper_imports=[],
+        allowed_helper_imports=sorted(set([
+            helper
+            for name in allowed_tools
+            for cap in [get_tool_capability(name)]
+            if cap
+            for helper in [*cap.helper_imports, *[fn.function_name for fn in cap.functions if fn.function_name]]
+            if helper
+        ])),
         required_dependencies=sorted(set(dependencies)),
-        forbidden_imports=[],
-        tool_function_cards=[],
+        forbidden_imports=sorted(set(forbidden_imports)),
+        tool_function_cards=cards,
         tool_snippets=snippets,
-        tool_usage_prompt="通用工具平台：coder 生成 python_script，后端 runner 只负责执行和校验。\n" + tool_snippet_prompt(snippets),
+        tool_usage_prompt="通用工具平台：工具选择来自 normalized plan 的 required_tool_slots / implementation_strategy / selected_tools / runtime_contract / artifact_contract；只有 selected tools 会注入 prompt；helper_preferred 不强制实现方式。\n"
+        + ("\n\nSelected tool function cards:\n\n" + "\n\n---\n\n".join(cards) if cards else "\n\nSelected tool function cards: 无")
+        + "\n\n" + layered_prompt + "\n" + tool_snippet_prompt(snippets),
         warnings=warnings,
     )
 

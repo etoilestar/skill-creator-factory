@@ -32,8 +32,8 @@
     </div>
 
     <!-- Warnings from blueprint parser -->
-    <div v-if="warnings.length" class="warnings">
-      <div v-for="(w, i) in warnings" :key="i" class="warning-item">⚠️ {{ w }}</div>
+    <div v-if="visibleWarnings.length" class="warnings">
+      <div v-for="(w, i) in visibleWarnings" :key="i" class="warning-item">⚠️ {{ warningMessage(w) }}</div>
     </div>
 
     <!-- File list -->
@@ -66,20 +66,8 @@
 
         <!-- Action buttons -->
         <span class="file-actions">
-          <template v-if="looksLikeDirectoryPath(file.path)">
-              <span class="file-meta muted">目录路径，无需上传</span>
-
-              <button
-                v-if="canRemoveFile(file)"
-                class="btn-small btn-remove"
-                @click="removeFile(idx)"
-              >
-                移除
-              </button>
-            </template>
-
-            <!-- 具体 assets 文件：必须由用户上传 -->
-            <template v-else-if="isAssetFile(file)">
+          <!-- 具体 assets 文件 / asset_requirement：必须由用户上传 -->
+          <template v-if="isAssetFile(file)">
               <input
                 type="file"
                 class="btn-small"
@@ -105,6 +93,18 @@
                 移除
               </button>
           </template>
+
+          <template v-else-if="looksLikeDirectoryPath(file.path)">
+              <span class="file-meta muted">目录路径，无需上传</span>
+
+              <button
+                v-if="canRemoveFile(file)"
+                class="btn-small btn-remove"
+                @click="removeFile(idx)"
+              >
+                移除
+              </button>
+            </template>
 
           <!-- 其他文件保持生成/写入按钮 -->
           <template v-else>
@@ -271,6 +271,7 @@ import { ref, computed, nextTick } from 'vue'
 import {
   initSkill,
   generateFileStream,
+  finalizeSkillMd,
   writeFile,
   validateSkill,
   packageSkill,
@@ -288,6 +289,8 @@ const props = defineProps({
   conversationHistory: { type: Array, default: () => [] },
   model: { type: String, default: null },
   warnings: { type: Array, default: () => [] },
+  assetRequirements: { type: Array, default: () => [] },
+  finalOutputs: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -298,8 +301,36 @@ const emit = defineEmits(['creation-complete', 'creation-error'])
 
 // File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error'
 const localFiles = ref(
-  props.files
-    .filter(f => isMaterializedSkillFilePath(f.path))
+  [
+    ...props.files,
+    ...props.assetRequirements.map((requirement, index) => ({
+      path: normalizeAssetRequirementPath(requirement, index),
+      generation_order: Number.isFinite(requirement.generation_order) ? requirement.generation_order : 3,
+      purpose: requirement.description || '需要用户上传素材',
+      required: requirement.required !== false,
+      can_skip: requirement.required === false,
+      file_type: 'asset',
+      file_kind: 'asset',
+      role: 'asset',
+      component_hint: 'asset_requirement',
+      inputs: [],
+      outputs: [],
+      dependencies: [],
+      side_effects: [],
+      required_tool_slots: [],
+      implementation_strategy: [{ strategy: 'require_user_asset', reason: requirement.description || '用户上传素材' }],
+      selected_tools: [],
+      runtime_contract: {},
+      artifact_contract: {},
+      required_capabilities: [],
+      raw_capability_hints: [],
+      forbidden_capabilities: [],
+      asset_source: 'user_upload',
+      asset_requirement: true,
+    })),
+  ]
+    .filter(f => f.asset_requirement || isMaterializedSkillFilePath(f.path))
+    .sort((a, b) => (Number(a.generation_order ?? 99) - Number(b.generation_order ?? 99)) || String(a.path || '').localeCompare(String(b.path || '')))
     .map(f => ({
       ...f,
       role: f.role || (
@@ -313,7 +344,8 @@ const localFiles = ref(
                 ? 'generic_script'
                 : null
       ),
-      status: 'pending',
+      status: f.path === 'SKILL.md' ? 'pending' : 'pending',
+      pendingLabel: f.path === 'SKILL.md' ? '待最终生成 / finalize pending' : '',
       generatedContent: '',
       bytesWritten: 0,
       error: '',
@@ -324,9 +356,31 @@ const localFiles = ref(
 )
 
 const localSkillName = ref(props.skillName)
+const scriptRuntimeSpecs = ref([])
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
+
+const visibleWarnings = computed(() => {
+  const seen = new Set()
+  return (props.warnings || []).filter((warning) => {
+    if (!warning || typeof warning !== 'object' || warning.severity !== 'user_warning') return false
+    const message = warningMessage(warning)
+    if (!message) return false
+    const key = warning && typeof warning === 'object'
+      ? [warning.source, warning.path, warning.field, warning.code].filter(Boolean).join(':')
+      : message
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+})
+
+function warningMessage(warning) {
+  return warning && typeof warning === 'object'
+    ? String(warning.message || warning.code || '')
+    : String(warning || '')
+}
 
 const phase = ref('idle')   // idle | running | paused | validating | packaging | complete | failed
 const paused = ref(false)
@@ -432,9 +486,24 @@ function isMaterializedSkillFilePath(path) {
   )
 }
 
+function normalizeAssetRequirementPath(requirement, index) {
+  const path = normalizeSkillPath(requirement?.path)
+  if (path && path.startsWith('assets/') && hasFileExtension(path)) return path
+  return `assets/__upload_required_${index + 1}__`
+}
+
 function isAssetFile(file) {
   const path = normalizeSkillPath(file?.path)
-  return path.startsWith('assets/') && hasFileExtension(path)
+
+  if (!path.startsWith('assets/')) return false
+
+  // assets/** 在 Creator 中默认是素材文件。
+  // 只要是具体 assets 文件或 asset_requirement，都应走上传流程，
+  // 不要求后端必须把 asset_source 标成 user_upload。
+  //
+  // 这样可以避免后端旧解析把 asset_source 误写成 bundled/空字符串后，
+  // 前端不显示上传按钮的问题。
+  return hasFileExtension(path) || Boolean(file?.asset_requirement)
 }
 
 function isReferenceFile(file) {
@@ -490,38 +559,100 @@ function commitName() {
 function addFile() {
   const path = newFilePath.value.trim()
   if (!path) return
+
   const allowed = ['SKILL.md', 'scripts/', 'references/', 'assets/']
   if (!allowed.some(p => path === p || path.startsWith(p))) {
     alert('路径必须是 SKILL.md 或 scripts/*、references/*、assets/* 下的文件')
     return
   }
+
   if (looksLikeDirectoryPath(path)) {
     alert('目录路径不需要加入待生成列表；请只添加具体文件，例如 assets/template.pdf')
     return
   }
+
   if (localFiles.value.some(f => f.path === path)) {
     alert('该文件路径已存在')
     return
   }
+
+  const isSkillMd = path === 'SKILL.md'
+  const isScript = path.startsWith('scripts/')
+  const isReference = path.startsWith('references/')
+  const isAsset = path.startsWith('assets/')
+
   localFiles.value.push({
     path,
     purpose: newFilePurpose.value.trim() || (
-        path === 'SKILL.md'
+      isSkillMd
         ? 'Skill 核心说明文件'
-        : `${path} 的职责待确认；请补充 role/inputs/outputs/capabilities 后再生成`
+        : isAsset
+          ? '用户上传素材文件'
+          : `${path} 的职责待确认；请补充 role/inputs/outputs/capabilities 后再生成`
     ),
-    required: path === 'SKILL.md',
-    can_skip: path !== 'SKILL.md',
-    file_type: path === 'SKILL.md' ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
-    role: path === 'SKILL.md' ? 'skill_overview' : (path.startsWith('references/') ? 'reference' : (path.startsWith('assets/') ? 'asset' : 'generic_script')),
+    required: isSkillMd || isAsset,
+    can_skip: !isSkillMd && !isAsset,
+    file_type: isSkillMd ? 'skill' : path.split('/')[0]?.replace(/s$/, '') || null,
+    file_kind: isSkillMd
+      ? 'skill_doc'
+      : (
+          isScript
+            ? 'script'
+            : (
+                isReference
+                  ? 'reference'
+                  : (
+                      isAsset
+                        ? 'asset'
+                        : 'config'
+                    )
+              )
+        ),
+    role: isSkillMd
+      ? 'skill_overview'
+      : (
+          isReference
+            ? 'reference'
+            : (
+                isAsset
+                  ? 'asset'
+                  : 'generic_script'
+              )
+        ),
+    component_hint: isSkillMd
+      ? 'skill_overview'
+      : (
+          isScript
+            ? 'generic_script'
+            : (
+                isAsset
+                  ? 'asset_requirement'
+                  : ''
+              )
+        ),
     inputs: [],
     outputs: [],
     dependencies: [],
+    side_effects: [],
+    required_tool_slots: [],
+    implementation_strategy: isScript
+      ? [{ strategy: 'local_code', reason: 'Manually added script defaults to local code until normalized.' }]
+      : (
+          isAsset
+            ? [{ strategy: 'require_user_asset', reason: 'assets 素材必须由用户上传，不能由模型生成。' }]
+            : []
+        ),
+    selected_tools: [],
+    runtime_contract: {},
+    artifact_contract: {},
     required_capabilities: [],
+    raw_capability_hints: [],
     forbidden_capabilities: [],
     reference_files: [],
     references: [],
-    low_confidence: path.startsWith('scripts/'),
+    low_confidence: isScript,
+    asset_source: isAsset ? 'user_upload' : '',
+    asset_requirement: isAsset,
     status: 'pending',
     generatedContent: '',
     bytesWritten: 0,
@@ -530,6 +661,7 @@ function addFile() {
     repairMessage: '',
     uploaded: false,
   })
+
   newFilePath.value = ''
   newFilePurpose.value = ''
   addFilePrompt.value = false
@@ -569,11 +701,16 @@ async function handleAssetUpload(fileItem, event) {
   fileItem.error = ''
 
   try {
+    const uploadPath = fileItem.asset_requirement && !hasFileExtension(fileItem.path)
+      ? `assets/${selected.name}`
+      : fileItem.path
     const result = await uploadAssetAPI({
       skillName: localSkillName.value,
-      filePath: fileItem.path,
+      filePath: uploadPath,
       file: selected,
     })
+    fileItem.path = uploadPath
+    fileItem.asset_requirement = false
     fileItem.status = 'done'
     fileItem.uploaded = true
     fileItem.bytesWritten = result.size
@@ -584,6 +721,14 @@ async function handleAssetUpload(fileItem, event) {
     event.target.value = ''
   }
 }
+
+function upsertRuntimeSpec(spec) {
+  if (!spec?.script_path) return
+  const idx = scriptRuntimeSpecs.value.findIndex(item => item.script_path === spec.script_path)
+  if (idx >= 0) scriptRuntimeSpecs.value[idx] = spec
+  else scriptRuntimeSpecs.value.push(spec)
+}
+
 // ---------------------------------------------------------------------------
 // Per-file generation & writing
 // ---------------------------------------------------------------------------
@@ -596,6 +741,25 @@ async function generateOneFile(idx) {
   file.repairMessage = ''
 
   try {
+    if (file.path === 'SKILL.md') {
+      const result = await finalizeSkillMd({
+        skillName: localSkillName.value,
+        description: file.purpose || props.skillName,
+        blueprintText: props.blueprintText,
+        model: props.model,
+        references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
+        assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
+        scriptRuntimeSpecs: scriptRuntimeSpecs.value,
+        finalOutputs: props.finalOutputs,
+      })
+      file.generatedContent = result.content || ''
+      if (!file.generatedContent.trim()) {
+        throw new Error('SKILL.md finalizer 未返回任何内容')
+      }
+      file.repairMessage = result.repair_attempts ? `SKILL.md 已完成 ${result.repair_attempts} 轮模型修复并通过校验。` : ''
+      file.status = 'preview'
+      return
+    }
     for await (const chunk of generateFileStream({
       skillName: localSkillName.value,
       filePath: file.path,
@@ -617,6 +781,9 @@ async function generateOneFile(idx) {
       } else if (chunk?.validation) {
         const statusText = chunk.validation.status === 'failed' ? '自动修复失败' : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
+      } else if (chunk?.runtimeSpec) {
+        upsertRuntimeSpec(chunk.runtimeSpec)
+        file.runtime_spec = chunk.runtimeSpec
       } else if (chunk?.error) {
         throw new Error(chunk.error)
       }
@@ -630,7 +797,10 @@ async function generateOneFile(idx) {
     file.status = 'preview'
   } catch (err) {
     file.status = 'error'
-    file.error = err.message || String(err)
+    const failedChecks = Array.isArray(err?.detail?.failed_checks)
+      ? err.detail.failed_checks.map(item => `${item.id || 'check'}: ${item.message || ''}`).join('\n')
+      : ''
+    file.error = failedChecks || err.message || String(err)
 
     if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
       file.showPreview = true
@@ -651,6 +821,10 @@ async function writeOneFile(idx) {
       file
     )
     if (!result.success) throw new Error(result.message)
+    if (result.runtime_spec) {
+      upsertRuntimeSpec(result.runtime_spec)
+      file.runtime_spec = result.runtime_spec
+    }
     file.status = 'done'
     file.bytesWritten = result.bytes || 0
   } catch (err) {

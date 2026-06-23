@@ -14,10 +14,10 @@ import json
 import re
 from typing import Literal
 from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
-from .creator_tool_registry import capabilities_for_role as registry_capabilities_for_role
 from .skill_dataflow import parse_schema_input_item
 
 
+FileKind = Literal["script", "skill_doc", "reference", "asset", "config"]
 FileType = Literal["skill", "script", "reference", "asset", "skill_md"]
 Language = Literal["python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"]
 Runtime = Literal["python", "node", "bash", "shell", "generic", "none"]
@@ -27,40 +27,57 @@ FileRole = str
 
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 
-ROLE_ALLOWED_CAPABILITIES: dict[str, frozenset[str]] = {
-    "text_generator": frozenset({"text_generation", "file_output"}),
-    "image_generator": frozenset({"image_generation", "file_output"}),
-    "composite_generator": frozenset({
-        "text_generation",
-        "image_generation",
-        "pdf_generation",
-        "docx_generation",
-        "pptx_generation",
-        "file_output",
-    }),
-    "pdf_builder": frozenset({"pdf_generation", "file_output"}),
-    "docx_builder": frozenset({"docx_generation", "file_output"}),
-    "pptx_builder": frozenset({"pptx_generation", "file_output"}),
-    "pdf_parser": frozenset({"pdf_parsing", "file_output"}),
-    "docx_parser": frozenset({"docx_parsing", "file_output"}),
-    "pptx_parser": frozenset({"pptx_parsing", "file_output"}),
-    "spreadsheet_reader": frozenset({"spreadsheet_read", "file_output"}),
-    "vision_analyzer": frozenset({"vision_understanding", "file_output"}),
-    "search_reader": frozenset({"web_search", "text_generation", "file_output"}),
-    "database_reader": frozenset({"database_read", "text_generation", "file_output"}),
-    "wechat_draft_creator": frozenset({"wechat_draft", "file_output"}),
-    "wechat_publisher": frozenset({"wechat_publish", "file_output"}),
-    "html_asset_builder": frozenset({"html_asset_generation", "file_output"}),
-    "asset_builder": frozenset({"asset_generation", "file_output"}),
-    "generic_script": frozenset({"deterministic_execution", "file_output"}),
-}
+PLATFORM_LAYER_NAMES: frozenset[str] = frozenset({
+    "creator_internal",
+    "business_skill",
+    "runtime_artifact",
+    "static_resource",
+    "platform_protocol",
+})
 
-_HIGH_RISK_EXPLICIT_HINTS: dict[str, re.Pattern[str]] = {
-    "web_search": re.compile(r"联网|网页搜索|网络搜索|搜索网页|web[-_ ]?search|internet|search engine|searchxng|searxng", re.I),
-    "database_read": re.compile(r"数据库|SQL|业务表|数据表|database|readonly|read[-_ ]?only|query_database", re.I),
-    "vision_understanding": re.compile(r"看图|识图|OCR|截图理解|图片内容分析|视觉理解|vision|analy[sz]e image|image understanding", re.I),
-    "wechat_publish": re.compile(r"直接发布|推送到公众号|发布到公众号|wechat_publish|publish_wechat", re.I),
-}
+# Capabilities in SkillPlan are a business contract. Host execution/sandbox
+# protocol and Creator safety controls are tracked separately so generated
+# business Skills cannot smuggle platform policy through required/forbidden
+# capability lists.
+_PLATFORM_PROTOCOL_CAPABILITIES: frozenset[str] = frozenset({
+    "deterministic_execution",
+    "runtime_execution",
+    "sandbox_execution",
+    "host_scheduling",
+    "script_runner",
+})
+_PLATFORM_SAFETY_CAPABILITIES: frozenset[str] = frozenset({
+    "network_disabled",
+    "filesystem_sandbox",
+    "secret_redaction",
+    "user_confirmation",
+    "approval_required",
+})
+
+def capability_layer(capability: str) -> str:
+    """Classify a declared capability by ownership layer."""
+    name = re.sub(r"[^A-Za-z0-9_-]", "", str(capability or "").strip())
+    if not name:
+        return "business_skill"
+    if name in _PLATFORM_PROTOCOL_CAPABILITIES:
+        return "platform_protocol"
+    if name in _PLATFORM_SAFETY_CAPABILITIES:
+        return "creator_internal"
+    cap = get_tool_capability(name)
+    if cap and cap.category in {"authoring"}:
+        return "creator_internal"
+    if cap and cap.category == "resource":
+        return "static_resource"
+    return "business_skill"
+
+
+def is_business_capability(capability: str) -> bool:
+    return capability_layer(capability) == "business_skill"
+
+
+def is_platform_safety_constraint(capability: str) -> bool:
+    return capability_layer(capability) == "creator_internal"
+
 
 def _dedupe_capabilities(values: list[str]) -> list[str]:
     seen: set[str] = set()
@@ -81,50 +98,13 @@ def normalize_required_capabilities(
     required_capabilities: list[str],
     user_blueprint_text: str = "",
 ) -> list[str]:
-    """Keep SkillPlan runtime capabilities scoped to the file's real role.
+    """Deprecated compatibility shim: capabilities are hints, not contracts.
 
-    Model-written blueprints sometimes copy every platform capability into
-    ``required_capabilities``.  This normalization is intentionally stricter:
-    resource/meta files never expose runtime capabilities, resource-category
-    capabilities are dropped, and script roles only keep capabilities that the
-    role can actually use.  High-risk retrieval/vision/publish capabilities are
-    only kept when the role is their dedicated role (or the blueprint explicitly
-    asks for that operation).
+    Creator normalized plans keep model-provided capability names in
+    ``raw_capability_hints`` for diagnostics only. They must not drive role
+    validation, tool-slot inference, implementation strategy, or script prompts.
     """
-    normalized_role = (role or "").strip()
-    normalized_path = (path or "").strip().replace("\\", "/")
-    if is_resource_role(normalized_role) or normalized_path == "SKILL.md" or normalized_path.startswith(("references/", "assets/")):
-        return []
-
-    allowed = ROLE_ALLOWED_CAPABILITIES.get(normalized_role)
-    requested = _dedupe_capabilities(required_capabilities)
-    if allowed is not None:
-        requested = [capability for capability in requested if capability in allowed]
-
-    runtime_only: list[str] = []
-    for capability in requested:
-        cap = get_tool_capability(capability)
-        if cap and cap.category == "resource":
-            continue
-        runtime_only.append(capability)
-
-    blueprint_text = user_blueprint_text or ""
-    guarded_roles = {
-        "web_search": "search_reader",
-        "database_read": "database_reader",
-        "vision_understanding": "vision_analyzer",
-        "wechat_publish": "wechat_publisher",
-    }
-    guarded: list[str] = []
-    for capability in runtime_only:
-        dedicated_role = guarded_roles.get(capability)
-        if dedicated_role and normalized_role != dedicated_role:
-            pattern = _HIGH_RISK_EXPLICIT_HINTS.get(capability)
-            if not (pattern and pattern.search(blueprint_text)):
-                continue
-        guarded.append(capability)
-
-    return guarded
+    return []
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
@@ -165,21 +145,88 @@ class RoleClassification:
 
 
 @dataclass(frozen=True)
+class ToolSlot:
+    """Structured interface need resolved after blueprint normalization."""
+
+    slot_id: str
+    functional_requirement: str = ""
+    tool_id: str = ""
+    call_template: dict[str, object] = field(default_factory=dict)
+    input_construction: dict[str, object] = field(default_factory=dict)
+    output_consumption: dict[str, object] = field(default_factory=dict)
+    input_contract: dict[str, object] = field(default_factory=dict)
+    output_contract: dict[str, object] = field(default_factory=dict)
+    input_modality: str = "json"
+    output_modality: str = "json"
+    side_effects: list[str] = field(default_factory=list)
+    runtime_requirements: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ImplementationStrategy:
+    """How a normalized tool slot can be implemented."""
+
+    slot_id: str
+    strategy: str = "generate_code"
+    tool_id: str = ""
+    reason: str = ""
+
+
+
+
+@dataclass(frozen=True)
+class ScriptRuntimeSpec:
+    """Internal post-trial runtime spec used to render final SKILL.md commands.
+
+    This is not written into SKILL.md; it records the argv/stdout/artifact
+    shape that actually ran successfully during script validation.
+    """
+
+    script_path: str
+    runtime: str
+    role: str
+    responsibility: str
+    input_policy: str
+    accepted_sample_argv: dict[str, object] = field(default_factory=dict)
+    required_outputs: list[str] = field(default_factory=list)
+    actual_stdout_fields: list[str] = field(default_factory=list)
+    artifact_fields: list[str] = field(default_factory=list)
+    file_outputs: list[str] = field(default_factory=list)
+    stdout_json: dict[str, object] = field(default_factory=dict)
+    artifact_paths: list[str] = field(default_factory=list)
+    command_template: str = ""
+
+
+@dataclass(frozen=True)
 class SkillPlanEntry:
-    """Contract for one file that Creator will generate."""
+    """Normalized contract for one file that Creator will generate.
+
+    ``role`` is retained as a component hint for prompts/UI/backwards
+    compatibility. Hard execution semantics are carried by file_kind, I/O, tool
+    slots, runtime_contract, and artifact_contract.
+    """
 
     path: str
     file_type: FileType
     role: FileRole
     purpose: str
+    file_kind: FileKind = "config"
+    component_hint: str = ""
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     default_values: dict[str, object] = field(default_factory=dict)
     dependencies: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
+    raw_capability_hints: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)
     allowed_capabilities: list[str] = field(default_factory=list)
     forbidden_capabilities: list[str] = field(default_factory=list)
+    business_capabilities: list[str] = field(default_factory=list)
+    platform_capabilities: list[str] = field(default_factory=list)
+    business_forbidden_capabilities: list[str] = field(default_factory=list)
+    platform_safety_constraints: list[str] = field(default_factory=list)
+    execution_contract: dict[str, str] = field(default_factory=dict)
+    layer: str = "business_skill"
     reference_files: list[str] = field(default_factory=list)
     skill_local_references: list[str] = field(default_factory=list)
     creator_internal_references: list[str] = field(default_factory=list)
@@ -187,6 +234,14 @@ class SkillPlanEntry:
     runtime: Runtime = "none"
     entrypoint: str = ""
     command_template: str = ""
+    workflow_order: int = 0
+    logical_edges: list[dict[str, object]] = field(default_factory=list)
+    required_tool_slots: list[ToolSlot] = field(default_factory=list)
+    implementation_strategy: list[ImplementationStrategy] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
+    runtime_contract: dict[str, object] = field(default_factory=dict)
+    artifact_contract: dict[str, object] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     required: bool = True
     can_skip: bool = False
     confidence: float = 0.0
@@ -203,14 +258,6 @@ class SkillPlan:
     warnings: list[str] = field(default_factory=list)
 
 
-_IMAGE_RE = re.compile(r"图片|图像|绘图|海报|插画|image|photo|poster|illustration|stable\s*diffusion", re.I)
-_PDF_RE = re.compile(r"pdf|报告|排版|layout|document|report", re.I)
-_TEXT_RE = re.compile(r"文本|文案|故事|童话|剧本|谜语|摘要|写作|text|story|tale|fairy|riddle|summary|copy", re.I)
-_MODEL_RE = re.compile(r"模型|llm|大语言|多模态|vision|image_model|text_model", re.I)
-_IMAGE_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(images|imgs|render|illustration|poster|picture|photo|visuals)(?:[_.-]|$)|配图|插画|海报|图片", re.I)
-_PDF_SCRIPT_NAME_RE = re.compile(r"(?:^|[_/-])(?:build|export|create|make|render|combine|merge)?_?pdf(?:[_.-]|$)|(?:^|[_/-])(?:pdf_builder|build_pdf|export_pdf|combine_to_pdf|merge_to_pdf)(?:[_.-]|$)|合并.*pdf|pdf.*合并", re.I)
-
-
 def file_type_for_path(path: str) -> FileType:
     if path == "SKILL.md":
         return "skill_md"
@@ -218,23 +265,45 @@ def file_type_for_path(path: str) -> FileType:
         return "script"
     if path.startswith("references/"):
         return "reference"
+    if path.startswith("assets/"):
+        return "asset"
     return "asset"
 
 
+def file_kind_for_path(path: str) -> FileKind:
+    normalized = (path or "").replace("\\", "/")
+    if normalized == "SKILL.md":
+        return "skill_doc"
+    if normalized.startswith("scripts/"):
+        return "script"
+    if normalized.startswith("references/"):
+        return "reference"
+    if normalized.startswith("assets/"):
+        return "asset"
+    return "config"
+
+
 def heuristic_signals_for_file(file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
-    """Return role-classification hints without making the final contract decision."""
-    text = f"{file_path}\n{purpose}\n{blueprint_summary}"
+    """Return platform-structure debug signals only; never business semantics."""
     signals: list[str] = []
-    if _IMAGE_RE.search(text):
-        signals.append("mentions_image")
-    if _PDF_RE.search(text):
-        signals.append("mentions_pdf")
-    if _TEXT_RE.search(text):
-        signals.append("mentions_text")
-    if _MODEL_RE.search(text):
-        signals.append("mentions_model")
-    if Path(file_path).suffix.lower() == ".py":
-        signals.append("python_script")
+    file_type = file_type_for_path(file_path)
+    if file_type == "script":
+        signals.append("path_is_script")
+    elif file_type == "reference":
+        signals.append("path_is_reference")
+    elif file_type == "asset":
+        signals.append("path_is_asset")
+    elif file_type == "skill_md":
+        signals.append("path_is_skill_md")
+    explicit_role = _explicit_role_from_plan_text(
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
+    )
+    if explicit_role:
+        signals.append("explicit_role_declared" if explicit_role in SCRIPT_ROLES or explicit_role in RESOURCE_ROLES else "invalid_role_for_path")
+    elif file_type == "script":
+        signals.append("missing_explicit_role")
     return signals
 
 
@@ -285,31 +354,69 @@ def _runner_for_runtime(runtime: Runtime) -> str:
     return ""
 
 
-def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str]) -> str:
-    keys = inputs or ["payload"]
-    payload = "{" + ",".join(f'"{key}":"{{{{{key}}}}}"' for key in keys) + "}"
-    runner = _runner_for_runtime(runtime)
-    if runner:
-        return f"{runner} {path} '{payload}'"
-    return f"{path} '{payload}'"
+def _stable_external_envelope(values: dict[str, str] | None = None) -> dict[str, object]:
+    values = values or {}
+    return {
+        "payload": values.get("payload", "{{user_request}}"),
+        "fields": {},
+        "options": {},
+        "input_files": [],
+    }
 
 
-def render_script_command_from_skill_plan(entry: SkillPlanEntry, values: dict[str, str] | None = None) -> str:
-    """Render a SKILL.md script command directly from one SkillPlan entry.
+def _command_args_from_runtime_contract(runtime_contract: dict[str, object] | None) -> dict[str, object]:
+    contract = runtime_contract or {}
+    command_args = contract.get("command_args")
+    if isinstance(command_args, dict):
+        return dict(command_args)
+    return {}
 
-    The JSON argv key set is determined solely by ``entry.inputs``.  ``values``
-    may provide placeholder/value expressions for those keys, but it cannot add
-    extra keys.  Missing values fall back to the same-named placeholder so the
-    command remains a generic, self-consistent contract rather than a
-    business-specific guess.
-    """
-    payload_keys = list(entry.inputs or ["payload"])
-    payload = {key: (values or {}).get(key, f"{{{{{key}}}}}") for key in payload_keys}
+
+def _render_command(path: str, runtime: Runtime | str, payload: dict[str, object]) -> str:
     rendered_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    runner = _runner_for_runtime(entry.runtime)
+    runner = _runner_for_runtime(runtime)  # type: ignore[arg-type]
     if runner:
-        return f"{runner} {entry.path} '{rendered_payload}'"
-    return f"{entry.path} '{rendered_payload}'"
+        return f"{runner} {path} '{rendered_payload}'"
+    return f"{path} '{rendered_payload}'"
+
+
+def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str], runtime_contract: dict[str, object] | None = None) -> str:
+    """Render a generic command without treating SkillPlan.inputs as argv keys."""
+    payload = _command_args_from_runtime_contract(runtime_contract) or _stable_external_envelope()
+    return _render_command(path, runtime, payload)
+
+
+def render_script_command_from_skill_plan(
+    entry: SkillPlanEntry,
+    values: dict[str, str] | None = None,
+    runtime_spec: ScriptRuntimeSpec | dict[str, object] | None = None,
+) -> str:
+    """Render a SKILL.md script command from verified runtime args when available.
+
+    Priority: ScriptRuntimeSpec.accepted_sample_argv, runtime_contract.command_args,
+    entry.command_template, then the platform-stable external envelope.
+    SkillPlan.inputs remain generation hints and are not used as argv keys.
+    """
+    if runtime_spec is not None:
+        if isinstance(runtime_spec, ScriptRuntimeSpec):
+            if runtime_spec.accepted_sample_argv:
+                return _render_command(runtime_spec.script_path or entry.path, runtime_spec.runtime or entry.runtime, dict(runtime_spec.accepted_sample_argv))
+            if runtime_spec.command_template:
+                return runtime_spec.command_template
+        elif isinstance(runtime_spec, dict):
+            accepted = runtime_spec.get("accepted_sample_argv")
+            if isinstance(accepted, dict) and accepted:
+                return _render_command(str(runtime_spec.get("script_path") or entry.path), str(runtime_spec.get("runtime") or entry.runtime), dict(accepted))
+            template = str(runtime_spec.get("command_template") or "")
+            if template:
+                return template
+
+    payload = _command_args_from_runtime_contract(entry.runtime_contract)
+    if payload:
+        return _render_command(entry.path, entry.runtime, payload)
+    if entry.command_template:
+        return entry.command_template
+    return _render_command(entry.path, entry.runtime, _stable_external_envelope(values))
 
 
 
@@ -348,7 +455,7 @@ def _segment_for_file(file_path: str, *texts: str) -> str:
             segment = after[: next_match.start()] if next_match else after
             # Prefer block-style segments that actually contain contract fields;
             # inline path mentions in section summaries often have no local data.
-            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
+            if re.search(r"\b(?:role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities)\b\s*[：:=]", segment, re.I):
                 return segment
             if len(segment) > len(best):
                 best = segment
@@ -366,7 +473,7 @@ _FIELD_AMBIGUOUS_RE = re.compile(
     r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
     re.I,
 )
-_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|forbidden_capabilities|language|runtime"
+_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|side_effects|required_tool_slots|language|runtime"
 
 
 def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
@@ -540,41 +647,6 @@ def _explicit_role_from_plan_text(*, file_path: str, purpose: str = "", blueprin
 
 
 
-def _should_promote_pdf_builder_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
-    """Return True for deterministic scripts whose local responsibility is PDF output.
-
-    PDF merge/export scripts are file builders, not model generators.  The path
-    must identify a PDF builder/exporter (for example build_pdf.py,
-    export_pdf.py, or combine_to_pdf.py); global SKILL.md model prose is ignored.
-    """
-    if file_type_for_path(file_path) != "script":
-        return False
-    if not _PDF_SCRIPT_NAME_RE.search(file_path):
-        return False
-    local_segment = _segment_for_file(file_path, purpose, blueprint_summary)
-    local_text = f"{file_path}\n{local_segment or purpose}"
-    if _IMAGE_SCRIPT_NAME_RE.search(file_path):
-        return False
-    return bool(_PDF_RE.search(local_text) or _PDF_SCRIPT_NAME_RE.search(file_path))
-
-
-def _should_promote_image_script_role(file_path: str, purpose: str = "", blueprint_summary: str = "") -> bool:
-    """Return True for scripts whose local contract clearly names image generation.
-
-    Generic prose such as "this skill generates images and PDFs" remains
-    conservative.  Promotion requires both image-generation wording and an
-    image-oriented script path/name so `scripts/main.py` in an ambiguous
-    composite blueprint still falls back to `generic_script` unless role is
-    explicitly declared.
-    """
-    if file_type_for_path(file_path) != "script":
-        return False
-    text = f"{file_path}\n{purpose}\n{blueprint_summary}"
-    if not _IMAGE_RE.search(text):
-        return False
-    return bool(_IMAGE_SCRIPT_NAME_RE.search(file_path))
-
-
 def _augment_inputs_for_role(role: FileRole, inputs: list[str], *, purpose: str = "", blueprint_summary: str = "") -> list[str]:
     """Return declared inputs without platform-invented business fields."""
     return list(inputs)
@@ -586,23 +658,14 @@ def file_role_classifier(
     blueprint_summary: str = "",
     heuristic_signals: list[str] | None = None,
 ) -> RoleClassification:
-    """Classify one file into a Creator role from the plan/model contract.
-
-    Domain keyword/regex matches are collected as heuristic_signals only.  They
-    do not directly select model capabilities.  Model-generating roles require
-    an explicit plan/model role such as ``role: image_generator``; deterministic
-    PDF exporter paths such as ``build_pdf.py``/``combine_to_pdf.py`` can be
-    inferred as ``pdf_builder`` because that role only grants file-output
-    capabilities.  Ambiguous scripts fall back to conservative
-    ``generic_script`` so high-impact capabilities are not enabled by accident.
-    """
+    """Classify files by platform path and explicit SkillPlan role only."""
     file_type = file_type_for_path(file_path)
     signals = list(heuristic_signals or heuristic_signals_for_file(file_path, purpose, blueprint_summary))
 
     if file_type == "skill_md":
         return RoleClassification("skill_overview", 1.0, "SKILL.md is the process overview file", signals)
     if file_type == "reference":
-        return RoleClassification("reference", 1.0, "references/ files contain subtask guidance", signals)
+        return RoleClassification("reference", 1.0, "references/ files contain auxiliary reference material", signals)
     if file_type == "asset":
         return RoleClassification("asset", 1.0, "assets/ files are static resources or templates", signals)
 
@@ -612,36 +675,7 @@ def file_role_classifier(
         blueprint_summary=blueprint_summary,
     )
     if explicit_role in SCRIPT_ROLES:
-        return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan/blueprint", signals)
-
-    if _should_promote_pdf_builder_role(file_path, purpose, blueprint_summary):
-        if "inferred_pdf_builder_role" not in signals:
-            signals.append("inferred_pdf_builder_role")
-        return RoleClassification(
-            "pdf_builder",
-            0.82,
-            "pdf-oriented script path/local responsibility builds or combines PDF files",
-            signals,
-        )
-
-    if _should_promote_image_script_role(file_path, purpose, blueprint_summary):
-        if "inferred_image_script_role" not in signals:
-            signals.append("inferred_image_script_role")
-        if _TEXT_RE.search(f"{file_path}\n{purpose}\n{blueprint_summary}"):
-            if "inferred_composite_script_role" not in signals:
-                signals.append("inferred_composite_script_role")
-            return RoleClassification(
-                "composite_generator",
-                0.84,
-                "image-oriented script also requires text_generation capability",
-                signals,
-            )
-        return RoleClassification(
-            "image_generator",
-            0.82,
-            "image-oriented script path/purpose requires image_generation capability",
-            signals,
-        )
+        return RoleClassification(explicit_role, 0.95, "explicit role declared by SkillPlan", signals)
 
     return RoleClassification(
         "generic_script",
@@ -652,33 +686,22 @@ def file_role_classifier(
 
 
 def default_io_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    """Return permissive blueprint hints for a role.
+    """Backward-compatible neutral default; role never decides IO."""
+    return [], []
 
-    These defaults are intentionally not a runtime contract.  Runtime dataflow is
-    determined by the concrete SKILL.md command placeholders and each script's
-    JSON stdout, so business Skills can choose domain-specific field names.
-    """
-    if role in SCRIPT_ROLES:
+
+def default_io_for_file_kind(file_kind: FileKind) -> tuple[list[str], list[str]]:
+    """Conservative IO defaults derived only from file kind."""
+    if file_kind == "script":
         return ["payload"], []
-    if role == "reference":
-        return [], ["non_empty_markdown", "required_sections"]
-    if role == "asset":
-        return [], []
-    if role == "skill_overview":
-        return ["user_request"], ["workflow", "script_order", "resource_references"]
-    return ["payload"], []
+    if file_kind == "skill_doc":
+        return ["user_request"], ["workflow"]
+    return [], []
 
 
 def capabilities_for_role(role: FileRole) -> tuple[list[str], list[str]]:
-    required, forbidden = registry_capabilities_for_role(str(role))
-    required = normalize_required_capabilities(
-        role=str(role),
-        path="",
-        required_capabilities=list(required or []),
-        user_blueprint_text="",
-    )
-    forbidden = [capability for capability in list(forbidden or []) if capability not in set(required)]
-    return required, forbidden
+    """Do not infer runtime capabilities from role/component_hint."""
+    return [], []
 
 
 def build_skill_plan_entry(
@@ -699,20 +722,15 @@ def build_skill_plan_entry(
     explicit_required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_optional_capabilities = _explicit_list_field("optional_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+    explicit_side_effects = _explicit_list_field("side_effects", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or []
+    explicit_tool_slots = _explicit_list_field("required_tool_slots", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or []
     role = classification.role
     role_reason = classification.reason
-    if (
-        file_type == "script"
-        and explicit_required_capabilities
-        and {"text_generation", "image_generation"}.issubset(set(explicit_required_capabilities))
-        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
-    ):
-        role = "composite_generator"
-        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
     explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    default_inputs, default_outputs = default_io_for_role(role)
+    file_kind = file_kind_for_path(file_path)
+    default_inputs, default_outputs = default_io_for_file_kind(file_kind)
     inputs = explicit_inputs if explicit_inputs is not None else default_inputs
     inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
     outputs = explicit_outputs if explicit_outputs is not None else default_outputs
@@ -724,45 +742,22 @@ def build_skill_plan_entry(
             creator_internal_references.append(ref)
     explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
-    default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
-    required_capabilities = explicit_required_capabilities or default_required_capabilities
-    required_capabilities = normalize_required_capabilities(
-        role=role,
-        path=file_path,
-        required_capabilities=required_capabilities,
-        user_blueprint_text=f"{purpose}\n{blueprint_summary}",
+    raw_required_capabilities = explicit_required_capabilities or []
+    raw_capability_hints = _dedupe_capabilities(raw_required_capabilities)
+    platform_capabilities = [cap for cap in raw_capability_hints if capability_layer(cap) == "platform_protocol"]
+    required_capabilities: list[str] = []
+    optional_capabilities = [cap for cap in (explicit_optional_capabilities or []) if is_business_capability(cap)]
+    allowed_capabilities = [cap for cap in (explicit_allowed_capabilities or []) if is_business_capability(cap)]
+    explicit_forbidden = (
+        _explicit_list_field("business_forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+        or _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     )
-    if (
-        file_type == "script"
-        and {"text_generation", "image_generation"}.issubset(set(required_capabilities))
-        and role not in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
-    ):
-        role = "composite_generator"
-        default_required_capabilities, default_forbidden_capabilities = capabilities_for_role(role)
-        if not explicit_required_capabilities:
-            required_capabilities = default_required_capabilities
-        required_capabilities = normalize_required_capabilities(
-            role=role,
-            path=file_path,
-            required_capabilities=required_capabilities,
-            user_blueprint_text=f"{purpose}\n{blueprint_summary}",
-        )
-        inputs = explicit_inputs if explicit_inputs is not None else default_io_for_role(role)[0]
-        inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-        outputs = explicit_outputs if explicit_outputs is not None else default_io_for_role(role)[1]
-        role_reason = "normalized text_generation + image_generation capabilities to composite_generator"
-    optional_capabilities = explicit_optional_capabilities or []
-    allowed_capabilities = explicit_allowed_capabilities or []
-    forbidden_capabilities = _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or default_forbidden_capabilities
-    forbidden_capabilities = [capability for capability in forbidden_capabilities if capability not in required_capabilities]
-    if role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder"}:
-        # Document exporters are optional by default so text/image generation can
-        # be run on demand without forcing export.  An explicit blueprint/UI
-        # required=true still overrides this default by passing required=True
-        # with purpose text that says the user requested one-step export.
-        if not re.search(r"一步|一次性|直接导出|必须导出|必需导出|one[- ]?step|single[- ]?step|required", purpose or "", re.I):
-            required = False
-            can_skip = True
+    raw_forbidden_capabilities = explicit_forbidden or []
+    platform_safety_constraints = [cap for cap in _dedupe_capabilities(raw_forbidden_capabilities) if is_platform_safety_constraint(cap)]
+    forbidden_capabilities = [
+        capability for capability in _dedupe_capabilities(raw_forbidden_capabilities)
+        if is_business_capability(capability) and capability not in required_capabilities
+    ]
     detected_language = language_for_path(file_path)
     explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
     language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
@@ -774,14 +769,26 @@ def build_skill_plan_entry(
         file_type=file_type,
         role=role,
         purpose=purpose,
+        file_kind=file_kind,
+        component_hint=role,
         inputs=inputs,
         outputs=outputs,
         default_values=explicit_default_values,
         dependencies=dependencies,
+        side_effects=explicit_side_effects,
         required_capabilities=required_capabilities,
+        raw_capability_hints=raw_capability_hints,
         optional_capabilities=optional_capabilities,
         allowed_capabilities=allowed_capabilities,
         forbidden_capabilities=forbidden_capabilities,
+        business_capabilities=required_capabilities,
+        platform_capabilities=platform_capabilities,
+        business_forbidden_capabilities=forbidden_capabilities,
+        platform_safety_constraints=platform_safety_constraints,
+        execution_contract={"runtime": runtime, "entrypoint": file_path} if file_type == "script" else {},
+        runtime_contract={"runtime": runtime, "entrypoint": file_path, "argv": "json_object"} if file_type == "script" else {"runtime": "none"},
+        artifact_contract={"stdout_fields": list(outputs or []), "final": bool(file_type == "script")} if file_type == "script" else {},
+        layer="business_skill" if file_type in {"skill", "script", "skill_md"} else "static_resource",
         # Public/final SKILL.md references are skill-local only.  Creator
         # kernel references remain separate internal context and must never be
         # merged into reference_files/skill_local_references.
@@ -792,6 +799,7 @@ def build_skill_plan_entry(
         runtime=runtime,
         entrypoint=file_path if file_type == "script" else "",
         command_template=command_template_for_entry(file_path, runtime, inputs) if file_type == "script" else "",
+        required_tool_slots=explicit_tool_slots,
         required=required,
         can_skip=can_skip,
         confidence=classification.confidence,
@@ -838,8 +846,12 @@ def _is_asset_upload_only(entry: SkillPlanEntry) -> bool:
     text = f"{entry.purpose}\n{' '.join(entry.inputs)}\n{' '.join(entry.outputs)}\n{' '.join(entry.dependencies)}"
     if entry.inputs or entry.outputs or entry.dependencies or entry.required_capabilities:
         return False
-    if is_dynamic_file_path(entry.path):
+    if is_dynamic_file_path(entry.path) or is_runtime_output_path(entry.path):
         return False
+    explicit_static_source = re.search(r"(?m)^\s*(?:source|asset_source)\s*:\s*(?:user_upload|upload|uploaded|bundled|static)\s*$", entry.purpose or "", re.I)
+    explicit_runtime_artifact = re.search(r"运行时产物|运行时生成|脚本生成|最终产物|最终生成|runtime\s+artifact|generated\s+artifact", entry.purpose or "", re.I)
+    if explicit_static_source and not explicit_runtime_artifact:
+        return True
     if is_runtime_artifact_semantic(entry.path, text):
         return False
     return True
@@ -860,6 +872,46 @@ def _command_template_for_entry_with_values(entry: SkillPlanEntry) -> str:
     return render_script_command_from_skill_plan(entry)
 
 
+def _tool_slots_from_structured_contract(entry: SkillPlanEntry) -> list[ToolSlot]:
+    """Infer real external/interface slots from structured fields only.
+
+    Runtime argv/stdout and final artifact metadata are represented by
+    runtime_contract/artifact_contract and are intentionally not tool slots.
+    """
+    slots: list[ToolSlot] = []
+    for name in getattr(entry, "required_tool_slots", []) or []:
+        if isinstance(name, ToolSlot):
+            slots.append(name)
+        elif str(name).strip():
+            slots.append(ToolSlot(slot_id=str(name).strip()))
+    for effect in getattr(entry, "side_effects", []) or []:
+        effect_name = str(effect).strip()
+        if effect_name:
+            slots.append(ToolSlot(slot_id=f"{entry.path}:{effect_name}", side_effects=[effect_name], input_contract={key: "any" for key in entry.inputs}, output_contract={key: "any" for key in entry.outputs}, runtime_requirements={"runtime": entry.runtime}))
+    seen: set[str] = set()
+    deduped: list[ToolSlot] = []
+    for slot in slots:
+        if slot.slot_id in seen:
+            continue
+        seen.add(slot.slot_id)
+        deduped.append(slot)
+    return deduped
+
+
+def _implementation_strategy_for_slot(slot: ToolSlot) -> ImplementationStrategy:
+    effects = {str(item).strip().lower() for item in (slot.side_effects or []) if str(item).strip()}
+    requirements = slot.runtime_requirements or {}
+    if effects & {"user_asset", "user_upload", "uploaded_asset"}:
+        return ImplementationStrategy(slot_id=slot.slot_id, strategy="require_user_asset", reason="slot declares a user-provided asset side effect")
+    if effects & {"external_api", "network", "http", "webhook", "database", "secret"}:
+        return ImplementationStrategy(slot_id=slot.slot_id, strategy="require_external_config", reason="slot requires external service/configuration")
+    if requirements.get("tool_id") or requirements.get("registered_tool"):
+        return ImplementationStrategy(slot_id=slot.slot_id, strategy="use_registered_tool", tool_id=str(requirements.get("tool_id") or requirements.get("registered_tool") or ""), reason="slot explicitly references a registered tool")
+    if effects - {"file_write", "local_file", "stdout_json"}:
+        return ImplementationStrategy(slot_id=slot.slot_id, strategy="unsupported", reason="slot side effects are not locally implementable without a selected tool/config")
+    return ImplementationStrategy(slot_id=slot.slot_id, strategy="generate_code", reason="slot is implementable with ordinary local code")
+
+
 def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
     """Normalize and clean a parsed SkillPlan after model/regex extraction."""
     entries: list[SkillPlanEntry] = []
@@ -875,12 +927,8 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
                 continue
             seen_skill_md = True
 
-        normalized_required = normalize_required_capabilities(
-            role=entry.role,
-            path=path,
-            required_capabilities=list(entry.required_capabilities or []),
-            user_blueprint_text=entry.purpose,
-        )
+        raw_capability_hints = _dedupe_capabilities(list(entry.raw_capability_hints or entry.required_capabilities or []))
+        normalized_required: list[str] = []
         dependencies = [dep for dep in _dedupe_paths(list(entry.dependencies or [])) if not dependency_is_output_semantic(dep, prior_outputs)]
         removed_deps = set(entry.dependencies or []) - set(dependencies)
         for dep in sorted(removed_deps):
@@ -889,9 +937,16 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
         cleaned = replace(
             entry,
             path=path,
+            file_kind=file_kind_for_path(path),
+            component_hint=entry.component_hint or entry.role,
             required_capabilities=normalized_required,
+            raw_capability_hints=raw_capability_hints,
             dependencies=dependencies,
-            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required)],
+            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
+            business_capabilities=[],
+            platform_capabilities=[cap for cap in entry.platform_capabilities if capability_layer(cap) == "platform_protocol"],
+            business_forbidden_capabilities=[cap for cap in entry.business_forbidden_capabilities or entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
+            platform_safety_constraints=[cap for cap in entry.platform_safety_constraints if is_platform_safety_constraint(cap)],
         )
 
         if cleaned.role in RESOURCE_ROLES or cleaned.file_type in {"skill_md", "reference", "asset"}:
@@ -901,13 +956,15 @@ def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
             if not _is_asset_upload_only(cleaned):
                 warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
                 continue
-            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], optional_capabilities=[], allowed_capabilities=[], runtime="none", entrypoint="", command_template="")
+            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], raw_capability_hints=[], optional_capabilities=[], allowed_capabilities=[], business_capabilities=[], platform_capabilities=[], runtime="none", entrypoint="", command_template="", execution_contract={}, layer="static_resource")
 
         if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
             cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")
 
         if cleaned.file_type == "script":
-            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned))
+            slots = _tool_slots_from_structured_contract(cleaned)
+            strategies = [_implementation_strategy_for_slot(slot) for slot in slots]
+            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned), required_tool_slots=slots, implementation_strategy=strategies, runtime_contract={"runtime": cleaned.runtime, "entrypoint": cleaned.path, "argv": "json_object"}, artifact_contract={"stdout_fields": list(cleaned.outputs or []), "final": True})
             prior_outputs.update(cleaned.outputs or [])
 
         entries.append(cleaned)
@@ -1011,3 +1068,37 @@ def validate_role(role: str, file_type: FileType) -> bool:
     if file_type == "script":
         return is_script_role(role)
     return is_resource_role(role)
+
+
+def logical_plan_check(plan: SkillPlan) -> list[str]:
+    """Validate normalized-plan logical closure before concrete tool choice.
+
+    This check is intentionally independent of role/capability labels and tool
+    registry availability. It verifies only file presence, acyclic dependencies,
+    sortable workflow order, input/output flow, and final-artifact clarity.
+    """
+    issues = validate_file_plan_semantics(plan)
+    issues.extend(validate_skill_plan_dataflow(plan))
+    paths = {entry.path for entry in plan.files}
+    for entry in plan.files:
+        for dep in entry.dependencies:
+            if dep.startswith(("scripts/", "references/", "assets/")) and dep not in paths:
+                issues.append(f"{entry.path} dependency has no source file: {dep}")
+    scripts = [entry for entry in plan.files if entry.file_kind == "script"]
+    if scripts and not any(entry.outputs for entry in scripts):
+        issues.append("Final artifact/output is unresolved; at least one script must declare outputs.")
+    return issues
+
+
+def implementation_resolution(plan: SkillPlan) -> list[str]:
+    """Validate that each normalized tool slot has an implementation strategy."""
+    issues: list[str] = []
+    for entry in plan.files:
+        strategies = {strategy.slot_id: strategy.strategy for strategy in (entry.implementation_strategy or [])}
+        for slot in entry.required_tool_slots or []:
+            strategy = strategies.get(slot.slot_id)
+            if not strategy:
+                issues.append(f"{entry.path} tool slot {slot.slot_id} has no implementation strategy.")
+            elif strategy == "unsupported":
+                issues.append(f"{entry.path} tool slot {slot.slot_id} is unsupported.")
+    return issues

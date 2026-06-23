@@ -5,6 +5,16 @@
  * backend/routers/creator.py.
  */
 
+
+function blueprintBodyOnly(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return ''
+  const marker = raw.search(/(^|\n)\s*#{0,2}\s*📋\s*Skill\s+架构蓝图/)
+  const fromMarker = marker >= 0 ? raw.slice(marker).trim() : raw
+  const stop = fromMarker.search(/(^|\n)\s*(AskUserQuestion|确认问题|用户确认|请选择|选项|按钮状态|创建进度|文件生成进度)\b|(^|\n)\s*```text\s*$/i)
+  return (stop >= 0 ? fromMarker.slice(0, stop) : fromMarker).trim()
+}
+
 function assertActionSuccess(payload, fallbackMessage) {
   if (!payload || payload.success !== true) {
     throw new Error(payload?.message || fallbackMessage)
@@ -24,7 +34,7 @@ export async function analyzeBlueprintPlan(messages, model = null) {
   const resp = await fetch('/api/creator/analyze-blueprint', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages, model }),
+    body: JSON.stringify({ messages, model, strict: true }),
   })
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({ detail: resp.statusText }))
@@ -91,7 +101,7 @@ export async function* generateFileStream({
       skill_name: skillName,
       file_path: filePath,
       purpose,
-      blueprint_text: blueprintText,
+      blueprint_text: blueprintBodyOnly(blueprintText),
       conversation_history: conversationHistory,
       model,
       role,
@@ -134,6 +144,9 @@ export async function* generateFileStream({
           yield { validation: parsed.validation }
           continue
         }
+        if (parsed.runtime_spec) {
+          yield { runtimeSpec: parsed.runtime_spec }
+        }
         if (typeof parsed.content === 'string') {
           yield parsed.content
         }
@@ -142,6 +155,45 @@ export async function* generateFileStream({
       }
     }
   }
+}
+
+
+/**
+ * Finalize SKILL.md with the model using verified script runtime specs as bash-block references.
+ */
+export async function finalizeSkillMd({
+  skillName,
+  description = '',
+  blueprintText = '',
+  model = null,
+  references = [],
+  assets = [],
+  scriptRuntimeSpecs = [],
+  finalOutputs = [],
+}) {
+  const resp = await fetch('/api/creator/finalize-skill-md', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      skill_name: skillName,
+      description,
+      blueprint_text: blueprintBodyOnly(blueprintText),
+      model,
+      references,
+      assets,
+      script_runtime_specs: scriptRuntimeSpecs,
+      final_outputs: finalOutputs,
+    }),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+    const detail = err.detail || 'SKILL.md 最终生成失败'
+    const message = typeof detail === 'string' ? detail : (detail.message || JSON.stringify(detail))
+    const error = new Error(message)
+    error.detail = detail
+    throw error
+  }
+  return resp.json()
 }
 
 /**

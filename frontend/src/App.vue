@@ -47,17 +47,20 @@ import { fetchLlmHealth } from './composables/useSkills.js'
 
 const sideCollapsed = ref(false)
 const llmStatus = ref('unknown')
-const llmLabel = ref('正在检查 LLM…')
+const llmLabel = ref('LLM 状态后台检查中…')
 
 onMounted(async () => {
   try {
     const data = await fetchLlmHealth()
-    if (data.connected) {
+    if (data.connected === true) {
       llmStatus.value = 'ok'
-      llmLabel.value = `LLM 已连接`
-    } else {
+      llmLabel.value = data.stale ? `LLM 已连接（缓存）` : `LLM 已连接`
+    } else if (data.connected === false) {
       llmStatus.value = 'err'
-      llmLabel.value = 'LLM 离线'
+      llmLabel.value = data.stale ? 'LLM 离线（缓存）' : 'LLM 离线'
+    } else {
+      llmStatus.value = 'unknown'
+      llmLabel.value = data.refreshing ? 'LLM 状态检查中…' : 'LLM 状态未知'
     }
   } catch {
     llmStatus.value = 'err'

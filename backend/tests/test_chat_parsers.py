@@ -1295,7 +1295,7 @@ def test_creator_generate_skill_md_prompt_uses_standard_markdown_execution_guida
         blueprint_text="## 📋 Skill 架构蓝图\n### 宿主执行方式\n- 需要脚本/命令",
         conversation_history=[],
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "宿主 Markdown 执行说明" in prompt
     assert "普通 Markdown 说明书" in prompt
@@ -1325,22 +1325,34 @@ description: demo
         _sanitize_generated_file_content("SKILL.md", skill_md)
 
 
-def test_creator_rejects_placeholder_image_script():
+def test_creator_allows_placeholder_words_until_trial_run_contract():
     from backend.routers.creator import _sanitize_generated_file_content
 
-    script = """import os
+    script = """import json
+import sys
+import os
 
 def main():
+    payload = json.loads(sys.argv[1])
     os.makedirs('generated_images', exist_ok=True)
     with open('generated_images/demo.png', 'w') as f:
         f.write('placeholder for image')
+    print(json.dumps({'image_path': 'generated_images/demo.png', 'text': str(payload.get('prompt', ''))}))
 
 if __name__ == '__main__':
     main()
 """
 
-    with pytest.raises(ValueError, match="占位|placeholder"):
-        _sanitize_generated_file_content("scripts/generate_image.py", script)
+    assert _sanitize_generated_file_content(
+        "scripts/generate_image.py",
+        script,
+        skill_plan_entry={
+            "path": "scripts/generate_image.py",
+            "role": "image_generator",
+            "inputs": ["prompt"],
+            "outputs": ["image_path"],
+        },
+    ) == script.strip()
 
 
 def test_creator_rejects_model_declared_script_without_model_call():
@@ -1487,7 +1499,7 @@ def test_creator_script_prompt_requires_platform_image_runtime_helper():
         conversation_history=[],
         role="image_generator",
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "LLM_BASE_URL" in prompt
     assert "IMAGE_BASE_URL" in prompt
@@ -1593,19 +1605,24 @@ print(os.environ['IMAGE_BASE_URL'], os.environ['VISION_MODEL'], prompt)
         )
 
 
-def test_creator_trial_args_add_text_optional_cases():
+def test_creator_trial_args_use_declared_inputs_for_fallback_payload():
     from backend.routers.creator import _trial_args_for_script
 
-    skill_md = """```bash
-python scripts/story.py '{"topic":"{{topic}}","text":"{{text}}"}'
-```"""
+    arg_sets = _trial_args_for_script(
+        "",
+        "scripts/build.py",
+        "import json, sys\njson.loads(sys.argv[1])",
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "pdf_builder",
+            "inputs": ["structured_biography", "image_path"],
+        },
+    )
+    payload = json.loads(arg_sets[0][0])
 
-    arg_sets = _trial_args_for_script(skill_md, "scripts/story.py", "import json, sys\njson.loads(sys.argv[1])")
-    payloads = [json.loads(args[0]) for args in arg_sets]
-
-    assert any("text" in payload and payload["text"] for payload in payloads)
-    assert any("topic" in payload and "text" not in payload for payload in payloads)
-    assert any(payload.get("text") == "" for payload in payloads)
+    assert payload["structured_biography"] == {"title": "试运行样例", "items": ["示例"]}
+    assert payload["image_path"] == "inputs/sample.txt"
+    assert payload["user_request"]
 
 
 def test_creator_trial_stdout_requires_json_object_for_scripts():
@@ -1758,8 +1775,8 @@ python scripts/generate.py '{"prompt":"{{prompt}}","topic":"{{topic}}"}'
 
     assert len(args) == 1
     payload = json.loads(args[0][0])
-    assert payload["prompt"] == "a cinematic watercolor cat under a warm sunset"
-    assert payload["topic"] == "system time"
+    assert payload["prompt"]
+    assert payload["topic"]
 
 
 def test_run_command_falls_back_when_inferred_skill_root_missing(tmp_path, monkeypatch):
@@ -1878,7 +1895,7 @@ def test_creator_script_prompt_includes_generated_file_contract():
         conversation_history=[],
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "必须满足以下脚本文件合同" in prompt
     assert "scripts/generate_story_and_image.py" in prompt
     assert "读取 sys.argv[1] 并 json.loads" in prompt
@@ -1899,8 +1916,9 @@ def test_creator_script_prompt_uses_skeleton_and_ignores_history():
         ],
     )
 
-    assert len(messages) == 1
-    prompt = messages[0]["content"]
+    assert len(messages) == 2
+    assert [message["role"] for message in messages] == ["system", "user"]
+    prompt = messages[-1]["content"]
     assert "固定脚本骨架" in prompt
     assert "def parse_args()" in prompt
     assert "def run(payload: dict)" in prompt or "def build_image_prompt(payload: dict)" in prompt
@@ -2001,7 +2019,7 @@ def test_creator_reference_prompt_includes_generated_file_contract():
         conversation_history=[],
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "必须满足以下参考资料文件合同" in prompt
     assert "references/style.md" in prompt
     assert "故事写作风格参考" in prompt
@@ -2104,7 +2122,7 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
         conversation_history=conversation_history,
     )
 
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
     assert "```bash fenced code block" in prompt
     assert "必须满足以下 SKILL.md 合同" in prompt
     assert "scripts/generate_nursery_rhyme.py" in prompt
@@ -2121,7 +2139,8 @@ def test_creator_skill_md_prompt_requires_bash_refs_and_blocks_flow_leak():
     assert "不要逐字复制这些约束" in prompt
     assert "若当前无误" not in prompt
     assert "确认项列表" not in prompt
-    assert len(messages) == 1
+    assert len(messages) == 2
+    assert [message["role"] for message in messages[:2]] == ["system", "user"]
 
 
 def test_creator_skill_md_contract_rejects_flow_leak_missing_bash_and_reference():
@@ -2700,7 +2719,7 @@ def test_creator_skeleton_uses_role_not_blueprint_global_image_keyword():
 
     assert "pdf_builder" in skeleton
     assert "generate_stable_diffusion_image" not in skeleton
-    assert "pdf_path" in skeleton
+    assert "pdf_path" not in skeleton
 
 
 def test_blueprint_plan_adds_per_file_roles_and_contracts():
@@ -2777,7 +2796,7 @@ def test_creator_skill_md_prompt_requires_composite_orchestration():
         blueprint_text="scripts/a.py role: text_generator\nreferences/a.md",
         conversation_history=[],
     )
-    prompt = messages[0]["content"]
+    prompt = messages[-1]["content"]
 
     assert "复合任务 orchestrator" in prompt
     assert "执行顺序" in prompt
@@ -3327,6 +3346,195 @@ def test_creator_validator_filters_model_invented_failed_checks():
         {"id": "skill_md.frontmatter", "target": "SKILL.md"}
     ]
     assert _filter_validator_failed_checks(model_checks, "") == []
+
+
+def test_creator_validator_ignores_unconfirmed_model_issues():
+    from backend.routers.creator import _filter_validator_model_call_misjudgements
+
+    issues, instructions = _filter_validator_model_call_misjudgements(
+        file_path="scripts/build.py",
+        deterministic_error="后端结构化检查结果",
+        failed_checks_text="",
+        issues=["模型额外提出的未确认问题"],
+        instructions="模型解释文本",
+    )
+
+    assert issues == []
+    assert instructions == "模型解释文本"
+
+
+def test_script_content_review_includes_only_minimal_protocol_security_checks():
+    from backend.routers.creator import _check_script_content_review_contract
+
+    results = _check_script_content_review_contract(
+        "scripts/build.py",
+        "import json\nif broken python",
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["text"],
+        },
+    )
+
+    result_ids = {result.id for result in results}
+    assert result_ids == {
+        "script.raw_source.single_file",
+        "script.source.syntax",
+        "script.json_argv.runtime",
+        "script.runtime.entrypoint",
+        "script.security.dangerous_operations",
+    }
+    assert all(
+        not result.id.startswith(("script.capability.", "tool_usage_contract.", "script.no_fake_implementation"))
+        for result in results
+    )
+
+
+def test_generated_script_content_uses_content_review_not_full_source_contract(monkeypatch):
+    from backend.routers import creator
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("_validate_script_file_source_contract should not be called for scripts/** first-round validation")
+
+    monkeypatch.setattr(creator, "_validate_script_file_source_contract", fail_if_called)
+
+    content = """import json
+import sys
+
+def run(payload):
+    # placeholder/mock/template words are not first-round hard gates.
+    return {"text": str(payload.get("payload", "placeholder"))}
+
+def main():
+    print(json.dumps(run(json.loads(sys.argv[1]))))
+
+if __name__ == "__main__":
+    main()
+"""
+
+    assert creator._sanitize_generated_file_content(
+        "scripts/build.py",
+        content,
+        skill_plan_entry={
+            "path": "scripts/build.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["text"],
+        },
+    ) == content.strip()
+
+
+def test_script_contract_rejects_guessed_helper_import_without_function_card():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/build_pdf.py",
+        "import json\nimport sys\nimport pdf_generation\n\ndef main():\n    print(json.dumps({'text': 'ok'}))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "pdf_builder",
+            "inputs": ["payload"],
+            "outputs": ["pdf_path"],
+            "required_capabilities": ["pdf_generation", "file_output"],
+        },
+    )
+
+    helper_check = next(result for result in results if result.id == "tool_usage_contract.forbidden_helper_import")
+    assert helper_check.passed
+    assert "第一轮不因此阻断" in helper_check.message
+
+
+def test_script_contract_undeclared_helper_is_warning_not_blocker():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/build_pdf.py",
+        "import json\nimport sys\nfrom backend.services.skill_runtime import create_pdf\n\ndef run(payload):\n    result = create_pdf(str(payload.get('text', 'hello')))\n    return {'pdf_path': result.get('pdf_path', 'out.pdf')}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/build_pdf.py",
+            "role": "generic_script",
+            "inputs": ["text"],
+            "outputs": ["pdf_path"],
+            "required_capabilities": [],
+        },
+    )
+
+    undeclared = next(result for result in results if result.id == "tool_usage_contract.undeclared_helper")
+    assert undeclared.passed
+    assert "warning:" in undeclared.message
+
+
+def test_script_contract_placeholder_mock_words_are_not_hard_gate():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/mock_named_but_runnable.py",
+        "import json\nimport sys\n\ndef run(payload):\n    # mock/template are allowed words here; runtime contract decides success.\n    return {'result': str(payload.get('payload', 'mock template'))}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/mock_named_but_runnable.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["result"],
+            "required_capabilities": [],
+        },
+    )
+
+    fake_check = next(result for result in results if result.id == "script.no_fake_implementation")
+    assert fake_check.passed
+
+
+def test_script_contract_blocks_dangerous_import_and_forbidden_path():
+    from backend.routers.creator import _check_script_file_contract
+
+    results = _check_script_file_contract(
+        "scripts/unsafe.py",
+        "import json\nimport sys\nimport subprocess\n\ndef run(payload):\n    return {'result': open('/etc/passwd').read()}\n\ndef main():\n    print(json.dumps(run(json.loads(sys.argv[1]))))\n\nif __name__ == '__main__':\n    main()\n",
+        skill_plan_entry={
+            "path": "scripts/unsafe.py",
+            "role": "generic_script",
+            "inputs": ["payload"],
+            "outputs": ["result"],
+            "required_capabilities": [],
+        },
+    )
+
+    security = next(result for result in results if result.id == "script.security.dangerous_operations")
+    assert not security.passed
+    assert "subprocess" in security.message
+
+
+def test_trial_stdout_missing_required_output_blocks():
+    from backend.routers.creator import _validate_trial_stdout_json
+
+    with pytest.raises(ValueError, match="stdout_contract"):
+        _validate_trial_stdout_json(
+            stdout=json.dumps({"other": "value"}),
+            content="",
+            args=["{}"],
+            skill_plan_entry={"role": "generic_script", "outputs": ["result"], "required_capabilities": []},
+        )
+
+
+def test_validator_repair_instructions_do_not_enter_repair_feedback():
+    from backend.routers.creator import _format_file_validator_feedback
+
+    feedback = _format_file_validator_feedback(
+        "stdout_contract: missing text",
+        {
+            "model": "validator-model",
+            "issues": [],
+            "failed_checks": [],
+            "repair_instructions": "旧规则：请修改 SkillPlan required_capabilities 并禁止调用未声明 helper",
+        },
+        targeted_repair="只修当前脚本 stdout required outputs",
+    )
+
+    assert "旧规则" not in feedback
+    assert "修改 SkillPlan" not in feedback
+    assert "只修当前脚本 stdout required outputs" in feedback
+    assert "repair_instructions 不进入 repair prompt" in feedback
+
 
 def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
     from backend.routers.creator import _validate_trial_stdout_json

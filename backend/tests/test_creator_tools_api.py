@@ -112,10 +112,56 @@ def test_analyze_blueprint_reports_disabled_required_tools():
 
     assert response.status_code == 200
     body = response.json()
-    missing = {tool["name"]: tool for tool in body["missing_tool_configs"]}
-    assert "docx_parsing" in missing
-    assert missing["docx_parsing"]["enabled"] is False
-    assert any("docx_parsing" in warning and "禁用" in warning for warning in body["warnings"])
+    assert body["missing_tool_configs"] == []
+    assert any("required_capabilities" in warning or "hint" in warning for warning in body["warnings"])
+
+
+def test_strict_analyze_blueprint_does_not_400_on_role_capability_mismatch():
+    client = TestClient(app)
+    blueprint = """## 📋 Skill 架构蓝图
+- **Skill 名称**: mismatch-demo
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/build_pdf.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/build_pdf.py`
+  file_kind: script
+  role: pdf_builder
+  inputs: [text]
+  outputs: [pdf_path]
+  dependencies: []
+  required_capabilities: [image_generation, docx_parsing]
+  forbidden_capabilities: [network_disabled]
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/build_pdf.py '{"text":"{{text}}"}'
+```
+"""
+    response = client.post(
+        "/api/creator/analyze-blueprint",
+        json={"strict": True, "messages": [{"role": "assistant", "content": blueprint}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    script = next(item for item in body["files"] if item["path"] == "scripts/build_pdf.py")
+    assert script["role"] == "pdf_builder"
+    assert script["required_capabilities"] == []
+    assert any("required_capabilities" in warning for warning in body["warnings"])
 
 
 def test_tool_registration_flow_creates_function_card_and_registered_tool(tmp_path, monkeypatch):

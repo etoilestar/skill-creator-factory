@@ -298,7 +298,13 @@ BUILTIN_TOOL_CAPABILITIES["file_output"] = replace(
 # safe import/call card only when implementation resolution selects the tool.
 BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
     BUILTIN_TOOL_CAPABILITIES["pdf_generation"],
-    helper_imports=["create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"],
+    helper_imports=[
+        "create_pdf",
+        "create_pdf_document",
+        "build_pdf_report",
+        "images_to_pdf",
+        "merge_pdfs",
+    ],
     functions=[
         ToolFunctionManifest(
             function_name="create_pdf",
@@ -335,6 +341,57 @@ BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
             usage_policy="helper_preferred",
             allowed_roles=["pdf_builder", "composite_generator"],
             required_capabilities=["pdf_generation"],
+        ),
+        ToolFunctionManifest(
+            function_name="create_pdf_document",
+            import_path="backend.services.runtime_tools",
+            short_description="Create a structured PDF from document blocks and style controls.",
+            when_to_use=(
+                "Use when a script needs headings, paragraphs, images, tables, page breaks, "
+                "font size, line spacing, indentation, or other structured document layout."
+            ),
+            signature=(
+                "create_pdf_document(blocks: list[dict] | dict | str, *, "
+                "styles: dict | None = None, filename: str = 'output.pdf', "
+                "title: str | None = None) -> dict[str, Any]"
+            ),
+            input_schema={
+                "type": "object",
+                "required": ["blocks"],
+                "properties": {
+                    "blocks": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                    "styles": {"type": "object"},
+                    "filename": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+            },
+            output_schema={
+                "type": "object",
+                "required": ["pdf_path", "file_outputs"],
+                "properties": {
+                    "pdf_path": {"type": "string"},
+                    "file_paths": {"type": "array", "items": {"type": "string"}},
+                    "file_outputs": {"type": "array"},
+                    "artifact_metadata": {"type": "object"},
+                },
+            },
+            example_call=(
+                "from backend.services.runtime_tools import create_pdf_document\n\n"
+                "result = create_pdf_document(\n"
+                "    blocks=[\n"
+                "        {'type': 'title', 'text': payload.get('title') or 'Report'},\n"
+                "        {'type': 'paragraph', 'text': payload['text_content']},\n"
+                "    ],\n"
+                "    styles={'body_font_size': 12, 'line_spacing': 1.5},\n"
+                "    filename=payload.get('output_filename') or 'report.pdf',\n"
+                ")"
+            ),
+            usage_policy="helper_preferred",
+            allowed_roles=["pdf_builder", "composite_generator"],
+            required_capabilities=["pdf_generation"],
         )
     ],
     snippets=[
@@ -364,6 +421,52 @@ BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
             requires=["pdf_generation"],
             usage_policy="helper_preferred",
             priority=120,
+        ),
+        ToolSnippet(
+            id="pdf_generation.create_pdf_document",
+            title="Create a structured PDF",
+            applies_to={
+                "roles": ["pdf_builder", "composite_generator"],
+                "capabilities": ["pdf_generation"],
+            },
+            description="Use the platform structured PDF helper when layout, images, tables, or styles matter.",
+            code=(
+                "from backend.services.runtime_tools import create_pdf_document\n\n"
+                "blocks = [\n"
+                "    {'type': 'title', 'text': payload.get('title') or 'Report'},\n"
+                "    {'type': 'paragraph', 'text': payload.get('text_content') or payload.get('text') or ''},\n"
+                "]\n"
+                "result = create_pdf_document(\n"
+                "    blocks=blocks,\n"
+                "    styles=payload.get('pdf_styles') or {},\n"
+                "    filename=payload.get('output_filename') or 'report.pdf',\n"
+                ")\n"
+                "return {\n"
+                "    'pdf_path': result['pdf_path'],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['pdf_path']],\n"
+                "    'artifact_metadata': result.get('artifact_metadata', {}),\n"
+                "}"
+            ),
+            expected_input_shape={
+                "text_content": "string",
+                "title": "string?",
+                "pdf_styles": "object?",
+                "output_filename": "string?",
+            },
+            expected_output_shape={
+                "pdf_path": "string",
+                "file_outputs": ["string"],
+                "artifact_metadata": "object?",
+            },
+            return_rule="Return pdf_path and file_outputs from create_pdf_document.",
+            anti_patterns=[
+                "Do not manually write outside OUTPUT_DIR.",
+                "Do not return the whole helper result as pdf_path.",
+                "Use create_pdf_document instead of create_pdf when layout, images, or tables matter.",
+            ],
+            requires=["pdf_generation"],
+            usage_policy="helper_preferred",
+            priority=130,
         )
     ],
     usage_policy="helper_preferred",

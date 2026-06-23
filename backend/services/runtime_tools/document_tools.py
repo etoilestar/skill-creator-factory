@@ -72,11 +72,315 @@ def create_text_file(
     text_path.write_text(str(text or ""), encoding="utf-8")
     return {"text_path": str(text_path), "file_paths": [str(text_path)], "file_outputs": [str(text_path)]}
 
+def _artifact_result(path: Path, *, artifact_type: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {
+        f"{artifact_type}_path": str(path),
+        "file_paths": [str(path)],
+        "file_outputs": [str(path)],
+    }
+    if metadata:
+        result["artifact_metadata"] = {
+            "artifact_type": artifact_type,
+            **metadata,
+        }
+    return result
 
-def _write_minimal_trial_pdf(path: Path) -> dict[str, Any]:
+def _write_minimal_trial_pdf(path: Path, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")
-    return {"pdf_path": str(path), "file_paths": [str(path)], "file_outputs": [str(path)]}
+    path.write_bytes(
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Count 0>>endobj\n"
+        b"trailer<</Root 1 0 R>>\n"
+        b"%%EOF\n"
+    )
+    return _artifact_result(path, artifact_type="pdf", metadata=metadata)
+
+
+def _normalize_pdf_styles(styles: dict[str, Any] | None) -> dict[str, Any]:
+    styles = dict(styles or {})
+    return {
+        "page_size": str(styles.get("page_size") or "A4"),
+        "font_name": str(styles.get("font_name") or styles.get("font_family") or "STSong-Light"),
+        "font_path": str(styles.get("font_path") or "").strip(),
+        "title_font_size": float(styles.get("title_font_size") or 20),
+        "heading_font_size": float(styles.get("heading_font_size") or 16),
+        "body_font_size": float(styles.get("body_font_size") or styles.get("font_size") or 12),
+        "caption_font_size": float(styles.get("caption_font_size") or 9),
+        "line_spacing": float(styles.get("line_spacing") or 1.35),
+        "first_line_indent": float(styles.get("first_line_indent") or 0),
+        "space_before": float(styles.get("space_before") or 0),
+        "space_after": float(styles.get("space_after") or 8),
+        "margin_left": float(styles.get("margin_left") or styles.get("margin") or 72),
+        "margin_right": float(styles.get("margin_right") or styles.get("margin") or 72),
+        "margin_top": float(styles.get("margin_top") or styles.get("margin") or 72),
+        "margin_bottom": float(styles.get("margin_bottom") or styles.get("margin") or 72),
+        "image_max_width": float(styles.get("image_max_width") or 420),
+        "image_max_height": float(styles.get("image_max_height") or 360),
+    }
+
+
+def _normalize_document_blocks(blocks: Any) -> list[dict[str, Any]]:
+    if isinstance(blocks, str):
+        return [{"type": "paragraph", "text": line} for line in _coerce_lines(blocks)]
+
+    if isinstance(blocks, dict):
+        if isinstance(blocks.get("blocks"), list):
+            blocks = blocks["blocks"]
+        else:
+            return [dict(blocks)]
+
+    if not isinstance(blocks, list):
+        try:
+            blocks = list(blocks)
+        except Exception:
+            blocks = [{"type": "paragraph", "text": str(blocks or "Generated document")}]
+
+    normalized: list[dict[str, Any]] = []
+    for item in blocks:
+        if isinstance(item, dict):
+            block = dict(item)
+        else:
+            block = {"type": "paragraph", "text": str(item)}
+        block_type = str(block.get("type") or "paragraph").strip().lower()
+        block["type"] = block_type
+        normalized.append(block)
+
+    return normalized or [{"type": "paragraph", "text": "Generated document"}]
+
+
+def _register_reportlab_font(font_name: str, font_path: str = "") -> str:
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+    # Built-in CID fonts work well for Chinese without bundling font files.
+    if not font_path:
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+        except Exception:
+            if font_name != "STSong-Light":
+                font_name = "STSong-Light"
+                pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+            else:
+                raise
+        return font_name
+
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    safe_font_path = _safe_input_path(font_path, {".ttf", ".otf"})
+    pdfmetrics.registerFont(TTFont(font_name, str(safe_font_path)))
+    return font_name
+
+
+def create_pdf_document(
+    blocks: list[dict[str, Any]] | dict[str, Any] | str | Iterable[Any],
+    *,
+    styles: dict[str, Any] | None = None,
+    output_path: str | os.PathLike[str] | None = None,
+    output_dir: str | os.PathLike[str] | None = None,
+    filename: str = "output.pdf",
+    title: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a structured PDF document from blocks and return artifact paths.
+
+    Supported block types:
+    - title: {"type": "title", "text": "..."}
+    - heading: {"type": "heading", "level": 1, "text": "..."}
+    - paragraph/text: {"type": "paragraph", "text": "..."}
+    - image: {"type": "image", "path": "...", "caption": "..."}
+    - table: {"type": "table", "headers": [...], "rows": [[...], ...]}
+    - spacer: {"type": "spacer", "height": 12}
+    - page_break: {"type": "page_break"}
+
+    Generated Skill scripts should print the returned dict, or include its
+    pdf_path/file_outputs fields in stdout JSON.
+    """
+    pdf_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    style_cfg = _normalize_pdf_styles(styles)
+    normalized_blocks = _normalize_document_blocks(blocks)
+
+    result_metadata = {
+        "creator_tool": "create_pdf_document",
+        "block_count": len(normalized_blocks),
+        "styles": {
+            key: value
+            for key, value in style_cfg.items()
+            if key != "font_path"
+        },
+        **(metadata or {}),
+    }
+
+    if _trial():
+        return _write_minimal_trial_pdf(pdf_path, metadata=result_metadata)
+
+    from xml.sax.saxutils import escape
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, LETTER
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import (
+        Image as RLImage,
+        ListFlowable,
+        ListItem,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    page_size_name = str(style_cfg["page_size"]).upper()
+    page_size = LETTER if page_size_name in {"LETTER", "US_LETTER"} else A4
+    font_name = _register_reportlab_font(str(style_cfg["font_name"]), str(style_cfg.get("font_path") or ""))
+
+    base_styles = getSampleStyleSheet()
+    body_font_size = float(style_cfg["body_font_size"])
+    body_leading = body_font_size * float(style_cfg["line_spacing"])
+
+    title_style = ParagraphStyle(
+        "SuperskillsTitle",
+        parent=base_styles["Title"],
+        fontName=font_name,
+        fontSize=float(style_cfg["title_font_size"]),
+        leading=float(style_cfg["title_font_size"]) * 1.25,
+        spaceAfter=14,
+    )
+    heading_style = ParagraphStyle(
+        "SuperskillsHeading",
+        parent=base_styles["Heading1"],
+        fontName=font_name,
+        fontSize=float(style_cfg["heading_font_size"]),
+        leading=float(style_cfg["heading_font_size"]) * 1.25,
+        spaceBefore=10,
+        spaceAfter=8,
+    )
+    body_style = ParagraphStyle(
+        "SuperskillsBody",
+        parent=base_styles["BodyText"],
+        fontName=font_name,
+        fontSize=body_font_size,
+        leading=body_leading,
+        firstLineIndent=float(style_cfg["first_line_indent"]),
+        spaceBefore=float(style_cfg["space_before"]),
+        spaceAfter=float(style_cfg["space_after"]),
+    )
+    caption_style = ParagraphStyle(
+        "SuperskillsCaption",
+        parent=base_styles["BodyText"],
+        fontName=font_name,
+        fontSize=float(style_cfg["caption_font_size"]),
+        leading=float(style_cfg["caption_font_size"]) * 1.25,
+        spaceBefore=4,
+        spaceAfter=8,
+    )
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=page_size,
+        leftMargin=float(style_cfg["margin_left"]),
+        rightMargin=float(style_cfg["margin_right"]),
+        topMargin=float(style_cfg["margin_top"]),
+        bottomMargin=float(style_cfg["margin_bottom"]),
+        title=title or pdf_path.stem,
+    )
+
+    story = []
+
+    def paragraph_text(value: Any) -> str:
+        return escape(str(value or "")).replace("\n", "<br/>")
+
+    for block in normalized_blocks:
+        block_type = str(block.get("type") or "paragraph").lower()
+
+        if block_type == "title":
+            story.append(Paragraph(paragraph_text(block.get("text")), title_style))
+            continue
+
+        if block_type == "heading":
+            story.append(Paragraph(paragraph_text(block.get("text")), heading_style))
+            continue
+
+        if block_type in {"paragraph", "text"}:
+            text = str(block.get("text") or block.get("content") or "")
+            if not text.strip():
+                story.append(Spacer(1, float(style_cfg["space_after"])))
+            else:
+                for part in text.split("\n\n"):
+                    story.append(Paragraph(paragraph_text(part), body_style))
+            continue
+
+        if block_type == "list":
+            items = block.get("items") or []
+            if isinstance(items, list):
+                flow_items = [
+                    ListItem(Paragraph(paragraph_text(item), body_style))
+                    for item in items
+                ]
+                story.append(ListFlowable(flow_items, bulletType="bullet"))
+            continue
+
+        if block_type == "image":
+            raw_path = str(block.get("path") or block.get("image_path") or "").strip()
+            if not raw_path:
+                continue
+            image_path = _safe_input_path(raw_path, {".png", ".jpg", ".jpeg", ".webp"})
+            image = RLImage(str(image_path))
+            max_w = float(block.get("max_width") or style_cfg["image_max_width"])
+            max_h = float(block.get("max_height") or style_cfg["image_max_height"])
+            scale = min(max_w / image.drawWidth, max_h / image.drawHeight, 1.0)
+            image.drawWidth *= scale
+            image.drawHeight *= scale
+            story.append(image)
+            if block.get("caption"):
+                story.append(Paragraph(paragraph_text(block.get("caption")), caption_style))
+            continue
+
+        if block_type == "table":
+            headers = block.get("headers") or []
+            rows = block.get("rows") or []
+            table_data = []
+            if headers:
+                table_data.append(headers)
+            table_data.extend(rows if isinstance(rows, list) else [])
+            if table_data:
+                rendered_rows = [
+                    [Paragraph(paragraph_text(cell), body_style) for cell in row]
+                    for row in table_data
+                ]
+                table = Table(rendered_rows, repeatRows=1 if headers else 0)
+                table.setStyle(
+                    TableStyle(
+                        [
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                            ("TOPPADDING", (0, 0), (-1, -1), 4),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ]
+                    )
+                )
+                story.append(table)
+                story.append(Spacer(1, 8))
+            continue
+
+        if block_type in {"page_break", "pagebreak", "break"}:
+            story.append(PageBreak())
+            continue
+
+        if block_type == "spacer":
+            story.append(Spacer(1, float(block.get("height") or 12)))
+            continue
+
+        story.append(Paragraph(paragraph_text(block.get("text") or block), body_style))
+
+    if not story:
+        story.append(Paragraph("Generated document", body_style))
+
+    doc.build(story)
+    return _artifact_result(pdf_path, artifact_type="pdf", metadata=result_metadata)
 
 def create_pdf(
     text: str | Iterable[Any],
@@ -86,40 +390,36 @@ def create_pdf(
     filename: str = "output.pdf",
     title: str | None = None,
     font_name: str = "STSong-Light",
+    font_size: float = 14,
+    line_spacing: float = 1.35,
 ) -> dict[str, Any]:
-    """Create a Unicode-capable PDF and return JSON-serializable paths.
+    """Create a simple Unicode-capable PDF from plain text.
 
-    ``STSong-Light`` is a built-in ReportLab CID font, so generated Chinese text
-    works without bundling a TTF file.  Generated scripts should print the
-    returned dict (or include its paths) as stdout JSON.
+    This is the compatibility wrapper for simple text-to-PDF tasks.  For
+    structured documents with headings, images, tables, or layout requirements,
+    generated Skill scripts should use create_pdf_document instead.
     """
-    pdf_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
-    if _trial():
-        return _write_minimal_trial_pdf(pdf_path)
+    blocks: list[dict[str, Any]] = []
+    if title:
+        blocks.append({"type": "title", "text": title})
+    blocks.extend({"type": "paragraph", "text": line} for line in _coerce_lines(text))
 
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    from reportlab.pdfgen import canvas
-
-    pdfmetrics.registerFont(UnicodeCIDFont(font_name))
-    c = canvas.Canvas(str(pdf_path), pagesize=A4)
-    _, height = A4
-    c.setTitle(title or pdf_path.stem)
-    c.setFont(font_name, 14)
-    y = height - 72
-    for raw_line in _coerce_lines(text):
-        line = str(raw_line)
-        while line:
-            chunk, line = line[:42], line[42:]
-            c.drawString(72, y, chunk)
-            y -= 22
-            if y < 72:
-                c.showPage()
-                c.setFont(font_name, 14)
-                y = height - 72
-    c.save()
-    return {"pdf_path": str(pdf_path), "file_paths": [str(pdf_path)], "file_outputs": [str(pdf_path)]}
+    return create_pdf_document(
+        blocks,
+        output_path=output_path,
+        output_dir=output_dir,
+        filename=filename,
+        title=title,
+        styles={
+            "font_name": font_name,
+            "body_font_size": font_size,
+            "line_spacing": line_spacing,
+        },
+        metadata={
+            "creator_tool": "create_pdf",
+            "compatibility_wrapper": True,
+        },
+    )
 
 
 def create_docx(
@@ -305,14 +605,47 @@ def images_to_pdf(image_paths: list[str], output_path: str | os.PathLike[str] | 
     return {"pdf_path": str(out_path), "file_paths": [str(out_path)], "file_outputs": [str(out_path)]}
 
 
-def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | None = None, *, filename: str = "report.pdf") -> dict[str, Any]:
-    """Build a simple PDF report from text sections and optional image references."""
-    lines = [str(title or "Report"), ""]
+def build_pdf_report(
+    title: str,
+    sections: list[dict],
+    image_paths: list[str] | None = None,
+    *,
+    filename: str = "report.pdf",
+    styles: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a structured PDF report from sections and optional images."""
+    blocks: list[dict[str, Any]] = [{"type": "title", "text": str(title or "Report")}]
+
     for section in sections or []:
-        lines.append(str(section.get("title") or "Section"))
-        lines.extend(_coerce_lines(str(section.get("text") or section.get("content") or "")))
-        lines.append("")
-    if image_paths:
-        lines.append("Images:")
-        lines.extend(str(_safe_input_path(path, {".png", ".jpg", ".jpeg", ".webp"})) for path in image_paths[:_MAX_INPUT_FILES])
-    return create_pdf(lines, filename=filename or "report.pdf", title=title or "Report")
+        section_title = str(section.get("title") or "Section")
+        section_text = str(section.get("text") or section.get("content") or "")
+        blocks.append({"type": "heading", "text": section_title})
+        blocks.append({"type": "paragraph", "text": section_text})
+
+        section_images = section.get("image_paths") or section.get("images") or []
+        if isinstance(section_images, str):
+            section_images = [section_images]
+        if isinstance(section_images, list):
+            for image_path in section_images[:_MAX_INPUT_FILES]:
+                blocks.append(
+                    {
+                        "type": "image",
+                        "path": str(image_path),
+                        "caption": section.get("image_caption") or "",
+                    }
+                )
+
+    for image_path in (image_paths or [])[:_MAX_INPUT_FILES]:
+        blocks.append({"type": "image", "path": str(image_path)})
+
+    return create_pdf_document(
+        blocks,
+        styles=styles,
+        filename=filename or "report.pdf",
+        title=title or "Report",
+        metadata={
+            "creator_tool": "build_pdf_report",
+            "section_count": len(sections or []),
+            "image_count": len(image_paths or []),
+        },
+    )

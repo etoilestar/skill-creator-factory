@@ -1462,17 +1462,14 @@ def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[
 def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
     """Hard format checks for SKILL.md.
 
-    This function deliberately does NOT decide semantic blueprint coverage.
-    Model review decides:
-    - which scripts are real blueprint tasks
-    - whether SKILL.md covers all planned tasks
-    - whether a path is an example/anti-example or a true file
-
     Deterministic checks here only enforce:
     - YAML frontmatter
     - no Creator/runtime leakage
+    - declared local resources are structurally mentioned
     - scripts mentioned in SKILL.md are represented with ```bash fenced blocks
     - command argv is parseable JSON object
+
+    不做语义覆盖裁决，不要求固定文档模板。
     """
     stripped = content.strip()
     results: list[ContractCheckResult] = []
@@ -1551,33 +1548,47 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
     ))
 
     for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
-        mentioned = reference_path in content
+        mentioned = _markdown_mentions_skill_resource_path(content, reference_path)
         results.append(ContractCheckResult(
             id="skill_md.reference.mentioned",
             passed=mentioned,
             target=reference_path,
             message=(
-                f"SKILL.md 已引用参考资料 {reference_path}。"
+                f"SKILL.md 已结构化引用参考资料 {reference_path}。"
                 if mentioned
-                else f"SKILL.md 缺少对参考资料 {reference_path} 的引用。"
+                else f"SKILL.md 缺少对参考资料 {reference_path} 的结构化引用。"
             ),
-            expected="蓝图真实规划的 references/ 资源必须在 SKILL.md 的参考资料/资源小节中静态引用，并说明用途。",
-            minimal_edit=f"添加参考资料小节，引用 `{reference_path}` 并说明何时读取。",
+            expected=(
+                "蓝图真实规划的 references/ 资源必须在 SKILL.md 中被结构化提及；"
+                "允许完整路径，也允许在同一 Markdown section 中出现 references/ 目录上下文和对应文件名。"
+            ),
+            minimal_edit=(
+                f"只在 SKILL.md 的资源说明局部补充 `{reference_path}`；"
+                "不要重写其它章节、脚本命令块或已通过内容。"
+            ),
+            details={"resource_path": reference_path},
         ))
 
     for asset_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="assets/"):
-        mentioned = asset_path in content
+        mentioned = _markdown_mentions_skill_resource_path(content, asset_path)
         results.append(ContractCheckResult(
             id="skill_md.asset.mentioned",
             passed=mentioned,
             target=asset_path,
             message=(
-                f"SKILL.md 已引用静态资源 {asset_path}。"
+                f"SKILL.md 已结构化引用静态资源 {asset_path}。"
                 if mentioned
-                else f"SKILL.md 缺少对静态资源 {asset_path} 的引用。"
+                else f"SKILL.md 缺少对静态资源 {asset_path} 的结构化引用。"
             ),
-            expected="蓝图真实规划的 assets/ 资源必须作为上传素材/静态资源引用，不得描述为模型生成。",
-            minimal_edit=f"在资源小节引用 `{asset_path}` 并说明它是静态/上传素材。",
+            expected=(
+                "蓝图真实规划的 assets/ 资源必须在 SKILL.md 中被结构化提及；"
+                "允许完整路径，也允许在同一 Markdown section 中出现 assets/ 目录上下文和对应文件名。"
+            ),
+            minimal_edit=(
+                f"只在 SKILL.md 的资源说明局部补充 `{asset_path}`；"
+                "不要重写其它章节、脚本命令块或已通过内容。"
+            ),
+            details={"resource_path": asset_path},
         ))
 
     results.extend(_check_skill_md_fenced_command_contracts(
@@ -1585,9 +1596,6 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
         blueprint_text=blueprint_text,
         required_script_paths=None,
     ))
-    # Cross-script input/output closure is intentionally excluded from the
-    # first-round SKILL.md static contract. Second-round E2E validation owns
-    # workflow dataflow checks after all scripts and stdout shapes exist.
 
     return results
 
@@ -2340,6 +2348,69 @@ def _reference_frontmatter_metadata(content: str) -> tuple[dict[str, Any], str]:
 
     return meta, body
 
+def _markdown_sections_for_resource_matching(content: str) -> list[tuple[str, str]]:
+    """Split Markdown into heading-scoped sections for resource path matching.
+
+    返回 (heading, section_text)。
+    不依赖中文/英文业务词，只用 Markdown heading 结构。
+    """
+    text = content or ""
+    lines = text.splitlines()
+    sections: list[tuple[str, str]] = []
+
+    current_heading = ""
+    current_lines: list[str] = []
+
+    for line in lines:
+        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+            if current_lines:
+                sections.append((current_heading, "\n".join(current_lines)))
+            current_heading = line.strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_heading, "\n".join(current_lines)))
+
+    return sections or [("", text)]
+
+
+def _markdown_mentions_skill_resource_path(content: str, resource_path: str) -> bool:
+    """Return whether SKILL.md structurally mentions a skill-local resource.
+
+    允许两种非硬编码表达：
+    1. 完整路径出现在任意位置：references/x.md
+    2. basename 出现在同一个 Markdown section，且该 section 同时出现资源目录前缀：
+       heading/body 中有 references/，列表项中有 x.md
+
+    不根据具体文件名、业务名、中文标题、英文标题做词表判断。
+    """
+    normalized = _normalize_skill_path(resource_path)
+    if not normalized:
+        return False
+
+    text = content or ""
+    if normalized in text:
+        return True
+
+    if "/" not in normalized:
+        return normalized in text
+
+    folder, basename = normalized.split("/", 1)
+    if not folder or not basename:
+        return False
+
+    basename_pattern = re.compile(rf"(?<![\w./-])`?{re.escape(basename)}`?(?![\w./-])")
+    folder_marker = f"{folder}/"
+
+    for _heading, section_text in _markdown_sections_for_resource_matching(text):
+        if folder_marker not in section_text:
+            continue
+        if basename_pattern.search(section_text):
+            return True
+
+    return False
 
 def _ensure_reference_metadata_frontmatter(
     *,
@@ -2348,25 +2419,61 @@ def _ensure_reference_metadata_frontmatter(
     purpose: str = "",
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Canonicalize references/*.md frontmatter without preserving illegal keys.
+    """Ensure references/*.md has valid ordinary document frontmatter.
 
-    References may omit frontmatter. If frontmatter exists (or this helper is
-    asked to add one for generation UX), only document metadata keys remain at
-    the top level; role/type/path/scope/loading/when_to_use and other Creator
-    planning fields are moved under metadata.creator.
+    references/*.md 是正式 Markdown 参考资料文件：
+    - 没有 frontmatter 时，补最小合法 frontmatter；
+    - 已有 frontmatter 时，只规范化普通文档 metadata；
+    - Creator 内部规划字段不放在顶层，交给 canonicalize_reference_frontmatter 处理。
     """
     if not file_path.startswith("references/") or Path(file_path).suffix.lower() != ".md":
         return content
 
-    meta, _body, had_frontmatter = parse_frontmatter(content)
-    if not had_frontmatter:
-        return content
-    canonical = canonicalize_reference_frontmatter(
-        meta,
-        file_path=file_path,
-        purpose=purpose or str((skill_plan_entry or {}).get("purpose") or ""),
+    text = (content or "").strip()
+    if not text:
+        stem = Path(file_path).stem.replace("-", " ").replace("_", " ").strip() or "reference"
+        text = f"# {stem}\n\n本文件提供当前参考资料的可复用规则、格式约束、质量标准或示例说明。\n"
+
+    meta, body, had_frontmatter = parse_frontmatter(text)
+
+    if had_frontmatter:
+        canonical = canonicalize_reference_frontmatter(
+            meta,
+            file_path=file_path,
+            purpose=purpose or str((skill_plan_entry or {}).get("purpose") or ""),
+        )
+        return apply_frontmatter_patch(text, canonical)
+
+    title = Path(file_path).stem.replace("-", " ").replace("_", " ").strip() or "reference"
+    description = (
+        purpose
+        or str((skill_plan_entry or {}).get("purpose") or "")
+        or f"{file_path} reference document"
     )
-    return apply_frontmatter_patch(content, canonical)
+
+    canonical = canonicalize_reference_frontmatter(
+        {
+            "title": title,
+            "description": description,
+            "metadata": {
+                "creator": {
+                    "path": file_path,
+                    "purpose": description,
+                }
+            },
+        },
+        file_path=file_path,
+        purpose=description,
+    )
+
+    yaml_text = yaml.safe_dump(
+        canonical,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    ).strip()
+
+    return f"---\n{yaml_text}\n---\n\n{text}\n"
 
 
 def _reference_metadata_contract_checks(
@@ -2539,6 +2646,19 @@ def _build_generated_file_contract_text(
         return _build_asset_file_contract_text(file_path, purpose)
     return ""
 
+def _reference_contains_write_file_directive(markdown_body: str) -> bool:
+    """Detect whether a reference body contains an actual write-file directive.
+
+    只扫描 reference 正文，不扫描 YAML frontmatter。
+    避免 metadata.creator.path 被误判成 Path/File 写入标签。
+
+    这里检测的是通用文件写入指令语法，不绑定具体业务案例。
+    """
+    body = markdown_body or ""
+    return bool(re.search(
+        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)",
+        body,
+    ))
 
 def _check_reference_file_contract(file_path: str, content: str, purpose: str = "") -> list[ContractCheckResult]:
     """Validate reference markdown as a formal documentation/resource file.
@@ -2712,10 +2832,7 @@ def _check_reference_file_contract(file_path: str, content: str, purpose: str = 
     # 注意：这里只扫描 frontmatter 之后的正文 stripped，不能扫描完整 content。
     # 否则 metadata.creator.path: references/... 会被误判为“写入文件标签”。
     # 同时不要使用 (?i) 忽略大小写，否则 YAML 小写 path 会命中 Path。
-    has_write_file_label = bool(re.search(
-        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)",
-        stripped,
-    ))
+    has_write_file_label = _reference_contains_write_file_directive(stripped)
     has_packaged_file_block = False
     lines = stripped.splitlines()
     for idx, line in enumerate(lines):
@@ -5667,16 +5784,34 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
 
     return ""
 
+def _file_done_error_sse(
+    *,
+    file_path: str,
+    role: str | None = None,
+    error: str,
+    error_type: str = "generation_error",
+) -> str:
+    return _sse({
+        "type": "file_done",
+        "status": "error",
+        "success": False,
+        "file_path": file_path,
+        "role": role,
+        "error_type": error_type,
+        "error": error,
+        "done": True,
+    })
+
 def _safe_validator_localizations(
     validator_data: dict[str, Any],
     *,
     file_path: str,
 ) -> list[dict[str, Any]]:
-    """Extract safe localization hints from validator output.
+    """Extract current-file localization hints from validator output.
 
     validator 不能新增失败范围，只能解释后端 deterministic_error。
-    因此这里只保留当前文件的定位字段和 minimal_edit，不传 issues /
-    failed_checks / 全局 repair_instructions 给 repair 模型。
+    这里只保留当前文件的定位字段和 minimal_edit，不传全量 issues /
+    failed_checks / repair_instructions 给 repair 模型。
     """
     raw_items = validator_data.get("localization")
     if not isinstance(raw_items, list):
@@ -5760,26 +5895,18 @@ async def _run_generated_file_validator_round(
                 "你是 Creator 生成文件校验模型，只输出严格 JSON object。"
                 "你不决定 passed/failed；后端确定性检查和 trial run 才是唯一裁决。"
                 "你只解释后端已经给出的真实错误，并给 coder 可执行的局部定位。"
-
                 "禁止新增 failed_checks。"
                 "禁止猜输入字段。"
                 "禁止要求修改 SkillPlan、capability、workflow、其它脚本或 E2E。"
                 "禁止报告任何未经后端结构化检查确认的推测性运行风险。"
-
                 "你的 localization 必须只围绕 deterministic_error。"
-                "如果 deterministic_error 是运行时异常，你只能定位导致该异常的当前文件代码区域。"
-                "如果 deterministic_error 是 stdout/schema/artifact 确定性失败，你只能定位当前文件中对应输出组织或产物创建区域。"
+                "如果 deterministic_error 是 Markdown/metadata/command/resource 引用错误，"
+                "只定位当前文件中最小可修改的标题、小节、frontmatter 或 fenced block。"
+                "如果 deterministic_error 是运行时异常，只定位导致该异常的当前文件代码区域。"
                 "如果无法定位，localization 返回空数组。"
-
-                "返回 JSON object，字段包括："
-                "passed, issues, failed_checks, localization, preserve, repair_instructions。"
+                "返回 JSON object，字段包括：passed, issues, failed_checks, localization, preserve, repair_instructions。"
                 "其中 passed 必须为 false，因为后端已经确认真实失败。"
                 "failed_checks 必须为空数组，除非后端 failed_checks_text 明确给出。"
-
-                "如果 failed_checks_text 为空，你不得提出新的 failed_checks，也不得提出 tool_result_used、list_cardinality、required_outputs 等新问题；"
-                "只能围绕 deterministic_error 的 traceback、stdout_required_outputs_missing、artifact evidence 等后端已经写明的错误定位当前代码。\n"
-                "input_files/files/resources 可能是 Creator smoke 自动注入的通用 envelope；"
-                "除非 deterministic_error 明确提到这些字段属于 required input 或 failed check，否则不得要求脚本遍历处理它们。\n"
             ),
         },
         {
@@ -5788,13 +5915,13 @@ async def _run_generated_file_validator_round(
                 f"目标文件：{file_path}\n\n"
                 "后端确定性校验/试运行错误，这是唯一真实失败来源：\n"
                 f"{deterministic_error}\n\n"
-                + (f"当前脚本合同/输入输出/产物摘要：\n{contract_text[-4000:]}\n\n" if contract_text else "")
+                + (f"当前文件合同摘要：\n{contract_text[-4000:]}\n\n" if contract_text else "")
                 + (f"后端确定性 failed_checks（只能解释这些，不能新增）：\n{failed_checks_text}\n\n" if failed_checks_text else "")
                 + (f"本轮修复模式：{repair_mode}\n\n" if repair_mode else "")
-                + (f"后端根据该错误生成的修复边界：\n{targeted_repair}\n\n" if targeted_repair else "")
-                + "当前代码（尾部截断，仅供定位）：\n"
+                + (f"后端确定性修复边界：\n{targeted_repair}\n\n" if targeted_repair else "")
+                + "当前文件内容（尾部截断，仅供定位）：\n"
                 "```text\n"
-                f"{content[-8000:]}\n"
+                f"{content[-12000:]}\n"
                 "```\n\n"
                 "请输出严格 JSON object：\n"
                 "{\n"
@@ -5804,8 +5931,8 @@ async def _run_generated_file_validator_round(
                 "  \"localization\": [\n"
                 "    {\n"
                 "      \"failed_file\": \"当前文件路径\",\n"
-                "      \"failed_function\": \"函数名或 main/run/stdout\",\n"
-                "      \"line_region\": \"行号或代码区域\",\n"
+                "      \"failed_function\": \"函数名、frontmatter、section、command block 或 stdout construction\",\n"
+                "      \"line_region\": \"行号或最小 Markdown/代码区域\",\n"
                 "      \"reason\": \"为什么该区域导致 deterministic_error\",\n"
                 "      \"minimal_edit\": \"只修复 deterministic_error 的最小修改建议\",\n"
                 "      \"allowed_scope\": \"只允许改哪里\",\n"
@@ -5813,7 +5940,7 @@ async def _run_generated_file_validator_round(
                 "    }\n"
                 "  ],\n"
                 "  \"preserve\": [\"已通过且应保留的局部结构\"],\n"
-                "  \"repair_instructions\": \"只针对 deterministic_error 的局部修改指令；不得要求修改 SkillPlan/capability/workflow/E2E/其它脚本。\"\n"
+                "  \"repair_instructions\": \"只针对 deterministic_error 的局部修改指令；不得要求修改其它文件或重写全文。\"\n"
                 "}\n"
             ),
         },
@@ -5873,13 +6000,10 @@ async def _run_generated_file_validator_round(
         "issues": filtered_issues if deterministic_failed else [],
         "failed_checks": failed_checks if deterministic_failed else [],
         "localization": localization if deterministic_failed else [],
-        # preserve 不传给 repair 使用，只保留给日志/调试，避免 validator 通过 preserve 发明约束。
         "preserve": [str(item) for item in data.get("preserve", [])] if isinstance(data.get("preserve"), list) else [],
-        # repair_instructions 也不直接进入 repair prompt；真正进入的是 localization.minimal_edit。
         "repair_instructions": filtered_instructions if deterministic_failed else "",
         "model": route.model,
     }
-
 
 
 def _filter_validator_model_call_misjudgements(
@@ -5927,7 +6051,6 @@ def _format_file_validator_feedback(
         ])
 
     safe_localizations: list[dict[str, Any]] = []
-
     if isinstance(validator_report, dict):
         raw_localization = validator_report.get("localization")
         if isinstance(raw_localization, list):
@@ -5971,9 +6094,10 @@ def _format_file_validator_feedback(
         "1. 只修复上面的 deterministic_error。",
         "2. validator localization 只能作为定位和 minimal_edit 参考，不能作为新的失败来源。",
         "3. 不得根据 validator 自行扩展问题范围。",
-        "4. 不得修改 SKILL.md、workflow、其它脚本、stdout schema、argv 协议或 E2E 映射。",
+        "4. 不得修改其它文件、SkillPlan、workflow、上下游脚本或 E2E 映射。",
         "5. 如果 localization 给出了 minimal_edit，优先落实该最小修改。",
         "6. 如果 minimal_edit 和 deterministic_error 冲突，以 deterministic_error 为准。",
+        "7. 对 Markdown 文件，只修改 localization 指向的 frontmatter、小节、列表项、段落或 fenced block；保留未失败区域。",
     ])
 
     return "\n".join(parts)
@@ -6556,9 +6680,12 @@ def _sanitize_generated_file_content(
 ) -> str:
     """Normalize model output into exactly the requested file content.
 
-    references/*.md are documentation resources. If a reference contains
-    executable-looking bash/sh/shell blocks calling scripts/**, demote those
-    blocks to text before validation/writing.
+    这里只做 normalize/sanitize，不做合同校验。
+
+    原因：
+    - references/*.md 需要先 sanitize，再补/规范化 frontmatter，再进入 contract check；
+    - 如果这里提前调用 _validate_generated_file_content，会在 frontmatter 修复前误杀；
+    - write-file 阶段也不应再次校验，避免前端展示内容与落盘内容不一致。
     """
     if file_path.startswith("scripts/") and _MULTI_FILE_MARKER_RE.search(content) and _extract_only_fenced_block(content) is None:
         sanitized = content.strip()
@@ -6572,13 +6699,6 @@ def _sanitize_generated_file_content(
 
     if file_path.startswith("references/") or role == "reference":
         sanitized = _sanitize_reference_markdown(sanitized)
-
-    _validate_generated_file_content(
-        file_path,
-        sanitized,
-        role=role,
-        skill_plan_entry=skill_plan_entry,
-    )
 
     return sanitized
 
@@ -7885,25 +8005,46 @@ async def _repair_skill_md_model_finalizer(
     skill_name: str,
     attempt: int,
 ) -> str:
+    """Repair SKILL.md by localized editing, not regeneration.
+
+    这里不让模型重新创作一份新 SKILL.md。
+    它必须根据 failures 中的 target/layer/minimal_edit，只编辑失败局部；
+    未被失败项指向的章节、命令块、frontmatter 字段和资源说明必须保持。
+    """
     repair_messages = [*prompt_messages, {
         "role": "user",
         "content": (
-            "上一次模型生成的 SKILL.md 未通过第一轮校验。只修 SKILL.md；不要修改 scripts、assets、SkillPlan 或 runtime specs。\n"
-            "修复反馈只涉及 frontmatter、bash block、脚本自然语言说明、蓝图一致性、references/assets 说明、最终产物说明、Creator 流程泄露或内部合同泄露。\n"
-            "不要要求 bash argv 与脚本字段完全一致；不要做 E2E 字段闭环；接口闭环由第二轮 E2E 处理。\n\n"
-            "失败项（JSON）：\n"
-            f"{json.dumps(failures, ensure_ascii=False, indent=2)}\n\n"
+            "上一次模型生成的 SKILL.md 未通过第一轮校验。"
+            "本轮不是重新生成 SKILL.md，而是对上一版做局部编辑。\n\n"
+
+            "局部修复原则：\n"
+            "1. 只修改 failures 指向的 target/layer/minimal_edit 对应区域。\n"
+            "2. 未被 failures 指向的 frontmatter、章节、脚本说明、bash fenced block、资源说明、最终产物说明必须保持原样。\n"
+            "3. 不得重排整篇文档，不得改写已通过章节，不得新增蓝图外脚本、reference、asset 或能力。\n"
+            "4. 如果失败是 reference/asset 提及问题，只在已有资源说明附近补充缺失路径；没有合适位置时才新增一个最小资源说明小节。\n"
+            "5. 如果失败是命令块问题，只修改对应 fenced block，不修改其它命令块或正文。\n"
+            "6. 如果失败是 frontmatter 问题，只修改 YAML frontmatter，不改正文。\n"
+            "7. 不做 E2E 字段闭环，不要求 bash argv 与脚本字段完全一致；接口闭环由第二轮 E2E 处理。\n\n"
+
+            "失败项 JSON：\n"
+            f"{json.dumps(failures, ensure_ascii=False, indent=2, default=str)}\n\n"
+
             "上一版 SKILL.md：\n"
-            f"{previous_content[-16000:]}\n\n"
-            "请返回修复后的完整 SKILL.md 正文，不要使用外层 Markdown fence。"
+            "```text\n"
+            f"{previous_content[-20000:]}\n"
+            "```\n\n"
+
+            "请返回局部修复后的完整 SKILL.md 文件内容。"
+            "不要使用外层 Markdown fence，不要解释，不要输出 diff。"
         ),
     }]
+
     return await _complete_creator_file_generation(
         messages=repair_messages,
         model=model,
         skill_name=skill_name,
         file_path="SKILL.md",
-        prompt_variant="model_finalizer_repair",
+        prompt_variant="model_finalizer_local_repair",
         retry_index=attempt,
     )
 
@@ -8078,10 +8219,12 @@ async def generate_file(request: GenerateFileRequest):
             prompt_variant = "standard"
         except Exception as exc:
             logger.exception("Creator generate_file prepare failed: %s", exc)
-            yield _sse({
-                "error": f"生成前准备失败：{exc}",
-                "done": True,
-            })
+            yield _file_done_error_sse(
+                file_path=request.file_path,
+                role=request.role,
+                error=f"生成前准备失败：{exc}",
+                error_type="prepare_failed",
+            )
             return
 
         candidate = ""
@@ -8098,10 +8241,12 @@ async def generate_file(request: GenerateFileRequest):
             )
         except Exception as exc:
             logger.exception("Creator generate_file initial model call failed: %s", exc)
-            yield _sse({
-                "error": f"模型调用失败：{exc}",
-                "done": True,
-            })
+            yield _file_done_error_sse(
+                file_path=request.file_path,
+                role=request.role,
+                error=f"模型调用失败：{exc}",
+                error_type="model_call_failed",
+            )
             return
 
         for attempt in range(1, _MAX_FILE_REPAIR_ATTEMPTS + 1):
@@ -8470,49 +8615,65 @@ async def generate_file(request: GenerateFileRequest):
                     },
                 })
 
-                validator_report = await _run_generated_file_validator_round(
-                    file_path=request.file_path,
-                    content=candidate,
-                    deterministic_error=deterministic_error,
-                    requested_model=route.model,
-                    targeted_repair=targeted_repair,
-                    contract_text=contract_text,
-                    passed_checks_text=passed_checks_text,
-                    failed_checks_text=failed_checks_text,
-                    repair_mode=_repair_mode_for_first_round(
+                try:
+                    validator_report = await _run_generated_file_validator_round(
+                        file_path=request.file_path,
+                        content=candidate,
+                        deterministic_error=deterministic_error,
+                        requested_model=route.model,
+                        targeted_repair=targeted_repair,
+                        contract_text=contract_text,
+                        passed_checks_text=passed_checks_text,
+                        failed_checks_text=failed_checks_text,
+                        repair_mode=_repair_mode_for_first_round(
+                            source=error_source,
+                            file_path=request.file_path,
+                            attempt=attempt,
+                        ),
+                    )
+
+                    feedback = _format_file_validator_feedback(
+                        deterministic_error,
+                        validator_report,
+                        targeted_repair=targeted_repair,
+                        file_path=request.file_path,
+                    )
+
+                    repair_mode = _repair_mode_for_first_round(
                         source=error_source,
                         file_path=request.file_path,
                         attempt=attempt,
-                    ),
-                )
+                    )
 
-                feedback = _format_file_validator_feedback(
-                    deterministic_error,
-                    validator_report,
-                    targeted_repair=targeted_repair,
-                    file_path=request.file_path,
-                )
+                    repaired_candidate = await _repair_generated_file_with_feedback(
+                        prompt_messages=prompt_messages,
+                        model=route.model,
+                        file_path=request.file_path,
+                        previous_content=candidate,
+                        validation_error=feedback,
+                        targeted_repair=targeted_repair,
+                        contract_text=contract_text,
+                        passed_checks_text=passed_checks_text,
+                        failed_checks_text=failed_checks_text,
+                        repair_mode=repair_mode,
+                        skill_plan_entry=effective_skill_plan_entry,
+                    )
 
-                repair_mode = _repair_mode_for_first_round(
-                    source=error_source,
-                    file_path=request.file_path,
-                    attempt=attempt,
-                )
-
-                repaired_candidate = await _repair_generated_file_with_feedback(
-                    prompt_messages=prompt_messages,
-                    model=route.model,
-                    file_path=request.file_path,
-                    previous_content=candidate,
-                    validation_error=feedback,
-                    targeted_repair=targeted_repair,
-                    contract_text=contract_text,
-                    passed_checks_text=passed_checks_text,
-                    failed_checks_text=failed_checks_text,
-                    repair_mode=repair_mode,
-                    skill_plan_entry=effective_skill_plan_entry,
-                )
-
+                except Exception as repair_exc:
+                    logger.exception(
+                        "[Creator][generate_file][repair_failed] file=%s source=%s layer=%s attempt=%d",
+                        request.file_path,
+                        error_source,
+                        stage_error.layer,
+                        attempt,
+                    )
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=f"文件内容修复阶段异常：{type(repair_exc).__name__}: {repair_exc}",
+                        error_type="repair_failed",
+                    )
+                    return
                 if request.file_path.startswith("scripts/") and repaired_candidate.strip() == (candidate or "").strip():
                     logger.warning(
                         "[Creator][generate_file][repair_noop] file=%s source=%s layer=%s attempt=%d repair_mode=%s",
@@ -8553,19 +8714,18 @@ async def generate_file(request: GenerateFileRequest):
         },
     )
 
-@router.post("/write-file")
+@router.post("/write-file", response_model=WriteFileResponse)
 async def write_file(request: WriteFileRequest):
     """Write already-validated generated content to disk.
 
-    /write-file 是纯落盘阶段：
-    - 不再做 content contract 校验；
-    - 不再做 script responsibility review；
-    - 不再做 script smoke trial run；
-    - 不再做 SKILL.md 蓝图一致性或跨文件检查。
+    /write-file 只落盘：
+    - 不做 content contract 校验；
+    - 不做 script responsibility review；
+    - 不做 script smoke trial run；
+    - 不做 SKILL.md 蓝图一致性或跨文件检查；
+    - 不重新 canonicalize，避免前端展示内容与落盘内容不一致。
 
-    所有“生成内容是否合格”的问题都必须在 /generate-file 的
-    生成 → 单文件合同校验 → 职责完成度校验 → smoke 试跑 → repair 循环中解决。
-    跨脚本数据流和最终产物闭环留给独立 E2E/validate-skill 阶段。
+    所有生成内容是否合格，必须在 /generate-file 的生成循环中解决。
     """
     skill_name = _validate_skill_name(request.skill_name)
     _validate_file_path(request.file_path)
@@ -8580,9 +8740,6 @@ async def write_file(request: WriteFileRequest):
     if not skill_dir.exists():
         raise HTTPException(status_code=404, detail=f"Skill 不存在：{skill_name}")
 
-    # 不在写入阶段重新 sanitize/canonicalize/validate。
-    # generate-file 已经返回经过单文件闭环校验和必要规范化后的 content；
-    # write-file 如果再次改写，会造成“前端展示内容”和“实际落盘内容”不一致。
     content = request.content or ""
 
     target_path = skill_dir / request.file_path

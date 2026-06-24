@@ -12,6 +12,7 @@ These endpoints decouple the file-creation phase from the main
 """
 
 import ast
+import difflib
 import base64
 import csv
 import io
@@ -279,6 +280,13 @@ class AnalyzeBlueprintResponse(BaseModel):
     final_outputs: list[str] = Field(default_factory=list)
     available_tools: list[dict[str, Any]] = Field(default_factory=list)
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
+
+    # 这是展示给用户确认的最终蓝图文本。
+    # 注意：前端应该展示这个字段，而不是展示 LLM 第一次生成的原始蓝图。
+    blueprint_text: str = ""
+
+    # true 表示后台在展示前对蓝图做过合同修正。
+    blueprint_refined: bool = False
 
 
 class InitSkillRequest(BaseModel):
@@ -3286,6 +3294,169 @@ def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> l
         capabilities = [capability for capability in capabilities if capability not in _MODEL_CAPABILITIES]
     return capabilities
 
+async def _refine_blueprint_contract_with_model(
+    *,
+    messages: list[dict],
+    initial_plan: BlueprintPlan,
+    requested_model: str | None,
+) -> tuple[list[dict], list[dict[str, Any]]]:
+    """Ask planning model to refine blueprint text and contracts.
+
+    只做蓝图阶段反馈闭环：
+    - 后台不改 FileSpecOut；
+    - 后台不做字段归属判断；
+    - 后台不做案例化规则；
+    - 模型返回完整 refined_blueprint_text；
+    - 后台后续重新 parse_blueprint。
+    """
+
+    def dump_item(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        if hasattr(item, "dict"):
+            return item.dict()
+        if hasattr(item, "__dict__"):
+            return dict(item.__dict__)
+        return item
+
+    blueprint_text = "\n\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if isinstance(message, dict)
+    )
+
+    plan_snapshot = {
+        "skill_name": initial_plan.skill_name,
+        "files": [
+            dump_item(item)
+            for item in (initial_plan.files or [])
+        ],
+        "skill_plan": {
+            "files": [
+                dump_item(item)
+                for item in ((initial_plan.skill_plan.files if initial_plan.skill_plan else []) or [])
+            ]
+        },
+        "warnings": list(initial_plan.warnings or []),
+    }
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason="creator blueprint contract refinement",
+    )
+
+    _log_creator_model_usage(
+        phase="blueprint_contract_refine.route",
+        file_path="__blueprint__",
+        route=route,
+        model=requested_model,
+    )
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 superskills Creator 的蓝图与合同审查模型。\n"
+                "你只负责检查并修正蓝图文本本身，不写代码，不输出 FileSpecOut patch。\n"
+                "你不能修改平台宿主协议。\n"
+                "你不能引入用户没有要求的业务目标。\n"
+                "你不能把 assets 改成模型生成；assets 只能是上传或静态素材说明。\n"
+                "如果发现蓝图、SkillPlan、脚本职责、inputs/outputs、workflow、最终产物合同不自洽，"
+                "请在蓝图文本中做最小必要修正。\n"
+                "如果当前蓝图已经自洽，返回原蓝图文本。\n"
+                "只输出严格 JSON object。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "原始蓝图文本：\n"
+                "```markdown\n"
+                f"{blueprint_text[-70000:]}\n"
+                "```\n\n"
+                "当前后台解析出的计划快照：\n"
+                "```json\n"
+                f"{json.dumps(plan_snapshot, ensure_ascii=False, indent=2, default=str)[:70000]}\n"
+                "```\n\n"
+                "请扩大检查范围，重点检查这些通用问题：\n"
+                "1. 文件职责是否互相重叠或缺失。\n"
+                "2. 每个脚本 inputs 是否能从用户输入或上游 outputs 得到。\n"
+                "3. 每个脚本 outputs 是否和后续脚本 inputs / 最终输出合同闭环。\n"
+                "4. SKILL.md workflow 顺序、命令参数、placeholder 是否能对应 SkillPlan。\n"
+                "5. 最终输出合同是否能由最后一步脚本真实产生。\n"
+                "6. references 是否只作为参考，不承担运行时输出职责。\n"
+                "7. assets 是否仍是上传或静态资源，不要改成模型生成文件。\n"
+                "8. 如果蓝图要求某种能力，必须明确由哪个脚本承担；如果不需要新增脚本，也要说明现有脚本如何承担。\n\n"
+                "返回严格 JSON object：\n"
+                "{\n"
+                "  \"changed\": true,\n"
+                "  \"diagnostics\": [\n"
+                "    {\n"
+                "      \"severity\": \"note|warning|error\",\n"
+                "      \"message\": \"发现的问题或不修改原因\"\n"
+                "    }\n"
+                "  ],\n"
+                "  \"refined_blueprint_text\": \"完整修正后的蓝图 Markdown 文本\"\n"
+                "}\n\n"
+                "要求：\n"
+                "1. refined_blueprint_text 必须是完整蓝图，不是片段。\n"
+                "2. 不要输出代码。\n"
+                "3. 不要输出 FileSpecOut patch。\n"
+                "4. 不要输出字段级 JSON patch。\n"
+                "5. 不要新增平台协议。\n"
+                "6. 只根据当前蓝图自洽性修正。"
+            ),
+        },
+    ]
+
+    try:
+        raw = await complete_chat_once(prompt_messages, route.model)
+        parsed = _parse_validator_json_object(raw)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("蓝图合同审查模型未返回 JSON object。")
+
+        refined_text = str(parsed.get("refined_blueprint_text") or "").strip()
+        if not refined_text:
+            raise ValueError("蓝图合同审查模型没有返回 refined_blueprint_text。")
+
+        diagnostics: list[dict[str, Any]] = []
+        for item in parsed.get("diagnostics", []) or []:
+            if isinstance(item, dict):
+                diagnostics.append({
+                    "severity": str(item.get("severity") or "note"),
+                    "code": "blueprint_contract_refine",
+                    "source": "blueprint_contract_refine",
+                    "path": "",
+                    "field": "",
+                    "message": str(item.get("message") or ""),
+                })
+            else:
+                diagnostics.append({
+                    "severity": "note",
+                    "code": "blueprint_contract_refine",
+                    "source": "blueprint_contract_refine",
+                    "path": "",
+                    "field": "",
+                    "message": str(item),
+                })
+
+        return [{"role": "user", "content": refined_text}], diagnostics
+
+    except Exception as exc:
+        logger.warning(
+            "[Creator][blueprint_contract_refine] skipped due to error: %s",
+            exc,
+        )
+        return messages, [{
+            "severity": "warning",
+            "code": "blueprint_contract_refine_failed",
+            "source": "blueprint_contract_refine",
+            "path": "",
+            "field": "",
+            "message": f"蓝图合同审查失败，已使用原始蓝图：{type(exc).__name__}: {exc}",
+        }]
 
 def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
     return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
@@ -3990,10 +4161,83 @@ def validate_file_contract(
     return []
 
 
-def validate_workflow_e2e(skill_name: str, *, external_context: dict[str, Any] | None = None) -> list[str]:
-    """Second-round Creator validator: execute SKILL.md workflow and check interfaces."""
-    return _run_skill_workflow_e2e_once(skill_name, external_context=external_context)
+def validate_workflow_e2e(
+    skill_name: str,
+    *,
+    external_context: dict[str, Any] | None = None,
+    source_skill_dir: Path | None = None,
+) -> list[str]:
+    """Second-round Creator validator.
 
+    第二轮只负责：
+    - SKILL.md workflow 能否真实执行；
+    - 上下游 JSON 字段能否串起来；
+    - 最后一步 stdout 是否符合现有 sandbox 平台协议；
+    - artifact 是否真实存在并基础合法。
+
+    不在这里靠模型判断是否通过。
+    不在这里写字段词表。
+    平台 IO 直接复用现有 sandbox/E2E 校验逻辑。
+    """
+
+    return _run_skill_workflow_e2e_once(
+        skill_name,
+        external_context=external_context,
+        source_skill_dir=source_skill_dir,
+    )
+
+def _run_e2e_sandbox_acceptance_gate(
+    *,
+    skill_name: str,
+    candidate_skill_dir: Path,
+    patched_file: str,
+    original_errors: list[str],
+    external_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Second-round E2E acceptance gate.
+
+    E2E 是否通过，必须由真实沙盒试运行决定。
+
+    这里不写平台字段词表。
+    直接调用 _run_skill_workflow_e2e_once，
+    复用现有 sandbox 平台协议。
+    """
+
+    candidate_skill_dir = candidate_skill_dir.resolve()
+
+    if not candidate_skill_dir.is_dir():
+        return {
+            "accepted": False,
+            "phase": "e2e_sandbox",
+            "patched_file": patched_file,
+            "reason": f"candidate skill dir 不存在：{candidate_skill_dir}",
+            "errors": [f"candidate skill dir 不存在：{candidate_skill_dir}"],
+            "original_errors": original_errors,
+        }
+
+    errors = _run_skill_workflow_e2e_once(
+        skill_name,
+        external_context=external_context,
+        source_skill_dir=candidate_skill_dir,
+    )
+
+    if errors:
+        return {
+            "accepted": False,
+            "phase": "e2e_sandbox",
+            "patched_file": patched_file,
+            "reason": "candidate 在简单沙盒 E2E 试运行中失败。",
+            "errors": errors,
+            "original_errors": original_errors,
+        }
+
+    return {
+        "accepted": True,
+        "phase": "e2e_sandbox",
+        "patched_file": patched_file,
+        "reason": "candidate 已通过现有 sandbox/E2E workflow 试运行。",
+        "errors": [],
+    }
 
 def _raise_file_contract_failures(results: list[ContractCheckResult]) -> None:
     failed = [result for result in results if not result.passed]
@@ -5369,6 +5613,887 @@ def _failure_layer_from_error_text(error_text: str) -> str | None:
         return "script_exit"
     return None
 
+@dataclass(frozen=True)
+class CreatorRepairScope:
+    """Creator 局部 diff 修复权限域。
+
+    注意：
+    - 不写平台 IO 字段词表；
+    - 不做 argv/stdout 字段穷举；
+    - 不做 fake/mock 词表拦截；
+    - 平台 IO 兼容性直接交给现有 smoke / sandbox / E2E 真实试运行；
+    - 本 scope 只负责 diff 结构安全：单文件、可应用、修改量受控。
+    """
+
+    phase: str
+    repair_type: str
+    target_file: str
+    max_changed_lines: int = 160
+    notes: tuple[str, ...] = ()
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "repair_type": self.repair_type,
+            "target_file": self.target_file,
+            "max_changed_lines": self.max_changed_lines,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
+class CreatorDiffProposal:
+    """Repair proposal.
+
+    主路径是 exact_replace：
+    {
+      "target_file": "scripts/x.py",
+      "reason": "...",
+      "edits": [
+        {"old": "当前文件中逐字复制的旧片段", "new": "替换后的新片段"}
+      ]
+    }
+
+    兜底兼容 unified diff：
+    {
+      "target_file": "scripts/x.py",
+      "reason": "...",
+      "diff": "--- a/scripts/x.py\n+++ b/scripts/x.py\n@@ ..."
+    }
+    """
+
+    target_file: str
+    reason: str
+    diff: str = ""
+    edits: list[dict[str, str]] = field(default_factory=list)
+    raw: dict[str, Any] | None = None
+    mode: str = "exact_replace"
+
+
+def _strip_diff_path_prefix(path: str) -> str:
+    value = str(path or "").strip().strip('"').strip("'")
+    if value.startswith("a/") or value.startswith("b/"):
+        value = value[2:]
+    return value.replace("\\", "/")
+
+def _extract_first_json_object_text(text: str) -> str | None:
+    """Extract the first balanced JSON object from a noisy model response.
+
+    只做格式抽取，不做业务判断。
+    允许模型前后多写解释时仍能抽出 JSON。
+    如果模型返回完整代码而不是 JSON，则返回 None。
+    """
+
+    source = str(text or "")
+    start = source.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index in range(start, len(source)):
+        ch = source[index]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+
+    return None
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    value = str(text or "").strip()
+
+    fence_match = re.fullmatch(
+        r"```(?:json|diff|patch|text|python|markdown|md)?\s*(.*?)```",
+        value,
+        flags=re.S | re.I,
+    )
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    return value
+
+
+def _looks_like_unified_diff(diff_text: str) -> bool:
+    value = str(diff_text or "").strip()
+    lines = value.splitlines()
+
+    has_old = any(line.startswith("--- ") for line in lines)
+    has_new = any(line.startswith("+++ ") for line in lines)
+    has_hunk = any(line.startswith("@@ ") for line in lines)
+
+    return has_old and has_new and has_hunk
+
+
+def _format_diff_response_violation(error: Exception, raw_text: str) -> str:
+    return (
+        "FORMAT_VIOLATION：上一次输出不是可接受的 repair diff proposal。\n"
+        f"解析错误：{type(error).__name__}: {error}\n\n"
+        "你必须重新输出严格 JSON object，且只包含 target_file、reason、diff。\n"
+        "diff 必须是 single-file unified diff，必须包含 ---、+++、@@ hunk。\n"
+        "禁止输出完整文件源码。\n"
+        "禁止输出 Markdown 解释。\n"
+        "禁止新增、删除或修改其它文件。\n\n"
+        "上一次输出片段如下：\n"
+        "```text\n"
+        f"{str(raw_text or '')[:4000]}\n"
+        "```"
+    )
+
+def _extract_json_or_diff_proposal(
+    text: str,
+    *,
+    expected_target_file: str,
+) -> CreatorDiffProposal:
+    """Parse model repair proposal.
+
+    优先接受 exact_replace JSON：
+
+    {
+      "target_file": "scripts/x.py",
+      "reason": "...",
+      "edits": [
+        {"old": "...", "new": "..."}
+      ]
+    }
+
+    兜底接受 unified diff，但不推荐让 Qwen 主路径写 diff。
+    """
+
+    raw_text = str(text or "").strip()
+    stripped = _strip_outer_code_fence(raw_text)
+
+    parsed: dict[str, Any] | None = None
+
+    try:
+        maybe_json = json.loads(stripped)
+        if isinstance(maybe_json, dict):
+            parsed = maybe_json
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is None:
+        json_text = _extract_first_json_object_text(raw_text)
+        if json_text:
+            try:
+                maybe_json = json.loads(json_text)
+                if isinstance(maybe_json, dict):
+                    parsed = maybe_json
+            except json.JSONDecodeError:
+                parsed = None
+
+    if isinstance(parsed, dict):
+        target_file = _strip_diff_path_prefix(parsed.get("target_file") or expected_target_file)
+        if target_file != expected_target_file:
+            raise ValueError(
+                f"patch target_file 不匹配：expected={expected_target_file!r}, actual={target_file!r}"
+            )
+
+        reason = str(parsed.get("reason") or parsed.get("summary") or "").strip()
+
+        edits = parsed.get("edits")
+        if isinstance(edits, list) and edits:
+            normalized_edits: list[dict[str, str]] = []
+
+            for index, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    raise ValueError(f"edits[{index}] 必须是 object。")
+
+                old = edit.get("old")
+                new = edit.get("new")
+
+                if not isinstance(old, str) or not old:
+                    raise ValueError(f"edits[{index}].old 必须是非空字符串。")
+
+                if not isinstance(new, str):
+                    raise ValueError(f"edits[{index}].new 必须是字符串。")
+
+                normalized_edits.append({"old": old, "new": new})
+
+            return CreatorDiffProposal(
+                target_file=target_file,
+                reason=reason,
+                edits=normalized_edits,
+                raw=parsed,
+                mode="exact_replace",
+            )
+
+        diff = str(parsed.get("diff") or parsed.get("unified_diff") or "").strip()
+        diff = _strip_outer_code_fence(diff)
+
+        if diff:
+            if not _looks_like_unified_diff(diff):
+                raise ValueError(
+                    "JSON 中的 diff 不是 unified diff。"
+                    "如果使用 diff，必须包含 ---、+++、@@。"
+                    "更推荐使用 edits old/new exact_replace 格式。"
+                )
+
+            old_path, new_path = _unified_diff_target_files(diff)
+
+            if new_path != expected_target_file:
+                raise ValueError(
+                    f"diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}"
+                )
+
+            if old_path not in {expected_target_file, new_path}:
+                raise ValueError(
+                    f"diff old file 不匹配：expected={expected_target_file!r}, actual={old_path!r}"
+                )
+
+            return CreatorDiffProposal(
+                target_file=target_file,
+                reason=reason,
+                diff=diff,
+                raw=parsed,
+                mode="unified_diff",
+            )
+
+        raise ValueError(
+            "修复模型返回 JSON，但没有 edits，也没有 diff/unified_diff。"
+            "请使用 edits old/new exact_replace 格式。"
+        )
+
+    raw_diff = stripped
+    fence_match = re.search(r"```(?:diff|patch)?\s*(.*?)```", raw_text, re.S | re.I)
+    if fence_match:
+        raw_diff = fence_match.group(1).strip()
+
+    if not _looks_like_unified_diff(raw_diff):
+        raise ValueError(
+            "修复模型没有返回 exact_replace JSON，也没有返回 raw unified diff。"
+            "如果输出的是完整源码，必须拒绝并要求模型重新输出 edits old/new patch。"
+        )
+
+    old_path, new_path = _unified_diff_target_files(raw_diff)
+
+    if new_path != expected_target_file:
+        raise ValueError(
+            f"raw diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}"
+        )
+
+    if old_path not in {expected_target_file, new_path}:
+        raise ValueError(
+            f"raw diff old file 不匹配：expected={expected_target_file!r}, actual={old_path!r}"
+        )
+
+    return CreatorDiffProposal(
+        target_file=expected_target_file,
+        reason="raw unified diff proposal",
+        diff=raw_diff,
+        raw=None,
+        mode="unified_diff",
+    )
+
+
+def _unified_diff_target_files(diff_text: str) -> tuple[str, str]:
+    old_path = ""
+    new_path = ""
+
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("--- "):
+            old_path = _strip_diff_path_prefix(line[4:].split("\t", 1)[0].strip())
+        elif line.startswith("+++ "):
+            new_path = _strip_diff_path_prefix(line[4:].split("\t", 1)[0].strip())
+            break
+
+    if not old_path or not new_path:
+        raise ValueError("unified diff 缺少 --- / +++ 文件头。")
+
+    if old_path == "/dev/null" or new_path == "/dev/null":
+        raise ValueError("局部修复不允许通过 diff 新增或删除文件。")
+
+    return old_path, new_path
+
+def _apply_exact_replace_patch(
+    *,
+    original_content: str,
+    proposal: CreatorDiffProposal,
+    expected_target_file: str,
+) -> tuple[str, dict[str, Any]]:
+    """Apply exact old/new replacement patch.
+
+    后台只做结构门禁：
+    - target_file 必须匹配；
+    - old 必须非空；
+    - old 必须唯一匹配；
+    - old 和 new 不能完全相同；
+    - 应用后必须产生真实 diff。
+    """
+
+    if proposal.target_file != expected_target_file:
+        raise ValueError(
+            f"patch target_file 不匹配：expected={expected_target_file!r}, actual={proposal.target_file!r}"
+        )
+
+    if not proposal.edits:
+        raise ValueError("exact_replace patch 必须包含非空 edits。")
+
+    candidate = original_content
+    applied: list[dict[str, Any]] = []
+
+    for index, edit in enumerate(proposal.edits):
+        old = edit.get("old", "")
+        new = edit.get("new", "")
+
+        if not isinstance(old, str) or not old:
+            raise ValueError(f"edits[{index}].old 必须是非空字符串。")
+
+        if not isinstance(new, str):
+            raise ValueError(f"edits[{index}].new 必须是字符串。")
+
+        if old == new:
+            raise ValueError(
+                f"edits[{index}] 是 no-op：old 与 new 完全相同。"
+                "请提交会真实改变当前失败内容的 patch；"
+                "如果要补充缺失内容，new 必须比 old 多出实际新增文本。"
+            )
+
+        count = candidate.count(old)
+
+        if count == 0:
+            raise ValueError(
+                f"edits[{index}].old 在当前文件中没有匹配。"
+                "请从当前文件逐字复制更准确的 old 片段。"
+            )
+
+        if count > 1:
+            raise ValueError(
+                f"edits[{index}].old 在当前文件中匹配了 {count} 次。"
+                "请提供更长 old 片段，保证唯一匹配。"
+            )
+
+        candidate = candidate.replace(old, new, 1)
+        applied.append({
+            "index": index,
+            "old_chars": len(old),
+            "new_chars": len(new),
+        })
+
+    diff = "".join(
+        difflib.unified_diff(
+            original_content.splitlines(keepends=True),
+            candidate.splitlines(keepends=True),
+            fromfile=f"a/{expected_target_file}",
+            tofile=f"b/{expected_target_file}",
+        )
+    )
+
+    if not diff.strip():
+        raise ValueError(
+            "exact_replace patch 应用后没有产生任何变化。"
+            "请检查 old/new 是否完全相同，或是否修改了与当前失败无关的片段。"
+        )
+
+    changed_line_count = sum(
+        1
+        for line in diff.splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+
+    return candidate, {
+        "mode": "exact_replace",
+        "edit_count": len(applied),
+        "applied": applied,
+        "changed_line_count": changed_line_count,
+        "generated_diff_chars": len(diff),
+        "generated_diff_excerpt": diff[:2000],
+    }
+
+def _apply_single_file_unified_diff(
+    *,
+    original_content: str,
+    diff_text: str,
+    expected_target_file: str,
+) -> tuple[str, dict[str, Any]]:
+    """Apply a single-file unified diff in memory.
+
+    不调用系统 patch。
+    不允许多文件修改。
+    不在这里判断平台 IO。
+    平台 IO 由后续 smoke / E2E sandbox 试运行判断。
+    """
+
+    old_path, new_path = _unified_diff_target_files(diff_text)
+
+    if new_path != expected_target_file:
+        raise ValueError(
+            f"diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}"
+        )
+
+    if old_path not in {expected_target_file, new_path}:
+        raise ValueError(
+            f"diff old file 不匹配：expected={expected_target_file!r}, actual={old_path!r}"
+        )
+
+    original_lines = (original_content or "").splitlines()
+    diff_lines = str(diff_text or "").splitlines()
+
+    output_lines: list[str] = []
+    source_index = 0
+    added = 0
+    deleted = 0
+    saw_hunk = False
+
+    hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+
+    i = 0
+    while i < len(diff_lines):
+        line = diff_lines[i]
+        match = hunk_re.match(line)
+
+        if not match:
+            i += 1
+            continue
+
+        saw_hunk = True
+        old_start = int(match.group(1))
+        hunk_source_index = old_start - 1
+
+        if hunk_source_index < source_index:
+            raise ValueError("diff hunk 重叠或顺序错误。")
+
+        output_lines.extend(original_lines[source_index:hunk_source_index])
+        source_index = hunk_source_index
+        i += 1
+
+        while i < len(diff_lines):
+            hunk_line = diff_lines[i]
+
+            if hunk_re.match(hunk_line):
+                break
+
+            if hunk_line.startswith("--- ") or hunk_line.startswith("+++ "):
+                break
+
+            if hunk_line.startswith("\\"):
+                i += 1
+                continue
+
+            if not hunk_line:
+                raise ValueError("diff hunk 中存在缺少前缀的空行；空上下文行必须以空格开头。")
+
+            prefix = hunk_line[0]
+            body = hunk_line[1:]
+
+            if prefix == " ":
+                if source_index >= len(original_lines) or original_lines[source_index] != body:
+                    raise ValueError(
+                        "diff context 不匹配，拒绝应用。"
+                        f"line={source_index + 1}, expected={body!r}"
+                    )
+
+                output_lines.append(original_lines[source_index])
+                source_index += 1
+
+            elif prefix == "-":
+                if source_index >= len(original_lines) or original_lines[source_index] != body:
+                    raise ValueError(
+                        "diff delete 行不匹配，拒绝应用。"
+                        f"line={source_index + 1}, expected={body!r}"
+                    )
+
+                source_index += 1
+                deleted += 1
+
+            elif prefix == "+":
+                output_lines.append(body)
+                added += 1
+
+            else:
+                raise ValueError(f"diff hunk 行前缀非法：{hunk_line[:80]!r}")
+
+            i += 1
+
+    if not saw_hunk:
+        raise ValueError("unified diff 没有 @@ hunk。")
+
+    output_lines.extend(original_lines[source_index:])
+
+    candidate = "\n".join(output_lines)
+    if original_content.endswith("\n"):
+        candidate += "\n"
+
+    return candidate, {
+        "old_path": old_path,
+        "new_path": new_path,
+        "added_lines": added,
+        "deleted_lines": deleted,
+        "changed_line_count": added + deleted,
+    }
+
+
+def _validate_repair_diff_scope(
+    *,
+    proposal: CreatorDiffProposal,
+    current_content: str,
+    scope: CreatorRepairScope,
+) -> tuple[str, dict[str, Any]]:
+    """Validate and apply repair proposal.
+
+    主路径：
+    - exact_replace old/new
+
+    兜底：
+    - unified diff
+
+    注意：
+    不做平台字段词表校验。
+    不做 fake/mock 词表校验。
+    不穷举 argv/stdout 字段。
+    平台 IO 是否兼容，由现有 sandbox / smoke / E2E 试运行决定。
+    """
+
+    if proposal.target_file != scope.target_file:
+        raise ValueError(
+            f"repair proposal target_file 越权：expected={scope.target_file!r}, actual={proposal.target_file!r}"
+        )
+
+    if proposal.mode == "exact_replace":
+        candidate, stats = _apply_exact_replace_patch(
+            original_content=current_content,
+            proposal=proposal,
+            expected_target_file=scope.target_file,
+        )
+
+    elif proposal.mode == "unified_diff":
+        candidate, stats = _apply_single_file_unified_diff(
+            original_content=current_content,
+            diff_text=proposal.diff,
+            expected_target_file=scope.target_file,
+        )
+        stats["mode"] = "unified_diff"
+
+    else:
+        raise ValueError(f"未知 repair proposal mode：{proposal.mode}")
+
+    changed_line_count = int(stats.get("changed_line_count") or 0)
+    if changed_line_count > scope.max_changed_lines:
+        raise ValueError(
+            "repair patch 修改行数超过当前修复域上限："
+            f"{changed_line_count} > {scope.max_changed_lines}"
+        )
+
+    return candidate, stats
+
+
+def _compact_messages_for_repair_context(
+    messages: list[dict],
+    *,
+    max_chars: int = 12000,
+) -> str:
+    parts: list[str] = []
+
+    for message in messages[-8:]:
+        role = str(message.get("role") or "")
+        content = str(message.get("content") or "")
+        if not content.strip():
+            continue
+
+        parts.append(f"\n[{role}]\n{content[-3000:]}")
+
+    return "\n".join(parts)[-max_chars:]
+
+
+def _sandbox_io_contract_text_for_creator() -> str:
+    """Describe the existing sandbox IO contract without field-name hardcoding.
+
+    这里只给模型解释现有 sandbox 的通用运行方式：
+    - Action schema
+    - JSON argv
+    - placeholder
+    - stdout JSON object
+    - context merge
+    - final output / artifact 由现有 sandbox 校验
+
+    不在 Creator repair 层重写平台字段白名单。
+    """
+
+    return (
+        "现有 sandbox IO 协议如下：\n"
+        "1. SKILL.md / references 中的 shell fenced command block 会被解析成 Action schema。\n"
+        "2. 每个 command 调用 scripts/...，脚本参数是一个 JSON argv object。\n"
+        "3. command JSON keys 需要与 Action schema inputs / optional_inputs 对齐。\n"
+        "4. {{placeholder}} 从 workflow context 中解析，解析不到会触发 dataflow_mismatch。\n"
+        "5. 每个脚本 stdout 必须是 JSON object；后端会 json.loads(stdout)，非 object 失败。\n"
+        "6. 每步 stdout 会 merge 到 workflow context，后续步骤可以引用其字段。\n"
+        "7. 最后一步必须通过现有 sandbox final output / artifact 校验；Creator 不另写字段词表。\n"
+        "8. references/*.md 是参考资料，不是 E2E 执行源。\n"
+    )
+
+
+async def _request_repair_diff_proposal(
+    *,
+    model: str,
+    file_path: str,
+    current_content: str,
+    failure_text: str,
+    scope: CreatorRepairScope,
+    task_context: str,
+    target_rule: str,
+    format_retry_limit: int = 2,
+) -> CreatorDiffProposal:
+    """Ask coding model for a repair patch proposal.
+
+    优先要求 exact_replace old/new。
+    兜底兼容 unified diff。
+    """
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 superskills Creator 的局部修复代码模型。\n"
+                "你只能输出严格 JSON object，不能输出 Markdown 解释。\n"
+                "你不能输出完整文件，只能输出 target_file 的局部 patch。\n"
+                "优先使用 edits old/new exact_replace 格式，不要手写 unified diff hunk 行号。\n"
+                "本轮只允许修复 target_file。\n"
+                "不要新增文件、删除文件、修改其它文件。\n"
+                "不要在 Creator repair 层重新定义平台 IO。"
+                "平台兼容性会由后续 sandbox / smoke / E2E 真实试运行判断。\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标文件：{file_path}\n\n"
+                "RepairScope：\n"
+                f"{json.dumps(scope.to_prompt_dict(), ensure_ascii=False, indent=2)}\n\n"
+                "本轮修复规则：\n"
+                f"{target_rule}\n\n"
+                "sandbox IO 前置协议：\n"
+                f"{_sandbox_io_contract_text_for_creator()}\n\n"
+                "真实失败来源：\n"
+                f"{failure_text[-12000:]}\n\n"
+                "上下文：\n"
+                f"{task_context[-20000:]}\n\n"
+                "当前目标文件完整内容：\n"
+                "```text\n"
+                f"{current_content}\n"
+                "```\n\n"
+                "只返回严格 JSON object，优先使用如下格式：\n"
+                "{\n"
+                f"  \"target_file\": \"{file_path}\",\n"
+                "  \"reason\": \"为什么这个 patch 只修复当前真实失败\",\n"
+                "  \"edits\": [\n"
+                "    {\n"
+                "      \"old\": \"从当前文件中逐字复制、且唯一出现的旧片段\",\n"
+                "      \"new\": \"替换后的新片段\"\n"
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
+                "要求：\n"
+                "1. old 必须从当前文件逐字复制。\n"
+                "2. old 必须唯一出现。\n"
+                "3. 不要输出完整文件源码。\n"
+                "4. 不要输出 Markdown。\n"
+                "5. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
+            ),
+        },
+    ]
+
+    last_error: Exception | None = None
+    last_text = ""
+
+    for attempt in range(1, max(1, format_retry_limit) + 1):
+        text = await complete_chat_once(messages, model)
+        last_text = text
+
+        try:
+            return _extract_json_or_diff_proposal(
+                text,
+                expected_target_file=file_path,
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "[Creator][repair_patch][format_violation] file=%s model=%s attempt=%d/%d error=%s",
+                file_path,
+                model,
+                attempt,
+                format_retry_limit,
+                exc,
+            )
+
+            if attempt >= format_retry_limit:
+                break
+
+            messages.append({
+                "role": "assistant",
+                "content": str(text or "")[:6000],
+            })
+            messages.append({
+                "role": "user",
+                "content": _format_diff_response_violation(exc, text),
+            })
+
+    raise ValueError(
+        "修复模型连续没有返回合法 patch proposal，已拒绝应用。\n"
+        f"target_file={file_path}\n"
+        f"last_error={type(last_error).__name__ if last_error else 'Unknown'}: {last_error}\n"
+        "last_output_excerpt:\n"
+        f"{str(last_text or '')[:4000]}"
+    )
+
+async def _request_and_apply_repair_patch(
+    *,
+    model: str,
+    file_path: str,
+    current_content: str,
+    failure_text: str,
+    scope: CreatorRepairScope,
+    task_context: str,
+    target_rule: str,
+    patch_retry_limit: int = 3,
+) -> tuple[CreatorDiffProposal, str, dict[str, Any]]:
+    """Request patch, apply patch, and retry on parse/apply failure.
+
+    不做业务规则判断。
+    只做：
+    - 格式失败反馈；
+    - old/new 匹配失败反馈；
+    - no-op patch 反馈；
+    - runtime traceback 优先级反馈。
+    """
+
+    runtime_priority_note = ""
+    if any(
+        marker in str(failure_text or "")
+        for marker in (
+            "Traceback",
+            "stderr=",
+            "exit_code=",
+            "脚本试运行失败",
+            "SyntaxError:",
+            "ValueError:",
+            "TypeError:",
+            "NameError:",
+            "ModuleNotFoundError:",
+            "ImportError:",
+        )
+    ):
+        runtime_priority_note = (
+            "RUNTIME_TRACEBACK_PRIORITY：这是 smoke/trial run 真实运行失败。"
+            "修复时必须优先依据 raw stderr Traceback、exit_code、报错源码行和异常类型。"
+            "validator 的解释只作为辅助说明；如果 validator 解释与 Traceback 冲突，以 Traceback 为准。"
+            "不要修改与 Traceback 无关的位置。"
+        )
+
+    accumulated_failure = failure_text + ("\n\n" + runtime_priority_note if runtime_priority_note else "")
+    accumulated_context = task_context + ("\n\n" + runtime_priority_note if runtime_priority_note else "")
+    last_error: Exception | None = None
+    last_proposal_excerpt = ""
+
+    for attempt in range(1, max(1, patch_retry_limit) + 1):
+        try:
+            proposal = await _request_repair_diff_proposal(
+                model=model,
+                file_path=file_path,
+                current_content=current_content,
+                failure_text=accumulated_failure,
+                scope=scope,
+                task_context=accumulated_context,
+                target_rule=target_rule,
+                format_retry_limit=2,
+            )
+
+            last_proposal_excerpt = json.dumps(
+                proposal.raw if proposal.raw is not None else {
+                    "target_file": proposal.target_file,
+                    "reason": proposal.reason,
+                    "mode": proposal.mode,
+                    "diff": proposal.diff[:2000],
+                    "edits": proposal.edits,
+                },
+                ensure_ascii=False,
+                default=str,
+            )[:5000]
+
+            candidate, diff_stats = _validate_repair_diff_scope(
+                proposal=proposal,
+                current_content=current_content,
+                scope=scope,
+            )
+
+            diff_stats["repair_patch_attempt"] = attempt
+            return proposal, candidate, diff_stats
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "[Creator][repair_patch][apply_or_parse_failed] file=%s model=%s attempt=%d/%d error=%s",
+                file_path,
+                model,
+                attempt,
+                patch_retry_limit,
+                exc,
+            )
+
+            if attempt >= patch_retry_limit:
+                break
+
+            no_op_note = ""
+            if (
+                "no-op" in str(exc)
+                or "没有产生任何变化" in str(exc)
+                or "old 与 new 完全相同" in str(exc)
+            ):
+                no_op_note = (
+                    "NO_OP_PATCH_REJECTED：上一轮 patch 没有产生真实变化。"
+                    "你不能提交 old 与 new 完全相同的 edit。"
+                    "new 必须真实改变当前失败内容。"
+                    "如果目标是在文件末尾补充内容，请让 old 选中当前文件末尾的一段真实文本，"
+                    "new 在该片段基础上追加缺失内容。"
+                )
+
+            apply_feedback = (
+                "\n\nPATCH_APPLY_OR_PARSE_FAILED：上一轮 patch 没有被后端接受。\n"
+                f"失败类型：{type(exc).__name__}\n"
+                f"失败原因：{exc}\n\n"
+                f"{runtime_priority_note}\n\n"
+                f"{no_op_note}\n\n"
+                "请重新输出 exact_replace JSON patch，不要输出完整文件，不要手写 unified diff。\n"
+                "old 必须从当前目标文件逐字复制，且只出现一次。\n"
+                "new 必须真实改变当前失败内容。\n"
+                "如果 old 没匹配，请复制更准确的当前文件片段。\n"
+                "如果 old 匹配多次，请提供更长 old 片段。\n\n"
+                "上一轮 proposal 摘要：\n"
+                "```text\n"
+                f"{last_proposal_excerpt}\n"
+                "```\n"
+            )
+
+            accumulated_failure = failure_text + apply_feedback
+            accumulated_context = task_context + apply_feedback
+
+    raise ValueError(
+        "修复模型连续提出无法解析或无法应用的 patch，已停止本轮 repair。\n"
+        f"target_file={file_path}\n"
+        f"last_error={type(last_error).__name__ if last_error else 'Unknown'}: {last_error}\n"
+    )
+
 async def _repair_generated_file_with_feedback(
     *,
     prompt_messages: list[dict],
@@ -5383,196 +6508,174 @@ async def _repair_generated_file_with_feedback(
     repair_mode: str = "minimal_edit",
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> str:
-    """Ask the routed generation model to fix one file using validator feedback.
+    """First-round single-file repair using local patch.
 
-    The repaired model output is intentionally not validated here. Validation
-    happens at the top of the generate-file retry loop so format errors in the
-    repaired response consume one retry attempt and can be sent back as feedback.
-    Previous content is passed as user-quoted data instead of an assistant turn
-    so Markdown-wrapped failures are not reinforced as the desired answer shape.
+    第一轮职责：
+    - 模型负责判断当前文件是否完成责任内功能；
+    - smoke / trial run 负责判断代码是否真的能跑通；
+    - 本函数只让模型提出局部 patch，并在内存中 apply patch 得到 candidate content；
+    - 不允许模型整文件覆盖；
+    - 不在 repair 层穷举平台 IO 字段，平台 IO 交给现有 smoke / sandbox 校验；
+    - patch 解析/apply 失败时，会反馈给写代码模型重试，而不是直接报错。
     """
+
+    current_content = previous_content or ""
     is_script = file_path.startswith("scripts/")
-    plan_entry = _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry) if is_script else None
+
+    scope = CreatorRepairScope(
+        phase="module_functional_smoke",
+        repair_type=repair_mode or "localized_patch",
+        target_file=file_path,
+        max_changed_lines=220 if repair_mode == "strict_contract_rewrite" else 160,
+        notes=(
+            "第一轮只修当前文件。",
+            "模型功能校验判断责任是否完成；smoke/trial run 判断代码是否通过。",
+            "平台兼容性直接交给现有 sandbox/smoke 校验，不在 repair 层做字段词表判断。",
+            "优先输出 edits old/new exact_replace patch，不要输出完整文件。",
+        ),
+    )
+
+    plan_entry = (
+        _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=skill_plan_entry)
+        if is_script
+        else None
+    )
     repair_language = plan_entry.language if plan_entry is not None else language_for_path(file_path)
-    repair_runtime = plan_entry.runtime if plan_entry is not None else runtime_for_language(repair_language, file_type_for_path(file_path))
-    runtime_rule = {
-        "python": "Python: parse sys.argv[1] as JSON，保留 main() 入口并 print JSON。",
-        "node": "Node: parse process.argv[2] as JSON，并 console.log(JSON.stringify(...))。",
-        "bash": "Bash: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
-        "shell": "Shell: parse $1 as JSON，并向 stdout 输出 JSON 或声明的文件产物。",
-    }.get(repair_runtime, "只输出该文件类型的原始内容；不得包含 Markdown fence。")
+    repair_runtime = plan_entry.runtime if plan_entry is not None else runtime_for_language(
+        repair_language,
+        file_type_for_path(file_path),
+    )
+
     if is_script:
-        output_contract = f"Rewrite as raw {repair_language} source. Remove any fenced code blocks or file labels. Do NOT include Markdown fences, explanations, file headers, or multi-file content. Keep JSON argv parsing broad and compatible with the current workflow envelope; do not change the blueprint or SKILL.md. {runtime_rule}"
-        local_edit_scope = "保留其它已经正确的导入、函数、参数解析、stdout JSON 协议和业务逻辑。"
-    elif file_path.startswith("references/"):
-        output_contract = (
-            "最终只返回当前 reference Markdown 文件内容；不要在文件外层套 Markdown 代码块。"
-            "references/*.md 必须包含 YAML frontmatter，且 title/description 非空；"
-            "frontmatter 顶层只允许 title/description/source/license/metadata；"
-            "metadata.creator.path / metadata.creator.purpose 是允许的内部记录，不要因其出现 references/ 路径而删除。"
-            "frontmatter 后必须有 Markdown 正文，正文必须包含标题，并提供可复用参考信息。"
-            "references/*.md 可以包含非执行性的 ```json 或 ```text 示例。"
-        )
-        local_edit_scope = (
-            "优先按失败项局部修复：metadata schema 错误只替换 frontmatter；"
-            "正文格式/参考价值错误只重写当前 reference 正文；"
-            "普通 ```json/```text 示例不是错误，不要为了修复而删除。"
-            "不要修改其它文件，不要添加可执行脚本命令块，不要重新定义 workflow/role/inputs/outputs/capabilities。"
-        )
-    else:
-        output_contract = "最终只返回 SKILL.md 文件正文；不要在文件外层套 Markdown 代码块，不要输出 Creator 创建流程、确认清单或 `点击开始创建` 文案。"
-        local_edit_scope = "保留已经正确的 frontmatter、章节结构、脚本命令示例和 reference 引用。"
-    if is_script:
-        tool_context = _creator_tool_context_for_script(
-            file_path=file_path,
-            skill_plan_entry=plan_entry,
-            failure_layer=_failure_layer_from_error_text(validation_error),
-            error_text=validation_error,
-            include_snippets=True,
-        ) if plan_entry is not None else ""
-        extra_rules = (
-            "Python / Node / Bash 必须按 SkillPlan.runtime 读取单个 JSON argv；输入解析应宽松兼容 payload / fields / options / input_files / 上游 stdout 字段；"
-            "修复只能基于当前确定性验证错误、当前脚本合同与必要 Tool Snippet；"
-            "不要根据错误文本、业务词、文件名或输出类型重新判断 role/capabilities；"
-            "不要修改 SkillPlan、SKILL.md capability、workflow 或上下游脚本；"
-            "不要生成 topicstring / tonehumorous / stylepopular-science 这类把 key、类型或默认值拼接起来的字段；"
-            "调用平台工具、模型 helper 或外部 helper 后，必须按 Tool Registry / Tool Snippet 声明的返回类型使用；"
-            "如果返回类型不确定，应在当前脚本内做通用类型适配，兼容 str/dict/list/None；"
-            "不得假设所有工具返回值都是 dict，也不得假设所有工具返回值都有 text 字段；"
-            "如果 deterministic_error 指出对象类型与访问方式不匹配，必须修复该访问方式，而不是 try/except 吞错。"
-            f"\n统一 Tool Registry 上下文：\n{tool_context}"
-        )
-    elif file_path.startswith("references/"):
-        extra_rules = (
-            "你只修当前 reference Markdown 文件；不要修改其它文件。"
-            "references/*.md 必须有 YAML frontmatter，且 title/description 非空；"
-            "如果错误是 frontmatter schema，只修 frontmatter。"
-            "如有 frontmatter，顶层只允许 title/description/source/license/metadata；"
-            "path/purpose/role/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
-            "required_tool_slots/implementation_strategy/command_template 等内部字段不能作为 frontmatter 顶层字段；"
-            "如需保留 path/purpose，只允许放在 metadata.creator 下，metadata.creator.path 是合法字段。"
-            "如果错误是正文格式或参考价值不足，必须把正文修成真正的 Markdown 参考资料文档："
-            "至少包含标题，并围绕当前 purpose 提供可复用规则、示例、约束、格式说明、风格要求或质量标准。"
-            "references/*.md 可以包含非执行性的 ```json/```text 示例；普通 JSON 示例块不是错误，不要删除。"
-            "只有 bash/sh/shell fenced block 中调用 scripts/** 的可执行命令块、写入文件标签、多文件打包才需要删除。"
-            "不要输出聊天式澄清问题、确认选项、状态说明或计划询问。"
-            "不要添加可执行脚本命令块，不要重新定义 workflow、role、inputs、outputs 或 capabilities；"
-            "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
-        )
-    else:
-        extra_rules = (
-            "你只修 SKILL.md；保持主体内容，不重写整个文件；"
-            "如果错误是命令格式，只修对应 bash command block；统一使用 python scripts/<file>.py '<JSON object>'；"
-            "不得使用 --args、--key value、--text_file、--image_file 或裸 JSON；"
-            "不要检查或修复上下游字段是否完全接上，那属于第二轮 E2E；"
-            "不要改变 workflow 主体、已通过命令块、未被错误指向的文件、role/capability；"
-            "如果蓝图包含 references/，必须在正文中明确引用对应 reference 路径；"
-            "不得复制 Creator UI 流程、待确认清单、文件创建面板说明或系统自动创建文件提示。"
+        tool_context = (
+            _creator_tool_context_for_script(
+                file_path=file_path,
+                skill_plan_entry=plan_entry,
+                failure_layer=_failure_layer_from_error_text(validation_error),
+                error_text=validation_error,
+                include_snippets=True,
+            )
+            if plan_entry is not None
+            else ""
         )
 
-    repair_messages = [*prompt_messages]
-    repair_snippet_text = ""
-    if is_script and plan_entry is not None:
-        snippets = resolve_tool_snippets_for_context(
-            role=plan_entry.role,
-            capabilities=list(plan_entry.required_capabilities or []) + list(plan_entry.optional_capabilities or []),
-            tool_names=[],
-            file_path=file_path,
-            failure_layer=_failure_layer_from_error_text(validation_error),
-            error_text=validation_error + "\n" + previous_content[-6000:],
-            max_snippets=5,
+        repair_snippet_text = ""
+        if plan_entry is not None:
+            snippets = resolve_tool_snippets_for_context(
+                role=plan_entry.role,
+                capabilities=list(plan_entry.required_capabilities or []) + list(plan_entry.optional_capabilities or []),
+                tool_names=[],
+                file_path=file_path,
+                failure_layer=_failure_layer_from_error_text(validation_error),
+                error_text=validation_error + "\n" + current_content[-6000:],
+                max_snippets=5,
+            )
+            repair_snippet_text = tool_snippet_prompt(snippets)
+
+        target_rule = (
+            "第一轮单文件修复。\n"
+            "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
+            "模型职责校验只负责判断该脚本有没有完成 SkillPlanEntry.purpose / role / capabilities 内的功能责任。\n"
+            "smoke / trial run 才负责判断代码能不能运行、stdout/artifact 是否合规。\n"
+            "如果失败来自模型功能职责校验，你可以修当前脚本中未完成职责的局部逻辑，"
+            "例如 PDF blocks/styles 组装、图片生成/检索参数、表格构造、内容生成调用、工具结果参与输出等。\n"
+            "如果失败来自 smoke/trial run，你只修导致运行失败、stdout 失败或 artifact 失败的局部逻辑。\n"
+            "不要为了绕过试运行而返回空结果或伪造成功。\n"
+            "平台 IO 是否兼容，由后续现有 smoke/sandbox 试运行判断。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
         )
-        repair_snippet_text = tool_snippet_prompt(snippets)
-    previous_for_prompt = previous_content[-8000:] if is_script else previous_content[-16000:]
-    previous_label = "待编辑草稿"
-    if is_script and repair_mode == "strict_contract_rewrite":
-        previous_for_prompt = (_extract_probable_python_source(previous_content) if repair_language == "python" else _drop_common_non_code_lines(_extract_single_wrapping_fence(previous_content) or previous_content)) or ""
-        previous_label = "可参考的源码候选（已移除 Markdown 外壳；若为空，请根据原始任务重新生成）"
-    repair_messages.append({
-        "role": "user",
-        "content": (
-            f"以下是上一次生成但未通过校验的 {file_path} 内容。它可能包含错误示范（例如 Markdown fence 或 Creator 流程泄露），"
-            f"不要模仿错误格式，只把它当作{previous_label}：\n"
-            "<previous_content>\n"
-            f"{previous_for_prompt}\n"
-            "</previous_content>"
-        ),
-    })
-    edit_strategy = (
-        "这是 scripts/ content_review 失败后的严格重写：不要走 minimal_edit，不要修补错误外壳；"
-        "请根据合同、蓝图和骨架重新输出完整可运行源码。"
-        if is_script and repair_mode == "strict_contract_rewrite"
-        else (
-            "这是 script_smoke 确定性失败后的 strict_patch："
-            "必须只修改 traceback / deterministic_error / validator localization 指出的失败行附近代码；"
-            "如果 localization 给出 minimal_edit，必须落实该最小修改；"
-            "修复后不得保留已被 deterministic_error 指出的错误访问方式或错误表达式；"
-            "不得重写 SKILL.md、workflow、其它脚本、stdout schema、argv 协议或 E2E 映射；"
-            "不得把运行错误改成 try/except 静默吞掉并返回假成功。"
-            if is_script and repair_mode == "strict_patch"
-            else (
-                "这是 script_functional 职责失败后的 localized_patch："
-                "只能修改校验模型/确定性证据指出的函数、行号或代码区域；"
-                "必须保留已通过的 import、parse_args、main 入口、JSON argv 协议、stdout 字段名和文件输出协议。"
-                if is_script and repair_mode == "localized_patch"
-                else (
-                    "请优先做局部修改：只修改校验意见指出的最小错误片段，"
-                    f"{local_edit_scope}"
-                    "修改完成后可以整合输出。"
-                )
+
+        extra_context = (
+            f"runtime={repair_runtime}, language={repair_language}\n\n"
+            "SkillPlanEntry：\n"
+            f"{json.dumps(skill_plan_entry or {}, ensure_ascii=False, default=str)[:6000]}\n\n"
+            "Tool Registry / Snippet 上下文：\n"
+            f"{tool_context}\n\n"
+            + (
+                "本次失败涉及以下工具；请优先按相关 Tool Snippet 修复，不要继续猜工具调用方式：\n"
+                f"{repair_snippet_text}\n"
+                if repair_snippet_text
+                else ""
             )
         )
-    )
-    repair_messages.append({
-        "role": "user",
-        "content": (
-            f"上一次生成的 {file_path} 没有通过校验模型/静态校验/试运行。"
-            f"{edit_strategy}"
-            f"{output_contract}\n"
-            f"{extra_rules}\n\n"
-            f"错误信息：\n{validation_error}"
-            + ("\n\n本次失败涉及以下工具；请优先按相关 Tool Snippet 修复，不要继续猜工具调用方式：\n" + repair_snippet_text if repair_snippet_text else "")
-            + ("" if is_script else (f"\n\n完整 contract（最终输出必须满足全部条目）：\n{contract_text}" if contract_text else ""))
-            + ("" if is_script else (f"\n\n已通过检查（必须保留，不要重写或删除对应内容）：\n{passed_checks_text}" if passed_checks_text else ""))
-            + (f"\n\n未通过检查（本轮只修这些项）：\n{failed_checks_text}" if failed_checks_text else "")
-            + (f"\n\n本轮修复模式：{repair_mode}" if repair_mode else "")
-            + ("\n- minimal_edit：只做最小编辑；localized_patch：只修失败函数/行号/区域；strict_patch：只修 deterministic_error/localization 指出的失败行附近代码；strict_contract_rewrite：仅 content_review 允许重写目标小节且必须保留已通过项。")            + ("\n- scripts/ 修复示例：Rewrite as raw <language> source, remove any fenced code blocks or file labels, keep JSON argv parsing broad and preserve required stdout outputs." if is_script else "")
-            + ("\n- 如果这是 scripts/ 文件且进入 strict_contract_rewrite：不要继续修补 Markdown 包裹草稿；必须重新输出会被直接保存的单文件源码，第一行必须是当前 runtime 的源码字符，全文不得出现 ``` 或 ~~~。" if is_script and repair_mode == "strict_contract_rewrite" else "")
-            + (f"\n\n后端根据确定性错误生成的必做修复步骤：\n{targeted_repair}" if targeted_repair else "")
-        ),
-    })
-    logger.info(
-        "[Creator][model] phase=repair.request file=%s model=%s repair_mode=%s messages=%d previous_chars=%d contract_chars=%d failed_checks_chars=%d",
-        file_path,
-        model,
-        repair_mode,
-        len(repair_messages),
-        len(previous_content or ""),
-        len(contract_text or ""),
-        len(failed_checks_text or ""),
-    )
-    repaired = await complete_chat_once(repair_messages, model)
-    if is_script:
-        normalized = _normalize_generated_file_content(file_path, repaired)
-        logger.info(
-            "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d normalized_chars=%d normalized=%s",
-            file_path,
-            model,
-            repair_mode,
-            len(repaired or ""),
-            len(normalized or ""),
-            normalized != repaired,
-        )
-        return normalized
-    logger.info(
-        "[Creator][model] phase=repair.response file=%s model=%s repair_mode=%s raw_chars=%d",
-        file_path,
-        model,
-        repair_mode,
-        len(repaired or ""),
-    )
-    return repaired
 
+    elif file_path == "SKILL.md":
+        target_rule = (
+            "第一轮 SKILL.md 修复。\n"
+            "只修当前失败相关的小节、frontmatter 或 fenced block。\n"
+            "不要整文件重写。\n"
+            "不要在这里做第二轮 E2E 跨模块字段推断；那属于 workflow E2E。\n"
+            "平台 IO 与 sandbox 模式对齐，由后续验证执行判断。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整 SKILL.md。"
+        )
+        extra_context = ""
+
+    elif file_path.startswith("references/"):
+        target_rule = (
+            "第一轮 reference 修复。\n"
+            "reference 是参考资料，不是执行源。\n"
+            "只修当前 reference 文件中的失败区域。\n"
+            "不要添加可执行 workflow。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+        )
+        extra_context = ""
+
+    else:
+        target_rule = (
+            "第一轮单文件修复。\n"
+            "只修当前文件。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+        )
+        extra_context = ""
+
+    task_context = "\n".join([
+        "原始生成上下文摘要：",
+        _compact_messages_for_repair_context(prompt_messages),
+        "",
+        "后端定向修复提示：",
+        targeted_repair or "无",
+        "",
+        "文件合同摘要：",
+        contract_text[-8000:] if contract_text else "无",
+        "",
+        "已通过检查，必须尽量保持：",
+        passed_checks_text[-5000:] if passed_checks_text else "无",
+        "",
+        "未通过检查，本轮只修这些：",
+        failed_checks_text[-5000:] if failed_checks_text else "无",
+        "",
+        "额外上下文：",
+        extra_context,
+    ])
+
+    logger.info(
+        "[Creator][model] phase=repair_patch.request file=%s model=%s repair_mode=%s previous_chars=%d",
+        file_path,
+        model,
+        repair_mode,
+        len(current_content),
+    )
+
+    _proposal, candidate, diff_stats = await _request_and_apply_repair_patch(
+        model=model,
+        file_path=file_path,
+        current_content=current_content,
+        failure_text=validation_error,
+        scope=scope,
+        task_context=task_context,
+        target_rule=target_rule,
+        patch_retry_limit=3,
+    )
+
+    logger.info(
+        "[Creator][model] phase=repair_patch.applied file=%s model=%s repair_mode=%s diff_stats=%s",
+        file_path,
+        model,
+        repair_mode,
+        json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000],
+    )
+
+    return candidate
 
 def _parse_validator_json_object(text: str) -> dict | None:
     stripped = (text or "").strip()
@@ -5790,17 +6893,29 @@ def _file_done_error_sse(
     role: str | None = None,
     error: str,
     error_type: str = "generation_error",
+    content: str | None = None,
+    recoverable: bool = True,
 ) -> str:
-    return _sse({
+    payload = {
         "type": "file_done",
-        "status": "error",
+        "status": "failed_draft" if recoverable else "error",
         "success": False,
         "file_path": file_path,
         "role": role,
         "error_type": error_type,
         "error": error,
+        "recoverable": recoverable,
+        "can_edit": True,
+        "can_retry": True,
         "done": True,
-    })
+    }
+
+    if content is not None:
+        payload["content"] = content
+        payload["draft_content"] = content
+        payload["content_chars"] = len(content)
+
+    return _sse(payload)
 
 def _safe_validator_localizations(
     validator_data: dict[str, Any],
@@ -7347,9 +8462,35 @@ def _sse(data: dict) -> str:
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     try:
-        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
+        initial_plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
     except BlueprintShapeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    effective_messages, blueprint_contract_warnings = await _refine_blueprint_contract_with_model(
+        messages=request.messages,
+        initial_plan=initial_plan,
+        requested_model=request.model,
+    )
+
+    if effective_messages == request.messages:
+        plan = initial_plan
+    else:
+        try:
+            plan = parse_blueprint(effective_messages, strict=request.strict)
+        except BlueprintShapeError as exc:
+            blueprint_contract_warnings.append({
+                "severity": "warning",
+                "code": "blueprint_refined_parse_failed",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": (
+                    "模型修正后的蓝图无法通过 parse_blueprint，已回退原始蓝图："
+                    f"{exc}"
+                ),
+            })
+            effective_messages = request.messages
+            plan = initial_plan
     entries_by_path = {
         entry.path: entry
         for entry in (plan.skill_plan.files if plan.skill_plan else [])
@@ -7358,7 +8499,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 
     blueprint_text = "\n\n".join(
         str(message.get("content") or "")
-        for message in request.messages
+        for message in effective_messages
         if isinstance(message, dict)
     )
 
@@ -7580,7 +8721,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
 
     warnings = []
     seen_warning_keys: set[str] = set()
-    for raw_warning in [*list(plan.warnings), *extra_path_warnings]:
+    for raw_warning in [*list(plan.warnings), *extra_path_warnings, *blueprint_contract_warnings]:
         warning = normalize_warning(raw_warning)
         if not warning:
             continue
@@ -7613,6 +8754,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         final_outputs=_final_outputs_from_plan_entries(list(entries_by_path.values())),
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
+        blueprint_text=blueprint_text,
+        blueprint_refined=effective_messages != request.messages,
     )
 
 
@@ -8005,47 +9148,37 @@ async def _repair_skill_md_model_finalizer(
     skill_name: str,
     attempt: int,
 ) -> str:
-    """Repair SKILL.md by localized editing, not regeneration.
+    """Repair SKILL.md by exact_replace patch, not full regeneration."""
 
-    这里不让模型重新创作一份新 SKILL.md。
-    它必须根据 failures 中的 target/layer/minimal_edit，只编辑失败局部；
-    未被失败项指向的章节、命令块、frontmatter 字段和资源说明必须保持。
-    """
-    repair_messages = [*prompt_messages, {
-        "role": "user",
-        "content": (
-            "上一次模型生成的 SKILL.md 未通过第一轮校验。"
-            "本轮不是重新生成 SKILL.md，而是对上一版做局部编辑。\n\n"
+    validation_error = (
+        "SKILL.md 第一轮校验未通过。"
+        "本轮只能对上一版 SKILL.md 做局部 patch 修复，不能重新生成完整文件。\n\n"
+        "失败项 JSON：\n"
+        f"{json.dumps(failures, ensure_ascii=False, indent=2, default=str)}"
+    )
 
-            "局部修复原则：\n"
-            "1. 只修改 failures 指向的 target/layer/minimal_edit 对应区域。\n"
-            "2. 未被 failures 指向的 frontmatter、章节、脚本说明、bash fenced block、资源说明、最终产物说明必须保持原样。\n"
-            "3. 不得重排整篇文档，不得改写已通过章节，不得新增蓝图外脚本、reference、asset 或能力。\n"
-            "4. 如果失败是 reference/asset 提及问题，只在已有资源说明附近补充缺失路径；没有合适位置时才新增一个最小资源说明小节。\n"
-            "5. 如果失败是命令块问题，只修改对应 fenced block，不修改其它命令块或正文。\n"
-            "6. 如果失败是 frontmatter 问题，只修改 YAML frontmatter，不改正文。\n"
-            "7. 不做 E2E 字段闭环，不要求 bash argv 与脚本字段完全一致；接口闭环由第二轮 E2E 处理。\n\n"
+    targeted_repair = (
+        "只修复 failures 指向的 target/layer/minimal_edit 对应区域。"
+        "未被 failures 指向的 frontmatter、章节、脚本说明、bash fenced block、资源说明、最终产物说明必须保持。"
+        "不得重排整篇文档，不得新增蓝图外脚本、reference、asset 或能力。"
+        "如果失败是命令块问题，只修改对应 fenced block。"
+        "如果失败是 frontmatter 问题，只修改 YAML frontmatter。"
+        "如果失败是资源提及问题，只在已有资源说明附近补充缺失路径。"
+        "不要输出完整 SKILL.md，只输出 exact_replace patch。"
+    )
 
-            "失败项 JSON：\n"
-            f"{json.dumps(failures, ensure_ascii=False, indent=2, default=str)}\n\n"
-
-            "上一版 SKILL.md：\n"
-            "```text\n"
-            f"{previous_content[-20000:]}\n"
-            "```\n\n"
-
-            "请返回局部修复后的完整 SKILL.md 文件内容。"
-            "不要使用外层 Markdown fence，不要解释，不要输出 diff。"
-        ),
-    }]
-
-    return await _complete_creator_file_generation(
-        messages=repair_messages,
+    return await _repair_generated_file_with_feedback(
+        prompt_messages=prompt_messages,
         model=model,
-        skill_name=skill_name,
         file_path="SKILL.md",
-        prompt_variant="model_finalizer_local_repair",
-        retry_index=attempt,
+        previous_content=previous_content,
+        validation_error=validation_error,
+        targeted_repair=targeted_repair,
+        contract_text="SKILL.md 是主 Skill 说明文档，必须保持蓝图意图、真实脚本顺序、资源说明和最终输出说明一致。",
+        passed_checks_text="",
+        failed_checks_text=json.dumps(failures, ensure_ascii=False, indent=2, default=str),
+        repair_mode="localized_patch",
+        skill_plan_entry=None,
     )
 
 
@@ -8459,28 +9592,14 @@ async def generate_file(request: GenerateFileRequest):
                             "->".join(_EMPTY_GENERATION_PROMPT_VARIANTS),
                             "model_empty_content",
                         )
-                        yield _sse({
-                            "type": "file_done",
-                            "status": "error",
-                            "success": False,
-                            "file_path": request.file_path,
-                            "role": request.role,
-                            "error_type": "model_empty_content",
-                            "error": "文件内容生成失败：same-model prompt degradation 已尝试 standard -> simplified -> minimal 后仍为空。",
-                            "diagnostics": {
-                                "model": route.model,
-                                "prompt_variant": prompt_variant,
-                                "retry_index": empty_retry_index,
-                                "prompt_chars": _prompt_chars(prompt_messages),
-                                "content_len": len(candidate or ""),
-                                "message_roles": _message_role_counts(prompt_messages),
-                                "system_chars": _message_role_chars(prompt_messages, "system"),
-                                "user_chars": _message_role_chars(prompt_messages, "user"),
-                                "finish_reason": "unknown",
-                                "prompt_variants": list(_EMPTY_GENERATION_PROMPT_VARIANTS),
-                            },
-                            "done": True,
-                        })
+                        yield _file_done_error_sse(
+                            file_path=request.file_path,
+                            role=request.role,
+                            error="文件内容生成失败：same-model prompt degradation 已尝试 standard -> simplified -> minimal 后仍为空。",
+                            error_type="model_empty_content",
+                            content=candidate or "",
+                            recoverable=True,
+                        )
                         return
 
                     next_variant = _EMPTY_GENERATION_PROMPT_VARIANTS[empty_retry_index]
@@ -8589,15 +9708,14 @@ async def generate_file(request: GenerateFileRequest):
                         deterministic_error,
                     )
 
-                    yield _sse({
-                        "type": "file_done",
-                        "status": "error",
-                        "success": False,
-                        "file_path": request.file_path,
-                        "role": request.role,
-                        "error": error_message,
-                        "done": True,
-                    })
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=error_message,
+                        error_type="repair_limit_exceeded",
+                        content=candidate or "",
+                        recoverable=True,
+                    )
                     return
 
                 yield _sse({
@@ -8672,6 +9790,8 @@ async def generate_file(request: GenerateFileRequest):
                         role=request.role,
                         error=f"文件内容修复阶段异常：{type(repair_exc).__name__}: {repair_exc}",
                         error_type="repair_failed",
+                        content=candidate or "",
+                        recoverable=True,
                     )
                     return
                 if request.file_path.startswith("scripts/") and repaired_candidate.strip() == (candidate or "").strip():
@@ -9562,11 +10682,17 @@ def _e2e_repair_target_from_errors(errors: list[str]) -> str:
     return "SKILL.md"
 
 
-def _copy_skill_dir_for_e2e(skill_name: str) -> tuple[tempfile.TemporaryDirectory, Path]:
-    source_dir = settings.skills_path / skill_name
+def _copy_skill_dir_for_e2e(
+    skill_name: str,
+    *,
+    source_skill_dir: Path | None = None,
+) -> tuple[tempfile.TemporaryDirectory, Path]:
+    source_dir = (source_skill_dir or (settings.skills_path / skill_name)).resolve()
+
     tmp = tempfile.TemporaryDirectory(prefix="creator-e2e-skill-")
     tmp_root = Path(tmp.name)
     trial_skill_dir = tmp_root / skill_name
+
     shutil.copytree(
         source_dir,
         trial_skill_dir,
@@ -9577,6 +10703,7 @@ def _copy_skill_dir_for_e2e(skill_name: str) -> tuple[tempfile.TemporaryDirector
             ".pytest_cache",
         ),
     )
+
     return tmp, trial_skill_dir
 
 
@@ -9845,17 +10972,25 @@ def _validate_e2e_command_static(
     return entry
 
 
-def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str, Any] | None = None) -> list[str]:
+def _run_skill_workflow_e2e_once(
+    skill_name: str,
+    *,
+    external_context: dict[str, Any] | None = None,
+    source_skill_dir: Path | None = None,
+) -> list[str]:
     """Run SKILL.md workflow once with soft internal dataflow validation.
 
-    规则：
-    - 只执行 SKILL.md 中的 bash/sh/shell fenced command block。
-    - references/*.md 只作为参考资料，不作为执行源。
-    - 中间步骤 stdout 只要求是合法非空 JSON object，不要求平台字段。
-    - 中间步骤字段名由 Skill 自己流转，不强制对齐 sandbox 平台协议。
-    - 最后一步 stdout 必须包含 sandbox 可消费的最终输出字段。
+    第二轮 E2E 职责：
+    - 只执行 SKILL.md 中的 bash/sh/shell fenced command block；
+    - references/*.md 只作为参考资料，不作为执行源；
+    - 中间步骤 stdout 只要求是合法非空 JSON object；
+    - 中间步骤字段名由 Skill 内部流转，不强制使用平台最终字段；
+    - 最后一步 stdout 必须通过现有 sandbox 平台输出校验；
+    - E2E 是否通过必须靠真实试运行，不靠模型判断；
+    - 不在这里检查 PDF 字体、图片风格、表格美观等第一轮功能质量。
     """
-    source_skill_dir = settings.skills_path / skill_name
+
+    source_skill_dir = (source_skill_dir or (settings.skills_path / skill_name)).resolve()
     skill_md_path = source_skill_dir / "SKILL.md"
 
     if not skill_md_path.is_file():
@@ -9924,29 +11059,52 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
     tmp_handle: tempfile.TemporaryDirectory | None = None
 
     try:
-        tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(skill_name)
+        tmp_handle, trial_skill_dir = _copy_skill_dir_for_e2e(
+            skill_name,
+            source_skill_dir=source_skill_dir,
+        )
         trial_skill_md = (trial_skill_dir / "SKILL.md").read_text(encoding="utf-8")
 
-        payload: dict[str, Any] = _seed_initial_e2e_payload(commands, external_context=external_context)
+        payload: dict[str, Any] = _seed_initial_e2e_payload(
+            commands,
+            external_context=external_context,
+        )
         traces: list[E2EStepTrace] = []
 
         venv_python: Path | None = None
+
         if any(command.script_path.endswith(".py") for command in commands):
             try:
                 venv_python = _get_skill_venv_python(trial_skill_dir)
+
                 for command in commands:
-                    if command.script_path.endswith(".py"):
-                        entry = _skill_plan_entry_for_file(
-                            file_path=command.script_path,
-                            blueprint_text=trial_skill_md,
-                        )
-                        _install_capability_dependencies(venv_python, entry.required_capabilities)
-                        refined_contract, resolution = _contract_resolution_for_trial(command.script_path, trial_skill_md, None, None)
-                        _install_declared_dependency_packages(
-                            venv_python,
-                            list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []),
-                            source_label="implementation_resolution",
-                        )
+                    if not command.script_path.endswith(".py"):
+                        continue
+
+                    entry = _skill_plan_entry_for_file(
+                        file_path=command.script_path,
+                        blueprint_text=trial_skill_md,
+                    )
+
+                    _install_capability_dependencies(
+                        venv_python,
+                        entry.required_capabilities,
+                    )
+
+                    refined_contract, resolution = _contract_resolution_for_trial(
+                        command.script_path,
+                        trial_skill_md,
+                        None,
+                        None,
+                    )
+
+                    _install_declared_dependency_packages(
+                        venv_python,
+                        list(refined_contract.declared_dependencies or [])
+                        + list(resolution.declared_dependencies or []),
+                        source_label="implementation_resolution",
+                    )
+
             except RuntimeError as exc:
                 return [
                     _e2e_error(
@@ -9976,6 +11134,7 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
                 if entry.runtime == "python":
                     if venv_python is None:
                         raise ValueError("python venv 未初始化。")
+
                     proc = _execute_e2e_python_command(
                         command=command,
                         trial_skill_dir=trial_skill_dir,
@@ -10029,12 +11188,14 @@ def _run_skill_workflow_e2e_once(skill_name: str, *, external_context: dict[str,
 
                 before_keys = set(payload.keys())
                 payload.update(stdout_json)
+
                 artifact_paths = _stdout_artifact_paths(stdout_json, entry, None)
                 if artifact_paths:
                     payload.setdefault("_artifacts", [])
                     if isinstance(payload["_artifacts"], list):
                         payload["_artifacts"].extend(artifact_paths)
                     payload["_last_artifacts"] = artifact_paths
+
                 new_keys = sorted(set(payload.keys()) - before_keys)
 
                 trace = E2EStepTrace(
@@ -10147,11 +11308,33 @@ async def _repair_existing_file_for_e2e_failure(
     e2e_errors: list[str],
     requested_model: str | None = None,
 ) -> str:
-    """Repair an existing SKILL.md/script file using E2E feedback.
+    """Repair existing SKILL.md/script file using local patch + sandbox E2E.
 
-    E2E workflow is defined only by SKILL.md. references/*.md are context
-    resources and should not be selected as executable workflow repair targets.
+    第二轮原则：
+
+    1. 只修跨模块接口串接：
+       - SKILL.md workflow command；
+       - 上下游 JSON 字段；
+       - 当前脚本 argv/stdout 对齐；
+       - 最终平台输出是否能被 sandbox 消费。
+
+    2. 不在这里修单模块功能细节：
+       - PDF 字体、字号、行距；
+       - 图片分辨率、风格；
+       - 表格样式；
+       - 内容质量。
+       这些属于第一轮 module functional smoke。
+
+    3. 不写平台 IO 词表。
+       平台 IO 直接复用现有 sandbox / E2E 试运行协议。
+
+    4. 模型只输出局部 patch。
+       E2E 是否通过由临时 skill 沙盒真实试运行决定。
+
+    5. 如果 patch apply / static preflight / sandbox E2E 失败，
+       在本函数内部继续把失败反馈给写代码模型重试，直到通过或达到最大轮次。
     """
+
     _validate_file_path(target_path)
 
     if target_path.startswith("references/"):
@@ -10167,35 +11350,35 @@ async def _repair_existing_file_for_e2e_failure(
     if not target_file.is_file():
         raise ValueError(f"端到端修复目标不存在：{target_path}")
 
-    current_content = target_file.read_text(encoding="utf-8")
-    skill_md = (
-        (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-        if (skill_dir / "SKILL.md").is_file()
-        else ""
-    )
+    skill_md_path = skill_dir / "SKILL.md"
+    skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
 
     all_file_summaries: list[str] = []
     for path in sorted(skill_dir.rglob("*")):
         if not path.is_file():
             continue
+
         rel = path.relative_to(skill_dir).as_posix()
         if rel.startswith(".venv/") or "__pycache__" in rel:
             continue
         if rel == target_path:
             continue
+
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
+
         all_file_summaries.append(f"\n--- FILE {rel} ---\n{text[-6000:]}")
 
     route = route_creator_file_model(
         file_path=target_path,
         purpose=(
-            "修复最终端到端工作流校验失败；"
-            "E2E 只以 SKILL.md 命令块为执行源，references/*.md 只是参考资料；"
-            "中间步骤允许 Skill 自己使用内部 JSON 字段流转，最终步骤必须对齐 sandbox 平台输出协议；"
-            "只修 E2E_REPAIR_TARGET 指向的局部文件，不要修改已成功 trace 对应部分。"
+            "第二轮 workflow E2E 局部修复："
+            "只修 SKILL.md workflow、跨模块 JSON 字段串接、最终平台输出字段映射；"
+            "不修单文件业务功能细节；"
+            "平台 IO 由 sandbox/E2E 试运行判断；"
+            "输出 single-file local patch proposal。"
         ),
         requested_model=requested_model,
     )
@@ -10206,17 +11389,31 @@ async def _repair_existing_file_for_e2e_failure(
         skill_name=skill_name,
         file_path=target_path,
         route=route,
-        extra=f"errors={len(e2e_errors)}",
+        extra=f"errors={len(e2e_errors)} mode=exact_replace_patch_sandbox_e2e",
     )
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
     structured_failure = _structured_failure_from_errors(e2e_errors)
-    target_region = str(structured_failure.get("target_region") or ("workflow block" if target_path == "SKILL.md" else "run()"))
     targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
+
+    scope = CreatorRepairScope(
+        phase="workflow_e2e",
+        repair_type="cross_step_io_alignment",
+        target_file=target_path,
+        max_changed_lines=220,
+        notes=(
+            "第二轮只修 workflow / cross-step IO / final sandbox output。",
+            "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
+            "优先输出 edits old/new exact_replace patch，不要输出完整文件。",
+        ),
+    )
 
     e2e_tool_cards = ""
     if target_path.startswith("scripts/"):
-        e2e_entry = _skill_plan_entry_for_file(file_path=target_path, blueprint_text=skill_md)
+        e2e_entry = _skill_plan_entry_for_file(
+            file_path=target_path,
+            blueprint_text=skill_md,
+        )
         e2e_tool_cards = _creator_tool_context_for_script(
             file_path=target_path,
             skill_plan_entry=e2e_entry,
@@ -10226,117 +11423,197 @@ async def _repair_existing_file_for_e2e_failure(
             include_snippets=True,
         )
 
-
-
-
-    contract_text = _build_generated_file_contract_text(
-        target_path,
-        skill_md + "\n".join(all_file_summaries)[-16000:],
-        "最终端到端数据流修复",
-        role=None,
-        skill_plan_entry=None,
-    )
-
     if target_path == "SKILL.md":
         target_rule = (
-            "你正在修复 SKILL.md 的 workflow 执行块。"
-            "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，"
-            "references/*.md 只是参考资料，不会作为执行步骤。"
-            "不要重新设计协议，不要加入 Runtime Contract JSON。"
-            "不要修改平台与 Skill 交互的最终 stdout 字段协议。"
-            "中间步骤允许使用任意内部 JSON 字段名流转；"
-            "只需要让当前失败步骤的命令块 JSON argv 占位符能从用户初始输入或前序 stdout JSON 中解析。"
-            "错误信息中的“已成功执行的前序边界 trace”代表已经跑通的步骤，"
-            "这些步骤的命令块、字段名和脚本调用方式不要改。"
+            "你正在修复 SKILL.md 的 workflow 执行块。\n"
+            "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
+            "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
+            "只修命令块、参数传递、步骤串接相关问题。\n"
+            "不要重写 SKILL.md 正文。\n"
+            "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整 SKILL.md。"
         )
+
     elif target_path.startswith("scripts/"):
         target_rule = (
-            "你正在修复脚本源码。"
-            "不要重新设计 SKILL.md，不要改其它脚本。"
-            "脚本只需要满足当前 SKILL.md 命令块传入的 JSON argv，"
-            "并在 stdout 输出合法 JSON object。"
-            "中间脚本 stdout 可以使用内部字段名；"
-            "如果这是最后一步，stdout 必须包含 sandbox 平台可消费的最终字段："
-            "text、markdown、image_path、image_paths、"
-            "pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。"
-            "如果后续步骤需要某个字段，当前脚本 stdout JSON 必须真实输出该字段。"
-            "错误信息中的“已成功执行的前序边界 trace”代表前序步骤已通过，不要改变前序字段名。"
-            "不要输出 Markdown，不要输出 error 字段，不要 mock/placeholder。"
+            "你正在修复脚本源码的 E2E 接口串接问题。\n"
+            "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
+            "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
+            "不要重新设计业务功能；PDF 样式、图片风格、表格样式、内容质量属于第一轮功能 smoke。\n"
+            "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整源码。"
         )
+
     else:
         target_rule = (
-            "只修复 E2E_REPAIR_TARGET 指向的文件。"
-            "不要重新设计流程，不要修改已成功 trace 对应的步骤。"
+            "只修复 E2E_REPAIR_TARGET 指向的文件。\n"
+            "只修当前 E2E 失败对应的最小接口串接问题。\n"
+            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
         )
 
-    prompt_messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是 superskills Creator 的最终端到端修复模型。"
-                "你只能输出目标文件的完整新内容，不能输出解释、Markdown 外壳或多文件 bundle。"
-                "E2E 工作流只由 SKILL.md 定义；references/*.md 是参考资料，不是执行步骤。"
-                "修复目标是让 SKILL.md workflow 从头到尾真实执行通过。"
-                "中间步骤只需要 JSON 边界能流转，不要求使用平台字段；"
-                "最终步骤必须输出与 sandbox 运行时一致的平台字段。"
-                "错误信息中的已成功前序边界 trace 是冻结区，不要重复修改已经通过的部分。"
-                "你只能修改 E2E_STRUCTURED_FAILURE.target_file 指向的文件，且只能修改 target_region 指定区域。"
-                "不要重写整个 Skill，不要重写整个 SKILL.md，不要修改已经通过的脚本/frontmatter/stdout 字段名。"
-                "不要用固定样例数据代替动态输入，不要通过 try/except 返回假成功。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Skill 名称：{skill_name}\n"
-                f"当前需要修复的文件：{target_path}\n"
-                f"只能修改区域：{target_region}\n\n"
-                f"结构化失败对象：\n{json.dumps(structured_failure, ensure_ascii=False, sort_keys=True)}\n\n"
-                f"{target_rule}\n\n"
-                f"定向 E2E 修复提示：{targeted_e2e_hint or '无'}\n\n"
-                "端到端失败信息：\n"
-                f"{deterministic_error}\n\n"
-                "当前 SKILL.md：\n"
-                f"{skill_md[-12000:]}\n\n"
-                "其它相关文件摘要：\n"
-                f"{''.join(all_file_summaries)[-20000:]}\n\n"
-                f"{e2e_tool_cards}\n\n"
-                "请只输出修复后的目标文件完整内容。"
-            ),
-        },
-    ]
+    base_task_context = "\n".join([
+        f"Skill 名称：{skill_name}",
+        "",
+        "结构化失败对象：",
+        json.dumps(structured_failure, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "",
+        "定向 E2E 修复提示：",
+        targeted_e2e_hint or "无",
+        "",
+        "sandbox IO 前置协议：",
+        _sandbox_io_contract_text_for_creator(),
+        "",
+        "当前 SKILL.md：",
+        skill_md[-12000:],
+        "",
+        "其它相关文件摘要：",
+        "".join(all_file_summaries)[-20000:],
+        "",
+        "Tool Registry / Snippet 上下文：",
+        e2e_tool_cards,
+    ])
 
-    repaired = await _repair_generated_file_with_feedback(
-        prompt_messages=prompt_messages,
-        model=model,
-        file_path=target_path,
-        previous_content=current_content,
-        validation_error=deterministic_error,
-        targeted_repair=target_rule,
-        contract_text=contract_text,
-        repair_mode="minimal_edit",
-        skill_plan_entry=None,
+    repair_feedback = deterministic_error
+    last_failure = ""
+    max_candidate_attempts = 3
+
+    for candidate_attempt in range(1, max_candidate_attempts + 1):
+        current_content = target_file.read_text(encoding="utf-8")
+
+        try:
+            _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
+                model=model,
+                file_path=target_path,
+                current_content=current_content,
+                failure_text=repair_feedback,
+                scope=scope,
+                task_context=base_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
+                target_rule=target_rule,
+                patch_retry_limit=3,
+            )
+
+            sanitized = _sanitize_generated_file_content(target_path, candidate_content)
+
+            try:
+                if target_path == "SKILL.md":
+                    _validate_skill_md_against_existing_files(skill_name, sanitized)
+
+                elif target_path.startswith("references/"):
+                    _validate_reference_file_contract(target_path, sanitized, skill_md)
+
+                elif target_path.startswith("assets/"):
+                    _validate_asset_file_contract(target_path, sanitized)
+
+                elif target_path.startswith("scripts/"):
+                    _validate_e2e_script_static_preflight(
+                        file_path=target_path,
+                        content=sanitized,
+                        skill_md=skill_md,
+                    )
+
+            except Exception as preflight_exc:
+                last_failure = (
+                    "STATIC_PREFLIGHT_FAILED：候选 patch 已应用，但静态预检失败。\n"
+                    f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
+                    f"error_type={type(preflight_exc).__name__}\n"
+                    f"error={preflight_exc}\n"
+                    "请基于这个静态错误继续输出新的 exact_replace patch。"
+                )
+                repair_feedback = deterministic_error + "\n\n" + last_failure
+                logger.warning(
+                    "[Creator][E2E][repair_candidate_static_failed] skill=%s file=%s attempt=%d/%d error=%s",
+                    skill_name,
+                    target_path,
+                    candidate_attempt,
+                    max_candidate_attempts,
+                    preflight_exc,
+                )
+                continue
+
+            with tempfile.TemporaryDirectory(prefix="creator-e2e-patch-candidate-") as tmp:
+                tmp_root = Path(tmp)
+                patched_skill_dir = tmp_root / skill_name
+
+                shutil.copytree(
+                    skill_dir,
+                    patched_skill_dir,
+                    ignore=shutil.ignore_patterns(
+                        ".venv",
+                        "__pycache__",
+                        "*.pyc",
+                        ".pytest_cache",
+                    ),
+                )
+
+                patched_target = patched_skill_dir / target_path
+                patched_target.parent.mkdir(parents=True, exist_ok=True)
+                patched_target.write_text(sanitized, encoding="utf-8")
+
+                sandbox_gate = _run_e2e_sandbox_acceptance_gate(
+                    skill_name=skill_name,
+                    candidate_skill_dir=patched_skill_dir,
+                    patched_file=target_path,
+                    original_errors=e2e_errors,
+                )
+
+                if not sandbox_gate.get("accepted"):
+                    last_failure = (
+                        "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
+                        f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
+                        f"diff_stats={json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
+                        f"sandbox_gate={json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
+                        "请基于 sandbox_gate.errors 继续输出新的 exact_replace patch。"
+                    )
+                    repair_feedback = deterministic_error + "\n\n" + last_failure
+                    logger.warning(
+                        "[Creator][E2E][repair_candidate_e2e_failed] skill=%s file=%s attempt=%d/%d",
+                        skill_name,
+                        target_path,
+                        candidate_attempt,
+                        max_candidate_attempts,
+                    )
+                    continue
+
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            target_file.write_text(sanitized, encoding="utf-8")
+
+            logger.info(
+                "[Creator][E2E][repair_accept] skill=%s file=%s attempt=%d diff_stats=%s sandbox=passed",
+                skill_name,
+                target_path,
+                candidate_attempt,
+                json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000],
+            )
+
+            return target_path
+
+        except Exception as candidate_exc:
+            last_failure = (
+                "REPAIR_CANDIDATE_FAILED：候选 patch 生成、解析或应用失败。\n"
+                f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
+                f"error_type={type(candidate_exc).__name__}\n"
+                f"error={candidate_exc}\n"
+                "请继续输出新的 exact_replace patch。"
+            )
+            repair_feedback = deterministic_error + "\n\n" + last_failure
+
+            logger.warning(
+                "[Creator][E2E][repair_candidate_failed] skill=%s file=%s attempt=%d/%d error=%s",
+                skill_name,
+                target_path,
+                candidate_attempt,
+                max_candidate_attempts,
+                candidate_exc,
+            )
+
+            continue
+
+    raise ValueError(
+        "端到端自动修复未完成：写代码模型连续提出的 patch 未能通过 apply/static/E2E。\n"
+        f"skill={skill_name}\n"
+        f"target={target_path}\n"
+        f"last_failure={last_failure[:12000]}"
     )
-
-    sanitized = _sanitize_generated_file_content(target_path, repaired)
-
-    if target_path == "SKILL.md":
-        _validate_skill_md_against_existing_files(skill_name, sanitized)
-    elif target_path.startswith("references/"):
-        _validate_reference_file_contract(target_path, sanitized, skill_md)
-    elif target_path.startswith("assets/"):
-        _validate_asset_file_contract(target_path, sanitized)
-    elif target_path.startswith("scripts/"):
-        _validate_e2e_script_static_preflight(
-            file_path=target_path,
-            content=sanitized,
-            skill_md=skill_md,
-        )
-
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    target_file.write_text(sanitized, encoding="utf-8")
-
-    return target_path
 
 def _iter_markdown_fenced_blocks(content: str) -> list[tuple[str, str]]:
     """Return fenced code blocks as (info_string, body).

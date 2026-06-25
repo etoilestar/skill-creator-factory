@@ -40,53 +40,6 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
     return render_script_command_from_skill_plan(entry)
 
 
-def _creator_tool_context_for_script(
-    *,
-    file_path: str,
-    skill_plan_entry: SkillPlanEntry | dict[str, Any] | None,
-    blueprint_text: str = "",
-    failure_layer: str | None = None,
-    error_text: str | None = None,
-    include_snippets: bool = True,
-) -> str:
-    """Build tool context from explicit SkillPlan contract and registry metadata only."""
-    if not file_path.startswith("scripts/"):
-        return ""
-    entry = skill_plan_entry or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text)
-    tool_resolve = resolve_tools_for_skill_plan_entry(entry)
-    parts = [tool_resolve.tool_usage_prompt]
-    if failure_layer or error_text:
-        role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
-        required = list(entry.get("required_capabilities", []) if isinstance(entry, dict) else getattr(entry, "required_capabilities", []) or [])
-        optional = list(entry.get("optional_capabilities", []) if isinstance(entry, dict) else getattr(entry, "optional_capabilities", []) or [])
-        allowed = list(entry.get("allowed_capabilities", []) if isinstance(entry, dict) else getattr(entry, "allowed_capabilities", []) or [])
-        forbidden = list(entry.get("forbidden_capabilities", []) if isinstance(entry, dict) else getattr(entry, "forbidden_capabilities", []) or [])
-        from ..creator_tool_registry import tool_layer_prompt_for_context
-        parts.append(tool_layer_prompt_for_context(
-            role=role,
-            required_capabilities=required,
-            optional_capabilities=optional,
-            allowed_capabilities=allowed,
-            forbidden_capabilities=forbidden,
-            failure_layer=failure_layer,
-            error_text=error_text,
-        ))
-        if include_snippets:
-            snippets = resolve_tool_snippets_for_context(
-                role=role,
-                capabilities=[*required, *optional, *allowed],
-                tool_names=[*required, *optional, *allowed],
-                file_path=file_path,
-                failure_layer=failure_layer,
-                error_text=error_text,
-                max_snippets=6,
-            )
-            if snippets:
-                parts.append(tool_snippet_prompt(snippets))
-    return "\n\n".join(part for part in parts if part)
-
-
-
 def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
     """Parse one standard Markdown bash command as a real script invocation.
 
@@ -1697,6 +1650,8 @@ def _build_script_file_contract_text(
         ])
 
     try:
+        from .e2e import _extract_e2e_workflow_commands
+
         workflow_commands = _extract_e2e_workflow_commands(Path("."), blueprint_text or "")
         script_commands = [cmd for cmd in workflow_commands if cmd.script_path == file_path]
         is_last_workflow_step = bool(

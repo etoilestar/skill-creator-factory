@@ -340,19 +340,6 @@ async def upload_asset(
     )
 
 
-@dataclass
-class FileGenerationStageError(Exception):
-    """Structured failure source for first-round generation validation."""
-
-    source: str
-    layer: str
-    detail: str
-    original: Exception | None = None
-
-    def __str__(self) -> str:
-        return self.detail
-
-
 def _contract_failure_layer(results: list[ContractCheckResult]) -> str:
     failed = [result for result in results if not result.passed]
     if not failed:

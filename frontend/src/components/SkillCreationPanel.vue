@@ -356,7 +356,6 @@ const localFiles = ref(
 )
 
 const localSkillName = ref(props.skillName)
-const scriptRuntimeSpecs = ref([])
 const editingName = ref(false)
 const nameError = ref('')
 const nameInputRef = ref(null)
@@ -722,13 +721,6 @@ async function handleAssetUpload(fileItem, event) {
   }
 }
 
-function upsertRuntimeSpec(spec) {
-  if (!spec?.script_path) return
-  const idx = scriptRuntimeSpecs.value.findIndex(item => item.script_path === spec.script_path)
-  if (idx >= 0) scriptRuntimeSpecs.value[idx] = spec
-  else scriptRuntimeSpecs.value.push(spec)
-}
-
 // ---------------------------------------------------------------------------
 // Per-file generation & writing
 // ---------------------------------------------------------------------------
@@ -749,7 +741,6 @@ async function generateOneFile(idx) {
         model: props.model,
         references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
         assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
-        scriptRuntimeSpecs: scriptRuntimeSpecs.value,
         finalOutputs: props.finalOutputs,
       })
       file.generatedContent = result.content || ''
@@ -781,9 +772,6 @@ async function generateOneFile(idx) {
       } else if (chunk?.validation) {
         const statusText = chunk.validation.status === 'failed' ? '自动修复失败' : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
-      } else if (chunk?.runtimeSpec) {
-        upsertRuntimeSpec(chunk.runtimeSpec)
-        file.runtime_spec = chunk.runtimeSpec
       } else if (chunk?.error) {
         throw new Error(chunk.error)
       }
@@ -821,10 +809,6 @@ async function writeOneFile(idx) {
       file
     )
     if (!result.success) throw new Error(result.message)
-    if (result.runtime_spec) {
-      upsertRuntimeSpec(result.runtime_spec)
-      file.runtime_spec = result.runtime_spec
-    }
     file.status = 'done'
     file.bytesWritten = result.bytes || 0
   } catch (err) {

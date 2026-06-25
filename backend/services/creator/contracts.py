@@ -1,0 +1,4205 @@
+"""Skill/file contract and blueprint validation helpers."""
+
+from .common import *  # noqa: F403
+
+
+@dataclass(frozen=True)
+class ContractCheckResult:
+    id: str
+    passed: bool
+    target: str
+    message: str
+    expected: str
+    minimal_edit: str
+    matched_paths: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+    layer: str = ""
+
+
+class ContractValidationError(ValueError):
+    """Validation error carrying structured contract check results."""
+
+    def __init__(self, message: str, results: list[ContractCheckResult]):
+        super().__init__(message)
+        self.results = results
+
+
+def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
+    """Compatibility shim: Creator no longer guesses business argv keys.
+
+    Input fields must come from SkillPlan.inputs, SKILL.md command JSON argv, or
+    E2E trace payload/stdout. The generic fallback is a single payload object.
+    """
+    return ["payload"]
+
+
+def _script_command_template(script_path: str, blueprint_text: str, entry: SkillPlanEntry | None = None) -> str:
+    """Render the command template from SkillPlanEntry, the sole execution contract."""
+    if entry is None:
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+    return render_script_command_from_skill_plan(entry)
+
+
+def _creator_tool_context_for_script(
+    *,
+    file_path: str,
+    skill_plan_entry: SkillPlanEntry | dict[str, Any] | None,
+    blueprint_text: str = "",
+    failure_layer: str | None = None,
+    error_text: str | None = None,
+    include_snippets: bool = True,
+) -> str:
+    """Build tool context from explicit SkillPlan contract and registry metadata only."""
+    if not file_path.startswith("scripts/"):
+        return ""
+    entry = skill_plan_entry or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text)
+    tool_resolve = resolve_tools_for_skill_plan_entry(entry)
+    parts = [tool_resolve.tool_usage_prompt]
+    if failure_layer or error_text:
+        role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
+        required = list(entry.get("required_capabilities", []) if isinstance(entry, dict) else getattr(entry, "required_capabilities", []) or [])
+        optional = list(entry.get("optional_capabilities", []) if isinstance(entry, dict) else getattr(entry, "optional_capabilities", []) or [])
+        allowed = list(entry.get("allowed_capabilities", []) if isinstance(entry, dict) else getattr(entry, "allowed_capabilities", []) or [])
+        forbidden = list(entry.get("forbidden_capabilities", []) if isinstance(entry, dict) else getattr(entry, "forbidden_capabilities", []) or [])
+        from ..creator_tool_registry import tool_layer_prompt_for_context
+        parts.append(tool_layer_prompt_for_context(
+            role=role,
+            required_capabilities=required,
+            optional_capabilities=optional,
+            allowed_capabilities=allowed,
+            forbidden_capabilities=forbidden,
+            failure_layer=failure_layer,
+            error_text=error_text,
+        ))
+        if include_snippets:
+            snippets = resolve_tool_snippets_for_context(
+                role=role,
+                capabilities=[*required, *optional, *allowed],
+                tool_names=[*required, *optional, *allowed],
+                file_path=file_path,
+                failure_layer=failure_layer,
+                error_text=error_text,
+                max_snippets=6,
+            )
+            if snippets:
+                parts.append(tool_snippet_prompt(snippets))
+    return "\n\n".join(part for part in parts if part)
+
+
+
+def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
+    """Parse one standard Markdown bash command as a real script invocation.
+
+    C 方案：
+    - 只要求它是可解析 shell 命令；
+    - runner 调用 scripts/*.py；
+    - 不强制参数必须是 JSON argv；
+    - JSON argv / argparse flags / no args 都先允许；
+    - 字段级参数对齐交给第二轮 E2E。
+    """
+    try:
+        parts = shlex.split((command or "").strip(), posix=True)
+    except ValueError:
+        return None
+
+    if len(parts) < 2:
+        return None
+
+    expected_script = script_path.replace("\\", "/").strip()
+    runner = Path(parts[0]).name
+    normalized_script = parts[1].replace("\\", "/").strip()
+
+    if runner not in {"python", "python3"}:
+        return None
+
+    if normalized_script != expected_script:
+        return None
+
+    if not expected_script.startswith("scripts/") or Path(expected_script).suffix.lower() != ".py":
+        return None
+
+    args = parts[2:]
+
+    json_payload: dict[str, Any] | None = None
+    arg_mode = "no_args"
+
+    if len(args) == 1:
+        arg0 = args[0].strip()
+        if arg0.startswith("{") and arg0.endswith("}"):
+            try:
+                parsed = json.loads(arg0)
+                if isinstance(parsed, dict):
+                    json_payload = parsed
+                    arg_mode = "json_arg"
+                else:
+                    arg_mode = "invalid_json_arg"
+            except json.JSONDecodeError:
+                arg_mode = "invalid_json_arg"
+        elif arg0:
+            arg_mode = "positional_args"
+    elif args:
+        if any(str(arg).startswith("-") for arg in args):
+            arg_mode = "argparse_flags"
+        else:
+            arg_mode = "positional_args"
+
+    placeholders: dict[str, str] = {}
+    keys: set[str] = set()
+
+    if json_payload is not None:
+        keys = set(str(key) for key in json_payload.keys())
+        for key, value in json_payload.items():
+            if isinstance(value, str):
+                match = re.fullmatch(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}", value.strip())
+                placeholders[str(key)] = match.group(1) if match else value.strip()
+            else:
+                placeholders[str(key)] = ""
+
+    return {
+        "runner": runner,
+        "script_path": expected_script,
+        "args": args,
+        "arg_mode": arg_mode,
+        "json_payload": json_payload,
+        "keys": keys,
+        "placeholders": placeholders,
+    }
+
+
+def _command_template_equivalent(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
+    """Compare command blocks by normalized execution shape, not business payload.
+
+    C 方案下，第一轮不要求 argv key 完全等于模板 key。
+    """
+    command_sig = _command_signature(command, script_path)
+    template_sig = _command_signature(_script_command_template(script_path, "", entry), script_path)
+
+    if not command_sig or not template_sig:
+        return False
+
+    if command_sig["runner"] != template_sig["runner"]:
+        return False
+
+    if command_sig["script_path"] != template_sig["script_path"]:
+        return False
+
+    return True
+
+
+
+def _command_payload_object(command: str, script_path: str) -> dict[str, Any] | None:
+    """Return JSON argv object only when the command actually uses JSON argv.
+
+    argparse flags / no args are not errors here; they simply return None.
+    """
+    command_sig = _command_signature(command, script_path)
+    if not command_sig:
+        return None
+
+    payload = command_sig.get("json_payload")
+    if isinstance(payload, dict):
+        return {str(key): value for key, value in payload.items()}
+
+    return None
+
+
+def _command_payload_keys(command: str, script_path: str) -> set[str] | None:
+    """Return JSON argv keys passed to script_path, or None if unparsable/non-JSON."""
+    payload = _command_payload_object(command, script_path)
+    if payload is None:
+        return None
+    return set(payload.keys())
+
+
+def _command_runtime_matches(command: str, script_path: str, entry: SkillPlanEntry) -> bool:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    for idx, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        if normalized == script_path or normalized.endswith("/" + script_path):
+            runner = parts[idx - 1] if idx > 0 else ""
+            if entry.runtime == "python":
+                return Path(runner).name.startswith("python")
+            if entry.runtime == "node":
+                return Path(runner).name == "node"
+            if entry.runtime == "bash":
+                return Path(runner).name in {"bash", "sh"}
+            if entry.runtime == "shell":
+                return Path(runner).name in {"sh", "bash"}
+            return True
+    return False
+
+def _check_command_block_contract(script_path: str, commands: list[str], entry: SkillPlanEntry) -> list[ContractCheckResult]:
+    """Validate command blocks as workflow-local execution contracts.
+
+    - Enforce parseable JSON argv and runtime consistency.
+    - Do not enforce cross-step dataflow or exact SkillPlan input-key matching;
+      E2E workflow validation owns argv/stdout handoff checks.
+    """
+    results: list[ContractCheckResult] = []
+
+    for idx, command in enumerate(commands, start=1):
+        command = command.strip()
+        target = f"{script_path}#command-{idx}"
+
+        command_sig = _command_signature(command, script_path)
+        parsed_ok = command_sig is not None
+        results.append(ContractCheckResult(
+            id="command_block.signature.parseable",
+            passed=parsed_ok,
+            target=target,
+            message="命令块可解析为 runner/script_path/JSON argv。" if parsed_ok else f"{script_path} 命令块无法解析为有效执行命令。",
+            expected="命令块应形如：python scripts/name.py '{\"some_key\":\"{{some_key}}\"}'。",
+            minimal_edit="保留脚本路径并确保 JSON argv 可解析；字段名可由 workflow 自由定义。",
+        ))
+        if not command_sig:
+            continue
+
+        runtime_matches = _command_runtime_matches(command, script_path, entry)
+        results.append(ContractCheckResult(
+            id="command_block.runtime.matches_skillplan",
+            passed=runtime_matches,
+            target=target,
+            message="命令块 runner 与脚本 runtime 一致。" if runtime_matches else f"命令块 runner 与脚本 runtime={entry.runtime} 不一致。",
+            expected="Python 用 python，Node 用 node，Bash/Shell 用 bash/sh；JSON keys 只需保持 workflow/脚本自洽。",
+            minimal_edit="修正 runner 或脚本路径；不要仅因 SkillPlan.inputs 改写可运行 payload。",
+        ))
+
+        keys = _command_payload_keys(command, script_path)
+        json_ok = keys is not None
+        results.append(ContractCheckResult(
+            id="command_block.json_argv.parseable",
+            passed=json_ok,
+            target=target,
+            message="命令块使用可解析 JSON argv。" if json_ok else f"{script_path} 命令块必须在脚本路径后传入 JSON object argv。",
+            expected="脚本路径后跟一个 JSON object argv；JSON keys 可由 workflow envelope 自由定义。",
+            minimal_edit="确保 JSON 可解析；字段对齐由第二轮 E2E trace 定位。",
+        ))
+
+        # First-round file contracts stop at command syntax/runtime/JSON shape.
+        # Exact argv key alignment with SkillPlan inputs is a workflow dataflow
+        # concern and is validated during second-round E2E execution.
+
+    return results
+
+def _build_skill_md_contract_text(blueprint_text: str) -> str:
+    """Hard-format authoring contract for SKILL.md.
+
+    Semantic coverage is checked by model review.
+    This contract only defines document format and fenced command norms.
+    """
+    return "\n".join([
+        "必须满足以下 SKILL.md 合同（硬格式与平台边界）：",
+        "",
+        "A. YAML frontmatter:",
+        "- 文件必须以 YAML frontmatter 开始。",
+        "- frontmatter 必须包含 name 和 description。",
+        "- frontmatter 在 metadata 后用 --- 关闭；不要要求文件末尾以 --- 结束。",
+        "",
+        "B. Markdown fenced block 规范:",
+        "- 所有脚本执行命令必须使用标准 Markdown fenced code block。",
+        "- shell 命令必须使用 ```bash 作为 info string，不要使用普通文本、行内代码或缩进代码块表达执行命令。",
+        "- 机器可读 JSON 示例、配置、stdout 示例必须使用 ```json fenced code block。",
+        "- 不要使用 '''bash 或 '''json；Markdown 标准 fence 使用三个反引号 ```。",
+        "",
+        "C. scripts 命令块标准:",
+        "- 对蓝图真实规划的每个脚本，SKILL.md 应提供一个独立的 ```bash fenced code block。",
+        "- 每个 ```bash block 内只能放一条真实 shell 命令。",
+        "- 命令必须直接调用真实 scripts/*.py 路径。",
+        "- 命令参数形态必须由当前脚本真实接口决定，不在 SKILL.md 层固定成唯一协议。",
+        "- 如果脚本使用 JSON argv，则命令形如：python scripts/<真实脚本名>.py '<JSON object argv>'，且 JSON argv 必须能被 json.loads 解析为 object。",
+        "- 如果脚本使用 argparse，则命令形如：python scripts/<真实脚本名>.py --arg value --other value。",
+        "- 如果脚本不需要参数，可以只写：python scripts/<真实脚本名>.py。",
+        "- 动态占位符应作为 shell 安全的字符串参数出现；JSON argv 中的动态 placeholder 必须作为 JSON 字符串值出现，例如 \"topic\":\"{{topic}}\"。",
+        "- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。",
+        "- 禁止在 ```bash block 内直接写 JSON 配置对象。",
+        "- 禁止在 ```bash block 内写 runner/script/argv 伪命令对象。",
+        "- 禁止在 ```bash block 内写说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。",
+        "",
+        "D. workflow / 平台边界:",
+        "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
+        "- 命令 placeholder 应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。",
+        "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
+        "- 多场景、多图片、多页 PDF 等循环应由脚本实现；SKILL.md 第一轮只需保持命令块静态可解析。",
+        "",
+        "E. references/assets:",
+        "- references 应在资源/参考资料小节说明用途和按需读取时机。",
+        "- reference 正文不要全文塞进 SKILL.md。",
+        "- assets/** 只能作为上传素材/静态资源引用，不能描述为模型生成。",
+        "",
+        "F. 禁止项:",
+        "- 不输出 placeholder/mock/fake API。",
+        "- 不要泄露 Creator 内部流程或 kernel references。",
+        "- 不要把蓝图说明文字中的示例/反例路径当成真实文件计划。",
+    ])
+
+def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
+    """Build first-round static authoring guidance for SKILL.md.
+
+    Despite the historical function name, this guide intentionally does not
+    impose internal workflow dataflow.  First-round SKILL.md generation owns
+    static Markdown/platform boundaries only; second-round E2E owns placeholder
+    provenance, stdout field closure, and downstream parser alignment.
+    """
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    reference_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/")
+
+    if not script_paths:
+        return (
+            "SKILL.md first-round static authoring guide:\n"
+            "- 当前蓝图没有 scripts/ 文件；SKILL.md 不要编造脚本命令块。\n"
+            "- 若任务可直接回答，明确写“直接回答用户问题”，不要生成伪脚本流程。"
+        )
+
+    lines: list[str] = [
+        "SKILL.md first-round static authoring guide（只约束静态格式和平台边界，不验证内部 dataflow）:",
+        "A. 命令块静态形态:",
+        "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
+        "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
+        "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
+        "",
+        "B. 资源边界:",
+        "- references/ 只在参考资料/资源小节说明用途和按需读取时机，不替代主流程命令块。",
+        "- assets/ 只能作为上传素材/静态资源引用，不能描述为模型生成。",
+        "",
+        "C. 可用脚本路径与静态命令示例:",
+    ]
+
+    for idx, script_path in enumerate(script_paths, start=1):
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        runner = {"python": "python", "node": "node", "bash": "bash", "shell": "sh"}.get(entry.runtime, "python")
+
+        input_keys = [
+            str(item).strip()
+            for item in (getattr(entry, "inputs", []) or [])
+            if str(item).strip()
+        ]
+
+        if input_keys:
+            payload = {
+                key: "{{" + key + "}}"
+                for key in input_keys
+                if "/" not in key and "\\" not in key and len(key) <= 80
+            }
+        else:
+            payload = {}
+
+        json_command = f"{runner} {script_path} {shlex.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))}"
+
+        lines.extend([
+            f"{idx}. {script_path}",
+            f"   role: {entry.role}",
+            f"   suggested inputs: {', '.join(input_keys) if input_keys else '无显式输入字段'}",
+            "   command shape examples（只说明形态，实际参数必须由脚本真实接口决定）:",
+            "```bash",
+            json_command,
+            "```",
+            "   如果该脚本源码使用 argparse，也可以写成：",
+            "```bash",
+            f"{runner} {script_path} --arg value",
+            "```",
+        ])
+
+    if reference_paths:
+        lines.extend([
+            "",
+            "D. references:",
+            "- SKILL.md 应在参考资料/资源小节逐字引用以下本地 reference，并说明何时读取：",
+        ])
+        for path in reference_paths:
+            lines.append(f"- {path}")
+
+    lines.extend([
+        "",
+        "E. 第二轮 E2E 责任边界:",
+        "- placeholder 来源、前后脚本 stdout 字段闭环、最终 stdout 平台输出字段，不在第一轮 SKILL.md prompt 中证明。",
+        "- 如果这些内容不一致，第二轮 E2E 真实执行会基于实际 stdout/文件产物反馈修复 SKILL.md 或脚本。",
+    ])
+
+    return "\n".join(lines)
+
+def _declared_skill_paths_from_blueprint(blueprint_text: str) -> set[str]:
+    """Extract all skill-local paths declared in the blueprint.
+
+    This must represent the generation plan, not files already on disk.
+    SKILL.md is generated before scripts/references, so scripts/references
+    mentioned by SKILL.md are valid as long as they are declared here.
+    """
+    text = blueprint_text or ""
+    paths: set[str] = set()
+
+    # 1. Existing parser path extraction.
+    for prefix in ("scripts/", "references/", "assets/"):
+        paths.update(_paths_requiring_skill_md_mentions(text, prefix=prefix))
+
+    # 2. Explicit SkillPlan lines:
+    # - path: `scripts/generate_story.py`
+    # - path: scripts/generate_story.py
+    for match in re.finditer(
+        r"(?im)^\s*[-*]?\s*path\s*:\s*`?([A-Za-z0-9_.\-/]+)`?\s*$",
+        text,
+    ):
+        path = match.group(1).strip().strip("`")
+        if path.startswith(("scripts/", "references/", "assets/")):
+            paths.add(path)
+
+    # 3. Inline local resource paths anywhere in blueprint.
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9_./-])((?:scripts|references|assets)/[A-Za-z0-9_.\-/]+)",
+        text,
+    ):
+        path = match.group(1).strip().rstrip("`，,。；;:)）]}")
+        if path.startswith(("scripts/", "references/", "assets/")):
+            paths.add(path)
+
+    # 4. Directory tree fallback:
+    # love-skill/
+    # ├── scripts/
+    # │   ├── generate_story.py
+    # ├── references/
+    # │   └── output-patterns.md
+    # └── assets/
+    #     └── placeholder-logo.png
+    current_dir: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        dir_match = re.search(r"(scripts|references|assets)/\s*$", line)
+        if dir_match:
+            current_dir = dir_match.group(1)
+            continue
+
+        file_match = re.search(r"(?:├──|└──|[-*])\s*([A-Za-z0-9_.-]+\.[A-Za-z0-9]+)\s*$", line)
+        if file_match and current_dir:
+            filename = file_match.group(1).strip()
+            paths.add(f"{current_dir}/{filename}")
+
+    return {p.replace("\\", "/").strip("/") for p in paths if p}
+
+
+def _skill_local_paths_in_markdown(content: str) -> set[str]:
+    return {match.group(1).strip() for match in _SKILL_FILE_PATH_RE.finditer(content or "")}
+
+
+def _kernel_resource_leak_paths(content: str) -> list[str]:
+    """Return explicit kernel/references paths mentioned in final Skill text."""
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in _KERNEL_RESOURCE_LEAK_RE.finditer(content or ""):
+        path = match.group(1).rstrip("`，,。；;:)）]")
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def _normalize_similarity_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+def _kernel_reference_content_copy_paths(content: str) -> list[str]:
+    """Detect large verbatim copying from kernel references without banning same names."""
+    import difflib
+
+    candidate = _normalize_similarity_text(content)
+    if len(candidate) < 500:
+        return []
+    matches: list[str] = []
+    kernel_refs = settings.kernel_path / "references"
+    if not kernel_refs.is_dir():
+        return []
+    for ref in sorted(kernel_refs.glob("*.md")):
+        try:
+            kernel_text = _normalize_similarity_text(ref.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if len(kernel_text) < 500:
+            continue
+        matcher = difflib.SequenceMatcher(None, candidate, kernel_text, autojunk=False)
+        longest = max((block.size for block in matcher.get_matching_blocks()), default=0)
+        # A contiguous 500+ char copy is almost certainly a leaked reference;
+        # for shorter kernel refs, also catch near-whole-file copies.
+        copied_ratio = longest / max(1, min(len(candidate), len(kernel_text)))
+        if longest >= 500 or (longest >= 300 and copied_ratio >= 0.60):
+            matches.append(f"kernel/references/{ref.name}")
+    return matches
+
+
+def _existing_skill_local_paths_for_skill(skill_name: str) -> set[str]:
+    skill_dir = settings.skills_path / skill_name
+    paths: set[str] = set()
+    if not skill_dir.exists():
+        return paths
+    for folder in ("scripts", "references", "assets"):
+        folder_path = skill_dir / folder
+        if not folder_path.is_dir():
+            continue
+        for child in folder_path.rglob("*"):
+            if child.is_file():
+                paths.add(child.relative_to(skill_dir).as_posix())
+    return paths
+
+def _skill_md_frontmatter_errors(content: str) -> list[str]:
+    meta, _body, _had = parse_frontmatter(content)
+    return validate_skill_frontmatter(meta)
+
+
+def _has_valid_skill_md_frontmatter(content: str) -> bool:
+    """Validate SKILL.md frontmatter using the Creator top-level schema."""
+    return not _skill_md_frontmatter_errors(content)
+
+
+
+def _canonicalize_markdown_frontmatter_for_file(
+    *,
+    file_path: str,
+    content: str,
+    skill_name: str = "",
+    purpose: str = "",
+) -> tuple[str, bool]:
+    """Deterministically fix metadata schema errors by replacing frontmatter only."""
+    if file_path == "SKILL.md":
+        meta, _body, _had = parse_frontmatter(content)
+        if not validate_skill_frontmatter(meta):
+            return content, False
+        canonical = canonicalize_skill_frontmatter(
+            meta,
+            default_name=skill_name,
+            default_description=purpose or "Skill description",
+        )
+        patched = apply_frontmatter_patch(content, canonical)
+        return patched, patched != content
+
+    if file_path.startswith("references/") and Path(file_path).suffix.lower() == ".md":
+        meta, _body, had = parse_frontmatter(content)
+        if not had or not validate_reference_frontmatter(meta):
+            return content, False
+        canonical = canonicalize_reference_frontmatter(meta, file_path=file_path, purpose=purpose)
+        patched = apply_frontmatter_patch(content, canonical)
+        return patched, patched != content
+
+    return content, False
+
+def _check_skill_md_command_dataflow(content: str, blueprint_text: str) -> list[ContractCheckResult]:
+    """Validate SKILL.md command placeholders against parsed SkillPlan dataflow."""
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        entries = [entry for entry in (parsed.skill_plan.files if parsed.skill_plan else []) if entry.file_type == "script"]
+    except Exception as exc:
+        return [ContractCheckResult(
+            id="skill_md.dataflow.plan_parseable",
+            passed=False,
+            target="SKILL.md",
+            message=f"无法解析蓝图脚本数据流：{exc}",
+            expected="蓝图应包含可解析的 SkillPlan / 文件职责计划。",
+            minimal_edit="补充每个 scripts/* 的 role、inputs、outputs。",
+        )]
+
+    results: list[ContractCheckResult] = []
+    produced: set[str] = set()
+    consumed: set[str] = set()
+    initial_user_inputs: set[str] = set(entries[0].inputs or []) if entries else set()
+    available_values: set[str] = set(initial_user_inputs)
+
+    for idx, entry in enumerate(entries, start=1):
+        commands = _extract_script_command_templates(content, entry.path)
+        if not commands:
+            # A reference may intentionally hold command details; existing
+            # command-existence checks decide that style, so dataflow skips it.
+            continue
+        placeholders = command_payload_placeholders(commands[0].strip().splitlines()[0], entry.path)
+        if placeholders is None:
+            results.append(ContractCheckResult(
+                id="skill_md.dataflow.command_json_parseable",
+                passed=False,
+                target=entry.path,
+                message=f"{entry.path} 命令无法解析 JSON argv，无法校验输入输出链路。",
+                expected="命令必须向脚本传入 JSON object argv。",
+                minimal_edit=f"改为 python {entry.path} '{{\"payload\":\"{{{{user_request}}}}\"}}' 形态。",
+            ))
+            continue
+        for input_name in entry.inputs:
+            placeholder = placeholders.get(input_name)
+            passed = placeholder is not None
+            if input_name in produced:
+                passed = placeholder == input_name or placeholder in produced
+            results.append(ContractCheckResult(
+                id="skill_md.dataflow.input_available",
+                passed=passed,
+                target=f"{entry.path}:{input_name}",
+                message=(
+                    f"{entry.path} 输入 {input_name} 已通过 JSON argv 传递，且前序 stdout 依赖保持对齐。"
+                    if passed
+                    else f"{entry.path} 输入 {input_name} 未通过 JSON argv 或前序 stdout 字段正确传递。"
+                ),
+                expected="脚本 inputs 必须出现在命令 JSON argv 中；若 input 对应前序 stdout 字段，placeholder 必须引用该前序字段。",
+                minimal_edit=(
+                    f"为 {entry.path} 的 JSON argv 补齐 {input_name}；"
+                    "如果该字段来自前序 stdout，请直接引用对应 stdout 字段 placeholder。"
+                ),
+                details={
+                    "target_script": entry.path,
+                    "input_name": input_name,
+                    "placeholder": placeholder,
+                    "upstream_available_outputs": sorted(produced),
+                    "available_values": sorted(available_values),
+                },
+            ))
+            if placeholder in produced:
+                consumed.add(placeholder)
+
+            unresolved_plan_input = idx > 1 and input_name not in available_values and (placeholder not in available_values if placeholder else True)
+            if unresolved_plan_input:
+                results.append(ContractCheckResult(
+                    id="skill_plan.dataflow_unresolved",
+                    passed=False,
+                    target=f"{entry.path}:{input_name}",
+                    message=f"{entry.path} 的 SkillPlan input {input_name} 无法从初始用户输入或前序 outputs 解析。",
+                    expected="SkillPlan.inputs 必须来自 user_request/首步用户字段、references/assets 静态资源或前序 SkillPlan.outputs；后续 inputs/outputs 命名不能断链。",
+                    minimal_edit="修 SkillPlan 或重新生成蓝图/文件计划；不要反复只修 SKILL.md 命令块。",
+                    details={
+                        "target_script": entry.path,
+                        "input_name": input_name,
+                        "available_values": sorted(available_values),
+                        "upstream_available_outputs": sorted(produced),
+                    },
+                ))
+        produced.update(entry.outputs or [])
+        available_values.update(entry.outputs or [])
+
+    final_outputs = set(_final_outputs_from_plan_entries(entries))
+    for output in sorted(produced - consumed - final_outputs):
+        results.append(ContractCheckResult(
+            id="skill_md.dataflow.output_consumed_or_final",
+            passed=False,
+            target=output,
+            message=f"脚本输出 {output} 既未被后续脚本引用，也不是最终输出。",
+            expected="每个脚本 outputs 必须被后续命令引用，或属于最终结果 metadata。",
+            minimal_edit="让后续脚本接收该 stdout 字段，或把它声明为最终输出。",
+        ))
+
+    return results
+
+
+
+
+
+def _check_skill_md_contract(content: str, blueprint_text: str) -> list[ContractCheckResult]:
+    """Hard format checks for SKILL.md.
+
+    Deterministic checks here only enforce:
+    - YAML frontmatter
+    - no Creator/runtime leakage
+    - declared local resources are structurally mentioned
+    - scripts mentioned in SKILL.md are represented with ```bash fenced blocks
+    - command argv is parseable JSON object
+
+    不做语义覆盖裁决，不要求固定文档模板。
+    """
+    stripped = content.strip()
+    results: list[ContractCheckResult] = []
+
+    frontmatter_errors = _skill_md_frontmatter_errors(stripped)
+    has_frontmatter = not frontmatter_errors
+    results.append(ContractCheckResult(
+        id="skill_md.frontmatter",
+        passed=has_frontmatter,
+        target="SKILL.md",
+        message=(
+            "SKILL.md frontmatter 合格。"
+            if has_frontmatter
+            else "SKILL.md frontmatter 必须只包含允许的顶层 YAML 字段，并包含 name/description。错误：" + "; ".join(frontmatter_errors)
+        ),
+        expected="顶层 YAML 只允许 name、description、license、allowed-tools、metadata；Creator 规划字段只能放正文或 metadata.creator。",
+        minimal_edit="只修正文件开头 YAML frontmatter；不改正文、workflow block、脚本路径或 scripts。",
+    ))
+
+    has_runtime_contract = bool(_SKILL_CUSTOM_RUNTIME_CONTRACT_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_runtime_contract",
+        passed=not has_runtime_contract,
+        target="SKILL.md",
+        message=(
+            "未包含自定义 Runtime Contract JSON 协议。"
+            if not has_runtime_contract
+            else "SKILL.md 不应包含自定义 Runtime Contract JSON 协议；请使用普通 Markdown 说明和 fenced command block。"
+        ),
+        expected="不要包含 Runtime Contract JSON。",
+        minimal_edit="删除 Runtime Contract JSON/协议小节，改为普通 Markdown 说明和 ```bash 命令块。",
+    ))
+
+    has_creator_flow = bool(_CREATOR_FLOW_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="skill_md.forbidden_creator_flow",
+        passed=not has_creator_flow,
+        target="SKILL.md",
+        message=(
+            "未包含 Creator 界面流程文案。"
+            if not has_creator_flow
+            else "SKILL.md 包含 Creator 界面流程/确认清单文本，这属于平台创建流程泄露。"
+        ),
+        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        minimal_edit="删除 Creator UI/确认清单/点击开始创建相关文案，只保留 Skill 使用说明。",
+    ))
+
+    kernel_leak_paths = _kernel_resource_leak_paths(content)
+    results.append(ContractCheckResult(
+        id="skill_md.resource.no_kernel_leak",
+        passed=not kernel_leak_paths,
+        target="SKILL.md",
+        message=(
+            "SKILL.md 未引用 Creator 内部 kernel resources。"
+            if not kernel_leak_paths
+            else "SKILL.md 显式引用了 Creator 内部 kernel resources：" + ", ".join(kernel_leak_paths)
+        ),
+        expected="最终业务 SKILL.md 只能引用业务 Skill 本地 resources；不得引用 kernel/references 等内部资源。",
+        minimal_edit="删除 kernel/references/... 内部 Creator 资源引用。",
+        matched_paths=kernel_leak_paths,
+    ))
+
+    kernel_copy_paths = _kernel_reference_content_copy_paths(content)
+    results.append(ContractCheckResult(
+        id="skill_md.resource.no_kernel_content_copy",
+        passed=not kernel_copy_paths,
+        target="SKILL.md",
+        message=(
+            "SKILL.md 未大段复制 Creator kernel reference 内容。"
+            if not kernel_copy_paths
+            else "SKILL.md 大段复制了 Creator kernel reference 内容：" + ", ".join(kernel_copy_paths)
+        ),
+        expected="最终业务 SKILL.md 不得大段复制 kernel/references 中的 Creator 内部说明。",
+        minimal_edit="删除复制的 kernel 内部说明，改写为面向该业务 Skill 的使用说明。",
+        matched_paths=kernel_copy_paths,
+    ))
+
+    for reference_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="references/"):
+        mentioned = _markdown_mentions_skill_resource_path(content, reference_path)
+        results.append(ContractCheckResult(
+            id="skill_md.reference.mentioned",
+            passed=mentioned,
+            target=reference_path,
+            message=(
+                f"SKILL.md 已结构化引用参考资料 {reference_path}。"
+                if mentioned
+                else f"SKILL.md 缺少对参考资料 {reference_path} 的结构化引用。"
+            ),
+            expected=(
+                "蓝图真实规划的 references/ 资源必须在 SKILL.md 中被结构化提及；"
+                "允许完整路径，也允许在同一 Markdown section 中出现 references/ 目录上下文和对应文件名。"
+            ),
+            minimal_edit=(
+                f"只在 SKILL.md 的资源说明局部补充 `{reference_path}`；"
+                "不要重写其它章节、脚本命令块或已通过内容。"
+            ),
+            details={"resource_path": reference_path},
+        ))
+
+    for asset_path in _paths_requiring_skill_md_mentions(blueprint_text, prefix="assets/"):
+        mentioned = _markdown_mentions_skill_resource_path(content, asset_path)
+        results.append(ContractCheckResult(
+            id="skill_md.asset.mentioned",
+            passed=mentioned,
+            target=asset_path,
+            message=(
+                f"SKILL.md 已结构化引用静态资源 {asset_path}。"
+                if mentioned
+                else f"SKILL.md 缺少对静态资源 {asset_path} 的结构化引用。"
+            ),
+            expected=(
+                "蓝图真实规划的 assets/ 资源必须在 SKILL.md 中被结构化提及；"
+                "允许完整路径，也允许在同一 Markdown section 中出现 assets/ 目录上下文和对应文件名。"
+            ),
+            minimal_edit=(
+                f"只在 SKILL.md 的资源说明局部补充 `{asset_path}`；"
+                "不要重写其它章节、脚本命令块或已通过内容。"
+            ),
+            details={"resource_path": asset_path},
+        ))
+
+    results.extend(_check_skill_md_fenced_command_contracts(
+        content=content,
+        blueprint_text=blueprint_text,
+        required_script_paths=None,
+    ))
+
+    return results
+
+
+
+def _contract_layer_for_check_id(check_id: str) -> str:
+    """Map deterministic validator check ids to repair layers."""
+    cid = check_id or ""
+    if cid.startswith("skill_md.frontmatter"):
+        return "skill_md_metadata"
+    if cid.startswith("skill_md.command_block") or cid.startswith("command_block"):
+        return "skill_md_command_block"
+    if cid.startswith("skill_md.reference"):
+        return "reference_metadata"
+    if cid.startswith("skill_md.asset"):
+        return "asset_source_contract"
+    if cid.startswith("skill_md.forbidden") or cid.startswith("skill_md.resource"):
+        return "skill_md_intent_alignment"
+    if cid.startswith("reference."):
+        return "reference_body"
+    if cid.startswith("asset."):
+        return "asset_source_contract"
+    if cid.startswith("script."):
+        return "script_static_contract"
+    return ""
+
+def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool) -> str:
+    selected = [result for result in results if result.passed is passed]
+    if not selected:
+        return "- 无"
+    lines: list[str] = []
+    for result in selected:
+        matched = f"\n  matched_paths: {', '.join(result.matched_paths)}" if result.matched_paths else ""
+        details = (
+            "\n  details: " + json.dumps(result.details, ensure_ascii=False, sort_keys=True)
+            if result.details else ""
+        )
+        layer = result.layer or _contract_layer_for_check_id(result.id)
+        layer_text = f" layer={layer}" if layer else ""
+        lines.append(
+            f"- {result.id} target={result.target}{layer_text}: {result.message}\n"
+            f"  expected: {result.expected}\n"
+            f"  minimal_edit: {result.minimal_edit}"
+            f"{matched}"
+            f"{details}"
+        )
+    return "\n".join(lines)
+
+
+def _format_contract_failures(results: list[ContractCheckResult]) -> str:
+    failed = [result for result in results if not result.passed]
+    if not failed:
+        return ""
+    return (
+        "SKILL.md contract 未通过：\n"
+        + _format_contract_checks(failed, passed=False)
+    )
+
+def _format_contract_failures_safe(results: list[ContractCheckResult]) -> str:
+    """Format contract failures without letting formatter bugs crash repair flow."""
+    try:
+        return _format_contract_failures(results)
+    except Exception as exc:
+        lines = [f"合同失败格式化异常：{exc}"]
+        for result in results or []:
+            try:
+                if getattr(result, "passed", False):
+                    continue
+                lines.append(
+                    f"- {getattr(result, 'id', 'unknown')}: "
+                    f"target={getattr(result, 'target', '')}; "
+                    f"message={getattr(result, 'message', '')}; "
+                    f"expected={getattr(result, 'expected', '')}; "
+                    f"minimal_edit={getattr(result, 'minimal_edit', '')}"
+                )
+            except Exception as inner_exc:
+                lines.append(f"- 无法格式化某个失败项：{inner_exc}")
+        return "\n".join(lines)
+
+def _validate_skill_md_contract(content: str, blueprint_text: str) -> None:
+    """Validate generated SKILL.md against blueprint-declared resources."""
+    results = _check_skill_md_contract(content, blueprint_text)
+    failed = [result for result in results if not result.passed]
+    if failed:
+        raise ContractValidationError(_format_contract_failures(results), results)
+
+
+def _json_loads_loose_object(text: str) -> dict[str, Any]:
+    """Parse a JSON object from model output.
+
+    Accepts raw JSON, ```json fenced JSON, or text containing one JSON object.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    parsed = _parse_validator_json_object(raw)
+    if isinstance(parsed, dict):
+        return parsed
+
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(raw[start:end + 1])
+            return obj if isinstance(obj, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    return {}
+
+
+def _collect_blueprint_skillplan_constraints(
+    *,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect hard constraints that SKILL.md must reflect.
+
+    This intentionally combines:
+    - declared file paths parsed from blueprint text
+    - SKILL.md FileSpecOut / SkillPlanEntry passed by frontend
+    """
+    declared_paths = sorted(_extract_declared_skill_paths(blueprint_text))
+    declared_scripts = sorted(p for p in declared_paths if p.startswith("scripts/"))
+    declared_references = sorted(p for p in declared_paths if p.startswith("references/"))
+    declared_assets = sorted(p for p in declared_paths if p.startswith("assets/"))
+
+    entry = skill_plan_entry or {}
+
+    def as_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, tuple):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            return [v.strip() for v in re.split(r"[,，、\n]+", value) if v.strip()]
+        return [str(value).strip()] if str(value).strip() else []
+
+    required_capabilities = as_list(entry.get("required_capabilities"))
+    forbidden_capabilities = as_list(entry.get("forbidden_capabilities"))
+    inputs = as_list(entry.get("inputs"))
+    outputs = as_list(entry.get("outputs"))
+    dependencies = as_list(entry.get("dependencies"))
+    reference_files = as_list(entry.get("reference_files") or entry.get("references"))
+
+    for p in reference_files:
+        if p.startswith("references/") and p not in declared_references:
+            declared_references.append(p)
+
+    for p in dependencies:
+        if p.startswith("scripts/") and p not in declared_scripts:
+            declared_scripts.append(p)
+        if p.startswith("references/") and p not in declared_references:
+            declared_references.append(p)
+        if p.startswith("assets/") and p not in declared_assets:
+            declared_assets.append(p)
+
+    return {
+        "declared_paths": sorted(set(declared_paths)),
+        "declared_scripts": sorted(set(declared_scripts)),
+        "declared_references": sorted(set(declared_references)),
+        "declared_assets": sorted(set(declared_assets)),
+        "required_capabilities": required_capabilities,
+        "raw_capability_hints": list(required_capabilities or []),
+        "forbidden_capabilities": forbidden_capabilities,
+        "inputs": inputs,
+        "outputs": outputs,
+        "dependencies": dependencies,
+        "reference_files": reference_files,
+    }
+
+
+def _deterministic_skill_md_blueprint_alignment_checks(
+    *,
+    content: str,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """Do not use regex to judge SKILL.md blueprint semantic alignment.
+
+    SKILL.md 是否覆盖蓝图规划任务、是否误把示例路径当真实文件、
+    capability 是否越界、workflow 是否完整，全部由模型审查。
+    """
+    return []
+
+
+async def _review_skill_md_blueprint_intent_with_model(
+    *,
+    skill_name: str,
+    content: str,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None,
+    model: str | None,
+) -> dict[str, Any]:
+    """Model review for SKILL.md semantic alignment with blueprint.
+
+    第一轮 SKILL.md 蓝图一致性审查：
+    - 模型负责语义一致性判断；
+    - 后端负责把 failed review 转成可局部返修的结构化错误；
+    - 不再 warning-only 放行。
+    """
+    constraints = _collect_blueprint_skillplan_constraints(
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+    )
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=model,
+        reason=f"creator SKILL.md blueprint alignment review: {skill_name}",
+    )
+    _log_creator_model_usage(
+        phase="skill_md.intent_review.route",
+        file_path="SKILL.md",
+        route=route,
+        model=model,
+        skill_name=skill_name,
+    )
+
+    parser_paths = _extract_declared_skill_paths(blueprint_text)
+
+    prompt = (
+        "你是 superskills Creator 的 SKILL.md 蓝图一致性审查器，只输出严格 JSON object。\n\n"
+
+        "审查目标：判断当前 SKILL.md 是否完成蓝图要求的 Skill 使用说明责任。\n"
+        "这属于第一轮单文件责任审查，不判断脚本实际运行、不判断 stdout 字段闭环、不判断最终 E2E。\n\n"
+
+        "必须硬性审查：\n"
+        "1. SKILL.md 是否覆盖蓝图真实业务意图、触发方式、输入来源、输出/最终产物。\n"
+        "2. SKILL.md 是否覆盖真实规划的 scripts/references/assets。\n"
+        "3. 如蓝图规划了 scripts/**，SKILL.md 是否说明脚本执行顺序和每步用途。\n"
+        "4. 如蓝图规划了 references/**，SKILL.md 是否说明运行时如何读取/参考这些资料，而不是全文复制 reference。\n"
+        "5. 如蓝图规划了 assets/**，SKILL.md 是否把它们描述为用户上传/静态资源，而不是模型生成素材。\n"
+        "6. SKILL.md 是否引入了蓝图外的脚本、资源、能力、外部 API、伪 key、伪数据库或 Creator UI 流程。\n"
+        "7. SKILL.md 是否把示例/反例路径误当成真实文件，或者漏掉目录结构/SkillPlan 中的真实文件。\n\n"
+
+        "边界：\n"
+        "- 不判断 bash 命令语法是否完全可执行；后台 parser 会检查。\n"
+        "- 不判断 argv/stdout 字段是否上下游闭环；第二轮 E2E 会检查。\n"
+        "- 不要求固定字段名。\n"
+        "- 不要求固定 SKILL.md 模板。\n"
+        "- 不允许把蓝图不一致降级为 warning；只要需要修改 SKILL.md 才能对齐蓝图，就必须 severity=error 且 passed=false。\n"
+        "- warning 只能用于不需要修改也不影响蓝图责任完成的提示。\n\n"
+
+        "真实文件判断原则：\n"
+        "- 出现在目录结构、SkillPlan path、dependencies、reference_files、asset_source 中的路径是真实文件。\n"
+        "- 出现在“例如/示例/反例/不要这样写/禁止”等语境中的路径不是实际文件，除非也出现在目录结构或 SkillPlan path 中。\n"
+        "- assets/** 如果 asset_source=user_upload，应描述为上传素材，不应要求模型生成。\n\n"
+
+        "返回格式必须是：\n"
+        "{\n"
+        '  "passed": true,\n'
+        '  "required_script_paths": ["scripts/example.py"],\n'
+        '  "required_reference_paths": ["references/example.md"],\n'
+        '  "required_asset_paths": ["assets/example.png"],\n'
+        '  "reviewers": {\n'
+        '    "intent_reviewer": {"passed": true, "issues": []},\n'
+        '    "file_plan_reviewer": {"passed": true, "issues": []},\n'
+        '    "workflow_reviewer": {"passed": true, "issues": []},\n'
+        '    "capability_reviewer": {"passed": true, "issues": []},\n'
+        '    "resource_reviewer": {"passed": true, "issues": []},\n'
+        '    "user_facing_reviewer": {"passed": true, "issues": []}\n'
+        "  },\n"
+        '  "issues": [\n'
+        '    {\n'
+        '      "severity": "error|warning",\n'
+        '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
+        '      "message": "不一致点",\n'
+        '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
+        '      "expected": "应当如何与蓝图一致",\n'
+        '      "minimal_edit": "只修改 SKILL.md 的哪个区域，不要整文件重写"\n'
+        '    }\n'
+        "  ],\n"
+        '  "repair_suggestions": "给修复模型的最小局部编辑建议"\n'
+        "}\n\n"
+
+        f"Skill 名称：{skill_name}\n\n"
+
+        "【蓝图约束 JSON，供参考；如和蓝图原文语境冲突，以蓝图原文为准】\n"
+        f"{json.dumps(constraints, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+
+        "【解析器提取路径，供参考；不是最终裁决】\n"
+        f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
+
+        "【蓝图原文】\n"
+        f"{(blueprint_text or '')[-18000:]}\n\n"
+
+        "【待审查 SKILL.md】\n"
+        f"{(content or '')[-22000:]}\n"
+    )
+
+    raw = await complete_chat_once(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是严格 JSON 输出的 SKILL.md 蓝图一致性审查器。"
+                    "只输出 JSON object，不要输出 Markdown。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        route.model,
+    )
+
+    data = _json_loads_loose_object(raw)
+    if not isinstance(data, dict) or not data:
+        return {
+            "passed": False,
+            "required_script_paths": [],
+            "required_reference_paths": [],
+            "required_asset_paths": [],
+            "reviewers": {},
+            "issues": [{
+                "severity": "error",
+                "field": "validator",
+                "message": "蓝图一致性审查模型未返回有效 JSON object。",
+                "evidence": str(raw or "")[:1000],
+                "expected": "返回 passed/required_*_paths/reviewers/issues/repair_suggestions。",
+                "minimal_edit": "重新审查 SKILL.md，并按蓝图真实意图局部修复。",
+            }],
+            "repair_suggestions": "审查模型输出无效；不能放行 SKILL.md，请重新进行局部返修。",
+        }
+
+    data.setdefault("passed", False)
+    data.setdefault("required_script_paths", [])
+    data.setdefault("required_reference_paths", [])
+    data.setdefault("required_asset_paths", [])
+    data.setdefault("reviewers", {})
+    data.setdefault("issues", [])
+    data.setdefault("repair_suggestions", "")
+
+    if not isinstance(data["required_script_paths"], list):
+        data["required_script_paths"] = []
+    if not isinstance(data["required_reference_paths"], list):
+        data["required_reference_paths"] = []
+    if not isinstance(data["required_asset_paths"], list):
+        data["required_asset_paths"] = []
+    if not isinstance(data["reviewers"], dict):
+        data["reviewers"] = {}
+    if not isinstance(data["issues"], list):
+        data["issues"] = []
+
+    reviewer_issues: list[dict[str, Any]] = []
+    for reviewer_name, reviewer_result in data["reviewers"].items():
+        if not isinstance(reviewer_result, dict):
+            continue
+
+        if reviewer_result.get("passed") is False:
+            for issue in reviewer_result.get("issues") or []:
+                if isinstance(issue, dict):
+                    reviewer_issues.append({
+                        "severity": issue.get("severity", "error"),
+                        "field": issue.get("field", reviewer_name),
+                        "message": issue.get("message", f"{reviewer_name} 审查未通过。"),
+                        "evidence": issue.get("evidence", ""),
+                        "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
+                        "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
+                    })
+                else:
+                    reviewer_issues.append({
+                        "severity": "error",
+                        "field": reviewer_name,
+                        "message": str(issue),
+                        "evidence": str(issue),
+                        "expected": "该审查角度应与蓝图一致。",
+                        "minimal_edit": "只修改 SKILL.md 中相关区域。",
+                    })
+
+    if reviewer_issues:
+        data["issues"].extend(reviewer_issues)
+        data["passed"] = False
+
+    # 如果顶层 passed=false 但没有 issues，补一个可返修错误，避免只报空失败。
+    if data.get("passed") is False and not data["issues"]:
+        data["issues"].append({
+            "severity": "error",
+            "field": "blueprint_alignment",
+            "message": "模型判定 SKILL.md 与蓝图不一致，但未返回具体 issue。",
+            "evidence": "passed=false with empty issues",
+            "expected": "SKILL.md 必须覆盖蓝图真实业务意图、文件计划、资源使用和 workflow 说明。",
+            "minimal_edit": "检查 SKILL.md 的用途说明、资源说明、脚本顺序和最终产物说明，只修改不一致区域。",
+        })
+
+    def _normalize_paths(raw_paths: Any, prefix: str) -> list[str]:
+        if not isinstance(raw_paths, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_paths:
+            path = str(item or "").replace("\\", "/").strip().strip("`")
+            if not path.startswith(prefix):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            out.append(path)
+        return out
+
+    data["required_script_paths"] = _normalize_paths(data["required_script_paths"], "scripts/")
+    data["required_reference_paths"] = _normalize_paths(data["required_reference_paths"], "references/")
+    data["required_asset_paths"] = _normalize_paths(data["required_asset_paths"], "assets/")
+
+    return data
+
+def _skill_md_blueprint_review_to_contract_results(
+    review: dict[str, Any],
+) -> list[ContractCheckResult]:
+    """Convert SKILL.md model blueprint review into local repairable failures.
+
+    这些 failures 会进入现有 generate-file repair loop，
+    由 _repair_generated_file_with_feedback 走 exact_replace 局部 patch。
+    """
+    if not isinstance(review, dict):
+        return [ContractCheckResult(
+            id="skill_md.blueprint_alignment.invalid_review",
+            passed=False,
+            target="SKILL.md:blueprint_alignment",
+            message="SKILL.md 蓝图一致性审查结果不是 JSON object。",
+            expected="审查器必须返回结构化 JSON；SKILL.md 必须与蓝图真实意图一致。",
+            minimal_edit="只修改 SKILL.md 中与蓝图意图不一致的最小区域。",
+            details={"review_type": type(review).__name__},
+            layer="skill_md_blueprint_alignment",
+        )]
+
+    issues: list[Any] = []
+    raw_issues = review.get("issues")
+    if isinstance(raw_issues, list):
+        issues.extend(raw_issues)
+
+    reviewers = review.get("reviewers")
+    if isinstance(reviewers, dict):
+        for reviewer_name, reviewer_result in reviewers.items():
+            if not isinstance(reviewer_result, dict):
+                continue
+            if reviewer_result.get("passed") is not False:
+                continue
+            for issue in reviewer_result.get("issues") or []:
+                if isinstance(issue, dict):
+                    merged = dict(issue)
+                    merged.setdefault("field", reviewer_name)
+                    issues.append(merged)
+                else:
+                    issues.append({
+                        "severity": "error",
+                        "field": reviewer_name,
+                        "message": str(issue),
+                        "evidence": str(issue),
+                    })
+
+    if review.get("passed") is False and not issues:
+        issues.append({
+            "severity": "error",
+            "field": "blueprint_alignment",
+            "message": "SKILL.md 与蓝图不一致，但模型未返回具体 issue。",
+            "evidence": "passed=false with empty issues",
+            "expected": "SKILL.md 应覆盖蓝图真实业务意图、文件计划、资源说明、workflow 和最终产物。",
+            "minimal_edit": "只修改 SKILL.md 中缺失或偏离蓝图的区域。",
+        })
+
+    results: list[ContractCheckResult] = []
+    for idx, issue in enumerate(issues, start=1):
+        if not isinstance(issue, dict):
+            issue = {
+                "severity": "error",
+                "field": "blueprint_alignment",
+                "message": str(issue),
+                "evidence": str(issue),
+            }
+
+        severity = str(issue.get("severity") or "error").strip().lower()
+
+        # 真正需要修改才能对齐蓝图的问题不能 warning-only 放行；
+        # 但纯 info/note 仍不作为硬失败。
+        if severity in {"info", "note", "advisory"}:
+            continue
+
+        field_name = str(issue.get("field") or "blueprint_alignment").strip() or "blueprint_alignment"
+        safe_field = re.sub(r"[^a-zA-Z0-9_.-]+", "_", field_name).strip("_") or "blueprint_alignment"
+
+        message = str(
+            issue.get("message")
+            or issue.get("problem")
+            or issue.get("reason")
+            or "SKILL.md 与蓝图要求不一致。"
+        ).strip()
+
+        evidence = str(issue.get("evidence") or issue.get("details") or "").strip()
+        expected = str(
+            issue.get("expected")
+            or "SKILL.md 必须与蓝图真实业务意图、文件计划、资源说明和 workflow 保持一致。"
+        ).strip()
+        minimal_edit = str(
+            issue.get("minimal_edit")
+            or issue.get("fix")
+            or issue.get("suggested_fix")
+            or "只修改 SKILL.md 中与该蓝图不一致相关的小节、列表项或 fenced block。"
+        ).strip()
+
+        results.append(ContractCheckResult(
+            id=f"skill_md.blueprint_alignment.{safe_field}.{idx}",
+            passed=False,
+            target=f"SKILL.md:{field_name}",
+            message=message + (f"\nevidence: {evidence}" if evidence else ""),
+            expected=expected,
+            minimal_edit=minimal_edit,
+            details={
+                "review": review,
+                "issue": issue,
+                "field": field_name,
+                "severity": severity,
+                "repair_suggestions": str(review.get("repair_suggestions") or ""),
+            },
+            layer="skill_md_blueprint_alignment",
+        ))
+
+    return results
+
+def _format_skill_md_intent_review_failure(review: dict[str, Any]) -> str:
+    """Format model review failure for UI/repair prompt.
+
+    Must never crash. If this crashes, auto-repair flow may break.
+    """
+    try:
+        if not isinstance(review, dict):
+            return (
+                "SKILL.md 与蓝图意图不一致：审查结果不是 JSON object。\n"
+                f"actual_type: {type(review).__name__}"
+            )
+
+        issues = review.get("issues")
+        if not isinstance(issues, list):
+            issues = []
+
+        lines = ["SKILL.md 与蓝图意图不一致："]
+
+        if not issues:
+            reviewers = review.get("reviewers")
+            if isinstance(reviewers, dict):
+                for reviewer_name, reviewer_result in reviewers.items():
+                    if not isinstance(reviewer_result, dict):
+                        continue
+                    reviewer_issues = reviewer_result.get("issues")
+                    if isinstance(reviewer_issues, list):
+                        for issue in reviewer_issues:
+                            issues.append(issue)
+
+        if not issues:
+            lines.append("模型审查未通过，但未返回具体 issues。")
+            lines.append("请检查蓝图真实文件计划、workflow、资源说明和命令块。")
+        else:
+            for idx, issue in enumerate(issues, start=1):
+                if isinstance(issue, dict):
+                    severity = issue.get("severity", "error")
+                    field = issue.get("field", "unknown")
+                    message = issue.get("message", "")
+                    expected = issue.get("expected", "")
+                    minimal_edit = issue.get("minimal_edit", "")
+
+                    lines.append(f"{idx}. [{severity}] {field}: {message}")
+                    if expected:
+                        lines.append(f"   expected: {expected}")
+                    if minimal_edit:
+                        lines.append(f"   minimal_edit: {minimal_edit}")
+                else:
+                    lines.append(f"{idx}. {issue}")
+
+        repair = str(review.get("repair_suggestions") or "").strip()
+        if repair:
+            lines.append("给修复模型的建议：")
+            lines.append(repair)
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        logger.exception("[Creator][skill_md] failed to format intent review failure")
+        return (
+            "SKILL.md 与蓝图意图不一致，但格式化失败信息时发生异常。\n"
+            f"格式化异常：{exc}\n"
+            f"原始审查结果：{review}"
+        )
+
+
+async def _validate_skill_md_blueprint_alignment(
+    *,
+    skill_name: str,
+    content: str,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Validate SKILL.md against blueprint as a first-round hard repair gate.
+
+    不再 warning-only：
+    - 基础格式失败：进入局部返修；
+    - 蓝图语义不一致：进入局部返修；
+    - 命令块格式失败：进入局部返修。
+
+    这里仍然不做第二轮 E2E：
+    - 不检查上下游 stdout 字段闭环；
+    - 不检查最终平台输出；
+    - 不检查脚本真实运行。
+    """
+    try:
+        hard_results = _check_skill_md_contract(content, blueprint_text)
+    except Exception as exc:
+        logger.exception(
+            "[Creator][skill_md] hard contract validator crashed skill=%s",
+            skill_name,
+        )
+        raise ValueError(
+            "SKILL.md 基础合同校验器内部异常，已转为可返修错误。\n"
+            f"错误：{type(exc).__name__}: {exc}\n"
+            "请检查 frontmatter、Creator 流程泄露、Runtime Contract 泄露、"
+            "scripts 命令块格式、references/assets 资源说明等基础结构。"
+        ) from exc
+
+    hard_failed = [result for result in hard_results if not result.passed]
+    if hard_failed:
+        message = (
+            "SKILL.md 基础格式/资源合同校验未通过。\n"
+            "这属于第一轮当前文件责任失败，请只修 SKILL.md 的失败区域。\n"
+            + _format_contract_failures_safe(hard_results)
+        )
+        logger.info(
+            "[Creator][skill_md] hard contract failed skill=%s failures=\n%s",
+            skill_name,
+            message,
+        )
+        raise ContractValidationError(message, hard_results)
+
+    deterministic_results = _deterministic_skill_md_blueprint_alignment_checks(
+        content=content,
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+    )
+    deterministic_failed = [result for result in deterministic_results if not result.passed]
+    if deterministic_failed:
+        message = (
+            "SKILL.md 蓝图一致性确定性检查未通过。\n"
+            "请只修 SKILL.md 中与蓝图不一致的区域。\n"
+            + _format_contract_failures_safe(deterministic_results)
+        )
+        raise ContractValidationError(message, deterministic_results)
+
+    try:
+        model_review = await _review_skill_md_blueprint_intent_with_model(
+            skill_name=skill_name,
+            content=content,
+            blueprint_text=blueprint_text,
+            skill_plan_entry=skill_plan_entry,
+            model=model,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[Creator][skill_md] model blueprint intent review crashed skill=%s",
+            skill_name,
+        )
+        raise ValueError(
+            "SKILL.md 蓝图一致性审查模型异常，不能放行当前 SKILL.md。\n"
+            f"错误：{type(exc).__name__}: {exc}\n"
+            "这不是最终失败；生成循环会继续尝试局部返修或重试。"
+        ) from exc
+
+    review = model_review if isinstance(model_review, dict) else {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "field": "validator",
+            "message": f"蓝图一致性审查返回类型错误：{type(model_review).__name__}",
+            "expected": "返回 JSON object。",
+            "minimal_edit": "重新审查并修复 SKILL.md 与蓝图不一致区域。",
+        }],
+    }
+
+    if review.get("passed") is not True:
+        results = _skill_md_blueprint_review_to_contract_results(review)
+        if not results:
+            results = [ContractCheckResult(
+                id="skill_md.blueprint_alignment.failed",
+                passed=False,
+                target="SKILL.md:blueprint_alignment",
+                message=_format_skill_md_intent_review_failure(review),
+                expected="SKILL.md 必须覆盖蓝图真实业务意图、文件计划、资源说明、workflow 和最终产物。",
+                minimal_edit="只修改 SKILL.md 中缺失、偏离或误引入蓝图外内容的区域。",
+                details={"review": review},
+                layer="skill_md_blueprint_alignment",
+            )]
+
+        message = (
+            "SKILL.md 与蓝图不一致，不能 warning-only 放行。\n"
+            "该失败会进入当前文件局部返修；不要整文件重写，不要修改 scripts/references/assets。\n"
+            + _format_skill_md_intent_review_failure(review)
+        )
+        logger.info(
+            "[Creator][skill_md] blueprint alignment failed skill=%s failures=\n%s",
+            skill_name,
+            message,
+        )
+        raise ContractValidationError(message, results)
+
+    required_script_paths = list(review.get("required_script_paths") or [])
+    if not required_script_paths:
+        required_script_paths = [
+            path
+            for path in _extract_declared_skill_paths(blueprint_text)
+            if isinstance(path, str) and path.startswith("scripts/")
+        ]
+
+    try:
+        fenced_results = _check_skill_md_fenced_command_contracts(
+            content=content,
+            blueprint_text=blueprint_text,
+            required_script_paths=required_script_paths,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[Creator][skill_md] fenced command validator crashed skill=%s",
+            skill_name,
+        )
+        raise ValueError(
+            "SKILL.md 命令块校验器内部异常，已转为可返修错误。\n"
+            f"错误：{type(exc).__name__}: {exc}\n"
+            "请检查 SKILL.md 中真实脚本是否使用标准 ```bash fenced code block，"
+            "且脚本参数是否为 json.loads 可解析的 JSON object。"
+        ) from exc
+
+    fenced_failed = [result for result in fenced_results if not result.passed]
+    if fenced_failed:
+        message = (
+            "SKILL.md 命令块格式校验未通过。\n"
+            "蓝图语义已对齐，但真实脚本命令块仍不满足后台可解析规范。\n"
+            "请只修复以下命令块问题，不要新增蓝图外脚本。\n"
+            + _format_contract_failures_safe(fenced_results)
+        )
+        logger.info(
+            "[Creator][skill_md] fenced command contract failed skill=%s failures=\n%s",
+            skill_name,
+            message,
+        )
+        raise ContractValidationError(message, fenced_results)
+
+    review["passed"] = True
+    review["fenced_check_passed"] = True
+    review["fenced_check_failed"] = []
+
+    logger.info(
+        "[Creator][skill_md] blueprint alignment passed skill=%s required_scripts=%s",
+        skill_name,
+        required_script_paths,
+    )
+
+    return review
+
+
+def _strip_orphan_trailing_fence(content: str) -> str:
+    """Remove isolated Markdown fence markers at file boundaries.
+
+    This is intentionally narrower than generic fence stripping: it deletes only
+    standalone trailing ```/~~~ lines left by model output, plus an optional
+    standalone opening fence when no matching closing fence remains.
+    """
+    lines = content.strip().splitlines()
+    changed = False
+    while lines and re.fullmatch(r"\s*(`{3,}|~{3,})\s*", lines[-1]):
+        lines.pop()
+        changed = True
+    if lines and re.fullmatch(r"\s*(`{3,}|~{3,})[A-Za-z0-9_-]*\s*", lines[0]):
+        body = "\n".join(lines[1:])
+        if "```" not in body and "~~~" not in body:
+            lines = lines[1:]
+            changed = True
+    return ("\n".join(lines).strip() if changed else content.strip())
+
+
+def _build_script_file_contract_text(
+    file_path: str,
+    blueprint_text: str,
+    *,
+    purpose: str = "",
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> str:
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+    recommended_command = _script_command_template(file_path, blueprint_text, entry)
+
+    declared_stdout_fields = [str(item).strip() for item in (entry.outputs or []) if str(item).strip()]
+    declared_stdout_text = ", ".join(declared_stdout_fields) if declared_stdout_fields else "无显式声明"
+
+    lines = [
+        f"脚本合同：{file_path}",
+        f"Role: {entry.role}",
+        f"file_type: {entry.file_type}",
+        f"runtime: {entry.runtime}",
+        f"entrypoint: {entry.entrypoint or file_path}",
+        f"recommended_command_template: {recommended_command}",
+        f"suggested_inputs: {', '.join(entry.inputs or ['payload'])}",
+        f"declared_stdout_fields: {declared_stdout_text}",
+        "",
+        "A. 输出形态:",
+        "- 单文件源码，Python 脚本必须通过 ast.parse。",
+        "- 最终只能输出当前脚本源码本身，不要 Markdown fence、文件标题、写入文件标签或多文件包。",
+        "",
+        "B. 参数接口（输入宽松）:",
+        "- 脚本必须能读取一个 JSON argv object。",
+        "- 可以宽松兼容 payload / user_request / input / text / fields / options / input_files / files / 上游 stdout 字段。",
+        "- 当前脚本只实现自己的单步职责；不要在脚本内调用、编排或转发执行其它 scripts/*.py，主流程由 SKILL.md workflow 负责。",
+        "- 不要求第一轮读取所有 input_sources 或 SkillPlan inputs；不因可选输入未使用而失败。",
+        "- 但是，脚本不得用与任务无关的默认 prompt、固定示例值、固定模板或常量结果替代核心业务输入。",
+        "- 如果核心输入缺失，可以从 payload/user_request/input/text/fields/options/input_files 或上游 stdout 中选择最合理来源；不要静默退回到无关任务。",
+        "",
+        "C. stdout 字段语义:",
+        "- declared_stdout_fields 只表示 stdout JSON 中应出现的业务字段，不等于文件路径字段。",
+        "- 普通 stdout 字段只做 JSON required/non-empty/type 校验，并由内容职责审查判断是否真正完成业务职责。",
+        "- 只有 artifact_fields、file_fields、file_outputs、artifact_outputs，或字段名本身具有 artifact/path/file 语义时，才按文件产物路径检查。",
+        "- 不要把普通业务字段的字符串值或字符串列表当成文件路径。",
+        "",
+        "D. 输出来源 / provenance:",
+        "- declared_stdout_fields 中的核心业务字段必须由 argv JSON、上游 stdout、reference 内容、uploaded assets、工具结果、模型结果或确定性计算推导出来。",
+        "- 不得为了满足 required_outputs 返回固定示例值、固定模板、无关默认值或与输入无关的常量。",
+        "- 如果使用 generate_text_with_llm、图像 helper、文档 helper 或其它工具，工具返回结果必须参与核心 declared_stdout_fields 的构造。",
+        "- 如果 declared_stdout_fields 包含多个结构化业务字段，优先让写作模型返回严格 JSON object，再解析为 stdout JSON；不要只把模型结果放到 text 字段，再硬编码其它字段。",
+        "- 如果只需要自由文本输出，可以返回 text/markdown 等文本字段；如果需要结构化字段，应让模型或确定性逻辑直接产生这些字段。",
+        "- 只有 SkillPlan 或输入明确声明为 constant/default/config 的字段，才允许固定值。",
+        "",
+        "E. 角色输出合同:",
+    ]
+
+    if entry.role == "text_generator":
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 如果 declared_stdout_fields 多于一个普通业务字段，应优先使用结构化生成模式：让文本模型返回 JSON object，并将解析结果作为 stdout。",
+            "- 可以调用 text_generation helper，但 helper 结果必须参与核心 stdout 字段构造；不得把 helper 调用当作装饰后再用固定值补其它字段。",
+        ])
+    elif entry.role == "image_generator":
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 可优先调用 generate_stable_diffusion_image helper，但不强制具体实现方式。",
+            "- 如果输出图片路径，必须返回具有 artifact/path 语义的平台字段，例如 image_path 或 image_paths，且真实文件存在性由试运行/E2E 校验。",
+            "- 如果还输出普通业务字段，这些字段仍然是 stdout data fields，不自动当作文件路径。",
+        ])
+    elif entry.role == "pdf_builder":
+        lines.extend([
+            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。",
+            "- 推荐使用 pdf_path 或 file_paths/file_outputs 等具有 artifact/path 语义的字段。",
+            "- 工具/helper 如何组合不作为第一轮 hard gate；最终以运行、stdout 合同和 artifact 真实存在为准。",
+            "- PDF 内容必须来自输入、上游 stdout、reference/assets、工具结果或确定性组装；不得生成空壳 PDF 或无关固定模板。",
+        ])
+    elif entry.role in {"docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}:
+        lines.extend([
+            "- stdout JSON 必须返回真实存在的文件产物路径；字段名由 workflow 决定。",
+            "- 推荐使用 docx_path、pptx_path、html_path、file_paths 或 file_outputs 等具有 artifact/path 语义的字段。",
+            "- 文件内容必须来自输入、上游 stdout、reference/assets、工具结果或确定性组装；不得生成空壳文件或无关固定模板。",
+        ])
+    else:
+        lines.extend([
+            "- stdout JSON 至少有一个非空字段；字段名由 workflow 决定。",
+            "- 如果 stdout 字段是普通业务数据，不要把它写成文件路径；如果 stdout 字段是文件产物路径，字段名应具备 artifact/path/file 语义。",
+        ])
+
+    try:
+        workflow_commands = _extract_e2e_workflow_commands(Path("."), blueprint_text or "")
+        script_commands = [cmd for cmd in workflow_commands if cmd.script_path == file_path]
+        is_last_workflow_step = bool(
+            script_commands
+            and workflow_commands
+            and script_commands[-1].ordinal == workflow_commands[-1].ordinal
+        )
+    except Exception:
+        is_last_workflow_step = False
+
+    if is_last_workflow_step:
+        lines.extend([
+            "",
+            "F. 最后一步平台输出合同:",
+            "- 这是 SKILL.md workflow 的最后一步：stdout JSON 必须至少包含一个 sandbox 平台最终字段：",
+            "  text、markdown、image_path、image_paths、pdf_path、docx_path、pptx_path、html_path、file_paths 或 file_outputs。",
+            "- 可以同时保留业务内部字段，例如 {\"time_output\": \"12:00:00\", \"text\": \"当前时间：12:00:00\"}。",
+            "- 中间步骤不强制平台最终字段，只要下一步 placeholder 可解析。",
+            "- 平台最终字段只用于最终展示/下载；普通业务字段仍然不自动成为文件路径。",
+        ])
+
+    lines.extend([
+        "",
+        "G. 第一轮验收边界:",
+        "- 第一轮 deterministic 校验只验协议 + 运行 + 产物：argv JSON、入口、运行成功、stdout JSON object、required outputs、真实 artifact、import/dependency 和危险系统操作。",
+        "- 工具/helper 如何组合、required/optional/allowed_capabilities、placeholder/mock/template 关键词不作为第一轮源码正则 hard gate。",
+        "- 但内容职责审查模型可以 hard veto：如果脚本只凑字段、返回固定示例值、没有使用核心输入、模型/工具结果没有参与核心输出构造，则视为当前脚本内容职责失败。",
+        "- 不要通过 print {'error':...}、{}、空路径、空文件、固定模板或 mock 数据绕过运行和产物校验。",
+    ])
+
+    return "\n".join(lines)
+
+_REFERENCE_FRONTMATTER_RE = re.compile(r"^---\s*\n([\s\S]*?)\n---\s*\n?", re.M)
+
+
+def _slug_from_reference_path(file_path: str) -> str:
+    stem = Path(file_path).stem.strip().lower()
+    slug = re.sub(r"[^a-z0-9\u4e00-\u9fff-]+", "-", stem).strip("-")
+    return slug or "reference"
+
+
+def _reference_frontmatter_metadata(content: str) -> tuple[dict[str, Any], str]:
+    """Return YAML frontmatter metadata and body."""
+    text = content or ""
+    match = _REFERENCE_FRONTMATTER_RE.match(text.strip())
+    if not match:
+        return {}, text.strip()
+
+    raw_meta = match.group(1).strip()
+    body = text.strip()[match.end():].strip()
+    try:
+        meta = yaml.safe_load(raw_meta) or {}
+    except yaml.YAMLError:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    return meta, body
+
+def _markdown_sections_for_resource_matching(content: str) -> list[tuple[str, str]]:
+    """Split Markdown into heading-scoped sections for resource path matching.
+
+    返回 (heading, section_text)。
+    不依赖中文/英文业务词，只用 Markdown heading 结构。
+    """
+    text = content or ""
+    lines = text.splitlines()
+    sections: list[tuple[str, str]] = []
+
+    current_heading = ""
+    current_lines: list[str] = []
+
+    for line in lines:
+        if re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+            if current_lines:
+                sections.append((current_heading, "\n".join(current_lines)))
+            current_heading = line.strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_heading, "\n".join(current_lines)))
+
+    return sections or [("", text)]
+
+
+def _markdown_mentions_skill_resource_path(content: str, resource_path: str) -> bool:
+    """Return whether SKILL.md structurally mentions a skill-local resource.
+
+    允许两种非硬编码表达：
+    1. 完整路径出现在任意位置：references/x.md
+    2. basename 出现在同一个 Markdown section，且该 section 同时出现资源目录前缀：
+       heading/body 中有 references/，列表项中有 x.md
+
+    不根据具体文件名、业务名、中文标题、英文标题做词表判断。
+    """
+    normalized = _normalize_skill_path(resource_path)
+    if not normalized:
+        return False
+
+    text = content or ""
+    if normalized in text:
+        return True
+
+    if "/" not in normalized:
+        return normalized in text
+
+    folder, basename = normalized.split("/", 1)
+    if not folder or not basename:
+        return False
+
+    basename_pattern = re.compile(rf"(?<![\w./-])`?{re.escape(basename)}`?(?![\w./-])")
+    folder_marker = f"{folder}/"
+
+    for _heading, section_text in _markdown_sections_for_resource_matching(text):
+        if folder_marker not in section_text:
+            continue
+        if basename_pattern.search(section_text):
+            return True
+
+    return False
+
+def _ensure_reference_metadata_frontmatter(
+    *,
+    file_path: str,
+    content: str,
+    purpose: str = "",
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> str:
+    """Ensure references/*.md has valid ordinary document frontmatter.
+
+    简单原则：
+    - 只处理 references/*.md；
+    - 不依赖 LLM；
+    - 不修正文；
+    - title/description 必须在顶层；
+    - 旧 frontmatter 解析失败时直接重建；
+    - Creator 内部信息只放 metadata.creator。
+    """
+    if not file_path.startswith("references/") or Path(file_path).suffix.lower() != ".md":
+        return content
+
+    text = (content or "").lstrip("\ufeff").strip()
+    if not text:
+        stem = Path(file_path).stem.replace("-", " ").replace("_", " ").strip() or "reference"
+        text = f"# {stem}\n\n本文件提供可复用参考信息。\n"
+
+    # raw split，不依赖 YAML 解析成功。
+    body = text
+    old_meta: dict[str, Any] = {}
+
+    if text.startswith("---"):
+        lines = text.splitlines(keepends=True)
+        end_index = None
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                end_index = i
+                break
+
+        if end_index is not None:
+            raw_meta = "".join(lines[1:end_index])
+            body = "".join(lines[end_index + 1:]).lstrip("\n")
+            try:
+                parsed = yaml.safe_load(raw_meta) or {}
+                if isinstance(parsed, dict):
+                    old_meta = parsed
+            except Exception:
+                old_meta = {}
+
+    plan = skill_plan_entry if isinstance(skill_plan_entry, dict) else {}
+
+    def _nonempty(value: Any) -> str:
+        return value.strip() if isinstance(value, str) and value.strip() else ""
+
+    metadata = old_meta.get("metadata") if isinstance(old_meta.get("metadata"), dict) else {}
+    creator = metadata.get("creator") if isinstance(metadata.get("creator"), dict) else {}
+
+    title = (
+        _nonempty(old_meta.get("title"))
+        or _nonempty(creator.get("title"))
+        or _nonempty(plan.get("title"))
+        or _nonempty(plan.get("name"))
+        or Path(file_path).stem.replace("-", " ").replace("_", " ").strip()
+        or "reference"
+    )
+
+    description = (
+        _nonempty(old_meta.get("description"))
+        or _nonempty(creator.get("description"))
+        or _nonempty(purpose)
+        or _nonempty(plan.get("purpose"))
+        or _nonempty(plan.get("description"))
+        or f"{file_path} reference document"
+    )
+
+    canonical: dict[str, Any] = {
+        "title": title,
+        "description": description,
+    }
+
+    for key in ("source", "license"):
+        if old_meta.get(key) not in (None, "", [], {}):
+            canonical[key] = old_meta[key]
+
+    creator = dict(creator) if isinstance(creator, dict) else {}
+    creator.pop("title", None)
+    creator.pop("description", None)
+    creator.setdefault("path", file_path)
+    if purpose:
+        creator.setdefault("purpose", purpose)
+
+    canonical["metadata"] = {"creator": creator}
+
+    yaml_text = yaml.safe_dump(
+        canonical,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    ).strip()
+
+    return f"---\n{yaml_text}\n---\n\n{body.strip()}\n"
+
+
+def _reference_metadata_contract_checks(
+    *,
+    file_path: str,
+    content: str,
+    purpose: str = "",
+) -> list[ContractCheckResult]:
+    """Validate Creator-generated references/*.md frontmatter.
+
+    references/*.md 是正式 Markdown 参考资料文件，不是轻量片段。
+    Creator 生成的 reference 必须像 SKILL.md 一样有基础 metadata，
+    但 schema 使用 reference 自己的普通文档元数据 schema。
+    """
+    meta, body, had_frontmatter = parse_frontmatter(content)
+    metadata_errors = validate_reference_frontmatter(meta) if had_frontmatter else []
+    results: list[ContractCheckResult] = []
+
+    missing_required: list[str] = []
+    if not had_frontmatter:
+        missing_required.append("frontmatter")
+    else:
+        for key in ("title", "description"):
+            value = meta.get(key) if isinstance(meta, dict) else None
+            if not isinstance(value, str) or not value.strip():
+                missing_required.append(key)
+
+    passed = had_frontmatter and not metadata_errors and not missing_required
+
+    results.append(ContractCheckResult(
+        id="reference.metadata.frontmatter_schema",
+        passed=passed,
+        target=file_path,
+        message=(
+            "reference frontmatter schema 合格。"
+            if passed
+            else "reference 必须包含普通文档 frontmatter，且 title/description 必须非空。错误："
+                 + "; ".join([*metadata_errors, *(f"missing {item}" for item in missing_required)])
+        ),
+        expected=(
+            "references/*.md 必须以 YAML frontmatter 开头；"
+            "顶层只允许 title、description、source、license、metadata；"
+            "title 和 description 必须非空。"
+        ),
+        minimal_edit=(
+            "只修当前 reference md 的 YAML frontmatter；"
+            "添加非空 title/description；"
+            "删除 role/path/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
+            "required_tool_slots/implementation_strategy/command_template 等 Creator 内部顶层字段；"
+            "如需保留内部信息，只能放到 metadata.creator 下。"
+        ),
+        details={
+            "had_frontmatter": had_frontmatter,
+            "missing_required": missing_required,
+            "metadata_errors": metadata_errors,
+        },
+    ))
+
+    body_text = body.strip() if had_frontmatter else (content or "").strip()
+    results.append(ContractCheckResult(
+        id="reference.metadata.body_exists",
+        passed=bool(body_text),
+        target=file_path,
+        message=("reference 存在 Markdown 正文。" if body_text else "reference 正文为空。"),
+        expected="frontmatter 后必须输出该 reference 的 Markdown 正文。",
+        minimal_edit="补充非空 reference 正文；正文必须是可复用参考资料，不是聊天问题、确认选项或状态说明。",
+    ))
+
+    return results
+
+def _build_reference_file_contract_text(file_path: str, purpose: str, blueprint_text: str) -> str:
+    script_paths = _paths_requiring_skill_md_mentions(blueprint_text, prefix="scripts/")
+    script_lines: list[str] = []
+
+    for script_path in script_paths:
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        if file_path in entry.reference_files or not entry.reference_files:
+            script_lines.extend([
+                f"- 本 reference 可以为 {script_path} 提供内容规范、格式规则、风格要求、质量标准、示例或反例；但不要重新定义该脚本的 role/inputs/outputs/capabilities/command_template。",
+                f"- 如果 SKILL.md 已包含 {script_path} 的可执行命令块，本 reference 不要再写可执行命令块。",
+                "- reference 正文可以提到相关脚本路径、阶段名或模块名，但不能把其它文件完整打包进来。",
+            ])
+
+    if not script_lines:
+        script_lines.append(
+            "- 本 reference 对应一个独立子任务/模块；正文必须提供可复用参考资料，而不是聊天回复、确认问题、状态说明或创建计划。"
+        )
+
+    metadata_example = yaml.safe_dump(
+        {
+            "title": _slug_from_reference_path(file_path),
+            "description": purpose or f"{file_path} reference",
+            "metadata": {
+                "creator": {
+                    "path": file_path,
+                    "purpose": purpose or "按 SKILL.md 工作流需要读取正文",
+                }
+            },
+        },
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    ).strip()
+
+    return "\n".join([
+        f"必须满足以下参考资料文件合同：{file_path}",
+        "",
+        "A. YAML frontmatter（硬格式要求）:",
+        "- 文件必须以 YAML frontmatter 开头，和 SKILL.md 一样必须有明确 metadata 区。",
+        "- frontmatter 顶层只允许：title、description、source、license、metadata。",
+        "- title 和 description 必须非空。",
+        "- path/purpose/role/type/scope/loading/when_to_use/inputs/outputs/capabilities/"
+        "required_tool_slots/implementation_strategy/command_template 等 Creator 内部信息不得作为顶层字段；"
+        "如需保留，只能放在 metadata.creator 下。",
+        "metadata 示例:",
+        "---",
+        metadata_example,
+        "---",
+        "",
+        "B. Markdown 正文格式（硬格式要求）:",
+        "- frontmatter 后必须有 Markdown 正文。",
+        "- 正文必须使用 Markdown 文档结构，至少包含一个 # 或 ## 标题。",
+        "- 正文可以包含段落、列表、表格、json/text 示例、质量检查项等。",
+        "- 不要把整个文件包裹在 ```markdown 代码块里；最终输出就是当前 .md 文件内容本身。",
+        "",
+        "C. 内容职责（参考价值要求）:",
+        f"- 职责说明：{purpose or '根据蓝图提供可操作参考资料'}",
+        "- reference 正文必须是参考资料本身，而不是对用户的澄清问题、确认选项、聊天回复、状态说明或计划询问。",
+        "- 正文必须提供可复用的规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。",
+        "- 每个 reference 只对应一个子任务/模块，不要把整个 Skill 包打包到一个 reference。",
+        "- 正文是辅助参考资料；不要重新定义 SkillPlan 的 role/capability/input/output 合同；如果 SKILL.md 已有可执行命令块，reference 不要重复写命令块。",
+        "- 不要重新定义 role / inputs / outputs / capabilities / command_template。",
+        *script_lines,
+        "",
+        "D. 禁止项:",
+        "- 不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        "- 不要包含其它 SKILL.md/scripts/assets/references 文件的完整打包内容。",
+        "- 不要包含 placeholder/TODO/待补充等占位文本。",
+    ])
+
+
+def _build_asset_file_contract_text(file_path: str, purpose: str) -> str:
+    return "\n".join([
+        f"必须满足以下 asset 文件合同：{file_path}",
+        "A. 输出形态:",
+        "- 只输出当前 asset 文件内容，不要写入文件标签、说明文字或多文件包。",
+        "- 文件必须非空；JSON 资源必须可被 json.loads 解析。",
+        "B. 内容职责:",
+        f"- 职责说明：{purpose or '根据蓝图提供模板或静态资源'}",
+        "C. 禁止项:",
+        "- asset 是模板或静态资源，不得包含运行时代码、图片生成调用或 Creator 创建流程文案。",
+    ])
+
+
+def _build_generated_file_contract_text(
+    file_path: str,
+    blueprint_text: str,
+    purpose: str = "",
+    *,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> str:
+    if file_path == "SKILL.md":
+        return _build_skill_md_contract_text(blueprint_text)
+    if file_path.startswith("scripts/"):
+        return _build_script_file_contract_text(file_path, blueprint_text, purpose=purpose, role=role, skill_plan_entry=skill_plan_entry)
+    if file_path.startswith("references/"):
+        return _build_reference_file_contract_text(file_path, purpose, blueprint_text)
+    if file_path.startswith("assets/"):
+        return _build_asset_file_contract_text(file_path, purpose)
+    return ""
+
+def _reference_contains_write_file_directive(markdown_body: str) -> bool:
+    """Detect whether a reference body contains an actual write-file directive.
+
+    只扫描 reference 正文，不扫描 YAML frontmatter。
+    避免 metadata.creator.path 被误判成 Path/File 写入标签。
+
+    这里检测的是通用文件写入指令语法，不绑定具体业务案例。
+    """
+    body = markdown_body or ""
+    return bool(re.search(
+        r"(?m)^\s*(?:写入文件|创建文件|保存为|File|Filename|Path)\s*[:：]\s*(?:SKILL\.md|scripts/|references/|assets/)",
+        body,
+    ))
+
+
+def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
+    raw_failures = _basic_markdown_format_failures(
+        file_path,
+        content,
+        require_frontmatter=True,
+    )
+    if raw_failures:
+        return [
+            ContractCheckResult(
+                id=str(item.get("id") or "reference.markdown_format"),
+                passed=False,
+                target=file_path,
+                message=str(item.get("message") or "reference Markdown 格式错误。"),
+                expected=str(item.get("expected") or "reference Markdown 格式必须合法。"),
+                minimal_edit=str(item.get("minimal_edit") or "只修 Markdown 格式区域。"),
+                details=item,
+                layer="markdown_format",
+            )
+            for item in raw_failures
+        ]
+
+    content = _ensure_reference_metadata_frontmatter(
+        file_path=file_path,
+        content=content,
+        purpose=purpose,
+        skill_plan_entry=None,
+    )
+
+    meta, body, had_frontmatter = parse_frontmatter(content)
+
+    stripped = (body if had_frontmatter else content or "").strip()
+    full_text = content.strip()
+
+    results: list[ContractCheckResult] = []
+
+    # 1. metadata / frontmatter
+    results.extend(_reference_metadata_contract_checks(
+        file_path=file_path,
+        content=content,
+        purpose=purpose,
+    ))
+
+    # 2. raw Markdown shape
+    wrapped_entire_file = bool(re.match(r"^\s*(```|~~~)", full_text)) and bool(re.search(r"(```|~~~)\s*$", full_text))
+    results.append(ContractCheckResult(
+        id="reference.markdown.raw_file_not_fenced",
+        passed=not wrapped_entire_file,
+        target=file_path,
+        message=(
+            "reference 是原始 Markdown 文件内容。"
+            if not wrapped_entire_file
+            else f"{file_path} 被整体包裹在 Markdown fenced code block 中。"
+        ),
+        expected="最终输出应是 references/*.md 文件正文自身，不要外层 ```markdown fence。",
+        minimal_edit="删除最外层 Markdown fence，只保留 frontmatter 和正文。",
+    ))
+
+    fence_markers = re.findall(r"(?m)^\s*(```|~~~)", stripped)
+    balanced_fences = len(fence_markers) % 2 == 0
+    results.append(ContractCheckResult(
+        id="reference.markdown.fences_balanced",
+        passed=balanced_fences,
+        target=file_path,
+        message=(
+            "reference Markdown fence 成对闭合。"
+            if balanced_fences
+            else f"{file_path} 存在未闭合的 Markdown fenced code block。"
+        ),
+        expected="Markdown fenced code block 必须成对闭合。",
+        minimal_edit="补齐或删除未闭合的 ```/~~~ fenced block。",
+    ))
+
+    declares_runtime_protocol = bool(re.search(
+        r"(?im)^\s*(?:runtime_contract|artifact_contract|required_tool_slots|implementation_strategy|command_template)\s*[:=]",
+        stripped,
+    ))
+    results.append(ContractCheckResult(
+        id="reference.no_runtime_protocol",
+        passed=not declares_runtime_protocol,
+        target=file_path,
+        message=(
+            "reference 未声明运行时协议。"
+            if not declares_runtime_protocol
+            else f"{file_path} 不应声明 runtime/tool/artifact 执行协议。"
+        ),
+        expected="reference 只提供文档上下文；运行时协议属于 normalized plan / scripts。",
+        minimal_edit="删除 runtime_contract、artifact_contract、required_tool_slots、implementation_strategy 或 command_template 等运行时协议字段。",
+    ))
+
+    results.append(ContractCheckResult(
+        id="reference.not_empty",
+        passed=bool(stripped),
+        target=file_path,
+        message=("参考资料正文非空。" if stripped else f"{file_path} 参考资料正文为空。"),
+        expected="frontmatter 后必须输出该 reference 的 Markdown 正文。",
+        minimal_edit="补充有实际指导价值的 Markdown 参考资料正文。",
+    ))
+
+    has_heading = bool(re.search(r"(?m)^#{1,6}\s+\S", stripped))
+    results.append(ContractCheckResult(
+        id="reference.markdown_document_heading",
+        passed=has_heading,
+        target=file_path,
+        message=(
+            "reference 正文包含 Markdown 文档标题。"
+            if has_heading
+            else f"{file_path} 正文不像 reference 文档：缺少 Markdown 标题。"
+        ),
+        expected="reference 正文必须使用 Markdown 文档结构，至少包含一个 #/## 标题。",
+        minimal_edit="把正文改写为真正的参考资料文档，添加标题，并围绕当前 purpose 提供规则、示例、约束或质量标准。",
+    ))
+
+    # 3. minimum reference-value gate
+    compact_body = re.sub(r"\s+", "", stripped)
+    nonempty_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    paragraph_count = len([
+        chunk for chunk in re.split(r"\n\s*\n", stripped)
+        if chunk.strip() and not chunk.strip().startswith("#")
+    ])
+    has_list = bool(re.search(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+\S", stripped))
+    has_table = bool(re.search(r"(?m)^\s*\|.+\|\s*$", stripped))
+    has_fenced_block = "```" in stripped or "~~~" in stripped
+    has_subheading = bool(re.search(r"(?m)^#{2,6}\s+\S", stripped))
+
+    has_reference_value = (
+        has_heading
+        and len(compact_body) >= 160
+        and (
+            has_subheading
+            or has_list
+            or has_table
+            or has_fenced_block
+            or paragraph_count >= 2
+            or len(nonempty_lines) >= 6
+        )
+    )
+    results.append(ContractCheckResult(
+        id="reference.content.has_reference_value",
+        passed=has_reference_value,
+        target=file_path,
+        message=(
+            "reference 正文具备基本参考资料结构和信息量。"
+            if has_reference_value
+            else f"{file_path} 正文信息量或文档结构不足，不应作为 reference 通过。"
+        ),
+        expected=(
+            "reference 必须是可复用参考资料；"
+            "应包含 Markdown 标题，并提供规则、约束、示例、格式说明、风格要求、质量标准或其它参考信息。"
+        ),
+        minimal_edit=(
+            "将当前正文改写为真正的参考资料文档；"
+            "不要输出聊天式澄清、确认选项、状态说明或计划询问；"
+            "正文应围绕当前 reference purpose 提供可复用规则、示例、约束或质量标准。"
+        ),
+        details={
+            "body_chars_without_space": len(compact_body),
+            "nonempty_lines": len(nonempty_lines),
+            "paragraph_count": paragraph_count,
+            "has_heading": has_heading,
+            "has_subheading": has_subheading,
+            "has_list": has_list,
+            "has_table": has_table,
+            "has_fenced_block": has_fenced_block,
+        },
+    ))
+
+    creator_flow_leak = bool(_CREATOR_FLOW_LEAK_RE.search(content))
+    results.append(ContractCheckResult(
+        id="reference.no_creator_flow",
+        passed=not creator_flow_leak,
+        target=file_path,
+        message=(
+            "未包含 Creator 创建流程文案。"
+            if not creator_flow_leak
+            else f"{file_path} 包含 Creator 创建流程/确认清单/点击开始创建等平台流程文案。"
+        ),
+        expected="不要包含 Creator 创建流程、确认清单、点击开始创建等平台流程文案。",
+        minimal_edit="删除平台创建流程文案，只保留 metadata 和参考资料正文。",
+    ))
+
+    # 允许正文提到 scripts/*.py；只禁止真正的多文件打包/写入文件标签。
+    # 注意：这里只扫描 frontmatter 之后的正文 stripped，不能扫描完整 content。
+    # 否则 metadata.creator.path: references/... 会被误判为“写入文件标签”。
+    # 同时不要使用 (?i) 忽略大小写，否则 YAML 小写 path 会命中 Path。
+    has_write_file_label = _reference_contains_write_file_directive(stripped)
+    has_packaged_file_block = False
+    lines = stripped.splitlines()
+    for idx, line in enumerate(lines):
+        line_text = line.strip()
+        if re.match(
+            r"^(?:#{1,6}\s*)?(?:SKILL\.md|scripts/[^\s]+|references/[^\s]+|assets/[^\s]+)\s*$",
+            line_text,
+        ):
+            following = "\n".join(lines[idx + 1: idx + 4])
+            if "```" in following or "~~~" in following:
+                has_packaged_file_block = True
+                break
+
+    single_file_ok = not has_write_file_label and not has_packaged_file_block
+    results.append(ContractCheckResult(
+        id="reference.single_file",
+        passed=single_file_ok,
+        target=file_path,
+        message=(
+            "参考资料是单文件内容。"
+            if single_file_ok
+            else f"{file_path} 包含多文件包、其它文件完整内容或写入文件标签。"
+        ),
+        expected=(
+            "只输出当前 reference 文件内容；"
+            "reference 正文可以提到相关脚本路径，但不能包含其它文件的完整内容或写入文件标签。"
+        ),
+        minimal_edit="删除其它文件完整内容和写入文件标签，只保留当前 reference metadata 和正文。",
+    ))
+
+    executable_reference_blocks: list[str] = []
+    for info, fenced_body in _iter_markdown_fenced_blocks(stripped):
+        if _is_shell_fence_info(info) and re.search(
+            r"(?m)^\s*(?:python|python3|node|bash|sh)\s+scripts/[A-Za-z0-9_./-]+\b",
+            fenced_body,
+        ):
+            executable_reference_blocks.append(fenced_body.strip())
+
+    results.append(ContractCheckResult(
+        id="reference.no_executable_script_blocks",
+        passed=not executable_reference_blocks,
+        target=file_path,
+        message=(
+            "reference 未包含可执行 scripts/** shell 命令块。"
+            if not executable_reference_blocks
+            else f"{file_path} 包含可执行 scripts/** shell 命令块，reference 只能作为说明资源。"
+        ),
+        expected=(
+            "references/*.md 可以包含 ```json 或 ```text 示例，"
+            "但不得包含 ```bash/```sh/```shell 中调用 scripts/** 的可执行命令。"
+        ),
+        minimal_edit="把 reference 中的可执行命令示例改为 ```text，或改写为普通说明，不要使用 bash/sh/shell fence。",
+    ))
+
+    capability_contract_patterns = [
+        r"(?i)\brequired_capabilities\b",
+        r"(?i)\bforbidden_capabilities\b",
+        r"(?i)\btext_generation\b",
+        r"(?i)\bimage_generation\b",
+        r"(?i)\bpdf_generation\b",
+        r"(?i)\bruntime_execution\b",
+    ]
+    mentions_script_capability_contract = bool(
+        re.search(r"scripts/[A-Za-z0-9_./-]+\.py", stripped)
+        and any(re.search(pattern, stripped) for pattern in capability_contract_patterns)
+    )
+    results.append(ContractCheckResult(
+        id="reference.no_script_capability_redefinition",
+        passed=not mentions_script_capability_contract,
+        target=file_path,
+        message=(
+            "reference 未重新定义脚本能力边界。"
+            if not mentions_script_capability_contract
+            else f"{file_path} 在 reference 正文中重新定义 scripts/*.py 的能力边界。"
+        ),
+        expected=(
+            "reference 只能描述内容结构、格式、风格和质量标准；"
+            "scripts/*.py 的 required_capabilities/forbidden_capabilities 只能来自 SkillPlan。"
+        ),
+        minimal_edit=(
+            "删除 reference 中关于某个脚本必须/禁止 text_generation、image_generation、pdf_generation、"
+            "runtime_execution 的描述，改为内容规范或输出格式要求。"
+        ),
+    ))
+
+    has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
+    results.append(ContractCheckResult(
+        id="reference.no_placeholder_phrases",
+        passed=not has_placeholder,
+        target=file_path,
+        message=(
+            "参考资料正文未包含占位短语。"
+            if not has_placeholder
+            else f"{file_path} 正文包含 placeholder/TODO/待补充等占位短语。"
+        ),
+        expected="不要使用 placeholder、TODO、待补充、将要生成等占位表达。",
+        minimal_edit="删除占位短语并替换为实际任务规则和示例。",
+    ))
+
+    return results
+
+
+
+def _reference_script_commands(content: str) -> list[tuple[str, str]]:
+    """Return executable script commands declared by references.
+
+    Current design intentionally returns no executable commands:
+    references/*.md are documentation resources, not workflow sources.
+    They may mention scripts/** in prose or examples, but those mentions must
+    never create an executable command contract.
+    """
+    return []
+
+
+def _declared_list_in_text(field_name: str, content: str) -> list[str] | None:
+    pattern = re.compile(rf"(?:^|\b){re.escape(field_name)}\s*[：:=]\s*\[?([^\]\n;]+)\]?", re.I | re.M)
+    match = pattern.search(content or "")
+    if not match:
+        return None
+    return [re.sub(r"[^A-Za-z0-9_./-]", "", item.strip().strip("'\"")) for item in re.split(r"[,，、]\s*", match.group(1)) if item.strip()]
+
+
+def _declared_role_in_text(content: str) -> str | None:
+    match = re.search(r"(?:^|\b)role\s*[：:=]\s*(text_generator|image_generator|composite_generator|pdf_builder|docx_builder|pptx_builder|html_asset_builder|asset_builder|generic_script)", content or "", re.I | re.M)
+    return match.group(1) if match else None
+
+
+def _anti_example_sections(content: str) -> str:
+    chunks: list[str] = []
+    matches = list(re.finditer(r"(?im)^#{1,3}.*(?:反例|错误示例|Anti[- ]?examples?).*$", content or ""))
+    for idx, match in enumerate(matches):
+        start = match.end()
+        next_heading = re.search(r"(?m)^#{1,3}\s+", content[start:])
+        end = start + next_heading.start() if next_heading else len(content)
+        chunks.append(content[start:end])
+    return "\n".join(chunks)
+
+
+def _check_reference_skillplan_redefinitions(file_path: str, content: str, entry: SkillPlanEntry) -> list[ContractCheckResult]:
+    """Ensure references do not invent a second script interface contract."""
+    results: list[ContractCheckResult] = []
+    declared_role = _declared_role_in_text(content)
+    role_ok = declared_role is None or declared_role == entry.role
+    results.append(ContractCheckResult(
+        id="reference.role.matches_skillplan",
+        passed=role_ok,
+        target=f"{file_path}#{entry.path}",
+        message=("reference 未重新定义冲突 role。" if role_ok else f"reference 重新定义 role={declared_role}，与 SkillPlan.role={entry.role} 冲突。"),
+        expected=f"reference 默认不要定义 role；如提及只能是 role={entry.role}。",
+        minimal_edit="删除 reference 中的 role/能力合同定义，改写为写作规范、风格要求、示例和质量标准。",
+    ))
+    for field_name, expected_values in (
+        ("inputs", entry.inputs or ["payload"]),
+        ("outputs", entry.outputs),
+        ("required_capabilities", entry.required_capabilities),
+        ("forbidden_capabilities", entry.forbidden_capabilities),
+    ):
+        declared = _declared_list_in_text(field_name, content)
+        ok = declared is None or declared == expected_values
+        results.append(ContractCheckResult(
+            id=f"reference.{field_name}.matches_skillplan",
+            passed=ok,
+            target=f"{file_path}#{entry.path}",
+            message=(f"reference 未重新定义冲突 {field_name}。" if ok else f"reference {field_name}={declared} 与 SkillPlan {field_name}={expected_values} 冲突。"),
+            expected=f"reference 默认不要定义 {field_name}；如提及必须逐字等于 SkillPlan: {expected_values}。",
+            minimal_edit=f"删除或修正 {field_name} 小节，避免产生第二套接口合同。",
+        ))
+    anti = _anti_example_sections(content)
+    correct_command_in_anti = bool(anti and entry.command_template and entry.command_template in anti)
+    correct_keys_in_anti = False
+    for command in re.findall(r"```(?:bash|sh|shell)?\s*\n([\s\S]*?)\n```", anti, flags=re.I):
+        keys = _command_payload_keys(command.strip(), entry.path)
+        if keys == set(entry.inputs or ["payload"]):
+            correct_keys_in_anti = True
+    results.append(ContractCheckResult(
+        id="reference.anti_example.not_skillplan_command",
+        passed=not correct_command_in_anti and not correct_keys_in_anti,
+        target=f"{file_path}#anti-examples",
+        message=("reference 未把 SkillPlan 正确命令/JSON keys 写成反例。" if not correct_command_in_anti and not correct_keys_in_anti else "reference 把 SkillPlan.command_template 或正确 JSON keys 写入反例，导致合同冲突。"),
+        expected="反例只能展示 extra key、缺失 key、错误 runner 或非 JSON argv；不得否定 SkillPlan.command_template。",
+        minimal_edit="从反例中移除正确命令，改为错误示例例如 extra 参数或 payload 包装。",
+    ))
+    return results
+
+def _validate_reference_file_contract(file_path: str, content: str, purpose: str = "") -> None:
+    results = _check_reference_file_contract(file_path, content, purpose)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(
+            _format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"),
+            results,
+        )
+
+
+def _asset_extension_check(file_path: str, stripped: str) -> tuple[bool, str, str]:
+    ext = Path(file_path).suffix.lower()
+    if not stripped:
+        return True, "空内容由 asset.not_empty 检查处理。", "当前 asset 文件内容非空。"
+    if ext == ".json":
+        try:
+            json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            return False, f"{file_path} 不是合法 JSON: {exc.msg}", "JSON asset 必须可被 json.loads 解析。"
+        return True, "JSON asset 可解析。", "JSON asset 必须可被 json.loads 解析。"
+    if ext in {".yaml", ".yml"}:
+        try:
+            yaml.safe_load(stripped)
+        except yaml.YAMLError as exc:
+            return False, f"{file_path} 不是合法 YAML: {exc}", "YAML asset 必须可被 yaml.safe_load 解析。"
+        return True, "YAML asset 可解析。", "YAML asset 必须可被 yaml.safe_load 解析。"
+    if ext == ".csv":
+        rows = list(csv.reader(io.StringIO(stripped)))
+        header = rows[0] if rows else []
+        if len(rows) < 3 or not header or any(not cell.strip() for cell in header):
+            return False, f"{file_path} CSV 必须包含非空表头和至少 2 行数据。", "CSV asset 必须包含 header 和至少 2 行数据。"
+        return True, "CSV asset 包含表头和至少 2 行数据。", "CSV asset 必须包含 header 和至少 2 行数据。"
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        data = stripped.encode("latin1", errors="ignore")
+        if re.fullmatch(r"[A-Za-z0-9+/=\s]+", stripped) and len(stripped) > 24:
+            try:
+                data = base64.b64decode(stripped, validate=True)
+            except ValueError:
+                data = stripped.encode("latin1", errors="ignore")
+        magic_ok = (
+            data.startswith(b"\x89PNG\r\n\x1a\n")
+            or data.startswith(b"\xff\xd8\xff")
+            or data.startswith(b"GIF87a")
+            or data.startswith(b"GIF89a")
+            or data.startswith(b"RIFF") and b"WEBP" in data[:16]
+        )
+        dims = _image_dimensions(data)
+        size_ok = dims is not None and dims[0] >= 64 and dims[1] >= 64
+        image_ok = magic_ok and size_ok
+        return (
+            image_ok,
+            "image asset 头部和尺寸合法。" if image_ok else f"{file_path} 不是有效图片或尺寸小于 64x64。",
+            "图片 asset 必须是有效图片字节或 base64，且尺寸 >= 64x64。",
+        )
+    if ext == ".pdf":
+        pdf_ok = stripped.startswith("%PDF-") and "%%EOF" in stripped and len(stripped.encode("latin1", errors="ignore")) > 100
+        return (
+            pdf_ok,
+            "PDF asset 结构合法。" if pdf_ok else f"{file_path} 必须以 %PDF- 开头、包含 %%EOF 且大于 100 bytes。",
+            "PDF asset 必须是有效、非空 PDF 内容。",
+        )
+    if ext in {".md", ".txt"}:
+        quality_ok = len(stripped) >= 40 and not _REFERENCE_PLACEHOLDER_RE.search(stripped)
+        return (
+            quality_ok,
+            "Markdown/text asset 满足最低质量要求。" if quality_ok else f"{file_path} 文本资源过短或包含占位短语。",
+            "Markdown/text asset 至少 40 个字符且不能包含占位短语。",
+        )
+    return True, "asset 格式可解析。", "当前 asset 文件内容必须符合其扩展名对应格式。"
+
+
+
+def _image_dimensions(data: bytes) -> tuple[int, int] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    if data.startswith(b"\xff\xd8"):
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            idx += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if idx + 2 > len(data):
+                break
+            length = int.from_bytes(data[idx:idx + 2], "big")
+            if length < 2:
+                break
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and idx + 7 <= len(data):
+                height = int.from_bytes(data[idx + 3:idx + 5], "big")
+                width = int.from_bytes(data[idx + 5:idx + 7], "big")
+                return width, height
+            idx += length
+    return None
+
+
+def _check_asset_file_contract(file_path: str, content: str) -> list[ContractCheckResult]:
+    stripped = content.strip()
+    has_runtime_code = bool(_PLATFORM_IMAGE_HELPER_RE.search(stripped))
+    parse_ok, parse_message, parse_expected = _asset_extension_check(file_path, stripped)
+    return [
+        ContractCheckResult(
+            id="asset.not_empty",
+            passed=bool(stripped),
+            target=file_path,
+            message=("asset 内容非空。" if stripped else f"{file_path} asset 内容为空。"),
+            expected="输出当前 asset 的模板或静态资源内容。",
+            minimal_edit="补充真实模板/静态资源内容，不要输出空壳。",
+        ),
+        ContractCheckResult(
+            id="asset.parseable",
+            passed=parse_ok,
+            target=file_path,
+            message=parse_message,
+            expected=parse_expected,
+            minimal_edit="按文件扩展名修正格式：JSON/YAML/CSV/image/PDF/Markdown 文本必须可解析且非空。",
+        ),
+        ContractCheckResult(
+            id="asset.no_runtime_capability",
+            passed=not has_runtime_code,
+            target=file_path,
+            message=(
+                "asset 未包含运行时图片生成能力。"
+                if not has_runtime_code
+                else f"{file_path} 是 asset，但包含图片生成 helper/运行时代码。"
+            ),
+            expected="asset 只能是模板或静态资源，不得执行 image_generation 等能力。",
+            minimal_edit="删除运行时代码或将该职责拆分为 scripts/ 文件。",
+        ),
+    ]
+
+
+def _validate_asset_file_contract(file_path: str, content: str) -> None:
+    results = _check_asset_file_contract(file_path, content)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
+
+
+def _script_uses_registry_helpers(content: str, capability: str) -> bool:
+    cap = get_tool_capability(capability)
+    if not cap or not cap.helper_imports:
+        return False
+    helper_pattern = "|".join(re.escape(helper) for helper in sorted(cap.helper_imports, key=len, reverse=True))
+    return bool(re.search(rf"\b(?:{helper_pattern})\b", content, re.IGNORECASE))
+
+
+
+_FORBIDDEN_GUESSED_HELPER_IMPORTS = {
+    "pdf_generation",
+    "file_output",
+    "platform_helpers",
+    "helpers.pdf_builder",
+    "tool_registry.pdf_builder",
+}
+
+
+def _registry_function_import_paths() -> set[str]:
+    paths: set[str] = set()
+    for capability in list_tool_capabilities():
+        for fn in getattr(capability, "functions", []) or []:
+            import_path = str(getattr(fn, "import_path", "") or "").strip()
+            signature = str(getattr(fn, "signature", "") or "").strip()
+            if import_path and signature:
+                paths.add(import_path)
+    return paths
+
+
+def _python_imported_modules(content: str) -> set[str]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    modules.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return modules
+
+
+def _forbidden_guessed_helper_imports(content: str) -> list[str]:
+    allowed_cards = _registry_function_import_paths()
+    hits: list[str] = []
+    for module in _python_imported_modules(content):
+        for forbidden in _FORBIDDEN_GUESSED_HELPER_IMPORTS:
+            if module == forbidden or module.startswith(forbidden + "."):
+                if module not in allowed_cards:
+                    hits.append(module)
+    return sorted(set(hits))
+
+
+def _script_satisfies_required_capability(content: str, capability: str) -> bool:
+    """Statically enforce only helper_required capabilities.
+
+    helper_preferred/self_implementation_allowed capabilities are validated by
+    trial run, E2E stdout, and artifact existence checks instead of source-code
+    implementation regexes.
+    """
+    capability = capability.lower()
+    cap = get_tool_capability(capability)
+    if cap and cap.usage_policy == "helper_required":
+        return _script_uses_registry_helpers(content, capability)
+    return True
+
+
+_ARTIFACT_OUTPUT_KEYS = {"pdf_path", "docx_path", "pptx_path", "html_path", "file_paths"}
+_ARTIFACT_CAPABILITIES = {"pdf_generation", "docx_generation", "pptx_generation", "html_generation", "html_asset_generation", "file_output"}
+
+
+def _script_has_real_file_creation_logic(content: str, *, outputs: list[str], capabilities: list[str]) -> bool:
+    """Do not infer artifact implementation from source regexes.
+
+    Static validation keeps syntax/interface/capability boundaries; actual file
+    creation is verified by trial run/E2E artifact checks.
+    """
+    return True
+
+
+
+_MODEL_CAPABILITIES = {"text_generation", "image_generation"}
+_DETERMINISTIC_BUILDER_ROLES = {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"}
+
+
+def _effective_required_capabilities_for_script(plan_entry: SkillPlanEntry) -> list[str]:
+    """Return capabilities that this script source must visibly exercise.
+
+    File builders/exporters are deterministic by default.  If a global
+    SKILL.md/blueprint model declaration was accidentally copied into a
+    builder's required_capabilities, do not turn that into a requirement for
+    ``build_pdf.py`` (or sibling exporters) to call LLM/IMAGE_MODEL.  Model
+    scripts keep their text/image requirements through their own generator
+    roles, while builders are validated for real artifact creation.
+    """
+    capabilities = list(plan_entry.required_capabilities or [])
+    if plan_entry.role in _DETERMINISTIC_BUILDER_ROLES:
+        capabilities = [capability for capability in capabilities if capability not in _MODEL_CAPABILITIES]
+    return capabilities
+
+async def _refine_blueprint_contract_with_model(
+    *,
+    messages: list[dict],
+    initial_plan: BlueprintPlan,
+    requested_model: str | None,
+    strict: bool = False,
+    max_rounds: int = 3,
+) -> tuple[list[dict], list[dict[str, Any]]]:
+    """Phase2 pre-display blueprint contract refinement.
+
+    只发生在蓝图展示给用户之前。
+
+    原则：
+    - 不在后台写业务规则；
+    - 不让后台判断哪个脚本该产出哪个字段；
+    - 不 patch FileSpecOut；
+    - 模型只判断蓝图/合同是否自洽；
+    - 需要修改时，模型输出 exact_replace patch；
+    - 后台 apply patch 后重新 parse_blueprint；
+    - 多轮直到模型认为通过、parse 通过，或达到 max_rounds。
+    """
+
+    def dump_item(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        if hasattr(item, "dict"):
+            return item.dict()
+        if hasattr(item, "__dict__"):
+            return dict(item.__dict__)
+        return item
+
+    def messages_to_blueprint_text(items: list[dict]) -> str:
+        return "\n\n".join(
+            str(message.get("content") or "")
+            for message in items
+            if isinstance(message, dict)
+        )
+
+    current_messages = list(messages or [])
+    current_plan = initial_plan
+    diagnostics: list[dict[str, Any]] = []
+    carry_feedback = ""
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason="creator phase2 blueprint contract refinement",
+    )
+
+    _log_creator_model_usage(
+        phase="blueprint_contract_refine.route",
+        file_path="__blueprint__",
+        route=route,
+        model=requested_model,
+    )
+
+    rounds = max(1, int(max_rounds or 1))
+
+    for round_index in range(1, rounds + 1):
+        blueprint_text = messages_to_blueprint_text(current_messages)
+
+        plan_snapshot = {
+            "skill_name": current_plan.skill_name,
+            "files": [dump_item(item) for item in (current_plan.files or [])],
+            "skill_plan": {
+                "files": [
+                    dump_item(item)
+                    for item in ((current_plan.skill_plan.files if current_plan.skill_plan else []) or [])
+                ]
+            },
+            "warnings": list(current_plan.warnings or []),
+        }
+
+        review_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 superskills Creator 的蓝图合同审查模型，只输出严格 JSON object。\n"
+                    "你只检查当前蓝图文本和当前解析计划是否自洽，不写代码，不输出完整重写蓝图。\n"
+                    "不要按固定案例套规则；只根据当前用户需求、当前蓝图和当前解析计划判断。\n"
+                    "不要修改平台宿主协议。\n"
+                    "不要输出 FileSpecOut patch。\n"
+                    "如果蓝图已经自洽，passed=true。\n"
+                    "如果不自洽，passed=false，并给出 repair_goal，后续会由 patch 模型做局部修改。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"当前轮次：{round_index}/{rounds}\n\n"
+                    "当前蓝图文本：\n"
+                    "```markdown\n"
+                    f"{blueprint_text[-70000:]}\n"
+                    "```\n\n"
+                    "当前 parse_blueprint 解析结果：\n"
+                    "```json\n"
+                    f"{json.dumps(plan_snapshot, ensure_ascii=False, indent=2, default=str)[:70000]}\n"
+                    "```\n\n"
+                    + (
+                        "上一轮 patch / parse 反馈：\n"
+                        f"{carry_feedback[-8000:]}\n\n"
+                        if carry_feedback
+                        else ""
+                    )
+                    + (
+                        "请判断蓝图与合同是否已经自洽，包括但不限于："
+                        "文件职责、脚本输入输出闭环、workflow 顺序、最终产物来源、references/assets 职责边界。"
+                        "这些只是检查方向，不是固定规则；你必须依据当前蓝图语义判断。\n\n"
+                        "返回 JSON：\n"
+                        "{\n"
+                        "  \"passed\": true,\n"
+                        "  \"diagnostics\": [\n"
+                        "    {\"severity\": \"note|warning|error\", \"message\": \"说明\"}\n"
+                        "  ],\n"
+                        "  \"repair_goal\": \"如果 passed=false，说明需要对蓝图文本做的最小修改；否则为空\"\n"
+                        "}"
+                    )
+                ),
+            },
+        ]
+
+        try:
+            review_raw = await complete_chat_once(review_messages, route.model)
+            review = _parse_validator_json_object(review_raw)
+            if not isinstance(review, dict):
+                raise ValueError("蓝图审查模型未返回 JSON object。")
+        except Exception as exc:
+            diagnostics.append({
+                "severity": "warning",
+                "code": "blueprint_contract_review_failed",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": f"第 {round_index} 轮蓝图审查失败，保留当前蓝图：{type(exc).__name__}: {exc}",
+            })
+            return current_messages, diagnostics
+
+        for item in review.get("diagnostics", []) or []:
+            if isinstance(item, dict):
+                diagnostics.append({
+                    "severity": str(item.get("severity") or "note"),
+                    "code": "blueprint_contract_refine",
+                    "source": "blueprint_contract_refine",
+                    "path": "",
+                    "field": "",
+                    "message": f"[round {round_index}] {str(item.get('message') or '')}",
+                })
+            else:
+                diagnostics.append({
+                    "severity": "note",
+                    "code": "blueprint_contract_refine",
+                    "source": "blueprint_contract_refine",
+                    "path": "",
+                    "field": "",
+                    "message": f"[round {round_index}] {str(item)}",
+                })
+
+        repair_goal = str(review.get("repair_goal") or "").strip()
+        passed = bool(review.get("passed")) and not repair_goal
+
+        if passed:
+            diagnostics.append({
+                "severity": "note",
+                "code": "blueprint_contract_refine_passed",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": f"蓝图合同自检在第 {round_index} 轮通过。",
+            })
+            return current_messages, diagnostics
+
+        if not repair_goal:
+            diagnostics.append({
+                "severity": "warning",
+                "code": "blueprint_contract_refine_no_goal",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": f"第 {round_index} 轮模型判定未通过但没有给出 repair_goal，保留当前蓝图。",
+            })
+            return current_messages, diagnostics
+
+        scope = CreatorRepairScope(
+            phase="phase2_blueprint_contract_refine",
+            repair_type="blueprint_text_patch",
+            target_file="BLUEPRINT.md",
+            max_changed_lines=max(120, len(blueprint_text.splitlines()) + 40),
+            notes=(
+                "Phase2 展示前蓝图修复。",
+                "只改蓝图文本，不写代码。",
+                "使用 exact_replace old/new patch。",
+                "保持用户需求，不新增平台协议。",
+            ),
+        )
+
+        try:
+            _proposal, candidate_text, diff_stats = await _request_and_apply_repair_patch(
+                model=route.model,
+                file_path="BLUEPRINT.md",
+                current_content=blueprint_text,
+                failure_text=(
+                    "蓝图合同自检未通过，需要在展示给用户之前修正蓝图文本。\n\n"
+                    f"第 {round_index} 轮 repair_goal：\n{repair_goal}\n\n"
+                    "诊断信息：\n"
+                    f"{json.dumps(diagnostics[-10:], ensure_ascii=False, indent=2, default=str)}"
+                ),
+                scope=scope,
+                task_context=(
+                    "当前 parse_blueprint 解析结果：\n"
+                    f"{json.dumps(plan_snapshot, ensure_ascii=False, indent=2, default=str)[:70000]}"
+                ),
+                target_rule=(
+                    "你正在修复 Creator Phase2 蓝图文本。"
+                    "只能修改导致蓝图、合同、workflow 或职责不自洽的局部文本。"
+                    "不要输出完整蓝图。"
+                    "不要输出代码。"
+                    "不要输出 FileSpecOut patch。"
+                    "不要新增平台宿主协议。"
+                    "必须使用 exact_replace old/new patch。"
+                ),
+                patch_retry_limit=3,
+            )
+        except Exception as exc:
+            diagnostics.append({
+                "severity": "warning",
+                "code": "blueprint_contract_patch_failed",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": f"第 {round_index} 轮蓝图 patch 失败，保留当前蓝图：{type(exc).__name__}: {exc}",
+            })
+            return current_messages, diagnostics
+
+        try:
+            next_messages = [{"role": "user", "content": candidate_text}]
+            next_plan = parse_blueprint(next_messages, strict=strict)
+        except BlueprintShapeError as exc:
+            carry_feedback = (
+                f"上一轮 patch 后 parse_blueprint 失败：{exc}\n"
+                "请基于原蓝图重新给出更小、更安全的 exact_replace patch。"
+            )
+            diagnostics.append({
+                "severity": "warning",
+                "code": "blueprint_contract_patch_parse_failed",
+                "source": "blueprint_contract_refine",
+                "path": "",
+                "field": "",
+                "message": f"第 {round_index} 轮 patch 后无法重新解析，继续下一轮：{exc}",
+            })
+            continue
+
+        current_messages = next_messages
+        current_plan = next_plan
+        carry_feedback = ""
+
+        diagnostics.append({
+            "severity": "note",
+            "code": "blueprint_contract_patch_applied",
+            "source": "blueprint_contract_refine",
+            "path": "",
+            "field": "",
+            "message": (
+                f"第 {round_index} 轮蓝图 patch 已应用并重新解析成功："
+                f"{json.dumps(diff_stats, ensure_ascii=False, default=str)[:1200]}"
+            ),
+        })
+
+    diagnostics.append({
+        "severity": "warning",
+        "code": "blueprint_contract_refine_round_limit",
+        "source": "blueprint_contract_refine",
+        "path": "",
+        "field": "",
+        "message": f"蓝图合同自检达到 {rounds} 轮上限，返回最后一次可解析蓝图。",
+    })
+
+    return current_messages, diagnostics
+
+def _script_required_capability_failures(content: str, capabilities: list[str]) -> list[str]:
+    return [capability for capability in capabilities if not _script_satisfies_required_capability(content, capability)]
+
+def _check_script_file_contract(
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """First-round generic script file contract checks.
+
+    这是 Creator 第一轮“单脚本文件合同”检查，只做通用平台协议与安全检查。
+
+    不做：
+    - 不按 role 名称判断职责路线；
+    - 不按业务 capability 名称判断是否允许调用某类工具；
+    - 不按业务输出字段名判断是否生成某类产物；
+    - 不通过业务词表判断写作、画图、PDF、数据库等任务；
+    - 不把 SkillPlanEntry.inputs / outputs 的具体字段名当 hard gate。
+
+    责任完成度由 _run_script_responsibility_review 判断；
+    字段名、上下游映射、真实参数消费由第二轮 E2E 判断；
+    artifact 真实存在与格式由 smoke/E2E 判断。
+    """
+
+    plan_entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+    strict_interface = skill_plan_entry is not None
+    stripped = content.strip()
+    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry)
+
+    has_markdown_or_bundle = (
+        "```" in stripped
+        or "~~~" in stripped
+        or bool(_MULTI_FILE_MARKER_RE.search(stripped))
+    )
+    raw_ok = bool(stripped) and not has_markdown_or_bundle
+
+    results: list[ContractCheckResult] = [
+        ContractCheckResult(
+            id="script.raw_source.single_file",
+            passed=raw_ok,
+            target=file_path,
+            message=(
+                "脚本是单个裸源码文件。"
+                if raw_ok
+                else f"{file_path} 生成内容包含 Markdown 代码块或多文件包，不是单个脚本源码。请重新生成该文件。"
+            ),
+            expected="只输出单个脚本源码本身，不要 Markdown fence、说明文字、写入文件标签或多文件包。",
+            minimal_edit="从上一次内容中只保留目标脚本源码；删除所有 ``` fence、文件路径标题、写入文件标签和说明文字。",
+        )
+    ]
+
+    if not raw_ok:
+        return results
+
+    # ------------------------------------------------------------------
+    # 1. Runtime syntax / entry checks
+    # ------------------------------------------------------------------
+
+    syntax_ok = True
+    syntax_message = f"{plan_entry.language} 源码基础校验通过。"
+    syntax_expected = "脚本源码必须符合 language/runtime 的基础语法与入口约定。"
+
+    if plan_entry.language == "python":
+        try:
+            ast.parse(stripped)
+        except SyntaxError as exc:
+            syntax_ok = False
+            syntax_message = f"{file_path} 生成内容不是合法 Python 源码: {exc.msg}"
+        syntax_expected = "Python 脚本必须能通过 ast.parse 语法检查。"
+
+    elif plan_entry.runtime == "node":
+        syntax_ok = "process.argv" in stripped and "console.log" in stripped
+        syntax_message = (
+            "Node/JS 脚本包含 process.argv 和 stdout 输出。"
+            if syntax_ok
+            else f"{file_path} Node/JS 脚本必须使用 process.argv 读取 argv 并通过 console.log 输出结果。"
+        )
+        syntax_expected = "Node/JS 脚本必须使用 process.argv 读取参数，并通过 console.log 输出可解析结果。"
+
+    elif plan_entry.runtime in {"bash", "shell"}:
+        syntax_ok = "$1" in stripped or "${1" in stripped
+        syntax_message = (
+            "Shell/Bash 脚本读取 $1 argv。"
+            if syntax_ok
+            else f"{file_path} Shell/Bash 脚本必须读取 $1 argv。"
+        )
+        syntax_expected = "Shell/Bash 脚本必须读取 $1 参数，并向 stdout 输出结果或写入声明产物。"
+
+    results.append(
+        ContractCheckResult(
+            id="script.source.syntax",
+            passed=syntax_ok,
+            target=file_path,
+            message=syntax_message,
+            expected=syntax_expected,
+            minimal_edit="修正源码语法/入口错误，同时保持 stdout JSON 和参数接口不变。",
+        )
+    )
+
+    if strict_interface:
+        reads_json = _script_reads_json_argv(stripped, plan_entry.runtime)
+        results.append(
+            ContractCheckResult(
+                id="script.json_argv.runtime",
+                passed=reads_json,
+                target=file_path,
+                message=(
+                    f"脚本按 {plan_entry.runtime} runtime 读取 JSON argv。"
+                    if reads_json
+                    else f"{file_path} 必须按 {plan_entry.runtime} runtime 读取 JSON argv。"
+                ),
+                expected="Python: sys.argv[1]+json.loads；Node: process.argv[2]+JSON.parse；Bash: $1 JSON。",
+                minimal_edit="补充 runtime 对应 JSON argv 解析入口。",
+            )
+        )
+
+        # 字段名只做 warning，不做 hard gate。
+        # 第一轮只判断单脚本是否可运行、是否有内容责任实现；
+        # 具体字段名和最终 SKILL.md block 对齐交给 E2E。
+        missing_inputs = [
+            str(key)
+            for key in (plan_entry.inputs or [])
+            if str(key or "").strip() and str(key) not in stripped
+        ]
+        results.append(
+            ContractCheckResult(
+                id="script.skillplan_inputs.recommended_names",
+                passed=True,
+                target=file_path,
+                message=(
+                    "脚本源码未发现明显缺失的推荐输入名。"
+                    if not missing_inputs
+                    else (
+                        "warning: 脚本源码未静态引用部分推荐输入名："
+                        f"{', '.join(missing_inputs)}；第一轮不阻断，字段名映射由 E2E 验证。"
+                    )
+                ),
+                expected=(
+                    "SkillPlanEntry.inputs 只作为推荐变量名和语义提示；"
+                    "第一轮不得把具体字段名作为 hard gate。"
+                ),
+                minimal_edit=(
+                    "仅当责任审查确认输入内容没有影响核心输出，或 E2E 发现最终参数映射失败时，"
+                    "才修当前脚本参数读取与输出逻辑。"
+                ),
+            )
+        )
+
+        has_entry = _script_has_main_entry(stripped, plan_entry.runtime)
+        results.append(
+            ContractCheckResult(
+                id="script.runtime.entrypoint",
+                passed=has_entry,
+                target=file_path,
+                message=(
+                    "脚本包含 runtime 入口与 stdout 输出。"
+                    if has_entry
+                    else f"{file_path} 缺少 {plan_entry.runtime} 入口或 stdout 输出。"
+                ),
+                expected="脚本包含对应 runtime 的入口函数/语句，并向 stdout 输出 JSON。",
+                minimal_edit="补齐 main/入口调用和 JSON stdout 输出。",
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Tool registry grounding warnings only.
+    # ------------------------------------------------------------------
+
+    tool_resolve = resolve_tools_for_skill_plan_entry(plan_entry)
+
+    guessed_helper_imports = (
+        _forbidden_guessed_helper_imports(stripped)
+        if plan_entry.language == "python"
+        else []
+    )
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.unverified_helper_import",
+            passed=True,
+            target=file_path,
+            message=(
+                "脚本未发现疑似猜测 helper import path。"
+                if not guessed_helper_imports
+                else (
+                    f"warning: {file_path} import 了未由 Tool Registry function card 明确提供 "
+                    f"import path 和调用签名的 helper：{', '.join(guessed_helper_imports)}；"
+                    "第一轮不因此阻断，实际以 import/trial run 结果为准。"
+                )
+            ),
+            expected=(
+                "第一轮不按 helper import 路线做 hard validation；"
+                "仅在 import 失败、调用失败或 stdout/artifact 不满足合同时失败。"
+            ),
+            minimal_edit=(
+                "如 trial run/import 失败，只修当前脚本的 import/call；"
+                "不要修改 SkillPlan、capability 声明或 workflow。"
+            ),
+        )
+    )
+
+    helper_required_capabilities = [
+        capability
+        for capability in effective_required_capabilities
+        if (
+            get_tool_capability(capability)
+            and get_tool_capability(capability).usage_policy == "helper_required"
+        )
+    ]
+    missing_capabilities = _script_required_capability_failures(
+        stripped,
+        helper_required_capabilities,
+    )
+    results.append(
+        ContractCheckResult(
+            id="script.required_capabilities.route_warning",
+            passed=True,
+            target=file_path,
+            message=(
+                "第一轮不强制 helper_required/required_capabilities 的具体工具路线。"
+                if not missing_capabilities
+                else (
+                    "warning: 脚本未调用这些 helper_required 能力对应接口："
+                    f"{', '.join(missing_capabilities)}；第一轮不阻断，"
+                    "实际以 stdout/artifact/trial run 闭环为准。"
+                )
+            ),
+            expected=(
+                "scripts/** 可按责任模块自主组合已有工具；"
+                "第一轮不使用 required/optional/allowed_capabilities 卡死实现路线。"
+            ),
+            minimal_edit=(
+                "repair 阶段只修当前脚本的 argv/run/stdout/artifact/import/输入使用/真实实现问题；"
+                "不要修 SkillPlan 或 capability 声明。"
+            ),
+        )
+    )
+
+    # forbidden_capabilities 只做 registry 层面的通用 warning。
+    # 不对任何具体 capability 名称做特殊分支。
+    registry_forbidden_helper_hits: list[str] = []
+    for forbidden_capability in plan_entry.forbidden_capabilities or []:
+        capability_name = str(forbidden_capability or "").strip()
+        if not capability_name:
+            continue
+        if _script_uses_registry_helpers(stripped, capability_name):
+            registry_forbidden_helper_hits.append(capability_name)
+
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.forbidden_registry_helpers",
+            passed=True,
+            target=file_path,
+            message=(
+                "脚本未调用 forbidden_capabilities 中禁止的 registry helper。"
+                if not registry_forbidden_helper_hits
+                else (
+                    f"warning: {file_path} 调用了这些 forbidden_capabilities 对应的 registry helper："
+                    f"{', '.join(registry_forbidden_helper_hits)}；第一轮不阻断，"
+                    "如运行或安全 gate 失败再修。"
+                )
+            ),
+            expected=(
+                "第一轮不按 capability/helper 路线阻断；"
+                "真实失败以 import/dependency、运行、stdout、artifact 合同和安全 gate 为准。"
+            ),
+            minimal_edit=(
+                "如该 helper 导致运行失败，只修当前脚本；"
+                "不要扩大 SkillPlan/capability 声明。"
+            ),
+        )
+    )
+
+    forbidden_direct_hits = [
+        item
+        for item in tool_resolve.forbidden_imports
+        if re.search(rf"\b{re.escape(item)}\b", stripped, re.IGNORECASE)
+    ]
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.forbidden_direct_imports",
+            passed=True,
+            target=file_path,
+            message=(
+                "脚本未绕过平台 helper 直接调用被禁止的底层工具库。"
+                if not forbidden_direct_hits
+                else (
+                    f"warning: {file_path} 直接调用了 Tool Resolve 禁止的底层工具/库："
+                    f"{', '.join(forbidden_direct_hits)}；第一轮不阻断，"
+                    "实际以 dependency/import/trial run 和安全 gate 为准。"
+                )
+            ),
+            expected=(
+                "第一轮不因工具路线选择阻断；"
+                "底层库是否可用由 dependency/import/trial run 和 artifact 合同验证。"
+            ),
+            minimal_edit="如 dependency/import/trial run 失败，只修当前脚本依赖和调用路径。",
+        )
+    )
+
+    undeclared_helper_hits: list[str] = []
+    declared_caps = (
+        set(effective_required_capabilities)
+        | set(plan_entry.optional_capabilities or [])
+        | set(plan_entry.allowed_capabilities or [])
+    )
+    for capability in [cap.name for cap in list_tool_capabilities() if cap.helper_imports]:
+        if capability not in declared_caps and _script_uses_registry_helpers(stripped, capability):
+            undeclared_helper_hits.append(capability)
+
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.undeclared_helper",
+            passed=True,
+            target=file_path,
+            message=(
+                "脚本未调用未声明 registry helper，或无需记录 warning。"
+                if not undeclared_helper_hits
+                else (
+                    f"warning: {file_path} 调用了未在 required/optional/allowed_capabilities "
+                    f"声明的工具能力：{', '.join(undeclared_helper_hits)}；第一轮不阻断。"
+                )
+            ),
+            expected=(
+                "undeclared_helper 降级为 warning；"
+                "scripts/** 可根据自身责任自主组合已有工具。"
+            ),
+            minimal_edit=(
+                "不要修 SkillPlan、capability 声明或 workflow；"
+                "仅当调用本身失败或 stdout/artifact 不满足合同时修当前脚本。"
+            ),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Artifact creation: no static business inference.
+    # ------------------------------------------------------------------
+
+    artifact_required = bool(_ARTIFACT_CAPABILITIES & set(effective_required_capabilities))
+    artifact_outputs_declared = bool(_ARTIFACT_OUTPUT_KEYS & set(plan_entry.outputs or []))
+    enforce_artifact_outputs = strict_interface or artifact_required or artifact_outputs_declared
+
+    has_real_file_output = _script_has_real_file_creation_logic(
+        stripped,
+        outputs=list(plan_entry.outputs or []) if enforce_artifact_outputs else [],
+        capabilities=effective_required_capabilities if enforce_artifact_outputs else [],
+    )
+    results.append(
+        ContractCheckResult(
+            id="script.file_outputs.runtime_verified",
+            passed=True,
+            target=file_path,
+            message=(
+                "文件产物实现方式不由第一轮源码词表判断；真实产物由 smoke/E2E 校验。"
+                if has_real_file_output
+                else (
+                    f"warning: {file_path} 可能声明或暗含文件产物输出；"
+                    "第一轮仅提示风险，真实产物由 smoke/E2E 校验。"
+                )
+            ),
+            expected=(
+                "第一轮不通过业务词表判断文件产物；"
+                "如声明 artifact 输出，后续 smoke/E2E 必须验证真实文件、路径返回和平台可消费性。"
+            ),
+            minimal_edit=(
+                "如 smoke/E2E 失败，再修脚本确保运行时创建真实文件，"
+                "并通过平台可消费字段返回路径。"
+            ),
+        )
+    )
+
+    results.append(
+        ContractCheckResult(
+            id="tool_usage_contract.artifact_output_e2e",
+            passed=True,
+            target=file_path,
+            message=(
+                f"{file_path} 的产物实现方式不由 Creator 后台源码正则判断；"
+                "最终由试运行/E2E 校验真实产物与 stdout 字段。"
+            ),
+            expected=(
+                "如果当前脚本职责包含文件产物，必须在运行时创建真实文件，"
+                "并通过平台可消费字段返回路径。"
+            ),
+            minimal_edit=(
+                "保持 argv/stdout 协议；如 smoke/E2E 失败，"
+                "修复真实文件创建、路径返回和平台字段。"
+            ),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Fake implementation is a responsibility concern, not keyword hard gate.
+    # ------------------------------------------------------------------
+
+    has_fake = bool(_SCRIPT_FAKE_IMPLEMENTATION_RE.search(stripped))
+    results.append(
+        ContractCheckResult(
+            id="script.no_fake_implementation.warning",
+            passed=True,
+            target=file_path,
+            message=(
+                "脚本未发现明显占位/模拟/假实现信号。"
+                if not has_fake
+                else (
+                    f"warning: {file_path} 包含占位/模拟/假实现信号；"
+                    "第一轮文件合同不因此阻断，由责任审查和 smoke/E2E 判断是否真实完成职责。"
+                )
+            ),
+            expected=(
+                "第一轮不使用 placeholder/mock/template 关键词正则作为 hard gate；"
+                "真实失败由责任审查、运行、stdout required outputs 和 artifact 验证决定。"
+            ),
+            minimal_edit=(
+                "仅当脚本责任审查、运行闭环、stdout 合同或 artifact 真实生成失败时修当前脚本。"
+            ),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Generic security gate.
+    # ------------------------------------------------------------------
+
+    dangerous_import_hits = sorted(set(re.findall(
+        r"^\s*(?:import|from)\s+(paramiko|ftplib|telnetlib|subprocess)\b",
+        stripped,
+        re.MULTILINE,
+    )))
+    dangerous_call_hits = sorted(set(re.findall(
+        r"\b(?:os\.system|subprocess\.(?:run|Popen|call|check_call|check_output))\b",
+        stripped,
+    )))
+    forbidden_path_hits = sorted(set(re.findall(
+        r"[\'\"]((?:/etc/passwd|/etc/shadow|/root/\.ssh/[^\'\"]*|~/.ssh/[^\'\"]*|\.\./[^\'\"]*))[\'\"]",
+        stripped,
+    )))
+    security_hits = [*dangerous_import_hits, *dangerous_call_hits, *forbidden_path_hits]
+
+    results.append(
+        ContractCheckResult(
+            id="script.security.dangerous_operations",
+            passed=not security_hits,
+            target=file_path,
+            message=(
+                "脚本未包含危险 import、shell 调用或禁止路径访问。"
+                if not security_hits
+                else f"{file_path} 包含危险操作或禁止路径：{', '.join(security_hits)}。"
+            ),
+            expected=(
+                "第一轮不审查业务工具路线，但安全风险、危险 import、禁止路径和恶意 shell 必须阻断。"
+            ),
+            minimal_edit=(
+                "移除危险 import/shell/禁止路径访问；"
+                "只保留当前脚本职责所需的安全本地逻辑或受控 helper 调用。"
+            ),
+        )
+    )
+
+    return results
+
+
+_SCRIPT_CONTENT_REVIEW_CHECK_IDS = {
+    "script.raw_source.single_file",
+    "script.source.syntax",
+    "script.security.dangerous_operations",
+}
+
+
+def _check_script_content_review_contract(
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """First script phase: deterministic protocol/security review only.
+
+    Runtime truth still comes from the single-script smoke phase, but syntax,
+    JSON argv parsing shape, entrypoint shape, and dangerous operations are cheap
+    deterministic gates before trial execution.
+    """
+    return [
+        result
+        for result in _check_script_file_contract(
+            file_path,
+            content,
+            role=role,
+            skill_plan_entry=skill_plan_entry,
+        )
+        if result.id in _SCRIPT_CONTENT_REVIEW_CHECK_IDS
+    ]
+
+
+def _validate_script_file_source_contract(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+    # Accept otherwise-valid raw source with a dangling orphan fence marker at
+    # the boundary.  Full fenced/bundled responses are still rejected by the
+    # lower-level checker unless the sanitize path extracted a single code block.
+    candidate = _strip_orphan_trailing_fence(content)
+    results = _check_script_file_contract(file_path, candidate, role=role, skill_plan_entry=skill_plan_entry)
+    if any(not result.passed for result in results):
+        raise ContractValidationError(_format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"), results)
+
+def _validate_skill_md_against_existing_files(
+    skill_name: str,
+    content: str,
+    *,
+    blueprint_text: str = "",
+    require_existing: bool = True,
+) -> None:
+    skill_name = _validate_skill_name(skill_name)
+    skill_root = settings.skills_path / skill_name
+
+    try:
+        referenced_paths = sorted(set(_skill_local_paths_in_markdown(content)))
+    except Exception as exc:
+        raise ValueError(f"SKILL.md 本地路径扫描失败：{exc}") from exc
+
+    ignored_dirs = [
+        path for path in referenced_paths if _is_directory_like_skill_path(path)
+    ]
+    materialized_paths = [
+        path for path in referenced_paths if _is_materialized_skill_resource_path(path)
+    ]
+
+    if ignored_dirs:
+        logger.info(
+            "[Creator][skill_md] 忽略目录型路径，不做上传校验 skill=%s paths=%s",
+            skill_name,
+            ignored_dirs,
+        )
+
+    if not require_existing:
+        return
+
+    missing: list[str] = []
+    for rel_path in materialized_paths:
+        abs_path = (skill_root / rel_path).resolve()
+        try:
+            abs_path.relative_to(skill_root.resolve())
+        except ValueError:
+            missing.append(rel_path)
+            continue
+        if not abs_path.exists() or not abs_path.is_file():
+            missing.append(rel_path)
+
+    if missing:
+        result = ContractCheckResult(
+            id="skill_md.resource.exists_on_disk",
+            passed=False,
+            target="SKILL.md",
+            message="SKILL.md 引用了最终打包时仍不存在的本地资源：" + ", ".join(missing),
+            expected="最终打包前，SKILL.md 引用的 scripts/references/assets 具体文件必须生成或上传；目录路径不检查。",
+            minimal_edit="生成缺失的 scripts/references，上传缺失 assets 文件，或删除 SKILL.md 中对应引用。",
+        )
+        raise ContractValidationError(
+            "SKILL.md contract 未通过：\n" + _format_contract_failures_safe([result]),
+            [result],
+        )
+
+
+def _clean_blueprint_for_file_prompt(blueprint_text: str) -> str:
+    """Remove Creator UI confirmation text from blueprint context before generation."""
+    cleaned_lines: list[str] = []
+    in_confirmation_block = False
+    for line in (blueprint_text or "").splitlines():
+        stripped = line.strip()
+        if _CREATOR_FLOW_LEAK_RE.search(stripped):
+            in_confirmation_block = True
+            continue
+        if in_confirmation_block:
+            if stripped.startswith("```") or stripped.startswith("- [") or stripped.startswith(">"):
+                continue
+            if not stripped:
+                in_confirmation_block = False
+                continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip() or blueprint_text
+
+
+def _reject_fake_script_implementation(file_path: str, content: str) -> None:
+    """Reject placeholder/mock scripts that pretend to implement capabilities."""
+    if _SCRIPT_FAKE_IMPLEMENTATION_RE.search(content):
+        raise ValueError(
+            f"{file_path} 包含占位/模拟/假 API 实现。"
+            "Creator 生成的脚本必须具备真实可执行功能；"
+            "如需图像或多模态能力，应通过宿主配置的模型/服务完成，不能写 placeholder 文件或假装调用 API。"
+        )
+
+
+def _requires_configured_model_call(*, plan_entry: SkillPlanEntry | None) -> bool:
+    """Return whether the current script contract requires host model use.
+
+    Model-call requirements are scoped to this script's SkillPlanEntry.
+    Whole-SKILL.md wording about LLM/image models can describe earlier or later
+    steps, but must not force deterministic exporter/builder scripts to call a
+    model unless their own required_capabilities declare text/image generation.
+    """
+    if plan_entry is None:
+        return False
+    return bool({"text_generation", "image_generation"} & set(_effective_required_capabilities_for_script(plan_entry)))
+
+
+def _script_uses_configured_model(content: str) -> bool:
+    """Detect whether script calls the configured host LLM/VL endpoint."""
+    return bool(_CONFIGURED_MODEL_CALL_RE.search(content))
+
+
+def _validate_configured_model_usage_static(*, file_path: str, content: str, skill_md: str, plan_entry: SkillPlanEntry | None = None) -> None:
+    """Reject scripts whose own SkillPlanEntry requires host-model behavior but do not call models."""
+    if _DIRECT_IMAGE_API_RE.search(content) and "VISION_MODEL" in content:
+        raise ValueError(
+            f"{file_path} 将 VISION_MODEL 与图片生成接口混用。"
+            "生成图片必须使用平台 Stable Diffusion 图片运行时或 IMAGE_MODEL；"
+            "VISION_MODEL 只用于看图理解/OCR/多模态问答。"
+        )
+
+
+    if _DATA_URI_RE.search(content):
+        raise ValueError(
+            f"{file_path} 输出 base64 data URI。"
+            "图片结果必须由平台运行时写入 OUTPUT_DIR，并在 stdout JSON 中返回 image_paths。"
+        )
+
+    if re.search(r"(?m)^\s*image_path\s*=\s*generate_stable_diffusion_image\s*\(", content):
+        raise ValueError(
+            f"{file_path} 将 helper 返回 dict 直接赋给 image_path。"
+            "图片脚本必须先保存 result = generate_stable_diffusion_image(desc)，"
+            "再执行 image_paths.append(result.get(\"image_path\"))。"
+        )
+
+    effective_required_capabilities = _effective_required_capabilities_for_script(plan_entry) if plan_entry else []
+    if plan_entry and plan_entry.role in {"pdf_builder", "docx_builder", "pptx_builder", "html_asset_builder", "asset_builder"} and not ({"text_generation", "image_generation"} & set(effective_required_capabilities)):
+        return
+    if not _requires_configured_model_call(plan_entry=plan_entry):
+        return
+    if _script_uses_configured_model(content):
+        return
+    raise ValueError(
+        f"{file_path} 的当前脚本职责/SkillPlan.required_capabilities 声明需要使用宿主/内置/配置模型，但脚本没有调用这些模型。"
+        "脚本不能用固定模板、随机词表或 ASCII 图替代模型能力；"
+        "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL。"
+    )
+
+def _script_paths_in_shell_fenced_blocks(skill_md: str) -> set[str]:
+    """Return scripts/*.py paths that appear inside shell fenced blocks."""
+    paths: set[str] = set()
+
+    for info, body in _iter_markdown_fenced_blocks(skill_md):
+        if not _is_shell_fence_info(info):
+            continue
+
+        for match in re.finditer(
+            r"(?<![\w./-])(scripts/[A-Za-z0-9_./-]+\.py)(?![\w./-])",
+            body.replace("\\", "/"),
+        ):
+            paths.add(match.group(1))
+
+    return paths
+
+
+def _script_paths_outside_shell_fenced_blocks(skill_md: str) -> set[str]:
+    """Return scripts/*.py paths mentioned outside shell fenced blocks.
+
+    This is not used to decide whether a script is part of the blueprint.
+    It only catches a bad SKILL.md style:
+    mentioning scripts/foo.py in prose without an executable ```bash block.
+    """
+    text = skill_md or ""
+
+    shell_block_bodies: list[str] = []
+    for info, body in _iter_markdown_fenced_blocks(text):
+        if _is_shell_fence_info(info):
+            shell_block_bodies.append(body)
+
+    text_without_shell_blocks = text
+    for body in shell_block_bodies:
+        text_without_shell_blocks = text_without_shell_blocks.replace(body, "")
+
+    paths: set[str] = set()
+    for match in re.finditer(
+        r"(?<![\w./-])(scripts/[A-Za-z0-9_./-]+\.py)(?![\w./-])",
+        text_without_shell_blocks.replace("\\", "/"),
+    ):
+        paths.add(match.group(1))
+
+    return paths
+
+
+def _validate_command_is_single_shell_json_invocation(
+    *,
+    command: str,
+    script_path: str,
+    entry: SkillPlanEntry,
+    upstream_available_outputs: set[str] | None = None,
+) -> list[ContractCheckResult]:
+    """Validate one shell fenced command under flexible command protocol.
+
+    C 方案：
+    - 阻断：不是单行命令；
+    - 阻断：不能解析成 python/python3 调用 scripts/*.py；
+    - 阻断：如果它看起来使用 JSON argv，但 JSON 不合法；
+    - 不阻断：使用 argparse flags、普通位置参数、无参数。
+    """
+    results: list[ContractCheckResult] = []
+    target = script_path
+
+    raw_command = command or ""
+    lines = [line.strip() for line in raw_command.strip().splitlines() if line.strip()]
+    one_line = len(lines) == 1
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.single_command",
+        passed=one_line,
+        target=target,
+        message=(
+            f"{script_path} 命令块只包含一条命令。"
+            if one_line
+            else f"{script_path} 命令块应只包含一条命令，不要在一个 block 里写多条命令或解释。"
+        ),
+        expected="每个 ```bash fenced block 内只放一条真实 shell 命令。",
+        minimal_edit="把解释移出 fenced block；一个 block 只保留一条调用 scripts/*.py 的 shell 命令。",
+    ))
+
+    if not one_line:
+        return results
+
+    command_line = lines[0]
+
+    try:
+        command_sig = _command_signature(command_line, script_path)
+    except Exception as exc:
+        logger.warning(
+            "[Creator][skill_md] command signature parser crashed script=%s command=%s error=%s",
+            script_path,
+            command_line,
+            exc,
+        )
+        command_sig = None
+
+    parsed_ok = command_sig is not None
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.signature_parseable",
+        passed=parsed_ok,
+        target=target,
+        message=(
+            f"{script_path} 命令块可解析为真实 scripts/*.py shell 调用。"
+            if parsed_ok
+            else f"{script_path} 命令块无法解析为真实 scripts/*.py shell 调用。"
+        ),
+        expected=(
+            "命令应是一条真实 shell 命令，并直接调用 scripts/*.py。"
+            "参数形态由脚本真实接口决定，可以是 JSON argv，也可以是 argparse flags。"
+        ),
+        minimal_edit=(
+            f"改为调用真实脚本的 shell 命令，例如：python {script_path} '<JSON object>' "
+            f"或 python {script_path} --arg value。具体参数由脚本接口决定。"
+        ),
+    ))
+
+    if not command_sig:
+        return results
+
+    arg_mode = str(command_sig.get("arg_mode") or "")
+    args = list(command_sig.get("args") or [])
+
+    # 只有“看起来想用 JSON argv 但 JSON 坏了”的情况才阻断。
+    # argparse flags / no_args / positional_args 不在第一轮误杀。
+    json_arg_ok = arg_mode != "invalid_json_arg"
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.args_parseable",
+        passed=json_arg_ok,
+        target=target,
+        message=(
+            f"{script_path} 命令参数形态可接受：{arg_mode or 'unknown'}。"
+            if json_arg_ok
+            else f"{script_path} 看起来使用 JSON argv，但 JSON 无法解析。"
+        ),
+        expected=(
+            "如果使用 JSON argv，则脚本路径后传一个 json.loads 可解析的 JSON object；"
+            "如果脚本使用 argparse，则使用该脚本声明的 flags。"
+        ),
+        minimal_edit=(
+            "只修当前命令参数。不要固定套用 payload/user_request/fields/options/input_files。"
+        ),
+        details={
+            "arg_mode": arg_mode,
+            "args": args,
+        },
+    ))
+
+    try:
+        runtime_matches = _command_runtime_matches(command_line, script_path, entry)
+    except Exception as exc:
+        runtime_matches = False
+        logger.warning(
+            "[Creator][skill_md] runtime match check crashed script=%s command=%s error=%s",
+            script_path,
+            command_line,
+            exc,
+        )
+
+    if not runtime_matches:
+        logger.info(
+            "[Creator][skill_md] non-blocking runtime mismatch script=%s inferred_runtime=%s command=%s",
+            script_path,
+            getattr(entry, "runtime", ""),
+            command_line,
+        )
+
+    return results
+
+
+def _check_skill_md_fenced_command_contracts(
+    *,
+    content: str,
+    blueprint_text: str,
+    required_script_paths: list[str] | None = None,
+) -> list[ContractCheckResult]:
+    """Validate fenced command style for SKILL.md.
+
+    这里是格式/可解析性校验，不做蓝图语义判断。
+    任何内部异常都转换成 ContractCheckResult，避免直接崩溃。
+    """
+    results: list[ContractCheckResult] = []
+
+    required = {
+        path.replace("\\", "/").strip()
+        for path in (required_script_paths or [])
+        if isinstance(path, str) and path.replace("\\", "/").strip().startswith("scripts/")
+    }
+
+    mentioned = {
+        path
+        for path in _skill_local_paths_in_markdown(content)
+        if isinstance(path, str) and path.startswith("scripts/")
+    }
+
+    scripts_to_check = sorted(required or mentioned)
+
+    entries_by_path: dict[str, SkillPlanEntry] = {}
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        if parsed.skill_plan:
+            entries_by_path = {
+                entry.path: entry
+                for entry in parsed.skill_plan.files
+                if entry.file_type == "script"
+            }
+    except Exception as exc:
+        logger.warning("[Creator][skill_md] failed to parse blueprint SkillPlan for command validation: %s", exc)
+
+    if entries_by_path:
+        scripts_to_check = [entry.path for entry in entries_by_path.values() if entry.path in scripts_to_check]
+
+    prior_outputs: set[str] = set()
+
+    for script_path in scripts_to_check:
+        try:
+            commands = _extract_script_command_templates(content, script_path)
+        except Exception as exc:
+            results.append(ContractCheckResult(
+                id="skill_md.command_block.extract_crashed",
+                passed=False,
+                target=script_path,
+                message=f"{script_path} 命令块提取失败：{exc}",
+                expected="能够从 SKILL.md 中提取该脚本对应的标准 ```bash fenced code block。",
+                minimal_edit=(
+                    f"为 {script_path} 添加独立、无缩进的标准命令块，例如：\n"
+                    f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+                ),
+            ))
+            continue
+
+        has_fenced = bool(commands)
+
+        results.append(ContractCheckResult(
+            id="skill_md.command_block.fenced_exists",
+            passed=has_fenced,
+            target=script_path,
+            message=(
+                f"{script_path} 已使用 ```bash fenced code block 表达可执行命令。"
+                if has_fenced
+                else f"{script_path} 缺少可执行 Markdown 命令块：标准 ```bash fenced code block。"
+            ),
+            expected=(
+                "真实脚本必须用标准 Markdown fenced code block 表示，例如：\n"
+                f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+            ),
+            minimal_edit=(
+                f"为 {script_path} 添加独立、无缩进的 ```bash fenced block；"
+                "不要只在正文中写“调用脚本”。"
+            ),
+        ))
+
+        if not commands:
+            continue
+
+        try:
+            entry = entries_by_path.get(script_path) or _skill_plan_entry_for_file(
+                file_path=script_path,
+                blueprint_text=blueprint_text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Creator][skill_md] failed to infer SkillPlanEntry for %s: %s",
+                script_path,
+                exc,
+            )
+            entry = SkillPlanEntry(
+                path=script_path,
+                role="generic_script",
+                file_type="python",
+                purpose="Inferred fallback entry for command validation.",
+                runtime="python",
+                inputs=[],
+                outputs=[],
+                dependencies=[],
+            )
+
+        for command in commands:
+            try:
+                results.extend(_validate_command_is_single_shell_json_invocation(
+                    command=command,
+                    script_path=script_path,
+                    entry=entry,
+                    upstream_available_outputs=prior_outputs,
+                ))
+            except Exception as exc:
+                logger.exception(
+                    "[Creator][skill_md] command validation crashed script=%s command=%s",
+                    script_path,
+                    command,
+                )
+                results.append(ContractCheckResult(
+                    id="skill_md.command_block.validation_crashed",
+                    passed=False,
+                    target=script_path,
+                    message=f"{script_path} 命令块校验内部异常：{exc}",
+                    expected="命令块应能被解析为 runner + scripts 路径 + JSON object argv。",
+                    minimal_edit=(
+                        f"将命令改为标准形式：\n"
+                        f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+                    ),
+                ))
+
+        prior_outputs.update(entry.outputs or [])
+
+    return results
+
+def _basic_markdown_format_failures(file_path: str, content: str, *, require_frontmatter: bool) -> list[dict[str, Any]]:
+    """Very small Markdown format gate.
+
+    只检查最基础格式：
+    1. frontmatter 是否存在；
+    2. frontmatter 是否有收尾 ---；
+    3. frontmatter YAML 是否能解析成 dict；
+    4. fenced block 数量是否成对。
+
+    不检查内容责任，不检查蓝图一致性。
+    """
+    text = (content or "").lstrip("\ufeff")
+    failures: list[dict[str, Any]] = []
+
+    if require_frontmatter:
+        if not text.startswith("---"):
+            failures.append({
+                "id": "markdown.frontmatter.missing",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} 缺少 YAML frontmatter。",
+                "expected": "文件必须以 --- 开始，并在正文前用单独一行 --- 闭合。",
+                "minimal_edit": "只在文件开头补齐 YAML frontmatter。",
+            })
+            return failures
+
+        lines = text.splitlines(keepends=True)
+        close_idx = None
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                close_idx = idx
+                break
+
+        if close_idx is None:
+            failures.append({
+                "id": "markdown.frontmatter.unclosed",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} frontmatter 只有开头 ---，没有收尾 ---。",
+                "expected": "frontmatter 必须在正文前用单独一行 --- 闭合。",
+                "minimal_edit": "只在正文第一个标题或正文开始前补一行 ---，不要修改正文内容。",
+            })
+            return failures
+
+        raw_yaml = "".join(lines[1:close_idx])
+        try:
+            parsed = yaml.safe_load(raw_yaml) or {}
+            if not isinstance(parsed, dict):
+                failures.append({
+                    "id": "markdown.frontmatter.not_object",
+                    "source": "markdown_format",
+                    "target": file_path,
+                    "layer": "markdown_format",
+                    "message": f"{file_path} frontmatter 必须是 YAML object。",
+                    "expected": "frontmatter 应是 key/value YAML object。",
+                    "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
+                })
+        except Exception as exc:
+            failures.append({
+                "id": "markdown.frontmatter.invalid_yaml",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
+                "expected": "frontmatter 必须是合法 YAML。",
+                "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
+            })
+
+    fence_count = len(re.findall(r"(?m)^\s*(```|~~~)", text))
+    if fence_count % 2 != 0:
+        failures.append({
+            "id": "markdown.fences_unbalanced",
+            "source": "markdown_format",
+            "target": file_path,
+            "layer": "markdown_format",
+            "message": f"{file_path} 存在未闭合的 Markdown fenced block。",
+            "expected": "所有 ``` 或 ~~~ fenced block 必须成对闭合。",
+            "minimal_edit": "只补齐或删除多余的 fenced block 标记。",
+            "details": {"fence_count": fence_count},
+        })
+
+    return failures
+
+def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
+    """Return shell command templates in SKILL.md that invoke script_path."""
+    commands: list[str] = []
+    normalized_script_path = script_path.replace("\\", "/")
+
+    for info, body in _iter_markdown_fenced_blocks(skill_md):
+        if not _is_shell_fence_info(info):
+            continue
+
+        command = body.strip()
+        if not command:
+            continue
+
+        normalized_command = command.replace("\\", "/")
+        if normalized_script_path in normalized_command:
+            commands.append(command)
+
+    return commands
+
+
+def _command_uses_json_argv(command: str) -> bool:
+    return "{" in command and "}" in command
+
+
+def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
+    if runtime == "node":
+        return "JSON.parse" in content and "process.argv" in content
+    if runtime in {"bash", "shell"}:
+        return "$1" in content or "${1" in content or "jq" in content
+    return "json.loads" in content and "sys.argv" in content
+
+
+def _script_uses_input_keys(content: str, keys: list[str]) -> tuple[bool, list[str]]:
+    missing = [key for key in keys if key not in content]
+    return not missing, missing
+
+
+def _script_has_main_entry(content: str, runtime: str) -> bool:
+    if runtime == "python":
+        return "def main" in content and "__main__" in content
+    if runtime == "node":
+        return "process.argv" in content and "console.log" in content
+    if runtime in {"bash", "shell"}:
+        return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content or "print(json.dumps" in content)
+    return True
+
+
+def _validate_script_contract_static(
+    *,
+    file_path: str,
+    content: str,
+    skill_md: str,
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> None:
+    """Validate script source against SKILL.md contract locally.
+
+    Creator 单文件阶段只做“协议 + 运行 + 产物”中的静态协议部分：
+    - 如果 SKILL.md 命令传入 JSON argv，脚本必须读取 JSON argv；
+    - 不用 fake/mock/template 关键词、工具能力声明、helper 路线或 LLM
+      validator 作为 hard gate；
+    - 字段级 stdout/artifact 闭环交给单文件 trial run 和最终 E2E。
+    """
+    explicit_entry = (
+        skill_plan_entry.__dict__
+        if isinstance(skill_plan_entry, SkillPlanEntry)
+        else skill_plan_entry
+    )
+    plan_entry = (
+        _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=explicit_entry)
+        if explicit_entry is not None
+        else _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+    )
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return
+
+    command_results = _check_command_block_contract(file_path, commands, plan_entry)
+    failed_command_results = [r for r in command_results if not r.passed]
+    if failed_command_results:
+        raise ValueError(
+            "SKILL.md 命令块不合法，属于 workflow 局部合同问题，不要改脚本字段强制对齐 SkillPlan:\n"
+            + _format_contract_checks(failed_command_results, passed=False)
+        )
+
+    json_argv_commands = [c for c in commands if _command_uses_json_argv(c)]
+    if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
+        raise ValueError(
+            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
+        )
+
+
+
+def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
+    """Refuse saving scripts that do not match the current SKILL.md contract."""
+    if not file_path.startswith("scripts/"):
+        return
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    if not skill_md_path.is_file():
+        return
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+
+
+def _validate_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
+    """Reject content that is clearly not the requested single file."""
+    if file_path == "SKILL.md":
+        _reject_custom_skill_md_protocol(content)
+        return
+
+    if file_path.startswith("scripts/"):
+        results = _check_script_content_review_contract(
+            file_path,
+            content,
+            role=role,
+            skill_plan_entry=skill_plan_entry,
+        )
+        if any(not result.passed for result in results):
+            raise ContractValidationError(
+                _format_contract_failures(results).replace("SKILL.md contract", f"{file_path} contract"),
+                results,
+            )
+        return
+
+    if file_path.startswith("references/"):
+        _validate_reference_file_contract(file_path, content)
+        return
+
+    if file_path.startswith("assets/"):
+        _validate_asset_file_contract(file_path, content)
+        return
+
+
+def validate_file_contract(
+    *,
+    file_path: str,
+    content: str,
+    blueprint_text: str = "",
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[ContractCheckResult]:
+    """First-round Creator validator: only check one file's own contract.
+
+    This layer deliberately excludes cross-file placeholder/dataflow closure and
+    final platform-output checks. Those belong to ``validate_workflow_e2e``.
+    """
+    if file_path == "SKILL.md":
+        return _check_skill_md_contract(content, blueprint_text or content)
+    if file_path.startswith("scripts/"):
+        return _check_script_file_contract(file_path, content, role=role, skill_plan_entry=skill_plan_entry)
+    if file_path.startswith("references/"):
+        purpose = ""
+        if isinstance(skill_plan_entry, dict):
+            purpose = str(skill_plan_entry.get("purpose") or "")
+        return _check_reference_file_contract(file_path, content, purpose=purpose)
+    if file_path.startswith("assets/"):
+        try:
+            _validate_asset_file_contract(file_path, content)
+            return []
+        except ContractValidationError as exc:
+            return list(exc.results)
+    return []
+
+from .repair import *  # noqa: F403  # late import for blueprint repair helpers
+
+__all__ = [name for name in globals() if not name.startswith("__")]

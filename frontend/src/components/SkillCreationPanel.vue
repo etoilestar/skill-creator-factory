@@ -743,6 +743,14 @@ async function generateOneFile(idx) {
         assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
         finalOutputs: props.finalOutputs,
       })
+      if (result?.success !== true) {
+        const failures = Array.isArray(result?.failures)
+          ? result.failures.map(item => `${item.id || 'check'}: ${item.message || ''}`).join('\n')
+          : ''
+        const error = new Error(failures || result?.error || 'SKILL.md finalize 未通过校验，已阻止预览/写入')
+        error.detail = { failed_checks: result?.failures || [] }
+        throw error
+      }
       file.generatedContent = result.content || ''
       if (!file.generatedContent.trim()) {
         throw new Error('SKILL.md finalizer 未返回任何内容')

@@ -1658,9 +1658,14 @@ async def _repair_existing_file_for_e2e_failure(
     repair_feedback = deterministic_error
     last_failure = ""
     max_candidate_attempts = 5
+    working_content = target_file.read_text(encoding="utf-8")
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
-        current_content = target_file.read_text(encoding="utf-8")
+        current_content = working_content
+        effective_skill_md = current_content if target_path == "SKILL.md" else skill_md
+        effective_task_context = base_task_context
+        if target_path == "SKILL.md":
+            effective_task_context = base_task_context.replace(skill_md[-12000:], effective_skill_md[-12000:], 1)
 
         try:
             _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
@@ -1669,7 +1674,7 @@ async def _repair_existing_file_for_e2e_failure(
                 current_content=current_content,
                 failure_text=repair_feedback,
                 scope=scope,
-                task_context=base_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
+                task_context=effective_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
                 target_rule=target_rule,
                 patch_retry_limit=3,
             )
@@ -1692,7 +1697,7 @@ async def _repair_existing_file_for_e2e_failure(
                     _validate_e2e_script_static_preflight(
                         file_path=target_path,
                         content=sanitized,
-                        skill_md=skill_md,
+                        skill_md=effective_skill_md,
                     )
 
             except Exception as preflight_exc:
@@ -1743,6 +1748,7 @@ async def _repair_existing_file_for_e2e_failure(
                 )
 
                 if not sandbox_gate.get("accepted"):
+                    working_content = sanitized
                     last_failure = (
                         "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
                         f"attempt={candidate_attempt}/{max_candidate_attempts}\n"

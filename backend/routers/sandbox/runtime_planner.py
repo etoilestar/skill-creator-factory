@@ -34,6 +34,22 @@ from .workflow_detection import (
 logger = logging.getLogger(__name__)
 
 
+def _compose_platform_tools_brief() -> str:
+    """给 runtime planner 的精简版平台工具能力摘要。"""
+    return (
+        "## 平台内置工具能力摘要\n\n"
+        "主模型在执行时可以使用以下平台内置能力：\n"
+        "1. **write_file**：写入文件内容。当 skill 脚本依赖的配置文件不存在时，"
+        "主模型可根据用户提供的配置信息创建该文件。触发方式：在 fenced code block 前写 `写入文件：<path>`。\n"
+        "2. **run_command**：执行 shell 命令，包括执行 skill 脚本。\n"
+        "3. **平台工具调用**：主模型可在生成的 Python 脚本中通过 "
+        "`from backend.services.skill_runtime import query_database_readonly, ...` 调用平台内置工具。\n"
+        "4. **临时脚本生成**：主模型可用 `python - <<'PY' ... PY` heredoc 语法生成临时 Python 脚本。\n\n"
+        "当缺少配置文件等模型可创建的资源，且用户已提供必要信息时，"
+        "应使用 mode=direct_answer 让主模型创建资源并执行脚本，不要使用 mode=ask_user。"
+    )
+
+
 def _compose_skill_runtime_planner_prompt() -> str:
     return (
         "你是 Skill Agent 运行时动作意图判断器。\n\n"
@@ -56,6 +72,11 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "6. 如果 Skill.md/reference 只写了 `scripts/...` 行内路径、'调用脚本'等自然语言，但没有具体 fenced 命令示例，"
         "必须使用 mode=ask_user，说明该 Skill 缺少可执行命令 block 示例，不能让主模型临时拼命令。\n"
         "7. 如果 available_scripts 和 resource_catalog 中没有对应脚本，而任务必须依赖脚本，应使用 mode=ask_user 并说明缺少脚本。\n"
+        "7.1 区分\"缺少用户信息\"和\"缺少可创建资源\"：\n"
+        "  - 如果缺少的是只有用户才知道的信息（如数据库连接参数、API 密钥、业务条件），使用 mode=ask_user。\n"
+        "  - 如果缺少的是模型可以创建的资源（如配置文件、目录），且用户已在对话中提供了必要信息，\n"
+        "    使用 mode=direct_answer，在 final_instruction 中提示主模型先用 `写入文件：<path>` 创建缺失的资源，再执行脚本。\n"
+        "  - 如果 skill 没有所需工具但平台有内置工具，使用 mode=direct_answer，让主模型用平台工具或生成临时脚本。\n"
         "8. 你不能把函数名、伪代码函数、Python 函数、自然语言动作当成系统命令。\n"
         "9. 如果当前 Skill 是写作、故事生成、公文生成、报告生成、总结、翻译、润色、分析、咨询等语言生成类任务，"
         "且最终产物是纯文本或 Markdown（不是 .pptx/.xlsx/.docx 等格式文件），"
@@ -79,7 +100,10 @@ def _compose_skill_runtime_planner_prompt() -> str:
         "- direct_answer：主模型继续生成最终回复；仅适用于无需脚本或单步脚本兜底。\n"
         "- execute_workflow：用于包含多个 scripts/*.py 命令、章节循环或文件产物链路的复合 Skill；后端将按 Action schema 顺序执行，不依赖主模型输出 bash。\n"
         "- execute：用于 read_resource/display/ignore 这类宿主受控动作；若 final_instruction 含合法单步命令，宿主会在前置动作后执行该命令。\n"
-        "- ask_user：缺少必要输入，或 SKILL.md 要求的脚本/资源不存在，无法安全继续。\n"
+        "- ask_user：缺少只有用户才知道的必要信息（如业务需求、数据库连接参数、API 密钥等），"
+        "或 SKILL.md 要求的脚本本身不存在，无法安全继续。"
+        "注意：如果缺少的是配置文件、目录等模型可以创建的资源，且用户已在对话中提供了必要信息，"
+        "不应使用 ask_user，而应使用 direct_answer，在 final_instruction 中提示主模型创建缺失的资源。\n"
         "- not_applicable：用户请求与当前 Skill 明显不匹配。\n\n"
         "输出格式：\n"
         "{\n"
@@ -412,6 +436,7 @@ async def _run_skill_runtime_planner_round(
 
     messages = [
         {"role": "system", "content": _compose_skill_runtime_planner_prompt()},
+        {"role": "system", "content": _compose_platform_tools_brief()},
         {"role": "user", "content": f"## Skill 执行规范\n{planner_body_prompt}"},
         {"role": "user", "content": f"## 可用脚本\n{json.dumps(available_scripts, ensure_ascii=False)}"},
         {"role": "user", "content": f"## SKILL.md / references Action schema\n{json.dumps(command_contract, ensure_ascii=False)}"},
@@ -423,6 +448,8 @@ async def _run_skill_runtime_planner_round(
     ]
 
     planner_model = _planner_model_name(model)
+    logger.info("[LLM_CALL] 阶段=runtime_planner 模型=%s 消息数=%d", planner_model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=runtime_planner 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
     planner_text = await complete_chat_once(messages, planner_model)
 
     try:
@@ -447,6 +474,8 @@ async def _run_skill_runtime_planner_round(
                 ),
             },
         ]
+        logger.info("[LLM_CALL] 阶段=runtime_planner_retry 模型=%s 消息数=%d", planner_model, len(retry_messages))
+        logger.debug("[LLM_CALL] 阶段=runtime_planner_retry 完整消息=%s", json.dumps(retry_messages, ensure_ascii=False)[:2000])
         planner_text = await complete_chat_once(retry_messages, planner_model)
         try:
             stripped = _strip_markdown_json_fence(planner_text)
@@ -476,6 +505,137 @@ async def _run_skill_runtime_planner_round(
 # Public aliases
 normalize_skill_runtime_plan = _normalize_skill_runtime_plan
 compose_skill_runtime_planner_prompt = _compose_skill_runtime_planner_prompt
+
+
+# ---------------------------------------------------------------------------
+# SubAgent 任务分组：将 planner 输出的 tasks 按 SubAgent 类型分组
+# ---------------------------------------------------------------------------
+
+from .sub_agent_types import SubAgentTask, SubAgentType
+
+
+# 领域关键词 → SubAgentType 映射（用于命令内容推断）
+_DATA_QUERY_KEYWORDS = frozenset({
+    "sql", "database", "db", "query", "select", "insert", "mysql",
+    "postgresql", "sqlite", "数据库", "查询", "统计",
+})
+_NETWORK_API_KEYWORDS = frozenset({
+    "curl", "http", "api", "request", "fetch", "webhook",
+    "requests", "httpx", "aiohttp", "网络", "接口", "爬虫",
+})
+_DOCUMENT_KEYWORDS = frozenset({
+    "pdf", "docx", "pptx", "xlsx", "excel", "word", "ppt",
+    "html", "markdown", "文档", "解析", "导出", "格式转换",
+})
+
+
+def _infer_sub_agent_type(action: str, command: str, scripts: list[str] | None = None) -> SubAgentType:
+    """基于 action 和 command 内容推断 SubAgent 类型。
+
+    Args:
+        action: 任务动作类型（run_command / read_resource / write_file 等）。
+        command: 命令文本或资源路径。
+        scripts: 可用脚本列表（可选）。
+
+    Returns:
+        推断的 SubAgentType。
+    """
+    text = (command or "").lower()
+
+    if action == "run_command":
+        if any(kw in text for kw in _DATA_QUERY_KEYWORDS):
+            return SubAgentType.DATA_QUERY
+        if any(kw in text for kw in _NETWORK_API_KEYWORDS):
+            return SubAgentType.NETWORK_API
+        if any(kw in text for kw in _DOCUMENT_KEYWORDS):
+            return SubAgentType.DOCUMENT
+        return SubAgentType.CODE_SCRIPT
+
+    if action == "read_resource":
+        if any(kw in text for kw in (".sql", ".db", ".csv", ".xlsx", ".sqlite")):
+            return SubAgentType.DATA_QUERY
+        if any(kw in text for kw in (".pdf", ".docx", ".pptx", ".xlsx")):
+            return SubAgentType.DOCUMENT
+        return SubAgentType.CODE_SCRIPT
+
+    if action == "write_file":
+        if any(kw in text for kw in _DOCUMENT_KEYWORDS):
+            return SubAgentType.DOCUMENT
+        return SubAgentType.CODE_SCRIPT
+
+    return SubAgentType.CODE_SCRIPT
+
+
+def _group_tasks_by_sub_agent(
+    plan: dict,
+    available_scripts: list[str] | None = None,
+    command_contract: dict | None = None,
+) -> list[SubAgentTask]:
+    """将 runtime planner 输出的 tasks 按 SubAgent 类型分组。
+
+    Args:
+        plan: _normalize_skill_runtime_plan() 的输出。
+        available_scripts: 可用脚本列表。
+        command_contract: 命令契约。
+
+    Returns:
+        SubAgentTask 列表。
+    """
+    tasks = plan.get("tasks") or []
+    if not isinstance(tasks, list):
+        return []
+
+    grouped: list[SubAgentTask] = []
+    scripts = available_scripts or []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+
+        action = str(task.get("action") or "").strip()
+        command = str(task.get("command") or "")
+        resource_handle = str(task.get("resource_handle") or "")
+
+        # 推断 SubAgent 类型
+        sub_agent_type = _infer_sub_agent_type(action, command, scripts)
+
+        grouped.append(SubAgentTask(
+            sub_agent_type=sub_agent_type,
+            task_description=str(task.get("reason") or action),
+            skill_sections=[],
+            resources=[resource_handle] if resource_handle else [],
+            parameters=task,
+            depends_on=[],
+        ))
+
+    # 合并相同 SubAgent 类型的连续任务
+    return _merge_consecutive_same_type(grouped)
+
+
+def _merge_consecutive_same_type(tasks: list[SubAgentTask]) -> list[SubAgentTask]:
+    """合并连续相同 SubAgent 类型的任务，减少 SubAgent 切换开销。"""
+    if not tasks:
+        return []
+
+    merged: list[SubAgentTask] = []
+    current = tasks[0]
+
+    for next_task in tasks[1:]:
+        if next_task.sub_agent_type == current.sub_agent_type:
+            # 合并：将下一个任务的参数追加到当前任务
+            current.parameters_list = current.parameters.get("parameters_list", [current.parameters])
+            if not isinstance(current.parameters_list, list):
+                current.parameters_list = [current.parameters_list]
+            current.parameters_list.append(next_task.parameters)
+            current.parameters = {"merged_tasks": current.parameters_list}
+            current.task_description += f"；{next_task.task_description}"
+            current.resources.extend(next_task.resources)
+        else:
+            merged.append(current)
+            current = next_task
+
+    merged.append(current)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +716,8 @@ async def _run_supplementary_plan_round(
     ]
 
     planner_model = _planner_model_name(model)
+    logger.info("[LLM_CALL] 阶段=supplementary_plan 模型=%s 消息数=%d", planner_model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=supplementary_plan 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
     response_text = await complete_chat_once(messages, planner_model)
 
     try:

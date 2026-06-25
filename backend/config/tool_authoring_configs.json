@@ -69,30 +69,13 @@
     },
     "default": {
       "auth_override": {},
-      "config": {
-        "auth_header_name": "X-API-KEY",
-        "auth_placement": "header",
-        "auth_query_param": "api_key",
-        "auth_type": "none",
-        "method": "GET",
-        "query_template": {
-          "extract_strategy": "auto",
-          "output_format": "text",
-          "timeout": 15,
-          "url": "https://example.com"
-        }
-      },
+      "config": {},
       "config_refs": {},
       "configured_env": [],
       "configured_secrets": [],
-      "sample_input": {
-        "extract_strategy": "auto",
-        "output_format": "text",
-        "timeout": 15,
-        "url": "https://example.com"
-      },
-      "tool_name": "web_content_scraper",
-      "updated_at": "2026-06-16T10:00:59.737128+00:00"
+      "sample_input": {},
+      "tool_name": "custom_tool",
+      "updated_at": "2026-06-25T02:43:04.419843+00:00"
     },
     "https_google_serper_dev_search": {
       "config": {
@@ -259,6 +242,22 @@
       },
       "tool_name": "serper_search",
       "updated_at": "2026-06-17T06:27:59.351335+00:00"
+    },
+    "serper_auth": {
+      "auth_override": {},
+      "config": {},
+      "config_refs": {
+        "SERPER_API_KEY": "env:SERPER_API_KEY"
+      },
+      "configured_env": [
+        "SERPER_API_KEY"
+      ],
+      "configured_secrets": [
+        "SERPER_API_KEY"
+      ],
+      "sample_input": {},
+      "tool_name": "serper_search",
+      "updated_at": "2026-06-25T02:43:05.239015+00:00"
     },
     "svm": {
       "auth_override": {
@@ -428,6 +427,22 @@
       "tool_name": "True",
       "updated_at": "2026-06-13T11:38:44.313149+00:00"
     },
+    "weather": {
+      "auth_override": {},
+      "config": {},
+      "config_refs": {
+        "WEATHER_API_KEY": "env:WEATHER_API_KEY"
+      },
+      "configured_env": [
+        "WEATHER_API_KEY"
+      ],
+      "configured_secrets": [
+        "WEATHER_API_KEY"
+      ],
+      "sample_input": {},
+      "tool_name": "weather_lookup",
+      "updated_at": "2026-06-25T02:43:05.495046+00:00"
+    },
     "web": {
       "config": {
         "auth": {
@@ -496,6 +511,6 @@
       "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-06-17T06:27:59.357202+00:00",
+  "updated_at": "2026-06-25T02:43:05.497046+00:00",
   "version": 1
 }

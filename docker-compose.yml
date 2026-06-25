@@ -18,7 +18,7 @@ services:
       - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen3:30b}
       - TEXT_MODEL=${TEXT_MODEL:-qwen3:30b}
       - CODE_MODEL=${CODE_MODEL:-qwen3-coder:30b}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
+#      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3:30b-instruct}
       - VALIDATOR_MODEL=${VALIDATOR_MODEL:-qwen3:8b}
       - IMAGE_MODEL=${IMAGE_MODEL:-stable-diffusion-2-1-base}
@@ -33,6 +33,11 @@ services:
       - MODEL_ACK_STRICT=${MODEL_ACK_STRICT:-false}
       - TEMPERATURE=${TEMPERATURE:-0.7}
       - MAX_TOKENS=${MAX_TOKENS:-4096}
+      # pip 镜像源（用于 Skill 脚本依赖自动安装）。默认清华镜像，可通过 .env 覆盖。
+      - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      - PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-100}
+      # Embedding 模型（用于文档语义检索）
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
 # Makes host.docker.internal resolve to the host on Linux as well
     extra_hosts:
       - "host.docker.internal:host-gateway"

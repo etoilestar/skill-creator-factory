@@ -106,6 +106,27 @@ class Settings(BaseSettings):
     # Maximum wall-clock seconds allowed for a single run_command subprocess.
     skill_command_timeout: int = Field(300, validation_alias=AliasChoices("SKILL_COMMAND_TIMEOUT", "skill_command_timeout"))
 
+    # pip 镜像源（用于 Skill 脚本依赖自动安装）。为空时使用 pip 默认源。
+    # Docker 部署时通过 PIP_INDEX_URL 环境变量注入。
+    pip_index_url: str = Field("", validation_alias=AliasChoices("PIP_INDEX_URL", "pip_index_url"))
+
+    # Master-SubAgent 多智能体架构开关。
+    # 启用后，sandbox 执行管道将使用 Master Agent 拆解任务、
+    # 调度专业化 SubAgent 执行，每个 SubAgent 仅加载本领域 SKILL.md 段落和工具，
+    # 从而大幅缩减 LLM 上下文长度，提升弱模型执行准确率。
+    # 设为 False 时走原有单 Agent 逻辑（向后兼容）。
+    sandbox_multi_agent_enabled: bool = Field(False, validation_alias=AliasChoices("SANDBOX_MULTI_AGENT_ENABLED", "sandbox_multi_agent_enabled"))
+
+    # 触发多 Agent 模式的 body_prompt 字符数阈值。
+    # 当 body_prompt 长度超过此值时，自动切换到 Master-SubAgent 模式。
+    # 仅在 sandbox_multi_agent_enabled=True 时生效。
+    sandbox_multi_agent_body_threshold: int = Field(4000, validation_alias=AliasChoices("SANDBOX_MULTI_AGENT_BODY_THRESHOLD", "sandbox_multi_agent_body_threshold"))
+
+    # 平台公网访问地址，用于生成文件下载链接的完整 URL 前缀。
+    # 为空时使用相对路径（/api/skills/...），依赖浏览器自动拼接 origin。
+    # 非空时生成绝对 URL（如 https://skill.example.com/api/skills/...）。
+    public_base_url: str = Field("", validation_alias=AliasChoices("PUBLIC_BASE_URL", "public_base_url"))
+
     model_config = {
         "env_file": PROJECT_ROOT / ".env",
         "env_file_encoding": "utf-8",

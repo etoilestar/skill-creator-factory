@@ -101,13 +101,13 @@ function taskDescription(task) {
 }
 
 .task-item.status-executing {
-  background: #e7f3ff;
-  border-left: 3px solid #2196f3;
+  background: var(--color-blue-bg);
+  border-left: 3px solid var(--color-blue-text);
 }
 
 .task-item.status-completed {
-  background: #e8f8ed;
-  border-left: 3px solid #4caf50;
+  background: var(--color-green-bg);
+  border-left: 3px solid var(--color-green-text);
 }
 
 .task-check {
@@ -128,7 +128,7 @@ function taskDescription(task) {
 
 .task-desc.completed {
   text-decoration: line-through;
-  color: var(--text-muted, #999);
+  color: var(--text-muted, #9ca3b8);
   opacity: 0.7;
 }
 
@@ -142,13 +142,13 @@ function taskDescription(task) {
   text-transform: uppercase;
 }
 
-.badge-run_command { background: #e3f2fd; color: #1565c0; }
-.badge-write_file { background: #fff3e0; color: #e65100; }
-.badge-read_resource { background: #e8f5e9; color: #2e7d32; }
-.badge-create_directory { background: #f3e5f5; color: #6a1b9a; }
-.badge-display { background: #f5f5f5; color: #616161; }
-.badge-ignore { background: #f5f5f5; color: #9e9e9e; }
-.badge-default { background: #f5f5f5; color: #757575; }
+.badge-run_command { background: var(--color-blue-bg); color: var(--color-blue-text); }
+.badge-write_file { background: var(--color-orange-bg); color: var(--color-orange-text); }
+.badge-read_resource { background: var(--color-green-bg); color: var(--color-green-text); }
+.badge-create_directory { background: var(--color-purple-bg); color: var(--color-purple-text); }
+.badge-display { background: rgba(255,255,255,0.06); color: var(--text-muted); }
+.badge-ignore { background: rgba(255,255,255,0.06); color: var(--text-muted); }
+.badge-default { background: rgba(255,255,255,0.06); color: var(--text-muted); }
 
 .task-text {
   overflow: hidden;

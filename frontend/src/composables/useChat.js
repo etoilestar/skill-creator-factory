@@ -54,7 +54,14 @@ export async function* streamChat(url, body, { signal } = {}) {
         if (parsed.type === 'error') throw new Error(parsed.message || '执行失败')
         if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
         else if (parsed.thought) yield { type: 'thought', data: parsed.thought }
-        else if ('status' in parsed) yield { type: 'status', data: parsed.status }
+        else if ('status' in parsed) {
+          // Handle ask_user status with message payload
+          if (parsed.status === 'ask_user') {
+            yield { type: 'status', data: { phase: 'ask_user', message: parsed.message || '缺少必要信息' } }
+          } else {
+            yield { type: 'status', data: parsed.status }
+          }
+        }
         else if (parsed.type === 'phase3_start') yield { type: 'status', data: { phase: 'phase3', message: parsed.message || '开始执行 Skill 创建流程…' } }
         else if (parsed.type === 'progress') yield { type: 'status', data: { phase: 'phase3', message: parsed.step || parsed.message || '正在执行…' } }
         else if (parsed.type === 'completed') yield {
@@ -75,6 +82,15 @@ export async function* streamChat(url, body, { signal } = {}) {
         else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
         else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
         else if (parsed.type === 'step_skipped') yield { type: 'step_skipped', data: parsed.data }
+        // Master/SubAgent dispatch events for multi-agent execution process
+        else if (parsed.type === 'master_dispatch' ||
+                 parsed.type === 'master_replan' ||
+                 parsed.type === 'master_retry' ||
+                 parsed.type === 'sub_agent_start' ||
+                 parsed.type === 'sub_agent_task_result' ||
+                 parsed.type === 'sub_agent_complete') {
+          yield { type: 'agent_process', data: parsed }
+        }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         // skip unparseable lines
@@ -137,7 +153,14 @@ export async function* streamConfirmResponse(response) {
         if (parsed.error) throw new Error(parsed.error)
         if (parsed.action_result) yield { type: 'action_result', data: parsed.action_result }
         else if (parsed.thought) yield { type: 'thought', data: parsed.thought }
-        else if ('status' in parsed) yield { type: 'status', data: parsed.status }
+        else if ('status' in parsed) {
+          // Handle ask_user status with message payload
+          if (parsed.status === 'ask_user') {
+            yield { type: 'status', data: { phase: 'ask_user', message: parsed.message || '缺少必要信息' } }
+          } else {
+            yield { type: 'status', data: parsed.status }
+          }
+        }
         else if (parsed.quick_actions) yield { type: 'quick_actions', data: parsed.quick_actions }
         else if (parsed.plan_preview) yield { type: 'plan_preview', data: parsed.plan_preview }
         else if (parsed.sop_plan) yield { type: 'sop_plan', data: parsed.sop_plan }
@@ -145,6 +168,15 @@ export async function* streamConfirmResponse(response) {
         else if (parsed.task_checklist) yield { type: 'task_checklist', data: parsed.task_checklist }
         else if (parsed.sandbox_retry) yield { type: 'sandbox_retry', data: parsed.sandbox_retry }
         else if (parsed.type === 'step_skipped') yield { type: 'step_skipped', data: parsed.data }
+        // Master/SubAgent dispatch events for multi-agent execution process
+        else if (parsed.type === 'master_dispatch' ||
+                 parsed.type === 'master_replan' ||
+                 parsed.type === 'master_retry' ||
+                 parsed.type === 'sub_agent_start' ||
+                 parsed.type === 'sub_agent_task_result' ||
+                 parsed.type === 'sub_agent_complete') {
+          yield { type: 'agent_process', data: parsed }
+        }
         else if (parsed.content) yield parsed.content
       } catch (e) {
         if (e.message && !e.message.startsWith('JSON')) throw e

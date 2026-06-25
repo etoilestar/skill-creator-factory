@@ -60,6 +60,8 @@ async def _run_instruction_analysis_round(
     ]
 
     planner_model = _planner_model_name(model)
+    logger.info("[LLM_CALL] 阶段=instruction_analysis 模型=%s 消息数=%d", planner_model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=instruction_analysis 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
     result_text = await complete_chat_once(messages, planner_model)
     stripped = _strip_markdown_json_fence(result_text)
 

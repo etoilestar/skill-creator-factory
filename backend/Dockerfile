@@ -32,14 +32,8 @@ RUN mkdir -p /var/run/sshd && \
 # 设置root密码为: skillfactory
 RUN echo "root:123456" | chpasswd
 
-# Pre-install Playwright's Chromium browser so skill scripts don't need to
-# download it at runtime (downloading at runtime causes subprocess timeouts).
-# The browser version is pinned to match skills/huashu-data-pro/package.json.
-COPY skills/huashu-data-pro/package.json /tmp/playwright-install/package.json
-RUN cd /tmp/playwright-install && \
-    npm install --omit=dev && \
-    npx playwright install chromium --with-deps && \
-    cd / && rm -rf /tmp/playwright-install
+RUN npm install -g playwright && \
+    npx playwright install chromium --with-deps
 
 # Install dependencies first (layer cache)
 COPY backend/requirements.txt ./backend/requirements.txt

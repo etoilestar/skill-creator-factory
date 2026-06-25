@@ -19,4 +19,6 @@ pymysql
 psycopg2-binary
 Pillow
 requests
+faiss-cpu
+numpy
 

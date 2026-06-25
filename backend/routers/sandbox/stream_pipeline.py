@@ -110,6 +110,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
+def _should_use_multi_agent_mode(body_prompt: str, request: ChatRequest) -> bool:
+    """判断是否应启用 Master-SubAgent 多智能体模式。
+
+    触发条件（全部满足）：
+    1. 配置开关 sandbox_multi_agent_enabled=True
+    2. body_prompt 长度超过阈值（上下文过长才需要拆分）
+    """
+    if not settings.sandbox_multi_agent_enabled:
+        return False
+    if len(body_prompt) < settings.sandbox_multi_agent_body_threshold:
+        return False
+    return True
+
+
 def _compose_platform_tools_prompt() -> str:
     """动态查询平台工具注册表，使用与 Creator 相同的 [Tool Snippet] 格式生成工具能力描述。"""
     capabilities = list_tool_capabilities()
@@ -202,7 +216,11 @@ def _make_stream(skill_context: dict, request: ChatRequest):
     strict_skill_execution = bool(skill_context.get("strict_skill_execution", False))
     execution_root = skill_context.get("execution_root")
     child_body_loader = skill_context.get("child_body_loader")
+    # 多 Skill 模式下，skill_name 是逗号分隔的合并名，用于 URL 生成时取第一个
+    _skill_names_list = skill_context.get("skill_names_list", [])
     parent_skill_name = skill_context.get("skill_name", "")
+    if _skill_names_list and "," in parent_skill_name:
+        parent_skill_name = _skill_names_list[0]
     enable_resource_preload = bool(skill_context.get("enable_resource_preload", False))
 
     # Dual execution mode: "plan" (规划模式，预览后确认再执行) or "execute" (执行模式，直接执行)
@@ -264,18 +282,36 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
             else:
                 yield _sse({"status": {"phase": "analyzing", "message": "分析请求匹配度…"}})
-                need_body = await _run_metadata_round(
+                is_multi_skill = bool(skill_context.get("is_multi_skill", False))
+                metadata_result = await _run_metadata_round(
                     metadata_prompt=skill_context["metadata_prompt"],
                     request=request,
                     model=model,
+                    is_multi_skill=is_multi_skill,
                 )
+                # 处理多 Skill 模式返回的 dict
+                if isinstance(metadata_result, dict):
+                    need_body = metadata_result.get("need_body", True)
+                    selected_skills = metadata_result.get("selected_skills")
+                else:
+                    need_body = metadata_result
+                    selected_skills = None
+
+                # 将 selected_skills 存入 skill_context 供 body_loader 使用
+                if selected_skills:
+                    skill_context["_selected_skills"] = selected_skills
+
+                detail_text = f"{'需要加载正文' if need_body else '请求与 Skill 不匹配，跳过正文'}"
+                if selected_skills:
+                    detail_text += f"，选中 Skill: {', '.join(selected_skills)}"
                 yield _thought(
                     "metadata_decision",
                     "分析匹配度",
-                    f"{'需要加载正文' if need_body else '请求与 Skill 不匹配，跳过正文'}",
+                    detail_text,
                     {
                         "need_body": need_body,
                         "metadata_chars": len(skill_context.get("metadata_prompt", "")),
+                        "selected_skills": selected_skills,
                     },
                 )
                 # Cache the result
@@ -296,6 +332,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 ]
                 fallback_messages.extend(_request_messages_with_files(request))
 
+                logger.info("[LLM_CALL] 阶段=fallback_stream 模型=%s 消息数=%d", model, len(fallback_messages))
+                logger.debug("[LLM_CALL] 阶段=fallback_stream 完整消息=%s", json.dumps(fallback_messages, ensure_ascii=False)[:2000])
                 async for chunk in stream_chat(fallback_messages, model):
                     yield _sse({"content": chunk})
 
@@ -304,7 +342,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
             if session_state and session_state.should_skip(StepName.LOAD_BODY, intent):
                 # --- SKIP: body loading ---
-                body_prompt = session_state.body_prompt or skill_context["body_loader"]()
+                _sel_skills = skill_context.get("_selected_skills")
+                body_prompt = session_state.body_prompt or skill_context["body_loader"](_sel_skills)
                 yield _step_skipped(StepName.LOAD_BODY, "复用上一轮 Skill 正文")
                 yield _thought(
                     "body_loaded",
@@ -318,7 +357,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                 )
             else:
                 yield _sse({"status": {"phase": "loading", "message": "加载 Skill 正文…"}})
-                body_prompt = skill_context["body_loader"]()
+                _sel_skills = skill_context.get("_selected_skills")
+                body_prompt = skill_context["body_loader"](_sel_skills)
                 yield _thought(
                     "body_loaded",
                     "加载 SKILL.md",
@@ -559,6 +599,403 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                     )
 
             if enable_action_execution:
+                # --- Master-SubAgent 多智能体调度模式 ---
+                if _should_use_multi_agent_mode(body_prompt, request):
+                    try:
+                        from .master_agent import MasterAgent
+                        from .sub_agent_types import SubAgentResult as _SubAgentResultType
+
+                        # 检查是否有暂停的执行计划需要恢复
+                        if session_state and session_state.pending_master_plan:
+                            yield _sse({"status": {"phase": "resuming", "message": "恢复暂停的任务…"}})
+                            yield _thought(
+                                "master_resume",
+                                "恢复执行",
+                                "用户已补充信息，从中断点继续执行",
+                                {"mode": "multi_agent_resume"},
+                            )
+
+                            # 从 session 恢复 MasterPlan
+                            saved_plan = session_state.pending_master_plan
+                            resume_index = session_state.pending_task_index or 0
+                            prior_results_raw = session_state.pending_results or []
+
+                            # 清除暂停状态
+                            session_state.pending_master_plan = None
+                            session_state.pending_task_index = None
+                            session_state.pending_results = None
+
+                            # 重建 MasterPlan
+                            from .sub_agent_types import SubAgentTask as _SubAgentTaskType, SubAgentType as _SubAgentTypeEnum
+                            restored_tasks = []
+                            for t_dict in (saved_plan.get("sub_agent_tasks") or []):
+                                try:
+                                    sa_type = _SubAgentTypeEnum(t_dict.get("sub_agent_type", "code_script"))
+                                except ValueError:
+                                    sa_type = _SubAgentTypeEnum.CODE_SCRIPT
+                                restored_tasks.append(_SubAgentTaskType(
+                                    task_id=t_dict.get("task_id", ""),
+                                    sub_agent_type=sa_type,
+                                    task_description=t_dict.get("task_description", ""),
+                                    skill_sections=t_dict.get("skill_sections", []),
+                                    resources=t_dict.get("resources", []),
+                                    parameters=t_dict.get("parameters", {}),
+                                    depends_on=t_dict.get("depends_on", []),
+                                ))
+
+                            plan = MasterPlan(
+                                plan_id=saved_plan.get("plan_id", ""),
+                                sub_agent_tasks=restored_tasks,
+                                execution_order=saved_plan.get("execution_order", []),
+                                mode="multi_agent",
+                            )
+
+                            # 重建 prior_results
+                            prior_results_objs = []
+                            for r_dict in prior_results_raw:
+                                try:
+                                    prior_results_objs.append(_SubAgentResultType(
+                                        sub_agent_type=_SubAgentTypeEnum(r_dict.get("sub_agent_type", "code_script")),
+                                        task_id=r_dict.get("task_id", ""),
+                                        success=r_dict.get("success", False),
+                                        output=r_dict.get("output", ""),
+                                        output_files=r_dict.get("output_files", []),
+                                        error=r_dict.get("error"),
+                                        observations=r_dict.get("observations", []),
+                                        execution_time_ms=r_dict.get("execution_time_ms", 0),
+                                        missing=r_dict.get("missing", []),
+                                        need_ask_user=r_dict.get("need_ask_user", False),
+                                        ask_user_message=r_dict.get("ask_user_message", ""),
+                                        raw_stdout=r_dict.get("raw_stdout", ""),
+                                        error_type=r_dict.get("error_type", ""),
+                                        error_detail=r_dict.get("error_detail", {}),
+                                    ))
+                                except Exception as r_exc:
+                                    logger.warning("Failed to restore SubAgentResult: %s", r_exc)
+
+                            master = MasterAgent()
+
+                            # 从中断点继续执行
+                            response_route = route_model(
+                                infer_sandbox_response_task(
+                                    body_prompt=body_prompt,
+                                    user_text=_last_user_text(request),
+                                    plan={"mode": "multi_agent"},
+                                ),
+                                requested_model=requested_model,
+                                reason="sandbox multi-agent response classification",
+                            )
+                            response_model = response_route.model
+                            yield _sse({"model_ack": response_route.ack()})
+
+                            sse_queue: asyncio.Queue = asyncio.Queue()
+
+                            async def _run_resume_dispatch():
+                                results = await master.dispatch_and_execute(
+                                    plan,
+                                    skill_context,
+                                    request,
+                                    model,
+                                    execution_root=execution_root,
+                                    yield_func=lambda evt: sse_queue.put_nowait(evt),
+                                    resume_from_index=resume_index,
+                                    prior_results=prior_results_objs if prior_results_objs else None,
+                                )
+                                await sse_queue.put(None)
+                                return results
+
+                            dispatch_task = asyncio.ensure_future(_run_resume_dispatch())
+
+                            while True:
+                                while not sse_queue.empty():
+                                    evt = sse_queue.get_nowait()
+                                    if evt is None:
+                                        break
+                                    yield evt
+                                if dispatch_task.done() and sse_queue.empty():
+                                    break
+                                await asyncio.sleep(0.02)
+
+                            results = dispatch_task.result()
+
+                            # 检查是否再次需要 ask_user
+                            ask_user_results = [r for r in results if r.need_ask_user]
+                            if ask_user_results:
+                                ask_messages = []
+                                for r in ask_user_results:
+                                    if r.ask_user_message:
+                                        ask_messages.append(r.ask_user_message)
+                                    elif r.missing:
+                                        for m in r.missing:
+                                            ask_messages.append(f"{m.get('type', '')}: {m.get('reason', '') or m.get('path', '')}")
+                                ask_text = "执行过程中仍缺少必要信息：\n" + "\n".join(
+                                    f"- {msg}" for msg in ask_messages
+                                ) if ask_messages else "执行过程中仍缺少必要信息，请补充后重试。"
+
+                                if session_state:
+                                    session_state.pending_master_plan = {
+                                        "plan_id": plan.plan_id,
+                                        "sub_agent_tasks": [t.to_dict() for t in plan.sub_agent_tasks],
+                                        "execution_order": plan.execution_order,
+                                    }
+                                    executed_task_ids = {r.task_id for r in results if not r.need_ask_user}
+                                    next_index = 0
+                                    for idx, t in enumerate(plan.get_execution_order()):
+                                        if t.task_id not in executed_task_ids:
+                                            next_index = idx
+                                            break
+                                        next_index = idx + 1
+                                    session_state.pending_task_index = next_index
+                                    session_state.pending_results = [
+                                        r.to_dict() for r in results if not r.need_ask_user
+                                    ]
+
+                                yield _sse({"status": "ask_user", "message": ask_text})
+                                yield _sse({"content": ask_text})
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            # 汇总结果
+                            yield _sse({"status": {"phase": "generating", "message": "汇总执行结果…"}})
+                            final_answer = await master.aggregate_and_answer(
+                                results,
+                                body_prompt,
+                                request,
+                                response_model,
+                                execution_root=execution_root,
+                                skill_name=parent_skill_name,
+                            )
+
+                            all_output_files: list[dict] = []
+                            for r in results:
+                                all_output_files.extend(r.output_files or [])
+
+                            final_answer = _finalize_answer_output_file_links(final_answer, all_output_files)
+
+                            yield _thought(
+                                "master_result",
+                                "多智能体执行结果",
+                                f"共 {len(results)} 个 SubAgent 执行，"
+                                f"成功 {sum(1 for r in results if r.success)} 个",
+                                {
+                                    "total_sub_agents": len(results),
+                                    "success_count": sum(1 for r in results if r.success),
+                                    "output_file_count": len(all_output_files),
+                                    "resumed": True,
+                                },
+                            )
+
+                            yield _sse({"status": None})
+                            if all_output_files:
+                                yield _sse({
+                                    "action_result": {
+                                        "action": "output_files",
+                                        "name": parent_skill_name,
+                                        "success": True,
+                                        "message": f"生成了 {len(all_output_files)} 个文件",
+                                        "output_files": all_output_files,
+                                    }
+                                })
+                            yield _sse({"content": final_answer})
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        # --- 正常多智能体模式（非恢复） ---
+                        yield _sse({"status": {"phase": "planning", "message": "Master Agent 分析任务…"}})
+                        yield _thought(
+                            "master_mode",
+                            "多智能体模式",
+                            "启用 Master-SubAgent 多智能体架构",
+                            {"mode": "multi_agent", "body_chars": len(body_prompt)},
+                        )
+
+                        master = MasterAgent()
+
+                        # 1. 任务拆解
+                        plan = await master.analyze_and_decompose(
+                            metadata_prompt=skill_context.get("metadata_prompt", ""),
+                            body_prompt=body_prompt,
+                            request=request,
+                            model=model,
+                            execution_root=execution_root,
+                        )
+                        yield _thought(
+                            "master_decompose",
+                            "任务拆解",
+                            f"拆解为 {len(plan.sub_agent_tasks)} 个 SubAgent 任务",
+                            {
+                                "task_count": len(plan.sub_agent_tasks),
+                                "tasks": [
+                                    {
+                                        "sub_agent_type": t.sub_agent_type.value,
+                                        "task_id": t.task_id,
+                                        "description": t.task_description[:200],
+                                        "depends_on": t.depends_on,
+                                    }
+                                    for t in plan.sub_agent_tasks
+                                ],
+                                "need_ask_user": plan.need_ask_user,
+                                "missing_info": plan.missing_info,
+                            },
+                        )
+
+                        # ask_user 模式：Master 判断需要向用户询问信息
+                        if plan.mode == "ask_user" and plan.need_ask_user:
+                            yield _sse({"status": None})
+                            missing_text = "缺少必要信息，无法执行 Skill：\n" + "\n".join(
+                                f"- {item}" for item in plan.missing_info
+                            )
+                            yield _sse({"content": missing_text})
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        # 2. 调度执行
+                        response_route = route_model(
+                            infer_sandbox_response_task(
+                                body_prompt=body_prompt,
+                                user_text=_last_user_text(request),
+                                plan={"mode": "multi_agent"},
+                            ),
+                            requested_model=requested_model,
+                            reason="sandbox multi-agent response classification",
+                        )
+                        response_model = response_route.model
+                        yield _sse({"model_ack": response_route.ack()})
+
+                        # 2. 调度执行（通过队列传递 SSE 事件）
+                        sse_queue: asyncio.Queue = asyncio.Queue()
+
+                        async def _run_dispatch():
+                            results = await master.dispatch_and_execute(
+                                plan,
+                                skill_context,
+                                request,
+                                model,
+                                execution_root=execution_root,
+                                yield_func=lambda evt: sse_queue.put_nowait(evt),
+                            )
+                            # 标记结束
+                            await sse_queue.put(None)
+                            return results
+
+                        dispatch_task = asyncio.ensure_future(_run_dispatch())
+
+                        # 同时消费 SSE 事件并 yield
+                        while True:
+                            # 消费队列中所有可用事件
+                            while not sse_queue.empty():
+                                evt = sse_queue.get_nowait()
+                                if evt is None:
+                                    break
+                                yield evt
+                            # 检查是否完成
+                            if dispatch_task.done() and sse_queue.empty():
+                                break
+                            # 让出控制权，让 dispatch_task 继续执行
+                            await asyncio.sleep(0.02)
+
+                        results = dispatch_task.result()
+
+                        # 检查是否有 SubAgent 报告需要向用户询问信息
+                        ask_user_results = [r for r in results if r.need_ask_user]
+                        if ask_user_results:
+                            ask_messages = []
+                            for r in ask_user_results:
+                                if r.ask_user_message:
+                                    ask_messages.append(r.ask_user_message)
+                                elif r.missing:
+                                    for m in r.missing:
+                                        ask_messages.append(f"{m.get('type', '')}: {m.get('reason', '') or m.get('path', '')}")
+                            ask_text = "执行过程中发现缺少必要信息：\n" + "\n".join(
+                                f"- {msg}" for msg in ask_messages
+                            ) if ask_messages else "执行过程中发现缺少必要信息，请补充后重试。"
+
+                            # 保存暂停状态到 session，支持用户补充信息后恢复执行
+                            if session_state:
+                                session_state.pending_master_plan = {
+                                    "plan_id": plan.plan_id,
+                                    "sub_agent_tasks": [t.to_dict() for t in plan.sub_agent_tasks],
+                                    "execution_order": plan.execution_order,
+                                }
+                                # 计算下一个待执行的任务索引
+                                executed_task_ids = {r.task_id for r in results if not r.need_ask_user}
+                                next_index = 0
+                                for idx, t in enumerate(plan.get_execution_order()):
+                                    if t.task_id not in executed_task_ids:
+                                        next_index = idx
+                                        break
+                                    next_index = idx + 1
+                                session_state.pending_task_index = next_index
+                                session_state.pending_results = [
+                                    r.to_dict() for r in results if not r.need_ask_user
+                                ]
+
+                            yield _sse({"status": "ask_user", "message": ask_text})
+                            yield _sse({"content": ask_text})
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        # 3. 汇总结果
+                        yield _sse({"status": {"phase": "generating", "message": "汇总执行结果…"}})
+                        final_answer = await master.aggregate_and_answer(
+                            results,
+                            body_prompt,
+                            request,
+                            response_model,
+                            execution_root=execution_root,
+                            skill_name=parent_skill_name,
+                        )
+
+                        # 收集所有输出文件
+                        all_output_files: list[dict] = []
+                        for r in results:
+                            all_output_files.extend(r.output_files or [])
+
+                        logger.info(
+                            "[OUTPUT_FILES] master_aggregate sub_agents=%d total_output_files=%d",
+                            len(results),
+                            len(all_output_files),
+                        )
+
+                        final_answer = _finalize_answer_output_file_links(final_answer, all_output_files)
+
+                        yield _thought(
+                            "master_result",
+                            "多智能体执行结果",
+                            f"共 {len(results)} 个 SubAgent 执行，"
+                            f"成功 {sum(1 for r in results if r.success)} 个",
+                            {
+                                "total_sub_agents": len(results),
+                                "success_count": sum(1 for r in results if r.success),
+                                "output_file_count": len(all_output_files),
+                            },
+                        )
+
+                        yield _sse({"status": None})
+                        if all_output_files:
+                            yield _sse({
+                                "action_result": {
+                                    "action": "output_files",
+                                    "name": parent_skill_name,
+                                    "success": True,
+                                    "message": f"生成了 {len(all_output_files)} 个文件",
+                                    "output_files": all_output_files,
+                                }
+                            })
+                        yield _sse({"content": final_answer})
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    except Exception as exc:
+                        logger.exception("Master-SubAgent mode failed, falling back to single agent: %s", exc)
+                        yield _thought(
+                            "master_fallback",
+                            "多智能体模式失败",
+                            f"回退到单 Agent 模式: {str(exc)[:200]}",
+                            {"error": str(exc)[:500]},
+                        )
+                        # 继续走下方原有单 Agent 逻辑
+
                 # --- Instruction Analysis Round ---
                 yield _sse({"status": {"phase": "analyzing_instruction", "message": "分析指令语义…"}})
                 instruction_analysis = await _run_instruction_analysis_round(
@@ -734,7 +1171,6 @@ def _make_stream(skill_context: dict, request: ChatRequest):
 
                             user_context = _workflow_context_from_request_text(
                                 _last_user_text(request),
-                                first_entry=(action_schema.get("entries") or [{}])[0] if action_schema.get("entries") else {},
                             )
 
                             # 使用 asyncio.Queue 桥接 ReAct 事件到 SSE 流
@@ -1206,7 +1642,10 @@ def _make_stream(skill_context: dict, request: ChatRequest):
                                 sup_task_result, sup_task_touched = _execute_single_task(
                                     sup_task, [], request,
                                     execution_root=execution_root,
+                                    inferred_skill_root=_exec_inferred_root,
                                     skill_name=parent_skill_name,
+                                    session_input_dir=_exec_session_dir,
+                                    previous_output_files=_exec_accumulated_output_files or None,
                                 )
                                 _exec_all_results.append(sup_task_result)
                                 _exec_all_touched.extend(sup_task_touched)
@@ -1413,6 +1852,8 @@ def _make_stream(skill_context: dict, request: ChatRequest):
             def _capture_final_ack(payload: dict) -> None:
                 ack_payload.update(payload)
 
+            logger.info("[LLM_CALL] 阶段=final_answer_stream 模型=%s 消息数=%d", response_model, len(final_messages))
+            logger.debug("[LLM_CALL] 阶段=final_answer_stream 完整消息=%s", json.dumps(final_messages, ensure_ascii=False)[:2000])
             async for chunk in stream_chat(final_messages, response_model, model_ack_callback=_capture_final_ack):
                 if ack_payload:
                     yield _sse({"model_ack": {**response_route.ack(actual_model=ack_payload.get("actual_model")), "provider": ack_payload}})
@@ -1494,7 +1935,7 @@ def build_skill_context(skill_name: str) -> dict:
     return {
         "skill_name": skill_name,
         "metadata_prompt": skill_metadata_prompt,
-        "body_loader": lambda: load_skill_body_prompt(skill_name),
+        "body_loader": lambda selected_skills=None: load_skill_body_prompt(skill_name),
         "child_body_loader": lambda child_ref: load_child_skill_body_prompt(skill_name, child_ref),
         "force_body": False,
         "enable_action_execution": True,
@@ -1502,6 +1943,80 @@ def build_skill_context(skill_name: str) -> dict:
         "execution_root": skill_root,
         "strict_skill_execution": True,
         "enable_resource_preload": True,
+    }
+
+
+def _merge_skill_contexts(contexts: list[dict]) -> dict:
+    """合并多个 Skill 的上下文为单个上下文。
+
+    策略：
+    - metadata_prompt：拼接所有 Skill 的元数据，每段用分隔线隔开
+    - body_loader：按需加载指定 Skill 的正文（selected_skills 参数）
+    - execution_root：使用第一个 Skill 的根目录
+    - skill_name：逗号分隔的所有 Skill 名称
+    """
+    if len(contexts) == 1:
+        return contexts[0]
+
+    # 拼接 metadata_prompt，增加多 Skill 选择指引
+    metadata_parts = []
+    for ctx in contexts:
+        name = ctx.get("skill_name", "unknown")
+        metadata_parts.append(f"## Skill: {name}\n\n{ctx['metadata_prompt']}")
+    combined_metadata = "\n\n---\n\n".join(metadata_parts)
+
+    # 追加多 Skill 选择指引
+    selection_guidance = (
+        "\n\n---\n\n"
+        "## 多 Skill 选择指引\n\n"
+        "当前已加载多个 Skill 的元数据。请根据用户请求，判断需要加载哪些 Skill 的正文。\n"
+        "在 need_body 为 true 时，同时返回 selected_skills 数组，列出需要加载正文的 Skill 名称。\n"
+        "如果只需要其中一个 Skill，只列出该 Skill 名称即可。\n"
+        "如果需要多个 Skill 配合完成，按执行顺序列出。\n"
+    )
+    combined_metadata += selection_guidance
+
+    # 组合 skill_name
+    combined_name = ",".join(ctx.get("skill_name", "") for ctx in contexts)
+
+    # body_loader：按需加载指定 Skill 的正文
+    def combined_body_loader(selected_skills=None):
+        body_parts = []
+        for ctx in contexts:
+            name = ctx.get("skill_name", "unknown")
+            if selected_skills and name not in selected_skills:
+                continue
+            body = ctx["body_loader"]()
+            body_parts.append(f"## Skill: {name}\n\n{body}")
+        return "\n\n---\n\n".join(body_parts)
+
+    # child_body_loader：合并所有 Skill 的子 Skill 加载器
+    def combined_child_loader(child_ref):
+        for ctx in contexts:
+            loader = ctx.get("child_body_loader")
+            if loader:
+                try:
+                    return loader(child_ref)
+                except Exception:
+                    continue
+        raise FileNotFoundError(f"Child skill not found: {child_ref}")
+
+    # execution_root：使用第一个 Skill 的根目录
+    first_root = contexts[0].get("execution_root")
+
+    return {
+        "skill_name": combined_name,
+        "skill_names_list": [ctx.get("skill_name", "") for ctx in contexts],
+        "metadata_prompt": combined_metadata,
+        "body_loader": combined_body_loader,
+        "child_body_loader": combined_child_loader if any(ctx.get("child_body_loader") for ctx in contexts) else None,
+        "force_body": False,
+        "enable_action_execution": True,
+        "require_action_confirmation": False,
+        "execution_root": first_root,
+        "strict_skill_execution": False,  # 多 Skill 模式下放宽严格限制
+        "enable_resource_preload": True,
+        "is_multi_skill": True,  # 标记为多 Skill 模式
     }
 
 
@@ -1514,6 +2029,28 @@ async def chat_in_sandbox(skill_name: str, request: ChatRequest):
         raise HTTPException(status_code=404, detail=str(exc))
 
     return _make_stream(skill_context, request)
+
+
+@router.post("/sandbox")
+async def chat_in_sandbox_multi(request: ChatRequest):
+    """Multi-turn chat with multiple skills loaded in sandbox mode.
+
+    用户可勾选多个 Skill 组合测试，平台将所有勾选 Skill 的元数据拼接到 prompt 中，
+    模型按需加载 Skill 正文，依次完成各 Skill 的任务。
+    """
+    if not request.skill_names:
+        raise HTTPException(status_code=400, detail="skill_names is required for multi-skill mode")
+
+    skill_contexts = []
+    for name in request.skill_names:
+        try:
+            ctx = build_skill_context(name)
+            skill_contexts.append(ctx)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    merged_context = _merge_skill_contexts(skill_contexts)
+    return _make_stream(merged_context, request)
 
 
 class PlanConfirmRequest(BaseModel):

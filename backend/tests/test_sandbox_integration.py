@@ -1053,7 +1053,6 @@ class TestDataflowContextPassing:
         from backend.routers.sandbox.workflow_dataflow import _workflow_context_from_request_text
         context = _workflow_context_from_request_text(
             "生成一个狮子和大象的故事",
-            first_entry={"inputs": ["topic"]},
         )
         assert isinstance(context, dict)
         assert "user_request" in context

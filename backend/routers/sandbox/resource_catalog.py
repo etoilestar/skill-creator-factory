@@ -262,7 +262,10 @@ async def _run_resource_selection_round(
         },
     ]
 
-    decision_text = await complete_chat_once(messages, _planner_model_name(model))
+    _rs_model = _planner_model_name(model)
+    logger.info("[LLM_CALL] 阶段=resource_selection 模型=%s 消息数=%d", _rs_model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=resource_selection 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
+    decision_text = await complete_chat_once(messages, _rs_model)
     return _parse_resource_selection_decision(
         decision_text,
         resource_catalog=resource_catalog,

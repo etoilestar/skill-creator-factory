@@ -16,6 +16,7 @@ from ..chat_utils import (
     _planner_model_name,
     _strip_markdown_json_fence,
 )
+from .output_links import build_file_download_url
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,10 @@ async def _get_llm_error_correction(
     ]
 
     try:
-        correction_text = await complete_chat_once(messages, _planner_model_name(model))
+        _ec_model = _planner_model_name(model)
+        logger.info("[LLM_CALL] 阶段=error_correction 模型=%s 消息数=%d", _ec_model, len(messages))
+        logger.debug("[LLM_CALL] 阶段=error_correction 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
+        correction_text = await complete_chat_once(messages, _ec_model)
         return _parse_error_correction_decision(correction_text)
     except Exception as exc:
         logger.warning("LLM error correction call failed: %s", exc)
@@ -224,13 +228,15 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
         if rel in seen:
             continue
         seen.add(rel)
-        output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
+        output_files.append({"path": rel, "url": build_file_download_url(skill_name, rel)})
 
     root = cwd.resolve()
+    # 回退逻辑支持所有 artifact 类型，而非仅图片
+    _ARTIFACT_FALLBACK_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".docx", ".pptx", ".html", ".htm"}
     for raw in raw_paths:
         candidate = Path(raw)
         normalized_raw = raw.replace("\\", "/")
-        if Path(raw).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        if Path(raw).suffix.lower() not in _ARTIFACT_FALLBACK_SUFFIXES:
             continue
         if not candidate.is_absolute():
             candidate = (root / candidate).resolve() if normalized_raw.startswith(("assets/", "outputs/")) else (root / "scripts" / candidate).resolve()
@@ -240,7 +246,7 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
         if rel in seen:
             continue
         seen.add(rel)
-        output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
+        output_files.append({"path": rel, "url": build_file_download_url(skill_name, rel)})
     return output_files
 
 

@@ -37,6 +37,35 @@ def _parse_need_body_decision(text: str) -> bool:
 
     return bool(need_body)
 
+
+def _parse_metadata_decision_with_skills(text: str) -> dict:
+    """Parse metadata decision with optional selected_skills for multi-skill mode.
+
+    Returns:
+        {"need_body": bool, "selected_skills": list[str] | None}
+    """
+    stripped = _strip_markdown_json_fence(text)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        logger.warning("metadata decision is not valid JSON: %s", text[:500])
+        return {"need_body": True, "selected_skills": None}
+
+    need_body = data.get("need_body", True)
+    if isinstance(need_body, str):
+        need_body = need_body.strip().lower() in {"true", "1", "yes", "y"}
+    else:
+        need_body = bool(need_body)
+
+    selected_skills = data.get("selected_skills")
+    if selected_skills is not None:
+        if not isinstance(selected_skills, list):
+            selected_skills = [str(selected_skills)]
+        selected_skills = [str(s) for s in selected_skills]
+
+    return {"need_body": need_body, "selected_skills": selected_skills}
+
 def _parse_child_skill_decision(
     text: str,
     *,
@@ -128,16 +157,27 @@ async def _run_metadata_round(
     metadata_prompt: str,
     request: ChatRequest,
     model: str,
-) -> bool:
+    is_multi_skill: bool = False,
+) -> bool | dict:
     """First internal model round.
 
     这一轮只给模型 metadata，不给 SKILL.md 正文。
     不向前端流式输出，只用于决定是否进入正文阶段。
+
+    Args:
+        is_multi_skill: 是否为多 Skill 组合模式。
+            False 时返回 bool（向后兼容）。
+            True 时返回 dict，包含 need_body 和 selected_skills。
     """
     messages = [{"role": "system", "content": metadata_prompt}]
     messages.extend(_request_messages_with_files(request))
 
+    logger.info("[LLM_CALL] 阶段=metadata_decision 模型=%s 消息数=%d", model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=metadata_decision 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
     decision_text = await complete_chat_once(messages, model)
+
+    if is_multi_skill:
+        return _parse_metadata_decision_with_skills(decision_text)
     return _parse_need_body_decision(decision_text)
 
 def _compose_child_skill_selection_prompt() -> str:
@@ -204,6 +244,8 @@ async def _run_child_skill_selection_round(
         },
     ]
 
+    logger.info("[LLM_CALL] 阶段=child_skill_selection 模型=%s 消息数=%d", model, len(messages))
+    logger.debug("[LLM_CALL] 阶段=child_skill_selection 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
     decision_text = await complete_chat_once(messages, model)
     return _parse_child_skill_decision(
         decision_text,

@@ -6,13 +6,36 @@
   --surface2: #22263a;
   --border: #2e3348;
   --text: #e2e5f0;
-  --text-muted: #7a8099;
+  --text-muted: #9ca3b8;
   --accent: #6c8aff;
   --accent-hover: #8aa4ff;
   --danger: #ff6b6b;
   --success: #4caf82;
   --radius: 8px;
   --font: 'Inter', 'Segoe UI', system-ui, sans-serif;
+
+  /* 语义色板 — 暗色主题 */
+  --color-blue-bg: rgba(108,138,255,0.12);
+  --color-blue-text: #93b4ff;
+  --color-blue-border: rgba(108,138,255,0.3);
+  --color-green-bg: rgba(34,197,94,0.12);
+  --color-green-text: #6ee7b7;
+  --color-green-border: rgba(34,197,94,0.3);
+  --color-red-bg: rgba(239,68,68,0.12);
+  --color-red-text: #fca5a5;
+  --color-red-border: rgba(239,68,68,0.3);
+  --color-yellow-bg: rgba(245,158,11,0.12);
+  --color-yellow-text: #fbbf24;
+  --color-yellow-border: rgba(245,158,11,0.3);
+  --color-purple-bg: rgba(168,85,247,0.12);
+  --color-purple-text: #c084fc;
+  --color-purple-border: rgba(168,85,247,0.3);
+  --color-orange-bg: rgba(249,115,22,0.12);
+  --color-orange-text: #fdba74;
+  --color-orange-border: rgba(249,115,22,0.3);
+  --color-pink-bg: rgba(236,72,153,0.12);
+  --color-pink-text: #f9a8d4;
+  --color-pink-border: rgba(236,72,153,0.3);
 }
 
 html, body, #app {

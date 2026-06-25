@@ -23,6 +23,7 @@ from .runtime_tools import (
     analyze_image_with_vision,
     api_get,
     api_post,
+    build_faiss_index,
     build_pdf_report,
     create_docx,
     create_pdf,
@@ -31,6 +32,7 @@ from .runtime_tools import (
     describe_database_table,
     extract_pdf_text,
     fetch_url_text,
+    get_ollama_embedding,
     images_to_pdf,
     list_database_tables,
     merge_pdfs,
@@ -41,6 +43,7 @@ from .runtime_tools import (
     read_pptx_text,
     read_spreadsheet,
     registered_tool_call,
+    search_faiss_index,
     upload_wechat_media,
     web_search,
 )

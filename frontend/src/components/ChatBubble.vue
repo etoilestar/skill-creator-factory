@@ -11,17 +11,25 @@
         </button>
         <pre v-if="!collapsed[idx]" class="think-body">{{ seg.content }}<span v-if="seg.open && streaming" class="cursor">▋</span></pre>
       </div>
-      <!-- Normal text -->
-      <pre v-else-if="seg.content" class="content">{{ seg.content }}<span v-if="streaming && idx === segments.length - 1" class="cursor">▋</span></pre>
+      <!-- Normal text with citation rendering -->
+      <pre v-else-if="seg.content" class="content" v-html="renderCitations(seg.content) + (streaming && idx === segments.length - 1 ? '<span class=\'cursor\'>▋</span>' : '')"></pre>
     </template>
     <div v-if="files && files.length" class="file-attachments">
       <span v-for="f in files" :key="f.filename" class="file-chip">📎 {{ f.filename }}</span>
+    </div>
+    <!-- Citation detail panel -->
+    <div v-if="expandedCitation" class="citation-detail">
+      <div class="citation-detail-header">
+        <span class="citation-detail-title">引用来源</span>
+        <button class="citation-detail-close" @click="expandedCitation = null" type="button">✕</button>
+      </div>
+      <div class="citation-detail-body">{{ expandedCitation }}</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, reactive, watchEffect } from 'vue'
+import { computed, reactive, ref, watchEffect } from 'vue'
 
 const props = defineProps({
   content: { type: String, required: true },
@@ -83,6 +91,47 @@ watchEffect(() => {
 function toggleThink(idx) {
   collapsed[idx] = !collapsed[idx]
 }
+
+// --- Citation rendering ---
+const expandedCitation = ref(null)
+
+/**
+ * Render citation tags in text content.
+ * Matches patterns like [来源：xxx.pdf 第3页] or [引用：xxx.docx] or [出处：xxx]
+ * and converts them to clickable blue tags.
+ */
+function renderCitations(text) {
+  if (!text) return ''
+  // Escape HTML first
+  const escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  // Replace citation patterns with clickable tags
+  return escaped.replace(
+    /\[(来源|引用|出处)[：:]\s*([^\]]+)\]/g,
+    (match, label, detail) => {
+      return `<span class="citation-tag" data-detail="${encodeURIComponent(detail)}" onclick="this.dispatchEvent(new CustomEvent('citation-click',{bubbles:true,detail:decodeURIComponent('${encodeURIComponent(detail)}')}))">${label}：${detail}</span>`
+    }
+  )
+}
+
+// Listen for citation click events (delegated from v-html)
+function handleCitationClick(e) {
+  const detail = e.detail
+  if (detail) {
+    expandedCitation.value = expandedCitation.value === detail ? null : detail
+  }
+}
+
+// Attach/detach event listener on mount
+import { onMounted, onUnmounted } from 'vue'
+onMounted(() => {
+  document.addEventListener('citation-click', handleCitationClick)
+})
+onUnmounted(() => {
+  document.removeEventListener('citation-click', handleCitationClick)
+})
 </script>
 
 <style scoped>
@@ -171,5 +220,55 @@ function toggleThink(idx) {
   background: var(--surface2, #f0f0f0);
   color: var(--text-muted, #666);
   white-space: nowrap;
+}
+
+/* Citation tag */
+:deep(.citation-tag) {
+  display: inline;
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+  font-family: var(--font);
+}
+:deep(.citation-tag:hover) {
+  background: rgba(59, 130, 246, 0.22);
+}
+
+/* Citation detail panel */
+.citation-detail {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2, #f8f9fa);
+  font-size: 12px;
+}
+.citation-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.citation-detail-title {
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.citation-detail-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+.citation-detail-body {
+  color: var(--text, #333);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

@@ -50,8 +50,35 @@ from .error_correction import (
     _validate_html_asset_outputs_in_generated_dir,
 )
 from .stdout_render import _validate_success_stdout_json_if_structured
+from .sub_agent_types import SubAgentPolicy
+from .output_links import build_file_download_url
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_command_script_path(command: str) -> str:
+    """Normalize skills/<name>/scripts/xxx.py to scripts/xxx.py.
+
+    SubAgent LLM may generate full relative paths like:
+        python skills/database-query/scripts/db_query.py "SQL"
+    This normalizes to:
+        python scripts/db_query.py "SQL"
+    so the path resolves correctly against execution_root (cwd).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    changed = False
+    for i, part in enumerate(parts):
+        normalized = part.replace("\\", "/")
+        idx = normalized.find("/scripts/")
+        if idx >= 0:
+            parts[i] = normalized[idx + 1:]  # scripts/xxx.py
+            changed = True
+    if not changed:
+        return command
+    return shlex.join(parts)
 
 
 def _execute_single_task(
@@ -64,6 +91,7 @@ def _execute_single_task(
     skill_name: str = "",
     session_input_dir: "Path | None" = None,
     previous_output_files: "list[dict] | None" = None,
+    sandbox_policy: "SubAgentPolicy | None" = None,
 ) -> "tuple[dict, list[Path]]":
     """Execute a single planned action task and return (result_dict, touched_paths).
 
@@ -82,6 +110,10 @@ def _execute_single_task(
     action = str(task.get("action") or "").strip()
     reason = str(task.get("reason") or "").strip()
     touched: list[Path] = []
+
+    # SubAgent 权限校验：如果提供了 sandbox_policy，检查当前操作是否允许
+    if sandbox_policy is not None and action not in {"display", "ignore"}:
+        sandbox_policy.check_action(action, task)
 
     if action in {"display", "ignore"}:
         return {"action": action, "success": True, "reason": reason}, touched
@@ -155,18 +187,44 @@ def _execute_single_task(
             written_bytes = len(str(content).encode("utf-8"))
 
         touched.append(path)
-        return {
+
+        # 为 write_file 产出的文件添加 output_files 元数据，使前端下载栏可见
+        write_cwd = execution_root or inferred_skill_root
+        write_skill_name = skill_name or (write_cwd.name if write_cwd else "")
+        result_dict: dict = {
             "action": action,
             "path": str(path),
             "success": True,
             "bytes": written_bytes,
             "reason": reason,
-        }, touched
+        }
+        if write_skill_name:
+            try:
+                if write_cwd:
+                    rel = path.relative_to(write_cwd)
+                else:
+                    raise ValueError("no write_cwd")
+                result_dict["output_files"] = [{
+                    "path": str(rel).replace("\\", "/"),
+                    "url": build_file_download_url(write_skill_name, str(rel).replace("\\", "/")),
+                }]
+            except ValueError:
+                # path 不在 write_cwd 下或无 write_cwd，使用文件名作为相对路径回退
+                rel_fallback = path.name
+                result_dict["output_files"] = [{
+                    "path": str(path),
+                    "url": build_file_download_url(write_skill_name, rel_fallback),
+                }]
+
+        return result_dict, touched
 
     if action == "run_command":
         command = str(task.get("command") or "").strip()
         if not command:
             raise ValueError("run_command 任务缺少 command")
+
+        # 归一化脚本路径：skills/<name>/scripts/xxx.py → scripts/xxx.py
+        command = _normalize_command_script_path(command)
 
         stdin_text = task.get("stdin", None)
         if stdin_text is not None:
@@ -188,10 +246,13 @@ def _execute_single_task(
         # Per-task snapshot taken *before* execution to detect new output files.
         pre_snapshot: set[str] = _snapshot_dir_files(cwd) if cwd else set()
 
-        materialized = _materialize_python_heredoc(command)
+        materialized = _materialize_python_heredoc(command, base_dir=cwd)
         if materialized is not None:
             argv = materialized
-            argv = _prepare_command_argv(
+            # venv 替换已在 _materialize_python_heredoc 中完成
+            # 但仍需要 _safe_command_argv 做安全校验
+            from .command_executor import _safe_command_argv
+            argv = _safe_command_argv(
                 " ".join(shlex.quote(part) for part in argv), base_dir=cwd
             )
         else:
@@ -234,6 +295,7 @@ def _execute_single_task(
 
         # Error-driven retry: up to _MAX_DEP_RETRY times for missing deps.
         completed = None
+        _tried_modules: set[str] = set()
         for _retry in range(_MAX_DEP_RETRY + 1):
             try:
                 completed = subprocess.run(
@@ -266,14 +328,40 @@ def _execute_single_task(
             )
             if py_missing and cwd is not None:
                 module_name = py_missing.group(1).split(".")[0]
+                if module_name in _tried_modules:
+                    logger.warning(
+                        "skill-env: module %s already installed but still missing, "
+                        "likely a deeper issue (C deps, version conflict, etc.)",
+                        module_name,
+                    )
+                    break
+                _tried_modules.add(module_name)
                 try:
                     venv_python = _get_skill_venv_python(cwd)
-                    if _retry_install_python_dep(module_name, venv_python):
+                    pip_stderr_buf: list[str] = []
+                    if _retry_install_python_dep(
+                        module_name, venv_python, out_stderr=pip_stderr_buf
+                    ):
                         retried = True
+                    else:
+                        logger.warning(
+                            "skill-env: pip install %s failed, stopping retries",
+                            module_name,
+                        )
+                        # 将 pip 真实失败原因追加到 completed.stderr，
+                        # 供后续 LLM 错误修正流程分析
+                        if pip_stderr_buf and completed is not None:
+                            pip_err = pip_stderr_buf[0]
+                            completed = completed._replace(
+                                stderr=(completed.stderr or "")
+                                + f"\n[pip install {module_name} 失败]\n{pip_err}"
+                            )
+                        break
                 except Exception as dep_exc:
                     logger.warning(
                         "skill-env: error-driven py dep install failed: %s", dep_exc
                     )
+                    break
 
             node_missing = re.search(r"Cannot find module '([^']+)'", stderr)
             if node_missing and cwd is not None:
@@ -312,8 +400,16 @@ def _execute_single_task(
                         else:
                             try:
                                 venv_python = _get_skill_venv_python(cwd)
-                                if _retry_install_python_dep(dep, venv_python):
+                                pip_stderr_buf2: list[str] = []
+                                if _retry_install_python_dep(
+                                    dep, venv_python, out_stderr=pip_stderr_buf2
+                                ):
                                     retried = True
+                                elif completed is not None and pip_stderr_buf2:
+                                    completed = completed._replace(
+                                        stderr=(completed.stderr or "")
+                                        + f"\n[pip install {dep} 失败]\n{pip_stderr_buf2[0]}"
+                                    )
                             except Exception as dep_exc:
                                 logger.warning(
                                     "skill-env: chinese dep install failed: %s", dep_exc
@@ -331,7 +427,7 @@ def _execute_single_task(
                 _validate_success_stdout_json_if_structured(completed.stdout)
                 _validate_stdout_against_action_entry(completed.stdout, action_entry)
                 if cwd is not None:
-                    validate_stdout_file_outputs(completed.stdout, skill_dir=cwd, cwd=cwd / "scripts")
+                    validate_stdout_file_outputs(completed.stdout, skill_dir=cwd, cwd=cwd)
                 if action_entry and str(action_entry.get("role") or "") in {"html_asset_builder", "asset_builder"}:
                     _validate_html_asset_outputs_in_generated_dir(completed.stdout, cwd=cwd)
             except FileOutputValidationError as exc:
@@ -358,24 +454,37 @@ def _execute_single_task(
             result["error"] = validation_code
 
         # Detect newly created files and attach download metadata.
+        # 无论命令成功与否，都检测新创建的文件——脚本可能在失败前已产出部分文件。
         effective_skill_name = skill_name or (cwd.name if cwd else "")
-        if success and cwd and effective_skill_name:
+        _new_files_count = 0
+        _declared_count = 0
+        if cwd and effective_skill_name:
             post_snapshot = _snapshot_dir_files(cwd)
             new_files = sorted(post_snapshot - pre_snapshot)
+            _new_files_count = len(new_files)
             if new_files:
                 result["output_files"] = [
                     {
                         "path": f,
-                        "url": f"/api/skills/{effective_skill_name}/files/{f}",
+                        "url": build_file_download_url(effective_skill_name, f),
                     }
                     for f in new_files
                 ]
             # Also extract output files declared in structured JSON stdout
             declared_output_files = _output_files_from_stdout_json(completed.stdout, cwd=cwd, skill_name=effective_skill_name)
+            _declared_count = len(declared_output_files)
             if declared_output_files:
                 by_path = {item["path"]: item for item in result.get("output_files") or []}
                 by_path.update({item["path"]: item for item in declared_output_files})
                 result["output_files"] = list(by_path.values())
+
+        logger.info(
+            "[OUTPUT_FILES] action=run_command success=%s new_files=%d declared=%d total=%d",
+            success,
+            _new_files_count,
+            _declared_count,
+            len(result.get("output_files") or []),
+        )
 
         return result, touched
 

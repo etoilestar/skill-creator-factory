@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 #  用户上下文构建
 # ---------------------------------------------------------------------------
 
-def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
+def _workflow_context_from_request_text(user_text: str) -> dict:
     """Build generic user-provided context without business field inference."""
     text = (user_text or "").strip()
     if not text:
@@ -140,6 +140,8 @@ async def _plan_workflow_steps_with_model(
 
     planner_model = _planner_model_name(model or getattr(req, "model", None))
     try:
+        logger.info("[LLM_CALL] 阶段=workflow_planning 模型=%s 消息数=%d", planner_model, len(messages))
+        logger.debug("[LLM_CALL] 阶段=workflow_planning 完整消息=%s", json.dumps(messages, ensure_ascii=False)[:2000])
         planner_text = await complete_chat_once(messages, planner_model)
         raw_plan = json.loads(_strip_markdown_json_fence(planner_text))
     except Exception as exc:
@@ -190,7 +192,13 @@ def _validate_step_plan(plan: dict, entries: list[dict]) -> dict:
         sp = str(step.get("script_path") or "")
         if not sp:
             continue
-        # 如果 script_path 不在 entries 中但格式正确，仍保留（宽松）
+        # 宽松校验：如果 script_path 不在 entries 中，记录 warning 但仍保留
+        if sp not in entry_paths:
+            logger.warning(
+                "workflow step script_path '%s' not in action schema entries, "
+                "execution may fail. available=%s",
+                sp, entry_paths,
+            )
         validated_steps.append({
             "script_path": sp,
             "description": str(step.get("description") or f"执行 {sp}"),
@@ -226,6 +234,7 @@ def _react_system_prompt(action_schema: dict) -> str:
         cmd = str(entry.get("command") or "").strip()
         outputs = entry.get("outputs") or []
         default_values = entry.get("default_values") or {}
+        optional_inputs = set(entry.get("optional_inputs") or [])
         role = str(entry.get("role") or "generic_script")
 
         # 从 command 中提取 JSON argv 的 key 列表作为实际参数名
@@ -248,11 +257,13 @@ def _react_system_prompt(action_schema: dict) -> str:
         except ValueError:
             pass
 
-        # 构建参数字符串：标注有默认值的参数
+        # 构建参数字符串：标注有默认值的参数和可选参数
         param_parts = []
         for pk in param_keys:
             if pk in default_values:
                 param_parts.append(f"{pk}(默认={default_values[pk]})")
+            elif pk in optional_inputs:
+                param_parts.append(f"{pk}(可选)")
             else:
                 param_parts.append(pk)
         param_desc = f"（参数: {', '.join(param_parts)}）" if param_parts else ""
@@ -322,10 +333,12 @@ def _parse_tool_call_response(response: str) -> dict:
     # 检查 tool_call
     tool_call = parsed.get("tool_call")
     if isinstance(tool_call, dict) and tool_call.get("script"):
+        raw_params = tool_call.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
         return {
             "need_tool": True,
             "script": str(tool_call["script"]),
-            "params": tool_call.get("params") or {},
+            "params": params,
         }
 
     # 检查 direct_response
@@ -343,12 +356,14 @@ def _build_command_from_tool_call(script_path: str, params: dict, action_schema:
     如果没有 command 模板，则直接用 python script_path + JSON params 构建。
     """
     entries = [e for e in (action_schema.get("entries") or []) if isinstance(e, dict)]
+    normalized_input = script_path.replace("\\", "/").lstrip("./")
 
-    # 查找匹配的 entry
+    # 查找匹配的 entry（统一使用 lstrip("./") 规范化，与 _render_command_with_params 一致）
     matched_entry = None
     for entry in entries:
         sp = str(entry.get("script_path") or "")
-        if sp == script_path or sp.endswith("/" + script_path):
+        normalized_sp = sp.replace("\\", "/").lstrip("./")
+        if normalized_sp == normalized_input or normalized_sp.endswith("/" + normalized_input):
             matched_entry = entry
             break
 
@@ -507,6 +522,8 @@ async def _execute_workflow_with_react_loop(
             react_model = _planner_model_name(model or getattr(req, "model", None))
 
             try:
+                logger.info("[LLM_CALL] 阶段=workflow_react 步骤=%d 调用=%d 模型=%s 消息数=%d", step_index, tool_call_count, react_model, len(conversation))
+                logger.debug("[LLM_CALL] 阶段=workflow_react 完整消息=%s", json.dumps(conversation, ensure_ascii=False)[:2000])
                 llm_response = await complete_chat_once(conversation, react_model)
             except Exception as exc:
                 logger.error("ReAct LLM call failed at step %d call %d: %s", step_index, tool_call_count, exc)
@@ -584,8 +601,8 @@ async def _execute_workflow_with_react_loop(
             # 构建工具执行结果
             raw_stdout = str(result.get("stdout") or "")
             raw_stderr = str(result.get("stderr") or "")
-            success = result.get("success", True)
-            returncode = result.get("returncode", 0)
+            success = result.get("success", False)
+            returncode = result.get("returncode", -1)
 
             # 解析 stdout JSON
             stdout_payload = {}

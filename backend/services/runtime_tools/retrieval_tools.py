@@ -178,3 +178,163 @@ def describe_database_table(table_name: str) -> dict[str, Any]:
         result = query_database_readonly(f"SELECT name, type FROM pragma_table_info('{table_name}')", limit=1000)
         return {"table_name": table_name, "columns": result.get("rows", [])}
     return {"table_name": table_name, "columns": []}
+
+
+# ---------------------------------------------------------------------------
+# Ollama Embedding helpers
+# ---------------------------------------------------------------------------
+
+def get_ollama_embedding(text: str, model: str | None = None) -> list[float]:
+    """调用 Ollama /api/embeddings 端点获取文本向量。
+
+    复用平台已有的 LLM_BASE_URL 和 EMBEDDING_MODEL 配置，
+    无需额外安装 embedding 模型依赖。
+    """
+    import httpx
+
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("text is empty")
+
+    if _trial():
+        return [0.0] * 1024  # bge-m3 维度
+
+    base_url = (os.environ.get("LLM_BASE_URL") or "http://localhost:11434").rstrip("/")
+    model = model or os.environ.get("EMBEDDING_MODEL") or "bge-m3:latest"
+    resp = httpx.post(
+        f"{base_url}/api/embeddings",
+        json={"model": model, "prompt": text},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["embedding"]
+
+
+# ---------------------------------------------------------------------------
+# FAISS vector index helpers
+# ---------------------------------------------------------------------------
+
+def build_faiss_index(
+    chunks: list[dict],
+    index_path: str,
+    *,
+    batch_size: int = 8,
+) -> dict[str, Any]:
+    """构建 FAISS 向量索引并保存。
+
+    Args:
+        chunks: 文档块列表，每项需含 ``content``、``source``、``page`` 等字段。
+        index_path: FAISS 索引保存路径。
+
+    Returns:
+        含 ``chunk_count``、``index_path``、``chunks_meta_path`` 的摘要字典。
+    """
+    if not chunks:
+        return {"chunk_count": 0, "index_path": "", "chunks_meta_path": "", "error": "chunks 为空"}
+
+    import numpy as np
+    import faiss
+
+    # 获取 embedding 向量
+    dim = None
+    embeddings = []
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        for chunk in batch:
+            content = str(chunk.get("content") or "")
+            try:
+                emb = get_ollama_embedding(content)
+            except Exception:
+                # 零向量填充失败的 embedding
+                dim = dim or 1024
+                emb = [0.0] * dim
+            if dim is None:
+                dim = len(emb)
+            embeddings.append(emb)
+
+    vectors = np.array(embeddings, dtype=np.float32)
+    faiss.normalize_L2(vectors)
+    index = faiss.IndexFlatIP(dim)
+    index.add(vectors)
+
+    # 保存索引
+    from pathlib import Path
+
+    index_file = Path(index_path)
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(index_file))
+
+    # 保存元数据
+    meta_path = index_file.parent / "chunks_meta.json"
+    meta = {
+        "chunk_count": len(chunks),
+        "dimension": dim,
+        "chunks": chunks,
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    return {
+        "chunk_count": len(chunks),
+        "index_path": str(index_file),
+        "chunks_meta_path": str(meta_path),
+    }
+
+
+def search_faiss_index(
+    query: str,
+    index_path: str,
+    *,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """语义检索：query embedding → FAISS search → 返回相关文档块。
+
+    Returns:
+        含 ``query`` 和 ``results`` 列表的字典。每个 result 包含
+        content、source、page、score 等字段。
+    """
+    query = str(query or "").strip()
+    if not query:
+        return {"query": "", "results": [], "error": "query is empty"}
+
+    from pathlib import Path
+
+    if not Path(index_path).exists():
+        return {"query": query, "results": [], "error": "索引文件不存在"}
+
+    import numpy as np
+    import faiss
+
+    index = faiss.read_index(index_path)
+
+    meta_path = str(Path(index_path).parent / "chunks_meta.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    chunks = meta.get("chunks", [])
+
+    if not chunks:
+        return {"query": query, "results": [], "error": "索引中没有文档块"}
+
+    # query embedding
+    try:
+        query_emb = get_ollama_embedding(query)
+    except Exception as exc:
+        return {"query": query, "results": [], "error": f"获取查询向量失败: {exc}"}
+
+    query_vec = np.array([query_emb], dtype=np.float32)
+    faiss.normalize_L2(query_vec)
+    scores, indices = index.search(query_vec, min(top_k, len(chunks)))
+
+    results = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < 0 or idx >= len(chunks):
+            continue
+        chunk = chunks[idx]
+        results.append({
+            "content": chunk.get("content", ""),
+            "source": chunk.get("source", ""),
+            "page": chunk.get("page", 0),
+            "section": chunk.get("section", ""),
+            "score": round(float(score), 4),
+        })
+
+    return {"query": query, "results": results}

@@ -65,8 +65,6 @@
             :conversation-history="chatHistory"
             :model="null"
             :warnings="creationPlan.warnings"
-            :asset-requirements="creationPlan.asset_requirements || []"
-            :final-outputs="creationPlan.final_outputs || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />
@@ -180,7 +178,7 @@ function actionLabel(action) {
 }
 
 const messages = ref([])
-const input = ref('帮我创建一个查询系统时间的skill')
+const input = ref('帮我创建一个查询数据库并将结果生成html格式报告的skill')
 const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')

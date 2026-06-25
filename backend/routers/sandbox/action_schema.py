@@ -310,13 +310,30 @@ def _validate_runtime_command_against_action_schema(command: str, *, execution_r
         raise ValueError("Skill Action schema 校验失败: " + json.dumps(action_schema["errors"], ensure_ascii=False))
     entry = _find_runtime_action_entry(action_schema, command)
     if entry is None:
+        schema_entries = action_schema.get("entries") or []
+        if not schema_entries:
+            # SKILL.md 格式不符合 action schema 提取规则（如使用 powershell 块、无 scripts/ 前缀），
+            # 跳过 entry 匹配校验，仅依赖脚本存在性检查（L296-304 已通过）
+            logger.warning(
+                "action_schema entries 为空，跳过 entry 匹配校验。script_path=%s, "
+                "SKILL.md 可能使用了非标准命令块格式（如 powershell、无 scripts/ 前缀）",
+                script_path,
+            )
+            return None
         raise ValueError(f"命令调用 {script_path}，但 SKILL.md/references 中没有唯一声明的执行入口")
     expected_keys = set(entry.get("inputs") or entry.get("command_keys") or [])
     optional_keys = set(entry.get("optional_inputs") or [])
     required_keys = expected_keys - optional_keys
     actual_keys = _command_json_argv_keys(command, script_path)
     if actual_keys is None:
-        raise ValueError(f"命令 {script_path} 必须使用可解析 JSON argv")
+        # 脚本使用非 JSON argv（如原始字符串参数），跳过参数键校验。
+        # 脚本存在性已在 L296-304 检查通过，参数正确性由脚本自行处理。
+        logger.warning(
+            "命令 %s 使用非 JSON argv（无法解析参数键），跳过参数校验。"
+            "命令可能使用原始字符串参数，如 SQL 语句。",
+            script_path,
+        )
+        return entry
     # 宽松校验：只检查必填参数是否都提供，额外参数允许（脚本自行处理或忽略）
     missing_required = required_keys - actual_keys
     if missing_required:

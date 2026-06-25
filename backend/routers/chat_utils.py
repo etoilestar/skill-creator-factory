@@ -412,12 +412,22 @@ def _scan_and_install_python_deps(script_path: Path, venv_python: Path) -> None:
 
     if to_install:
         logger.info("skill-env: pip installing into venv: %s", to_install)
-        subprocess.run(
-            [str(venv_python), "-m", "pip", "install", "--quiet"] + to_install,
+        cmd = [str(venv_python), "-m", "pip", "install", "--quiet"]
+        if settings.pip_index_url:
+            cmd += ["--index-url", settings.pip_index_url]
+        cmd += to_install
+        install_result = subprocess.run(
+            cmd,
             timeout=180,
             capture_output=True,
             text=True,
         )
+        if install_result.returncode != 0:
+            logger.warning(
+                "skill-env: pre-scan pip install failed (rc=%d): %s",
+                install_result.returncode,
+                (install_result.stderr or "")[-500:],
+            )
 
 
 def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
@@ -532,19 +542,38 @@ def _scan_and_install_node_deps(script_path: Path, skill_dir: Path) -> None:
         )
 
 
-def _retry_install_python_dep(module_name: str, venv_python: Path) -> bool:
+def _retry_install_python_dep(
+    module_name: str,
+    venv_python: Path,
+    *,
+    out_stderr: "list[str] | None" = None,
+) -> bool:
     """Error-driven: install a single missing Python module into the skill venv.
 
     Returns True if the install command succeeded.
+    If *out_stderr* is provided, pip's stderr (last 1000 chars) is appended
+    on failure so the caller can propagate it to the LLM correction flow.
     """
     pkg = _IMPORT_TO_PACKAGE.get(module_name, module_name)
     logger.info("skill-env: error-driven pip install %s (for import %s)", pkg, module_name)
+    cmd = [str(venv_python), "-m", "pip", "install", "--quiet"]
+    if settings.pip_index_url:
+        cmd += ["--index-url", settings.pip_index_url]
+    cmd.append(pkg)
     result = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--quiet", pkg],
+        cmd,
         timeout=180,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-1000:]
+        logger.warning(
+            "skill-env: pip install %s failed (rc=%d): %s",
+            pkg, result.returncode, stderr_tail[:500],
+        )
+        if out_stderr is not None:
+            out_stderr.append(stderr_tail)
     return result.returncode == 0
 
 
@@ -891,23 +920,35 @@ def _correct_expanded_input_paths(
             result.append(arg)
             continue
 
-        try:
-            path.resolve().relative_to(session_input_dir.resolve())
-            wrong_ext = path.suffix.lower()
-            candidates = session_files_by_ext.get(wrong_ext, [])
-            if len(candidates) >= 1:
-                corrected = str(candidates[0].resolve())
-                if len(candidates) == 1:
-                    logger.info(
-                        "Corrected input path: %s -> %s (LLM used placeholder filename)",
-                        arg, corrected,
-                    )
-                else:
-                    logger.warning(
-                        "Multiple files with extension '%s' in session dir, using first: %s -> %s",
-                        wrong_ext, arg, corrected,
-                    )
-        except ValueError:
+        if session_input_dir is not None:
+            try:
+                path.resolve().relative_to(session_input_dir.resolve())
+                wrong_ext = path.suffix.lower()
+                candidates = session_files_by_ext.get(wrong_ext, [])
+                if len(candidates) >= 1:
+                    corrected = str(candidates[0].resolve())
+                    if len(candidates) == 1:
+                        logger.info(
+                            "Corrected input path: %s -> %s (LLM used placeholder filename)",
+                            arg, corrected,
+                        )
+                    else:
+                        logger.warning(
+                            "Multiple files with extension '%s' in session dir, using first: %s -> %s",
+                            wrong_ext, arg, corrected,
+                        )
+            except ValueError:
+                if "/" not in arg and "\\" not in arg:
+                    wrong_ext = Path(arg).suffix.lower()
+                    candidates = session_files_by_ext.get(wrong_ext, [])
+                    if len(candidates) == 1:
+                        corrected = str(candidates[0].resolve())
+                        logger.info(
+                            "Corrected bare input filename: %s -> %s",
+                            arg, corrected,
+                        )
+        else:
+            # session_input_dir 为 None 时，仅尝试裸文件名纠正
             if "/" not in arg and "\\" not in arg:
                 wrong_ext = Path(arg).suffix.lower()
                 candidates = session_files_by_ext.get(wrong_ext, [])

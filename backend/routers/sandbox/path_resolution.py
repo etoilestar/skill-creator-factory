@@ -167,6 +167,18 @@ def _infer_skill_root_from_tasks(plan: dict, *, execution_root: Path | None = No
     if not valid:
         return None
 
+    # 当 execution_root 已提供时，不应返回比它更深的路径。
+    # 沙盒流程中 execution_root 是权威 Skill 根目录，深层路径（如 assets/generated/images）
+    # 不应被误判为 Skill 根。
+    if execution_root is not None:
+        exec_root_resolved = execution_root.resolve()
+        valid = [
+            p for p in valid
+            if p == exec_root_resolved or exec_root_resolved in p.parents
+        ]
+        if not valid:
+            return None
+
     return sorted(valid, key=lambda p: len(p.parts), reverse=True)[0]
 
 def _resolve_planned_file_path(
@@ -179,8 +191,8 @@ def _resolve_planned_file_path(
 
     规则：
     - 绝对路径保持绝对路径；
-    - sandbox 有 execution_root 时，相对路径基于 execution_root；
-    - creator 推断出 inferred_skill_root 时，Skill 内部相对路径基于 inferred_skill_root；
+    - sandbox 有 execution_root 时，所有相对路径基于 execution_root；
+    - creator 推断出 inferred_skill_root 时（execution_root 为 None），Skill 内部相对路径基于 inferred_skill_root；
     - 否则退回原有逻辑。
     """
     path = Path(raw_path).expanduser()
@@ -188,6 +200,11 @@ def _resolve_planned_file_path(
     if path.is_absolute():
         return _resolve_safe_path(raw_path, base_dir=execution_root)
 
+    # 沙盒流程：execution_root 是权威 Skill 根目录，直接使用
+    if execution_root is not None:
+        return _resolve_safe_path(raw_path, base_dir=execution_root)
+
+    # Creator 流程：execution_root 未设置时，使用 inferred_skill_root 推断根目录
     if inferred_skill_root is not None:
         first = path.parts[0] if path.parts else ""
 
@@ -195,7 +212,7 @@ def _resolve_planned_file_path(
         if raw_path == "SKILL.md" or first in {"scripts", "references", "assets"}:
             return _resolve_safe_path(raw_path, base_dir=inferred_skill_root)
 
-    return _resolve_safe_path(raw_path, base_dir=execution_root)
+    return _resolve_safe_path(raw_path, base_dir=execution_root or inferred_skill_root)
 
 def _parse_path_argument(path_expr: str) -> str:
     try:

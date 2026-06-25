@@ -154,6 +154,18 @@ class SandboxSessionState:
     # The body_prompt *after* appending child skill and resources
     augmented_body_prompt: Optional[str] = None
 
+    # --- Master-SubAgent 多智能体模式状态 ---
+    # 当前活跃的 SubAgent 类型（用于多 Agent 模式追踪）
+    active_sub_agent: Optional[str] = None
+    # SubAgent 执行结果（key = task_id）
+    sub_agent_results: Dict[str, Any] = field(default_factory=dict)
+    # Master 的拆解计划
+    master_plan: Optional[dict] = None
+    # ask_user 暂停/恢复状态
+    pending_master_plan: Optional[dict] = None      # 暂停的 MasterPlan 序列化数据
+    pending_task_index: Optional[int] = None         # 暂停时的任务索引
+    pending_results: Optional[list] = None            # 暂停前已完成的 SubAgent 结果
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -191,6 +203,12 @@ class SandboxSessionState:
         self.child_decision = None
         self.resource_decision = None
         self.augmented_body_prompt = None
+        self.active_sub_agent = None
+        self.sub_agent_results.clear()
+        self.master_plan = None
+        self.pending_master_plan = None
+        self.pending_task_index = None
+        self.pending_results = None
 
 
 # ---------------------------------------------------------------------------

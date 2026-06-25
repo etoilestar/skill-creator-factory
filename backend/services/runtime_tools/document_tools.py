@@ -316,3 +316,123 @@ def build_pdf_report(title: str, sections: list[dict], image_paths: list[str] | 
         lines.append("Images:")
         lines.extend(str(_safe_input_path(path, {".png", ".jpg", ".jpeg", ".webp"})) for path in image_paths[:_MAX_INPUT_FILES])
     return create_pdf(lines, filename=filename or "report.pdf", title=title or "Report")
+
+
+# ---------------------------------------------------------------------------
+# Document chunking helpers
+# ---------------------------------------------------------------------------
+
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
+    """将长文本按固定大小分块，支持重叠。
+
+    Args:
+        text: 输入文本。
+        chunk_size: 每块最大字符数。
+        overlap: 相邻块重叠字符数。
+
+    Returns:
+        文本块列表。
+    """
+    text = str(text or "").strip()
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+
+def chunk_pdf_by_page(pdf_path: str | os.PathLike[str], *, max_pages: int | None = None) -> list[dict[str, Any]]:
+    """PDF 按页提取文本并分块。
+
+    Returns:
+        列表，每项含 content、source、page 字段。
+    """
+    from pypdf import PdfReader
+
+    resolved = Path(pdf_path).expanduser().resolve()
+    source = resolved.name
+    reader = PdfReader(str(resolved))
+    chunks: list[dict[str, Any]] = []
+    for page_idx, page in enumerate(reader.pages):
+        if max_pages is not None and page_idx >= max_pages:
+            break
+        page_text = (page.extract_text() or "").strip()
+        if not page_text:
+            continue
+        for chunk in chunk_text(page_text):
+            chunks.append({"content": chunk, "source": source, "page": page_idx + 1, "section": ""})
+    return chunks
+
+
+def chunk_document(file_path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """自动识别文档类型并分块。
+
+    支持 PDF、DOCX、PPTX、XLSX、TXT、CSV、MD 等格式。
+
+    Returns:
+        列表，每项含 content、source、page/section 字段。
+    """
+    resolved = Path(file_path).expanduser().resolve()
+    suffix = resolved.suffix.lower()
+    source = resolved.name
+
+    if suffix == ".pdf":
+        return chunk_pdf_by_page(resolved)
+
+    if suffix == ".docx":
+        from docx import Document
+        doc = Document(str(resolved))
+        paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        full_text = "\n".join(paragraphs)
+        return [{"content": c, "source": source, "page": 0, "section": ""} for c in chunk_text(full_text)]
+
+    if suffix == ".pptx":
+        from pptx import Presentation
+        prs = Presentation(str(resolved))
+        chunks: list[dict[str, Any]] = []
+        for slide_idx, slide in enumerate(prs.slides):
+            texts = [shape.text.strip() for shape in slide.shapes if hasattr(shape, "text") and shape.text and shape.text.strip()]
+            slide_text = "\n".join(texts)
+            if not slide_text:
+                continue
+            for c in chunk_text(slide_text):
+                chunks.append({"content": c, "source": source, "page": slide_idx + 1, "section": ""})
+        return chunks
+
+    if suffix in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        wb = load_workbook(str(resolved), read_only=True, data_only=True)
+        chunks = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows_iter = ws.iter_rows(values_only=True)
+            header = next(rows_iter, None)
+            if not header:
+                continue
+            col_names = [str(v) if v else f"Col{i}" for i, v in enumerate(header, 1)]
+            row_lines = []
+            for row in rows_iter:
+                if row:
+                    line = " | ".join(f"{col_names[i]}={v}" for i, v in enumerate(row) if v is not None)
+                    if line.strip():
+                        row_lines.append(line)
+                    if len(row_lines) >= 20:
+                        chunks.append({"content": f"[Sheet: {sheet_name}]\n" + "\n".join(row_lines), "source": source, "page": 0, "section": sheet_name})
+                        row_lines = []
+            if row_lines:
+                chunks.append({"content": f"[Sheet: {sheet_name}]\n" + "\n".join(row_lines), "source": source, "page": 0, "section": sheet_name})
+        wb.close()
+        return chunks
+
+    # 纯文本文件（TXT、CSV、MD、JSON、LOG 等）
+    try:
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+        return [{"content": c, "source": source, "page": 0, "section": ""} for c in chunk_text(text)]
+    except Exception:
+        return []

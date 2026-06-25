@@ -92,6 +92,7 @@ from .chat_utils import (
     _retry_install_python_dep,
 )
 from .chat_models import ChatRequest, MarkdownBlock
+from .sandbox.path_resolution import _workflow_payload_summary
 
 logger = logging.getLogger(__name__)
 
@@ -143,14 +144,6 @@ def _workflow_value_preview(value: Any, *, max_len: int = 300) -> dict[str, Any]
             "preview_error": str(exc),
         }
 
-
-def _workflow_payload_summary(payload: dict[str, Any] | None, *, max_len: int = 300) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        str(key): _workflow_value_preview(value, max_len=max_len)
-        for key, value in payload.items()
-    }
 
 def _available_scripts_for_root(execution_root: Path | None) -> list[str]:
     """Return real scripts under the current business Skill root only."""
@@ -2532,16 +2525,6 @@ def _output_files_from_stdout_json(stdout: str, *, cwd: Path | None, skill_name:
         output_files.append({"path": rel, "url": f"/api/skills/{skill_name}/files/{rel}"})
     return output_files
 
-
-
-def _workflow_context_from_request_text(user_text: str, first_entry: dict) -> dict:
-    """Build generic user-provided context without business field inference."""
-    text = (user_text or "").strip()
-    if not text:
-        return {}
-    context = {"user_request": text, "input": text, "text": text}
-    context.update(extract_inline_context_values(text))
-    return context
 
 
 def _missing_workflow_placeholders(entry: dict, context: dict) -> list[str]:

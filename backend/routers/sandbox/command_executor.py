@@ -31,11 +31,14 @@ def _runtime_script_dir() -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
-def _materialize_python_heredoc(command: str) -> list[str] | None:
+def _materialize_python_heredoc(command: str, base_dir: Path | None = None) -> list[str] | None:
     """Convert `python - <<'PY' ... PY` into `python <safe-script>.py`.
 
     目的：兼容模型常输出的多行校验脚本，同时继续使用 shell=False，
     不开放真正 shell 的管道、重定向、变量展开、命令替换等能力。
+
+    当传入 base_dir 时，尝试使用 skill 专属 venv 的 python 执行 heredoc，
+    使其能访问 venv 中安装的第三方包。
     """
     match = _PYTHON_HEREDOC_RE.match(command.strip())
     if not match:
@@ -51,6 +54,20 @@ def _materialize_python_heredoc(command: str) -> list[str] | None:
     script_path.write_text(script, encoding="utf-8")
 
     resolved = _resolve_safe_path(str(script_path))
+
+    # 尝试使用 venv python，使 heredoc 能访问 venv 中安装的包
+    if base_dir is not None:
+        try:
+            venv_python = _get_skill_venv_python(base_dir)
+            # 静态扫描依赖并预装
+            _scan_and_install_python_deps(resolved, venv_python)
+            return [str(venv_python), str(resolved)]
+        except Exception as exc:
+            logger.warning(
+                "skill-env: heredoc venv setup failed, using system %s: %s",
+                python_bin, exc,
+            )
+
     return [python_bin, str(resolved)]
 
 def _extract_skill_local_paths_from_argv(argv: list[str]) -> list[str]:

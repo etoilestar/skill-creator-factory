@@ -30,6 +30,7 @@ class ChatRequest(BaseModel):
     input_files: list[dict] = []  # [{"path": "inputs/session/file.csv", "filename": "file.csv"}, ...]
     execution_mode: Optional[str] = "execute"  # "plan" | "execute" | "craft"(deprecated)
     sandbox_session_id: Optional[str] = None
+    skill_names: list[str] = []  # 多 Skill 组合测试时使用
 
     def effective_execution_mode(self) -> str:
         """Return the normalized execution mode.

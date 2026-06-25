@@ -1,9 +1,6 @@
 """Repair scope, diff application, and generated-file repair helpers."""
 
 from .common import *  # noqa: F403
-from . import common as _common
-
-globals().update({k: v for k, v in _common.__dict__.items() if not k.startswith("__")})
 
 
 def _failure_layer_from_error_text(error_text: str) -> str | None:
@@ -2188,3 +2185,4 @@ async def _run_script_responsibility_review(
         "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
     }
 
+__all__ = [name for name in globals() if not name.startswith("__")]

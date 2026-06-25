@@ -1,40 +1,9 @@
 """Prompt construction, model calls, content normalization, and file-generation helpers."""
 
 from .common import *  # noqa: F403
-from . import common as _common
-
-globals().update({k: v for k, v in _common.__dict__.items() if not k.startswith("__")})
-
-def _complete_chat_once_sync_for_e2e(messages: list[dict[str, str]], model: str) -> str:
-    """Run async complete_chat_once from synchronous E2E code.
-
-    validate_workflow_e2e / _run_skill_workflow_e2e_once 是同步链路。
-    如果当前线程没有 event loop，直接 asyncio.run；
-    如果当前线程已经在 event loop 中，则开一个短生命周期线程执行 asyncio.run，
-    避免 RuntimeError: asyncio.run() cannot be called from a running event loop。
-    """
-
-    import asyncio
-    import concurrent.futures
-
-    async def _call() -> str:
-        return await complete_chat_once(messages, model)
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(_call())
-
-    def _runner() -> str:
-        return asyncio.run(_call())
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_runner)
-        return future.result()
-
-def _numbered_source(content: str) -> str:
-    return "\n".join(f"{idx:04d}: {line}" for idx, line in enumerate((content or "").splitlines(), start=1))
-
+from .contracts import *  # noqa: F403
+from .e2e import *  # noqa: F403
+from .repair import *  # noqa: F403
 
 def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     """Return whether content is safe to accept as the requested raw script.
@@ -633,29 +602,6 @@ def _script_local_contract_payload(
     }
 
 
-def _script_stdout_schema_for_entry(plan_entry: SkillPlanEntry) -> dict[str, Any]:
-    """Build a deterministic stdout schema from the per-file output contract.
-
-    注意：
-    - 只有 SkillPlanEntry.outputs 明确声明的字段才作为 required；
-    - outputs 为空时，不要伪造 required=["text"]；
-    - stdout 至少一个非空字段由 _validate_trial_stdout_json 的通用规则保证。
-    """
-    properties = {
-        key: {"description": f"Non-empty value for declared output field {key}."}
-        for key in (plan_entry.outputs or [])
-        if isinstance(key, str) and key.strip()
-    }
-
-    return {
-        "type": "object",
-        "required": list(properties.keys()),
-        "properties": properties,
-        "additionalProperties": True,
-        "forbidden": ["error"],
-    }
-
-
 def _creator_file_generation_messages(task_content: str, *, system_rule: str | None = None) -> list[dict]:
     """Return Creator generation messages with the concrete task in user role."""
     rule = system_rule or "你是 Creator 文件内容生成器。只遵守用户消息中的当前文件生成任务；只输出目标文件内容。"
@@ -1035,11 +981,8 @@ def _local_blueprint_text_for_path(path: str, blueprint_text: str, *, window: in
     return text[max(0, idx - window): min(len(text), idx + len(path) + window)]
 
 
-def _sse(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
+__all__ = [name for name in globals() if not name.startswith("__")]

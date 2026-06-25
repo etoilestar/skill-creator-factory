@@ -1,9 +1,6 @@
 """Skill/file contract and blueprint validation helpers."""
 
 from .common import *  # noqa: F403
-from . import common as _common
-
-globals().update({k: v for k, v in _common.__dict__.items() if not k.startswith("__")})
 
 
 @dataclass(frozen=True)
@@ -3647,6 +3644,503 @@ def _validate_configured_model_usage_static(*, file_path: str, content: str, ski
         "请通过 LLM_BASE_URL + TEXT_MODEL 调用文本模型，需要图像/视觉能力时使用 IMAGE_MODEL/VISION_MODEL。"
     )
 
+def _script_paths_in_shell_fenced_blocks(skill_md: str) -> set[str]:
+    """Return scripts/*.py paths that appear inside shell fenced blocks."""
+    paths: set[str] = set()
+
+    for info, body in _iter_markdown_fenced_blocks(skill_md):
+        if not _is_shell_fence_info(info):
+            continue
+
+        for match in re.finditer(
+            r"(?<![\w./-])(scripts/[A-Za-z0-9_./-]+\.py)(?![\w./-])",
+            body.replace("\\", "/"),
+        ):
+            paths.add(match.group(1))
+
+    return paths
+
+
+def _script_paths_outside_shell_fenced_blocks(skill_md: str) -> set[str]:
+    """Return scripts/*.py paths mentioned outside shell fenced blocks.
+
+    This is not used to decide whether a script is part of the blueprint.
+    It only catches a bad SKILL.md style:
+    mentioning scripts/foo.py in prose without an executable ```bash block.
+    """
+    text = skill_md or ""
+
+    shell_block_bodies: list[str] = []
+    for info, body in _iter_markdown_fenced_blocks(text):
+        if _is_shell_fence_info(info):
+            shell_block_bodies.append(body)
+
+    text_without_shell_blocks = text
+    for body in shell_block_bodies:
+        text_without_shell_blocks = text_without_shell_blocks.replace(body, "")
+
+    paths: set[str] = set()
+    for match in re.finditer(
+        r"(?<![\w./-])(scripts/[A-Za-z0-9_./-]+\.py)(?![\w./-])",
+        text_without_shell_blocks.replace("\\", "/"),
+    ):
+        paths.add(match.group(1))
+
+    return paths
+
+
+def _validate_command_is_single_shell_json_invocation(
+    *,
+    command: str,
+    script_path: str,
+    entry: SkillPlanEntry,
+    upstream_available_outputs: set[str] | None = None,
+) -> list[ContractCheckResult]:
+    """Validate one shell fenced command under flexible command protocol.
+
+    C 方案：
+    - 阻断：不是单行命令；
+    - 阻断：不能解析成 python/python3 调用 scripts/*.py；
+    - 阻断：如果它看起来使用 JSON argv，但 JSON 不合法；
+    - 不阻断：使用 argparse flags、普通位置参数、无参数。
+    """
+    results: list[ContractCheckResult] = []
+    target = script_path
+
+    raw_command = command or ""
+    lines = [line.strip() for line in raw_command.strip().splitlines() if line.strip()]
+    one_line = len(lines) == 1
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.single_command",
+        passed=one_line,
+        target=target,
+        message=(
+            f"{script_path} 命令块只包含一条命令。"
+            if one_line
+            else f"{script_path} 命令块应只包含一条命令，不要在一个 block 里写多条命令或解释。"
+        ),
+        expected="每个 ```bash fenced block 内只放一条真实 shell 命令。",
+        minimal_edit="把解释移出 fenced block；一个 block 只保留一条调用 scripts/*.py 的 shell 命令。",
+    ))
+
+    if not one_line:
+        return results
+
+    command_line = lines[0]
+
+    try:
+        command_sig = _command_signature(command_line, script_path)
+    except Exception as exc:
+        logger.warning(
+            "[Creator][skill_md] command signature parser crashed script=%s command=%s error=%s",
+            script_path,
+            command_line,
+            exc,
+        )
+        command_sig = None
+
+    parsed_ok = command_sig is not None
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.signature_parseable",
+        passed=parsed_ok,
+        target=target,
+        message=(
+            f"{script_path} 命令块可解析为真实 scripts/*.py shell 调用。"
+            if parsed_ok
+            else f"{script_path} 命令块无法解析为真实 scripts/*.py shell 调用。"
+        ),
+        expected=(
+            "命令应是一条真实 shell 命令，并直接调用 scripts/*.py。"
+            "参数形态由脚本真实接口决定，可以是 JSON argv，也可以是 argparse flags。"
+        ),
+        minimal_edit=(
+            f"改为调用真实脚本的 shell 命令，例如：python {script_path} '<JSON object>' "
+            f"或 python {script_path} --arg value。具体参数由脚本接口决定。"
+        ),
+    ))
+
+    if not command_sig:
+        return results
+
+    arg_mode = str(command_sig.get("arg_mode") or "")
+    args = list(command_sig.get("args") or [])
+
+    # 只有“看起来想用 JSON argv 但 JSON 坏了”的情况才阻断。
+    # argparse flags / no_args / positional_args 不在第一轮误杀。
+    json_arg_ok = arg_mode != "invalid_json_arg"
+
+    results.append(ContractCheckResult(
+        id="skill_md.command_block.args_parseable",
+        passed=json_arg_ok,
+        target=target,
+        message=(
+            f"{script_path} 命令参数形态可接受：{arg_mode or 'unknown'}。"
+            if json_arg_ok
+            else f"{script_path} 看起来使用 JSON argv，但 JSON 无法解析。"
+        ),
+        expected=(
+            "如果使用 JSON argv，则脚本路径后传一个 json.loads 可解析的 JSON object；"
+            "如果脚本使用 argparse，则使用该脚本声明的 flags。"
+        ),
+        minimal_edit=(
+            "只修当前命令参数。不要固定套用 payload/user_request/fields/options/input_files。"
+        ),
+        details={
+            "arg_mode": arg_mode,
+            "args": args,
+        },
+    ))
+
+    try:
+        runtime_matches = _command_runtime_matches(command_line, script_path, entry)
+    except Exception as exc:
+        runtime_matches = False
+        logger.warning(
+            "[Creator][skill_md] runtime match check crashed script=%s command=%s error=%s",
+            script_path,
+            command_line,
+            exc,
+        )
+
+    if not runtime_matches:
+        logger.info(
+            "[Creator][skill_md] non-blocking runtime mismatch script=%s inferred_runtime=%s command=%s",
+            script_path,
+            getattr(entry, "runtime", ""),
+            command_line,
+        )
+
+    return results
+
+
+def _check_skill_md_fenced_command_contracts(
+    *,
+    content: str,
+    blueprint_text: str,
+    required_script_paths: list[str] | None = None,
+) -> list[ContractCheckResult]:
+    """Validate fenced command style for SKILL.md.
+
+    这里是格式/可解析性校验，不做蓝图语义判断。
+    任何内部异常都转换成 ContractCheckResult，避免直接崩溃。
+    """
+    results: list[ContractCheckResult] = []
+
+    required = {
+        path.replace("\\", "/").strip()
+        for path in (required_script_paths or [])
+        if isinstance(path, str) and path.replace("\\", "/").strip().startswith("scripts/")
+    }
+
+    mentioned = {
+        path
+        for path in _skill_local_paths_in_markdown(content)
+        if isinstance(path, str) and path.startswith("scripts/")
+    }
+
+    scripts_to_check = sorted(required or mentioned)
+
+    entries_by_path: dict[str, SkillPlanEntry] = {}
+    try:
+        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text}])
+        if parsed.skill_plan:
+            entries_by_path = {
+                entry.path: entry
+                for entry in parsed.skill_plan.files
+                if entry.file_type == "script"
+            }
+    except Exception as exc:
+        logger.warning("[Creator][skill_md] failed to parse blueprint SkillPlan for command validation: %s", exc)
+
+    if entries_by_path:
+        scripts_to_check = [entry.path for entry in entries_by_path.values() if entry.path in scripts_to_check]
+
+    prior_outputs: set[str] = set()
+
+    for script_path in scripts_to_check:
+        try:
+            commands = _extract_script_command_templates(content, script_path)
+        except Exception as exc:
+            results.append(ContractCheckResult(
+                id="skill_md.command_block.extract_crashed",
+                passed=False,
+                target=script_path,
+                message=f"{script_path} 命令块提取失败：{exc}",
+                expected="能够从 SKILL.md 中提取该脚本对应的标准 ```bash fenced code block。",
+                minimal_edit=(
+                    f"为 {script_path} 添加独立、无缩进的标准命令块，例如：\n"
+                    f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+                ),
+            ))
+            continue
+
+        has_fenced = bool(commands)
+
+        results.append(ContractCheckResult(
+            id="skill_md.command_block.fenced_exists",
+            passed=has_fenced,
+            target=script_path,
+            message=(
+                f"{script_path} 已使用 ```bash fenced code block 表达可执行命令。"
+                if has_fenced
+                else f"{script_path} 缺少可执行 Markdown 命令块：标准 ```bash fenced code block。"
+            ),
+            expected=(
+                "真实脚本必须用标准 Markdown fenced code block 表示，例如：\n"
+                f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+            ),
+            minimal_edit=(
+                f"为 {script_path} 添加独立、无缩进的 ```bash fenced block；"
+                "不要只在正文中写“调用脚本”。"
+            ),
+        ))
+
+        if not commands:
+            continue
+
+        try:
+            entry = entries_by_path.get(script_path) or _skill_plan_entry_for_file(
+                file_path=script_path,
+                blueprint_text=blueprint_text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Creator][skill_md] failed to infer SkillPlanEntry for %s: %s",
+                script_path,
+                exc,
+            )
+            entry = SkillPlanEntry(
+                path=script_path,
+                role="generic_script",
+                file_type="python",
+                purpose="Inferred fallback entry for command validation.",
+                runtime="python",
+                inputs=[],
+                outputs=[],
+                dependencies=[],
+            )
+
+        for command in commands:
+            try:
+                results.extend(_validate_command_is_single_shell_json_invocation(
+                    command=command,
+                    script_path=script_path,
+                    entry=entry,
+                    upstream_available_outputs=prior_outputs,
+                ))
+            except Exception as exc:
+                logger.exception(
+                    "[Creator][skill_md] command validation crashed script=%s command=%s",
+                    script_path,
+                    command,
+                )
+                results.append(ContractCheckResult(
+                    id="skill_md.command_block.validation_crashed",
+                    passed=False,
+                    target=script_path,
+                    message=f"{script_path} 命令块校验内部异常：{exc}",
+                    expected="命令块应能被解析为 runner + scripts 路径 + JSON object argv。",
+                    minimal_edit=(
+                        f"将命令改为标准形式：\n"
+                        f"```bash\npython {script_path} '{{\"arg_name\":\"arg_value_or_placeholder\"}}'\n```"
+                    ),
+                ))
+
+        prior_outputs.update(entry.outputs or [])
+
+    return results
+
+def _basic_markdown_format_failures(file_path: str, content: str, *, require_frontmatter: bool) -> list[dict[str, Any]]:
+    """Very small Markdown format gate.
+
+    只检查最基础格式：
+    1. frontmatter 是否存在；
+    2. frontmatter 是否有收尾 ---；
+    3. frontmatter YAML 是否能解析成 dict；
+    4. fenced block 数量是否成对。
+
+    不检查内容责任，不检查蓝图一致性。
+    """
+    text = (content or "").lstrip("\ufeff")
+    failures: list[dict[str, Any]] = []
+
+    if require_frontmatter:
+        if not text.startswith("---"):
+            failures.append({
+                "id": "markdown.frontmatter.missing",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} 缺少 YAML frontmatter。",
+                "expected": "文件必须以 --- 开始，并在正文前用单独一行 --- 闭合。",
+                "minimal_edit": "只在文件开头补齐 YAML frontmatter。",
+            })
+            return failures
+
+        lines = text.splitlines(keepends=True)
+        close_idx = None
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                close_idx = idx
+                break
+
+        if close_idx is None:
+            failures.append({
+                "id": "markdown.frontmatter.unclosed",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} frontmatter 只有开头 ---，没有收尾 ---。",
+                "expected": "frontmatter 必须在正文前用单独一行 --- 闭合。",
+                "minimal_edit": "只在正文第一个标题或正文开始前补一行 ---，不要修改正文内容。",
+            })
+            return failures
+
+        raw_yaml = "".join(lines[1:close_idx])
+        try:
+            parsed = yaml.safe_load(raw_yaml) or {}
+            if not isinstance(parsed, dict):
+                failures.append({
+                    "id": "markdown.frontmatter.not_object",
+                    "source": "markdown_format",
+                    "target": file_path,
+                    "layer": "markdown_format",
+                    "message": f"{file_path} frontmatter 必须是 YAML object。",
+                    "expected": "frontmatter 应是 key/value YAML object。",
+                    "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
+                })
+        except Exception as exc:
+            failures.append({
+                "id": "markdown.frontmatter.invalid_yaml",
+                "source": "markdown_format",
+                "target": file_path,
+                "layer": "markdown_format",
+                "message": f"{file_path} frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
+                "expected": "frontmatter 必须是合法 YAML。",
+                "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
+            })
+
+    fence_count = len(re.findall(r"(?m)^\s*(```|~~~)", text))
+    if fence_count % 2 != 0:
+        failures.append({
+            "id": "markdown.fences_unbalanced",
+            "source": "markdown_format",
+            "target": file_path,
+            "layer": "markdown_format",
+            "message": f"{file_path} 存在未闭合的 Markdown fenced block。",
+            "expected": "所有 ``` 或 ~~~ fenced block 必须成对闭合。",
+            "minimal_edit": "只补齐或删除多余的 fenced block 标记。",
+            "details": {"fence_count": fence_count},
+        })
+
+    return failures
+
+def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
+    """Return shell command templates in SKILL.md that invoke script_path."""
+    commands: list[str] = []
+    normalized_script_path = script_path.replace("\\", "/")
+
+    for info, body in _iter_markdown_fenced_blocks(skill_md):
+        if not _is_shell_fence_info(info):
+            continue
+
+        command = body.strip()
+        if not command:
+            continue
+
+        normalized_command = command.replace("\\", "/")
+        if normalized_script_path in normalized_command:
+            commands.append(command)
+
+    return commands
+
+
+def _command_uses_json_argv(command: str) -> bool:
+    return "{" in command and "}" in command
+
+
+def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
+    if runtime == "node":
+        return "JSON.parse" in content and "process.argv" in content
+    if runtime in {"bash", "shell"}:
+        return "$1" in content or "${1" in content or "jq" in content
+    return "json.loads" in content and "sys.argv" in content
+
+
+def _script_uses_input_keys(content: str, keys: list[str]) -> tuple[bool, list[str]]:
+    missing = [key for key in keys if key not in content]
+    return not missing, missing
+
+
+def _script_has_main_entry(content: str, runtime: str) -> bool:
+    if runtime == "python":
+        return "def main" in content and "__main__" in content
+    if runtime == "node":
+        return "process.argv" in content and "console.log" in content
+    if runtime in {"bash", "shell"}:
+        return ("$1" in content or "${1" in content) and ("echo" in content or "printf" in content or "print(json.dumps" in content)
+    return True
+
+
+def _validate_script_contract_static(
+    *,
+    file_path: str,
+    content: str,
+    skill_md: str,
+    skill_plan_entry: dict[str, Any] | SkillPlanEntry | None = None,
+) -> None:
+    """Validate script source against SKILL.md contract locally.
+
+    Creator 单文件阶段只做“协议 + 运行 + 产物”中的静态协议部分：
+    - 如果 SKILL.md 命令传入 JSON argv，脚本必须读取 JSON argv；
+    - 不用 fake/mock/template 关键词、工具能力声明、helper 路线或 LLM
+      validator 作为 hard gate；
+    - 字段级 stdout/artifact 闭环交给单文件 trial run 和最终 E2E。
+    """
+    explicit_entry = (
+        skill_plan_entry.__dict__
+        if isinstance(skill_plan_entry, SkillPlanEntry)
+        else skill_plan_entry
+    )
+    plan_entry = (
+        _skill_plan_entry_for_file(file_path=file_path, skill_plan_entry=explicit_entry)
+        if explicit_entry is not None
+        else _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+    )
+    commands = _extract_script_command_templates(skill_md, file_path)
+    if not commands:
+        return
+
+    command_results = _check_command_block_contract(file_path, commands, plan_entry)
+    failed_command_results = [r for r in command_results if not r.passed]
+    if failed_command_results:
+        raise ValueError(
+            "SKILL.md 命令块不合法，属于 workflow 局部合同问题，不要改脚本字段强制对齐 SkillPlan:\n"
+            + _format_contract_checks(failed_command_results, passed=False)
+        )
+
+    json_argv_commands = [c for c in commands if _command_uses_json_argv(c)]
+    if json_argv_commands and not _script_reads_json_argv(content, plan_entry.runtime):
+        raise ValueError(
+            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
+        )
+
+
+
+def _validate_script_against_existing_skill_contract(skill_name: str, file_path: str, content: str) -> None:
+    """Refuse saving scripts that do not match the current SKILL.md contract."""
+    if not file_path.startswith("scripts/"):
+        return
+    skill_md_path = settings.skills_path / skill_name / "SKILL.md"
+    if not skill_md_path.is_file():
+        return
+    skill_md = skill_md_path.read_text(encoding="utf-8")
+    _validate_script_contract_static(file_path=file_path, content=content, skill_md=skill_md)
+
+
+
 def _validate_generated_file_content(file_path: str, content: str, role: str | None = None, skill_plan_entry: dict[str, Any] | None = None) -> None:
     """Reject content that is clearly not the requested single file."""
     if file_path == "SKILL.md":
@@ -3706,4 +4200,6 @@ def validate_file_contract(
             return list(exc.results)
     return []
 
+from .repair import *  # noqa: F403  # late import for blueprint repair helpers
 
+__all__ = [name for name in globals() if not name.startswith("__")]

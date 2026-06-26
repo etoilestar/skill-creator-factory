@@ -43,11 +43,10 @@ def _script_command_template(script_path: str, blueprint_text: str, entry: Skill
 def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
     """Parse one standard Markdown bash command as a real script invocation.
 
-    C 方案：
+    Creator 默认协议：
     - 只要求它是可解析 shell 命令；
     - runner 调用 scripts/*.py；
-    - 不强制参数必须是 JSON argv；
-    - JSON argv / argparse flags / no args 都先允许；
+    - 脚本路径后必须传入一个可解析为 object 的 JSON argv；
     - 字段级参数对齐交给第二轮 E2E。
     """
     try:
@@ -141,10 +140,7 @@ def _command_template_equivalent(command: str, script_path: str, entry: SkillPla
 
 
 def _command_payload_object(command: str, script_path: str) -> dict[str, Any] | None:
-    """Return JSON argv object only when the command actually uses JSON argv.
-
-    argparse flags / no args are not errors here; they simply return None.
-    """
+    """Return JSON argv object for Creator default executable commands."""
     command_sig = _command_signature(command, script_path)
     if not command_sig:
         return None
@@ -261,11 +257,9 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 对蓝图真实规划的每个脚本，SKILL.md 应提供一个独立的 ```bash fenced code block。",
         "- 每个 ```bash block 内只能放一条真实 shell 命令。",
         "- 命令必须直接调用真实 scripts/*.py 路径。",
-        "- 命令参数形态必须由当前脚本真实接口决定，不在 SKILL.md 层固定成唯一协议。",
-        "- 如果脚本使用 JSON argv，则命令形如：python scripts/<真实脚本名>.py '<JSON object argv>'，且 JSON argv 必须能被 json.loads 解析为 object。",
-        "- 如果脚本使用 argparse，则命令形如：python scripts/<真实脚本名>.py --arg value --other value。",
-        "- 如果脚本不需要参数，可以只写：python scripts/<真实脚本名>.py。",
-        "- 动态占位符应作为 shell 安全的字符串参数出现；JSON argv 中的动态 placeholder 必须作为 JSON 字符串值出现，例如 \"topic\":\"{{topic}}\"。",
+        "- Creator 默认产物必须使用统一 JSON argv 协议：脚本路径后跟一个 shell-quoted JSON object argv。",
+        "- JSON argv 必须能被 json.loads 解析为 object；动态 placeholder 必须作为 JSON 字符串值出现。",
+        "- 外部已有脚本若使用其它 CLI 风格，应先由包装脚本适配为 JSON argv，再在 SKILL.md 调用该包装入口。",
         "- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。",
         "- 禁止在 ```bash block 内直接写 JSON 配置对象。",
         "- 禁止在 ```bash block 内写 runner/script/argv 伪命令对象。",
@@ -351,10 +345,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             "```bash",
             json_command,
             "```",
-            "   如果该脚本源码使用 argparse，也可以写成：",
-            "```bash",
-            f"{runner} {script_path} --arg value",
-            "```",
+            "   Creator 默认生成只使用上述 JSON argv 命令形态；外部已有 CLI 应由包装入口适配。",
         ])
 
     if reference_paths:
@@ -658,9 +649,21 @@ def _check_skill_md_contract(content: str, blueprint_text: str) -> list[Contract
 
     frontmatter_errors = _skill_md_frontmatter_errors(stripped)
     has_frontmatter = not frontmatter_errors
+    structure_failures = _skill_md_body_structure_failures("SKILL.md", stripped)
+    results.extend(ContractCheckResult(
+        id=str(item.get("id") or "skill_md.markdown_body_structure"),
+        passed=False,
+        target="SKILL.md",
+        message=str(item.get("message") or "SKILL.md frontmatter/body boundary invalid."),
+        expected=str(item.get("expected") or "frontmatter 后必须有正文。"),
+        minimal_edit=str(item.get("minimal_edit") or "重新生成格式正确的 SKILL.md。"),
+        details=dict(item.get("details") or {}),
+        layer="markdown_format",
+    ) for item in structure_failures)
+
     results.append(ContractCheckResult(
         id="skill_md.frontmatter",
-        passed=has_frontmatter,
+        passed=has_frontmatter and not structure_failures,
         target="SKILL.md",
         message=(
             "SKILL.md frontmatter 合格。"
@@ -3651,13 +3654,11 @@ def _validate_command_is_single_shell_json_invocation(
     entry: SkillPlanEntry,
     upstream_available_outputs: set[str] | None = None,
 ) -> list[ContractCheckResult]:
-    """Validate one shell fenced command under flexible command protocol.
+    """Validate one shell fenced command under Creator JSON argv protocol.
 
-    C 方案：
     - 阻断：不是单行命令；
-    - 阻断：不能解析成 python/python3 调用 scripts/*.py；
-    - 阻断：如果它看起来使用 JSON argv，但 JSON 不合法；
-    - 不阻断：使用 argparse flags、普通位置参数、无参数。
+    - 阻断：不能解析成 runner 调用 scripts/*.py；
+    - 阻断：脚本路径后没有可解析为 object 的 JSON argv。
     """
     results: list[ContractCheckResult] = []
     target = script_path
@@ -3707,12 +3708,10 @@ def _validate_command_is_single_shell_json_invocation(
             else f"{script_path} 命令块无法解析为真实 scripts/*.py shell 调用。"
         ),
         expected=(
-            "命令应是一条真实 shell 命令，并直接调用 scripts/*.py。"
-            "参数形态由脚本真实接口决定，可以是 JSON argv，也可以是 argparse flags。"
+            "命令应是一条真实 shell 命令，并直接调用 scripts/*.py，脚本路径后跟 JSON object argv。"
         ),
         minimal_edit=(
-            f"改为调用真实脚本的 shell 命令，例如：python {script_path} '<JSON object>' "
-            f"或 python {script_path} --arg value。具体参数由脚本接口决定。"
+            f"改为调用真实脚本的 shell 命令，例如：python {script_path} '<JSON object>'。"
         ),
     ))
 
@@ -3722,9 +3721,7 @@ def _validate_command_is_single_shell_json_invocation(
     arg_mode = str(command_sig.get("arg_mode") or "")
     args = list(command_sig.get("args") or [])
 
-    # 只有“看起来想用 JSON argv 但 JSON 坏了”的情况才阻断。
-    # argparse flags / no_args / positional_args 不在第一轮误杀。
-    json_arg_ok = arg_mode != "invalid_json_arg"
+    json_arg_ok = arg_mode == "json_arg"
 
     results.append(ContractCheckResult(
         id="skill_md.command_block.args_parseable",
@@ -3736,8 +3733,7 @@ def _validate_command_is_single_shell_json_invocation(
             else f"{script_path} 看起来使用 JSON argv，但 JSON 无法解析。"
         ),
         expected=(
-            "如果使用 JSON argv，则脚本路径后传一个 json.loads 可解析的 JSON object；"
-            "如果脚本使用 argparse，则使用该脚本声明的 flags。"
+            "脚本路径后必须传一个 json.loads 可解析的 JSON object argv。"
         ),
         minimal_edit=(
             "只修当前命令参数。不要固定套用 payload/user_request/fields/options/input_files。"
@@ -3783,9 +3779,16 @@ def _check_skill_md_fenced_command_contracts(
     """
     results: list[ContractCheckResult] = []
 
+    source_required_paths = required_script_paths
+    if source_required_paths is None:
+        source_required_paths = [
+            path for path in _declared_skill_paths_from_blueprint(blueprint_text)
+            if path.startswith("scripts/")
+        ]
+
     required = {
         path.replace("\\", "/").strip()
-        for path in (required_script_paths or [])
+        for path in (source_required_paths or [])
         if isinstance(path, str) and path.replace("\\", "/").strip().startswith("scripts/")
     }
 
@@ -3832,6 +3835,23 @@ def _check_skill_md_fenced_command_contracts(
             continue
 
         has_fenced = bool(commands)
+
+        results.append(ContractCheckResult(
+            id="skill_md.script_command.exists",
+            passed=has_fenced,
+            target=script_path,
+            message=(
+                f"{script_path} 已使用 ```bash fenced code block 表达可执行命令。"
+                if has_fenced
+                else f"{script_path} 缺少可执行 Markdown 命令块：标准 ```bash fenced code block。"
+            ),
+            expected=(
+                "真实脚本必须用标准 Markdown fenced code block 表示，并传入 JSON object argv。"
+            ),
+            minimal_edit=(
+                f"为 {script_path} 添加独立、无缩进的 ```bash fenced block。"
+            ),
+        ))
 
         results.append(ContractCheckResult(
             id="skill_md.command_block.fenced_exists",
@@ -3907,6 +3927,101 @@ def _check_skill_md_fenced_command_contracts(
 
     return results
 
+
+def _skill_md_body_structure_failures(file_path: str, content: str) -> list[dict[str, Any]]:
+    """Hard-check SKILL.md frontmatter/body boundary without title wordlists."""
+    text = (content or "").lstrip("\ufeff")
+    failures: list[dict[str, Any]] = []
+
+    def failure(check_id: str, message: str, expected: str, minimal_edit: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        item = {
+            "id": check_id,
+            "source": "markdown_format",
+            "target": file_path,
+            "layer": "markdown_format",
+            "message": message,
+            "expected": expected,
+            "minimal_edit": minimal_edit,
+        }
+        if details:
+            item["details"] = details
+        return item
+
+    if file_path != "SKILL.md":
+        return failures
+
+    if not text.startswith("---"):
+        return [failure(
+            "markdown.frontmatter.missing",
+            "SKILL.md 缺少 YAML frontmatter。",
+            "SKILL.md 必须以 YAML frontmatter 开始，并在正文前用单独一行 --- 闭合。",
+            "重新生成完整 SKILL.md：frontmatter 只放 metadata，闭合 --- 后写入非空 Markdown 正文。",
+        )]
+
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return [failure(
+            "markdown.frontmatter.boundary_invalid",
+            "SKILL.md frontmatter 起始边界异常。",
+            "第一行必须是单独的 ---。",
+            "修正文件开头 frontmatter 边界，并保留闭合后的正文。",
+        )]
+
+    close_idx = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            close_idx = idx
+            break
+    if close_idx is None:
+        return [failure(
+            "markdown.frontmatter.unclosed",
+            "SKILL.md frontmatter 没有收尾 ---，正文边界无法确定。",
+            "frontmatter 必须在正文前用单独一行 --- 闭合。",
+            "重新生成完整 SKILL.md，确保 metadata 和正文由闭合 --- 明确分隔。",
+        )]
+
+    raw_yaml = "".join(lines[1:close_idx])
+    body = "".join(lines[close_idx + 1:])
+    try:
+        parsed = yaml.safe_load(raw_yaml) or {}
+    except Exception as exc:
+        return [failure(
+            "markdown.frontmatter.invalid_yaml",
+            f"SKILL.md frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
+            "frontmatter 必须是合法 YAML object。",
+            "只修 frontmatter YAML；正文必须保留在闭合 --- 之后。",
+        )]
+    if not isinstance(parsed, dict):
+        failures.append(failure(
+            "markdown.frontmatter.not_object",
+            "SKILL.md frontmatter 必须是 YAML object。",
+            "frontmatter 只能承载 metadata key/value。",
+            "将正文级内容移到闭合 --- 之后，并修正 metadata object。",
+        ))
+
+    if not body.strip():
+        failures.append(failure(
+            "markdown.body.missing",
+            "SKILL.md frontmatter 后缺少非空 Markdown 正文。",
+            "闭合 --- 之后必须存在真实正文；frontmatter 不能吞掉正文。",
+            "重新生成完整 SKILL.md，在闭合 --- 后写入用途、执行步骤、资源和输出说明。",
+        ))
+
+    metadata_markdown_lines = [
+        idx + 2 for idx, line in enumerate(lines[1:close_idx])
+        if re.match(r"^\s{0,3}(#{1,6}\s+|[-*+]\s+|```|~~~|>\s+)", line)
+    ]
+    if metadata_markdown_lines:
+        failures.append(failure(
+            "markdown.frontmatter.contains_body_markdown",
+            "SKILL.md frontmatter 区域包含正文级 Markdown 结构，疑似正文被 metadata 区吞掉。",
+            "frontmatter 只能承载 YAML metadata；标题、列表、引用和 fenced block 必须在闭合 --- 之后。",
+            "移动正文 Markdown 到闭合 --- 后，frontmatter 只保留 metadata。",
+            {"line_numbers": metadata_markdown_lines[:20]},
+        ))
+
+    return failures
+
 def _basic_markdown_format_failures(file_path: str, content: str, *, require_frontmatter: bool) -> list[dict[str, Any]]:
     """Very small Markdown format gate.
 
@@ -3920,6 +4035,11 @@ def _basic_markdown_format_failures(file_path: str, content: str, *, require_fro
     """
     text = (content or "").lstrip("\ufeff")
     failures: list[dict[str, Any]] = []
+
+    if file_path == "SKILL.md":
+        structure_failures = _skill_md_body_structure_failures(file_path, content)
+        if structure_failures:
+            return structure_failures
 
     if require_frontmatter:
         if not text.startswith("---"):

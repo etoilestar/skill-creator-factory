@@ -1603,6 +1603,22 @@ async def write_file(request: WriteFileRequest):
 
     content = request.content or ""
 
+    if request.file_path == "SKILL.md":
+        format_failures = _basic_markdown_format_failures(
+            "SKILL.md",
+            content,
+            require_frontmatter=True,
+        )
+        if format_failures:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "markdown_format",
+                    "message": "SKILL.md frontmatter/body 结构校验失败，已阻止写入。",
+                    "failed_checks": format_failures,
+                },
+            )
+
     target_path = skill_dir / request.file_path
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(content, encoding="utf-8")

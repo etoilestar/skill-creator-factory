@@ -2873,8 +2873,9 @@ def detect_required_component_coverage(script_content: str, requirements: list[R
             continue
         component_terms = [str(item or "").strip().lower() for item in req.required_components if str(item or "").strip()]
         has_semantic_literal = any(_term_has_evidence(term, evidence) for term in component_terms)
-        if len(text.strip()) < 120 or (component_terms and evidence.get("generic_builders") and not has_semantic_literal):
-            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"No conservative static evidence that required components enter a constructed object/collection.","missing_evidence":["required component construction evidence"],"minimal_edit":"Add the required component into the current script's constructed blocks/items/sections/options or equivalent output object."})
+        has_core_path = bool(evidence.get("generic_builders") and evidence.get("output_writes") and (evidence.get("input_reads") or has_semantic_literal))
+        if len(text.strip()) < 120 or not has_core_path:
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"No conservative static evidence of an input-read → generic construction → output path for required components.","missing_evidence":["input_reads + generic_builders + output_writes"],"minimal_edit":"Add the required component into a generic constructed object and return/print it from the current script."})
     return issues
 
 
@@ -2887,11 +2888,10 @@ def detect_required_constraint_application(script_content: str, requirements: li
         required_constraints = [c for c in (req.constraints or []) if getattr(c, "required", True) and str(getattr(c, "source", "") or "") in {"user_explicit", "blueprint", "inferred"}]
         if not req.required or not required_constraints:
             continue
-        for constraint in required_constraints:
-            term_values = [str(getattr(constraint, "name", "") or ""), str(getattr(constraint, "value", "") or "")]
-            if not any(_term_has_evidence(term.lower(), evidence) for term in term_values if term.strip()):
-                issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"styles/options/config/parameters","reason":"No conservative static evidence that a required constraint is applied to styles/options/config/parameters.","missing_evidence":[f"constraint:{getattr(constraint, 'name', '') or getattr(constraint, 'kind', '')}"],"minimal_edit":"Apply the required constraint through a generic styles/options/config/parameters structure or equivalent builder argument."})
-                break
+        has_constraint_landing = bool(evidence.get("generic_builders"))
+        if not has_constraint_landing:
+            first = required_constraints[0]
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"styles/options/config/parameters","reason":"No conservative static evidence of any styles/options/config/parameters landing for required constraints.","missing_evidence":[f"constraint_landing:{getattr(first, 'name', '') or getattr(first, 'kind', '')}"],"minimal_edit":"Apply required constraints through a generic styles/options/config/parameters structure or equivalent builder argument."})
     return issues
 
 

@@ -139,7 +139,7 @@ def test_validator_error_stage_is_not_business_repair(monkeypatch):
     assert "not a business-file repair target" in source
 
 
-def test_requirement_extraction_uses_validator_model_as_primary(monkeypatch):
+def test_validator_graph_source_quality_marked(monkeypatch):
     import asyncio
     from backend.services.creator import api
 
@@ -148,21 +148,42 @@ def test_requirement_extraction_uses_validator_model_as_primary(monkeypatch):
 
     monkeypatch.setattr(api, "complete_chat_once", fake_complete)
     graph = asyncio.run(api._extract_requirement_graph_with_validator(blueprint_text="blueprint", files_out=[_script_spec()], requested_model=None))
+    assert graph.requirement_graph_source == "validator"
+    assert graph.requirement_graph_quality == "full"
     assert graph.requirements[0].id == "req_custom"
     assert graph.requirements[0].constraints[0].name == "format"
 
 
-def test_long_script_missing_required_component_static_fails():
+def test_fallback_graph_source_quality_marked():
+    graph = build_default_requirement_graph([_script_spec()])
+    assert graph.requirement_graph_source == "fallback"
+    assert graph.requirement_graph_quality == "fallback_coarse"
+
+
+def test_obvious_shell_missing_required_component_static_fails():
+    from backend.services.creator.repair import detect_required_component_coverage
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    source = "\n".join([
+        "def run():",
+        *[f"    value_{i} = {i}" for i in range(50)],
+        "    return {'ok': True}",
+    ])
+    issues = detect_required_component_coverage(source, [req])
+    assert issues and issues[0]["requirement_id"] == req.id
+
+
+def test_fallback_description_literal_missing_with_core_path_is_not_blocking():
     from backend.services.creator.repair import detect_required_component_coverage
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     source = "\n".join([
         "def run(payload):",
         "    blocks = []",
-        *[f"    value_{i} = {i}" for i in range(50)],
-        "    return {'ok': True, 'blocks': blocks}",
+        "    user_value = payload.get('anything')",
+        "    blocks.append({'type': 'section', 'value': user_value})",
+        *[f"    value_{i} = {i}" for i in range(20)],
+        "    return {'blocks': blocks}",
     ])
-    issues = detect_required_component_coverage(source, [req])
-    assert issues and issues[0]["requirement_id"] == req.id
+    assert detect_required_component_coverage(source, [req]) == []
 
 
 def test_required_constraint_missing_static_fails():
@@ -170,7 +191,7 @@ def test_required_constraint_missing_static_fails():
     from backend.services.creator.common import RequirementConstraint
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     req.constraints = [RequirementConstraint(name="portable", kind="format", value="portable", source="user_explicit", required=True)]
-    source = "def run(payload):\n    styles = {}\n    return {'ok': True, 'styles': styles}\n"
+    source = "def run(payload):\n    result = payload.get('x')\n    return {'ok': result}\n"
     issues = detect_required_constraint_application(source, [req])
     assert issues and issues[0]["requirement_id"] == req.id
 
@@ -226,3 +247,44 @@ def test_runtime_metadata_structured_policy_not_substring():
     metadata = {"styles": {}, "component_types": ["paragraph"], "constraint_values": {"unrelated": "semantic artifact"}}
     missing = e2e._structured_requirement_metadata_missing(req, metadata)
     assert "component_types contains table" in missing
+
+
+def test_e2e_validator_invalid_json_then_retry_valid_passes(monkeypatch):
+    from backend.services.creator import e2e
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    calls = iter(["not json", '{"passed": true, "advisory_notes": []}'])
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda messages, model: next(calls))
+    entry = build_skill_plan_entry(file_path="scripts/generic.py", purpose="inputs: topic outputs: artifact")
+    review = e2e._run_e2e_step_argument_effect_review(
+        command=e2e.E2EWorkflowCommand(1, "SKILL.md", "scripts/generic.py", "python scripts/generic.py '{}'", "python", {"topic": "{{topic}}"}),
+        script_content="def run(payload): return payload",
+        skill_plan_entry=entry,
+        rendered_payload={"topic": "x"},
+        stdout_json={"artifact": "ok"},
+        artifact_paths=[],
+        trace=e2e.E2EStepTrace(1, "scripts/generic.py", "", [], ["topic"], ["artifact"], ["artifact"], [], {}, {}),
+        previous_traces=[],
+    )
+    assert review["passed"] is True
+
+
+def test_e2e_validator_two_invalid_json_returns_validator_error(monkeypatch):
+    from backend.services.creator import e2e
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    calls = iter(["not json", "still not json"])
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda messages, model: next(calls))
+    entry = build_skill_plan_entry(file_path="scripts/generic.py", purpose="inputs: topic outputs: artifact")
+    review = e2e._run_e2e_step_argument_effect_review(
+        command=e2e.E2EWorkflowCommand(1, "SKILL.md", "scripts/generic.py", "python scripts/generic.py '{}'", "python", {"topic": "{{topic}}"}),
+        script_content="def run(payload): return payload",
+        skill_plan_entry=entry,
+        rendered_payload={"topic": "x"},
+        stdout_json={"artifact": "ok"},
+        artifact_paths=[],
+        trace=e2e.E2EStepTrace(1, "scripts/generic.py", "", [], ["topic"], ["artifact"], ["artifact"], [], {}, {}),
+        previous_traces=[],
+    )
+    assert review["passed"] is False
+    assert review["failure_type"] == "e2e_requirement_validator_error"

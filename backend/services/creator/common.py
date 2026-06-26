@@ -259,6 +259,8 @@ class RequirementItem(BaseModel):
 
 class RequirementGraph(BaseModel):
     requirements: list[RequirementItem] = Field(default_factory=list)
+    requirement_graph_source: str = "validator"
+    requirement_graph_quality: str = "full"
 
 
 def _requirement_id_for_file(path: str, suffix: str) -> str:
@@ -311,7 +313,7 @@ def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
                 owner_step=path,
                 kind="component",
                 required=required,
-                source="blueprint",
+                source="inferred",
                 description=purpose or f"Implement the declared responsibility for {path}.",
                 semantic_inputs=inputs,
                 semantic_outputs=outputs,
@@ -320,13 +322,18 @@ def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
                 evidence_policy={
                     "first_round": "Review semantic responsibility evidence in the target file without hard-gating field, variable, function, or tool names.",
                     "e2e": "Verify required semantic inputs are mapped, received, consumed, and reflected in stdout/runtime metadata when applicable.",
+                    "graph_quality": "fallback_coarse",
                 },
                 non_requirements=[
                     "exact field names", "exact variable names", "fixed function names",
                     "fixed helper/tool invocation style", "subjective quality wording",
                 ],
             ))
-    return RequirementGraph(requirements=items)
+    return RequirementGraph(
+        requirements=items,
+        requirement_graph_source="fallback",
+        requirement_graph_quality="fallback_coarse",
+    )
 
 
 def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]:
@@ -375,7 +382,9 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
         if not item.id.strip() or not item.target_file.strip() or not item.description.strip():
             raise RequirementGraphValidationError("Requirement item misses id, target_file, or description.", code="validator_incomplete", details={"index": idx, "item": merged})
         items.append(item)
-    return RequirementGraph(requirements=items)
+    source = str(data.get("requirement_graph_source") or data.get("source") or "validator") if isinstance(data, dict) else "validator"
+    quality = str(data.get("requirement_graph_quality") or data.get("quality") or "full") if isinstance(data, dict) else "full"
+    return RequirementGraph(requirements=items, requirement_graph_source=source, requirement_graph_quality=quality)
 
 
 def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:

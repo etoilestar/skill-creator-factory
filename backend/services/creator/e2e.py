@@ -973,44 +973,68 @@ def _run_e2e_step_argument_effect_review(
         },
     ]
 
-    try:
-        text = _complete_chat_once_sync_for_e2e(messages, route.model)
-    except Exception as exc:
-        logger.warning(
-            "[Creator][E2E][argument_effect_review_unavailable] step=%s script=%s error=%s",
-            command.ordinal,
-            command.script_path,
-            exc,
-        )
-        return {
-            "passed": False,
-            "failure_type": "e2e_requirement_validator_error",
-            "target_file": command.script_path if rendered_payload else "SKILL.md",
-            "layer": "e2e_requirement_validator_error",
-            "problem": f"E2E requirement validator unavailable: {type(exc).__name__}: {exc}",
-            "evidence": "validator unavailable; not a business-file failure",
-            "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
-            "model": route.model,
-        }
+    last_text = ""
+    data: dict[str, Any] | None = None
+    for review_attempt in range(2):
+        try:
+            active_messages = messages if review_attempt == 0 else [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一轮 E2E requirement validator 没有返回合法 JSON object。\n"
+                        "请只重试 JSON 格式；不要要求修改 SKILL.md 或脚本。\n"
+                        f"上一轮输出片段：{last_text[:1200]}"
+                    ),
+                },
+            ]
+            text = _complete_chat_once_sync_for_e2e(active_messages, route.model)
+            last_text = str(text or "")
+        except Exception as exc:
+            if review_attempt == 0:
+                last_text = f"validator unavailable: {type(exc).__name__}: {exc}"
+                continue
+            logger.warning(
+                "[Creator][E2E][argument_effect_review_unavailable] step=%s script=%s error=%s",
+                command.ordinal,
+                command.script_path,
+                exc,
+            )
+            return {
+                "passed": False,
+                "failure_type": "e2e_requirement_validator_error",
+                "target_file": command.script_path if rendered_payload else "SKILL.md",
+                "layer": "e2e_requirement_validator_error",
+                "problem": f"E2E requirement validator unavailable: {type(exc).__name__}: {exc}",
+                "evidence": "validator unavailable after format retry; not a business-file failure",
+                "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
+                "model": route.model,
+            }
 
-    data = _parse_validator_json_object(text)
-    if not isinstance(data, dict) or not data:
+        parsed = _parse_validator_json_object(last_text)
+        if isinstance(parsed, dict) and parsed:
+            data = parsed
+            break
+        if review_attempt == 0:
+            continue
         logger.warning(
             "[Creator][E2E][argument_effect_review_invalid_json] step=%s script=%s raw=%s",
             command.ordinal,
             command.script_path,
-            str(text or "")[:1000],
+            last_text[:1000],
         )
         return {
             "passed": False,
             "failure_type": "e2e_requirement_validator_error",
             "target_file": command.script_path if rendered_payload else "SKILL.md",
             "layer": "e2e_requirement_validator_error",
-            "problem": "E2E requirement validator did not return valid JSON.",
-            "evidence": str(text or "")[:1000],
+            "problem": "E2E requirement validator did not return valid JSON after format retry.",
+            "evidence": last_text[:1000],
             "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
             "model": route.model,
         }
+
+    data = data or {}
 
     if data.get("passed") is True:
         return {

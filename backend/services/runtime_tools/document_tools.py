@@ -8,6 +8,7 @@ these helpers exist and are platform-owned.
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 from pathlib import Path
@@ -422,52 +423,170 @@ def create_pdf(
     )
 
 
+def _rows_from_tabular(headers: Any = None, rows: Any = None) -> tuple[list[str], list[list[Any]]]:
+    if rows is None:
+        rows = []
+    if isinstance(rows, dict):
+        rows = rows.get("rows") or []
+    if not isinstance(rows, list):
+        rows = list(rows) if rows is not None else []
+    if rows and all(isinstance(item, dict) for item in rows):
+        columns = [str(value) for value in (headers or [])]
+        for row in rows:
+            for key in row.keys():
+                if str(key) not in columns:
+                    columns.append(str(key))
+        return columns, [[row.get(column) for column in columns] for row in rows]
+    matrix = [list(row) if isinstance(row, (list, tuple)) else [row] for row in rows]
+    columns = [str(value) for value in (headers or [])]
+    if not columns and matrix:
+        columns = [f"Column{index}" for index in range(1, max(len(row) for row in matrix) + 1)]
+    return columns, matrix
+
+
 def create_docx(
-    text: str | Iterable[Any],
+    text: str | Iterable[Any] | None = None,
     *,
+    blocks: list[dict[str, Any]] | dict[str, Any] | str | Iterable[Any] | None = None,
+    paragraphs: Iterable[Any] | None = None,
     output_path: str | os.PathLike[str] | None = None,
     output_dir: str | os.PathLike[str] | None = None,
     filename: str = "output.docx",
     title: str | None = None,
 ) -> dict[str, Any]:
-    """Create a Word document and return JSON-serializable paths."""
+    """Create a Word document with text, blocks, lists, tables, and images."""
     docx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    if not docx_path.name.lower().endswith(".docx"):
+        docx_path = docx_path.with_suffix(".docx")
 
     from docx import Document
 
     document = Document()
+    source_blocks = blocks if blocks is not None else paragraphs if paragraphs is not None else text
+    normalized = _normalize_document_blocks(source_blocks or "Generated document")
     if title:
         document.add_heading(str(title), level=1)
-    for line in _coerce_lines(text):
-        document.add_paragraph(str(line))
+    for block in normalized:
+        block_type = str(block.get("type") or "paragraph").lower()
+        if block_type == "title":
+            document.add_heading(str(block.get("text") or ""), level=0)
+        elif block_type == "heading":
+            level = max(1, min(int(block.get("level") or 1), 9))
+            document.add_heading(str(block.get("text") or ""), level=level)
+        elif block_type == "list":
+            for item in block.get("items") or []:
+                document.add_paragraph(str(item), style="List Bullet")
+        elif block_type == "table":
+            headers, rows = _rows_from_tabular(block.get("headers"), block.get("rows"))
+            table_rows = ([headers] if headers else []) + rows
+            if table_rows:
+                width = max(len(row) for row in table_rows) or 1
+                table = document.add_table(rows=len(table_rows), cols=width)
+                table.style = "Table Grid"
+                for r_idx, row in enumerate(table_rows):
+                    for c_idx in range(width):
+                        table.cell(r_idx, c_idx).text = str(row[c_idx] if c_idx < len(row) and row[c_idx] is not None else "")
+        elif block_type == "image":
+            raw_path = str(block.get("path") or block.get("image_path") or "").strip()
+            if raw_path:
+                document.add_picture(str(_safe_input_path(raw_path, {".png", ".jpg", ".jpeg", ".webp"})))
+                if block.get("caption"):
+                    document.add_paragraph(str(block.get("caption")))
+        else:
+            document.add_paragraph(str(block.get("text") or block.get("content") or ""))
     document.save(str(docx_path))
-    return {"docx_path": str(docx_path), "file_paths": [str(docx_path)], "file_outputs": [str(docx_path)]}
+    return _artifact_result(docx_path, artifact_type="docx")
 
 
 def create_pptx(
-    slides: str | Iterable[Any],
+    slides: str | Iterable[Any] | None = None,
     *,
     output_path: str | os.PathLike[str] | None = None,
     output_dir: str | os.PathLike[str] | None = None,
     filename: str = "output.pptx",
     title: str = "Generated Presentation",
 ) -> dict[str, Any]:
-    """Create a simple PowerPoint deck and return JSON-serializable paths."""
+    """Create a PowerPoint deck with title, content, list, image, and table slides."""
     pptx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    if not pptx_path.name.lower().endswith(".pptx"):
+        pptx_path = pptx_path.with_suffix(".pptx")
 
     from pptx import Presentation
+    from pptx.util import Inches
 
     prs = Presentation()
-    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
-    title_slide.shapes.title.text = str(title or "Generated Presentation")
-    title_slide.placeholders[1].text = "Created by Superskills runtime tools"
-
-    for index, line in enumerate(_coerce_lines(slides), start=1):
-        slide = prs.slides.add_slide(prs.slide_layouts[1])
-        slide.shapes.title.text = f"Slide {index}"
-        slide.placeholders[1].text = str(line)
+    normalized = _normalize_document_blocks(slides or [{"type": "title", "text": title}])
+    if not any(str(b.get("type")).lower() == "title" for b in normalized):
+        normalized.insert(0, {"type": "title", "text": title})
+    for index, block in enumerate(normalized, start=1):
+        block_type = str(block.get("type") or "content").lower()
+        if block_type == "title":
+            slide = prs.slides.add_slide(prs.slide_layouts[0])
+            slide.shapes.title.text = str(block.get("text") or title)
+            slide.placeholders[1].text = str(block.get("subtitle") or "")
+        elif block_type == "image":
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = str(block.get("title") or f"Slide {index}")
+            raw_path = str(block.get("path") or block.get("image_path") or "").strip()
+            if raw_path:
+                slide.shapes.add_picture(str(_safe_input_path(raw_path, {".png", ".jpg", ".jpeg", ".webp"})), Inches(1), Inches(1.5), width=Inches(8))
+        elif block_type == "table":
+            headers, rows = _rows_from_tabular(block.get("headers"), block.get("rows"))
+            data = ([headers] if headers else []) + rows or [[""]]
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = str(block.get("title") or f"Slide {index}")
+            table = slide.shapes.add_table(len(data), max(len(r) for r in data), Inches(0.5), Inches(1.5), Inches(9), Inches(4)).table
+            for r_idx, row in enumerate(data):
+                for c_idx in range(len(table.columns)):
+                    table.cell(r_idx, c_idx).text = str(row[c_idx] if c_idx < len(row) and row[c_idx] is not None else "")
+        else:
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = str(block.get("title") or block.get("heading") or f"Slide {index}")
+            body = slide.placeholders[1].text_frame
+            body.clear()
+            items = block.get("items") if block_type == "list" else None
+            lines = items if isinstance(items, list) else _coerce_lines(block.get("text") or block.get("content") or "")
+            for i, line in enumerate(lines):
+                para = body.paragraphs[0] if i == 0 else body.add_paragraph()
+                para.text = str(line)
+                para.level = 0
     prs.save(str(pptx_path))
-    return {"pptx_path": str(pptx_path), "file_paths": [str(pptx_path)], "file_outputs": [str(pptx_path)]}
+    return _artifact_result(pptx_path, artifact_type="pptx")
+
+
+def create_xlsx(sheets: Any = None, *, headers: Any = None, rows: Any = None, output_path: str | os.PathLike[str] | None = None, output_dir: str | os.PathLike[str] | None = None, filename: str = "output.xlsx") -> dict[str, Any]:
+    """Create an XLSX workbook from sheets or headers/rows."""
+    xlsx_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    if not xlsx_path.name.lower().endswith(".xlsx"):
+        xlsx_path = xlsx_path.with_suffix(".xlsx")
+    from openpyxl import Workbook
+    wb = Workbook()
+    sheet_specs = sheets if isinstance(sheets, list) and sheets else [{"name": "Sheet1", "headers": headers, "rows": rows or []}]
+    wb.remove(wb.active)
+    for idx, spec in enumerate(sheet_specs, start=1):
+        spec = spec if isinstance(spec, dict) else {"name": f"Sheet{idx}", "rows": spec}
+        ws = wb.create_sheet(str(spec.get("name") or f"Sheet{idx}")[:31])
+        cols, matrix = _rows_from_tabular(spec.get("headers"), spec.get("rows"))
+        if cols:
+            ws.append(cols)
+        for row in matrix:
+            ws.append(list(row))
+    wb.save(str(xlsx_path))
+    return _artifact_result(xlsx_path, artifact_type="xlsx")
+
+
+def create_csv(headers: Any = None, rows: Any = None, *, output_path: str | os.PathLike[str] | None = None, output_dir: str | os.PathLike[str] | None = None, filename: str = "output.csv", encoding: str = "utf-8") -> dict[str, Any]:
+    """Create a CSV file from headers and dict/list rows using the stdlib csv module."""
+    csv_path = _output_path(output_path=output_path, output_dir=output_dir, filename=filename)
+    if not csv_path.name.lower().endswith(".csv"):
+        csv_path = csv_path.with_suffix(".csv")
+    columns, matrix = _rows_from_tabular(headers, rows or [])
+    with csv_path.open("w", newline="", encoding=encoding) as file_obj:
+        writer = csv.writer(file_obj)
+        if columns:
+            writer.writerow(columns)
+        writer.writerows(matrix)
+    return _artifact_result(csv_path, artifact_type="csv")
 
 
 def extract_pdf_text(path: str | os.PathLike[str], *, max_pages: int | None = None) -> dict[str, Any]:
@@ -566,6 +685,28 @@ def read_spreadsheet(path: str | os.PathLike[str], sheet_name: str | None = None
             break
         rows.append({columns[i] if i < len(columns) else f"Column{i+1}": value for i, value in enumerate(values)})
     return {"sheets": workbook.sheetnames, "columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated, "source_path": str(safe_path)}
+
+
+def read_csv(path: str | os.PathLike[str], max_rows: int = 500, encoding: str = "utf-8") -> dict[str, Any]:
+    """Read a CSV file into structured rows and columns."""
+    max_rows = max(1, min(int(max_rows or 500), 5000))
+    if _trial():
+        return {"columns": ["A", "B"], "rows": [{"A": "mock", "B": "value"}], "row_count": 1, "truncated": False, "text": "A,B\nmock,value", "source_path": str(path)}
+    safe_path = _safe_input_path(path, {".csv", ".tsv"})
+    delimiter = "\t" if safe_path.suffix.lower() == ".tsv" else ","
+    with safe_path.open(newline="", encoding=encoding) as file_obj:
+        reader = csv.reader(file_obj, delimiter=delimiter)
+        header = next(reader, [])
+        columns = [str(value) if value not in (None, "") else f"Column{index}" for index, value in enumerate(header, start=1)]
+        rows = []
+        truncated = False
+        for index, values in enumerate(reader, start=1):
+            if index > max_rows:
+                truncated = True
+                break
+            rows.append({columns[i] if i < len(columns) else f"Column{i+1}": value for i, value in enumerate(values)})
+    text = "\n".join([",".join(columns)] + [",".join(str(row.get(column, "")) for column in columns) for row in rows])
+    return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated, "text": text, "source_path": str(safe_path)}
 
 
 def merge_pdfs(pdf_paths: list[str], output_path: str | os.PathLike[str] | None = None) -> dict[str, Any]:

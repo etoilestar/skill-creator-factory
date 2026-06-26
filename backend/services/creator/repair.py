@@ -2759,42 +2759,30 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
-def _issue_severity_is_blocking(item: dict[str, Any]) -> bool:
-    severity = str(item.get("severity") or "").strip().lower()
-    if severity in {"blocking", "blocker", "error", "critical"}:
-        return True
-    if item.get("blocking") is True:
-        return True
-    return False
+def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids: set[str]) -> bool:
+    """Backend-owned blocking predicate for first-round responsibility clues.
 
-
-def _issue_structurally_advisory(item: dict[str, Any], required_ids: set[str] | None = None) -> bool:
+    Do not use severity/warning/advisory wording as the gate. A model item is
+    actionable only when it structurally points at a required requirement and
+    reports missing evidence that can be repaired in the current file.
+    """
     if not isinstance(item, dict):
-        return True
-    required_ids = required_ids or set()
+        return False
     rid = str(item.get("requirement_id") or "").strip()
     if not rid or (required_ids and rid not in required_ids):
-        return True
-    scope_kind = str(item.get("scope") or item.get("kind") or item.get("category") or item.get("issue_type") or "").strip().lower()
-    if scope_kind in {"validator_advisory", "advisory", "note", "info", "warning"}:
-        return True
-    severity = str(item.get("severity") or "").strip().lower()
-    if severity in {"warning", "info", "note", "advisory"}:
-        return True
-    if item.get("blocking") is False:
-        return True
+        return False
     if str(item.get("evidence_level") or "").strip().lower() != "missing":
-        return True
+        return False
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
-        return True
-    return False
+        return False
+    # Scope is normalized by the backend when producing the repair issue; do
+    # not infer blocking from advisory/severity/scope wording.
+    return True
 
 
 def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str]) -> bool:
-    if _issue_structurally_advisory(item, required_ids):
-        return False
-    return _issue_severity_is_blocking(item)
+    return _is_structured_missing_required_evidence(item, required_ids)
 
 
 def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
@@ -2829,24 +2817,30 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
     if missing:
         return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
     blocking: list[dict[str, Any]] = []
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
+    candidate_items = [item for item in checks if isinstance(item, dict)]
+    candidate_items.extend(item for item in advisory_notes if isinstance(item, dict))
+    seen_blockers: set[tuple[str, tuple[str, ...]]] = set()
+    for check in candidate_items:
         rid = str(check.get("requirement_id") or "")
         if not _is_blocking_requirement_check(check, required_ids):
-            advisory_notes.append(check)
+            if check not in advisory_notes:
+                advisory_notes.append(check)
             continue
         missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
+        key = (rid, tuple(str(item) for item in missing_evidence))
+        if key in seen_blockers:
+            continue
+        seen_blockers.add(key)
         blocking.append({
                 "id": "script_requirement_failed",
                 "requirement_id": rid,
                 "failed_file": file_path,
                 "failed_function": "current script",
-                "code_region": str(check.get("target_file") or file_path),
-                "reason": str(check.get("reason") or "Required requirement lacks implementation evidence."),
+                "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
+                "reason": str(check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
                 "missing_evidence": missing_evidence,
-                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement."),
-                "allowed_scope": "Only modify the current script responsibility implementation area.",
+                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
+                "allowed_scope": "current file only",
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
                 "details": {"check": check},
             })
@@ -2866,20 +2860,17 @@ def _detect_script_responsibility_static_blockers(
     product/helper/output path. Field aliases, variable names, and extra stdout
     metadata are not treated as failures.
     """
-    req_items = _coerce_requirement_items(requirements)
+    req_items = [req for req in _coerce_requirement_items(requirements) if getattr(req, "required", False)]
+    if not req_items or not str(script_content or "").strip():
+        return []
     required_inputs: list[tuple[str, str, str]] = []
-    for value in (getattr(skill_plan_entry, "inputs", []) or []):
-        text = str(value or "").strip()
-        if text:
-            required_inputs.append(("skill_plan_input", text, ""))
     for req in req_items:
-        if not getattr(req, "required", False):
-            continue
-        for value in getattr(req, "semantic_inputs", []) or []:
-            text = str(value or "").strip()
-            if text:
-                required_inputs.append(("requirement", text, req.id))
-    if not required_inputs or not str(script_content or "").strip():
+        semantic_inputs = [str(value or "").strip() for value in (getattr(req, "semantic_inputs", []) or []) if str(value or "").strip()]
+        if not semantic_inputs:
+            semantic_inputs = [str(value or "").strip() for value in (getattr(skill_plan_entry, "inputs", []) or []) if str(value or "").strip()]
+        for text in semantic_inputs:
+            required_inputs.append(("requirement", text, req.id))
+    if not required_inputs:
         return []
 
     try:
@@ -2888,8 +2879,13 @@ def _detect_script_responsibility_static_blockers(
         return []
 
     input_roots = {"payload", "argv", "args", "input", "inputs", "data", "context", "params", "config", "options"}
-    core_names = {"blocks", "sections", "items", "pages", "document", "documents", "rows", "table", "tables", "content", "contents", "result", "results", "artifact", "artifacts", "output", "outputs"}
-    helper_terms = ("create", "render", "build", "generate", "write", "save", "export", "document", "pdf", "image", "text", "table", "file", "page", "section", "block")
+    structural_core_names = {"blocks", "sections", "items", "pages", "document", "documents", "rows", "table", "tables", "content", "contents", "result", "results", "artifact", "artifacts", "output", "outputs"}
+    declared_outputs = {str(value or "").strip() for value in (getattr(skill_plan_entry, "outputs", []) or []) if str(value or "").strip()}
+    artifact_contract = getattr(skill_plan_entry, "artifact_contract", None)
+    if isinstance(artifact_contract, dict):
+        declared_outputs.update(str(key) for key in artifact_contract.keys())
+    core_names = structural_core_names | declared_outputs
+    helper_terms = tuple(sorted(structural_core_names | {part for output in declared_outputs for part in re.split(r"[^A-Za-z0-9]+", output) if part}))
 
     aliases: set[str] = set()
     core_vars: set[str] = set()
@@ -2950,7 +2946,7 @@ def _detect_script_responsibility_static_blockers(
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for arg in node.args.args:
-                if arg.arg in input_roots:
+                if arg.arg:
                     aliases.add(arg.arg)
         if isinstance(node, ast.Assign):
             if _contains_input_read(node.value):
@@ -3004,13 +3000,11 @@ def _detect_script_responsibility_static_blockers(
     if weak_evidence or (has_input_read and has_tainted_core and has_core_output):
         return []
 
-    requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), None)
-    if not requirement_id and req_items:
-        requirement_id = req_items[0].id
-    failed_file = getattr(skill_plan_entry, "path", "") or (req_items[0].target_file if req_items else "")
+    requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), req_items[0].id)
+    failed_file = getattr(skill_plan_entry, "path", "") or req_items[0].target_file
     return [{
         "id": "script_requirement_failed",
-        "requirement_id": requirement_id or "required_input",
+        "requirement_id": requirement_id,
         "failed_file": failed_file,
         "failed_function": "current script",
         "code_region": "run() input and product construction path",

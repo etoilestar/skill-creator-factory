@@ -80,6 +80,45 @@ def test_requirement_review_requires_check_coverage_and_missing_evidence_for_blo
 
 
 
+
+def test_warning_with_required_missing_evidence_is_backend_blocking():
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "checks": [{
+                "requirement_id": req.id,
+                "severity": "warning",
+                "evidence_level": "missing",
+                "missing_evidence": ["core product construction"],
+                "allowed_scope": "advisory text should not decide blocking",
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["failure_type"] == "script_requirement_failed"
+
+
+def test_advisory_collection_with_required_missing_evidence_is_backend_blocking():
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "checks": [{"requirement_id": req.id, "evidence_level": "present", "missing_evidence": []}],
+            "advisory_notes": [{
+                "requirement_id": req.id,
+                "evidence_level": "missing",
+                "missing_evidence": ["helper result output"],
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["allowed_scope"] == "current file only"
+
 def test_static_responsibility_blocks_required_input_not_in_core_path():
     spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
     req = build_default_requirement_graph([spec]).requirements[0]

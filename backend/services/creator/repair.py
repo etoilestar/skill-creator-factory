@@ -1,6 +1,7 @@
 """Repair scope, diff application, and generated-file repair helpers."""
 
 from .common import *  # noqa: F403
+from collections.abc import Mapping, Sequence
 
 
 def _failure_layer_from_error_text(error_text: str) -> str | None:
@@ -154,8 +155,8 @@ def _format_diff_response_violation(error: Exception, raw_text: str) -> str:
     return (
         "FORMAT_VIOLATION：上一次输出不是可接受的 repair diff proposal。\n"
         f"解析错误：{type(error).__name__}: {error}\n\n"
-        "你必须重新输出严格 JSON object，且只包含 target_file、reason、diff。\n"
-        "diff 必须是 single-file unified diff，必须包含 ---、+++、@@ hunk。\n"
+        "你必须重新输出严格 JSON object，且只包含 target_file、reason、edits 或 diff。\n"
+        "首选 edits[].old_lines/new_lines；diff 必须是 single-file unified diff，必须包含 ---、+++、@@ hunk。\n"
         "禁止输出完整文件源码。\n"
         "禁止输出 Markdown 解释。\n"
         "禁止新增、删除或修改其它文件。\n\n"
@@ -164,6 +165,109 @@ def _format_diff_response_violation(error: Exception, raw_text: str) -> str:
         f"{str(raw_text or '')[:4000]}\n"
         "```"
     )
+
+class CreatorRepairProposalParseError(ValueError):
+    """Structured parse error for repair proposal UI/events."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        parser_error: str = "",
+        last_output_excerpt: str = "",
+        diff_extraction_attempted: bool = False,
+        lines_fallback_attempted: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.parser_error = parser_error or message
+        self.last_output_excerpt = str(last_output_excerpt or "")[:4000]
+        self.diff_extraction_attempted = diff_extraction_attempted
+        self.lines_fallback_attempted = lines_fallback_attempted
+
+
+_PATCH_SCHEMA_KEYS = {
+    "target_file", "reason", "edits", "old", "new", "old_lines", "new_lines", "diff", "unified_diff"
+}
+
+
+def _extract_patch_like_json_text(text: str) -> str | None:
+    """Return a likely patch-proposal object text without accepting arbitrary JSON."""
+    raw = str(text or "")
+    first = _extract_first_json_object_text(raw)
+    if first and any(f'"{key}"' in first for key in _PATCH_SCHEMA_KEYS):
+        return first
+    fenced = re.search(r"```(?:json|text)?\s*({[\s\S]*?})\s*```", raw, re.I)
+    if fenced and any(f'"{key}"' in fenced.group(1) for key in _PATCH_SCHEMA_KEYS):
+        return fenced.group(1)
+    return None
+
+
+def _extract_diff_payload_from_malformed_patch_text(text: str) -> str | None:
+    """Conservatively recover only unified-diff payloads from malformed patch proposals."""
+    raw = str(text or "")
+    for match in re.finditer(r"```(?:diff|patch)?\s*([\s\S]*?)```", raw, re.I):
+        candidate = match.group(1).strip()
+        if _looks_like_unified_diff(candidate):
+            return candidate
+
+    key_match = re.search(r'"(?:diff|unified_diff)"\s*:\s*', raw)
+    search_area = raw[key_match.end():] if key_match else raw
+    lines = search_area.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("--- ")), None)
+    if start is None:
+        return None
+    diff_lines: list[str] = []
+    for line in lines[start:]:
+        stripped = line.rstrip()
+        if diff_lines and re.match(r'^\s*[,}]\s*$', stripped):
+            break
+        diff_lines.append(stripped.rstrip('"').rstrip("\\n"))
+    candidate = "\n".join(diff_lines).strip()
+    return candidate if _looks_like_unified_diff(candidate) else None
+
+
+def _coerce_patch_schema_fields(parsed: dict[str, Any], *, expected_target_file: str) -> CreatorDiffProposal:
+    """Coerce and validate only CreatorDiffProposal schema fields."""
+    allowed = {key: parsed.get(key) for key in _PATCH_SCHEMA_KEYS if key in parsed}
+    target_file = _strip_diff_path_prefix(allowed.get("target_file") or expected_target_file)
+    if target_file != expected_target_file:
+        raise ValueError(
+            f"patch target_file 不匹配：expected={expected_target_file!r}, actual={target_file!r}"
+        )
+    reason = str(allowed.get("reason") or parsed.get("summary") or "").strip()
+    edits = allowed.get("edits")
+    if isinstance(edits, list) and edits:
+        normalized_edits: list[dict[str, str]] = []
+        for index, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                raise ValueError(f"edits[{index}] 必须是 object。")
+            old = edit.get("old")
+            new = edit.get("new")
+            if old is None and isinstance(edit.get("old_lines"), list):
+                if not all(isinstance(line, str) for line in edit["old_lines"]):
+                    raise ValueError(f"edits[{index}].old_lines 必须是字符串数组。")
+                old = "\n".join(edit["old_lines"])
+            if new is None and isinstance(edit.get("new_lines"), list):
+                if not all(isinstance(line, str) for line in edit["new_lines"]):
+                    raise ValueError(f"edits[{index}].new_lines 必须是字符串数组。")
+                new = "\n".join(edit["new_lines"])
+            if not isinstance(old, str) or not old:
+                raise ValueError(f"edits[{index}].old/old_lines 必须是非空字符串。")
+            if not isinstance(new, str):
+                raise ValueError(f"edits[{index}].new/new_lines 必须是字符串。")
+            normalized_edits.append({"old": old, "new": new})
+        return CreatorDiffProposal(target_file=target_file, reason=reason, edits=normalized_edits, raw=allowed, mode="exact_replace")
+
+    diff = str(allowed.get("diff") or allowed.get("unified_diff") or "").strip()
+    diff = _strip_outer_code_fence(diff)
+    if diff:
+        if not _looks_like_unified_diff(diff):
+            raise ValueError("JSON 中的 diff 不是 unified diff。")
+        old_path, new_path = _unified_diff_target_files(diff)
+        if new_path != expected_target_file or old_path not in {expected_target_file, new_path}:
+            raise ValueError(f"diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}")
+        return CreatorDiffProposal(target_file=target_file, reason=reason, diff=diff, raw=allowed, mode="unified_diff")
+    raise ValueError("修复模型返回 JSON，但没有 edits，也没有 diff/unified_diff。")
 
 def _extract_json_or_diff_proposal(
     text: str,
@@ -189,104 +293,45 @@ def _extract_json_or_diff_proposal(
     stripped = _strip_outer_code_fence(raw_text)
 
     parsed: dict[str, Any] | None = None
+    parser_error = ""
+    diff_extraction_attempted = False
+    lines_fallback_attempted = False
 
     try:
         maybe_json = json.loads(stripped)
         if isinstance(maybe_json, dict):
             parsed = maybe_json
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        parser_error = f"{type(exc).__name__}: {exc}"
         parsed = None
 
     if parsed is None:
-        json_text = _extract_first_json_object_text(raw_text)
+        json_text = _extract_patch_like_json_text(raw_text)
         if json_text:
             try:
                 maybe_json = json.loads(json_text)
                 if isinstance(maybe_json, dict):
                     parsed = maybe_json
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                parser_error = f"{type(exc).__name__}: {exc}"
                 parsed = None
 
     if isinstance(parsed, dict):
-        target_file = _strip_diff_path_prefix(parsed.get("target_file") or expected_target_file)
-        if target_file != expected_target_file:
-            raise ValueError(
-                f"patch target_file 不匹配：expected={expected_target_file!r}, actual={target_file!r}"
-            )
+        lines_fallback_attempted = True
+        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file)
 
-        reason = str(parsed.get("reason") or parsed.get("summary") or "").strip()
-
-        edits = parsed.get("edits")
-        if isinstance(edits, list) and edits:
-            normalized_edits: list[dict[str, str]] = []
-
-            for index, edit in enumerate(edits):
-                if not isinstance(edit, dict):
-                    raise ValueError(f"edits[{index}] 必须是 object。")
-
-                old = edit.get("old")
-                new = edit.get("new")
-
-                if old is None and isinstance(edit.get("old_lines"), list):
-                    if not all(isinstance(line, str) for line in edit["old_lines"]):
-                        raise ValueError(f"edits[{index}].old_lines 必须是字符串数组。")
-                    old = "\n".join(edit["old_lines"])
-
-                if new is None and isinstance(edit.get("new_lines"), list):
-                    if not all(isinstance(line, str) for line in edit["new_lines"]):
-                        raise ValueError(f"edits[{index}].new_lines 必须是字符串数组。")
-                    new = "\n".join(edit["new_lines"])
-
-                if not isinstance(old, str) or not old:
-                    raise ValueError(f"edits[{index}].old/old_lines 必须是非空字符串。")
-
-                if not isinstance(new, str):
-                    raise ValueError(f"edits[{index}].new/new_lines 必须是字符串。")
-
-                normalized_edits.append({"old": old, "new": new})
-
-            return CreatorDiffProposal(
-                target_file=target_file,
-                reason=reason,
-                edits=normalized_edits,
-                raw=parsed,
-                mode="exact_replace",
-            )
-
-        diff = str(parsed.get("diff") or parsed.get("unified_diff") or "").strip()
-        diff = _strip_outer_code_fence(diff)
-
-        if diff:
-            if not _looks_like_unified_diff(diff):
-                raise ValueError(
-                    "JSON 中的 diff 不是 unified diff。"
-                    "如果使用 diff，必须包含 ---、+++、@@。"
-                    "更推荐使用 edits old/new exact_replace 格式。"
-                )
-
-            old_path, new_path = _unified_diff_target_files(diff)
-
-            if new_path != expected_target_file:
-                raise ValueError(
-                    f"diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}"
-                )
-
-            if old_path not in {expected_target_file, new_path}:
-                raise ValueError(
-                    f"diff old file 不匹配：expected={expected_target_file!r}, actual={old_path!r}"
-                )
-
-            return CreatorDiffProposal(
-                target_file=target_file,
-                reason=reason,
-                diff=diff,
-                raw=parsed,
-                mode="unified_diff",
-            )
-
-        raise ValueError(
-            "修复模型返回 JSON，但没有 edits，也没有 diff/unified_diff。"
-            "请使用 edits old/new exact_replace 格式。"
+    diff_extraction_attempted = True
+    recovered_diff = _extract_diff_payload_from_malformed_patch_text(raw_text)
+    if recovered_diff:
+        old_path, new_path = _unified_diff_target_files(recovered_diff)
+        if new_path != expected_target_file or old_path not in {expected_target_file, new_path}:
+            raise ValueError(f"recovered diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}")
+        return CreatorDiffProposal(
+            target_file=expected_target_file,
+            reason="recovered unified diff proposal",
+            diff=recovered_diff,
+            raw={"target_file": expected_target_file, "diff": recovered_diff},
+            mode="unified_diff",
         )
 
     raw_diff = stripped
@@ -295,9 +340,14 @@ def _extract_json_or_diff_proposal(
         raw_diff = fence_match.group(1).strip()
 
     if not _looks_like_unified_diff(raw_diff):
-        raise ValueError(
+        raise CreatorRepairProposalParseError(
             "修复模型没有返回 exact_replace JSON，也没有返回 raw unified diff。"
             "如果输出的是完整源码，必须拒绝并要求模型重新输出 edits old/new patch。"
+            ,
+            parser_error=parser_error or "no patch-schema JSON or unified diff found",
+            last_output_excerpt=raw_text,
+            diff_extraction_attempted=diff_extraction_attempted,
+            lines_fallback_attempted=lines_fallback_attempted,
         )
 
     old_path, new_path = _unified_diff_target_files(raw_diff)
@@ -524,6 +574,88 @@ def _find_approximate_substring_span(content: str, query: str) -> dict[str, Any]
 
 class CreatorRepairNoopPatch(ValueError):
     """Raised when a proposal contains no effective edits and should not consume normal retries."""
+
+def _locate_failure_evidence_span(content: str, evidence: str) -> tuple[int, int, str] | None:
+    evidence = str(evidence or "").strip()
+    if not evidence:
+        return None
+    count = content.count(evidence)
+    if count == 1:
+        start = content.find(evidence)
+        return start, start + len(evidence), "exact"
+    span = _find_unique_normalized_span(content, evidence)
+    if span is not None:
+        return span[0], span[1], "normalized_exact"
+    approx = _find_approximate_substring_span(content, evidence)
+    if approx.get("accepted"):
+        return int(approx["start"]), int(approx["end"]), "approximate_substring"
+    return None
+
+
+def _build_deterministic_patch_from_failure(
+    *,
+    failure: Mapping[str, Any],
+    current_content: str,
+    target_file: str,
+) -> CreatorDiffProposal | None:
+    """Build a schema-safe micro patch from structured failure fields only."""
+    if str(failure.get("target") or failure.get("target_file") or target_file) not in {target_file, "SKILL.md"}:
+        return None
+    evidence = (
+        failure.get("evidence")
+        or (failure.get("details") or {}).get("evidence")
+        or (failure.get("details") or {}).get("matched_excerpt")
+    )
+    minimal = failure.get("minimal_edit")
+    if not isinstance(minimal, Mapping):
+        return None
+    op = str(minimal.get("op") or minimal.get("operation") or "").lower()
+    replacement = minimal.get("new") if "new" in minimal else minimal.get("replacement")
+    append_text = minimal.get("text")
+    located = _locate_failure_evidence_span(current_content, str(evidence or ""))
+    if located is None:
+        return None
+    start, end, _kind = located
+    old = current_content[start:end]
+    if op in {"replace", "delete"}:
+        new = "" if op == "delete" else replacement
+    elif op == "append":
+        new = old + str(append_text or "")
+    else:
+        return None
+    if not isinstance(new, str) or old == new:
+        return None
+    return CreatorDiffProposal(
+        target_file=target_file,
+        reason="deterministic micro patch from structured failure evidence/minimal_edit",
+        edits=[{"old": old, "new": new}],
+        raw={"target_file": target_file, "edits": [{"old": old, "new": new}]},
+        mode="exact_replace",
+    )
+
+
+def _apply_deterministic_micro_patch_if_safe(
+    *,
+    failures: Sequence[Mapping[str, Any]] | None,
+    current_content: str,
+    scope: CreatorRepairScope,
+) -> tuple[CreatorDiffProposal, str, dict[str, Any]] | None:
+    for failure in failures or []:
+        proposal = _build_deterministic_patch_from_failure(
+            failure=failure,
+            current_content=current_content,
+            target_file=scope.target_file,
+        )
+        if proposal is None:
+            continue
+        candidate, stats = _validate_repair_diff_scope(
+            proposal=proposal,
+            current_content=current_content,
+            scope=scope,
+        )
+        stats["mode"] = "deterministic_micro_patch"
+        return proposal, candidate, stats
+    return None
 
 
 def _apply_exact_replace_patch(
@@ -804,6 +936,101 @@ def _apply_single_file_unified_diff(
     }
 
 
+def _diff_hunks_to_exact_replace_edits(diff_text: str, *, original_content: str) -> list[dict[str, str]]:
+    """Convert single-file unified-diff hunks to exact_replace edits.
+
+    This intentionally ignores hunk line numbers and relies on the existing
+    exact/normalized/approximate matching policy in _apply_exact_replace_patch.
+    Pure insertions use adjacent context for a unique insertion anchor.
+    """
+    _unified_diff_target_files(diff_text)
+    diff_lines = str(diff_text or "").splitlines()
+    hunk_re = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@")
+    edits: list[dict[str, str]] = []
+    i = 0
+    while i < len(diff_lines):
+        if not hunk_re.match(diff_lines[i]):
+            i += 1
+            continue
+        i += 1
+        hunk: list[tuple[str, str]] = []
+        while i < len(diff_lines) and not hunk_re.match(diff_lines[i]):
+            line = diff_lines[i]
+            if line.startswith(("--- ", "+++ ")):
+                break
+            if line.startswith("\\"):
+                i += 1
+                continue
+            if not line:
+                raise ValueError("diff hunk 中存在缺少前缀的空行；无法转换为 exact_replace。")
+            if line[0] not in {" ", "-", "+"}:
+                raise ValueError(f"diff hunk 行前缀非法：{line[:80]!r}")
+            hunk.append((line[0], line[1:]))
+            i += 1
+
+        old_lines = [body for prefix, body in hunk if prefix in {" ", "-"}]
+        new_lines = [body for prefix, body in hunk if prefix in {" ", "+"}]
+        deleted = [body for prefix, body in hunk if prefix == "-"]
+        added = [body for prefix, body in hunk if prefix == "+"]
+        if deleted:
+            edits.append({"old": "\n".join(old_lines), "new": "\n".join(new_lines)})
+            continue
+        if added:
+            # Pure insertion: replace a unique context span by context+added.
+            context_lines = [body for prefix, body in hunk if prefix == " "]
+            if not context_lines:
+                raise ValueError("纯新增 hunk 缺少上下文，无法唯一定位插入点。")
+            context = "\n".join(context_lines)
+            if original_content.count(context) != 1 and _find_unique_normalized_span(original_content, context) is None:
+                raise ValueError("纯新增 hunk 上下文无法唯一定位，拒绝转换。")
+            insert_at = next((idx for idx, (prefix, _body) in enumerate(hunk) if prefix == "+"), len(hunk))
+            before = "\n".join(body for prefix, body in hunk[:insert_at] if prefix == " ")
+            after = "\n".join(body for prefix, body in hunk[insert_at:] if prefix == " ")
+            new_parts = []
+            if before:
+                new_parts.append(before)
+            new_parts.extend(added)
+            if after:
+                new_parts.append(after)
+            edits.append({"old": context, "new": "\n".join(new_parts)})
+    if not edits:
+        raise ValueError("unified diff 没有可转换的 hunk edit。")
+    return edits
+
+
+def _apply_unified_diff_or_convert_to_exact(
+    *,
+    original_content: str,
+    proposal: CreatorDiffProposal,
+    expected_target_file: str,
+) -> tuple[str, dict[str, Any]]:
+    try:
+        candidate, stats = _apply_single_file_unified_diff(
+            original_content=original_content,
+            diff_text=proposal.diff,
+            expected_target_file=expected_target_file,
+        )
+        stats["mode"] = "unified_diff"
+        return candidate, stats
+    except Exception as diff_exc:
+        edits = _diff_hunks_to_exact_replace_edits(proposal.diff, original_content=original_content)
+        exact = CreatorDiffProposal(
+            target_file=expected_target_file,
+            reason=f"converted from unified diff after apply failed: {diff_exc}",
+            edits=edits,
+            raw={"target_file": expected_target_file, "edits": edits},
+            mode="exact_replace",
+        )
+        candidate, stats = _apply_exact_replace_patch(
+            original_content=original_content,
+            proposal=exact,
+            expected_target_file=expected_target_file,
+        )
+        stats["mode"] = "unified_diff_to_exact_replace"
+        stats["unified_diff_apply_error"] = str(diff_exc)[:1000]
+        return candidate, stats
+
+
 def _validate_repair_diff_scope(
     *,
     proposal: CreatorDiffProposal,
@@ -838,12 +1065,11 @@ def _validate_repair_diff_scope(
         )
 
     elif proposal.mode == "unified_diff":
-        candidate, stats = _apply_single_file_unified_diff(
+        candidate, stats = _apply_unified_diff_or_convert_to_exact(
             original_content=current_content,
-            diff_text=proposal.diff,
+            proposal=proposal,
             expected_target_file=scope.target_file,
         )
-        stats["mode"] = "unified_diff"
 
     else:
         raise ValueError(f"未知 repair proposal mode：{proposal.mode}")
@@ -892,7 +1118,7 @@ def _sandbox_io_contract_text_for_creator() -> str:
 
     return (
         "现有 sandbox IO 协议如下：\n"
-        "1. SKILL.md / references 中的 shell fenced command block 会被解析成 Action schema。\n"
+        "1. SKILL.md 中的 shell fenced command block 会被解析成 Action schema；references/*.md 只读按需加载，不作为执行步骤。\n"
         "2. 每个 command 调用 scripts/...，脚本参数是一个 JSON argv object。\n"
         "3. command JSON keys 需要与 Action schema inputs / optional_inputs 对齐。\n"
         "4. {{placeholder}} 从 workflow context 中解析，解析不到会触发 dataflow_mismatch。\n"
@@ -927,7 +1153,7 @@ async def _request_repair_diff_proposal(
                 "你是 superskills Creator 的局部修复代码模型。\n"
                 "你只能输出严格 JSON object，不能输出 Markdown 解释。\n"
                 "你不能输出完整文件，只能输出 target_file 的局部 patch。\n"
-                "优先使用 edits old/new exact_replace 格式，不要手写 unified diff hunk 行号。\n"
+                "优先使用 edits old_lines/new_lines exact_replace 格式，不要手写 unified diff hunk 行号。\n"
                 "本轮只允许修复 target_file。\n"
                 "不要新增文件、删除文件、修改其它文件。\n"
                 "不要在 Creator repair 层重新定义平台 IO。"
@@ -952,24 +1178,30 @@ async def _request_repair_diff_proposal(
                 "```text\n"
                 f"{current_content}\n"
                 "```\n\n"
-                "只返回严格 JSON object，优先使用如下格式：\n"
+                "只返回严格 JSON object。对 SKILL.md、Markdown、shell command block、包含 JSON argv 的片段，首选如下 old_lines/new_lines 格式：\n"
                 "{\n"
                 f"  \"target_file\": \"{file_path}\",\n"
                 "  \"reason\": \"为什么这个 patch 只修复当前真实失败\",\n"
                 "  \"edits\": [\n"
                 "    {\n"
-                "      \"old\": \"从当前文件中逐字复制、且唯一出现的旧片段\",\n"
-                "      \"new\": \"替换后的新片段\"\n"
+                "      \"old_lines\": [\n"
+                "        \"从当前文件逐行复制的旧内容\"\n"
+                "      ],\n"
+                "      \"new_lines\": [\n"
+                "        \"替换后的新内容\"\n"
+                "      ]\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
                 "要求：\n"
-                "1. old 必须从当前文件逐字复制。\n"
-                "2. old 必须唯一出现。\n"
-                "3. 不要输出完整文件源码。\n"
-                "4. 不要输出 Markdown。\n"
-                "5. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
-                "6. 多行代码片段建议使用 old_lines/new_lines 字符串数组，后端会用换行 join，避免 JSON 字符串裸换行转义错误。\n"
+                "1. old_lines 每个数组元素是一行当前文件原文；后端会用 \\n join，不需要在单个字符串里转义整段 shell JSON。\n"
+                "2. new_lines 每个数组元素是一行目标文件内容；proposal JSON 的转义不能污染目标文件内容。\n"
+                "3. 不要为了让 proposal JSON 合法，就把 SKILL.md 里的 shell argv 改成带反斜杠的内容。\n"
+                "4. old_lines join 后必须从当前文件逐字复制，且唯一出现。\n"
+                "5. 不要输出完整文件源码。\n"
+                "6. 不要输出 Markdown。\n"
+                "7. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
+                "8. old/new 单字符串仅为兼容旧格式；本轮不要作为首选。\n"
             ),
         },
     ]
@@ -1010,12 +1242,16 @@ async def _request_repair_diff_proposal(
                 "content": _format_diff_response_violation(exc, text),
             })
 
-    raise ValueError(
+    raise CreatorRepairProposalParseError(
         "修复模型连续没有返回合法 patch proposal，已拒绝应用。\n"
         f"target_file={file_path}\n"
         f"last_error={type(last_error).__name__ if last_error else 'Unknown'}: {last_error}\n"
         "last_output_excerpt:\n"
-        f"{str(last_text or '')[:4000]}"
+        f"{str(last_text or '')[:4000]}",
+        parser_error=str(last_error or ""),
+        last_output_excerpt=last_text,
+        diff_extraction_attempted=bool(getattr(last_error, "diff_extraction_attempted", False)),
+        lines_fallback_attempted=bool(getattr(last_error, "lines_fallback_attempted", False)),
     )
 
 async def _request_and_apply_repair_patch(
@@ -1171,6 +1407,17 @@ async def _request_and_apply_repair_patch(
 
             accumulated_failure = failure_text + apply_feedback
             accumulated_context = task_context + apply_feedback
+
+    if isinstance(last_error, CreatorRepairProposalParseError):
+        raise CreatorRepairProposalParseError(
+            "修复模型连续提出无法解析的 patch，已停止本轮 repair。\n"
+            f"target_file={file_path}\n"
+            f"last_error={last_error}",
+            parser_error=last_error.parser_error,
+            last_output_excerpt=last_error.last_output_excerpt,
+            diff_extraction_attempted=last_error.diff_extraction_attempted,
+            lines_fallback_attempted=last_error.lines_fallback_attempted,
+        )
 
     raise ValueError(
         "修复模型连续提出无法解析或无法应用的 patch，已停止本轮 repair。\n"
@@ -1340,16 +1587,38 @@ async def _repair_generated_file_with_feedback(
         len(current_content),
     )
 
-    _proposal, candidate, diff_stats = await _request_and_apply_repair_patch(
-        model=model,
-        file_path=file_path,
+    structured_failures: list[Mapping[str, Any]] = []
+    parsed_failure_json = _parse_validator_json_object(failed_checks_text)
+    if isinstance(parsed_failure_json, dict):
+        maybe = parsed_failure_json.get("failures") or parsed_failure_json.get("failed_checks")
+        if isinstance(maybe, list):
+            structured_failures = [item for item in maybe if isinstance(item, Mapping)]
+    else:
+        try:
+            maybe = json.loads(failed_checks_text) if failed_checks_text else None
+            if isinstance(maybe, list):
+                structured_failures = [item for item in maybe if isinstance(item, Mapping)]
+        except Exception:
+            structured_failures = []
+
+    deterministic = _apply_deterministic_micro_patch_if_safe(
+        failures=structured_failures,
         current_content=current_content,
-        failure_text=validation_error,
         scope=scope,
-        task_context=task_context,
-        target_rule=target_rule,
-        patch_retry_limit=3,
     )
+    if deterministic is not None:
+        _proposal, candidate, diff_stats = deterministic
+    else:
+        _proposal, candidate, diff_stats = await _request_and_apply_repair_patch(
+            model=model,
+            file_path=file_path,
+            current_content=current_content,
+            failure_text=validation_error,
+            scope=scope,
+            task_context=task_context,
+            target_rule=target_rule,
+            patch_retry_limit=3,
+        )
 
     logger.info(
         "[Creator][model] phase=repair_patch.applied file=%s model=%s repair_mode=%s diff_stats=%s",

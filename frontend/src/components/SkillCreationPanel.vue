@@ -247,6 +247,11 @@
             <span v-if="event.patch_status"> · patch {{ event.patch_status }}</span>
             <span v-if="event.rerun_status"> · rerun {{ event.rerun_status }}</span>
             <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
+            <pre v-if="event.patch_status === 'parse_failed'" class="post-detail">parser_error: {{ event.parser_error || event.rejection_reason || 'unknown' }}
+diff_extraction_attempted: {{ Boolean(event.diff_extraction_attempted) }}
+old_lines_new_lines_fallback_attempted: {{ Boolean(event.old_lines_new_lines_fallback_attempted) }}
+last_output_excerpt:
+{{ event.last_output_excerpt || '' }}</pre>
           </div>
         </div>
       </div>

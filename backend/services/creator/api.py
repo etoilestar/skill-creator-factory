@@ -585,6 +585,78 @@ def _exception_to_skill_md_failures(exc: Exception, *, source: str = "skill_md")
     }]
 
 
+def classify_skill_md_failure_severity(failure: dict[str, Any]) -> str:
+    if str(failure.get("severity") or "").lower() in {"advisory", "note", "warning"}:
+        return "advisory"
+    if str(failure.get("layer") or "").lower() in {"advisory", "advisory_notes"}:
+        return "advisory"
+    if bool(failure.get("advisory")):
+        return "advisory"
+    return "hard"
+
+
+def merge_duplicate_failures(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        key = (
+            str(failure.get("target") or failure.get("target_file") or ""),
+            str(failure.get("layer") or ""),
+            str(failure.get("evidence") or (failure.get("details") or {}).get("evidence") or ""),
+            str(failure.get("minimal_edit") or ""),
+        )
+        if key not in merged:
+            merged[key] = dict(failure)
+        else:
+            messages = [str(merged[key].get("message") or ""), str(failure.get("message") or "")]
+            merged[key]["message"] = " / ".join(dict.fromkeys(m for m in messages if m))
+    return list(merged.values())
+
+
+def resolve_resource_role_conflicts(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize reviewer resource-role conflicts without business hardcoding."""
+    normalized: list[dict[str, Any]] = []
+    for failure in failures:
+        item = dict(failure)
+        blob = json.dumps(item, ensure_ascii=False, default=str).lower()
+        if "reference" in blob or "references/" in blob:
+            forbids_read = any(token in blob for token in ("不能读取", "禁止读取", "must not read", "cannot read"))
+            describes_execution = any(token in blob for token in ("执行步骤", "execute step", "executable step", "bash", "shell"))
+            describes_generated = any(token in blob for token in ("生成素材", "生成文件", "最终产物", "artifact", "asset"))
+            if forbids_read and not (describes_execution or describes_generated):
+                item["severity"] = "advisory"
+                item["message"] = (
+                    str(item.get("message") or "")
+                    + "（已按资源角色规则降级：reference 可按需只读加载，但不能执行、修改、生成或作为产物/素材。）"
+                )
+            elif describes_execution or describes_generated:
+                item["expected"] = (
+                    "references/*.md 是只读、按需加载的参考资料；非执行步骤、非产物、非生成素材，且不得被修改。"
+                )
+        if "asset" in blob or "assets/" in blob:
+            if any(token in blob for token in ("模型生成", "generate asset", "write asset")):
+                item["expected"] = "assets/** 只能是用户上传或结构预留的静态素材，不能由模型生成或写入。"
+        normalized.append(item)
+    return normalized
+
+
+def normalize_skill_md_failures(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resolved = resolve_resource_role_conflicts(merge_duplicate_failures(failures))
+    return [failure for failure in resolved if classify_skill_md_failure_severity(failure) == "hard"]
+
+
+def failure_ledger_for_skill_md_finalize(failures: list[dict[str, Any]]) -> dict[str, Any]:
+    hard = normalize_skill_md_failures(failures)
+    return {
+        "hard_failures": hard,
+        "advisory_notes": [
+            failure for failure in failures
+            if classify_skill_md_failure_severity(resolve_resource_role_conflicts([failure])[0]) != "hard"
+        ],
+    }
+
+
 def _non_code_text_near_script(content: str, script_path: str, window: int = 360) -> str:
     normalized = content.replace("\r\n", "\n")
     idx = normalized.find(script_path)
@@ -849,6 +921,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                 content=content,
                 blueprint_text=request.blueprint_text or "",
             )
+            failures = normalize_skill_md_failures(failures)
 
             # 阶段 3：格式/合同通过后，再做蓝图责任审查。
             if not failures:
@@ -862,6 +935,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     )
                 except Exception as exc:
                     failures = _exception_to_skill_md_failures(exc, source="blueprint_alignment")
+                    failures = normalize_skill_md_failures(failures)
 
             if not failures:
                 return {

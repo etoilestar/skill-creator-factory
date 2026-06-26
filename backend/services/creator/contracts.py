@@ -824,16 +824,34 @@ def _format_contract_checks(results: list[ContractCheckResult], *, passed: bool)
     lines: list[str] = []
     for result in selected:
         matched = f"\n  matched_paths: {', '.join(result.matched_paths)}" if result.matched_paths else ""
+        details_payload = result.details
+        if result.id == "reference.no_placeholder_phrases" and isinstance(result.details, dict):
+            safe_matches = []
+            for item in result.details.get("matches") or []:
+                if isinstance(item, dict):
+                    safe_matches.append({
+                        "line_number": item.get("line_number"),
+                        "context_hash": hashlib.sha256(str(item.get("context_excerpt") or "").encode("utf-8")).hexdigest()[:12],
+                        "in_fenced_block": item.get("in_fenced_block"),
+                    })
+            details_payload = {"matches": safe_matches, "terms_policy": "matched terms are omitted from repair prompts and must not be written into the body"}
         details = (
-            "\n  details: " + json.dumps(result.details, ensure_ascii=False, sort_keys=True)
-            if result.details else ""
+            "\n  details: " + json.dumps(details_payload, ensure_ascii=False, sort_keys=True)
+            if details_payload else ""
         )
         layer = result.layer or _contract_layer_for_check_id(result.id)
         layer_text = f" layer={layer}" if layer else ""
+        message = result.message
+        expected = result.expected
+        minimal_edit = result.minimal_edit
+        if result.id == "reference.no_placeholder_phrases":
+            message = "reference 正文包含未完成状态说明。"
+            expected = "reference 正文必须填入实际规则、示例或约束，不保留未完成状态说明。"
+            minimal_edit = "删除未完成状态说明；保留已有有效内容。"
         lines.append(
-            f"- {result.id} target={result.target}{layer_text}: {result.message}\n"
-            f"  expected: {result.expected}\n"
-            f"  minimal_edit: {result.minimal_edit}"
+            f"- {result.id} target={result.target}{layer_text}: {message}\n"
+            f"  expected: {expected}\n"
+            f"  minimal_edit: {minimal_edit}"
             f"{matched}"
             f"{details}"
         )
@@ -2143,6 +2161,61 @@ def _reference_contains_write_file_directive(markdown_body: str) -> bool:
     ))
 
 
+
+def _reference_placeholder_matches(markdown_body: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    in_fenced = False
+    lines = str(markdown_body or "").splitlines()
+    for index, line in enumerate(lines, start=1):
+        if re.match(r"^\s*```", line):
+            in_fenced = not in_fenced
+        for match in _REFERENCE_PLACEHOLDER_RE.finditer(line):
+            start = max(0, index - 2)
+            end = min(len(lines), index + 1)
+            matches.append({
+                "term": match.group(0),
+                "line_number": index,
+                "line_text": line,
+                "context_excerpt": "\n".join(lines[start:end]),
+                "in_fenced_block": in_fenced,
+            })
+    return matches
+
+
+def _sanitize_reference_placeholders(content: str) -> str:
+    meta, body = _reference_frontmatter_metadata(content)
+    had_frontmatter = str(content or "").lstrip().startswith("---")
+    body_lines = body.splitlines()
+    sanitized: list[str] = []
+    in_fenced = False
+    for line in body_lines:
+        if re.match(r"^\s*```", line):
+            in_fenced = not in_fenced
+            sanitized.append(line)
+            continue
+        if in_fenced or not _REFERENCE_PLACEHOLDER_RE.search(line):
+            sanitized.append(line)
+            continue
+        matches = list(_REFERENCE_PLACEHOLDER_RE.finditer(line))
+        non_match_text = _REFERENCE_PLACEHOLDER_RE.sub("", line)
+        cleaned = re.sub(r"[，,、/；;：:（）()\[\]{}]+", " ", non_match_text).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if not cleaned or len(cleaned) < max(4, len(line.strip()) // 4):
+            continue
+        # If the line was a rule listing the banned forms, keep the rule intent
+        # without repeating any matched term.
+        if any(token in line for token in ("禁止", "不要", "不得", "避免")) and len(matches) >= 1:
+            sanitized.append("不得保留未完成状态说明。")
+            continue
+        sanitized.append(cleaned)
+    new_body = "\n".join(sanitized).strip() + "\n"
+    if not had_frontmatter:
+        return new_body
+    frontmatter_match = re.match(r"\s*(---\s*\n.*?\n---\s*\n?)", str(content or ""), flags=re.S)
+    if not frontmatter_match:
+        return str(content or "")
+    return frontmatter_match.group(1).rstrip() + "\n" + new_body
+
 def _check_reference_file_contract(file_path: str, content: str, *, purpose: str = "") -> list[ContractCheckResult]:
     raw_failures = _basic_markdown_format_failures(
         file_path,
@@ -2413,7 +2486,8 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         ),
     ))
 
-    has_placeholder = bool(_REFERENCE_PLACEHOLDER_RE.search(stripped))
+    placeholder_matches = _reference_placeholder_matches(stripped)
+    has_placeholder = bool(placeholder_matches)
     results.append(ContractCheckResult(
         id="reference.no_placeholder_phrases",
         passed=not has_placeholder,
@@ -2425,6 +2499,7 @@ def _check_reference_file_contract(file_path: str, content: str, *, purpose: str
         ),
         expected="不要使用 placeholder、TODO、待补充、将要生成等占位表达。",
         minimal_edit="删除占位短语并替换为实际任务规则和示例。",
+        details={"matches": placeholder_matches, "banned_terms": sorted(set(match["term"] for match in placeholder_matches))},
     ))
 
     return results

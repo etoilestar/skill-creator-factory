@@ -288,3 +288,150 @@ def test_e2e_validator_two_invalid_json_returns_validator_error(monkeypatch):
     )
     assert review["passed"] is False
     assert review["failure_type"] == "e2e_requirement_validator_error"
+
+
+def test_responsibility_advisory_field_repair_instruction_is_ignored():
+    from backend.services.creator.repair import _parse_requirement_review_result
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "checks": [{"requirement_id": req.id, "status": "advisory", "severity": "advisory", "evidence_level": "weak", "reason": "field_name_mismatch", "missing_evidence": []}],
+            "repair_instructions": "rename stdout field",
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+    assert review["repair_instructions"] == ""
+
+
+def test_responsibility_only_field_and_extra_stdout_issues_normalize_to_passed():
+    from backend.services.creator.repair import _parse_requirement_review_result
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": False,
+            "blocking_issues": [{"issue_type": "extra_stdout_field", "problem": "额外返回字段"}],
+            "checks": [{"requirement_id": req.id, "status": "failed", "severity": "blocking", "evidence_level": "weak", "reason": "field_name_mismatch", "missing_evidence": ["rename"]}],
+            "repair_instructions": "delete helper metadata",
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+    assert review["issues"] == []
+
+
+def test_free_form_issue_without_requirement_id_cannot_block():
+    from backend.services.creator.repair import _parse_requirement_review_result
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {"passed": False, "checks": [{"status": "failed", "severity": "blocking", "evidence_level": "missing", "missing_evidence": ["x"]}, {"requirement_id": req.id, "status": "passed", "severity": "advisory", "evidence_level": "strong"}]},
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+
+
+def test_missing_evidence_is_required_for_blocking_requirement_failure():
+    from backend.services.creator.repair import _parse_requirement_review_result
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {"passed": False, "checks": [{"requirement_id": req.id, "status": "failed", "severity": "blocking", "evidence_level": "missing", "missing_evidence": []}]},
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+
+
+def test_reference_placeholder_matches_include_details_and_sanitizer_preserves_frontmatter():
+    from backend.services.creator.contracts import _reference_placeholder_matches, _sanitize_reference_placeholders, _check_reference_file_contract
+    content = "---\ntitle: Guide\ndescription: Demo\n---\n# Guide\nTODO 待补充具体内容\n\n## 规则\nplaceholder 示例\n"
+    body = content.split("---", 2)[-1]
+    matches = _reference_placeholder_matches(body)
+    assert matches and {"term", "line_number", "line_text", "context_excerpt", "in_fenced_block"} <= set(matches[0])
+    sanitized = _sanitize_reference_placeholders(content)
+    assert sanitized.startswith("---\ntitle: Guide\ndescription: Demo\n---")
+    assert "TODO" not in sanitized and "placeholder" not in sanitized
+    failed = {r.id for r in _check_reference_file_contract("references/guide.md", sanitized) if not r.passed}
+    assert "reference.no_placeholder_phrases" not in failed
+
+
+def test_advisory_repair_instructions_do_not_enter_repair_feedback():
+    from backend.services.creator.repair import _format_file_validator_feedback
+    feedback = _format_file_validator_feedback(
+        "deterministic failure",
+        {"passed": True, "repair_instructions": "field_name_mismatch: rename extra stdout field", "issues": []},
+        file_path="scripts/generic.py",
+    )
+    assert "field_name_mismatch" not in feedback
+
+
+def test_repeated_same_failure_escalates_to_strict_patch_source_guard():
+    import inspect
+    from backend.services.creator import api
+
+    source = inspect.getsource(api.generate_file)
+    assert "repeated_same_failure" in source
+    assert '"strict_patch" if repeated_same_failure' in source
+
+
+def test_repair_noop_path_escalates_strict_patch_source_guard():
+    import inspect
+    from backend.services.creator import api
+
+    source = inspect.getsource(api.generate_file)
+    assert "repair_noop" in source
+    assert "repair_mode=\"strict_patch\"" in source
+
+
+def test_required_missing_blocking_not_downgraded_by_message_text():
+    from backend.services.creator.repair import _parse_requirement_review_result
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {"passed": False, "checks": [{"requirement_id": req.id, "status": "failed", "severity": "blocking", "blocking": True, "evidence_level": "missing", "missing_evidence": ["core evidence"], "reason": "字段名旁边的 required responsibility missing"}]},
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["requirement_id"] == req.id
+
+
+def test_validator_failure_repair_instructions_do_not_enter_feedback():
+    from backend.services.creator.repair import _format_file_validator_feedback
+    for failure_type in ["none", "script_requirement_validator_error", "script_requirement_validator_incomplete", "validator_error", "validator_incomplete"]:
+        feedback = _format_file_validator_feedback(
+            "deterministic failure",
+            {"failure_type": failure_type, "repair_instructions": "rename output", "issues": []},
+            file_path="scripts/generic.py",
+        )
+        assert "rename output" not in feedback
+
+
+def test_reference_sanitizer_does_not_template_replace_and_preserves_fence():
+    from backend.services.creator.contracts import _sanitize_reference_placeholders
+    content = "---\ntitle: Guide\ndescription: Demo\n---\n# Guide\nTODO\n保留前缀 placeholder 保留后缀\n```text\nTODO stays in fence\n```\n"
+    sanitized = _sanitize_reference_placeholders(content)
+    assert sanitized.startswith("---\ntitle: Guide\ndescription: Demo\n---")
+    assert "具体规则、示例和约束" not in sanitized
+    assert "保留前缀" in sanitized and "保留后缀" in sanitized
+    assert "TODO stays in fence" in sanitized
+    assert "\nTODO\n" not in sanitized
+
+
+def test_contract_check_format_omits_reference_banned_terms_from_details():
+    from backend.services.creator.contracts import _check_reference_file_contract, _format_contract_checks
+    content = "---\ntitle: Guide\ndescription: Demo\n---\n# Guide\nTODO 待补充\n"
+    failed = [r for r in _check_reference_file_contract("references/guide.md", content) if not r.passed]
+    text = _format_contract_checks(failed, passed=False)
+    assert "context_hash" in text
+    assert "待补充" not in text
+
+
+def test_structured_failure_signature_ignores_candidate_digest():
+    from backend.services.creator import api
+    from backend.services.creator.common import FileGenerationStageError
+    err1 = FileGenerationStageError(source="script_functional", layer="responsibility", detail="one")
+    err2 = FileGenerationStageError(source="script_functional", layer="responsibility", detail="one")
+    assert api._structured_failure_signature(err1, "same failure") == api._structured_failure_signature(err2, "same failure")

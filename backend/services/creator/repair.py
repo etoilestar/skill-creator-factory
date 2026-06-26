@@ -2559,15 +2559,34 @@ def _format_file_validator_feedback(
             json.dumps(safe_localizations, ensure_ascii=False, indent=2, default=str),
         ])
 
+    advisory_only_report = (
+        isinstance(validator_report, dict)
+        and (validator_report.get("passed") is True or validator_report.get("failure_type") in {"none", None, ""})
+        and not validator_report.get("issues")
+    )
+    repair_text = str(validator_report.get("repair_instructions") or "").strip() if isinstance(validator_report, dict) else ""
+    issues_for_repair = validator_report.get("issues") if isinstance(validator_report, dict) else []
+    has_structured_blocking_issue = any(
+        isinstance(item, dict)
+        and str(item.get("requirement_id") or "").strip()
+        and isinstance(item.get("missing_evidence"), list)
+        and bool(item.get("missing_evidence"))
+        for item in (issues_for_repair if isinstance(issues_for_repair, list) else [])
+    )
+    failure_type = str(validator_report.get("failure_type") or "") if isinstance(validator_report, dict) else ""
+    if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete", "validator_error", "validator_incomplete"}:
+        advisory_only_report = True
     if (
         not delegate_to_backend_contract
         and isinstance(validator_report, dict)
-        and str(validator_report.get("repair_instructions") or "").strip()
+        and repair_text
+        and not advisory_only_report
+        and has_structured_blocking_issue
     ):
         parts.extend([
             "",
             "校验模型给出的辅助 repair_instructions，仅作为定位参考，不得覆盖 deterministic_error：",
-            str(validator_report.get("repair_instructions") or "").strip(),
+            repair_text,
         ])
 
     parts.extend([
@@ -2739,6 +2758,44 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
+def _issue_severity_is_blocking(item: dict[str, Any]) -> bool:
+    severity = str(item.get("severity") or "").strip().lower()
+    if severity in {"blocking", "blocker", "error", "critical"}:
+        return True
+    if item.get("blocking") is True:
+        return True
+    return False
+
+
+def _issue_structurally_advisory(item: dict[str, Any], required_ids: set[str] | None = None) -> bool:
+    if not isinstance(item, dict):
+        return True
+    required_ids = required_ids or set()
+    rid = str(item.get("requirement_id") or "").strip()
+    if not rid or (required_ids and rid not in required_ids):
+        return True
+    scope_kind = str(item.get("scope") or item.get("kind") or item.get("category") or item.get("issue_type") or "").strip().lower()
+    if scope_kind in {"validator_advisory", "advisory", "note", "info", "warning"}:
+        return True
+    severity = str(item.get("severity") or "").strip().lower()
+    if severity in {"warning", "info", "note", "advisory"}:
+        return True
+    if item.get("blocking") is False:
+        return True
+    if str(item.get("evidence_level") or "").strip().lower() != "missing":
+        return True
+    missing = item.get("missing_evidence")
+    if not isinstance(missing, list) or not missing:
+        return True
+    return False
+
+
+def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str]) -> bool:
+    if _issue_structurally_advisory(item, required_ids):
+        return False
+    return _issue_severity_is_blocking(item)
+
+
 def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
     items: list[RequirementItem] = []
     for raw in requirements or []:
@@ -2755,6 +2812,13 @@ def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
 def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list[RequirementItem], file_path: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"passed": False, "failure_type": "script_requirement_validator_error", "issues": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
+    advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
+    for collection_name in ("blocking_issues", "issues"):
+        collection = data.get(collection_name)
+        if isinstance(collection, list):
+            for raw_issue in collection:
+                if isinstance(raw_issue, dict):
+                    advisory_notes.append(raw_issue)
     checks = data.get("checks")
     if not isinstance(checks, list):
         return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
@@ -2768,13 +2832,11 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
         if not isinstance(check, dict):
             continue
         rid = str(check.get("requirement_id") or "")
-        if rid not in required_ids:
+        if not _is_blocking_requirement_check(check, required_ids):
+            advisory_notes.append(check)
             continue
-        if str(check.get("evidence_level") or "").lower() == "missing" and str(check.get("severity") or "").lower() == "blocking":
-            missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
-            if not missing_evidence:
-                continue
-            blocking.append({
+        missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
+        blocking.append({
                 "id": "script_requirement_failed",
                 "requirement_id": rid,
                 "failed_file": file_path,
@@ -2787,7 +2849,7 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
                 "details": {"check": check},
             })
-    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [], "raw_review": data}
+    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
 
 
 def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:

@@ -1203,6 +1203,49 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
         "error": "SKILL.md finalize did not pass after repair attempts.",
     }
 
+
+
+def _structured_failure_signature(stage_error: FileGenerationStageError, deterministic_error: str) -> str:
+    """Stable signature for repeated first-round failures, independent of candidate text."""
+    original = getattr(stage_error, "original", None)
+    records: list[dict[str, Any]] = []
+    if isinstance(original, ContractValidationError):
+        for result in original.results:
+            if getattr(result, "passed", False):
+                continue
+            details = getattr(result, "details", {}) or {}
+            records.append({
+                "check_id": getattr(result, "id", ""),
+                "layer": getattr(result, "layer", "") or getattr(stage_error, "layer", ""),
+                "target": getattr(result, "target", ""),
+                "missing_evidence": details.get("missing_evidence") or details.get("missing_requirement_ids") or [],
+                "matched": details.get("matches") or details.get("matched_paths") or getattr(result, "matched_paths", []),
+                "code_region": details.get("code_region") or details.get("line_region") or "",
+                "evidence": details.get("evidence") or getattr(result, "message", ""),
+            })
+    elif isinstance(original, ScriptFunctionalValidationError):
+        for issue in getattr(original, "issues", []) or []:
+            if not isinstance(issue, dict):
+                continue
+            records.append({
+                "check_id": issue.get("id") or issue.get("issue_type") or "script_functional",
+                "layer": getattr(original, "layer", "") or getattr(stage_error, "layer", ""),
+                "target": issue.get("failed_file") or issue.get("target_file") or "",
+                "requirement_id": issue.get("requirement_id") or "",
+                "missing_evidence": issue.get("missing_evidence") or [],
+                "matched": issue.get("matched_ranges") or issue.get("matches") or [],
+                "code_region": issue.get("code_region") or issue.get("line_region") or "",
+                "evidence": issue.get("evidence") or issue.get("reason") or "",
+            })
+    if not records:
+        records.append({
+            "check_id": getattr(stage_error, "source", ""),
+            "layer": getattr(stage_error, "layer", ""),
+            "evidence": str(deterministic_error or "")[:1000],
+        })
+    payload = {"source": stage_error.source, "layer": stage_error.layer, "records": records}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
     """Generate one Creator file and stream it back as SSE.
@@ -1298,6 +1341,7 @@ async def generate_file(request: GenerateFileRequest):
 
         candidate = ""
         repair_counts_by_layer: dict[str, int] = {}
+        repair_failure_signatures: dict[str, tuple[int, str]] = {}
 
         try:
             candidate = await _complete_creator_file_generation(
@@ -1403,15 +1447,29 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                     elif request.file_path.startswith("references/"):
-                        _raise_file_contract_failures(validate_file_contract(
+                        reference_entry = {
+                            **(effective_skill_plan_entry or {}),
+                            "purpose": request.purpose or request.blueprint_text,
+                        }
+                        reference_results = validate_file_contract(
                             file_path=request.file_path,
                             content=content,
                             blueprint_text=request.blueprint_text,
-                            skill_plan_entry={
-                                **(effective_skill_plan_entry or {}),
-                                "purpose": request.purpose or request.blueprint_text,
-                            },
-                        ))
+                            skill_plan_entry=reference_entry,
+                        )
+                        if any((not result.passed and result.id == "reference.no_placeholder_phrases") for result in reference_results):
+                            patched_reference = _sanitize_reference_placeholders(content)
+                            if patched_reference != content:
+                                patched_results = validate_file_contract(
+                                    file_path=request.file_path,
+                                    content=patched_reference,
+                                    blueprint_text=request.blueprint_text,
+                                    skill_plan_entry=reference_entry,
+                                )
+                                if not any(not result.passed for result in patched_results):
+                                    content = patched_reference
+                                    reference_results = patched_results
+                        _raise_file_contract_failures(reference_results)
 
                     elif request.file_path.startswith("scripts/"):
                         _raise_file_contract_failures(_check_script_content_review_contract(
@@ -1543,6 +1601,13 @@ async def generate_file(request: GenerateFileRequest):
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
                 repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+                failure_signature = _structured_failure_signature(stage_error, deterministic_error)
+                candidate_digest = hashlib.sha256((candidate or "").encode("utf-8")).hexdigest()
+                signature_key = f"{error_layer}:{failure_signature}"
+                previous_repeat_count, previous_digest = repair_failure_signatures.get(signature_key, (0, ""))
+                repeated_same_failure = previous_repeat_count >= 1
+                repeated_same_candidate = previous_digest == candidate_digest
+                repair_failure_signatures[signature_key] = (previous_repeat_count + 1, candidate_digest)
 
                 if error_source == "model_empty_content":
                     empty_retry_index = repair_counts_by_layer[error_layer]
@@ -1807,11 +1872,11 @@ async def generate_file(request: GenerateFileRequest):
                         contract_text=contract_text,
                         passed_checks_text=passed_checks_text,
                         failed_checks_text=failed_checks_text,
-                        repair_mode=_repair_mode_for_first_round(
+                        repair_mode=("strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
                             source=error_source,
                             file_path=request.file_path,
                             attempt=attempt,
-                        ),
+                        )),
                     )
 
                     feedback = _format_file_validator_feedback(
@@ -1821,7 +1886,7 @@ async def generate_file(request: GenerateFileRequest):
                         file_path=request.file_path,
                     )
 
-                    repair_mode = _repair_mode_for_first_round(
+                    repair_mode = "strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
                         source=error_source,
                         file_path=request.file_path,
                         attempt=attempt,
@@ -1867,6 +1932,20 @@ async def generate_file(request: GenerateFileRequest):
                         attempt,
                         repair_mode,
                     )
+
+                    if repair_mode == "strict_patch":
+                        yield _file_done_error_sse(
+                            file_path=request.file_path,
+                            role=request.role,
+                            error=(
+                                "repair_noop_with_same_failure_signature: strict_patch 返回 no-op；"
+                                f" failure_signature={failure_signature} error={deterministic_error}"
+                            ),
+                            error_type="repair_noop_with_same_failure_signature",
+                            content=candidate or "",
+                            recoverable=True,
+                        )
+                        return
 
                     repaired_candidate = await _repair_generated_file_with_feedback(
                         prompt_messages=prompt_messages,

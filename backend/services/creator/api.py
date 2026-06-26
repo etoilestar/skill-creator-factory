@@ -578,6 +578,18 @@ def _contract_result_to_failure(result: ContractCheckResult) -> dict[str, Any]:
 
 
 def _exception_to_skill_md_failures(exc: Exception, *, source: str = "skill_md") -> list[dict[str, Any]]:
+    if isinstance(exc, CreatorValidatorReviewError):
+        return [{
+            "id": f"{source}.validator_error",
+            "target": "SKILL.md",
+            "message": str(exc),
+            "expected": "重试蓝图一致性 reviewer，获得有效 JSON 后再决定是否需要修 SKILL.md。",
+            "minimal_edit": "不要修改 SKILL.md；这是审查器输出格式问题。",
+            "details": {"raw_excerpt": exc.raw_excerpt},
+            "layer": "validator_error",
+            "severity": "advisory",
+            "advisory": True,
+        }]
     if isinstance(exc, ContractValidationError):
         return [_contract_result_to_failure(result) for result in exc.results if not result.passed]
     return [{

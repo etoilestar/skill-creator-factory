@@ -53,7 +53,7 @@ def test_approximate_substring_fallback_succeeds_for_unique_high_similarity_span
     )
 
     assert "validate input and write a final report" in candidate
-    assert stats["applied"][0]["fallback_type"] == "approximate_substring"
+    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
     assert stats["applied"][0]["similarity"] >= 0.88
     assert "original_model_old_excerpt" in stats["applied"][0]
 
@@ -65,7 +65,7 @@ def test_approximate_substring_rejects_multiple_high_similarity_candidates():
     )
     old = "use the parser to validate payload and write final report"
 
-    with pytest.raises(ValueError, match="approximate substring .*拒绝"):
+    with pytest.raises(ValueError, match="Markdown structured approximate .*拒绝"):
         _apply_exact_replace_patch(
             original_content=original,
             proposal=_proposal(old=old, new="replacement"),
@@ -77,7 +77,7 @@ def test_scripts_python_does_not_use_approximate_substring():
     original = "def run(payload):\n    return {'result': payload}\n"
     old = "def run(data):\n    return {'result': data}\n"
 
-    with pytest.raises(ValueError, match="不启用 approximate substring"):
+    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
         _apply_exact_replace_patch(
             original_content=original,
             proposal=_proposal(target_file="scripts/main.py", old=old, new="def run(payload):\n    return {'ok': payload}\n"),
@@ -200,7 +200,7 @@ def test_unified_diff_to_exact_does_not_enable_approximate_for_python_scripts():
         ),
         mode="unified_diff",
     )
-    with pytest.raises(ValueError, match="不启用 approximate substring"):
+    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
         _apply_unified_diff_or_convert_to_exact(
             original_content=original,
             proposal=proposal,
@@ -227,7 +227,7 @@ def test_deterministic_micro_patch_uses_structured_repair_ops_only():
     assert result is not None
     _proposal, candidate, stats = result
     assert "Read references only when needed." in candidate
-    assert stats["mode"] == "deterministic_micro_patch"
+    assert stats["mode"] == "deterministic_micro_patch_batch"
 
 
 def test_deterministic_micro_patch_ignores_natural_language_minimal_edit():
@@ -333,3 +333,56 @@ def test_nonstandard_shell_text_with_backslashes_is_not_rejected_by_argv_guard()
         scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
     )
     assert "Updated text." in candidate
+
+
+def test_markdown_structured_match_handles_minor_old_text_changes():
+    original = "# Skill\n\nUse `scripts/run.py` to read input, validate payload, and write the final report.\n"
+    old = "Use `scripts/run.py` to read inputs, validate payload, and write final report."
+    candidate, stats = _apply_exact_replace_patch(
+        original_content=original,
+        proposal=_proposal(old=old, new="Use `scripts/run.py` to read input and write the final artifact."),
+        expected_target_file="SKILL.md",
+    )
+    assert "final artifact" in candidate
+    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
+
+
+def test_markdown_fuzzy_rejects_command_block_changes():
+    original = "# Skill\n\n```bash\npython scripts/run.py '{\"topic\":\"{{topic}}\"}'\n```\n"
+    old = "python scripts/run.py '{\"topics\":\"{{topic}}\"}'"
+    with pytest.raises(ValueError, match="命令块内部|command block"):
+        _apply_exact_replace_patch(
+            original_content=original,
+            proposal=_proposal(old=old, new="python scripts/run.py '{\"topic\":\"{{topic}}\",\"count\":3}'"),
+            expected_target_file="SKILL.md",
+        )
+
+
+def test_append_after_uses_markdown_line_boundary_without_gluing():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[{"target_file": "SKILL.md", "repair_ops": [{"op": "append_after", "anchor": "- item", "text": "- next"}]}],
+        current_content="# Skill\n\n- item\n",
+        scope=scope,
+    )
+    assert result is not None
+    _proposal, candidate, _stats = result
+    assert "- item\n- next\n" in candidate
+    assert "- item- next" not in candidate
+
+
+def test_multiple_repair_ops_are_batched():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[
+            {"target_file": "SKILL.md", "repair_ops": [{"op": "replace", "anchor": "old one", "replacement": "new one"}]},
+            {"target_file": "SKILL.md", "repair_ops": [{"op": "replace", "anchor": "old two", "replacement": "new two"}]},
+        ],
+        current_content="# Skill\n\nold one\nold two\n",
+        scope=scope,
+    )
+    assert result is not None
+    _proposal, candidate, stats = result
+    assert "new one" in candidate and "new two" in candidate
+    assert stats["mode"] == "deterministic_micro_patch_batch"
+    assert stats["repair_ops"]["applied"] == 2

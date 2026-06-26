@@ -463,6 +463,178 @@ def _is_approximate_replace_allowed(target_file: str) -> bool:
     return path.endswith((".md", ".markdown", ".txt", ".text", ".rst", ".yaml", ".yml", ".json"))
 
 
+def _is_markdown_file(target_file: str) -> bool:
+    path = _strip_diff_path_prefix(target_file).lower()
+    return path == "skill.md" or path.startswith("references/") or path.endswith((".md", ".markdown"))
+
+
+def _markdown_fence_ranges(content: str) -> list[tuple[int, int, str]]:
+    """Return fenced code block char ranges with info string."""
+    ranges: list[tuple[int, int, str]] = []
+    offset = 0
+    open_start: int | None = None
+    open_info = ""
+    for raw_line in (content or "").splitlines(keepends=True):
+        line_start = offset
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if open_start is None:
+                open_start = line_start
+                open_info = stripped[3:].strip().lower()
+            elif stripped.startswith(marker):
+                ranges.append((open_start, line_start + len(raw_line), open_info))
+                open_start = None
+                open_info = ""
+        offset += len(raw_line)
+    if open_start is not None:
+        ranges.append((open_start, len(content or ""), open_info))
+    return ranges
+
+
+def _span_inside_command_fence(content: str, start: int, end: int) -> bool:
+    for fence_start, fence_end, info in _markdown_fence_ranges(content):
+        if start >= fence_start and end <= fence_end and _is_shell_fence_info(info):
+            return True
+    return False
+
+
+def _span_crosses_markdown_boundary(content: str, start: int, end: int) -> bool:
+    """Reject fuzzy matches that cross headings or fenced-block boundaries."""
+    snippet = content[start:end]
+    if re.search(r"(?m)^#{1,6}\s+", snippet):
+        return True
+    crossings = 0
+    for fence_start, fence_end, _info in _markdown_fence_ranges(content):
+        if start < fence_start < end or start < fence_end < end:
+            crossings += 1
+    return crossings > 0
+
+
+def _line_boundary_span(content: str, start: int, end: int) -> tuple[int, int]:
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    else:
+        line_end += 1
+    return line_start, line_end
+
+
+def _ensure_block_text(text: str, *, before: bool = False) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    if before:
+        if not value.endswith("\n"):
+            value += "\n"
+    else:
+        if not value.startswith("\n"):
+            value = "\n" + value
+        if not value.endswith("\n"):
+            value += "\n"
+    return value
+
+
+def _patch_match_policy_for_file(target_file: str, old: str) -> str:
+    path = _strip_diff_path_prefix(target_file).lower()
+    if path.startswith("scripts/") or path.endswith((".py", ".js", ".ts", ".sh", ".bash")):
+        return "code_strict"
+    if _is_markdown_file(path):
+        return "markdown_structured"
+    if path.endswith((".json", ".yaml", ".yml", ".toml", ".ini")):
+        return "config_normalized"
+    return "text_normalized"
+
+
+def _resolve_patch_span(
+    *,
+    content: str,
+    old: str,
+    target_file: str,
+    edit_index: int,
+) -> dict[str, Any]:
+    """Resolve old text to one safe replacement span according to file policy."""
+    count = content.count(old)
+    if count == 1:
+        start = content.find(old)
+        return {
+            "start": start,
+            "end": start + len(old),
+            "fallback_type": "exact",
+            "similarity": None,
+            "matched_excerpt": old,
+            "policy": "exact",
+        }
+    if count > 1:
+        raise ValueError(
+            f"edits[{edit_index}].old 在当前文件中匹配了 {count} 次。"
+            "请提供更长 old 片段，保证唯一匹配。"
+        )
+
+    policy = _patch_match_policy_for_file(target_file, old)
+    if policy == "code_strict":
+        raise ValueError(
+            f"edits[{edit_index}].old 在当前文件中没有匹配。"
+            "代码文件只允许 exact 替换；请从当前文件逐字复制更准确的 old 片段。"
+        )
+
+    normalized_span = _find_unique_normalized_span(content, old)
+    if normalized_span is not None:
+        start, end = normalized_span
+        if policy == "markdown_structured" and _span_inside_command_fence(content, start, end):
+            raise ValueError(
+                f"edits[{edit_index}].old 只在 Markdown shell command block 内通过宽松匹配命中；"
+                "命令块内部不允许 fuzzy/normalized 自动修改，请逐字提供 old。"
+            )
+        return {
+            "start": start,
+            "end": end,
+            "fallback_type": "normalized_exact",
+            "similarity": 1.0,
+            "matched_excerpt": _excerpt(content, start, end),
+            "policy": policy,
+        }
+
+    if policy != "markdown_structured":
+        raise ValueError(
+            f"edits[{edit_index}].old 在当前文件中没有 exact/normalized 匹配。"
+            "当前文件策略不启用 approximate substring 自动替换。"
+        )
+
+    approx = _find_approximate_substring_span(content, old)
+    if not approx.get("accepted"):
+        raise ValueError(
+            f"edits[{edit_index}].old 在当前文件中没有 exact/normalized 匹配，"
+            "Markdown structured approximate 置信度不足，已拒绝自动替换。"
+            f"reason={approx.get('reason')}; "
+            f"similarity={float(approx.get('similarity') or 0):.3f}; "
+            f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
+            "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
+            "```text\n"
+            f"{approx.get('matched_excerpt') or ''}\n"
+            "```"
+        )
+    start = int(approx["start"])
+    end = int(approx["end"])
+    if (
+        _span_inside_command_fence(content, start, end)
+        or _span_crosses_markdown_boundary(content, start, end)
+    ):
+        raise ValueError(
+            f"edits[{edit_index}].old 的 Markdown structured 匹配命中命令块内部或跨结构边界；"
+            "已拒绝自动替换，请提供不跨 section/fence 的唯一 old。"
+        )
+    return {
+        "start": start,
+        "end": end,
+        "fallback_type": "markdown_structured",
+        "similarity": float(approx["similarity"]),
+        "matched_excerpt": str(approx.get("matched_excerpt") or ""),
+        "policy": policy,
+    }
+
+
 def _extract_approximate_anchors(query: str) -> list[str]:
     patterns = [
         r"(?:[\w.-]+/)+[\w.-]+",
@@ -623,15 +795,17 @@ def _build_deterministic_patch_from_failure(
         if located is None:
             continue
         start, end, _kind = located
+        if _is_markdown_file(target_file) and op in {"append_after", "append_before"}:
+            start, end = _line_boundary_span(current_content, start, end)
         old = current_content[start:end]
         if op == "replace":
             new = repair_op.get("replacement") if "replacement" in repair_op else repair_op.get("new")
         elif op == "delete":
             new = ""
         elif op == "append_after":
-            new = old + str(repair_op.get("text") or "")
+            new = old.rstrip("\n") + _ensure_block_text(str(repair_op.get("text") or "")) if _is_markdown_file(target_file) else old + str(repair_op.get("text") or "")
         else:
-            new = str(repair_op.get("text") or "") + old
+            new = _ensure_block_text(str(repair_op.get("text") or ""), before=True) + old.lstrip("\n") if _is_markdown_file(target_file) else str(repair_op.get("text") or "") + old
         if isinstance(new, str) and old != new:
             edits.append({"old": old, "new": new})
     if not edits:
@@ -651,6 +825,9 @@ def _apply_deterministic_micro_patch_if_safe(
     current_content: str,
     scope: CreatorRepairScope,
 ) -> tuple[CreatorDiffProposal, str, dict[str, Any]] | None:
+    all_edits: list[dict[str, str]] = []
+    skipped: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
     for failure in failures or []:
         proposal = _build_deterministic_patch_from_failure(
             failure=failure,
@@ -658,15 +835,39 @@ def _apply_deterministic_micro_patch_if_safe(
             target_file=scope.target_file,
         )
         if proposal is None:
+            unresolved.append({"target": failure.get("target") or failure.get("target_file"), "reason": "no_applicable_repair_ops"})
             continue
-        candidate, stats = _validate_repair_diff_scope(
-            proposal=proposal,
-            current_content=current_content,
-            scope=scope,
-        )
-        stats["mode"] = "deterministic_micro_patch"
-        return proposal, candidate, stats
-    return None
+        for edit in proposal.edits:
+            if edit in all_edits:
+                skipped.append({"reason": "duplicate", "old_chars": len(edit.get("old", ""))})
+                continue
+            if edit.get("old") == edit.get("new"):
+                skipped.append({"reason": "noop", "old_chars": len(edit.get("old", ""))})
+                continue
+            all_edits.append(edit)
+    if not all_edits:
+        return None
+    batched = CreatorDiffProposal(
+        target_file=scope.target_file,
+        reason="batched deterministic micro patches from structured failure repair_ops",
+        edits=all_edits,
+        raw={"target_file": scope.target_file, "edits": all_edits},
+        mode="exact_replace",
+    )
+    candidate, stats = _validate_repair_diff_scope(
+        proposal=batched,
+        current_content=current_content,
+        scope=scope,
+    )
+    stats["mode"] = "deterministic_micro_patch_batch"
+    stats["repair_ops"] = {
+        "applied": len(stats.get("applied") or []),
+        "unresolved": len(unresolved),
+        "skipped": len(skipped) + int(stats.get("skipped_noop_count") or 0),
+        "unresolved_items": unresolved[:20],
+        "skipped_items": skipped[:20],
+    }
+    return batched, candidate, stats
 
 
 def _apply_exact_replace_patch(
@@ -716,55 +917,17 @@ def _apply_exact_replace_patch(
             })
             continue
 
-        count = candidate.count(old)
-        fallback_type = "exact"
-        similarity: float | None = None
-        matched_excerpt = old
-        replace_start: int | None = None
-        replace_end: int | None = None
-
-        if count == 1:
-            replace_start = candidate.find(old)
-            replace_end = replace_start + len(old)
-        elif count > 1:
-            raise ValueError(
-                f"edits[{index}].old 在当前文件中匹配了 {count} 次。"
-                "请提供更长 old 片段，保证唯一匹配。"
-            )
-        else:
-            normalized_span = _find_unique_normalized_span(candidate, old)
-            if normalized_span is not None:
-                replace_start, replace_end = normalized_span
-                fallback_type = "normalized_exact"
-                similarity = 1.0
-                matched_excerpt = _excerpt(candidate, replace_start, replace_end)
-            elif _is_approximate_replace_allowed(expected_target_file):
-                approx = _find_approximate_substring_span(candidate, old)
-                if not approx.get("accepted"):
-                    raise ValueError(
-                        f"edits[{index}].old 在当前文件中没有 exact/normalized 匹配，"
-                        "approximate substring 置信度不足，已拒绝自动替换。"
-                        f"reason={approx.get('reason')}; "
-                        f"similarity={float(approx.get('similarity') or 0):.3f}; "
-                        f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
-                        "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
-                        "```text\n"
-                        f"{approx.get('matched_excerpt') or ''}\n"
-                        "```"
-                    )
-                replace_start = int(approx["start"])
-                replace_end = int(approx["end"])
-                fallback_type = "approximate_substring"
-                similarity = float(approx["similarity"])
-                matched_excerpt = str(approx.get("matched_excerpt") or "")
-            else:
-                raise ValueError(
-                    f"edits[{index}].old 在当前文件中没有匹配。"
-                    "当前文件类型只允许 exact 或 normalized exact，不启用 approximate substring 自动替换。"
-                    "请从当前文件逐字复制更准确的 old 片段。"
-                )
-
-        assert replace_start is not None and replace_end is not None
+        resolved = _resolve_patch_span(
+            content=candidate,
+            old=old,
+            target_file=expected_target_file,
+            edit_index=index,
+        )
+        replace_start = int(resolved["start"])
+        replace_end = int(resolved["end"])
+        fallback_type = str(resolved.get("fallback_type") or "exact")
+        similarity = resolved.get("similarity")
+        matched_excerpt = str(resolved.get("matched_excerpt") or old)
         original_span = candidate[replace_start:replace_end]
         if original_span == new:
             skipped_noop.append({
@@ -782,6 +945,7 @@ def _apply_exact_replace_patch(
             "similarity": similarity,
             "matched_excerpt": matched_excerpt[:1000],
             "original_model_old_excerpt": old[:1000],
+            "match_policy": resolved.get("policy"),
         })
 
     if not applied:

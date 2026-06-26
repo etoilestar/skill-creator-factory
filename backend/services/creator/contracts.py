@@ -1037,6 +1037,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- 不要求固定字段名或固定 SKILL.md 模板。\n"
         "- 空 assets 或蓝图未要求上传素材时，不要求写固定 assets 话术。\n\n"
         "结构化 issue 字段规范：\n"
+        "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
+        "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
         "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
         "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
@@ -1064,6 +1066,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         '  "issues": [\n'
         '    {\n'
         '      "severity": "error|warning",\n'
+        '      "blocking": true,\n'
+        '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1319,10 +1323,12 @@ def _dedupe_review_issues(issues: Any) -> list[dict[str, Any]]:
     for raw in issues:
         issue = raw if isinstance(raw, dict) else {"message": str(raw), "evidence": str(raw)}
         key = (
-            str(issue.get("severity") or "").lower(),
             str(issue.get("field") or ""),
+            str(issue.get("category") or issue.get("claim_type") or ""),
             re.sub(r"\s+", " ", str(issue.get("message") or "")).strip().lower(),
-            re.sub(r"\s+", " ", str(issue.get("evidence") or "")).strip().lower()[:240],
+            re.sub(r"\s+", " ", str(issue.get("expected") or "")).strip().lower(),
+            str(issue.get("target") or issue.get("target_file") or ""),
+            str(issue.get("locator") or issue.get("anchor") or ""),
         )
         if key in seen:
             continue
@@ -1332,33 +1338,56 @@ def _dedupe_review_issues(issues: Any) -> list[dict[str, Any]]:
 
 
 def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
-    """Classify semantic blueprint issues without hard-coded business cases.
+    """Classify semantic blueprint issues from structured reviewer/contract facts."""
+    explicit = issue.get("blocking")
+    if isinstance(explicit, bool):
+        return explicit
 
-    Blocking is reserved for executable closure and user-controlled contract
-    delivery: paths/resources, platform I/O, final artifact/output contract, or
-    explicit critical requirements carried by blueprint/file plan/schema/script
-    contracts. Style/detail/role-label/verbatim-alignment gaps remain advisory.
-    """
     severity = str(issue.get("severity") or "error").strip().lower()
     if severity in {"warning", "info", "note", "advisory"}:
         return False
     if severity in {"blocking", "blocker"}:
         return True
 
-    field = str(issue.get("field") or "").lower()
-    issue_json = json.dumps(issue, ensure_ascii=False, sort_keys=True).lower()
-    structured_signals = {
-        "file_plan", "workflow", "resources", "platform_io", "artifact", "final_output",
-        "script_input", "script_output", "schema", "contract", "user_requirement",
-        "critical_requirement", "inputs", "outputs",
-    }
-    advisory_signals = {
-        "wording", "copy", "verbatim", "role_label", "role tag", "detail", "style_only",
-        "fixed_phrase", "template",
-    }
-    has_structured_signal = any(signal in field or signal in issue_json for signal in structured_signals)
-    has_advisory_signal = any(signal in field or signal in issue_json for signal in advisory_signals)
-    return has_structured_signal or not has_advisory_signal
+    impact = issue.get("contract_impact") or issue.get("impact")
+    if isinstance(impact, dict):
+        contract_keys = {
+            "execution_closure",
+            "resource_role",
+            "platform_io",
+            "final_artifact",
+            "final_output",
+            "artifact_contract",
+            "user_requirement_transfer",
+            "key_requirement_transfer",
+        }
+        return any(bool(impact.get(key)) for key in contract_keys)
+
+    if issue.get("required_contract") or issue.get("artifact_contract") or issue.get("platform_io_contract"):
+        return True
+
+    user_requirement = issue.get("user_requirement") or issue.get("key_requirement")
+    if isinstance(user_requirement, dict):
+        return bool(
+            user_requirement.get("required")
+            and (
+                user_requirement.get("missing")
+                or user_requirement.get("ambiguous")
+                or user_requirement.get("not_passed_to_script")
+                or user_requirement.get("not_in_artifact_contract")
+            )
+        )
+
+    role = str(issue.get("resource_role") or "").lower()
+    claim = str(issue.get("claim_type") or "").lower()
+    if role == "reference" and claim in {"execution_step", "artifact", "asset_material", "model_generated", "modifiable", "write_asset"}:
+        return True
+    if role == "asset" and claim in {"model_generated", "modifiable", "write_asset"}:
+        return True
+
+    # Plain reviewer severity=error is not enough to enter the repair loop.
+    # Reviewers must provide explicit blocking/contract facts above.
+    return False
 
 def _format_skill_md_intent_review_failure(review: dict[str, Any]) -> str:
     """Format model review failure for UI/repair prompt.

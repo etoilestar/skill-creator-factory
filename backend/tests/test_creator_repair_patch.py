@@ -53,7 +53,7 @@ def test_approximate_substring_fallback_succeeds_for_unique_high_similarity_span
     )
 
     assert "validate input and write a final report" in candidate
-    assert stats["applied"][0]["fallback_type"] == "approximate_substring"
+    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
     assert stats["applied"][0]["similarity"] >= 0.88
     assert "original_model_old_excerpt" in stats["applied"][0]
 
@@ -65,7 +65,7 @@ def test_approximate_substring_rejects_multiple_high_similarity_candidates():
     )
     old = "use the parser to validate payload and write final report"
 
-    with pytest.raises(ValueError, match="approximate substring .*拒绝"):
+    with pytest.raises(ValueError, match="Markdown structured approximate .*拒绝"):
         _apply_exact_replace_patch(
             original_content=original,
             proposal=_proposal(old=old, new="replacement"),
@@ -77,7 +77,7 @@ def test_scripts_python_does_not_use_approximate_substring():
     original = "def run(payload):\n    return {'result': payload}\n"
     old = "def run(data):\n    return {'result': data}\n"
 
-    with pytest.raises(ValueError, match="不启用 approximate substring"):
+    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
         _apply_exact_replace_patch(
             original_content=original,
             proposal=_proposal(target_file="scripts/main.py", old=old, new="def run(payload):\n    return {'ok': payload}\n"),
@@ -200,7 +200,7 @@ def test_unified_diff_to_exact_does_not_enable_approximate_for_python_scripts():
         ),
         mode="unified_diff",
     )
-    with pytest.raises(ValueError, match="不启用 approximate substring"):
+    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
         _apply_unified_diff_or_convert_to_exact(
             original_content=original,
             proposal=proposal,
@@ -227,7 +227,7 @@ def test_deterministic_micro_patch_uses_structured_repair_ops_only():
     assert result is not None
     _proposal, candidate, stats = result
     assert "Read references only when needed." in candidate
-    assert stats["mode"] == "deterministic_micro_patch"
+    assert stats["mode"] == "deterministic_micro_patch_batch"
 
 
 def test_deterministic_micro_patch_ignores_natural_language_minimal_edit():
@@ -344,7 +344,7 @@ def test_markdown_structured_match_handles_minor_old_text_changes():
         expected_target_file="SKILL.md",
     )
     assert "final artifact" in candidate
-    assert stats["applied"][0]["fallback_type"] == "approximate_substring"
+    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
 
 
 def test_markdown_fuzzy_rejects_command_block_changes():
@@ -384,4 +384,5 @@ def test_multiple_repair_ops_are_batched():
     assert result is not None
     _proposal, candidate, stats = result
     assert "new one" in candidate and "new two" in candidate
+    assert stats["mode"] == "deterministic_micro_patch_batch"
     assert stats["repair_ops"]["applied"] == 2

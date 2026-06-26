@@ -297,8 +297,8 @@ def test_blueprint_review_top_level_issues_dedupes_and_ignores_reviewer_duplicat
     review = {
         "passed": False,
         "issues": [
-            {"severity": "error", "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
-            {"severity": "error", "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
+            {"severity": "error", "blocking": True, "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
+            {"severity": "error", "blocking": True, "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
         ],
         "reviewers": {"file_plan_reviewer": {"passed": False, "issues": [{"severity": "error", "field": "file_plan", "message": "duplicate nested", "evidence": "scripts/a.py"}]}},
     }
@@ -317,7 +317,7 @@ def test_blueprint_wording_advisory_does_not_block():
 def test_user_key_requirement_missing_blocks():
     from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 
-    review = {"passed": False, "issues": [{"severity": "error", "field": "user_requirement", "message": "page count cannot be passed to script", "evidence": "schema lacks input"}]}
+    review = {"passed": False, "issues": [{"severity": "error", "field": "user_requirement", "message": "page count cannot be passed to script", "evidence": "schema lacks input", "contract_impact": {"user_requirement_transfer": True}}]}
     results = _skill_md_blueprint_review_to_contract_results(review)
     assert results and results[0].layer == "skill_md_blueprint_alignment"
 
@@ -329,3 +329,27 @@ def test_reviewer_json_parse_failed_is_validator_error_not_skill_repair():
     failures = _exception_to_skill_md_failures(CreatorValidatorReviewError("bad json", raw_excerpt="oops"), source="blueprint_alignment")
     assert failures[0]["layer"] == "validator_error"
     assert normalize_skill_md_failures(failures) == []
+
+
+def test_plain_error_without_contract_facts_is_advisory():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {"passed": False, "issues": [{"severity": "error", "field": "user_facing", "message": "description could be richer"}]}
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_explicit_blocking_false_does_not_block():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {"passed": False, "issues": [{"severity": "error", "blocking": False, "field": "workflow", "message": "role tag absent", "contract_impact": {"execution_closure": True}}]}
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_reviewer_dedupe_ignores_changing_evidence():
+    from backend.services.creator.contracts import _dedupe_review_issues
+
+    issues = [
+        {"severity": "error", "field": "file_plan", "message": "same", "expected": "same expected", "evidence": "old evidence"},
+        {"severity": "error", "field": "file_plan", "message": "same", "expected": "same expected", "evidence": "new evidence"},
+    ]
+    assert len(_dedupe_review_issues(issues)) == 1

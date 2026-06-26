@@ -1972,6 +1972,7 @@ def test_repair_prompt_does_not_request_argv_key_alignment():
 async def test_finalize_skill_md_endpoint_uses_model_finalizer(monkeypatch, tmp_path):
     from backend.config import settings
     from backend.routers import creator
+    from backend.services.creator import api as creator_api
     from backend.routers.creator import FinalizeSkillMdRequest
 
     monkeypatch.setattr(settings, "skills_path", tmp_path)
@@ -1997,8 +1998,8 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
     async def fake_alignment(**_kwargs):
         return None
 
-    monkeypatch.setattr(creator, "_complete_creator_file_generation", fake_complete_creator_file_generation)
-    monkeypatch.setattr(creator, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
 
     result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
         skill_name="demo-skill",
@@ -2015,6 +2016,7 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
 async def test_finalize_skill_md_repairs_bad_draft_before_success(monkeypatch, tmp_path):
     from backend.config import settings
     from backend.routers import creator
+    from backend.services.creator import api as creator_api
     from backend.routers.creator import FinalizeSkillMdRequest
 
     monkeypatch.setattr(settings, "skills_path", tmp_path)
@@ -2043,8 +2045,8 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
     async def fake_alignment(**_kwargs):
         return None
 
-    monkeypatch.setattr(creator, "_complete_creator_file_generation", fake_complete_creator_file_generation)
-    monkeypatch.setattr(creator, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
 
     result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
         skill_name="demo-skill",
@@ -2056,7 +2058,47 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
 
     assert result["success"] is True
     assert result["repair_attempts"] == 1
-    assert calls == ["model_finalizer", "model_finalizer_repair"]
+    assert calls == ["model_finalizer", "format_full_rewrite"]
+
+
+
+
+@pytest.mark.asyncio
+async def test_generate_file_hard_format_enters_format_full_rewrite(monkeypatch, tmp_path):
+    import json
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.services.creator import api as creator_api
+    from backend.routers.creator import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    calls = []
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        calls.append(kwargs["prompt_variant"])
+        if len(calls) == 1:
+            return "---\nname: demo\ndescription: Demo\n# unclosed frontmatter\n"
+        return "---\nname: demo\ndescription: Demo\n---\n\n# Guide\n\nReference body.\n"
+
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+
+    response = await creator.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="references/guide.md",
+        purpose="Guide",
+        blueprint_text="references/guide.md",
+        conversation_history=[],
+    ))
+    events = []
+    async for line in response.body_iterator:
+        if isinstance(line, bytes):
+            line = line.decode()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+            events.append(json.loads(line[6:]))
+
+    assert "format_full_rewrite" in calls
+    assert any(event.get("status") == "format_full_rewrite" for event in events)
+    assert any("Guide" in str(event.get("content") or "") for event in events)
 
 
 @pytest.mark.asyncio
@@ -2073,7 +2115,7 @@ async def test_finalize_skill_md_returns_structured_failures_after_repairs(monke
     async def fake_complete_creator_file_generation(**_kwargs):
         return "# Still invalid"
 
-    monkeypatch.setattr(creator, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
 
     with pytest.raises(HTTPException) as excinfo:
         await creator.finalize_skill_md(FinalizeSkillMdRequest(

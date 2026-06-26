@@ -189,3 +189,71 @@ def test_resolve_tool_snippets_prioritizes_error_repair_context():
     assert "create_pdf" in snippets[0]["code"]
     assert "Do not return {'pdf_path': result}" in snippets[0]["formatted"]
     assert "Snippets" in tool_snippet_prompt(snippets)
+
+
+def test_office_and_table_capabilities_have_manifests_and_snippets():
+    expected = {
+        "docx_generation": "create_docx",
+        "pptx_generation": "create_pptx",
+        "xlsx_generation": "create_xlsx",
+        "csv_generation": "create_csv",
+        "docx_parsing": "read_docx_text",
+        "pptx_parsing": "read_pptx_text",
+        "spreadsheet_read": "read_spreadsheet",
+        "csv_read": "read_csv",
+    }
+    names = {cap.name for cap in list_tool_capabilities()}
+    assert set(expected).issubset(names)
+    for capability_name, helper in expected.items():
+        capability = get_tool_capability(capability_name)
+        assert helper in capability.helper_imports
+        assert capability.functions
+        assert capability.snippets
+        card = capability.functions[0]
+        assert card.example_call and helper in card.example_call
+        assert card.example_stdout
+        assert card.common_mistakes
+        snippet_text = capability.snippets[0].code + capability.snippets[0].return_rule
+        assert helper in snippet_text
+        assert "dict" in snippet_text or "JSON" in snippet_text
+        if capability_name == "docx_generation":
+            assert "text=" in snippet_text
+            assert "blocks=" in snippet_text
+            assert "paragraphs=" in snippet_text
+            assert "title=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "pptx_generation":
+            assert "slides=" in snippet_text
+            assert "blocks" in snippet_text
+            assert "title=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "xlsx_generation":
+            assert "sheets=" in snippet_text
+            assert "headers=" in snippet_text
+            assert "rows=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "csv_generation":
+            assert "headers=" in snippet_text
+            assert "rows=" in snippet_text
+            assert "output_filename" in snippet_text
+        if capability_name.endswith("_generation"):
+            assert f"{capability_name.split('_')[0]}_path" in capability.output_schema["properties"]
+            assert "file_paths" in capability.output_schema["properties"]
+            assert "file_outputs" in capability.output_schema["properties"]
+            assert "Do not drop file_outputs" in " ".join(card.common_mistakes)
+
+
+def test_resolve_office_table_tools_does_not_route_to_pdf():
+    from backend.services.creator_tool_registry import resolve_tools_for_skill_plan_entry
+
+    for capability_name, helper in {
+        "docx_generation": "create_docx",
+        "pptx_generation": "create_pptx",
+        "xlsx_generation": "create_xlsx",
+        "csv_generation": "create_csv",
+    }.items():
+        resolved = resolve_tools_for_skill_plan_entry({"role": "composite_generator", "required_capabilities": [capability_name, "file_output"]})
+        assert capability_name in resolved.allowed_tools
+        assert helper in resolved.allowed_helper_imports
+        assert "pdf_generation" not in resolved.allowed_tools
+        assert "Do not route" in resolved.tool_usage_prompt

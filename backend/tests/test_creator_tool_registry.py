@@ -257,3 +257,145 @@ def test_resolve_office_table_tools_does_not_route_to_pdf():
         assert helper in resolved.allowed_helper_imports
         assert "pdf_generation" not in resolved.allowed_tools
         assert "Do not route" in resolved.tool_usage_prompt
+
+
+def _file_manifest(prop_schema):
+    return {
+        "runtime_type": "python_script",
+        "tool_name": "sample_file_tool",
+        "description": "sample",
+        "input_schema": {"type": "object", "properties": {"file": prop_schema}},
+        "output_schema": {"type": "object", "required": ["success"], "properties": {"success": {"type": "boolean"}, "seen": {}}},
+        "dependencies": [],
+        "permissions": {"network": False, "read_files": True, "write_files": False, "subprocess": False, "env": []},
+        "artifact_policy": {"file_fields": []},
+        "auth": {"required": "no", "secrets": []},
+    }
+
+
+def _make_sample_pdf(monkeypatch, tmp_path):
+    import backend.services.creator_tool_registry as registry
+
+    sample_pdf = tmp_path / "sample.pdf"
+    sample_pdf.write_bytes(b"%PDF-1.4\n% test sample\n")
+    monkeypatch.setattr(registry, "PDF_SAMPLE_PATH", sample_pdf)
+    return registry, sample_pdf
+
+
+def test_resolve_sample_input_pdf_content_media_type(monkeypatch, tmp_path):
+    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+
+    manifest = _file_manifest({"type": "string", "format": "file-path", "contentMediaType": "application/pdf"})
+    sample_input, notes = registry.resolve_tool_trial_sample_input(manifest, {})
+
+    assert sample_input == {"file": str(sample_pdf.resolve())}
+    assert notes == []
+
+
+def test_resolve_sample_input_pdf_extension(monkeypatch, tmp_path):
+    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+
+    manifest = _file_manifest({"type": "string", "format": "file-path", "accepted_extensions": [".pdf"]})
+    sample_input, notes = registry.resolve_tool_trial_sample_input(manifest, {})
+
+    assert sample_input["file"] == str(sample_pdf.resolve())
+    assert notes == []
+
+
+def test_resolve_sample_input_image_media_type_and_extension():
+    from backend.services.creator_tool_registry import IMAGE_SAMPLE_PATH, resolve_tool_trial_sample_input
+
+    for prop_schema in [
+        {"type": "string", "format": "file-path", "contentMediaType": "image/png"},
+        {"type": "string", "format": "file-path", "accepted_extensions": [".jpg"]},
+    ]:
+        sample_input, notes = resolve_tool_trial_sample_input(_file_manifest(prop_schema), {})
+        assert sample_input["file"] == str(IMAGE_SAMPLE_PATH.resolve())
+        assert notes == []
+
+
+def test_resolve_sample_input_array_of_file_paths(monkeypatch, tmp_path):
+    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+
+    manifest = _file_manifest({"type": "array", "items": {"type": "string", "format": "file-path", "contentMediaType": "application/pdf"}})
+    sample_input, notes = registry.resolve_tool_trial_sample_input(manifest, {})
+
+    assert sample_input == {"file": [str(sample_pdf.resolve())]}
+    assert notes == []
+
+
+def test_resolve_sample_input_does_not_override_user_value():
+    from backend.services.creator_tool_registry import resolve_tool_trial_sample_input
+
+    manifest = _file_manifest({"type": "string", "format": "file-path", "contentMediaType": "application/pdf"})
+    sample_input, notes = resolve_tool_trial_sample_input(manifest, {"file": "/user/provided.pdf"})
+
+    assert sample_input == {"file": "/user/provided.pdf"}
+    assert notes == []
+
+
+def test_resolve_sample_input_missing_sample_warns_without_fabricating(monkeypatch, tmp_path):
+    import backend.services.creator_tool_registry as registry
+
+    monkeypatch.setattr(registry, "PDF_SAMPLE_PATH", tmp_path / "missing.pdf")
+    manifest = _file_manifest({"type": "string", "format": "file-path", "contentMediaType": "application/pdf"})
+    sample_input, notes = registry.resolve_tool_trial_sample_input(manifest, {})
+
+    assert sample_input == {}
+    assert notes
+    assert "missing" in notes[0]
+
+
+def test_validate_dynamic_trial_receives_resolved_sample_input(monkeypatch, tmp_path):
+    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+
+    script = """
+def run(payload, config=None):
+    import os
+    return {"success": True, "seen_basename": os.path.basename(payload.get("file", "")), "seen_exists": os.path.exists(payload.get("file", ""))}
+def sample_file_tool(payload, config=None):
+    return run(payload, config)
+"""
+    validation = registry.validate_tool_manifest(
+        _file_manifest({"type": "string", "format": "file-path", "contentMediaType": "application/pdf"}),
+        adapter_code=script,
+        sample_input={},
+        dynamic=True,
+        require_auth_config=False,
+    )
+
+    assert validation["success"] is True
+    assert validation["sample_input"] == {"file": str(sample_pdf.resolve())}
+    assert validation["dynamic_trial"]["result"]["seen_basename"] == "sample.pdf"
+    assert validation["dynamic_trial"]["result"]["seen_exists"] is True
+
+
+def test_author_trial_run_and_finalize_return_resolved_sample_input(monkeypatch, tmp_path):
+    import asyncio
+    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+
+    async def fake_snippet(**kwargs):
+        return None
+
+    async def fake_contract(**kwargs):
+        return {"sample_input": kwargs["sample_input"]}
+
+    monkeypatch.setattr(registry, "_author_snippet_with_model", fake_snippet)
+    monkeypatch.setattr(registry, "_summarize_tool_contract_with_model", fake_contract)
+
+    manifest = _file_manifest({"type": "string", "format": "file-path", "contentMediaType": "application/pdf"})
+    script = """
+def run(payload, config=None):
+    return {"success": True, "seen": payload}
+def sample_file_tool(payload, config=None):
+    return run(payload, config)
+"""
+    request = {"manifest": manifest, "runtime_code": script, "sample_input": {}}
+
+    trial = asyncio.run(registry.author_tool({**request, "action": "trial_run"}))
+    finalized = asyncio.run(registry.author_tool({**request, "action": "finalize"}))
+
+    expected = {"file": str(sample_pdf.resolve())}
+    assert trial["sample_input"] == expected
+    assert finalized["sample_input"] == expected
+    assert finalized["tool_contract"]["sample_input"] == expected

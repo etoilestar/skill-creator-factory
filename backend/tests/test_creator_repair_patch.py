@@ -3,8 +3,12 @@ import pytest
 from backend.services.creator import repair
 from backend.services.creator.repair import (
     CreatorDiffProposal,
+    CreatorRepairProposalParseError,
     CreatorRepairScope,
     _apply_exact_replace_patch,
+    _apply_deterministic_micro_patch_if_safe,
+    _apply_unified_diff_or_convert_to_exact,
+    _extract_json_or_diff_proposal,
     _validate_repair_diff_scope,
     _request_and_apply_repair_patch,
 )
@@ -120,14 +124,158 @@ async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(mo
 
 
 def test_old_lines_new_lines_patch_parses_to_exact_replace():
-    from backend.services.creator.repair import _extract_json_or_diff_proposal
-
     proposal = _extract_json_or_diff_proposal(
         '{"target_file":"SKILL.md","edits":[{"old_lines":["alpha","beta"],"new_lines":["alpha","BETA"]}]}',
         expected_target_file="SKILL.md",
     )
 
     assert proposal.edits == [{"old": "alpha\nbeta", "new": "alpha\nBETA"}]
+
+
+def test_old_lines_handles_shell_json_argv_without_polluting_target_content():
+    proposal = _extract_json_or_diff_proposal(
+        """
+        {
+          "target_file": "SKILL.md",
+          "reason": "fix argv",
+          "edits": [{
+            "old_lines": ["```bash", "python scripts/run.py '{\\"topic\\": \\"{{topic}}\\"}'", "```"],
+            "new_lines": ["```bash", "python scripts/run.py '{\\"topic\\": \\"{{topic}}\\", \\"count\\": 3}'", "```"]
+          }]
+        }
+        """,
+        expected_target_file="SKILL.md",
+    )
+    assert proposal.edits[0]["old"] == '```bash\npython scripts/run.py \'{"topic": "{{topic}}"}\'\n```'
+    assert "\\{" not in proposal.edits[0]["new"]
+
+
+def test_malformed_json_with_fenced_diff_is_recovered():
+    text = '''{"target_file":"SKILL.md","diff":"bad " quote
+```diff
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -1 +1 @@
+-old
++new
+```
+}'''
+    proposal = _extract_json_or_diff_proposal(text, expected_target_file="SKILL.md")
+    assert proposal.mode == "unified_diff"
+    assert "old" in proposal.diff
+
+
+def test_parse_failure_is_structured_when_no_patch_schema_found():
+    with pytest.raises(CreatorRepairProposalParseError) as exc:
+        _extract_json_or_diff_proposal("not a patch", expected_target_file="SKILL.md")
+    assert exc.value.diff_extraction_attempted is True
+    assert exc.value.last_output_excerpt == "not a patch"
+
+
+def test_unified_diff_bad_line_number_converts_to_exact_replace_for_markdown():
+    original = "one\nold\nthree\n"
+    proposal = CreatorDiffProposal(
+        target_file="SKILL.md",
+        reason="bad hunk line",
+        diff="--- a/SKILL.md\n+++ b/SKILL.md\n@@ -99,3 +99,3 @@\n one\n-old\n+new\n three\n",
+        mode="unified_diff",
+    )
+    candidate, stats = _apply_unified_diff_or_convert_to_exact(
+        original_content=original,
+        proposal=proposal,
+        expected_target_file="SKILL.md",
+    )
+    assert candidate == "one\nnew\nthree\n"
+    assert stats["mode"] == "unified_diff_to_exact_replace"
+
+
+def test_unified_diff_to_exact_does_not_enable_approximate_for_python_scripts():
+    original = "def run(payload):\n    return {'result': payload}\n"
+    proposal = CreatorDiffProposal(
+        target_file="scripts/main.py",
+        reason="bad approximate hunk",
+        diff=(
+            "--- a/scripts/main.py\n+++ b/scripts/main.py\n@@ -50,2 +50,2 @@\n"
+            "-def run(data):\n-    return {'result': data}\n+def run(payload):\n+    return {'ok': payload}\n"
+        ),
+        mode="unified_diff",
+    )
+    with pytest.raises(ValueError, match="不启用 approximate substring"):
+        _apply_unified_diff_or_convert_to_exact(
+            original_content=original,
+            proposal=proposal,
+            expected_target_file="scripts/main.py",
+        )
+
+
+def test_deterministic_micro_patch_uses_structured_repair_ops_only():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    failure = {
+        "target_file": "SKILL.md",
+        "repair_ops": [{
+            "op": "append_after",
+            "anchor": "Reference rules",
+            "text": "\nRead references only when needed.",
+        }],
+    }
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[failure],
+        current_content="# Skill\n\nReference rules\n",
+        scope=scope,
+    )
+
+    assert result is not None
+    _proposal, candidate, stats = result
+    assert "Read references only when needed." in candidate
+    assert stats["mode"] == "deterministic_micro_patch"
+
+
+def test_deterministic_micro_patch_ignores_natural_language_minimal_edit():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[{
+            "target_file": "SKILL.md",
+            "evidence": "Reference rules",
+            "minimal_edit": "append a read-only note after the reference section",
+        }],
+        current_content="# Skill\n\nReference rules\n",
+        scope=scope,
+    )
+
+    assert result is None
+
+
+def test_resource_role_conflicts_use_structured_claims_only():
+    from backend.services.creator.api import normalize_skill_md_failures
+
+    advisory = normalize_skill_md_failures([{
+        "target_file": "SKILL.md",
+        "resource_role": "reference",
+        "claim_type": "forbid_read",
+        "severity": "error",
+        "message": "structured read prohibition",
+    }])
+    hard = normalize_skill_md_failures([{
+        "target_file": "SKILL.md",
+        "resource_role": "reference",
+        "claim_type": "execution_step",
+        "severity": "error",
+        "message": "structured execution claim",
+    }])
+
+    assert advisory == []
+    assert hard and "只读" in hard[0]["expected"]
+
+
+def test_failure_ledger_drops_resolved_previous_failure():
+    from backend.services.creator.api import failure_ledger_for_skill_md_finalize
+
+    previous = [{"target_file": "SKILL.md", "layer": "review", "id": "a", "evidence": "old"}]
+    current = [{"target_file": "SKILL.md", "layer": "review", "id": "b", "evidence": "new"}]
+    ledger = failure_ledger_for_skill_md_finalize(current, previous_remaining=previous)
+
+    assert ledger["resolved_failures"] == previous
+    assert all(item["id"] != "a" for item in ledger["remaining_failures"])
 
 
 def test_normalized_span_mapping_trims_spans_with_surrounding_whitespace():

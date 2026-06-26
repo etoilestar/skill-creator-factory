@@ -1893,7 +1893,7 @@ async def _repair_existing_file_for_e2e_failure(
         notes=(
             "第二轮只修 workflow / cross-step IO / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
-            "优先输出 edits old/new exact_replace patch，不要输出完整文件。",
+            "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
         ),
     )
 
@@ -1920,7 +1920,7 @@ async def _repair_existing_file_for_e2e_failure(
             "只修命令块、参数传递、步骤串接相关问题。\n"
             "不要重写 SKILL.md 正文。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整 SKILL.md。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
         )
 
     elif target_path.startswith("scripts/"):
@@ -1930,14 +1930,14 @@ async def _repair_existing_file_for_e2e_failure(
             "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
             "不要重新设计业务功能；PDF 样式、图片风格、表格样式、内容质量属于第一轮功能 smoke。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整源码。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整源码。"
         )
 
     else:
         target_rule = (
             "只修复 E2E_REPAIR_TARGET 指向的文件。\n"
             "只修当前 E2E 失败对应的最小接口串接问题。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
 
     base_task_context = "\n".join([
@@ -2173,6 +2173,10 @@ async def _repair_existing_file_for_e2e_failure(
                 "target_file": target_path,
                 "patch_status": patch_status,
                 "rejection_reason": error_text[:2000],
+                "last_output_excerpt": getattr(candidate_exc, "last_output_excerpt", ""),
+                "parser_error": getattr(candidate_exc, "parser_error", "") or (error_text[:1000] if patch_status == "parse_failed" else ""),
+                "diff_extraction_attempted": bool(getattr(candidate_exc, "diff_extraction_attempted", False)),
+                "old_lines_new_lines_fallback_attempted": bool(getattr(candidate_exc, "lines_fallback_attempted", False)),
                 "failed_checks": repair_feedback.split("\n\n")[:8],
                 "resolved_failures": e2e_session.resolved_failures,
                 "rerun_status": "skipped",

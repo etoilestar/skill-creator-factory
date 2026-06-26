@@ -272,7 +272,9 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 多场景、多图片、多页 PDF 等循环应由脚本实现；SKILL.md 第一轮只需保持命令块静态可解析。",
         "",
         "E. references/assets:",
-        "- references 应在资源/参考资料小节说明用途和按需读取时机。",
+        "- references/*.md 为只读参考资料，可按需由相关脚本按路径只读加载，用于获取格式、布局、模板或规则说明。",
+        "- references/*.md 不作为独立执行步骤，不被修改，不产出文件，不作为上传素材，也不作为最终 artifact。",
+        "- 如果脚本不需要运行时读取 reference，也可以说明其内容已在脚本设计阶段被吸收为实现规范。",
         "- reference 正文不要全文塞进 SKILL.md。",
         "- assets/** 只能作为上传素材/静态资源引用，不能描述为模型生成。",
         "",
@@ -310,7 +312,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
-        "- references/ 只在参考资料/资源小节说明用途和按需读取时机，不替代主流程命令块。",
+        "- references/ 是只读参考资料：可按需读取用于格式/模板/规则，但不替代主流程命令块，不作为产物或上传素材。",
         "- assets/ 只能作为上传素材/静态资源引用，不能描述为模型生成。",
         "",
         "C. 可用脚本路径与静态命令示例:",
@@ -1030,6 +1032,10 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- 不要求固定 SKILL.md 模板。\n"
         "- 不允许把蓝图不一致降级为 warning；只要需要修改 SKILL.md 才能对齐蓝图，就必须 severity=error 且 passed=false。\n"
         "- warning 只能用于不需要修改也不影响蓝图责任完成的提示。\n\n"
+        "结构化 issue 字段规范：\n"
+        "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
+        "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
+        "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件判断原则：\n"
         "- 出现在目录结构、SkillPlan path、dependencies、reference_files、asset_source 中的路径是真实文件。\n"
@@ -1057,7 +1063,10 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
         '      "expected": "应当如何与蓝图一致",\n'
-        '      "minimal_edit": "只修改 SKILL.md 的哪个区域，不要整文件重写"\n'
+        '      "minimal_edit": "只修改 SKILL.md 的哪个区域，不要整文件重写",\n'
+        '      "resource_role": "reference|asset|null",\n'
+        '      "claim_type": "forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset|null",\n'
+        '      "repair_ops": [{"op": "replace|delete|append_after|append_before", "anchor": "当前文件中唯一定位的原文", "text": "追加文本", "replacement": "替换文本"}]\n'
         '    }\n'
         "  ],\n"
         '  "repair_suggestions": "给修复模型的最小局部编辑建议"\n'
@@ -1145,6 +1154,9 @@ async def _review_skill_md_blueprint_intent_with_model(
                         "evidence": issue.get("evidence", ""),
                         "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
                         "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
+                        "resource_role": issue.get("resource_role"),
+                        "claim_type": issue.get("claim_type"),
+                        "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
                     })
                 else:
                     reviewer_issues.append({
@@ -2868,7 +2880,7 @@ async def _refine_blueprint_contract_with_model(
             notes=(
                 "Phase2 展示前蓝图修复。",
                 "只改蓝图文本，不写代码。",
-                "使用 exact_replace old/new patch。",
+                "使用 exact_replace old_lines/new_lines patch；old/new 单字符串仅兼容旧格式。",
                 "保持用户需求，不新增平台协议。",
             ),
         )
@@ -2896,7 +2908,7 @@ async def _refine_blueprint_contract_with_model(
                     "不要输出代码。"
                     "不要输出 FileSpecOut patch。"
                     "不要新增平台宿主协议。"
-                    "必须使用 exact_replace old/new patch。"
+                    "必须使用 exact_replace old_lines/new_lines patch；old/new 单字符串仅兼容旧格式。"
                 ),
                 patch_retry_limit=3,
             )

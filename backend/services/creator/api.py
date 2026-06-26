@@ -560,6 +560,8 @@ def _repair_mode_for_first_round(*, source: str, file_path: str, attempt: int) -
 
 
 def _contract_result_to_failure(result: ContractCheckResult) -> dict[str, Any]:
+    issue = result.details.get("issue") if isinstance(result.details, dict) else None
+    issue = issue if isinstance(issue, dict) else {}
     return {
         "id": result.id,
         "target": result.target,
@@ -568,6 +570,9 @@ def _contract_result_to_failure(result: ContractCheckResult) -> dict[str, Any]:
         "minimal_edit": result.minimal_edit,
         "details": result.details,
         "layer": result.layer or _contract_layer_for_check_id(result.id),
+        "resource_role": issue.get("resource_role"),
+        "claim_type": issue.get("claim_type"),
+        "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
     }
 
 
@@ -594,65 +599,118 @@ def classify_skill_md_failure_severity(failure: dict[str, Any]) -> str:
         return "advisory"
     return "hard"
 
+def _failure_signature(failure: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(failure.get("target") or failure.get("target_file") or ""),
+        str(failure.get("layer") or failure.get("source_layer") or ""),
+        str(failure.get("id") or failure.get("check_id") or ""),
+        str(failure.get("evidence") or (failure.get("details") or {}).get("evidence") or ""),
+    )
+
 
 def merge_duplicate_failures(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for failure in failures:
         if not isinstance(failure, dict):
             continue
-        key = (
-            str(failure.get("target") or failure.get("target_file") or ""),
-            str(failure.get("layer") or ""),
-            str(failure.get("evidence") or (failure.get("details") or {}).get("evidence") or ""),
-            str(failure.get("minimal_edit") or ""),
-        )
+        key = _failure_signature(failure)
         if key not in merged:
             merged[key] = dict(failure)
         else:
             messages = [str(merged[key].get("message") or ""), str(failure.get("message") or "")]
             merged[key]["message"] = " / ".join(dict.fromkeys(m for m in messages if m))
+            ops = []
+            for source in (merged[key].get("repair_ops"), failure.get("repair_ops")):
+                if isinstance(source, list):
+                    ops.extend(op for op in source if isinstance(op, dict))
+            if ops:
+                merged[key]["repair_ops"] = ops
     return list(merged.values())
 
 
 def resolve_resource_role_conflicts(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize reviewer resource-role conflicts without business hardcoding."""
+    """Normalize reviewer resource-role conflicts from structured fields only."""
     normalized: list[dict[str, Any]] = []
     for failure in failures:
         item = dict(failure)
-        blob = json.dumps(item, ensure_ascii=False, default=str).lower()
-        if "reference" in blob or "references/" in blob:
-            forbids_read = any(token in blob for token in ("不能读取", "禁止读取", "must not read", "cannot read"))
-            describes_execution = any(token in blob for token in ("执行步骤", "execute step", "executable step", "bash", "shell"))
-            describes_generated = any(token in blob for token in ("生成素材", "生成文件", "最终产物", "artifact", "asset"))
-            if forbids_read and not (describes_execution or describes_generated):
+        role = str(item.get("resource_role") or item.get("role") or "").lower()
+        claim = str(item.get("claim_type") or item.get("resource_claim") or "").lower()
+        target = str(item.get("target_file") or item.get("target") or "")
+        if role == "reference" or target.startswith("references/"):
+            if claim in {"forbid_read", "no_runtime_read", "must_not_read"}:
                 item["severity"] = "advisory"
                 item["message"] = (
                     str(item.get("message") or "")
                     + "（已按资源角色规则降级：reference 可按需只读加载，但不能执行、修改、生成或作为产物/素材。）"
                 )
-            elif describes_execution or describes_generated:
+            elif claim in {"execution_step", "artifact", "asset_material", "model_generated", "modifiable"}:
                 item["expected"] = (
                     "references/*.md 是只读、按需加载的参考资料；非执行步骤、非产物、非生成素材，且不得被修改。"
                 )
-        if "asset" in blob or "assets/" in blob:
-            if any(token in blob for token in ("模型生成", "generate asset", "write asset")):
+        if role == "asset" or target.startswith("assets/"):
+            if claim in {"model_generated", "modifiable", "write_asset"}:
                 item["expected"] = "assets/** 只能是用户上传或结构预留的静态素材，不能由模型生成或写入。"
         normalized.append(item)
     return normalized
 
 
+def _normalize_repair_ops(failure: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pass through structured repair ops; do not parse natural language."""
+    allowed = {"replace", "delete", "append_after", "append_before"}
+    source = failure.get("repair_ops")
+    ops: list[dict[str, Any]] = []
+    if isinstance(source, list):
+        candidates = source
+    elif isinstance(source, dict):
+        candidates = [source]
+    else:
+        candidates = []
+    for op in candidates:
+        if not isinstance(op, dict):
+            continue
+        op_name = str(op.get("op") or "").lower()
+        anchor = op.get("anchor") or op.get("evidence") or failure.get("evidence") or (failure.get("details") or {}).get("evidence")
+        if op_name not in allowed or not isinstance(anchor, str) or not anchor:
+            continue
+        normalized = {"op": op_name, "anchor": anchor}
+        if isinstance(op.get("text"), str):
+            normalized["text"] = op["text"]
+        if isinstance(op.get("replacement"), str):
+            normalized["replacement"] = op["replacement"]
+        if isinstance(op.get("new"), str):
+            normalized["replacement"] = op["new"]
+        ops.append(normalized)
+    return ops
+
+
 def normalize_skill_md_failures(failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     resolved = resolve_resource_role_conflicts(merge_duplicate_failures(failures))
+    for failure in resolved:
+        ops = _normalize_repair_ops(failure)
+        if ops:
+            failure["repair_ops"] = ops
     return [failure for failure in resolved if classify_skill_md_failure_severity(failure) == "hard"]
 
 
-def failure_ledger_for_skill_md_finalize(failures: list[dict[str, Any]]) -> dict[str, Any]:
+def failure_ledger_for_skill_md_finalize(
+    failures: list[dict[str, Any]],
+    *,
+    previous_remaining: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_all = resolve_resource_role_conflicts(merge_duplicate_failures([*(previous_remaining or []), *failures]))
     hard = normalize_skill_md_failures(failures)
+    current_signatures = {_failure_signature(failure) for failure in failures}
+    resolved = [
+        failure for failure in (previous_remaining or [])
+        if _failure_signature(failure) not in current_signatures
+    ]
     return {
+        "resolved_failures": resolved,
+        "remaining_failures": hard,
         "hard_failures": hard,
         "advisory_notes": [
-            failure for failure in failures
-            if classify_skill_md_failure_severity(resolve_resource_role_conflicts([failure])[0]) != "hard"
+            failure for failure in normalized_all
+            if classify_skill_md_failure_severity(failure) != "hard"
         ],
     }
 
@@ -844,6 +902,8 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
     )
 
     failures: list[dict[str, Any]] = []
+    repair_events: list[dict[str, Any]] = []
+    previous_remaining_failures: list[dict[str, Any]] = []
     candidate = ""
     content = ""
 
@@ -921,7 +981,12 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                 content=content,
                 blueprint_text=request.blueprint_text or "",
             )
-            failures = normalize_skill_md_failures(failures)
+            ledger = failure_ledger_for_skill_md_finalize(
+                failures,
+                previous_remaining=previous_remaining_failures,
+            )
+            failures = list(ledger["remaining_failures"])
+            previous_remaining_failures = failures
 
             # 阶段 3：格式/合同通过后，再做蓝图责任审查。
             if not failures:
@@ -934,8 +999,13 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                         model=request.model or route.model,
                     )
                 except Exception as exc:
-                    failures = _exception_to_skill_md_failures(exc, source="blueprint_alignment")
-                    failures = normalize_skill_md_failures(failures)
+                    raw_failures = _exception_to_skill_md_failures(exc, source="blueprint_alignment")
+                    ledger = failure_ledger_for_skill_md_finalize(
+                        raw_failures,
+                        previous_remaining=previous_remaining_failures,
+                    )
+                    failures = list(ledger["remaining_failures"])
+                    previous_remaining_failures = failures
 
             if not failures:
                 return {
@@ -945,20 +1015,33 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "validation_status": "passed",
                     "editable": True,
                     "disabled": False,
+                    "repair_events": repair_events,
                 }
 
             if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                 break
 
             # 非格式错误继续走原来的局部 diff。
-            candidate = await _repair_skill_md_model_finalizer(
-                previous_content=content,
-                failures=failures,
-                prompt_messages=prompt_messages,
-                model=route.model,
-                skill_name=skill_name,
-                attempt=attempt,
-            )
+            try:
+                candidate = await _repair_skill_md_model_finalizer(
+                    previous_content=content,
+                    failures=failures,
+                    prompt_messages=prompt_messages,
+                    model=route.model,
+                    skill_name=skill_name,
+                    attempt=attempt,
+                )
+            except CreatorRepairProposalParseError as parse_exc:
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "parse_failed",
+                    "parser_error": parse_exc.parser_error,
+                    "last_output_excerpt": parse_exc.last_output_excerpt,
+                    "diff_extraction_attempted": parse_exc.diff_extraction_attempted,
+                    "old_lines_new_lines_fallback_attempted": parse_exc.lines_fallback_attempted,
+                })
+                raise
 
         except Exception as exc:
             logger.exception(
@@ -978,6 +1061,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
         "editable": True,
         "disabled": False,
         "failures": failures,
+        "repair_events": repair_events,
         "error": "SKILL.md finalize did not pass after repair attempts.",
     }
 

@@ -342,7 +342,7 @@ def _extract_json_or_diff_proposal(
     if not _looks_like_unified_diff(raw_diff):
         raise CreatorRepairProposalParseError(
             "修复模型没有返回 exact_replace JSON，也没有返回 raw unified diff。"
-            "如果输出的是完整源码，必须拒绝并要求模型重新输出 edits old/new patch。"
+            "如果输出的是完整源码，必须拒绝并要求模型重新输出 edits old_lines/new_lines patch。"
             ,
             parser_error=parser_error or "no patch-schema JSON or unified diff found",
             last_output_excerpt=raw_text,
@@ -599,37 +599,46 @@ def _build_deterministic_patch_from_failure(
     target_file: str,
 ) -> CreatorDiffProposal | None:
     """Build a schema-safe micro patch from structured failure fields only."""
-    if str(failure.get("target") or failure.get("target_file") or target_file) not in {target_file, "SKILL.md"}:
+    failure_target = str(failure.get("target_file") or failure.get("target") or target_file)
+    if failure_target not in {target_file, "SKILL.md"} and not failure_target.startswith(f"{target_file}:"):
         return None
-    evidence = (
-        failure.get("evidence")
-        or (failure.get("details") or {}).get("evidence")
-        or (failure.get("details") or {}).get("matched_excerpt")
-    )
-    minimal = failure.get("minimal_edit")
-    if not isinstance(minimal, Mapping):
-        return None
-    op = str(minimal.get("op") or minimal.get("operation") or "").lower()
-    replacement = minimal.get("new") if "new" in minimal else minimal.get("replacement")
-    append_text = minimal.get("text")
-    located = _locate_failure_evidence_span(current_content, str(evidence or ""))
-    if located is None:
-        return None
-    start, end, _kind = located
-    old = current_content[start:end]
-    if op in {"replace", "delete"}:
-        new = "" if op == "delete" else replacement
-    elif op == "append":
-        new = old + str(append_text or "")
+    repair_ops = failure.get("repair_ops")
+    if isinstance(repair_ops, Mapping):
+        ops = [repair_ops]
+    elif isinstance(repair_ops, Sequence) and not isinstance(repair_ops, (str, bytes)):
+        ops = [op for op in repair_ops if isinstance(op, Mapping)]
     else:
         return None
-    if not isinstance(new, str) or old == new:
+    edits: list[dict[str, str]] = []
+    for repair_op in ops:
+        op = str(repair_op.get("op") or "").lower()
+        if op not in {"replace", "delete", "append_after", "append_before"}:
+            continue
+        anchor = repair_op.get("anchor") or repair_op.get("evidence")
+        if not isinstance(anchor, str) or not anchor:
+            continue
+        located = _locate_failure_evidence_span(current_content, anchor)
+        if located is None:
+            continue
+        start, end, _kind = located
+        old = current_content[start:end]
+        if op == "replace":
+            new = repair_op.get("replacement") if "replacement" in repair_op else repair_op.get("new")
+        elif op == "delete":
+            new = ""
+        elif op == "append_after":
+            new = old + str(repair_op.get("text") or "")
+        else:
+            new = str(repair_op.get("text") or "") + old
+        if isinstance(new, str) and old != new:
+            edits.append({"old": old, "new": new})
+    if not edits:
         return None
     return CreatorDiffProposal(
         target_file=target_file,
-        reason="deterministic micro patch from structured failure evidence/minimal_edit",
-        edits=[{"old": old, "new": new}],
-        raw={"target_file": target_file, "edits": [{"old": old, "new": new}]},
+        reason="deterministic micro patch from structured failure repair_ops",
+        edits=edits,
+        raw={"target_file": target_file, "edits": edits},
         mode="exact_replace",
     )
 
@@ -1040,7 +1049,7 @@ def _validate_repair_diff_scope(
     """Validate and apply repair proposal.
 
     主路径：
-    - exact_replace old/new
+    - exact_replace old_lines/new_lines（兼容 old/new）
 
     兜底：
     - unified diff
@@ -1142,7 +1151,7 @@ async def _request_repair_diff_proposal(
 ) -> CreatorDiffProposal:
     """Ask coding model for a repair patch proposal.
 
-    优先要求 exact_replace old/new。
+    优先要求 exact_replace old_lines/new_lines。
     兜底兼容 unified diff。
     """
 
@@ -1270,7 +1279,7 @@ async def _request_and_apply_repair_patch(
     不做业务规则判断。
     只做：
     - 格式失败反馈；
-    - old/new 匹配失败反馈；
+    - old_lines/new_lines（兼容 old/new）匹配失败反馈；
     - no-op patch 反馈；
     - runtime traceback 优先级反馈。
     """
@@ -1462,7 +1471,7 @@ async def _repair_generated_file_with_feedback(
             "第一轮只修当前文件。",
             "模型功能校验判断责任是否完成；smoke/trial run 判断代码是否通过。",
             "平台兼容性直接交给现有 sandbox/smoke 校验，不在 repair 层做字段词表判断。",
-            "优先输出 edits old/new exact_replace patch，不要输出完整文件。",
+            "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
         ),
     )
 
@@ -1513,7 +1522,7 @@ async def _repair_generated_file_with_feedback(
             "如果失败来自 smoke/trial run，你只修导致运行失败、stdout 失败或 artifact 失败的局部逻辑。\n"
             "不要为了绕过试运行而返回空结果或伪造成功。\n"
             "平台 IO 是否兼容，由后续现有 smoke/sandbox 试运行判断。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
 
         extra_context = (
@@ -1537,7 +1546,7 @@ async def _repair_generated_file_with_feedback(
             "不要整文件重写。\n"
             "不要在这里做第二轮 E2E 跨模块字段推断；那属于 workflow E2E。\n"
             "平台 IO 与 sandbox 模式对齐，由后续验证执行判断。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整 SKILL.md。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
         )
         extra_context = ""
 
@@ -1547,7 +1556,7 @@ async def _repair_generated_file_with_feedback(
             "reference 是参考资料，不是执行源。\n"
             "只修当前 reference 文件中的失败区域。\n"
             "不要添加可执行 workflow。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
         extra_context = ""
 
@@ -1555,7 +1564,7 @@ async def _repair_generated_file_with_feedback(
         target_rule = (
             "第一轮单文件修复。\n"
             "只修当前文件。\n"
-            "优先输出 edits old/new exact_replace patch。不要输出完整文件。"
+            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
         extra_context = ""
 

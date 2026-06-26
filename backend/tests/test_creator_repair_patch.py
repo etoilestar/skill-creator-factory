@@ -6,6 +6,7 @@ from backend.services.creator.repair import (
     CreatorRepairProposalParseError,
     CreatorRepairScope,
     _apply_exact_replace_patch,
+    _apply_deterministic_micro_patch_if_safe,
     _apply_unified_diff_or_convert_to_exact,
     _extract_json_or_diff_proposal,
     _validate_repair_diff_scope,
@@ -205,6 +206,76 @@ def test_unified_diff_to_exact_does_not_enable_approximate_for_python_scripts():
             proposal=proposal,
             expected_target_file="scripts/main.py",
         )
+
+
+def test_deterministic_micro_patch_uses_structured_repair_ops_only():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    failure = {
+        "target_file": "SKILL.md",
+        "repair_ops": [{
+            "op": "append_after",
+            "anchor": "Reference rules",
+            "text": "\nRead references only when needed.",
+        }],
+    }
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[failure],
+        current_content="# Skill\n\nReference rules\n",
+        scope=scope,
+    )
+
+    assert result is not None
+    _proposal, candidate, stats = result
+    assert "Read references only when needed." in candidate
+    assert stats["mode"] == "deterministic_micro_patch"
+
+
+def test_deterministic_micro_patch_ignores_natural_language_minimal_edit():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[{
+            "target_file": "SKILL.md",
+            "evidence": "Reference rules",
+            "minimal_edit": "append a read-only note after the reference section",
+        }],
+        current_content="# Skill\n\nReference rules\n",
+        scope=scope,
+    )
+
+    assert result is None
+
+
+def test_resource_role_conflicts_use_structured_claims_only():
+    from backend.services.creator.api import normalize_skill_md_failures
+
+    advisory = normalize_skill_md_failures([{
+        "target_file": "SKILL.md",
+        "resource_role": "reference",
+        "claim_type": "forbid_read",
+        "severity": "error",
+        "message": "structured read prohibition",
+    }])
+    hard = normalize_skill_md_failures([{
+        "target_file": "SKILL.md",
+        "resource_role": "reference",
+        "claim_type": "execution_step",
+        "severity": "error",
+        "message": "structured execution claim",
+    }])
+
+    assert advisory == []
+    assert hard and "只读" in hard[0]["expected"]
+
+
+def test_failure_ledger_drops_resolved_previous_failure():
+    from backend.services.creator.api import failure_ledger_for_skill_md_finalize
+
+    previous = [{"target_file": "SKILL.md", "layer": "review", "id": "a", "evidence": "old"}]
+    current = [{"target_file": "SKILL.md", "layer": "review", "id": "b", "evidence": "new"}]
+    ledger = failure_ledger_for_skill_md_finalize(current, previous_remaining=previous)
+
+    assert ledger["resolved_failures"] == previous
+    assert all(item["id"] != "a" for item in ledger["remaining_failures"])
 
 
 def test_normalized_span_mapping_trims_spans_with_surrounding_whitespace():

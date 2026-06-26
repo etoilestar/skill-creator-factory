@@ -1032,6 +1032,10 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- 不要求固定 SKILL.md 模板。\n"
         "- 不允许把蓝图不一致降级为 warning；只要需要修改 SKILL.md 才能对齐蓝图，就必须 severity=error 且 passed=false。\n"
         "- warning 只能用于不需要修改也不影响蓝图责任完成的提示。\n\n"
+        "结构化 issue 字段规范：\n"
+        "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
+        "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
+        "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件判断原则：\n"
         "- 出现在目录结构、SkillPlan path、dependencies、reference_files、asset_source 中的路径是真实文件。\n"
@@ -1059,7 +1063,10 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
         '      "expected": "应当如何与蓝图一致",\n'
-        '      "minimal_edit": "只修改 SKILL.md 的哪个区域，不要整文件重写"\n'
+        '      "minimal_edit": "只修改 SKILL.md 的哪个区域，不要整文件重写",\n'
+        '      "resource_role": "reference|asset|null",\n'
+        '      "claim_type": "forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset|null",\n'
+        '      "repair_ops": [{"op": "replace|delete|append_after|append_before", "anchor": "当前文件中唯一定位的原文", "text": "追加文本", "replacement": "替换文本"}]\n'
         '    }\n'
         "  ],\n"
         '  "repair_suggestions": "给修复模型的最小局部编辑建议"\n'
@@ -1147,6 +1154,9 @@ async def _review_skill_md_blueprint_intent_with_model(
                         "evidence": issue.get("evidence", ""),
                         "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
                         "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
+                        "resource_role": issue.get("resource_role"),
+                        "claim_type": issue.get("claim_type"),
+                        "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
                     })
                 else:
                     reviewer_issues.append({
@@ -2870,7 +2880,7 @@ async def _refine_blueprint_contract_with_model(
             notes=(
                 "Phase2 展示前蓝图修复。",
                 "只改蓝图文本，不写代码。",
-                "使用 exact_replace old/new patch。",
+                "使用 exact_replace old_lines/new_lines patch；old/new 单字符串仅兼容旧格式。",
                 "保持用户需求，不新增平台协议。",
             ),
         )
@@ -2898,7 +2908,7 @@ async def _refine_blueprint_contract_with_model(
                     "不要输出代码。"
                     "不要输出 FileSpecOut patch。"
                     "不要新增平台宿主协议。"
-                    "必须使用 exact_replace old/new patch。"
+                    "必须使用 exact_replace old_lines/new_lines patch；old/new 单字符串仅兼容旧格式。"
                 ),
                 patch_retry_limit=3,
             )

@@ -2559,15 +2559,34 @@ def _format_file_validator_feedback(
             json.dumps(safe_localizations, ensure_ascii=False, indent=2, default=str),
         ])
 
+    advisory_only_report = (
+        isinstance(validator_report, dict)
+        and (validator_report.get("passed") is True or validator_report.get("failure_type") in {"none", None, ""})
+        and not validator_report.get("issues")
+    )
+    repair_text = str(validator_report.get("repair_instructions") or "").strip() if isinstance(validator_report, dict) else ""
+    issues_for_repair = validator_report.get("issues") if isinstance(validator_report, dict) else []
+    has_structured_blocking_issue = any(
+        isinstance(item, dict)
+        and str(item.get("requirement_id") or "").strip()
+        and isinstance(item.get("missing_evidence"), list)
+        and bool(item.get("missing_evidence"))
+        for item in (issues_for_repair if isinstance(issues_for_repair, list) else [])
+    )
+    failure_type = str(validator_report.get("failure_type") or "") if isinstance(validator_report, dict) else ""
+    if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete", "validator_error", "validator_incomplete"}:
+        advisory_only_report = True
     if (
         not delegate_to_backend_contract
         and isinstance(validator_report, dict)
-        and str(validator_report.get("repair_instructions") or "").strip()
+        and repair_text
+        and not advisory_only_report
+        and has_structured_blocking_issue
     ):
         parts.extend([
             "",
             "校验模型给出的辅助 repair_instructions，仅作为定位参考，不得覆盖 deterministic_error：",
-            str(validator_report.get("repair_instructions") or "").strip(),
+            repair_text,
         ])
 
     parts.extend([
@@ -2738,11 +2757,219 @@ def _normalize_responsibility_review_issues(
 
     return normalized
 
+
+def _issue_severity_is_blocking(item: dict[str, Any]) -> bool:
+    severity = str(item.get("severity") or "").strip().lower()
+    if severity in {"blocking", "blocker", "error", "critical"}:
+        return True
+    if item.get("blocking") is True:
+        return True
+    return False
+
+
+def _issue_structurally_advisory(item: dict[str, Any], required_ids: set[str] | None = None) -> bool:
+    if not isinstance(item, dict):
+        return True
+    required_ids = required_ids or set()
+    rid = str(item.get("requirement_id") or "").strip()
+    if not rid or (required_ids and rid not in required_ids):
+        return True
+    scope_kind = str(item.get("scope") or item.get("kind") or item.get("category") or item.get("issue_type") or "").strip().lower()
+    if scope_kind in {"validator_advisory", "advisory", "note", "info", "warning"}:
+        return True
+    severity = str(item.get("severity") or "").strip().lower()
+    if severity in {"warning", "info", "note", "advisory"}:
+        return True
+    if item.get("blocking") is False:
+        return True
+    if str(item.get("evidence_level") or "").strip().lower() != "missing":
+        return True
+    missing = item.get("missing_evidence")
+    if not isinstance(missing, list) or not missing:
+        return True
+    return False
+
+
+def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str]) -> bool:
+    if _issue_structurally_advisory(item, required_ids):
+        return False
+    return _issue_severity_is_blocking(item)
+
+
+def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
+    items: list[RequirementItem] = []
+    for raw in requirements or []:
+        try:
+            if isinstance(raw, RequirementItem):
+                items.append(raw)
+            elif isinstance(raw, dict):
+                items.append(RequirementItem(**raw))
+        except Exception:
+            continue
+    return items
+
+
+def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list[RequirementItem], file_path: str) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"passed": False, "failure_type": "script_requirement_validator_error", "issues": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
+    advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
+    for collection_name in ("blocking_issues", "issues"):
+        collection = data.get(collection_name)
+        if isinstance(collection, list):
+            for raw_issue in collection:
+                if isinstance(raw_issue, dict):
+                    advisory_notes.append(raw_issue)
+    checks = data.get("checks")
+    if not isinstance(checks, list):
+        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
+    required_ids = {r.id for r in requirements if r.required}
+    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
+    missing = sorted(required_ids - seen)
+    if missing:
+        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
+    blocking: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        rid = str(check.get("requirement_id") or "")
+        if not _is_blocking_requirement_check(check, required_ids):
+            advisory_notes.append(check)
+            continue
+        missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
+        blocking.append({
+                "id": "script_requirement_failed",
+                "requirement_id": rid,
+                "failed_file": file_path,
+                "failed_function": "current script",
+                "code_region": str(check.get("target_file") or file_path),
+                "reason": str(check.get("reason") or "Required requirement lacks implementation evidence."),
+                "missing_evidence": missing_evidence,
+                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement."),
+                "allowed_scope": "Only modify the current script responsibility implementation area.",
+                "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
+                "details": {"check": check},
+            })
+    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
+
+
+def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
+    if not requirements:
+        return []
+    text = str(script_content or "")
+    if re.search(r"except\s+Exception[^:]*:([\s\S]{0,500}?)(return|print)\s*\(?\s*\{[^}]*['\"]error['\"]", text):
+        return [{"id": "script_requirement_failed", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
+    return []
+
+
+
+def _python_static_evidence(script_content: str) -> dict[str, Any]:
+    evidence = {
+        "input_reads": False,
+        "generic_builders": False,
+        "output_writes": False,
+        "called_functions": set(),
+        "string_literals": set(),
+    }
+    try:
+        tree = ast.parse(script_content or "")
+    except Exception:
+        return evidence
+    generic_container_names = {"blocks", "items", "sections", "pages", "slides", "rows", "options", "config", "parameters", "styles"}
+    generic_input_names = {"payload", "input", "inputs", "fields", "options", "config", "parameters"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in generic_input_names:
+                evidence["input_reads"] = True
+            if node.id in generic_container_names:
+                evidence["generic_builders"] = True
+        elif isinstance(node, ast.Attribute):
+            if node.attr in generic_input_names:
+                evidence["input_reads"] = True
+            if node.attr in generic_container_names:
+                evidence["generic_builders"] = True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                evidence["called_functions"].add(func.id)
+            elif isinstance(func, ast.Attribute):
+                evidence["called_functions"].add(func.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = node.value.strip().lower()
+            if text:
+                evidence["string_literals"].add(text)
+        elif isinstance(node, (ast.Return, ast.Expr)):
+            dump = ast.dump(node).lower()
+            if "print" in dump or "return" in dump:
+                evidence["output_writes"] = True
+    return evidence
+
+
+def _requirement_terms(requirement: RequirementItem) -> list[str]:
+    terms: list[str] = []
+    for value in [requirement.description, *requirement.required_components, *requirement.semantic_outputs]:
+        text = str(value or "").strip().lower()
+        if text:
+            terms.append(text)
+    for constraint in requirement.constraints or []:
+        for value in (getattr(constraint, "name", ""), getattr(constraint, "value", "")):
+            text = str(value or "").strip().lower()
+            if text:
+                terms.append(text)
+    return terms
+
+
+def _term_has_evidence(term: str, evidence: dict[str, Any]) -> bool:
+    literals = evidence.get("string_literals") or set()
+    # Requirement-derived terms are the only semantic probes; no business word list.
+    compact = term[:80]
+    return any(compact in literal or literal in compact for literal in literals if literal)
+
+def detect_required_component_coverage(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
+    if not requirements or not str(script_content or "").strip():
+        return []
+    text = str(script_content or "")
+    evidence = _python_static_evidence(text)
+    issues=[]
+    for req in requirements:
+        if not req.required or not req.required_components:
+            continue
+        component_terms = [str(item or "").strip().lower() for item in req.required_components if str(item or "").strip()]
+        has_semantic_literal = any(_term_has_evidence(term, evidence) for term in component_terms)
+        has_core_path = bool(evidence.get("generic_builders") and evidence.get("output_writes") and (evidence.get("input_reads") or has_semantic_literal))
+        if len(text.strip()) < 120 or not has_core_path:
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"No conservative static evidence of an input-read → generic construction → output path for required components.","missing_evidence":["input_reads + generic_builders + output_writes"],"minimal_edit":"Add the required component into a generic constructed object and return/print it from the current script."})
+    return issues
+
+
+def detect_required_constraint_application(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
+    if not requirements or not str(script_content or "").strip():
+        return []
+    evidence = _python_static_evidence(script_content)
+    issues: list[dict[str, Any]] = []
+    for req in requirements:
+        required_constraints = [c for c in (req.constraints or []) if getattr(c, "required", True) and str(getattr(c, "source", "") or "") in {"user_explicit", "blueprint", "inferred"}]
+        if not req.required or not required_constraints:
+            continue
+        has_constraint_landing = bool(evidence.get("generic_builders"))
+        if not has_constraint_landing:
+            first = required_constraints[0]
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"styles/options/config/parameters","reason":"No conservative static evidence of any styles/options/config/parameters landing for required constraints.","missing_evidence":[f"constraint_landing:{getattr(first, 'name', '') or getattr(first, 'kind', '')}"],"minimal_edit":"Apply required constraints through a generic styles/options/config/parameters structure or equivalent builder argument."})
+    return issues
+
+
+def detect_requirement_evidence_static(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
+    issues=[]
+    issues.extend(detect_error_stdout_bypass(script_content, requirements, expected_outputs))
+    issues.extend(detect_required_component_coverage(script_content, requirements))
+    issues.extend(detect_required_constraint_application(script_content, requirements))
+    return issues
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
     script_content: str,
     skill_plan_entry: SkillPlanEntry,
+    requirements: Any = None,
     deterministic_issues: list[dict[str, Any]] | None = None,
     requested_model: str | None = None,
     review_context: dict[str, Any] | None = None,
@@ -2761,14 +2988,16 @@ async def _run_script_responsibility_review(
     - 最终 E2E 闭环。
     """
 
-    deterministic_issues = deterministic_issues or []
+    req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    deterministic_issues = (deterministic_issues or []) + detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
     review_context = review_context if isinstance(review_context, dict) else {}
 
     if deterministic_issues:
         return {
             "passed": False,
             "issues": deterministic_issues,
-            "repair_instructions": "按确定性静态检查结果修复当前脚本源码。",
+            "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+            "failure_type": "script_requirement_failed",
             "model": "deterministic",
         }
 
@@ -2882,48 +3111,80 @@ async def _run_script_responsibility_review(
         },
     ]
 
-    try:
-        text = await complete_chat_once(messages, route.model)
-    except Exception as exc:
-        logger.warning(
-            "[Creator][script_responsibility][review_unavailable] file=%s error=%s",
-            file_path,
-            exc,
-        )
-        return {
-            "passed": False,
-            "issues": [{
-                "id": "script_responsibility.review_unavailable",
-                "failed_file": file_path,
-                "failed_function": "responsibility_review",
-                "code_region": "review",
-                "reason": f"职责审查模型不可用：{type(exc).__name__}: {exc}",
-                "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                "allowed_scope": "不要自动修改脚本。",
-                "forbidden_scope": "不得因为 validator 不可用而判定脚本通过。",
-            }],
-            "repair_instructions": "职责审查模型不可用，不能放行当前脚本。",
-            "model": route.model,
-        }
+    last_text = ""
+    last_parsed: dict[str, Any] | None = None
+    for review_attempt in range(2):
+        try:
+            active_messages = messages if review_attempt == 0 else [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一轮 validator 输出格式不合规或 checks 未覆盖所有 required requirement_id。\n"
+                        "请只重试输出严格 JSON object；不要修改或建议修改脚本；每个 required requirement 必须有一条 checks[]。\n"
+                        f"上一轮输出片段：{last_text[:1200]}"
+                    ),
+                },
+            ]
+            text = await complete_chat_once(active_messages, route.model)
+            last_text = str(text or "")
+        except Exception as exc:
+            logger.warning(
+                "[Creator][script_responsibility][review_unavailable] file=%s error=%s",
+                file_path,
+                exc,
+            )
+            return {
+                "passed": False,
+                "issues": [{
+                    "id": "script_responsibility.review_unavailable",
+                    "failed_file": file_path,
+                    "failed_function": "responsibility_review",
+                    "code_region": "review",
+                    "reason": f"职责审查模型不可用：{type(exc).__name__}: {exc}",
+                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+                    "allowed_scope": "不要自动修改脚本。",
+                    "forbidden_scope": "不得因为 validator 不可用而判定脚本通过。",
+                }],
+                "repair_instructions": "职责审查模型不可用，不能放行当前脚本。",
+                "failure_type": "script_requirement_validator_error",
+                "model": route.model,
+            }
 
-    data = _parse_validator_json_object(text)
-    if not isinstance(data, dict) or not data:
-        return {
-            "passed": False,
-            "issues": [{
-                "id": "script_responsibility.invalid_json",
-                "failed_file": file_path,
-                "failed_function": "responsibility_review",
-                "code_region": "review",
-                "reason": "职责审查模型没有返回合法 JSON object。",
-                "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                "allowed_scope": "不要自动修改脚本。",
-                "forbidden_scope": "不得因为 validator 输出非法而判定脚本通过。",
-                "details": {"raw": str(text or "")[:1000]},
-            }],
-            "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
-            "model": route.model,
-        }
+        data = _parse_validator_json_object(last_text)
+        if not isinstance(data, dict) or not data:
+            if review_attempt == 0:
+                continue
+            return {
+                "passed": False,
+                "issues": [{
+                    "id": "script_responsibility.invalid_json",
+                    "failed_file": file_path,
+                    "failed_function": "responsibility_review",
+                    "code_region": "review",
+                    "reason": "职责审查模型没有返回合法 JSON object。",
+                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+                    "allowed_scope": "不要自动修改脚本。",
+                    "forbidden_scope": "不得因为 validator 输出非法而判定脚本通过。",
+                    "details": {"raw": last_text[:1000]},
+                }],
+                "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
+                "failure_type": "script_requirement_validator_error",
+                "model": route.model,
+            }
+
+        if req_items:
+            parsed_review = _parse_requirement_review_result(data, requirements=req_items, file_path=file_path)
+            parsed_review["model"] = route.model
+            last_parsed = parsed_review
+            if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"} and review_attempt == 0:
+                continue
+            if not parsed_review.get("passed"):
+                return parsed_review
+            return parsed_review
+        break
+
+    data = data if isinstance(data, dict) else {}
 
     blocking = data.get("blocking_issues")
     blocking_issues = blocking if isinstance(blocking, list) else []

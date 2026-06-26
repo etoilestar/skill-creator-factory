@@ -288,3 +288,33 @@ def test_normalized_span_mapping_trims_spans_with_surrounding_whitespace():
 
     assert candidate == "\n\n  标题：您好\n下一行\n  "
     assert stats["applied"][0]["fallback_type"] == "normalized_exact"
+
+
+def test_markdown_patch_regression_unclosed_fence_is_rejected():
+    original = "---\nname: x\ndescription: y\n---\n\n# Use\n\nText.\n"
+    proposal = CreatorDiffProposal(
+        target_file="SKILL.md",
+        reason="test",
+        edits=[{"old": "Text.", "new": "```bash\npython scripts/a.py '{}'"}],
+    )
+    with pytest.raises(ValueError, match="hard Markdown format regression"):
+        _validate_repair_diff_scope(
+            proposal=proposal,
+            current_content=original,
+            scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
+        )
+
+
+def test_command_patch_escaped_json_argv_is_rejected():
+    original = "---\nname: x\ndescription: y\n---\n\n```bash\npython scripts/a.py '{\"k\":\"v\"}'\n```\n"
+    proposal = CreatorDiffProposal(
+        target_file="SKILL.md",
+        reason="test",
+        edits=[{"old": "python scripts/a.py '{\"k\":\"v\"}'", "new": "python scripts/a.py '{\\\"k\\\":\\\"v\\\"}'"}],
+    )
+    with pytest.raises(ValueError, match="backslash-escaped shell JSON argv"):
+        _validate_repair_diff_scope(
+            proposal=proposal,
+            current_content=original,
+            scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
+        )

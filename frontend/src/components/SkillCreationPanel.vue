@@ -244,7 +244,11 @@
             <span v-if="Array.isArray(event.reused_checkpoints)"> · 复用 checkpoint: {{ event.reused_checkpoints.join(', ') || '无' }}</span>
             <span v-if="Array.isArray(event.invalidated_checkpoints)"> · 失效 checkpoint: {{ event.invalidated_checkpoints.join(', ') || '无' }}</span>
             <span v-if="event.reused_venv !== undefined"> · {{ event.reused_venv ? '复用 venv' : '准备 venv' }}</span>
-            <span v-if="event.patch_status"> · patch {{ event.patch_status }}</span>
+            <span v-if="event.type === 'hard_format_requires_full_rewrite' || event.patch_status === 'hard_format_failed'">
+              · hard format requires full rewrite
+            </span>
+            <span v-else-if="event.patch_status"> · patch {{ event.patch_status }}</span>
+            <span v-if="event.format_rewrite_status"> · format rewrite {{ event.format_rewrite_status }}</span>
             <span v-if="event.rerun_status"> · rerun {{ event.rerun_status }}</span>
             <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
             <pre v-if="event.patch_status === 'parse_failed'" class="post-detail">parser_error: {{ event.parser_error || event.rejection_reason || 'unknown' }}
@@ -797,7 +801,18 @@ async function generateOneFile(idx) {
       } else if (chunk?.done) {
         break
       } else if (chunk?.validation) {
-        const statusText = chunk.validation.status === 'failed' ? '自动修复失败' : '自动修复中'
+        const validationStatus = chunk.validation.status
+        const statusText = validationStatus === 'failed'
+          ? '自动修复失败'
+          : validationStatus === 'format_full_rewrite'
+            ? '格式整文件重写中'
+            : validationStatus === 'format_full_rewrite_failed'
+              ? '格式整文件重写失败'
+              : validationStatus === 'parse_failed'
+                ? '补丁解析失败'
+                : validationStatus === 'localized_patch_failed'
+                  ? '局部补丁失败'
+                  : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
       } else if (chunk?.error) {
         throw new Error(chunk.error)

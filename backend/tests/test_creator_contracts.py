@@ -235,3 +235,47 @@ def test_partial_tool_schema_becomes_available_tool_candidate():
         assert resolution.allowed_imports == ["backend.services.runtime_tools"]
     finally:
         clear_registered_tool_capabilities()
+
+from backend.services.creator.contracts import detect_markdown_hard_format_failures, _command_signature
+
+
+def test_hard_format_skill_missing_frontmatter_full_rewrite():
+    failures = detect_markdown_hard_format_failures("SKILL.md", "# Body\n", True)
+    assert failures
+    assert failures[0]["severity"] == "hard_format"
+    assert failures[0]["repair_strategy"] == "full_rewrite"
+    assert failures[0]["model_patch_allowed"] is False
+    assert any(f["id"] == "markdown.frontmatter.missing" for f in failures)
+
+
+def test_hard_format_frontmatter_unclosed_full_rewrite():
+    failures = detect_markdown_hard_format_failures("SKILL.md", "---\nname: x\ndescription: y\n# swallowed\n", True)
+    assert any(f["id"] == "markdown.frontmatter.unclosed" for f in failures)
+
+
+def test_hard_format_fenced_block_unclosed_full_rewrite():
+    content = "---\nname: x\ndescription: y\n---\n\n```bash\npython scripts/a.py '{}'\n"
+    failures = detect_markdown_hard_format_failures("SKILL.md", content, True)
+    assert any(f["id"] == "markdown.fences.bash_unclosed" for f in failures)
+
+
+def test_hard_format_no_body_full_rewrite():
+    failures = detect_markdown_hard_format_failures("SKILL.md", "---\nname: x\ndescription: y\n---\n", True)
+    assert any(f["id"] == "markdown.body.missing" for f in failures)
+
+
+def test_reference_without_frontmatter_allowed_by_hard_gate():
+    assert detect_markdown_hard_format_failures("references/guide.md", "# Guide\n\nText.\n", False) == []
+
+
+def test_reference_unclosed_frontmatter_requires_full_rewrite():
+    failures = detect_markdown_hard_format_failures("references/guide.md", "---\ntitle: Guide\n# Body\n", False)
+    assert any(f["id"] == "markdown.frontmatter.unclosed" for f in failures)
+
+
+def test_closed_bash_block_bad_json_argv_is_not_hard_format():
+    content = "---\nname: x\ndescription: y\n---\n\n```bash\npython scripts/a.py '{bad}'\n```\n"
+    assert detect_markdown_hard_format_failures("SKILL.md", content, True) == []
+    sig = _command_signature("python scripts/a.py '{bad}'", "scripts/a.py")
+    assert sig is not None
+    assert sig["arg_mode"] == "invalid_json_arg"

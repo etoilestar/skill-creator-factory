@@ -4034,8 +4034,192 @@ def _skill_md_body_structure_failures(file_path: str, content: str) -> list[dict
 
     return failures
 
+_SKILL_FRONTMATTER_ALLOWED_TOP_LEVEL = {"name", "description", "license", "allowed-tools", "metadata"}
+_REFERENCE_FRONTMATTER_ALLOWED_TOP_LEVEL = {"title", "description", "source", "license", "metadata"}
+
+
+def _hard_format_failure(
+    *,
+    check_id: str,
+    file_path: str,
+    message: str,
+    expected: str,
+    minimal_edit: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = {
+        "id": check_id,
+        "source": "markdown_format",
+        "target": file_path,
+        "layer": "markdown_format",
+        "severity": "hard_format",
+        "repair_strategy": "full_rewrite",
+        "model_patch_allowed": False,
+        "message": message,
+        "expected": expected,
+        "minimal_edit": minimal_edit,
+    }
+    if details:
+        item["details"] = details
+    return item
+
+
+def detect_markdown_hard_format_failures(file_path: str, content: str, require_frontmatter: bool) -> list[dict[str, Any]]:
+    """Deterministic hard Markdown format gate.
+
+    This gate owns global Markdown structure decisions.  Any failure returned
+    here requires full-file rewrite and is forbidden from localized patch
+    repair.
+    """
+    raw = content or ""
+    text = raw.lstrip("\ufeff")
+    stripped = text.strip()
+    failures: list[dict[str, Any]] = []
+
+    if not stripped:
+        return [_hard_format_failure(
+            check_id="markdown.file.empty",
+            file_path=file_path,
+            message=f"{file_path} 内容为空。",
+            expected="Markdown 文件必须包含合法 frontmatter（如需要）和非空正文。",
+            minimal_edit="整文件重写为完整 Markdown 文件。",
+        )]
+
+    if re.fullmatch(r"```(?:markdown|md|text)\s+[\s\S]*?\s*```", stripped, flags=re.I):
+        failures.append(_hard_format_failure(
+            check_id="markdown.file.wrapped_in_code_fence",
+            file_path=file_path,
+            message=f"{file_path} 被整体包裹在 ```markdown/```text fenced block 中。",
+            expected="文件内容本身必须是 Markdown，不得整体再套一层 fenced block。",
+            minimal_edit="整文件重写，移除最外层 fenced block。",
+        ))
+
+    lines = text.splitlines(keepends=True)
+    had_frontmatter = bool(lines and lines[0].strip() == "---")
+    close_idx: int | None = None
+    parsed_frontmatter: dict[str, Any] | None = None
+    frontmatter_allowed = (
+        _SKILL_FRONTMATTER_ALLOWED_TOP_LEVEL
+        if file_path == "SKILL.md"
+        else _REFERENCE_FRONTMATTER_ALLOWED_TOP_LEVEL
+    )
+
+    if require_frontmatter and not had_frontmatter:
+        failures.append(_hard_format_failure(
+            check_id="markdown.frontmatter.missing",
+            file_path=file_path,
+            message=f"{file_path} 缺少 YAML frontmatter。",
+            expected="文件必须以单独一行 --- 开始，并在正文前用单独一行 --- 闭合。",
+            minimal_edit="整文件重写，补齐合法 frontmatter 和正文。",
+        ))
+
+    if had_frontmatter:
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                close_idx = idx
+                break
+        if close_idx is None:
+            failures.append(_hard_format_failure(
+                check_id="markdown.frontmatter.unclosed",
+                file_path=file_path,
+                message=f"{file_path} frontmatter 开始/结束 --- 不成对。",
+                expected="YAML frontmatter 必须用单独一行 --- 闭合。",
+                minimal_edit="整文件重写，确保 frontmatter 边界明确闭合。",
+            ))
+        else:
+            raw_yaml = "".join(lines[1:close_idx])
+            try:
+                parsed = yaml.safe_load(raw_yaml) or {}
+                if not isinstance(parsed, dict):
+                    failures.append(_hard_format_failure(
+                        check_id="markdown.frontmatter.not_object",
+                        file_path=file_path,
+                        message=f"{file_path} frontmatter 必须是 YAML object。",
+                        expected="frontmatter 顶层必须是 key/value object。",
+                        minimal_edit="整文件重写，修正 frontmatter object。",
+                    ))
+                else:
+                    parsed_frontmatter = parsed
+            except Exception as exc:
+                failures.append(_hard_format_failure(
+                    check_id="markdown.frontmatter.invalid_yaml",
+                    file_path=file_path,
+                    message=f"{file_path} frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
+                    expected="frontmatter 必须是合法 YAML。",
+                    minimal_edit="整文件重写，修正 YAML 并保留正文。",
+                ))
+
+            if parsed_frontmatter is not None:
+                illegal = sorted(str(key) for key in parsed_frontmatter if str(key) not in frontmatter_allowed)
+                if illegal:
+                    failures.append(_hard_format_failure(
+                        check_id="markdown.frontmatter.illegal_top_level_fields",
+                        file_path=file_path,
+                        message=f"{file_path} frontmatter 顶层字段非法：{', '.join(illegal)}。",
+                        expected=f"frontmatter 顶层字段只允许：{', '.join(sorted(frontmatter_allowed))}。",
+                        minimal_edit="整文件重写，移除非法顶层字段。",
+                        details={"illegal_fields": illegal},
+                    ))
+                if file_path == "SKILL.md":
+                    missing = [key for key in ("name", "description") if not str(parsed_frontmatter.get(key) or "").strip()]
+                    if missing:
+                        failures.append(_hard_format_failure(
+                            check_id="markdown.frontmatter.missing_required_fields",
+                            file_path=file_path,
+                            message=f"SKILL.md frontmatter 缺少必填字段：{', '.join(missing)}。",
+                            expected="SKILL.md frontmatter 必须包含非空 name 和 description。",
+                            minimal_edit="整文件重写，补齐 name/description。",
+                            details={"missing_fields": missing},
+                        ))
+                body = "".join(lines[close_idx + 1:])
+                if require_frontmatter and not body.strip():
+                    failures.append(_hard_format_failure(
+                        check_id="markdown.body.missing",
+                        file_path=file_path,
+                        message=f"{file_path} frontmatter 后缺少非空正文。",
+                        expected="frontmatter 闭合后必须有 Markdown 正文。",
+                        minimal_edit="整文件重写，在 frontmatter 后补齐正文。",
+                    ))
+
+    fence_stack: list[tuple[str, str, int]] = []
+    fence_re = re.compile(r"^\s{0,3}(```|~~~)\s*([A-Za-z0-9_-]*)")
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        match = fence_re.match(line)
+        if not match:
+            continue
+        marker = match.group(1)
+        info = (match.group(2) or "").lower()
+        if fence_stack and fence_stack[-1][0] == marker:
+            fence_stack.pop()
+        else:
+            fence_stack.append((marker, info, line_no))
+    if fence_stack:
+        first_unclosed = fence_stack[-1]
+        check_id = "markdown.fences.bash_unclosed" if first_unclosed[1] in {"bash", "sh", "shell"} else "markdown.fences.unclosed"
+        failures.append(_hard_format_failure(
+            check_id=check_id,
+            file_path=file_path,
+            message=f"{file_path} 存在未闭合的 {'bash ' if first_unclosed[1] in {'bash', 'sh', 'shell'} else ''}fenced code block。",
+            expected="所有 fenced code block 必须成对闭合；bash block 未闭合属于 hard_format。",
+            minimal_edit="整文件重写，确保 fenced block 开闭结构正确。",
+            details={"line": first_unclosed[2], "info": first_unclosed[1]},
+        ))
+
+    return failures
+
+
+def validate_no_hard_format_regression(file_path: str, before: str, after: str, *, require_frontmatter: bool) -> None:
+    before_failures = detect_markdown_hard_format_failures(file_path, before, require_frontmatter)
+    after_failures = detect_markdown_hard_format_failures(file_path, after, require_frontmatter)
+    if not before_failures and after_failures:
+        raise ValueError(
+            "localized patch caused hard Markdown format regression; patch rejected:\n"
+            + json.dumps(after_failures, ensure_ascii=False, default=str)
+        )
+
+
 def _basic_markdown_format_failures(file_path: str, content: str, *, require_frontmatter: bool) -> list[dict[str, Any]]:
-    """Very small Markdown format gate.
+    """Compatibility wrapper for the deterministic hard format gate.
 
     只检查最基础格式：
     1. frontmatter 是否存在；
@@ -4045,84 +4229,7 @@ def _basic_markdown_format_failures(file_path: str, content: str, *, require_fro
 
     不检查内容责任，不检查蓝图一致性。
     """
-    text = (content or "").lstrip("\ufeff")
-    failures: list[dict[str, Any]] = []
-
-    if file_path == "SKILL.md":
-        structure_failures = _skill_md_body_structure_failures(file_path, content)
-        if structure_failures:
-            return structure_failures
-
-    if require_frontmatter:
-        if not text.startswith("---"):
-            failures.append({
-                "id": "markdown.frontmatter.missing",
-                "source": "markdown_format",
-                "target": file_path,
-                "layer": "markdown_format",
-                "message": f"{file_path} 缺少 YAML frontmatter。",
-                "expected": "文件必须以 --- 开始，并在正文前用单独一行 --- 闭合。",
-                "minimal_edit": "只在文件开头补齐 YAML frontmatter。",
-            })
-            return failures
-
-        lines = text.splitlines(keepends=True)
-        close_idx = None
-        for idx in range(1, len(lines)):
-            if lines[idx].strip() == "---":
-                close_idx = idx
-                break
-
-        if close_idx is None:
-            failures.append({
-                "id": "markdown.frontmatter.unclosed",
-                "source": "markdown_format",
-                "target": file_path,
-                "layer": "markdown_format",
-                "message": f"{file_path} frontmatter 只有开头 ---，没有收尾 ---。",
-                "expected": "frontmatter 必须在正文前用单独一行 --- 闭合。",
-                "minimal_edit": "只在正文第一个标题或正文开始前补一行 ---，不要修改正文内容。",
-            })
-            return failures
-
-        raw_yaml = "".join(lines[1:close_idx])
-        try:
-            parsed = yaml.safe_load(raw_yaml) or {}
-            if not isinstance(parsed, dict):
-                failures.append({
-                    "id": "markdown.frontmatter.not_object",
-                    "source": "markdown_format",
-                    "target": file_path,
-                    "layer": "markdown_format",
-                    "message": f"{file_path} frontmatter 必须是 YAML object。",
-                    "expected": "frontmatter 应是 key/value YAML object。",
-                    "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
-                })
-        except Exception as exc:
-            failures.append({
-                "id": "markdown.frontmatter.invalid_yaml",
-                "source": "markdown_format",
-                "target": file_path,
-                "layer": "markdown_format",
-                "message": f"{file_path} frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
-                "expected": "frontmatter 必须是合法 YAML。",
-                "minimal_edit": "只修 YAML frontmatter 内容，不要修改正文。",
-            })
-
-    fence_count = len(re.findall(r"(?m)^\s*(```|~~~)", text))
-    if fence_count % 2 != 0:
-        failures.append({
-            "id": "markdown.fences_unbalanced",
-            "source": "markdown_format",
-            "target": file_path,
-            "layer": "markdown_format",
-            "message": f"{file_path} 存在未闭合的 Markdown fenced block。",
-            "expected": "所有 ``` 或 ~~~ fenced block 必须成对闭合。",
-            "minimal_edit": "只补齐或删除多余的 fenced block 标记。",
-            "details": {"fence_count": fence_count},
-        })
-
-    return failures
+    return detect_markdown_hard_format_failures(file_path, content, require_frontmatter)
 
 def _extract_script_command_templates(skill_md: str, script_path: str) -> list[str]:
     """Return shell command templates in SKILL.md that invoke script_path."""

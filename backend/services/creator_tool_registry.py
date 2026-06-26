@@ -51,6 +51,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 CUSTOM_TOOL_REGISTRY_PATH = CONFIG_DIR / "tool_registry.custom.json"
 CUSTOM_TOOL_ADAPTER_DIR = Path(__file__).resolve().parent / "runtime_tools" / "custom_tools"
+SAMPLE_INPUT_DIR = PROJECT_ROOT / "backend" / "samples"
+PDF_SAMPLE_PATH = SAMPLE_INPUT_DIR / "sample.pdf"
+IMAGE_SAMPLE_PATH = SAMPLE_INPUT_DIR / "sample.png"
 
 _TOOL_AUTHORING_CONFIG_STORE: dict[str, dict[str, Any]] = {}
 _TOOL_AUTHORING_CONFIG_LOADED = False
@@ -181,6 +184,89 @@ _ROLE_FORBIDDEN_CAPABILITIES: dict[str, list[str]] = {
     "skill_overview": ["runtime_execution"],
 }
 
+
+
+def _sample_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _schema_string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def _schema_file_kind(schema: dict[str, Any]) -> str | None:
+    """Infer pdf/image file samples from generic JSON Schema metadata only."""
+    if not isinstance(schema, dict):
+        return None
+    values: list[str] = []
+    for key in ("contentMediaType", "media_type", "mime_type"):
+        values.extend(_schema_string_values(schema.get(key)))
+    for key in ("accepted_extensions", "extensions", "file_extensions"):
+        values.extend(_schema_string_values(schema.get(key)))
+    fmt = str(schema.get("format") or "").strip().lower()
+    if fmt in {"file-path", "file", "path"}:
+        values.append(fmt)
+    strong = " ".join(values).lower()
+    if "application/pdf" in strong or re.search(r"(^|[\s,;])\.pdf($|[\s,;])", strong):
+        return "pdf"
+    if "image/" in strong or re.search(r"(^|[\s,;])\.(png|jpe?g|webp)($|[\s,;])", strong):
+        return "image"
+    desc = " ".join(str(schema.get(k) or "") for k in ("description", "title")).lower()
+    if "application/pdf" in desc or re.search(r"(^|[\s,;])\.pdf($|[\s,;])", desc):
+        return "pdf"
+    if "image/" in desc or re.search(r"(^|[\s,;])\.(png|jpe?g|webp)($|[\s,;])", desc):
+        return "image"
+    return None
+
+
+def _builtin_sample_path(kind: str) -> Path:
+    return PDF_SAMPLE_PATH if kind == "pdf" else IMAGE_SAMPLE_PATH
+
+
+def resolve_tool_trial_sample_input(manifest: dict[str, Any], sample_input: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
+    """Fill missing PDF/image file inputs from backend/samples based on schema metadata."""
+    resolved = dict(sample_input or {}) if isinstance(sample_input, dict) else {}
+    notes: list[str] = []
+    schema = manifest.get("input_schema") if isinstance(manifest, dict) and isinstance(manifest.get("input_schema"), dict) else {}
+    if schema.get("type") != "object" or not isinstance(schema.get("properties"), dict):
+        return resolved, notes
+    for field_name, field_schema in schema["properties"].items():
+        if _sample_value_present(resolved.get(field_name)):
+            continue
+        if not isinstance(field_schema, dict):
+            continue
+        field_type = field_schema.get("type")
+        target_schema = field_schema
+        is_array = field_type == "array" or isinstance(field_schema.get("items"), dict)
+        if is_array:
+            items = field_schema.get("items") if isinstance(field_schema.get("items"), dict) else {}
+            target_schema = {**field_schema, **items}
+        elif field_type == "object":
+            notes.append(f"sample_input.{field_name}: complex object schema cannot be auto-filled with built-in file samples")
+            continue
+        elif isinstance(field_type, list) and "object" in field_type:
+            notes.append(f"sample_input.{field_name}: complex object schema cannot be auto-filled with built-in file samples")
+            continue
+        kind = _schema_file_kind(target_schema)
+        if not kind:
+            continue
+        sample_path = _builtin_sample_path(kind)
+        if not sample_path.exists():
+            notes.append(f"sample_input.{field_name}: built-in {kind} sample is missing at {sample_path}; not fabricating a path")
+            continue
+        absolute = str(sample_path.resolve())
+        resolved[field_name] = [absolute] if is_array else absolute
+    return resolved, notes
 
 def _simple_cap(name: str, display_name: str, category: str, roles: list[str], **kwargs: Any) -> ToolCapability:
     return ToolCapability(
@@ -2713,6 +2799,8 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         manifest = _normalize_dependencies_for_script(manifest, script_code)
     errors = _script_tool_spec_errors(manifest)
     warnings: list[str] = []
+    resolved_sample_input, sample_notes = resolve_tool_trial_sample_input(manifest, sample_input if isinstance(sample_input, dict) else {})
+    warnings.extend(sample_notes)
     if not script_code.strip():
         errors.append("adapter_code/script_code is required and must contain the generated Python script")
         auth_report = _auth_validation_report(manifest, "", require_auth_config=require_auth_config)
@@ -2727,7 +2815,7 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         if auth_gate.get("missing_env") and not require_auth_config:
             dynamic_result = {"skipped": True, "reason": "auth_config_missing", "auth_gate": auth_gate, "temporary_environment": {"success": True, "status": "skipped_auth_config_missing", "reason": "auth config is missing; script execution is skipped until credentials are configured"}}
         else:
-            dynamic_result = _run_generated_tool_script(script_code=script_code, manifest=manifest, payload=sample_input or {}, config={}, trial=not real_run)
+            dynamic_result = _run_generated_tool_script(script_code=script_code, manifest=manifest, payload=resolved_sample_input, config={}, trial=not real_run)
             if not dynamic_result.get("success"):
                 errors.extend(dynamic_result.get("errors") or ["dynamic script validation failed"])
     success = not errors
@@ -2737,6 +2825,8 @@ def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None
         "status": "validated" if success else "failed",
         "errors": sorted(set(errors)),
         "warnings": sorted(set(warnings)),
+        "sample_input": resolved_sample_input,
+        "sample_notes": sample_notes,
         "dynamic_trial": dynamic_result,
         "real_run": {"skipped": not real_run},
         "dependency_environment": dynamic_result.get("dependency_environment") if isinstance(dynamic_result, dict) else {},
@@ -2870,6 +2960,8 @@ async def _run_planner(request: dict[str, Any], model_notes: list[str], warnings
                 "\"sample_input\": {}, "
                 "\"implementation_notes\": []}. "
                 "manifest must contain runtime_type='python_script', tool_name, description, canonical JSON Schema input_schema/output_schema, dependencies, permissions, artifact_policy, and auth. "
+                "For file path inputs, input_schema properties must declare format='file-path'. For PDF inputs also declare contentMediaType='application/pdf' or accepted_extensions=['.pdf']; for image inputs declare contentMediaType='image/png' or accepted_extensions with image extensions. "
+                "Do not invent local test file paths in sample_input; if trial needs PDF/image files, backend will use backend/samples/sample.pdf or backend/samples/sample.png. "
                 "auth must be {required:'yes'|'no'|'unknown', reason:'...', secrets:[{env:'ENV_NAME', description:'...', required:true}]}. "
                 "Only auth.secrets are credentials. permissions.env is only an allow-list for environment variables and must not by itself imply auth. "
                 "dependencies must be objects: {package:'pip-package-name', imports:['python_import_name'], version:''}. "
@@ -3398,6 +3490,8 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             real_run=bool(request.get("real_run") or request.get("allow_external_network")),
             require_auth_config=False,
         )
+        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
+        warnings.extend(validation.get("sample_notes") or [])
 
         return {
             "workflow_step": 4,
@@ -3444,6 +3538,8 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             real_run=bool(request.get("allow_external_network")),
             require_auth_config=True,
         )
+        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
+        warnings.extend(validation.get("sample_notes") or [])
 
         snippet = None
         tool_contract = None
@@ -3522,6 +3618,12 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
                 require_auth_config=False,
             )
         )
+        if isinstance(validation, dict):
+            if not isinstance(validation.get("sample_input"), dict):
+                resolved_sample_input, sample_notes = resolve_tool_trial_sample_input(manifest, sample_input)
+                validation = {**validation, "sample_input": resolved_sample_input, "sample_notes": sample_notes}
+            sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
+            warnings.extend(validation.get("sample_notes") or [])
 
         snippet = await _author_snippet_with_model(
             request=request,
@@ -3880,6 +3982,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             require_auth_config=False,
         )
 
+        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
         if validation.get("success"):
             break
 
@@ -3922,6 +4025,7 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
         script_code = repaired_code
 
+    sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
     validation["repair_log"] = repair_log
     validation["spec_repair_log"] = spec_repair_log
 

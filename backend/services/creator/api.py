@@ -393,6 +393,7 @@ def _stage_error_from_exception(source: str, exc: Exception, *, default_layer: s
 
 def _first_round_repair_limit(source: str) -> int:
     return {
+        "hard_format": 3,
         "markdown_format": 3,
         "content_review": 4,
         "skill_md_blueprint_alignment": 6,
@@ -922,13 +923,20 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             content = _sanitize_generated_file_content("SKILL.md", candidate)
 
             # 阶段 1：Markdown 基础格式错误，直接整文件重写，不走 diff。
-            format_failures = _basic_markdown_format_failures(
+            format_failures = detect_markdown_hard_format_failures(
                 "SKILL.md",
                 content,
                 require_frontmatter=True,
             )
             if format_failures:
                 failures = format_failures
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "hard_format_failed",
+                    "format_rewrite_status": "format_full_rewrite",
+                    "failures": format_failures,
+                })
 
                 if attempt >= 3:
                     break
@@ -970,7 +978,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     model=route.model,
                     skill_name=skill_name,
                     file_path="SKILL.md",
-                    prompt_variant="markdown_format_rewrite",
+                    prompt_variant="format_full_rewrite",
                     retry_index=attempt - 1,
                 )
                 continue
@@ -1205,18 +1213,17 @@ async def generate_file(request: GenerateFileRequest):
                             or request.file_path.startswith("references/")
                             or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
                     ):
-                        format_failures = _basic_markdown_format_failures(
+                        format_failures = detect_markdown_hard_format_failures(
                             request.file_path,
                             content,
                             require_frontmatter=(
                                     request.file_path == "SKILL.md"
-                                    or request.file_path.startswith("references/")
                             ),
                         )
                         if format_failures:
                             raise FileGenerationStageError(
-                                source="markdown_format",
-                                layer="format",
+                                source="hard_format",
+                                layer="hard_format",
                                 detail=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
                             )
 
@@ -1464,7 +1471,7 @@ async def generate_file(request: GenerateFileRequest):
                     prompt_messages = next_messages
                     prompt_variant = next_variant
                     continue
-                if error_source == "markdown_format":
+                if error_source == "hard_format":
                     layer_limit = _first_round_repair_limit(error_source)
 
                     if repair_counts_by_layer[error_layer] > layer_limit:
@@ -1475,7 +1482,7 @@ async def generate_file(request: GenerateFileRequest):
                                 f"Markdown 格式修复失败：已整文件重写 {layer_limit} 轮仍未通过。"
                                 f"最后错误：{deterministic_error}"
                             ),
-                            error_type="markdown_format_rewrite_failed",
+                            error_type="format_full_rewrite_failed",
                             content=candidate or "",
                             recoverable=True,
                         )
@@ -1483,14 +1490,14 @@ async def generate_file(request: GenerateFileRequest):
 
                     yield _sse({
                         "type": "validation",
-                        "status": "rewriting_format",
+                        "status": "format_full_rewrite",
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
                         "editable": True,
                         "disabled": False,
                         "validation": {
-                            "status": "rewriting_format",
+                            "status": "format_full_rewrite",
                             "attempt": repair_counts_by_layer[error_layer],
                             "source": error_source,
                             "layer": stage_error.layer,
@@ -1537,7 +1544,7 @@ async def generate_file(request: GenerateFileRequest):
                         model=route.model,
                         skill_name=skill_name,
                         file_path=request.file_path,
-                        prompt_variant="markdown_format_rewrite",
+                        prompt_variant="format_full_rewrite",
                         retry_index=repair_counts_by_layer[error_layer] - 1,
                     )
                     continue

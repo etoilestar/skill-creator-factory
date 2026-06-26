@@ -1841,6 +1841,24 @@ async def _repair_existing_file_for_e2e_failure(
     skill_md_path = skill_dir / "SKILL.md"
     skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
 
+    if target_path == "SKILL.md":
+        hard_format_failures = detect_markdown_hard_format_failures(
+            "SKILL.md",
+            skill_md,
+            require_frontmatter=True,
+        )
+        if hard_format_failures:
+            if repair_events is not None:
+                repair_events.append({
+                    "type": "hard_format_requires_full_rewrite",
+                    "target_file": "SKILL.md",
+                    "failures": hard_format_failures,
+                })
+            raise ValueError(
+                "hard_format_requires_full_rewrite: E2E localized patch cannot repair SKILL.md hard Markdown format; "
+                + json.dumps(hard_format_failures, ensure_ascii=False, default=str)
+            )
+
     all_file_summaries: list[str] = []
     for path in sorted(skill_dir.rglob("*")):
         if not path.is_file():
@@ -1917,8 +1935,9 @@ async def _repair_existing_file_for_e2e_failure(
             "你正在修复 SKILL.md 的 workflow 执行块。\n"
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
-            "只修命令块、参数传递、步骤串接相关问题。\n"
+            "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
             "不要重写 SKILL.md 正文。\n"
+            "不要修改 frontmatter 边界；不要修改 fenced block 开闭结构。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
         )

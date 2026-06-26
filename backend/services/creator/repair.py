@@ -36,6 +36,7 @@ class CreatorRepairScope:
     repair_type: str
     target_file: str
     max_changed_lines: int = 160
+    allow_format_repair: bool = False
     notes: tuple[str, ...] = ()
 
     def to_prompt_dict(self) -> dict[str, Any]:
@@ -44,6 +45,7 @@ class CreatorRepairScope:
             "repair_type": self.repair_type,
             "target_file": self.target_file,
             "max_changed_lines": self.max_changed_lines,
+            "allow_format_repair": self.allow_format_repair,
             "notes": list(self.notes),
         }
 
@@ -1090,7 +1092,65 @@ def _validate_repair_diff_scope(
             f"{changed_line_count} > {scope.max_changed_lines}"
         )
 
+    if not scope.allow_format_repair and (
+        scope.target_file == "SKILL.md"
+        or scope.target_file.startswith("references/")
+        or Path(scope.target_file).suffix.lower() in {".md", ".markdown"}
+    ):
+        from .contracts import validate_no_hard_format_regression
+
+        validate_no_hard_format_regression(
+            scope.target_file,
+            current_content,
+            candidate,
+            require_frontmatter=(scope.target_file == "SKILL.md"),
+        )
+        if scope.target_file == "SKILL.md" and _skill_md_has_backslash_escaped_json_argv(candidate):
+            raise ValueError(
+                "localized patch introduced backslash-escaped shell JSON argv inside a bash fenced block; "
+                "合法 shell JSON argv 不允许被改写成带反斜杠的 argv。"
+            )
+
     return candidate, stats
+
+
+def _skill_md_has_backslash_escaped_json_argv(content: str) -> bool:
+    """Detect escaped JSON argv only on standard scripts/*.py shell commands.
+
+    This intentionally ignores ordinary shell snippets (echo/sed/etc.) and
+    non-standard/multiline shell text. Command-contract repair owns closed bash
+    blocks whose JSON argv is otherwise invalid.
+    """
+    from .contracts import _command_signature
+
+    for info, body in _iter_markdown_fenced_blocks(content):
+        if not _is_shell_fence_info(info):
+            continue
+        lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+        if len(lines) != 1:
+            continue
+        command = lines[0]
+        try:
+            parts = shlex.split(command, posix=True)
+        except ValueError:
+            continue
+        if len(parts) != 3:
+            continue
+        runner = Path(parts[0]).name
+        script_path = parts[1].replace("\\", "/").strip()
+        argv = parts[2].strip()
+        if runner not in {"python", "python3"}:
+            continue
+        if not script_path.startswith("scripts/") or Path(script_path).suffix.lower() != ".py":
+            continue
+
+        command_sig = _command_signature(command, script_path)
+        if not command_sig or command_sig.get("arg_mode") != "invalid_json_arg":
+            continue
+        if argv.startswith("{") and argv.endswith("}") and any(token in argv for token in ('\\"', "\\{", "\\}")):
+            return True
+
+    return False
 
 
 def _compact_messages_for_repair_context(
@@ -1462,6 +1522,20 @@ async def _repair_generated_file_with_feedback(
     current_content = previous_content or ""
     is_script = file_path.startswith("scripts/")
 
+    if file_path == "SKILL.md" or file_path.startswith("references/") or Path(file_path).suffix.lower() in {".md", ".markdown"}:
+        from .contracts import detect_markdown_hard_format_failures
+
+        hard_format_failures = detect_markdown_hard_format_failures(
+            file_path,
+            current_content,
+            require_frontmatter=(file_path == "SKILL.md"),
+        )
+        if hard_format_failures:
+            raise ValueError(
+                "hard_format failure must not enter localized patch repair; full rewrite required:\n"
+                + json.dumps(hard_format_failures, ensure_ascii=False, default=str)
+            )
+
     scope = CreatorRepairScope(
         phase="module_functional_smoke",
         repair_type=repair_mode or "localized_patch",
@@ -1542,8 +1616,12 @@ async def _repair_generated_file_with_feedback(
     elif file_path == "SKILL.md":
         target_rule = (
             "第一轮 SKILL.md 修复。\n"
-            "只修当前失败相关的小节、frontmatter 或 fenced block。\n"
+            "当前文件已通过 hard format gate；本轮不是 Markdown 全局格式修复。\n"
+            "只修当前失败相关的小节内容、职责描述、蓝图对齐或命令合同问题。\n"
             "不要整文件重写。\n"
+            "不要修改 frontmatter 边界。\n"
+            "不要修改 fenced block 开闭结构。\n"
+            "不要把 proposal JSON 转义写进目标文件。\n"
             "不要在这里做第二轮 E2E 跨模块字段推断；那属于 workflow E2E。\n"
             "平台 IO 与 sandbox 模式对齐，由后续验证执行判断。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
@@ -1553,8 +1631,11 @@ async def _repair_generated_file_with_feedback(
     elif file_path.startswith("references/"):
         target_rule = (
             "第一轮 reference 修复。\n"
+            "当前文件已通过 hard format gate；本轮不是 Markdown 全局格式修复。\n"
             "reference 是参考资料，不是执行源。\n"
             "只修当前 reference 文件中的失败区域。\n"
+            "不要修改 frontmatter 边界或 fenced block 开闭结构。\n"
+            "不要把 proposal JSON 转义写进目标文件。\n"
             "不要添加可执行 workflow。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )

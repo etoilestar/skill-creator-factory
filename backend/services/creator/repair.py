@@ -2799,19 +2799,100 @@ def detect_error_stdout_bypass(script_content: str, requirements: list[Requireme
     return []
 
 
+
+def _python_static_evidence(script_content: str) -> dict[str, Any]:
+    evidence = {
+        "input_reads": False,
+        "generic_builders": False,
+        "output_writes": False,
+        "called_functions": set(),
+        "string_literals": set(),
+    }
+    try:
+        tree = ast.parse(script_content or "")
+    except Exception:
+        return evidence
+    generic_container_names = {"blocks", "items", "sections", "pages", "slides", "rows", "options", "config", "parameters", "styles"}
+    generic_input_names = {"payload", "input", "inputs", "fields", "options", "config", "parameters"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in generic_input_names:
+                evidence["input_reads"] = True
+            if node.id in generic_container_names:
+                evidence["generic_builders"] = True
+        elif isinstance(node, ast.Attribute):
+            if node.attr in generic_input_names:
+                evidence["input_reads"] = True
+            if node.attr in generic_container_names:
+                evidence["generic_builders"] = True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                evidence["called_functions"].add(func.id)
+            elif isinstance(func, ast.Attribute):
+                evidence["called_functions"].add(func.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = node.value.strip().lower()
+            if text:
+                evidence["string_literals"].add(text)
+        elif isinstance(node, (ast.Return, ast.Expr)):
+            dump = ast.dump(node).lower()
+            if "print" in dump or "return" in dump:
+                evidence["output_writes"] = True
+    return evidence
+
+
+def _requirement_terms(requirement: RequirementItem) -> list[str]:
+    terms: list[str] = []
+    for value in [requirement.description, *requirement.required_components, *requirement.semantic_outputs]:
+        text = str(value or "").strip().lower()
+        if text:
+            terms.append(text)
+    for constraint in requirement.constraints or []:
+        for value in (getattr(constraint, "name", ""), getattr(constraint, "value", "")):
+            text = str(value or "").strip().lower()
+            if text:
+                terms.append(text)
+    return terms
+
+
+def _term_has_evidence(term: str, evidence: dict[str, Any]) -> bool:
+    literals = evidence.get("string_literals") or set()
+    # Requirement-derived terms are the only semantic probes; no business word list.
+    compact = term[:80]
+    return any(compact in literal or literal in compact for literal in literals if literal)
+
 def detect_required_component_coverage(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
     if not requirements or not str(script_content or "").strip():
         return []
     text = str(script_content or "")
+    evidence = _python_static_evidence(text)
     issues=[]
     for req in requirements:
-        if req.required and req.required_components and len(text.strip()) < 120:
-            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"Script is too small to show required component construction evidence.","missing_evidence":["required component construction evidence"],"minimal_edit":"Implement the required component construction in the current script."})
+        if not req.required or not req.required_components:
+            continue
+        component_terms = [str(item or "").strip().lower() for item in req.required_components if str(item or "").strip()]
+        has_semantic_literal = any(_term_has_evidence(term, evidence) for term in component_terms)
+        if len(text.strip()) < 120 or (component_terms and evidence.get("generic_builders") and not has_semantic_literal):
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"No conservative static evidence that required components enter a constructed object/collection.","missing_evidence":["required component construction evidence"],"minimal_edit":"Add the required component into the current script's constructed blocks/items/sections/options or equivalent output object."})
     return issues
 
 
 def detect_required_constraint_application(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
-    return []
+    if not requirements or not str(script_content or "").strip():
+        return []
+    evidence = _python_static_evidence(script_content)
+    issues: list[dict[str, Any]] = []
+    for req in requirements:
+        required_constraints = [c for c in (req.constraints or []) if getattr(c, "required", True) and str(getattr(c, "source", "") or "") in {"user_explicit", "blueprint", "inferred"}]
+        if not req.required or not required_constraints:
+            continue
+        for constraint in required_constraints:
+            term_values = [str(getattr(constraint, "name", "") or ""), str(getattr(constraint, "value", "") or "")]
+            if not any(_term_has_evidence(term.lower(), evidence) for term in term_values if term.strip()):
+                issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"styles/options/config/parameters","reason":"No conservative static evidence that a required constraint is applied to styles/options/config/parameters.","missing_evidence":[f"constraint:{getattr(constraint, 'name', '') or getattr(constraint, 'kind', '')}"],"minimal_edit":"Apply the required constraint through a generic styles/options/config/parameters structure or equivalent builder argument."})
+                break
+    return issues
 
 
 def detect_requirement_evidence_static(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
@@ -2968,57 +3049,80 @@ async def _run_script_responsibility_review(
         },
     ]
 
-    try:
-        text = await complete_chat_once(messages, route.model)
-    except Exception as exc:
-        logger.warning(
-            "[Creator][script_responsibility][review_unavailable] file=%s error=%s",
-            file_path,
-            exc,
-        )
-        return {
-            "passed": False,
-            "issues": [{
-                "id": "script_responsibility.review_unavailable",
-                "failed_file": file_path,
-                "failed_function": "responsibility_review",
-                "code_region": "review",
-                "reason": f"职责审查模型不可用：{type(exc).__name__}: {exc}",
-                "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                "allowed_scope": "不要自动修改脚本。",
-                "forbidden_scope": "不得因为 validator 不可用而判定脚本通过。",
-            }],
-            "repair_instructions": "职责审查模型不可用，不能放行当前脚本。",
-            "failure_type": "script_requirement_validator_error",
-            "model": route.model,
-        }
+    last_text = ""
+    last_parsed: dict[str, Any] | None = None
+    for review_attempt in range(2):
+        try:
+            active_messages = messages if review_attempt == 0 else [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一轮 validator 输出格式不合规或 checks 未覆盖所有 required requirement_id。\n"
+                        "请只重试输出严格 JSON object；不要修改或建议修改脚本；每个 required requirement 必须有一条 checks[]。\n"
+                        f"上一轮输出片段：{last_text[:1200]}"
+                    ),
+                },
+            ]
+            text = await complete_chat_once(active_messages, route.model)
+            last_text = str(text or "")
+        except Exception as exc:
+            logger.warning(
+                "[Creator][script_responsibility][review_unavailable] file=%s error=%s",
+                file_path,
+                exc,
+            )
+            return {
+                "passed": False,
+                "issues": [{
+                    "id": "script_responsibility.review_unavailable",
+                    "failed_file": file_path,
+                    "failed_function": "responsibility_review",
+                    "code_region": "review",
+                    "reason": f"职责审查模型不可用：{type(exc).__name__}: {exc}",
+                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+                    "allowed_scope": "不要自动修改脚本。",
+                    "forbidden_scope": "不得因为 validator 不可用而判定脚本通过。",
+                }],
+                "repair_instructions": "职责审查模型不可用，不能放行当前脚本。",
+                "failure_type": "script_requirement_validator_error",
+                "model": route.model,
+            }
 
-    data = _parse_validator_json_object(text)
-    if not isinstance(data, dict) or not data:
-        return {
-            "passed": False,
-            "issues": [{
-                "id": "script_responsibility.invalid_json",
-                "failed_file": file_path,
-                "failed_function": "responsibility_review",
-                "code_region": "review",
-                "reason": "职责审查模型没有返回合法 JSON object。",
-                "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                "allowed_scope": "不要自动修改脚本。",
-                "forbidden_scope": "不得因为 validator 输出非法而判定脚本通过。",
-                "details": {"raw": str(text or "")[:1000]},
-            }],
-            "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
-            "failure_type": "script_requirement_validator_error",
-            "model": route.model,
-        }
+        data = _parse_validator_json_object(last_text)
+        if not isinstance(data, dict) or not data:
+            if review_attempt == 0:
+                continue
+            return {
+                "passed": False,
+                "issues": [{
+                    "id": "script_responsibility.invalid_json",
+                    "failed_file": file_path,
+                    "failed_function": "responsibility_review",
+                    "code_region": "review",
+                    "reason": "职责审查模型没有返回合法 JSON object。",
+                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+                    "allowed_scope": "不要自动修改脚本。",
+                    "forbidden_scope": "不得因为 validator 输出非法而判定脚本通过。",
+                    "details": {"raw": last_text[:1000]},
+                }],
+                "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
+                "failure_type": "script_requirement_validator_error",
+                "model": route.model,
+            }
 
-    if req_items:
-        parsed_review = _parse_requirement_review_result(data, requirements=req_items, file_path=file_path)
-        parsed_review["model"] = route.model
-        if not parsed_review.get("passed"):
+        if req_items:
+            parsed_review = _parse_requirement_review_result(data, requirements=req_items, file_path=file_path)
+            parsed_review["model"] = route.model
+            last_parsed = parsed_review
+            if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"} and review_attempt == 0:
+                continue
+            if not parsed_review.get("passed"):
+                return parsed_review
             return parsed_review
-        return parsed_review
+        break
+
+    data = data if isinstance(data, dict) else {}
 
     blocking = data.get("blocking_issues")
     blocking_issues = blocking if isinstance(blocking, list) else []

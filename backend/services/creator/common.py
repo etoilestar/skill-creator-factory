@@ -30,7 +30,7 @@ import shutil
 
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ...config import settings
 from ..blueprint_parser import BlueprintPlan, BlueprintShapeError, clean_blueprint_body_text, parse_blueprint
@@ -205,6 +205,17 @@ class RequirementGraphValidationError(ValueError):
         self.details = details or {}
 
 
+class RequirementConstraint(BaseModel):
+    name: str = ""
+    kind: str = "constraint"
+    value: Any = None
+    comparator: str = "equals"
+    unit: str = ""
+    source: str = "blueprint"
+    required: bool = True
+    evidence_policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class RequirementItem(BaseModel):
     id: str
     target_file: str
@@ -216,9 +227,34 @@ class RequirementItem(BaseModel):
     semantic_inputs: list[str] = Field(default_factory=list)
     semantic_outputs: list[str] = Field(default_factory=list)
     required_components: list[str] = Field(default_factory=list)
-    constraints: list[str] = Field(default_factory=list)
+    constraints: list[RequirementConstraint] = Field(default_factory=list)
     evidence_policy: dict[str, Any] = Field(default_factory=dict)
     non_requirements: list[str] = Field(default_factory=list)
+
+    @field_validator("constraints", mode="before")
+    @classmethod
+    def _coerce_constraints(cls, value: Any) -> list[Any]:
+        if value in (None, ""):
+            return []
+        raw_items = value if isinstance(value, list) else [value]
+        items: list[Any] = []
+        for raw in raw_items:
+            if isinstance(raw, RequirementConstraint):
+                items.append(raw)
+            elif isinstance(raw, dict):
+                items.append(raw)
+            else:
+                text = str(raw or "").strip()
+                if text:
+                    items.append({
+                        "name": text,
+                        "kind": "constraint",
+                        "value": text,
+                        "comparator": "describes",
+                        "source": "blueprint",
+                        "required": True,
+                    })
+        return items
 
 
 class RequirementGraph(BaseModel):
@@ -259,7 +295,15 @@ def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
             if isinstance(source_obj, dict):
                 for key, value in source_obj.items():
                     if value not in (None, "", [], {}):
-                        constraints.append(f"{key}: {value}")
+                        constraints.append(RequirementConstraint(
+                            name=str(key),
+                            kind="contract",
+                            value=value,
+                            comparator="declared",
+                            source="default_contract",
+                            required=True,
+                            evidence_policy={"first_round": "look for semantic use in options/styles/config/parameters/builders", "e2e": "look for structured runtime metadata evidence"},
+                        ))
         if purpose or outputs or components or constraints:
             items.append(RequirementItem(
                 id=_requirement_id_for_file(path, "core"),
@@ -315,11 +359,13 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
         merged.setdefault("kind", "component")
         merged.setdefault("required", True)
         merged.setdefault("source", "blueprint")
-        for key in ("semantic_inputs", "semantic_outputs", "required_components", "constraints", "non_requirements"):
+        for key in ("semantic_inputs", "semantic_outputs", "required_components", "non_requirements"):
             value = merged.get(key, [])
             if isinstance(value, str):
                 value = [value]
             merged[key] = [str(v).strip() for v in (value or []) if str(v).strip()] if isinstance(value, list) else []
+        if not isinstance(merged.get("constraints"), list):
+            merged["constraints"] = [merged.get("constraints")] if merged.get("constraints") else []
         if not isinstance(merged.get("evidence_policy"), dict):
             merged["evidence_policy"] = {}
         try:

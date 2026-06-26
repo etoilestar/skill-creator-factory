@@ -6,6 +6,74 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 
+
+async def _extract_requirement_graph_with_validator(
+    *,
+    blueprint_text: str,
+    files_out: list[FileSpecOut],
+    requested_model: str | None = None,
+) -> RequirementGraph:
+    """Use the validator model as the primary path for fine-grained requirements.
+
+    The deterministic graph remains a fallback/retry scaffold; backend schema
+    validation remains the authority and never routes failures into business-file
+    repair.
+    """
+    fallback_graph = build_default_requirement_graph(files_out)
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator requirement graph extraction")
+    file_payload = [file_spec.model_dump(mode="json") for file_spec in files_out]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator requirement graph 提取器，只输出严格 JSON object。\n"
+                "从 blueprint、file_plan、runtime_contract、artifact_contract、required_capabilities、implementation_strategy 中提取细粒度 requirements。\n"
+                "不要硬编码任何具体 Skill、脚本名、字段名、变量名或业务词表；semantic_inputs/semantic_outputs 是语义，不是字段名 hard gate。\n"
+                "kind 只能使用通用类别：component, layout_style, media_property, quantity, naming, format, transformation, io, artifact, tool_use。\n"
+                "constraints 必须优先输出结构化对象：name, kind, value, comparator, unit, source, required, evidence_policy。\n"
+                "主观质量词只能作为 non_requirements 或 advisory，不得 required blocking。\n"
+                "每个有实质职责的 scripts/** 文件必须至少有一个 required=true requirement。\n"
+                "返回：{\"requirements\": [{\"id\":..., \"target_file\":..., \"owner_step\":..., \"kind\":..., \"required\": true|false, \"source\":..., \"description\":..., \"semantic_inputs\": [], \"semantic_outputs\": [], \"required_components\": [], \"constraints\": [], \"evidence_policy\": {}, \"non_requirements\": []}]}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
+                "file_plan_and_contracts:\n" + json.dumps(file_payload, ensure_ascii=False, default=str)[:20000] + "\n\n"
+                "fallback_requirement_graph_for_reference_only:\n" + fallback_graph.model_dump_json()[:12000]
+            ),
+        },
+    ]
+    try:
+        text = await complete_chat_once(messages, route.model)
+        graph = normalize_requirement_graph(parse_requirement_graph_result(text))
+        return validate_requirement_graph_schema(graph, files_out)
+    except RequirementGraphValidationError:
+        raise
+    except Exception as exc:
+        raise RequirementGraphValidationError(
+            f"Requirement graph validator failed: {type(exc).__name__}: {exc}",
+            code="validator_error",
+            details={"error": str(exc)},
+        ) from exc
+
+
+def _persist_requirement_graph(skill_name: str, graph: RequirementGraph) -> None:
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "requirement_graph.json").write_text(
+        graph.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_persisted_requirement_graph(skill_name: str) -> RequirementGraph | None:
+    path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "requirement_graph.json"
+    if not path.is_file():
+        return None
+    return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
+
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     try:
@@ -202,23 +270,54 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         )
 
-    requirement_graph = build_default_requirement_graph(files_out)
+    fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
-        validate_requirement_graph_schema(requirement_graph, files_out)
+        requirement_graph = await _extract_requirement_graph_with_validator(
+            blueprint_text=blueprint_text,
+            files_out=files_out,
+            requested_model=request.model,
+        )
     except RequirementGraphValidationError as exc:
+        if exc.code == "validator_incomplete":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "validator_incomplete",
+                    "source": "requirement_graph",
+                    "message": str(exc),
+                    "details": exc.details,
+                    "recoverable": True,
+                    "repair_target": "validator",
+                },
+            ) from exc
+        try:
+            requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
+        except RequirementGraphValidationError as fallback_exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": fallback_exc.code,
+                    "source": "requirement_graph",
+                    "message": str(fallback_exc),
+                    "details": fallback_exc.details,
+                    "recoverable": True,
+                    "repair_target": "validator",
+                },
+            ) from fallback_exc
         warnings.append({
             "severity": "validator_warning",
             "code": exc.code,
             "source": "requirement_graph",
             "path": str((exc.details or {}).get("path") or ""),
             "field": "requirement_graph",
-            "message": str(exc),
+            "message": f"Requirement graph validator failed; using backend fallback graph: {exc}",
         })
     requirements_by_file: dict[str, list[RequirementItem]] = {}
     for req in requirement_graph.requirements:
         requirements_by_file.setdefault(req.target_file, []).append(req)
     for file_spec in files_out:
         file_spec.requirements = list(requirements_by_file.get(file_spec.path, []))
+    _persist_requirement_graph(plan.skill_name, requirement_graph)
 
     asset_requirements = [
         AssetRequirementOut(
@@ -1341,7 +1440,10 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                         entry_requirements = []
-                        if isinstance(effective_skill_plan_entry, dict):
+                        persisted_graph = _load_persisted_requirement_graph(skill_name)
+                        if persisted_graph is not None:
+                            entry_requirements = [req for req in persisted_graph.requirements if req.target_file == request.file_path]
+                        if not entry_requirements and isinstance(effective_skill_plan_entry, dict):
                             entry_requirements = effective_skill_plan_entry.get("requirements") or []
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
@@ -1513,6 +1615,20 @@ async def generate_file(request: GenerateFileRequest):
                     prompt_messages = next_messages
                     prompt_variant = next_variant
                     continue
+                if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=(
+                            "Requirement validator failed or returned incomplete checks; this is not a business-file repair target. "
+                            f"Last validator error: {deterministic_error}"
+                        ),
+                        error_type=error_source,
+                        content=candidate or "",
+                        recoverable=True,
+                    )
+                    return
+
                 if error_source == "hard_format":
                     layer_limit = _first_round_repair_limit(error_source)
 
@@ -1987,6 +2103,17 @@ async def validate_skill(request: SkillActionRequest):
                         "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
                         if repair_logs else ""
                     )
+                ),
+                repair_events=repair_events or e2e_session.events,
+            )
+
+        if any(re.search(r"^E2E_LAYER=e2e_requirement_validator_(?:error|incomplete)", err, re.M) for err in e2e_errors):
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "严格端到端 requirement validator 失败；这不是业务文件修复目标，请重试 validator 或切换 validator 模型：\n"
+                    + "\n\n".join(e2e_errors)
                 ),
                 repair_events=repair_events or e2e_session.events,
             )

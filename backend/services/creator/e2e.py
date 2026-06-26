@@ -864,9 +864,11 @@ def _run_e2e_step_argument_effect_review(
     placeholders = sorted(_e2e_command_placeholders(command))
     argv_template = command.argv_template if isinstance(command.argv_template, dict) else {}
 
-    # 只有完全没有 argv、没有 placeholder、没有声明输入时，才跳过。
-    # 之前 rendered_payload 空就直接跳过，会漏掉“SKILL.md 没传参数”的接口问题。
-    if not rendered_payload and not argv_template and not placeholders and not declared_inputs:
+    req_items = coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    artifact_contract = getattr(skill_plan_entry, "artifact_contract", {}) or {}
+    substantive_step = bool(rendered_payload or argv_template or placeholders or declared_inputs or artifact_contract or any(getattr(r, "required", False) for r in req_items))
+    # 只有完全没有 argv、没有 placeholder、没有声明输入、没有 required requirements/产物合同时，才跳过。
+    if not substantive_step:
         return {
             "passed": True,
             "model": None,
@@ -980,11 +982,14 @@ def _run_e2e_step_argument_effect_review(
             exc,
         )
         return {
-            "passed": True,
+            "passed": False,
+            "failure_type": "e2e_requirement_validator_error",
+            "target_file": command.script_path if rendered_payload else "SKILL.md",
+            "layer": "e2e_requirement_validator_error",
+            "problem": f"E2E requirement validator unavailable: {type(exc).__name__}: {exc}",
+            "evidence": "validator unavailable; not a business-file failure",
+            "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
             "model": route.model,
-            "advisory_notes": [
-                f"E2E 接口审查模型不可用，已跳过本轮 LLM 接口审查：{type(exc).__name__}: {exc}"
-            ],
         }
 
     data = _parse_validator_json_object(text)
@@ -996,11 +1001,14 @@ def _run_e2e_step_argument_effect_review(
             str(text or "")[:1000],
         )
         return {
-            "passed": True,
+            "passed": False,
+            "failure_type": "e2e_requirement_validator_error",
+            "target_file": command.script_path if rendered_payload else "SKILL.md",
+            "layer": "e2e_requirement_validator_error",
+            "problem": "E2E requirement validator did not return valid JSON.",
+            "evidence": str(text or "")[:1000],
+            "repair_instruction": "Retry validator or return recoverable validator failure; do not patch business files solely for this.",
             "model": route.model,
-            "advisory_notes": [
-                "E2E 接口审查模型没有返回合法 JSON object，已跳过本轮 LLM 接口审查。"
-            ],
         }
 
     if data.get("passed") is True:
@@ -1068,6 +1076,45 @@ def _run_e2e_step_argument_effect_review(
         "model": route.model,
         "raw_review": data,
     }
+
+def _e2e_requirement_mapping_failure(**kwargs) -> str:
+    return _e2e_argument_effect_failure(**kwargs)
+
+def _e2e_requirement_effect_failure(**kwargs) -> str:
+    return _e2e_argument_effect_failure(**kwargs)
+
+def _run_e2e_requirement_flow_review(
+    *,
+    command: E2EWorkflowCommand,
+    script_content: str,
+    skill_plan_entry: SkillPlanEntry,
+    rendered_payload: dict[str, Any],
+    stdout_json: dict[str, Any],
+    artifact_paths: list[str],
+    trace: E2EStepTrace,
+    previous_traces: list[E2EStepTrace],
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    review = _run_e2e_step_argument_effect_review(
+        command=command, script_content=script_content, skill_plan_entry=skill_plan_entry,
+        rendered_payload=rendered_payload, stdout_json=stdout_json, artifact_paths=artifact_paths,
+        trace=trace, previous_traces=previous_traces, requested_model=requested_model,
+    )
+    if not review.get("passed"):
+        return review
+    reqs = coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    required = [r for r in reqs if getattr(r, "required", False)]
+    metadata = stdout_json.get("artifact_metadata") if isinstance(stdout_json.get("artifact_metadata"), dict) else {}
+    if required and not rendered_payload and any(r.semantic_inputs for r in required):
+        r = next((x for x in required if x.semantic_inputs), required[0])
+        return {"passed": False, "target_file": "SKILL.md", "layer": "e2e_requirement_mapping_failed", "failure_kind": "missing_payload", "problem": "Required semantic input was not delivered to the step payload.", "evidence": "rendered_payload is empty while requirement declares semantic_inputs", "requirement_id": r.id, "missing_evidence": ["semantic input in rendered_payload"], "repair_instruction": "Pass the required semantic input from user input or previous stdout into this command."}
+    if required and artifact_paths and metadata:
+        haystack = json.dumps({"stdout": stdout_json, "metadata": metadata}, ensure_ascii=False, default=str).lower()
+        for r in required:
+            probes = [*r.required_components, *r.constraints, *r.semantic_outputs]
+            if probes and not any(str(p).lower()[:40] in haystack for p in probes if str(p).strip()):
+                return {"passed": False, "target_file": command.script_path, "layer": "runtime_metadata_requirement_failed", "failure_kind": "runtime_metadata_missing_evidence", "problem": "Runtime metadata/stdout does not contain conservative evidence for a required requirement.", "evidence": json.dumps(metadata, ensure_ascii=False, default=str)[:1000], "requirement_id": r.id, "missing_evidence": probes[:5], "repair_instruction": "Ensure the script output or runtime helper metadata reflects the required component/constraint evidence."}
+    return review
 
 def _e2e_argument_effect_failure(
     *,
@@ -1641,7 +1688,7 @@ def _run_skill_workflow_e2e_once(
                     stdout_shape=_json_object_shape(stdout_json),
                 )
 
-                argument_effect_review = _run_e2e_step_argument_effect_review(
+                argument_effect_review = _run_e2e_requirement_flow_review(
                     command=command,
                     script_content=content,
                     skill_plan_entry=entry,

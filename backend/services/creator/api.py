@@ -202,6 +202,24 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         )
 
+    requirement_graph = build_default_requirement_graph(files_out)
+    try:
+        validate_requirement_graph_schema(requirement_graph, files_out)
+    except RequirementGraphValidationError as exc:
+        warnings.append({
+            "severity": "validator_warning",
+            "code": exc.code,
+            "source": "requirement_graph",
+            "path": str((exc.details or {}).get("path") or ""),
+            "field": "requirement_graph",
+            "message": str(exc),
+        })
+    requirements_by_file: dict[str, list[RequirementItem]] = {}
+    for req in requirement_graph.requirements:
+        requirements_by_file.setdefault(req.target_file, []).append(req)
+    for file_spec in files_out:
+        file_spec.requirements = list(requirements_by_file.get(file_spec.path, []))
+
     asset_requirements = [
         AssetRequirementOut(
             path=file_spec.path,
@@ -278,6 +296,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         final_outputs=_final_outputs_from_plan_entries(list(entries_by_path.values())),
         available_tools=available_tools,
         missing_tool_configs=missing_tool_configs,
+        requirement_graph=requirement_graph,
         blueprint_text=blueprint_text,
         blueprint_refined=False,
     )
@@ -1321,10 +1340,14 @@ async def generate_file(request: GenerateFileRequest):
                             skill_plan_entry=effective_skill_plan_entry,
                         )
 
+                        entry_requirements = []
+                        if isinstance(effective_skill_plan_entry, dict):
+                            entry_requirements = effective_skill_plan_entry.get("requirements") or []
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
                             script_content=content,
                             skill_plan_entry=entry,
+                            requirements=entry_requirements,
                             deterministic_issues=[],
                             requested_model=request.model or route.model,
                             review_context={
@@ -1338,6 +1361,13 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                         if not responsibility_review.get("passed"):
+                            failure_type = str(responsibility_review.get("failure_type") or "script_requirement_failed")
+                            if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
+                                raise FileGenerationStageError(
+                                    source=failure_type,
+                                    layer=failure_type,
+                                    detail=json.dumps(responsibility_review, ensure_ascii=False, default=str),
+                                )
                             issues = (
                                 responsibility_review.get("issues")
                                 if isinstance(responsibility_review.get("issues"), list)

@@ -2738,11 +2738,95 @@ def _normalize_responsibility_review_issues(
 
     return normalized
 
+
+def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
+    items: list[RequirementItem] = []
+    for raw in requirements or []:
+        try:
+            if isinstance(raw, RequirementItem):
+                items.append(raw)
+            elif isinstance(raw, dict):
+                items.append(RequirementItem(**raw))
+        except Exception:
+            continue
+    return items
+
+
+def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list[RequirementItem], file_path: str) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"passed": False, "failure_type": "script_requirement_validator_error", "issues": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
+    checks = data.get("checks")
+    if not isinstance(checks, list):
+        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
+    required_ids = {r.id for r in requirements if r.required}
+    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
+    missing = sorted(required_ids - seen)
+    if missing:
+        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
+    blocking: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        rid = str(check.get("requirement_id") or "")
+        if rid not in required_ids:
+            continue
+        if str(check.get("evidence_level") or "").lower() == "missing" and str(check.get("severity") or "").lower() == "blocking":
+            missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
+            if not missing_evidence:
+                continue
+            blocking.append({
+                "id": "script_requirement_failed",
+                "requirement_id": rid,
+                "failed_file": file_path,
+                "failed_function": "current script",
+                "code_region": str(check.get("target_file") or file_path),
+                "reason": str(check.get("reason") or "Required requirement lacks implementation evidence."),
+                "missing_evidence": missing_evidence,
+                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement."),
+                "allowed_scope": "Only modify the current script responsibility implementation area.",
+                "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
+                "details": {"check": check},
+            })
+    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [], "raw_review": data}
+
+
+def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
+    if not requirements:
+        return []
+    text = str(script_content or "")
+    if re.search(r"except\s+Exception[^:]*:([\s\S]{0,500}?)(return|print)\s*\(?\s*\{[^}]*['\"]error['\"]", text):
+        return [{"id": "script_requirement_failed", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
+    return []
+
+
+def detect_required_component_coverage(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
+    if not requirements or not str(script_content or "").strip():
+        return []
+    text = str(script_content or "")
+    issues=[]
+    for req in requirements:
+        if req.required and req.required_components and len(text.strip()) < 120:
+            issues.append({"id":"script_requirement_failed","requirement_id":req.id,"failed_file":req.target_file,"failed_function":"current script","code_region":"file","reason":"Script is too small to show required component construction evidence.","missing_evidence":["required component construction evidence"],"minimal_edit":"Implement the required component construction in the current script."})
+    return issues
+
+
+def detect_required_constraint_application(script_content: str, requirements: list[RequirementItem]) -> list[dict[str, Any]]:
+    return []
+
+
+def detect_requirement_evidence_static(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
+    issues=[]
+    issues.extend(detect_error_stdout_bypass(script_content, requirements, expected_outputs))
+    issues.extend(detect_required_component_coverage(script_content, requirements))
+    issues.extend(detect_required_constraint_application(script_content, requirements))
+    return issues
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
     script_content: str,
     skill_plan_entry: SkillPlanEntry,
+    requirements: Any = None,
     deterministic_issues: list[dict[str, Any]] | None = None,
     requested_model: str | None = None,
     review_context: dict[str, Any] | None = None,
@@ -2761,14 +2845,16 @@ async def _run_script_responsibility_review(
     - 最终 E2E 闭环。
     """
 
-    deterministic_issues = deterministic_issues or []
+    req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    deterministic_issues = (deterministic_issues or []) + detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
     review_context = review_context if isinstance(review_context, dict) else {}
 
     if deterministic_issues:
         return {
             "passed": False,
             "issues": deterministic_issues,
-            "repair_instructions": "按确定性静态检查结果修复当前脚本源码。",
+            "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+            "failure_type": "script_requirement_failed",
             "model": "deterministic",
         }
 
@@ -2903,6 +2989,7 @@ async def _run_script_responsibility_review(
                 "forbidden_scope": "不得因为 validator 不可用而判定脚本通过。",
             }],
             "repair_instructions": "职责审查模型不可用，不能放行当前脚本。",
+            "failure_type": "script_requirement_validator_error",
             "model": route.model,
         }
 
@@ -2922,8 +3009,16 @@ async def _run_script_responsibility_review(
                 "details": {"raw": str(text or "")[:1000]},
             }],
             "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
+            "failure_type": "script_requirement_validator_error",
             "model": route.model,
         }
+
+    if req_items:
+        parsed_review = _parse_requirement_review_result(data, requirements=req_items, file_path=file_path)
+        parsed_review["model"] = route.model
+        if not parsed_review.get("passed"):
+            return parsed_review
+        return parsed_review
 
     blocking = data.get("blocking_issues")
     blocking_issues = blocking if isinstance(blocking, list) else []

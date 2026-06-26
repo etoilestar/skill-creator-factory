@@ -216,6 +216,31 @@ def test_office_and_table_capabilities_have_manifests_and_snippets():
         snippet_text = capability.snippets[0].code + capability.snippets[0].return_rule
         assert helper in snippet_text
         assert "dict" in snippet_text or "JSON" in snippet_text
+        if capability_name == "docx_generation":
+            assert "text=" in snippet_text
+            assert "blocks=" in snippet_text
+            assert "paragraphs=" in snippet_text
+            assert "title=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "pptx_generation":
+            assert "slides=" in snippet_text
+            assert "blocks" in snippet_text
+            assert "title=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "xlsx_generation":
+            assert "sheets=" in snippet_text
+            assert "headers=" in snippet_text
+            assert "rows=" in snippet_text
+            assert "output_filename" in snippet_text
+        elif capability_name == "csv_generation":
+            assert "headers=" in snippet_text
+            assert "rows=" in snippet_text
+            assert "output_filename" in snippet_text
+        if capability_name.endswith("_generation"):
+            assert f"{capability_name.split('_')[0]}_path" in capability.output_schema["properties"]
+            assert "file_paths" in capability.output_schema["properties"]
+            assert "file_outputs" in capability.output_schema["properties"]
+            assert "Do not drop file_outputs" in " ".join(card.common_mistakes)
 
 
 def test_resolve_office_table_tools_does_not_route_to_pdf():

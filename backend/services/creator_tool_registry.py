@@ -477,28 +477,202 @@ BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
 
 
 
+
+def _document_generation_examples(helper: str, artifact: str) -> dict[str, Any]:
+    if helper == "create_docx":
+        return {
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "blocks": {"type": "array", "items": {"type": "object"}},
+                    "paragraphs": {"type": "array"},
+                    "title": {"type": "string"},
+                    "output_filename": {"type": "string"},
+                },
+            },
+            "example_call": (
+                "from backend.services.runtime_tools import create_docx\n\n"
+                "result = create_docx(\n"
+                "    text=payload.get('text') or payload.get('content') or '',\n"
+                "    blocks=payload.get('blocks'),\n"
+                "    paragraphs=payload.get('paragraphs'),\n"
+                "    title=payload.get('title'),\n"
+                "    filename=payload.get('output_filename') or 'output.docx',\n"
+                ")"
+            ),
+            "snippet": (
+                "import json\n"
+                "from backend.services.runtime_tools import create_docx\n\n"
+                "text = payload.get('text') or payload.get('content') or ''\n"
+                "blocks = payload.get('blocks')\n"
+                "paragraphs = payload.get('paragraphs')\n"
+                "result = create_docx(\n"
+                "    text=text,\n"
+                "    blocks=blocks,\n"
+                "    paragraphs=paragraphs,\n"
+                "    title=payload.get('title'),\n"
+                "    filename=payload.get('output_filename') or 'output.docx',\n"
+                ")\n"
+                "# helper returns a dict; do not treat it as a string\n"
+                "return {\n"
+                "    'docx_path': result['docx_path'],\n"
+                "    'file_paths': result.get('file_paths') or [result['docx_path']],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['docx_path']],\n"
+                "}"
+            ),
+        }
+    if helper == "create_pptx":
+        return {
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "slides": {"type": "array"},
+                    "blocks": {"type": "array", "items": {"type": "object"}},
+                    "title": {"type": "string"},
+                    "output_filename": {"type": "string"},
+                },
+            },
+            "example_call": (
+                "from backend.services.runtime_tools import create_pptx\n\n"
+                "slides = payload.get('slides') or payload.get('blocks') or [payload.get('text') or payload.get('content') or '']\n"
+                "result = create_pptx(\n"
+                "    slides=slides,\n"
+                "    title=payload.get('title') or 'Generated Presentation',\n"
+                "    filename=payload.get('output_filename') or 'output.pptx',\n"
+                ")"
+            ),
+            "snippet": (
+                "import json\n"
+                "from backend.services.runtime_tools import create_pptx\n\n"
+                "slides = payload.get('slides') or payload.get('blocks') or [payload.get('text') or payload.get('content') or '']\n"
+                "result = create_pptx(\n"
+                "    slides=slides,\n"
+                "    title=payload.get('title') or 'Generated Presentation',\n"
+                "    filename=payload.get('output_filename') or 'output.pptx',\n"
+                ")\n"
+                "# helper returns a dict; do not treat it as a string\n"
+                "return {\n"
+                "    'pptx_path': result['pptx_path'],\n"
+                "    'file_paths': result.get('file_paths') or [result['pptx_path']],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['pptx_path']],\n"
+                "}"
+            ),
+        }
+    if helper == "create_xlsx":
+        return {
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sheets": {"type": "array", "items": {"type": "object"}},
+                    "headers": {"type": "array"},
+                    "rows": {"type": "array"},
+                    "output_filename": {"type": "string"},
+                },
+            },
+            "example_call": (
+                "from backend.services.runtime_tools import create_xlsx\n\n"
+                "result = create_xlsx(\n"
+                "    sheets=payload.get('sheets'),\n"
+                "    headers=payload.get('headers'),\n"
+                "    rows=payload.get('rows') or [],\n"
+                "    filename=payload.get('output_filename') or 'output.xlsx',\n"
+                ")"
+            ),
+            "snippet": (
+                "import json\n"
+                "from backend.services.runtime_tools import create_xlsx\n\n"
+                "sheets = payload.get('sheets')\n"
+                "headers = payload.get('headers')\n"
+                "rows = payload.get('rows') or []\n"
+                "result = create_xlsx(\n"
+                "    sheets=sheets,\n"
+                "    headers=headers,\n"
+                "    rows=rows,\n"
+                "    filename=payload.get('output_filename') or 'output.xlsx',\n"
+                ")\n"
+                "# helper returns a dict; do not treat it as a string\n"
+                "return {\n"
+                "    'xlsx_path': result['xlsx_path'],\n"
+                "    'file_paths': result.get('file_paths') or [result['xlsx_path']],\n"
+                "    'file_outputs': result.get('file_outputs') or [result['xlsx_path']],\n"
+                "}"
+            ),
+        }
+    return {
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "headers": {"type": "array"},
+                "rows": {"type": "array"},
+                "output_filename": {"type": "string"},
+            },
+        },
+        "example_call": (
+            "from backend.services.runtime_tools import create_csv\n\n"
+            "result = create_csv(\n"
+            "    headers=payload.get('headers'),\n"
+            "    rows=payload.get('rows') or [],\n"
+            "    filename=payload.get('output_filename') or 'output.csv',\n"
+            ")"
+        ),
+        "snippet": (
+            "import json\n"
+            "from backend.services.runtime_tools import create_csv\n\n"
+            "headers = payload.get('headers')\n"
+            "rows = payload.get('rows') or []\n"
+            "result = create_csv(\n"
+            "    headers=headers,\n"
+            "    rows=rows,\n"
+            "    filename=payload.get('output_filename') or 'output.csv',\n"
+            ")\n"
+            "# helper returns a dict; do not treat it as a string\n"
+            "return {\n"
+            "    'csv_path': result['csv_path'],\n"
+            "    'file_paths': result.get('file_paths') or [result['csv_path']],\n"
+            "    'file_outputs': result.get('file_outputs') or [result['csv_path']],\n"
+            "}"
+        ),
+    }
+
+
 def _document_artifact_capability(capability: str, helper: str, artifact: str, package: str | None, imports: list[str], display: str) -> None:
     deps = [{"package": package, "imports": imports}] if package else []
+    examples = _document_generation_examples(helper, artifact)
+    output_schema = {
+        "type": "object",
+        "required": [f"{artifact}_path", "file_paths", "file_outputs"],
+        "properties": {
+            f"{artifact}_path": {"type": "string"},
+            "file_paths": {"type": "array", "items": {"type": "string"}},
+            "file_outputs": {"type": "array", "items": {"type": "string"}},
+        },
+    }
     BUILTIN_TOOL_CAPABILITIES[capability] = replace(
         BUILTIN_TOOL_CAPABILITIES[capability],
         helper_imports=[helper],
         dependencies=deps or BUILTIN_TOOL_CAPABILITIES[capability].dependencies,
-        input_schema={"type": "object", "properties": {"output_filename": {"type": "string"}, "title": {"type": "string"}, "blocks": {"type": "array"}, "headers": {"type": "array"}, "rows": {"type": "array"}, "sheets": {"type": "array"}}},
-        output_schema={"type": "object", "required": [f"{artifact}_path", "file_outputs"], "properties": {f"{artifact}_path": {"type": "string"}, "file_paths": {"type": "array", "items": {"type": "string"}}, "file_outputs": {"type": "array", "items": {"type": "string"}}}},
-        artifact_outputs=[{"field": f"{artifact}_path", "type": artifact}, {"field": "file_outputs", "type": "file_list"}],
+        input_schema=examples["input_schema"],
+        output_schema=output_schema,
+        artifact_outputs=[{"field": f"{artifact}_path", "type": artifact}, {"field": "file_paths", "type": "file_list"}, {"field": "file_outputs", "type": "file_list"}],
         functions=[ToolFunctionManifest(
             function_name=helper,
             import_path="backend.services.runtime_tools",
             short_description=f"Create a {display} artifact and return platform artifact paths.",
             when_to_use=f"Use for user requests that explicitly need {display}/document/table output; do not route this to PDF unless the user asks for PDF.",
             signature=f"{helper}(..., filename: str = 'output.{artifact}') -> dict[str, Any]",
-            input_schema={"type": "object"},
-            output_schema={"type": "object", "required": [f"{artifact}_path", "file_outputs"]},
-            artifact_outputs=[{"field": f"{artifact}_path", "type": artifact}, {"field": "file_outputs", "type": "file_list"}],
-            example_call=f"from backend.services.runtime_tools import {helper}\nresult = {helper}(filename=payload.get('output_filename') or 'output.{artifact}')",
+            input_schema=examples["input_schema"],
+            output_schema=output_schema,
+            artifact_outputs=[{"field": f"{artifact}_path", "type": artifact}, {"field": "file_paths", "type": "file_list"}, {"field": "file_outputs", "type": "file_list"}],
+            example_call=examples["example_call"],
             example_return=f"{{'{artifact}_path': '/outputs/output.{artifact}', 'file_paths': ['/outputs/output.{artifact}'], 'file_outputs': ['/outputs/output.{artifact}']}}",
-            example_stdout=f"print(json.dumps({{'{artifact}_path': result['{artifact}_path'], 'file_outputs': result.get('file_outputs') or [result['{artifact}_path']]}}))",
-            common_mistakes=[f"{helper} returns a dict, not a string; preserve {artifact}_path and file_outputs in stdout JSON.", "Do not write outside OUTPUT_DIR.", "Do not convert this request to PDF unless PDF is requested."],
+            example_stdout=f"print(json.dumps({{'{artifact}_path': result['{artifact}_path'], 'file_paths': result.get('file_paths') or [result['{artifact}_path']], 'file_outputs': result.get('file_outputs') or [result['{artifact}_path']]}}))",
+            common_mistakes=[
+                f"{helper} returns a dict, not a string; preserve {artifact}_path, file_paths, and file_outputs in stdout JSON.",
+                "Do not drop file_outputs.",
+                "Do not write outside OUTPUT_DIR.",
+                "Do not convert Office/CSV requests to PDF unless PDF is explicitly requested.",
+            ],
             trial_mode_behavior="Creates a minimal valid artifact under OUTPUT_DIR during trial runs.",
             usage_policy="helper_preferred",
             required_capabilities=[capability],
@@ -507,11 +681,17 @@ def _document_artifact_capability(capability: str, helper: str, artifact: str, p
             id=f"{capability}.{helper}",
             title=f"Create {display} artifact",
             applies_to={"capabilities": [capability]},
-            description=f"Import and call {helper}; return stdout JSON with path fields for artifact validation.",
-            code=f"import json\nfrom backend.services.runtime_tools import {helper}\n\nresult = {helper}(filename=payload.get('output_filename') or 'output.{artifact}')\n# helper returns a dict; do not treat it as a string\nreturn {{\n    '{artifact}_path': result['{artifact}_path'],\n    'file_paths': result.get('file_paths') or [result['{artifact}_path']],\n    'file_outputs': result.get('file_outputs') or [result['{artifact}_path']],\n}}",
-            expected_output_shape={f"{artifact}_path": "string", "file_outputs": ["string"]},
-            return_rule=f"Final stdout JSON must preserve {artifact}_path and file_outputs from the helper result.",
-            anti_patterns=["Do not drop file_outputs.", "Do not return the helper dict as a nested string.", "Do not route Office/CSV output to PDF."],
+            description=f"Import and call {helper} with content fields; return stdout JSON with path fields for artifact validation.",
+            code=examples["snippet"],
+            expected_input_shape=examples["input_schema"].get("properties", {}),
+            expected_output_shape={f"{artifact}_path": "string", "file_paths": ["string"], "file_outputs": ["string"]},
+            return_rule=f"Final stdout JSON must preserve {artifact}_path, file_paths, and file_outputs from the helper result.",
+            anti_patterns=[
+                f"Do not call {helper}(filename=...) without passing content fields; that creates empty or generic artifacts.",
+                "Do not treat the helper result as a string; it is a dict.",
+                "Do not drop file_outputs.",
+                "Do not route Office/CSV output to PDF.",
+            ],
             requires=[capability], usage_policy="helper_preferred", priority=125,
         )],
         usage_policy="helper_preferred",
@@ -522,7 +702,6 @@ _document_artifact_capability("docx_generation", "create_docx", "docx", "python-
 _document_artifact_capability("pptx_generation", "create_pptx", "pptx", "python-pptx", ["pptx"], "PowerPoint PPTX")
 _document_artifact_capability("xlsx_generation", "create_xlsx", "xlsx", "openpyxl", ["openpyxl"], "Excel XLSX")
 _document_artifact_capability("csv_generation", "create_csv", "csv", None, [], "CSV")
-
 
 
 def _read_capability(capability: str, helper: str, source_ext: str, package: str | None, imports: list[str]) -> None:

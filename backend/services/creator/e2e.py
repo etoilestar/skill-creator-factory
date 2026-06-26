@@ -739,6 +739,9 @@ def _load_valid_checkpoint(session: CreatorE2ESession, step_index: int) -> dict[
         return None
     if data.get("command_plan_signature") != session.command_plan_signature:
         return None
+    script_path = str(data.get("script_path") or "")
+    if script_path and data.get("script_hash") != _file_sha256(session.workspace_dir / script_path):
+        return None
     if not data.get("passed"):
         return None
     return data
@@ -1789,6 +1792,7 @@ async def _repair_existing_file_for_e2e_failure(
     requested_model: str | None = None,
     external_context: dict[str, Any] | None = None,
     repair_events: list[dict[str, Any]] | None = None,
+    e2e_session: CreatorE2ESession | None = None,
 ) -> str:
     """Repair existing SKILL.md/script file using local patch + sandbox E2E.
 
@@ -1827,7 +1831,8 @@ async def _repair_existing_file_for_e2e_failure(
         target_path = "SKILL.md"
 
     skill_dir = settings.skills_path / skill_name
-    e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
+    if e2e_session is None:
+        e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
     target_file = skill_dir / target_path
 
     if not target_file.is_file():
@@ -1876,6 +1881,7 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     deterministic_error = "\n\n".join(e2e_errors)[-12000:]
+    repair_state = _e2e_repair_state_from_errors(e2e_errors, resolved_failures=e2e_session.resolved_failures)
     structured_failure = _structured_failure_from_errors(e2e_errors)
     targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
 
@@ -1937,6 +1943,9 @@ async def _repair_existing_file_for_e2e_failure(
     base_task_context = "\n".join([
         f"Skill 名称：{skill_name}",
         "",
+        "E2E repair 状态机（只能修 remaining_failed_checks；resolved_failures 禁止重复修复）：",
+        json.dumps(repair_state, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "",
         "结构化失败对象：",
         json.dumps(structured_failure, ensure_ascii=False, indent=2, sort_keys=True, default=str),
         "",
@@ -1956,7 +1965,7 @@ async def _repair_existing_file_for_e2e_failure(
         e2e_tool_cards,
     ])
 
-    repair_feedback = deterministic_error
+    repair_feedback = "\n\n".join(repair_state.get("remaining_failed_checks") or e2e_errors)[-12000:]
     last_failure = ""
     max_candidate_attempts = 5
     working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
@@ -1967,6 +1976,16 @@ async def _repair_existing_file_for_e2e_failure(
         effective_task_context = base_task_context
         if target_path == "SKILL.md":
             effective_task_context = base_task_context.replace(skill_md[-12000:], effective_skill_md[-12000:], 1)
+
+        current_repair_state = _e2e_repair_state_from_errors(
+            repair_feedback.split("\n\n"),
+            resolved_failures=e2e_session.resolved_failures,
+        )
+        effective_task_context += (
+            "\n\n当前 E2E repair 状态机：\n"
+            + json.dumps(current_repair_state, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            + "\n\n硬性要求：只能修 remaining_failed_checks；不得再次修改 resolved_failures 对应问题。"
+        )
 
         try:
             _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
@@ -2076,6 +2095,25 @@ async def _repair_existing_file_for_e2e_failure(
             })
 
             if not sandbox_gate.get("accepted"):
+                gate_errors = sandbox_gate.get("errors") or []
+                next_target = _e2e_repair_target_from_errors(gate_errors)
+                has_explicit_next_target = any("E2E_REPAIR_TARGET=" in str(error or "") for error in gate_errors)
+                if has_explicit_next_target and next_target and next_target != target_path:
+                    e2e_session.events.append({
+                        **e2e_session.to_event_base(),
+                        "attempt": candidate_attempt,
+                        "target_file": target_path,
+                        "patch_status": "rejected",
+                        "rejection_reason": "remaining failure target moved to a different file",
+                        "remaining_target_file": next_target,
+                        "failed_checks": sandbox_gate.get("errors") or [],
+                        "rerun_status": "failed",
+                        "writeback_status": "candidate_only",
+                    })
+                    raise ValueError(
+                        "E2E_REPAIR_TARGET_CHANGED：当前 remaining failure 已转移到其它文件，"
+                        f"停止继续修旧 target_file={target_path!r}，next_target={next_target!r}。"
+                    )
                 working_content = sanitized
                 last_failure = (
                     "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
@@ -2122,6 +2160,26 @@ async def _repair_existing_file_for_e2e_failure(
             return target_path
 
         except Exception as candidate_exc:
+            error_text = str(candidate_exc)
+            if "proposal_noop" in error_text or "no-op" in error_text:
+                patch_status = "noop"
+            elif "FORMAT_VIOLATION" in error_text or "JSON" in error_text or "parse" in error_text:
+                patch_status = "parse_failed"
+            else:
+                patch_status = "rejected"
+            e2e_session.events.append({
+                **e2e_session.to_event_base(),
+                "attempt": candidate_attempt,
+                "target_file": target_path,
+                "patch_status": patch_status,
+                "rejection_reason": error_text[:2000],
+                "failed_checks": repair_feedback.split("\n\n")[:8],
+                "resolved_failures": e2e_session.resolved_failures,
+                "rerun_status": "skipped",
+                "writeback_status": "candidate_only",
+            })
+            if repair_events is not None and patch_status in {"noop", "parse_failed"}:
+                repair_events.extend(e2e_session.events)
             last_failure = (
                 "REPAIR_CANDIDATE_FAILED：候选 patch 生成、解析或应用失败。\n"
                 f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
@@ -2156,6 +2214,8 @@ def validate_workflow_e2e(
     external_context: dict[str, Any] | None = None,
     source_skill_dir: Path | None = None,
     requested_model: str | None = None,
+    e2e_session: CreatorE2ESession | None = None,
+    resume_from_step: int = 1,
 ) -> list[str]:
     """Second-round Creator validator.
 
@@ -2175,6 +2235,8 @@ def validate_workflow_e2e(
         external_context=external_context,
         source_skill_dir=source_skill_dir,
         requested_model=requested_model,
+        e2e_session=e2e_session,
+        resume_from_step=resume_from_step,
     )
 
 def _run_e2e_sandbox_acceptance_gate(

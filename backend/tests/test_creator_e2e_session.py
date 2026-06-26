@@ -109,3 +109,17 @@ def test_e2e_state_ignores_advisory_when_no_failed_checks():
     assert state["full_e2e_passed"] is True
     assert state["remaining_failed_checks"] == []
     assert state["current_target_file"] == "none"
+
+
+def test_checkpoint_rejects_changed_script_hash(tmp_path, monkeypatch):
+    skill_dir = _make_skill(tmp_path)
+    _patch_fast_e2e(monkeypatch)
+    monkeypatch.setattr(e2e, "_execute_e2e_python_command", lambda command, **kwargs: subprocess.CompletedProcess([], 0, stdout='{"ok": true}', stderr=""))
+    monkeypatch.setattr(e2e, "_parse_e2e_stdout_json", lambda command, **kwargs: ({"one": "ok"} if command.ordinal == 1 else {"text": "done"}))
+
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    assert e2e._run_skill_workflow_e2e_once("demo", source_skill_dir=skill_dir, e2e_session=session) == []
+    assert e2e._load_valid_checkpoint(session, 1) is not None
+
+    (session.workspace_dir / "scripts" / "one.py").write_text("print('changed')\n", encoding="utf-8")
+    assert e2e._load_valid_checkpoint(session, 1) is None

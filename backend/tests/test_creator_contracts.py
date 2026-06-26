@@ -279,3 +279,13 @@ def test_closed_bash_block_bad_json_argv_is_not_hard_format():
     sig = _command_signature("python scripts/a.py '{bad}'", "scripts/a.py")
     assert sig is not None
     assert sig["arg_mode"] == "invalid_json_arg"
+
+
+def test_hard_format_entire_file_fenced_without_language_full_rewrite():
+    failures = detect_markdown_hard_format_failures("SKILL.md", "```\n---\nname: x\ndescription: y\n---\n# Body\n```\n", True)
+    assert any(f["id"] == "markdown.file.wrapped_in_code_fence" for f in failures)
+
+
+def test_hard_format_local_plain_fence_is_allowed_when_closed():
+    content = "---\nname: x\ndescription: y\n---\n\n# Body\n\n```\nexample\n```\n"
+    assert detect_markdown_hard_format_failures("SKILL.md", content, True) == []

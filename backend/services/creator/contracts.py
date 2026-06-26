@@ -4085,7 +4085,7 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
             minimal_edit="整文件重写为完整 Markdown 文件。",
         )]
 
-    if re.fullmatch(r"```(?:markdown|md|text)\s+[\s\S]*?\s*```", stripped, flags=re.I):
+    if re.fullmatch(r"(```|~~~)[^\n`~]*\n[\s\S]*\n\1\s*", stripped, flags=re.I):
         failures.append(_hard_format_failure(
             check_id="markdown.file.wrapped_in_code_fence",
             file_path=file_path,

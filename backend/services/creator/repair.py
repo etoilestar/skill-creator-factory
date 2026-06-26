@@ -1105,13 +1105,52 @@ def _validate_repair_diff_scope(
             candidate,
             require_frontmatter=(scope.target_file == "SKILL.md"),
         )
-        if scope.target_file == "SKILL.md" and re.search(r"```(?:bash|sh|shell)\s+[\s\S]*?\\[\"{][\s\S]*?```", candidate, re.I):
+        if scope.target_file == "SKILL.md" and _skill_md_has_backslash_escaped_json_argv(candidate):
             raise ValueError(
                 "localized patch introduced backslash-escaped shell JSON argv inside a bash fenced block; "
                 "合法 shell JSON argv 不允许被改写成带反斜杠的 argv。"
             )
 
     return candidate, stats
+
+
+def _skill_md_has_backslash_escaped_json_argv(content: str) -> bool:
+    """Detect escaped JSON argv only on standard scripts/*.py shell commands.
+
+    This intentionally ignores ordinary shell snippets (echo/sed/etc.) and
+    non-standard/multiline shell text. Command-contract repair owns closed bash
+    blocks whose JSON argv is otherwise invalid.
+    """
+    from .contracts import _command_signature
+
+    for info, body in _iter_markdown_fenced_blocks(content):
+        if not _is_shell_fence_info(info):
+            continue
+        lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+        if len(lines) != 1:
+            continue
+        command = lines[0]
+        try:
+            parts = shlex.split(command, posix=True)
+        except ValueError:
+            continue
+        if len(parts) != 3:
+            continue
+        runner = Path(parts[0]).name
+        script_path = parts[1].replace("\\", "/").strip()
+        argv = parts[2].strip()
+        if runner not in {"python", "python3"}:
+            continue
+        if not script_path.startswith("scripts/") or Path(script_path).suffix.lower() != ".py":
+            continue
+
+        command_sig = _command_signature(command, script_path)
+        if not command_sig or command_sig.get("arg_mode") != "invalid_json_arg":
+            continue
+        if argv.startswith("{") and argv.endswith("}") and any(token in argv for token in ('\\"', "\\{", "\\}")):
+            return True
+
+    return False
 
 
 def _compact_messages_for_repair_context(

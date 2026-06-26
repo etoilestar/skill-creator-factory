@@ -318,3 +318,18 @@ def test_command_patch_escaped_json_argv_is_rejected():
             current_content=original,
             scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
         )
+
+
+def test_nonstandard_shell_text_with_backslashes_is_not_rejected_by_argv_guard():
+    original = "---\nname: x\ndescription: y\n---\n\n```bash\necho '{\\\"k\\\":\\\"v\\\"}'\n```\n\nText.\n"
+    proposal = CreatorDiffProposal(
+        target_file="SKILL.md",
+        reason="test",
+        edits=[{"old": "Text.", "new": "Updated text."}],
+    )
+    candidate, _stats = _validate_repair_diff_scope(
+        proposal=proposal,
+        current_content=original,
+        scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
+    )
+    assert "Updated text." in candidate

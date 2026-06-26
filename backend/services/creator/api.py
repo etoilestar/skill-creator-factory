@@ -1681,18 +1681,54 @@ async def generate_file(request: GenerateFileRequest):
                     prompt_variant = next_variant
                     continue
                 if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                    yield _file_done_error_sse(
-                        file_path=request.file_path,
-                        role=request.role,
-                        error=(
-                            "Requirement validator failed or returned incomplete checks; this is not a business-file repair target. "
-                            f"Last validator error: {deterministic_error}"
-                        ),
-                        error_type=error_source,
-                        content=candidate or "",
-                        recoverable=True,
+                    static_blockers: list[dict[str, Any]] = []
+                    if request.file_path.startswith("scripts/"):
+                        try:
+                            static_skill_md = (
+                                (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
+                                if (settings.skills_path / skill_name / "SKILL.md").is_file()
+                                else ""
+                            )
+                            static_entry = _skill_plan_entry_for_file(
+                                file_path=request.file_path,
+                                blueprint_text=static_skill_md,
+                                role=request.role,
+                                skill_plan_entry=effective_skill_plan_entry,
+                            )
+                            static_requirements: list[Any] = []
+                            static_graph = _load_persisted_requirement_graph(skill_name)
+                            if static_graph is not None:
+                                static_requirements = [req for req in static_graph.requirements if req.target_file == request.file_path]
+                            static_blockers = _detect_script_responsibility_static_blockers(
+                                candidate or "",
+                                static_entry,
+                                static_requirements,
+                            )
+                        except Exception:
+                            static_blockers = []
+                    if not static_blockers:
+                        yield _file_done_error_sse(
+                            file_path=request.file_path,
+                            role=request.role,
+                            error=(
+                                "Requirement validator failed or returned incomplete checks; no localized business blocker was identified. "
+                                f"Last validator error: {deterministic_error}"
+                            ),
+                            error_type=error_source,
+                            content=candidate or "",
+                            recoverable=True,
+                        )
+                        return
+                    stage_error = FileGenerationStageError(
+                        source="script_requirement_failed",
+                        layer="responsibility",
+                        detail=json.dumps({"issues": static_blockers}, ensure_ascii=False, default=str),
+                        original=ScriptFunctionalValidationError(static_blockers, layer="responsibility"),
                     )
-                    return
+                    deterministic_error = str(stage_error)
+                    error_source = stage_error.source
+                    error_layer = f"{stage_error.source}:{stage_error.layer}"
+                    repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
                 if error_source == "hard_format":
                     layer_limit = _first_round_repair_limit(error_source)

@@ -9,7 +9,9 @@ from backend.services.creator.common import (
     validate_requirement_graph_schema,
 )
 from backend.services.creator.repair import (
+    _detect_script_responsibility_static_blockers,
     _parse_requirement_review_result,
+    _run_script_responsibility_review,
     detect_error_stdout_bypass,
 )
 from backend.services.runtime_tools.document_tools import create_pdf_document, create_text_file
@@ -77,6 +79,143 @@ def test_requirement_review_requires_check_coverage_and_missing_evidence_for_blo
     assert failed["issues"][0]["requirement_id"] == req.id
 
 
+
+
+def test_warning_with_required_missing_evidence_is_backend_blocking():
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "checks": [{
+                "requirement_id": req.id,
+                "severity": "warning",
+                "evidence_level": "missing",
+                "missing_evidence": ["core product construction"],
+                "allowed_scope": "advisory text should not decide blocking",
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["failure_type"] == "script_requirement_failed"
+
+
+def test_advisory_collection_with_required_missing_evidence_is_backend_blocking():
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "checks": [{"requirement_id": req.id, "evidence_level": "present", "missing_evidence": []}],
+            "advisory_notes": [{
+                "requirement_id": req.id,
+                "evidence_level": "missing",
+                "missing_evidence": ["helper result output"],
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["allowed_scope"] == "current file only"
+
+def test_static_responsibility_blocks_required_input_not_in_core_path():
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = "def run(payload):\n    blocks = [{'type': 'text', 'text': 'fixed'}]\n    return {'path': 'out.pdf'}\n"
+    issues = _detect_script_responsibility_static_blockers(script, spec, [req])
+    assert issues
+    assert issues[0]["id"] == "script_requirement_failed"
+    assert issues[0]["allowed_scope"] == "current script only"
+
+
+def test_static_responsibility_passes_when_input_enters_blocks_and_helper_args():
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+def run(payload):
+    brief = payload.get('customer brief')
+    sections = [{'type': 'text', 'text': brief}]
+    result = create_pdf_document(sections, filename='out.pdf')
+    print({'path': result.get('path'), 'debug': {'block_count': len(sections)}})
+"""
+    assert _detect_script_responsibility_static_blockers(script, spec, [req]) == []
+
+
+def test_static_responsibility_allows_different_field_name_when_input_flows():
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+def run(payload):
+    source = payload.get('brief_text')
+    blocks = [{'type': 'text', 'text': source}]
+    result = create_pdf_document(blocks, filename='out.pdf')
+    return {'artifact': result, 'metadata': {'source': 'payload'}}
+"""
+    assert _detect_script_responsibility_static_blockers(script, spec, [req]) == []
+
+
+@pytest.mark.asyncio
+async def test_validator_passed_with_static_blocker_enters_script_requirement_failed(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return '{"passed": true, "checks": [{"requirement_id": "' + req.id + '", "severity": "warning", "evidence_level": "weak", "missing_evidence": []}], "advisory_notes": [{"requirement_id": "' + req.id + '", "evidence_level": "missing", "missing_evidence": ["input not used"]}]}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'path': 'fixed.pdf'}\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["failure_type"] == "script_requirement_failed"
+    assert review["issues"][0]["allowed_scope"] == "current script only"
+
+
+@pytest.mark.asyncio
+async def test_validator_incomplete_twice_static_blocker_repairs_script(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return '{"passed": true, "advisory_notes": []}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    blocks = []\n    return {'path': 'fixed.pdf'}\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["failure_type"] == "script_requirement_failed"
+
+
+@pytest.mark.asyncio
+async def test_validator_incomplete_twice_without_static_blocker_stays_incomplete(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return '{"passed": true, "advisory_notes": []}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    script = """
+def run(payload):
+    brief = payload.get('brief_text')
+    blocks = [{'type': 'text', 'text': brief}]
+    result = create_pdf_document(blocks, filename='out.pdf')
+    return {'artifact': result, 'extra_stdout_metadata': {'ok': True}}
+"""
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content=script,
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
+
 def test_error_stdout_bypass_cannot_satisfy_expected_outputs():
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     issues = detect_error_stdout_bypass('try:\n    run()\nexcept Exception:\n    return {"error": "failed"}\n', [req], ["semantic artifact"])
@@ -122,7 +261,89 @@ def test_persisted_requirement_graph_round_trips_to_generate_and_e2e(monkeypatch
     assert loaded_for_e2e.requirements[0].id == graph.requirements[0].id
 
 
-def test_validator_error_stage_is_not_business_repair(monkeypatch):
+
+@pytest.mark.asyncio
+async def test_generate_file_validator_incomplete_uses_entry_requirements_static_fallback(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n", encoding="utf-8")
+
+    spec = _script_spec(path="scripts/main.py", inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    spec.requirements = [req]
+    entry = spec.model_dump(mode="json")
+    entry["requirements"] = [req.model_dump(mode="json")]
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "def run(payload):\n    return {'path': 'fixed.pdf'}\n"
+
+    reviews = iter([
+        {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": []},
+        {"passed": True, "issues": []},
+    ])
+
+    async def fake_responsibility_review(**_kwargs):
+        return next(reviews)
+
+    seen_static_requirements = []
+
+    def fake_static_blockers(script_content, skill_plan_entry, requirements):
+        seen_static_requirements.extend(requirements or [])
+        if requirements:
+            return [{
+                "id": "script_requirement_failed",
+                "requirement_id": req.id,
+                "failed_file": "scripts/main.py",
+                "reason": "required input is not in the constructed output",
+                "missing_evidence": ["required input -> output"],
+                "minimal_edit": "patch current script",
+                "allowed_scope": "current script only",
+            }]
+        return []
+
+    repair_modes = []
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        repair_modes.append(kwargs.get("repair_mode"))
+        return "def run(payload):\n    brief = payload.get('customer brief')\n    return {'path': brief}\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_load_persisted_requirement_graph", lambda _skill_name: None)
+    monkeypatch.setattr(api, "_detect_script_responsibility_static_blockers", fake_static_blockers)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    async def fake_generated_file_validator_round(**_kwargs):
+        return {"passed": False, "issues": []}
+
+    monkeypatch.setattr(api, "_run_generated_file_validator_round", fake_generated_file_validator_round)
+    monkeypatch.setattr(api, "_check_script_content_review_contract", lambda *args, **kwargs: [])
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate report",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=entry,
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert seen_static_requirements, body
+    assert repair_modes, body
+    assert "script_requirement_failed" in body
+    assert "script_requirement_validator_incomplete" not in body
+
+def test_validator_error_stage_checks_static_blockers_before_error(monkeypatch):
     from backend.services.creator import api
 
     events = []
@@ -132,11 +353,12 @@ def test_validator_error_stage_is_not_business_repair(monkeypatch):
 
     monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair)
     assert "script_requirement_validator_error" in api.generate_file.__globals__["FileGenerationStageError"].__name__ or True
-    # Contract-level assertion: generate_file has an explicit early return before repair for validator failures.
+    # Contract-level assertion: validator failures only early-return when no localized static blocker is found.
     import inspect
     source = inspect.getsource(api.generate_file)
     assert "script_requirement_validator_error" in source
-    assert "not a business-file repair target" in source
+    assert "_detect_script_responsibility_static_blockers" in source
+    assert "no localized business blocker was identified" in source
 
 
 def test_validator_graph_source_quality_marked(monkeypatch):

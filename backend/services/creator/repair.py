@@ -1757,6 +1757,7 @@ async def _repair_generated_file_with_feedback(
             "smoke / trial run 才负责判断代码能不能运行、stdout/artifact 是否合规。\n"
             "如果失败来自模型功能职责校验，你可以修当前脚本中未完成职责的局部逻辑，"
             "例如 PDF blocks/styles 组装、图片生成/检索参数、表格构造、内容生成调用、工具结果参与输出等。\n"
+            "本轮只修当前脚本的核心责任缺失：让 required inputs 参与核心产物构造，并保证 declared outputs 来自真实 helper result 或构造结果。不要修改 SKILL.md，不要改其它脚本，不要只改字段名，不要删除辅助 stdout metadata。\n"
             "如果失败来自 smoke/trial run，你只修导致运行失败、stdout 失败或 artifact 失败的局部逻辑。\n"
             "不要为了绕过试运行而返回空结果或伪造成功。\n"
             "平台 IO 是否兼容，由后续现有 smoke/sandbox 试运行判断。\n"
@@ -2758,42 +2759,30 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
-def _issue_severity_is_blocking(item: dict[str, Any]) -> bool:
-    severity = str(item.get("severity") or "").strip().lower()
-    if severity in {"blocking", "blocker", "error", "critical"}:
-        return True
-    if item.get("blocking") is True:
-        return True
-    return False
+def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids: set[str]) -> bool:
+    """Backend-owned blocking predicate for first-round responsibility clues.
 
-
-def _issue_structurally_advisory(item: dict[str, Any], required_ids: set[str] | None = None) -> bool:
+    Do not use severity/warning/advisory wording as the gate. A model item is
+    actionable only when it structurally points at a required requirement and
+    reports missing evidence that can be repaired in the current file.
+    """
     if not isinstance(item, dict):
-        return True
-    required_ids = required_ids or set()
+        return False
     rid = str(item.get("requirement_id") or "").strip()
     if not rid or (required_ids and rid not in required_ids):
-        return True
-    scope_kind = str(item.get("scope") or item.get("kind") or item.get("category") or item.get("issue_type") or "").strip().lower()
-    if scope_kind in {"validator_advisory", "advisory", "note", "info", "warning"}:
-        return True
-    severity = str(item.get("severity") or "").strip().lower()
-    if severity in {"warning", "info", "note", "advisory"}:
-        return True
-    if item.get("blocking") is False:
-        return True
+        return False
     if str(item.get("evidence_level") or "").strip().lower() != "missing":
-        return True
+        return False
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
-        return True
-    return False
+        return False
+    # Scope is normalized by the backend when producing the repair issue; do
+    # not infer blocking from advisory/severity/scope wording.
+    return True
 
 
 def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str]) -> bool:
-    if _issue_structurally_advisory(item, required_ids):
-        return False
-    return _issue_severity_is_blocking(item)
+    return _is_structured_missing_required_evidence(item, required_ids)
 
 
 def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
@@ -2828,28 +2817,202 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
     if missing:
         return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
     blocking: list[dict[str, Any]] = []
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
+    candidate_items = [item for item in checks if isinstance(item, dict)]
+    candidate_items.extend(item for item in advisory_notes if isinstance(item, dict))
+    seen_blockers: set[tuple[str, tuple[str, ...]]] = set()
+    for check in candidate_items:
         rid = str(check.get("requirement_id") or "")
         if not _is_blocking_requirement_check(check, required_ids):
-            advisory_notes.append(check)
+            if check not in advisory_notes:
+                advisory_notes.append(check)
             continue
         missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
+        key = (rid, tuple(str(item) for item in missing_evidence))
+        if key in seen_blockers:
+            continue
+        seen_blockers.add(key)
         blocking.append({
                 "id": "script_requirement_failed",
                 "requirement_id": rid,
                 "failed_file": file_path,
                 "failed_function": "current script",
-                "code_region": str(check.get("target_file") or file_path),
-                "reason": str(check.get("reason") or "Required requirement lacks implementation evidence."),
+                "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
+                "reason": str(check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
                 "missing_evidence": missing_evidence,
-                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement."),
-                "allowed_scope": "Only modify the current script responsibility implementation area.",
+                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
+                "allowed_scope": "current file only",
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
                 "details": {"check": check},
             })
     return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
+
+
+
+def _detect_script_responsibility_static_blockers(
+    script_content: str,
+    skill_plan_entry: SkillPlanEntry,
+    requirements: Any,
+) -> list[dict[str, Any]]:
+    """Conservative first-round check for required input -> core product paths.
+
+    This is intentionally small: it only blocks when there is no AST evidence that
+    declared/semantic required inputs are read and flow into a generic constructed
+    product/helper/output path. Field aliases, variable names, and extra stdout
+    metadata are not treated as failures.
+    """
+    req_items = [req for req in _coerce_requirement_items(requirements) if getattr(req, "required", False)]
+    if not req_items or not str(script_content or "").strip():
+        return []
+    required_inputs: list[tuple[str, str, str]] = []
+    for req in req_items:
+        semantic_inputs = [str(value or "").strip() for value in (getattr(req, "semantic_inputs", []) or []) if str(value or "").strip()]
+        if not semantic_inputs:
+            semantic_inputs = [str(value or "").strip() for value in (getattr(skill_plan_entry, "inputs", []) or []) if str(value or "").strip()]
+        for text in semantic_inputs:
+            required_inputs.append(("requirement", text, req.id))
+    if not required_inputs:
+        return []
+
+    try:
+        tree = ast.parse(script_content or "")
+    except SyntaxError:
+        return []
+
+    input_roots = {"payload", "argv", "args", "input", "inputs", "data", "context", "params", "config", "options"}
+    structural_core_names = {"blocks", "sections", "items", "pages", "document", "documents", "rows", "table", "tables", "content", "contents", "result", "results", "artifact", "artifacts", "output", "outputs"}
+    declared_outputs = {str(value or "").strip() for value in (getattr(skill_plan_entry, "outputs", []) or []) if str(value or "").strip()}
+    artifact_contract = getattr(skill_plan_entry, "artifact_contract", None)
+    if isinstance(artifact_contract, dict):
+        declared_outputs.update(str(key) for key in artifact_contract.keys())
+    core_names = structural_core_names | declared_outputs
+    helper_terms = tuple(sorted(structural_core_names | {part for output in declared_outputs for part in re.split(r"[^A-Za-z0-9]+", output) if part}))
+
+    aliases: set[str] = set()
+    core_vars: set[str] = set()
+    helper_result_vars: set[str] = set()
+    has_input_read = False
+    has_required_key_read = False
+    has_tainted_core = False
+    has_core_output = False
+
+    def _name(n: ast.AST) -> str:
+        if isinstance(n, ast.Name):
+            return n.id
+        if isinstance(n, ast.Attribute):
+            return n.attr
+        return ""
+
+    def _call_name(n: ast.AST) -> str:
+        if isinstance(n, ast.Call):
+            return _name(n.func).lower()
+        return ""
+
+    def _contains_input_read(n: ast.AST) -> bool:
+        for child in ast.walk(n):
+            if isinstance(child, ast.Name) and (child.id in input_roots or child.id in aliases):
+                return True
+            if isinstance(child, ast.Attribute) and child.attr in input_roots:
+                return True
+            if isinstance(child, ast.Subscript):
+                root = _name(child.value)
+                if root in input_roots or root in aliases:
+                    return True
+        return False
+
+    def _contains_required_literal(n: ast.AST) -> bool:
+        literals: list[str] = []
+        for child in ast.walk(n):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                literals.append(child.value.lower())
+        if not literals:
+            return False
+        for _kind, text, _rid in required_inputs:
+            compact = text.lower().strip()
+            if compact and any(compact in lit or lit in compact for lit in literals):
+                return True
+        return False
+
+    def _is_core_expr(n: ast.AST) -> bool:
+        call = _call_name(n)
+        if call and any(term in call for term in helper_terms):
+            return True
+        if isinstance(n, (ast.List, ast.Dict, ast.Tuple, ast.JoinedStr)):
+            return True
+        return any(isinstance(child, ast.Name) and child.id in core_names for child in ast.walk(n))
+
+    def _is_tainted(n: ast.AST) -> bool:
+        return _contains_input_read(n) or _contains_required_literal(n) or any(isinstance(child, ast.Name) and child.id in core_vars for child in ast.walk(n))
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in node.args.args:
+                if arg.arg:
+                    aliases.add(arg.arg)
+        if isinstance(node, ast.Assign):
+            if _contains_input_read(node.value):
+                has_input_read = True
+                for target in node.targets:
+                    name = _name(target)
+                    if name:
+                        aliases.add(name)
+            if _contains_required_literal(node.value):
+                has_required_key_read = True
+            if _is_core_expr(node.value) and _is_tainted(node.value):
+                has_tainted_core = True
+                for target in node.targets:
+                    name = _name(target)
+                    if name:
+                        core_vars.add(name)
+                        if _call_name(node.value):
+                            helper_result_vars.add(name)
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            if value is not None and _contains_input_read(value):
+                has_input_read = True
+                name = _name(node.target)
+                if name:
+                    aliases.add(name)
+            if value is not None and _contains_required_literal(value):
+                has_required_key_read = True
+            if value is not None and _is_core_expr(value) and _is_tainted(value):
+                has_tainted_core = True
+                name = _name(node.target)
+                if name:
+                    core_vars.add(name)
+        elif isinstance(node, ast.Call):
+            if _contains_input_read(node):
+                has_input_read = True
+            if _contains_required_literal(node):
+                has_required_key_read = True
+            call = _call_name(node)
+            if call and any(term in call for term in helper_terms) and _is_tainted(node):
+                has_tainted_core = True
+                has_core_output = True
+        elif isinstance(node, ast.Return):
+            if node.value is not None and (_is_tainted(node.value) or any(isinstance(child, ast.Name) and child.id in helper_result_vars for child in ast.walk(node.value))):
+                has_core_output = True
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = _call_name(node.value)
+            if call == "print" and (_is_tainted(node.value) or any(isinstance(child, ast.Name) and child.id in helper_result_vars for child in ast.walk(node.value))):
+                has_core_output = True
+
+    weak_evidence = has_input_read and (has_required_key_read or has_tainted_core or has_core_output)
+    if weak_evidence or (has_input_read and has_tainted_core and has_core_output):
+        return []
+
+    requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), req_items[0].id)
+    failed_file = getattr(skill_plan_entry, "path", "") or req_items[0].target_file
+    return [{
+        "id": "script_requirement_failed",
+        "requirement_id": requirement_id,
+        "failed_file": failed_file,
+        "failed_function": "current script",
+        "code_region": "run() input and product construction path",
+        "reason": "Required inputs have no conservative static evidence of participating in core product/helper/output construction.",
+        "missing_evidence": ["required input read", "required input -> blocks/sections/items/pages/document/helper/stdout path", "declared output from helper result or constructed product"],
+        "minimal_edit": "只修改当前脚本 run() 中的输入读取和产物构造逻辑。",
+        "allowed_scope": "current script only",
+    }]
 
 
 def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
@@ -2959,9 +3122,10 @@ def detect_required_constraint_application(script_content: str, requirements: li
 
 def detect_requirement_evidence_static(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
     issues=[]
+    # Keep only deterministic structural bypass checks here. Core responsibility
+    # flow is handled by _detect_script_responsibility_static_blockers so field
+    # names, variable names, and extra stdout metadata remain advisory-only.
     issues.extend(detect_error_stdout_bypass(script_content, requirements, expected_outputs))
-    issues.extend(detect_required_component_coverage(script_content, requirements))
-    issues.extend(detect_required_constraint_application(script_content, requirements))
     return issues
 
 async def _run_script_responsibility_review(
@@ -2990,6 +3154,7 @@ async def _run_script_responsibility_review(
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
     deterministic_issues = (deterministic_issues or []) + detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
+    deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
     review_context = review_context if isinstance(review_context, dict) else {}
 
     if deterministic_issues:
@@ -3155,6 +3320,15 @@ async def _run_script_responsibility_review(
         if not isinstance(data, dict) or not data:
             if review_attempt == 0:
                 continue
+            static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+            if static_blockers:
+                return {
+                    "passed": False,
+                    "issues": static_blockers,
+                    "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                    "failure_type": "script_requirement_failed",
+                    "model": "deterministic",
+                }
             return {
                 "passed": False,
                 "issues": [{
@@ -3180,7 +3354,28 @@ async def _run_script_responsibility_review(
             if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"} and review_attempt == 0:
                 continue
             if not parsed_review.get("passed"):
+                if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
+                    static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+                    if static_blockers:
+                        return {
+                            "passed": False,
+                            "issues": static_blockers,
+                            "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                            "failure_type": "script_requirement_failed",
+                            "model": "deterministic",
+                            "raw_review": parsed_review.get("raw_review"),
+                        }
                 return parsed_review
+            static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+            if static_blockers:
+                return {
+                    "passed": False,
+                    "issues": static_blockers,
+                    "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                    "failure_type": "script_requirement_failed",
+                    "model": "deterministic",
+                    "raw_review": parsed_review.get("raw_review"),
+                }
             return parsed_review
         break
 

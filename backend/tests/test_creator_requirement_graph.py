@@ -261,6 +261,88 @@ def test_persisted_requirement_graph_round_trips_to_generate_and_e2e(monkeypatch
     assert loaded_for_e2e.requirements[0].id == graph.requirements[0].id
 
 
+
+@pytest.mark.asyncio
+async def test_generate_file_validator_incomplete_uses_entry_requirements_static_fallback(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n", encoding="utf-8")
+
+    spec = _script_spec(path="scripts/main.py", inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    spec.requirements = [req]
+    entry = spec.model_dump(mode="json")
+    entry["requirements"] = [req.model_dump(mode="json")]
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "def run(payload):\n    return {'path': 'fixed.pdf'}\n"
+
+    reviews = iter([
+        {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": []},
+        {"passed": True, "issues": []},
+    ])
+
+    async def fake_responsibility_review(**_kwargs):
+        return next(reviews)
+
+    seen_static_requirements = []
+
+    def fake_static_blockers(script_content, skill_plan_entry, requirements):
+        seen_static_requirements.extend(requirements or [])
+        if requirements:
+            return [{
+                "id": "script_requirement_failed",
+                "requirement_id": req.id,
+                "failed_file": "scripts/main.py",
+                "reason": "required input is not in the constructed output",
+                "missing_evidence": ["required input -> output"],
+                "minimal_edit": "patch current script",
+                "allowed_scope": "current script only",
+            }]
+        return []
+
+    repair_modes = []
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        repair_modes.append(kwargs.get("repair_mode"))
+        return "def run(payload):\n    brief = payload.get('customer brief')\n    return {'path': brief}\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_load_persisted_requirement_graph", lambda _skill_name: None)
+    monkeypatch.setattr(api, "_detect_script_responsibility_static_blockers", fake_static_blockers)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    async def fake_generated_file_validator_round(**_kwargs):
+        return {"passed": False, "issues": []}
+
+    monkeypatch.setattr(api, "_run_generated_file_validator_round", fake_generated_file_validator_round)
+    monkeypatch.setattr(api, "_check_script_content_review_contract", lambda *args, **kwargs: [])
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate report",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=entry,
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert seen_static_requirements, body
+    assert repair_modes, body
+    assert "script_requirement_failed" in body
+    assert "script_requirement_validator_incomplete" not in body
+
 def test_validator_error_stage_checks_static_blockers_before_error(monkeypatch):
     from backend.services.creator import api
 

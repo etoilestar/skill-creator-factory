@@ -11,6 +11,7 @@ from backend.services.creator.common import (
 from backend.services.creator.repair import (
     _detect_script_responsibility_static_blockers,
     _parse_requirement_review_result,
+    _runtime_tool_contract_static_blockers,
     _run_script_responsibility_review,
     detect_error_stdout_bypass,
 )
@@ -125,7 +126,7 @@ def test_static_responsibility_blocks_required_input_not_in_core_path():
     script = "def run(payload):\n    blocks = [{'type': 'text', 'text': 'fixed'}]\n    return {'path': 'out.pdf'}\n"
     issues = _detect_script_responsibility_static_blockers(script, spec, [req])
     assert issues
-    assert issues[0]["id"] == "script_requirement_failed"
+    assert issues[0]["id"] == "semantic_responsibility_missing"
     assert issues[0]["allowed_scope"] == "current script only"
 
 
@@ -153,6 +154,56 @@ def run(payload):
     return {'artifact': result, 'metadata': {'source': 'payload'}}
 """
     assert _detect_script_responsibility_static_blockers(script, spec, [req]) == []
+
+
+def test_static_responsibility_allows_different_intermediate_representation():
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+def run(payload):
+    source = payload.get('brief_text')
+    rows = [{'kind': 'paragraph', 'value': source}]
+    assembled = {'rows': rows, 'options': {'format': 'portable'}}
+    return {'artifact': assembled, 'extra_stdout_metadata': {'ok': True}}
+"""
+    assert _detect_script_responsibility_static_blockers(script, spec, [req]) == []
+
+
+def test_runtime_tool_contract_blocks_unknown_helper():
+    spec = _script_spec(
+        selected_tools=["text_file"],
+        required_capabilities=["text_file"],
+    )
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+from backend.services.runtime_tools import missing_runtime_helper
+
+def run(payload):
+    result = missing_runtime_helper({'text': payload.get('brief_text')})
+    return {'artifact': result}
+"""
+    issues = _runtime_tool_contract_static_blockers(script, spec, [req])
+    assert issues
+    assert issues[0]["id"] == "tool_contract_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_tool_contract_mismatch_preempts_validator_and_enters_patchable_failure(monkeypatch):
+    spec = _script_spec(selected_tools=[], required_capabilities=[])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        raise AssertionError("deterministic tool contract should run before validator")
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="from backend.services.runtime_tools import missing_runtime_helper\n\ndef run(payload):\n    return missing_runtime_helper(payload)\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["failure_type"] == "script_requirement_failed"
+    assert review["issues"][0]["id"] == "tool_contract_mismatch"
 
 
 @pytest.mark.asyncio

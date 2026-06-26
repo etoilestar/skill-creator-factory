@@ -1733,6 +1733,8 @@ async def validate_skill(request: SkillActionRequest):
     max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))
     attempt = 0
     repair_logs: list[str] = []
+    repair_events: list[dict[str, Any]] = []
+    e2e_session = _create_e2e_session(skill_name, source_skill_dir=settings.skills_path / skill_name)
 
     while True:
         external_context = _external_context_from_skill_action_request(request)
@@ -1741,6 +1743,7 @@ async def validate_skill(request: SkillActionRequest):
                 skill_name,
                 external_context=external_context,
                 requested_model=request.model,
+                e2e_session=e2e_session,
             )
         except Exception as exc:
             logger.exception("validate-skill e2e validator crashed skill=%s", skill_name)
@@ -1763,6 +1766,7 @@ async def validate_skill(request: SkillActionRequest):
                 success=True,
                 path=result.get("path"),
                 message=result["message"] + "\n严格端到端工作流校验通过：SKILL.md 命令已按顺序真实执行，中间 JSON 边界已流转，最终 stdout 已对齐 sandbox 平台输出协议。" + suffix,
+                repair_events=repair_events or e2e_session.events,
             )
 
         if not request.auto_repair or attempt >= max_attempts:
@@ -1777,6 +1781,7 @@ async def validate_skill(request: SkillActionRequest):
                         if repair_logs else ""
                     )
                 ),
+                repair_events=repair_events or e2e_session.events,
             )
 
         target_path = _e2e_repair_target_from_errors(e2e_errors)
@@ -1787,6 +1792,8 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_errors=e2e_errors,
                 requested_model=request.model,
                 external_context=external_context,
+                repair_events=repair_events,
+                e2e_session=e2e_session,
             )
             attempt += 1
             repair_logs.append(
@@ -1811,6 +1818,7 @@ async def validate_skill(request: SkillActionRequest):
                         if repair_logs else ""
                     )
                 ),
+                repair_events=repair_events or e2e_session.events,
             )
 
 

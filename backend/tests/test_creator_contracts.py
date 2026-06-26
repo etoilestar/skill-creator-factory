@@ -289,3 +289,43 @@ def test_hard_format_entire_file_fenced_without_language_full_rewrite():
 def test_hard_format_local_plain_fence_is_allowed_when_closed():
     content = "---\nname: x\ndescription: y\n---\n\n# Body\n\n```\nexample\n```\n"
     assert detect_markdown_hard_format_failures("SKILL.md", content, True) == []
+
+
+def test_blueprint_review_top_level_issues_dedupes_and_ignores_reviewer_duplicates():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {"severity": "error", "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
+            {"severity": "error", "field": "file_plan", "message": "missing script path", "evidence": "scripts/a.py"},
+        ],
+        "reviewers": {"file_plan_reviewer": {"passed": False, "issues": [{"severity": "error", "field": "file_plan", "message": "duplicate nested", "evidence": "scripts/a.py"}]}},
+    }
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert "missing script path" in results[0].message
+
+
+def test_blueprint_wording_advisory_does_not_block():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {"passed": False, "issues": [{"severity": "warning", "field": "wording", "message": "not detailed enough", "evidence": "summary"}]}
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_user_key_requirement_missing_blocks():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {"passed": False, "issues": [{"severity": "error", "field": "user_requirement", "message": "page count cannot be passed to script", "evidence": "schema lacks input"}]}
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert results and results[0].layer == "skill_md_blueprint_alignment"
+
+
+def test_reviewer_json_parse_failed_is_validator_error_not_skill_repair():
+    from backend.services.creator.api import _exception_to_skill_md_failures, normalize_skill_md_failures
+    from backend.services.creator.contracts import CreatorValidatorReviewError
+
+    failures = _exception_to_skill_md_failures(CreatorValidatorReviewError("bad json", raw_excerpt="oops"), source="blueprint_alignment")
+    assert failures[0]["layer"] == "validator_error"
+    assert normalize_skill_md_failures(failures) == []

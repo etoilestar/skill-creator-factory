@@ -333,3 +333,55 @@ def test_nonstandard_shell_text_with_backslashes_is_not_rejected_by_argv_guard()
         scope=CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md"),
     )
     assert "Updated text." in candidate
+
+
+def test_markdown_structured_match_handles_minor_old_text_changes():
+    original = "# Skill\n\nUse `scripts/run.py` to read input, validate payload, and write the final report.\n"
+    old = "Use `scripts/run.py` to read inputs, validate payload, and write final report."
+    candidate, stats = _apply_exact_replace_patch(
+        original_content=original,
+        proposal=_proposal(old=old, new="Use `scripts/run.py` to read input and write the final artifact."),
+        expected_target_file="SKILL.md",
+    )
+    assert "final artifact" in candidate
+    assert stats["applied"][0]["fallback_type"] == "approximate_substring"
+
+
+def test_markdown_fuzzy_rejects_command_block_changes():
+    original = "# Skill\n\n```bash\npython scripts/run.py '{\"topic\":\"{{topic}}\"}'\n```\n"
+    old = "python scripts/run.py '{\"topics\":\"{{topic}}\"}'"
+    with pytest.raises(ValueError, match="命令块内部|command block"):
+        _apply_exact_replace_patch(
+            original_content=original,
+            proposal=_proposal(old=old, new="python scripts/run.py '{\"topic\":\"{{topic}}\",\"count\":3}'"),
+            expected_target_file="SKILL.md",
+        )
+
+
+def test_append_after_uses_markdown_line_boundary_without_gluing():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[{"target_file": "SKILL.md", "repair_ops": [{"op": "append_after", "anchor": "- item", "text": "- next"}]}],
+        current_content="# Skill\n\n- item\n",
+        scope=scope,
+    )
+    assert result is not None
+    _proposal, candidate, _stats = result
+    assert "- item\n- next\n" in candidate
+    assert "- item- next" not in candidate
+
+
+def test_multiple_repair_ops_are_batched():
+    scope = CreatorRepairScope(phase="test", repair_type="test", target_file="SKILL.md")
+    result = _apply_deterministic_micro_patch_if_safe(
+        failures=[
+            {"target_file": "SKILL.md", "repair_ops": [{"op": "replace", "anchor": "old one", "replacement": "new one"}]},
+            {"target_file": "SKILL.md", "repair_ops": [{"op": "replace", "anchor": "old two", "replacement": "new two"}]},
+        ],
+        current_content="# Skill\n\nold one\nold two\n",
+        scope=scope,
+    )
+    assert result is not None
+    _proposal, candidate, stats = result
+    assert "new one" in candidate and "new two" in candidate
+    assert stats["repair_ops"]["applied"] == 2

@@ -24,6 +24,14 @@ class ContractValidationError(ValueError):
         self.results = results
 
 
+class CreatorValidatorReviewError(ValueError):
+    """Validator/model-review infrastructure failed; do not repair SKILL.md content."""
+
+    def __init__(self, message: str, *, raw_excerpt: str = "") -> None:
+        super().__init__(message)
+        self.raw_excerpt = str(raw_excerpt or "")[:1000]
+
+
 def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
     """Compatibility shim: Creator no longer guesses business argv keys.
 
@@ -1016,31 +1024,28 @@ async def _review_skill_md_blueprint_intent_with_model(
         "审查目标：判断当前 SKILL.md 是否完成蓝图要求的 Skill 使用说明责任。\n"
         "这属于第一轮单文件责任审查，不判断脚本实际运行、不判断 stdout 字段闭环、不判断最终 E2E。\n\n"
 
-        "必须硬性审查：\n"
-        "1. SKILL.md 是否覆盖蓝图真实业务意图、触发方式、输入来源、输出/最终产物。\n"
-        "2. SKILL.md 是否覆盖真实规划的 scripts/references/assets。\n"
-        "3. 如蓝图规划了 scripts/**，SKILL.md 是否说明脚本执行顺序和每步用途。\n"
-        "4. 如蓝图规划了 references/**，SKILL.md 是否说明运行时如何读取/参考这些资料，而不是全文复制 reference。\n"
-        "5. 如蓝图规划了 assets/**，SKILL.md 是否把它们描述为用户上传/静态资源，而不是模型生成素材。\n"
-        "6. SKILL.md 是否引入了蓝图外的脚本、资源、能力、外部 API、伪 key、伪数据库或 Creator UI 流程。\n"
-        "7. SKILL.md 是否把示例/反例路径误当成真实文件，或者漏掉目录结构/SkillPlan 中的真实文件。\n\n"
+        "Blocking 审查范围（只在影响执行闭环时 severity=error）：\n"
+        "1. 真实文件路径、资源角色、脚本执行顺序、平台输入输出、最终产物契约缺失或冲突。\n"
+        "2. 蓝图/用户需求中用户可控的关键要求（数量、长度、页数、段落、风格、结构、格式、命名、输出组成等）缺失、模糊，或无法从 SKILL.md 传递到脚本输入/最终产物。\n"
+        "3. references/** 被当成执行步骤、可修改文件、artifact、asset；assets/** 在蓝图要求上传或存在真实素材时角色描述错误。\n"
+        "4. 引入蓝图外会改变执行/产物契约的脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程。\n\n"
 
-        "边界：\n"
+        "Advisory 边界（只能 warning，不阻塞 finalize）：\n"
+        "- 文案没有逐字复述蓝图、表达不够详细、缺少固定话术、缺少 role 标签、章节模板不一致。\n"
         "- 不判断 bash 命令语法是否完全可执行；后台 parser 会检查。\n"
         "- 不判断 argv/stdout 字段是否上下游闭环；第二轮 E2E 会检查。\n"
-        "- 不要求固定字段名。\n"
-        "- 不要求固定 SKILL.md 模板。\n"
-        "- 不允许把蓝图不一致降级为 warning；只要需要修改 SKILL.md 才能对齐蓝图，就必须 severity=error 且 passed=false。\n"
-        "- warning 只能用于不需要修改也不影响蓝图责任完成的提示。\n\n"
+        "- 不要求固定字段名或固定 SKILL.md 模板。\n"
+        "- 空 assets 或蓝图未要求上传素材时，不要求写固定 assets 话术。\n\n"
         "结构化 issue 字段规范：\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
         "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
         "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
-        "真实文件判断原则：\n"
+        "真实文件和资源角色判断原则：\n"
         "- 出现在目录结构、SkillPlan path、dependencies、reference_files、asset_source 中的路径是真实文件。\n"
         "- 出现在“例如/示例/反例/不要这样写/禁止”等语境中的路径不是实际文件，除非也出现在目录结构或 SkillPlan path 中。\n"
-        "- assets/** 如果 asset_source=user_upload，应描述为上传素材，不应要求模型生成。\n\n"
+        "- reference 是只读参考资源：可被参考，但不能作为执行步骤、不能修改、不能作为 artifact、不能作为 asset。\n"
+        "- assets 只有在蓝图要求上传或存在实际 asset 时才严格校验，空 assets 不触发固定话术要求。\n\n"
 
         "返回格式必须是：\n"
         "{\n"
@@ -1103,22 +1108,10 @@ async def _review_skill_md_blueprint_intent_with_model(
 
     data = _json_loads_loose_object(raw)
     if not isinstance(data, dict) or not data:
-        return {
-            "passed": False,
-            "required_script_paths": [],
-            "required_reference_paths": [],
-            "required_asset_paths": [],
-            "reviewers": {},
-            "issues": [{
-                "severity": "error",
-                "field": "validator",
-                "message": "蓝图一致性审查模型未返回有效 JSON object。",
-                "evidence": str(raw or "")[:1000],
-                "expected": "返回 passed/required_*_paths/reviewers/issues/repair_suggestions。",
-                "minimal_edit": "重新审查 SKILL.md，并按蓝图真实意图局部修复。",
-            }],
-            "repair_suggestions": "审查模型输出无效；不能放行 SKILL.md，请重新进行局部返修。",
-        }
+        raise CreatorValidatorReviewError(
+            "蓝图一致性审查模型未返回有效 JSON object；这是 validator failure，不应进入 SKILL.md 内容返修。",
+            raw_excerpt=str(raw or "")[:1000],
+        )
 
     data.setdefault("passed", False)
     data.setdefault("required_script_paths", [])
@@ -1139,37 +1132,38 @@ async def _review_skill_md_blueprint_intent_with_model(
     if not isinstance(data["issues"], list):
         data["issues"] = []
 
-    reviewer_issues: list[dict[str, Any]] = []
-    for reviewer_name, reviewer_result in data["reviewers"].items():
-        if not isinstance(reviewer_result, dict):
-            continue
+    if not data["issues"]:
+        reviewer_issues: list[dict[str, Any]] = []
+        for reviewer_name, reviewer_result in data["reviewers"].items():
+            if not isinstance(reviewer_result, dict):
+                continue
+            if reviewer_result.get("passed") is False:
+                for issue in reviewer_result.get("issues") or []:
+                    if isinstance(issue, dict):
+                        reviewer_issues.append({
+                            "severity": issue.get("severity", "error"),
+                            "field": issue.get("field", reviewer_name),
+                            "message": issue.get("message", f"{reviewer_name} 审查未通过。"),
+                            "evidence": issue.get("evidence", ""),
+                            "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
+                            "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
+                            "resource_role": issue.get("resource_role"),
+                            "claim_type": issue.get("claim_type"),
+                            "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
+                        })
+                    else:
+                        reviewer_issues.append({
+                            "severity": "error",
+                            "field": reviewer_name,
+                            "message": str(issue),
+                            "evidence": str(issue),
+                            "expected": "该审查角度应与蓝图一致。",
+                            "minimal_edit": "只修改 SKILL.md 中相关区域。",
+                        })
+        data["issues"] = reviewer_issues
 
-        if reviewer_result.get("passed") is False:
-            for issue in reviewer_result.get("issues") or []:
-                if isinstance(issue, dict):
-                    reviewer_issues.append({
-                        "severity": issue.get("severity", "error"),
-                        "field": issue.get("field", reviewer_name),
-                        "message": issue.get("message", f"{reviewer_name} 审查未通过。"),
-                        "evidence": issue.get("evidence", ""),
-                        "expected": issue.get("expected", "该审查角度应与蓝图一致。"),
-                        "minimal_edit": issue.get("minimal_edit", "只修改 SKILL.md 中相关区域。"),
-                        "resource_role": issue.get("resource_role"),
-                        "claim_type": issue.get("claim_type"),
-                        "repair_ops": issue.get("repair_ops") if isinstance(issue.get("repair_ops"), list) else [],
-                    })
-                else:
-                    reviewer_issues.append({
-                        "severity": "error",
-                        "field": reviewer_name,
-                        "message": str(issue),
-                        "evidence": str(issue),
-                        "expected": "该审查角度应与蓝图一致。",
-                        "minimal_edit": "只修改 SKILL.md 中相关区域。",
-                    })
-
-    if reviewer_issues:
-        data["issues"].extend(reviewer_issues)
+    data["issues"] = _dedupe_review_issues(data["issues"])
+    if any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
         data["passed"] = False
 
     # 如果顶层 passed=false 但没有 issues，补一个可返修错误，避免只报空失败。
@@ -1230,7 +1224,7 @@ def _skill_md_blueprint_review_to_contract_results(
         issues.extend(raw_issues)
 
     reviewers = review.get("reviewers")
-    if isinstance(reviewers, dict):
+    if not issues and isinstance(reviewers, dict):
         for reviewer_name, reviewer_result in reviewers.items():
             if not isinstance(reviewer_result, dict):
                 continue
@@ -1259,6 +1253,7 @@ def _skill_md_blueprint_review_to_contract_results(
             "minimal_edit": "只修改 SKILL.md 中缺失或偏离蓝图的区域。",
         })
 
+    issues = _dedupe_review_issues(issues)
     results: list[ContractCheckResult] = []
     for idx, issue in enumerate(issues, start=1):
         if not isinstance(issue, dict):
@@ -1271,9 +1266,7 @@ def _skill_md_blueprint_review_to_contract_results(
 
         severity = str(issue.get("severity") or "error").strip().lower()
 
-        # 真正需要修改才能对齐蓝图的问题不能 warning-only 放行；
-        # 但纯 info/note 仍不作为硬失败。
-        if severity in {"info", "note", "advisory"}:
+        if not _review_issue_is_blocking(issue):
             continue
 
         field_name = str(issue.get("field") or "blueprint_alignment").strip() or "blueprint_alignment"
@@ -1316,6 +1309,56 @@ def _skill_md_blueprint_review_to_contract_results(
         ))
 
     return results
+
+
+def _dedupe_review_issues(issues: Any) -> list[dict[str, Any]]:
+    if not isinstance(issues, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for raw in issues:
+        issue = raw if isinstance(raw, dict) else {"message": str(raw), "evidence": str(raw)}
+        key = (
+            str(issue.get("severity") or "").lower(),
+            str(issue.get("field") or ""),
+            re.sub(r"\s+", " ", str(issue.get("message") or "")).strip().lower(),
+            re.sub(r"\s+", " ", str(issue.get("evidence") or "")).strip().lower()[:240],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(issue))
+    return out
+
+
+def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
+    """Classify semantic blueprint issues without hard-coded business cases.
+
+    Blocking is reserved for executable closure and user-controlled contract
+    delivery: paths/resources, platform I/O, final artifact/output contract, or
+    explicit critical requirements carried by blueprint/file plan/schema/script
+    contracts. Style/detail/role-label/verbatim-alignment gaps remain advisory.
+    """
+    severity = str(issue.get("severity") or "error").strip().lower()
+    if severity in {"warning", "info", "note", "advisory"}:
+        return False
+    if severity in {"blocking", "blocker"}:
+        return True
+
+    field = str(issue.get("field") or "").lower()
+    issue_json = json.dumps(issue, ensure_ascii=False, sort_keys=True).lower()
+    structured_signals = {
+        "file_plan", "workflow", "resources", "platform_io", "artifact", "final_output",
+        "script_input", "script_output", "schema", "contract", "user_requirement",
+        "critical_requirement", "inputs", "outputs",
+    }
+    advisory_signals = {
+        "wording", "copy", "verbatim", "role_label", "role tag", "detail", "style_only",
+        "fixed_phrase", "template",
+    }
+    has_structured_signal = any(signal in field or signal in issue_json for signal in structured_signals)
+    has_advisory_signal = any(signal in field or signal in issue_json for signal in advisory_signals)
+    return has_structured_signal or not has_advisory_signal
 
 def _format_skill_md_intent_review_failure(review: dict[str, Any]) -> str:
     """Format model review failure for UI/repair prompt.
@@ -1477,28 +1520,23 @@ async def _validate_skill_md_blueprint_alignment(
     if review.get("passed") is not True:
         results = _skill_md_blueprint_review_to_contract_results(review)
         if not results:
-            results = [ContractCheckResult(
-                id="skill_md.blueprint_alignment.failed",
-                passed=False,
-                target="SKILL.md:blueprint_alignment",
-                message=_format_skill_md_intent_review_failure(review),
-                expected="SKILL.md 必须覆盖蓝图真实业务意图、文件计划、资源说明、workflow 和最终产物。",
-                minimal_edit="只修改 SKILL.md 中缺失、偏离或误引入蓝图外内容的区域。",
-                details={"review": review},
-                layer="skill_md_blueprint_alignment",
-            )]
+            review["passed"] = True
+            review["advisory_only"] = True
+        else:
+            message = (
+                "SKILL.md 与蓝图不一致，不能 warning-only 放行。\n"
+                "该失败会进入当前文件局部返修；不要整文件重写，不要修改 scripts/references/assets。\n"
+                + _format_skill_md_intent_review_failure(review)
+            )
+            logger.info(
+                "[Creator][skill_md] blueprint alignment failed skill=%s failures=\n%s",
+                skill_name,
+                message,
+            )
+            raise ContractValidationError(message, results)
 
-        message = (
-            "SKILL.md 与蓝图不一致，不能 warning-only 放行。\n"
-            "该失败会进入当前文件局部返修；不要整文件重写，不要修改 scripts/references/assets。\n"
-            + _format_skill_md_intent_review_failure(review)
-        )
-        logger.info(
-            "[Creator][skill_md] blueprint alignment failed skill=%s failures=\n%s",
-            skill_name,
-            message,
-        )
-        raise ContractValidationError(message, results)
+    if review.get("passed") is not True:
+        review["passed"] = True
 
     required_script_paths = list(review.get("required_script_paths") or [])
     if not required_script_paths:

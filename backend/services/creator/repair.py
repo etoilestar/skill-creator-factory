@@ -463,6 +463,79 @@ def _is_approximate_replace_allowed(target_file: str) -> bool:
     return path.endswith((".md", ".markdown", ".txt", ".text", ".rst", ".yaml", ".yml", ".json"))
 
 
+def _is_markdown_file(target_file: str) -> bool:
+    path = _strip_diff_path_prefix(target_file).lower()
+    return path == "skill.md" or path.startswith("references/") or path.endswith((".md", ".markdown"))
+
+
+def _markdown_fence_ranges(content: str) -> list[tuple[int, int, str]]:
+    """Return fenced code block char ranges with info string."""
+    ranges: list[tuple[int, int, str]] = []
+    offset = 0
+    open_start: int | None = None
+    open_info = ""
+    for raw_line in (content or "").splitlines(keepends=True):
+        line_start = offset
+        stripped = raw_line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if open_start is None:
+                open_start = line_start
+                open_info = stripped[3:].strip().lower()
+            elif stripped.startswith(marker):
+                ranges.append((open_start, line_start + len(raw_line), open_info))
+                open_start = None
+                open_info = ""
+        offset += len(raw_line)
+    if open_start is not None:
+        ranges.append((open_start, len(content or ""), open_info))
+    return ranges
+
+
+def _span_inside_command_fence(content: str, start: int, end: int) -> bool:
+    for fence_start, fence_end, info in _markdown_fence_ranges(content):
+        if start >= fence_start and end <= fence_end and _is_shell_fence_info(info):
+            return True
+    return False
+
+
+def _span_crosses_markdown_boundary(content: str, start: int, end: int) -> bool:
+    """Reject fuzzy matches that cross headings or fenced-block boundaries."""
+    snippet = content[start:end]
+    if re.search(r"(?m)^#{1,6}\s+", snippet):
+        return True
+    crossings = 0
+    for fence_start, fence_end, _info in _markdown_fence_ranges(content):
+        if start < fence_start < end or start < fence_end < end:
+            crossings += 1
+    return crossings > 0
+
+
+def _line_boundary_span(content: str, start: int, end: int) -> tuple[int, int]:
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    else:
+        line_end += 1
+    return line_start, line_end
+
+
+def _ensure_block_text(text: str, *, before: bool = False) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    if before:
+        if not value.endswith("\n"):
+            value += "\n"
+    else:
+        if not value.startswith("\n"):
+            value = "\n" + value
+        if not value.endswith("\n"):
+            value += "\n"
+    return value
+
+
 def _extract_approximate_anchors(query: str) -> list[str]:
     patterns = [
         r"(?:[\w.-]+/)+[\w.-]+",
@@ -623,15 +696,17 @@ def _build_deterministic_patch_from_failure(
         if located is None:
             continue
         start, end, _kind = located
+        if _is_markdown_file(target_file) and op in {"append_after", "append_before"}:
+            start, end = _line_boundary_span(current_content, start, end)
         old = current_content[start:end]
         if op == "replace":
             new = repair_op.get("replacement") if "replacement" in repair_op else repair_op.get("new")
         elif op == "delete":
             new = ""
         elif op == "append_after":
-            new = old + str(repair_op.get("text") or "")
+            new = old.rstrip("\n") + _ensure_block_text(str(repair_op.get("text") or "")) if _is_markdown_file(target_file) else old + str(repair_op.get("text") or "")
         else:
-            new = str(repair_op.get("text") or "") + old
+            new = _ensure_block_text(str(repair_op.get("text") or ""), before=True) + old.lstrip("\n") if _is_markdown_file(target_file) else str(repair_op.get("text") or "") + old
         if isinstance(new, str) and old != new:
             edits.append({"old": old, "new": new})
     if not edits:
@@ -651,6 +726,9 @@ def _apply_deterministic_micro_patch_if_safe(
     current_content: str,
     scope: CreatorRepairScope,
 ) -> tuple[CreatorDiffProposal, str, dict[str, Any]] | None:
+    all_edits: list[dict[str, str]] = []
+    skipped: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
     for failure in failures or []:
         proposal = _build_deterministic_patch_from_failure(
             failure=failure,
@@ -658,15 +736,39 @@ def _apply_deterministic_micro_patch_if_safe(
             target_file=scope.target_file,
         )
         if proposal is None:
+            unresolved.append({"target": failure.get("target") or failure.get("target_file"), "reason": "no_applicable_repair_ops"})
             continue
-        candidate, stats = _validate_repair_diff_scope(
-            proposal=proposal,
-            current_content=current_content,
-            scope=scope,
-        )
-        stats["mode"] = "deterministic_micro_patch"
-        return proposal, candidate, stats
-    return None
+        for edit in proposal.edits:
+            if edit in all_edits:
+                skipped.append({"reason": "duplicate", "old_chars": len(edit.get("old", ""))})
+                continue
+            if edit.get("old") == edit.get("new"):
+                skipped.append({"reason": "noop", "old_chars": len(edit.get("old", ""))})
+                continue
+            all_edits.append(edit)
+    if not all_edits:
+        return None
+    batched = CreatorDiffProposal(
+        target_file=scope.target_file,
+        reason="batched deterministic micro patches from structured failure repair_ops",
+        edits=all_edits,
+        raw={"target_file": scope.target_file, "edits": all_edits},
+        mode="exact_replace",
+    )
+    candidate, stats = _validate_repair_diff_scope(
+        proposal=batched,
+        current_content=current_content,
+        scope=scope,
+    )
+    stats["mode"] = "deterministic_micro_patch"
+    stats["repair_ops"] = {
+        "applied": len(stats.get("applied") or []),
+        "unresolved": len(unresolved),
+        "skipped": len(skipped) + int(stats.get("skipped_noop_count") or 0),
+        "unresolved_items": unresolved[:20],
+        "skipped_items": skipped[:20],
+    }
+    return batched, candidate, stats
 
 
 def _apply_exact_replace_patch(
@@ -738,6 +840,11 @@ def _apply_exact_replace_patch(
                 fallback_type = "normalized_exact"
                 similarity = 1.0
                 matched_excerpt = _excerpt(candidate, replace_start, replace_end)
+                if _is_markdown_file(expected_target_file) and _span_inside_command_fence(candidate, replace_start, replace_end):
+                    raise ValueError(
+                        f"edits[{index}].old 只在 Markdown shell command block 内通过宽松匹配命中；"
+                        "命令块内部不允许 fuzzy/normalized 自动修改，请逐字提供 old。"
+                    )
             elif _is_approximate_replace_allowed(expected_target_file):
                 approx = _find_approximate_substring_span(candidate, old)
                 if not approx.get("accepted"):
@@ -757,6 +864,14 @@ def _apply_exact_replace_patch(
                 fallback_type = "approximate_substring"
                 similarity = float(approx["similarity"])
                 matched_excerpt = str(approx.get("matched_excerpt") or "")
+                if _is_markdown_file(expected_target_file) and (
+                    _span_inside_command_fence(candidate, replace_start, replace_end)
+                    or _span_crosses_markdown_boundary(candidate, replace_start, replace_end)
+                ):
+                    raise ValueError(
+                        f"edits[{index}].old 的 Markdown 宽松匹配命中命令块内部或跨结构边界；"
+                        "已拒绝自动替换，请提供不跨 section/fence 的唯一 old。"
+                    )
             else:
                 raise ValueError(
                     f"edits[{index}].old 在当前文件中没有匹配。"

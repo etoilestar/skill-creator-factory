@@ -996,7 +996,7 @@ def _split_skill_md_finalize_failures(
     for failure in failures:
         if _is_skill_md_finalize_format_rewrite_failure(failure):
             format_rewrite.append(failure)
-        elif _is_skill_md_finalize_content_patch_failure(failure):
+        elif classify_skill_md_failure_severity(failure) == "hard":
             patchable.append(failure)
         else:
             deferred.append(failure)
@@ -1277,6 +1277,16 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "last_output_excerpt": parse_exc.last_output_excerpt,
                     "diff_extraction_attempted": parse_exc.diff_extraction_attempted,
                     "old_lines_new_lines_fallback_attempted": parse_exc.lines_fallback_attempted,
+                })
+                failures = failures or patchable_failures
+                break
+            except Exception as repair_exc:
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "patch_failed",
+                    "error": f"{type(repair_exc).__name__}: {repair_exc}",
+                    "failures": patchable_failures,
                 })
                 failures = failures or patchable_failures
                 break

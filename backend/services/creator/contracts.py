@@ -87,7 +87,7 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         arg0 = args[0].strip()
         if arg0.startswith("{") and arg0.endswith("}"):
             try:
-                parsed = json.loads(arg0)
+                parsed = _loads_templated_json_argv_object(arg0)
                 if isinstance(parsed, dict):
                     json_payload = parsed
                     arg_mode = "json_arg"
@@ -124,6 +124,59 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         "keys": keys,
         "placeholders": placeholders,
     }
+
+
+_UNQUOTED_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}")
+
+
+def _replace_unquoted_json_template_placeholders(text: str) -> str:
+    """Replace unquoted {{placeholder}} JSON-template values with null.
+
+    Quoted placeholders are ordinary JSON strings and are preserved.
+    """
+    source = str(text or "")
+    result: list[str] = []
+    idx = 0
+    in_string = False
+    escape = False
+
+    while idx < len(source):
+        ch = source[idx]
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            idx += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            idx += 1
+            continue
+
+        if source.startswith("{{", idx):
+            end = source.find("}}", idx + 2)
+            if end >= 0:
+                token = source[idx:end + 2]
+                if _UNQUOTED_TEMPLATE_PLACEHOLDER_RE.fullmatch(token):
+                    result.append("null")
+                    idx = end + 2
+                    continue
+
+        result.append(ch)
+        idx += 1
+
+    return "".join(result)
+
+
+def _loads_templated_json_argv_object(text: str) -> Any:
+    """Load a JSON argv template, allowing unquoted placeholders as values."""
+    return json.loads(_replace_unquoted_json_template_placeholders(text))
 
 
 def _command_template_equivalent(command: str, script_path: str, entry: SkillPlanEntry) -> bool:

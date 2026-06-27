@@ -457,10 +457,14 @@ def _find_unique_normalized_span(content: str, old: str) -> tuple[int, int] | No
 
 
 def _is_approximate_replace_allowed(target_file: str) -> bool:
-    path = _strip_diff_path_prefix(target_file).lower()
-    if path.startswith("scripts/") and path.endswith(".py"):
-        return False
-    return path.endswith((".md", ".markdown", ".txt", ".text", ".rst", ".yaml", ".yml", ".json"))
+    """Return whether approximate replacement may be attempted for a decoded text target.
+
+    Patch safety is intentionally independent of file extension.  Callers have
+    already constrained the repair to one target_file and supplied decoded text;
+    uniqueness, similarity, scope limits, real-diff checks, and post-apply
+    validators provide the safety boundary.
+    """
+    return bool(_strip_diff_path_prefix(target_file))
 
 
 def _is_markdown_file(target_file: str) -> bool:
@@ -469,7 +473,11 @@ def _is_markdown_file(target_file: str) -> bool:
 
 
 def _markdown_fence_ranges(content: str) -> list[tuple[int, int, str]]:
-    """Return fenced code block char ranges with info string."""
+    """Return fenced code block char ranges with info string.
+
+    Kept for Markdown-specific validators/diagnostics.  Fuzzy patch permission
+    must not depend on these ranges or on any extension allow/deny list.
+    """
     ranges: list[tuple[int, int, str]] = []
     offset = 0
     open_start: int | None = None
@@ -500,7 +508,7 @@ def _span_inside_command_fence(content: str, start: int, end: int) -> bool:
 
 
 def _span_crosses_markdown_boundary(content: str, start: int, end: int) -> bool:
-    """Reject fuzzy matches that cross headings or fenced-block boundaries."""
+    """Diagnostic helper retained for optional Markdown validators only."""
     snippet = content[start:end]
     if re.search(r"(?m)^#{1,6}\s+", snippet):
         return True
@@ -537,14 +545,8 @@ def _ensure_block_text(text: str, *, before: bool = False) -> str:
 
 
 def _patch_match_policy_for_file(target_file: str, old: str) -> str:
-    path = _strip_diff_path_prefix(target_file).lower()
-    if path.startswith("scripts/") or path.endswith((".py", ".js", ".ts", ".sh", ".bash")):
-        return "code_strict"
-    if _is_markdown_file(path):
-        return "markdown_structured"
-    if path.endswith((".json", ".yaml", ".yml", ".toml", ".ini")):
-        return "config_normalized"
-    return "text_normalized"
+    """Compatibility label for stats; not a permission policy."""
+    return "generic_text"
 
 
 def _resolve_patch_span(
@@ -554,7 +556,13 @@ def _resolve_patch_span(
     target_file: str,
     edit_index: int,
 ) -> dict[str, Any]:
-    """Resolve old text to one safe replacement span according to file policy."""
+    """Resolve old text to one safe replacement span using generic text matching.
+
+    All decoded target_file text follows the same sequence: exact, normalized,
+    approximate/fuzzy, then whole-file fallback when the proposal clearly
+    describes the full current file.  Extension-specific allow/deny lists are
+    deliberately not used here.
+    """
     count = content.count(old)
     if count == 1:
         start = content.find(old)
@@ -564,7 +572,7 @@ def _resolve_patch_span(
             "fallback_type": "exact",
             "similarity": None,
             "matched_excerpt": old,
-            "policy": "exact",
+            "policy": "generic_text",
         }
     if count > 1:
         raise ValueError(
@@ -572,67 +580,58 @@ def _resolve_patch_span(
             "请提供更长 old 片段，保证唯一匹配。"
         )
 
-    policy = _patch_match_policy_for_file(target_file, old)
-    if policy == "code_strict":
-        raise ValueError(
-            f"edits[{edit_index}].old 在当前文件中没有匹配。"
-            "代码文件只允许 exact 替换；请从当前文件逐字复制更准确的 old 片段。"
-        )
-
     normalized_span = _find_unique_normalized_span(content, old)
     if normalized_span is not None:
         start, end = normalized_span
-        if policy == "markdown_structured" and _span_inside_command_fence(content, start, end):
-            raise ValueError(
-                f"edits[{edit_index}].old 只在 Markdown shell command block 内通过宽松匹配命中；"
-                "命令块内部不允许 fuzzy/normalized 自动修改，请逐字提供 old。"
-            )
         return {
             "start": start,
             "end": end,
             "fallback_type": "normalized_exact",
             "similarity": 1.0,
             "matched_excerpt": _excerpt(content, start, end),
-            "policy": policy,
+            "policy": "generic_text",
         }
 
-    if policy != "markdown_structured":
-        raise ValueError(
-            f"edits[{edit_index}].old 在当前文件中没有 exact/normalized 匹配。"
-            "当前文件策略不启用 approximate substring 自动替换。"
-        )
-
     approx = _find_approximate_substring_span(content, old)
-    if not approx.get("accepted"):
-        raise ValueError(
-            f"edits[{edit_index}].old 在当前文件中没有 exact/normalized 匹配，"
-            "Markdown structured approximate 置信度不足，已拒绝自动替换。"
-            f"reason={approx.get('reason')}; "
-            f"similarity={float(approx.get('similarity') or 0):.3f}; "
-            f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
-            "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
-            "```text\n"
-            f"{approx.get('matched_excerpt') or ''}\n"
-            "```"
-        )
-    start = int(approx["start"])
-    end = int(approx["end"])
-    if (
-        _span_inside_command_fence(content, start, end)
-        or _span_crosses_markdown_boundary(content, start, end)
-    ):
-        raise ValueError(
-            f"edits[{edit_index}].old 的 Markdown structured 匹配命中命令块内部或跨结构边界；"
-            "已拒绝自动替换，请提供不跨 section/fence 的唯一 old。"
-        )
-    return {
-        "start": start,
-        "end": end,
-        "fallback_type": "markdown_structured",
-        "similarity": float(approx["similarity"]),
-        "matched_excerpt": str(approx.get("matched_excerpt") or ""),
-        "policy": policy,
-    }
+    if approx.get("accepted"):
+        return {
+            "start": int(approx["start"]),
+            "end": int(approx["end"]),
+            "fallback_type": "fuzzy_window",
+            "similarity": float(approx["similarity"]),
+            "matched_excerpt": str(approx.get("matched_excerpt") or ""),
+            "policy": "generic_text",
+            "second_similarity": float(approx.get("second_similarity") or 0),
+        }
+
+    full_similarity = difflib.SequenceMatcher(
+        None,
+        _normalize_text_with_spans(old)[0],
+        _normalize_text_with_spans(content)[0],
+        autojunk=False,
+    ).ratio()
+    if full_similarity >= 0.92:
+        return {
+            "start": 0,
+            "end": len(content),
+            "fallback_type": "full_file_fallback",
+            "similarity": full_similarity,
+            "matched_excerpt": _excerpt(content, 0, len(content)),
+            "policy": "generic_text",
+        }
+
+    raise ValueError(
+        f"edits[{edit_index}].old 在当前文件中没有 exact/normalized/fuzzy 唯一可靠匹配。"
+        f"reason={approx.get('reason')}; "
+        f"similarity={float(approx.get('similarity') or 0):.3f}; "
+        f"second_similarity={float(approx.get('second_similarity') or 0):.3f}; "
+        f"full_file_similarity={full_similarity:.3f}; "
+        "请提供更长唯一 old，或提交与当前全文高度一致的 full-file fallback。\n"
+        "最相近候选原文片段如下，可在下一轮直接复制为 old：\n"
+        "```text\n"
+        f"{approx.get('matched_excerpt') or ''}\n"
+        "```"
+    )
 
 
 def _extract_approximate_anchors(query: str) -> list[str]:
@@ -1256,26 +1255,58 @@ def _validate_repair_diff_scope(
             f"{changed_line_count} > {scope.max_changed_lines}"
         )
 
-    if not scope.allow_format_repair and (
-        scope.target_file == "SKILL.md"
-        or scope.target_file.startswith("references/")
-        or Path(scope.target_file).suffix.lower() in {".md", ".markdown"}
-    ):
-        from .contracts import validate_no_hard_format_regression
-
-        validate_no_hard_format_regression(
-            scope.target_file,
-            current_content,
-            candidate,
-            require_frontmatter=(scope.target_file == "SKILL.md"),
-        )
-        if scope.target_file == "SKILL.md" and _skill_md_has_backslash_escaped_json_argv(candidate):
-            raise ValueError(
-                "localized patch introduced backslash-escaped shell JSON argv inside a bash fenced block; "
-                "合法 shell JSON argv 不允许被改写成带反斜杠的 argv。"
-            )
+    stats["post_apply_validators"] = _run_registered_repair_text_validators(
+        target_file=scope.target_file,
+        before=current_content,
+        after=candidate,
+        scope=scope,
+    )
 
     return candidate, stats
+
+
+def _run_registered_repair_text_validators(
+    *,
+    target_file: str,
+    before: str,
+    after: str,
+    scope: CreatorRepairScope,
+) -> list[str]:
+    """Run optional registered post-apply text validators for repair patches.
+
+    Missing specialized validators are not a rejection condition.  Generic patch
+    safety remains target_file equality, unique matching, similarity/margin,
+    changed-line scope, and real diff; smoke/sandbox/E2E continue after this.
+    """
+    ran: list[str] = []
+    if scope.allow_format_repair:
+        return ran
+
+    validators: list[tuple[str, Callable[[], bool], Callable[[], None]]] = [
+        (
+            "hard_format_regression",
+            lambda: target_file == "SKILL.md" or target_file.startswith("references/") or _is_markdown_file(target_file),
+            lambda: __import__("backend.services.creator.contracts", fromlist=["validate_no_hard_format_regression"]).validate_no_hard_format_regression(
+                target_file,
+                before,
+                after,
+                require_frontmatter=(target_file == "SKILL.md"),
+            ),
+        ),
+        (
+            "skill_md_shell_json_argv",
+            lambda: target_file == "SKILL.md",
+            lambda: (_ for _ in ()).throw(ValueError(
+                "localized patch introduced backslash-escaped shell JSON argv inside a bash fenced block; "
+                "合法 shell JSON argv 不允许被改写成带反斜杠的 argv。"
+            )) if _skill_md_has_backslash_escaped_json_argv(after) else None,
+        ),
+    ]
+    for name, applies, validate in validators:
+        if applies():
+            validate()
+            ran.append(name)
+    return ran
 
 
 def _skill_md_has_backslash_escaped_json_argv(content: str) -> bool:

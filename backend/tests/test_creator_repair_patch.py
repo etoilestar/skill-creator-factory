@@ -53,7 +53,7 @@ def test_approximate_substring_fallback_succeeds_for_unique_high_similarity_span
     )
 
     assert "validate input and write a final report" in candidate
-    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
+    assert stats["applied"][0]["fallback_type"] == "fuzzy_window"
     assert stats["applied"][0]["similarity"] >= 0.88
     assert "original_model_old_excerpt" in stats["applied"][0]
 
@@ -65,7 +65,7 @@ def test_approximate_substring_rejects_multiple_high_similarity_candidates():
     )
     old = "use the parser to validate payload and write final report"
 
-    with pytest.raises(ValueError, match="Markdown structured approximate .*拒绝"):
+    with pytest.raises(ValueError, match="没有 exact/normalized/fuzzy 唯一可靠匹配|second_best_margin"):
         _apply_exact_replace_patch(
             original_content=original,
             proposal=_proposal(old=old, new="replacement"),
@@ -73,16 +73,18 @@ def test_approximate_substring_rejects_multiple_high_similarity_candidates():
         )
 
 
-def test_scripts_python_does_not_use_approximate_substring():
-    original = "def run(payload):\n    return {'result': payload}\n"
-    old = "def run(data):\n    return {'result': data}\n"
+def test_scripts_python_uses_generic_fuzzy_when_similarity_is_safe():
+    original = "value = payload.get('customer_name')\nresult = {'customer_name': value}\n"
+    old = "value = payload.get('customer name')\nresult = {'customer_name': value}\n"
 
-    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
-        _apply_exact_replace_patch(
-            original_content=original,
-            proposal=_proposal(target_file="scripts/main.py", old=old, new="def run(payload):\n    return {'ok': payload}\n"),
-            expected_target_file="scripts/main.py",
-        )
+    candidate, stats = _apply_exact_replace_patch(
+        original_content=original,
+        proposal=_proposal(target_file="scripts/main.py", old=old, new="value = payload.get('name')\nresult = {'customer_name': value}\n"),
+        expected_target_file="scripts/main.py",
+    )
+
+    assert "payload.get('name')" in candidate
+    assert stats["applied"][0]["fallback_type"] == "fuzzy_window"
 
 
 def test_fallback_still_respects_changed_line_count_scope():
@@ -189,23 +191,24 @@ def test_unified_diff_bad_line_number_converts_to_exact_replace_for_markdown():
     assert stats["mode"] == "unified_diff_to_exact_replace"
 
 
-def test_unified_diff_to_exact_does_not_enable_approximate_for_python_scripts():
-    original = "def run(payload):\n    return {'result': payload}\n"
+def test_unified_diff_to_exact_uses_generic_fuzzy_for_python_scripts():
+    original = "value = payload.get('customer_name')\nresult = {'customer_name': value}\n"
     proposal = CreatorDiffProposal(
         target_file="scripts/main.py",
         reason="bad approximate hunk",
         diff=(
             "--- a/scripts/main.py\n+++ b/scripts/main.py\n@@ -50,2 +50,2 @@\n"
-            "-def run(data):\n-    return {'result': data}\n+def run(payload):\n+    return {'ok': payload}\n"
+            "-value = payload.get('customer name')\n-result = {'customer_name': value}\n+value = payload.get('name')\n+result = {'customer_name': value}\n"
         ),
         mode="unified_diff",
     )
-    with pytest.raises(ValueError, match="代码文件只允许 exact|不启用 approximate substring"):
-        _apply_unified_diff_or_convert_to_exact(
-            original_content=original,
-            proposal=proposal,
-            expected_target_file="scripts/main.py",
-        )
+    candidate, stats = _apply_unified_diff_or_convert_to_exact(
+        original_content=original,
+        proposal=proposal,
+        expected_target_file="scripts/main.py",
+    )
+    assert "payload.get('name')" in candidate
+    assert stats["mode"] == "unified_diff_to_exact_replace"
 
 
 def test_deterministic_micro_patch_uses_structured_repair_ops_only():
@@ -344,18 +347,20 @@ def test_markdown_structured_match_handles_minor_old_text_changes():
         expected_target_file="SKILL.md",
     )
     assert "final artifact" in candidate
-    assert stats["applied"][0]["fallback_type"] == "markdown_structured"
+    assert stats["applied"][0]["fallback_type"] == "fuzzy_window"
 
 
-def test_markdown_fuzzy_rejects_command_block_changes():
-    original = "# Skill\n\n```bash\npython scripts/run.py '{\"topic\":\"{{topic}}\"}'\n```\n"
-    old = "python scripts/run.py '{\"topics\":\"{{topic}}\"}'"
-    with pytest.raises(ValueError, match="命令块内部|command block"):
-        _apply_exact_replace_patch(
-            original_content=original,
-            proposal=_proposal(old=old, new="python scripts/run.py '{\"topic\":\"{{topic}}\",\"count\":3}'"),
-            expected_target_file="SKILL.md",
-        )
+def test_fuzzy_can_patch_any_text_fragment_in_command_block():
+    original = '# Skill\n\n```bash\npython scripts/run.py \'{"topic":"{{topic}}"}\'\n```\n'
+    old = 'python scripts/run.py \'{"topics":"{{topic}}"}\''
+    candidate, stats = _apply_exact_replace_patch(
+        original_content=original,
+        proposal=_proposal(old=old, new='python scripts/run.py \'{"topic":"{{topic}}","count":3}\''),
+        expected_target_file="SKILL.md",
+    )
+
+    assert "count" in candidate
+    assert stats["applied"][0]["fallback_type"] == "fuzzy_window"
 
 
 def test_append_after_uses_markdown_line_boundary_without_gluing():

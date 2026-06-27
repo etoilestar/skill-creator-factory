@@ -2261,6 +2261,48 @@ def test_skill_md_blueprint_alignment_still_blocks_reverse_reference_role():
     assert len(results) == 1
     assert results[0].id.startswith("skill_md.blueprint_alignment.resources")
 
+
+def test_skill_md_blueprint_alignment_does_not_trust_blocking_for_detail_requests():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": True,
+                "field": "workflow",
+                "message": "脚本间数据闭环说明不够精确，未证明 placeholder 来自哪个 stdout。",
+                "expected": "补充字段来源证明。",
+                "minimal_edit": "说明字段如何序列化/解析。",
+            }
+        ],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_blueprint_alignment_blocks_missing_final_artifact_semantics():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": False,
+                "field": "intent",
+                "message": "最终产物缺失，用户无法理解运行后会得到什么。",
+                "expected": "说明最终产物。",
+                "minimal_edit": "补充最终产物说明。",
+            }
+        ],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].id.startswith("skill_md.blueprint_alignment.intent")
+
 def test_creator_targeted_repair_instructions_for_missing_skill_script_block():
     from backend.routers.creator import _targeted_generated_file_repair_instructions
 

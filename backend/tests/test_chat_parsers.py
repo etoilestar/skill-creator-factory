@@ -2217,6 +2217,92 @@ description: demo
     assert any(result.id == "skill_md.script_command.exists" for result in exc_info.value.results)
 
 
+def test_skill_md_blueprint_alignment_ignores_manifest_wording_complaints():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": True,
+                "field": "resources",
+                "message": "references/workflows.md 未写 role: reference，assets/template.pdf 未写 source: bundled 和 dependencies，且未精确证明哪个脚本读取哪个资源。",
+                "expected": "逐字匹配 manifest 字段并证明读取链路。",
+                "minimal_edit": "补 role/source/dependencies/stdout placeholder 闭环。",
+            }
+        ],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_blueprint_alignment_still_blocks_reverse_reference_role():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": True,
+                "field": "resources",
+                "message": "references/workflows.md 被描述为要生成的产物 asset。",
+                "resource_role": "reference",
+                "claim_type": "artifact",
+                "contract_impact": {"resource_role": True},
+                "expected": "reference 只能作为参考资料。",
+                "minimal_edit": "删除产物描述。",
+            }
+        ],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].id.startswith("skill_md.blueprint_alignment.resources")
+
+
+def test_skill_md_blueprint_alignment_does_not_trust_blocking_for_detail_requests():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": True,
+                "field": "workflow",
+                "message": "脚本间数据闭环说明不够精确，未证明 placeholder 来自哪个 stdout。",
+                "expected": "补充字段来源证明。",
+                "minimal_edit": "说明字段如何序列化/解析。",
+            }
+        ],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_blueprint_alignment_blocks_missing_final_artifact_semantics():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": False,
+                "field": "intent",
+                "message": "最终产物缺失，用户无法理解运行后会得到什么。",
+                "expected": "说明最终产物。",
+                "minimal_edit": "补充最终产物说明。",
+            }
+        ],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].id.startswith("skill_md.blueprint_alignment.intent")
+
 def test_creator_targeted_repair_instructions_for_missing_skill_script_block():
     from backend.routers.creator import _targeted_generated_file_repair_instructions
 

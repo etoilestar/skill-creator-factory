@@ -724,7 +724,7 @@ def _exception_to_skill_md_failures(exc: Exception, *, source: str = "skill_md")
 def classify_skill_md_failure_severity(failure: dict[str, Any]) -> str:
     if str(failure.get("severity") or "").lower() in {"advisory", "note", "warning"}:
         return "advisory"
-    if str(failure.get("layer") or "").lower() in {"advisory", "advisory_notes"}:
+    if str(failure.get("layer") or "").lower() in {"advisory", "advisory_notes", "validator_error"}:
         return "advisory"
     if bool(failure.get("advisory")):
         return "advisory"
@@ -1043,13 +1043,16 @@ async def _repair_skill_md_model_finalizer(
     failures_text = json.dumps(failures, ensure_ascii=False, indent=2, default=str)
 
     validation_error = (
-        "SKILL.md 普通内容责任缺失，需要做局部 patch。\n"
+        "SKILL.md 第一轮只修真正缺失的语义责任内容，需要做局部 patch。\n"
+        "如果 failure 只是说法不够精确、证明不够细、内部字段未写、字段来源/运行时闭环未解释，不要生成 patch。\n"
         "失败项 JSON：\n"
         f"{failures_text}"
     )
 
     targeted_repair = (
-        "只修复 failures 指向的普通 Markdown 说明内容缺失。"
+        "只修复 failures 指向的真正缺失内容：用户需求、真实路径、主流程、最终产物或明显写反的资源角色。"
+        "不要做措辞优化，不要补 role/source/dependencies/bundled 等内部 manifest 字段，"
+        "不要补 stdout/placeholder 来源证明或第二轮 E2E 才负责的运行时闭环说明。"
         "未被 failures 指向的内容必须保持。"
         "不要输出完整 SKILL.md，只输出 exact_replace patch。"
     )
@@ -1062,7 +1065,7 @@ async def _repair_skill_md_model_finalizer(
         validation_error=validation_error,
         targeted_repair=targeted_repair,
         contract_text=(
-            "SKILL.md 是主 Skill 说明文档；本轮只补普通 Markdown 说明内容。"
+            "SKILL.md 是主 Skill 说明文档；本轮只补用户无法理解或无法启动 Skill 的缺失内容。"
         ),
         passed_checks_text="",
         failed_checks_text=failures_text,
@@ -1102,6 +1105,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
     previous_remaining_failures: list[dict[str, Any]] = []
     candidate = ""
     content = ""
+    skip_semantic_review_after_patch = False
 
     for attempt in range(1, _MAX_FILE_REPAIR_ATTEMPTS + 1):
         try:
@@ -1191,7 +1195,20 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             failures = list(ledger["remaining_failures"])
             previous_remaining_failures = failures
 
-            # 阶段 3：格式/合同通过后，再做蓝图责任审查。
+            # 阶段 3：格式/合同通过后，再做第一轮语义覆盖审查。
+            # 如果上一轮已经应用 localized patch，本轮只做通用安全校验
+            # （Markdown/命令块/本地路径），避免 reviewer 为新措辞反复返修。
+            if not failures and skip_semantic_review_after_patch:
+                return {
+                    "success": True,
+                    "content": content,
+                    "repair_attempts": attempt - 1,
+                    "validation_status": "passed_after_patch_safety_checks",
+                    "editable": True,
+                    "disabled": False,
+                    "repair_events": repair_events,
+                }
+
             if not failures:
                 try:
                     await _validate_skill_md_blueprint_alignment(
@@ -1266,6 +1283,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     skill_name=skill_name,
                     attempt=attempt,
                 )
+                skip_semantic_review_after_patch = True
                 if deferred_failures:
                     previous_remaining_failures = deferred_failures
             except CreatorRepairProposalParseError as parse_exc:

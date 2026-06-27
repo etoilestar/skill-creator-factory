@@ -1062,12 +1062,10 @@ async def _review_skill_md_blueprint_intent_with_model(
     skill_plan_entry: dict[str, Any] | None,
     model: str | None,
 ) -> dict[str, Any]:
-    """Model review for SKILL.md semantic alignment with blueprint.
+    """Model review for first-round SKILL.md semantic coverage.
 
-    第一轮 SKILL.md 蓝图一致性审查：
-    - 模型负责语义一致性判断；
-    - 后端负责把 failed review 转成可局部返修的结构化错误；
-    - 不再 warning-only 放行。
+    第一轮只判断 SKILL.md 是否基本表达用户需求和执行入口；
+    证明性细节、内部 manifest 字段和运行时闭环交给后续静态/E2E 校验。
     """
     constraints = _collect_blueprint_skillplan_constraints(
         blueprint_text=blueprint_text,
@@ -1077,7 +1075,7 @@ async def _review_skill_md_blueprint_intent_with_model(
     route = route_model(
         VALIDATOR_TASK,
         requested_model=model,
-        reason=f"creator SKILL.md blueprint alignment review: {skill_name}",
+        reason=f"creator SKILL.md semantic coverage review: {skill_name}",
     )
     _log_creator_model_usage(
         phase="skill_md.intent_review.route",
@@ -1090,23 +1088,31 @@ async def _review_skill_md_blueprint_intent_with_model(
     parser_paths = _extract_declared_skill_paths(blueprint_text)
 
     prompt = (
-        "你是 superskills Creator 的 SKILL.md 蓝图一致性审查器，只输出严格 JSON object。\n\n"
+        "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
 
-        "审查目标：判断当前 SKILL.md 是否完成蓝图要求的 Skill 使用说明责任。\n"
-        "这属于第一轮单文件责任审查，不判断脚本实际运行、不判断 stdout 字段闭环、不判断最终 E2E。\n\n"
+        "审查目标：只回答 SKILL.md 是否基本表达了这个 Skill 的语义责任。\n"
+        "第一轮只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、真实路径有没有提到、最终产物是什么、reference/asset 的角色有没有明显写反。\n"
+        "不要审查证明是否足够细；不要审查第二轮 E2E 负责的问题。\n\n"
 
-        "Blocking 审查范围（只在影响执行闭环时 severity=error）：\n"
-        "1. 真实文件路径、资源角色、脚本执行顺序、平台输入输出、最终产物契约缺失或冲突。\n"
-        "2. 蓝图/用户需求中用户可控的关键要求（数量、长度、页数、段落、风格、结构、格式、命名、输出组成等）缺失、模糊，或无法从 SKILL.md 传递到脚本输入/最终产物。\n"
-        "3. references/** 被当成执行步骤、可修改文件、artifact、asset；assets/** 在蓝图要求上传或存在真实素材时角色描述错误。\n"
-        "4. 引入蓝图外会改变执行/产物契约的脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程。\n\n"
+        "输出 error 必须同时满足两个条件：\n"
+        "1. 该问题会导致用户无法理解或无法启动这个 Skill；\n"
+        "2. 该问题不能交给第二轮 E2E 验证。\n"
+        "只要不同时满足，就必须 passed=true 或最多输出 warning；warning 不进入修复。\n\n"
 
-        "Advisory 边界（只能 warning，不阻塞 finalize）：\n"
-        "- 文案没有逐字复述蓝图、表达不够详细、缺少固定话术、缺少 role 标签、章节模板不一致。\n"
-        "- 不判断 bash 命令语法是否完全可执行；后台 parser 会检查。\n"
-        "- 不判断 argv/stdout 字段是否上下游闭环；第二轮 E2E 会检查。\n"
-        "- 不要求固定字段名或固定 SKILL.md 模板。\n"
-        "- 空 assets 或蓝图未要求上传素材时，不要求写固定 assets 话术。\n\n"
+        "只有以下明显语义责任失败才能 error：\n"
+        "- SKILL.md 明显无法表达用户需求或主流程；\n"
+        "- 真实 scripts/references/assets 路径缺失；\n"
+        "- 最终产物缺失；\n"
+        "- reference/asset 角色明显写反；\n"
+        "- 引入蓝图外能力、脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程。\n\n"
+
+        "以下情况必须 passed=true 或最多 warning，不能 error，不能提出 blocking repair：\n"
+        "- 说明不够细、资源用途说法不够精确、只是想优化措辞；\n"
+        "- 没证明 placeholder 来自哪个 stdout、字段如何序列化/解析、JSON 运行时类型是否完全闭环；\n"
+        "- 没证明哪个脚本读取哪个 reference/asset；\n"
+        "- 没写 role/source/dependencies/bundled 等内部 manifest 字段；\n"
+        "- 触发词、章节模板、固定话术没有逐字一致。\n\n"
+        "不要为了让文案更精确而提出 blocking repair；不要要求 SKILL.md 写内部 manifest 字段。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
@@ -1172,7 +1178,7 @@ async def _review_skill_md_blueprint_intent_with_model(
             {
                 "role": "system",
                 "content": (
-                    "你是严格 JSON 输出的 SKILL.md 蓝图一致性审查器。"
+                    "你是严格 JSON 输出的第一轮 SKILL.md 语义覆盖审查器。"
                     "只输出 JSON object，不要输出 Markdown。"
                 ),
             },
@@ -1408,56 +1414,78 @@ def _dedupe_review_issues(issues: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
-    """Classify semantic blueprint issues from structured reviewer/contract facts."""
-    explicit = issue.get("blocking")
-    if isinstance(explicit, bool):
-        return explicit
+_DETAIL_OR_PROOF_REVIEW_TERMS = (
+    "证明", "更精确", "不够精确", "说明不够细", "措辞", "优化",
+    "placeholder", "stdout", "序列化", "解析", "JSON 运行时类型", "闭环",
+    "哪个脚本读取", "读取哪个", "role:", "role：", "source:", "source：",
+    "dependencies", "bundled", "manifest", "SkillPlan", "触发词", "章节模板", "固定话术", "逐字",
+)
 
-    severity = str(issue.get("severity") or "error").strip().lower()
-    if severity in {"warning", "info", "note", "advisory"}:
-        return False
-    if severity in {"blocking", "blocker"}:
-        return True
+_HARD_SEMANTIC_REVIEW_TERMS = (
+    "路径缺失", "未提及真实路径", "缺真实路径", "缺少真实路径",
+    "最终产物缺失", "缺最终产物", "缺少最终产物",
+    "角色写反", "资源角色写反", "明显写反",
+    "蓝图外", "引入额外", "外部 API", "伪 key", "伪数据库", "Creator UI",
+    "无法理解", "无法启动",
+)
 
-    impact = issue.get("contract_impact") or issue.get("impact")
-    if isinstance(impact, dict):
-        contract_keys = {
-            "execution_closure",
-            "resource_role",
-            "platform_io",
-            "final_artifact",
-            "final_output",
-            "artifact_contract",
-            "user_requirement_transfer",
-            "key_requirement_transfer",
-        }
-        return any(bool(impact.get(key)) for key in contract_keys)
 
-    if issue.get("required_contract") or issue.get("artifact_contract") or issue.get("platform_io_contract"):
-        return True
-
-    user_requirement = issue.get("user_requirement") or issue.get("key_requirement")
-    if isinstance(user_requirement, dict):
-        return bool(
-            user_requirement.get("required")
-            and (
-                user_requirement.get("missing")
-                or user_requirement.get("ambiguous")
-                or user_requirement.get("not_passed_to_script")
-                or user_requirement.get("not_in_artifact_contract")
-            )
+def _review_issue_text(issue: dict[str, Any]) -> str:
+    return "\n".join(
+        str(issue.get(key) or "")
+        for key in (
+            "field", "message", "problem", "reason", "evidence", "details",
+            "expected", "minimal_edit", "fix", "suggested_fix",
         )
+    )
 
+
+def _review_issue_is_detail_or_proof_request(issue: dict[str, Any]) -> bool:
+    text = _review_issue_text(issue)
+    return any(term in text for term in _DETAIL_OR_PROOF_REVIEW_TERMS)
+
+
+def _review_issue_is_clear_reverse_resource_role(issue: dict[str, Any]) -> bool:
     role = str(issue.get("resource_role") or "").lower()
     claim = str(issue.get("claim_type") or "").lower()
     if role == "reference" and claim in {"execution_step", "artifact", "asset_material", "model_generated", "modifiable", "write_asset"}:
         return True
-    if role == "asset" and claim in {"model_generated", "modifiable", "write_asset"}:
+    if role == "asset" and claim in {"reference_document", "context_reference", "read_into_context", "model_generated", "modifiable", "write_asset"}:
+        return True
+    return "角色写反" in _review_issue_text(issue) or "明显写反" in _review_issue_text(issue)
+
+
+def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
+    """Classify first-round SKILL.md semantic coverage issues.
+
+    Do not blindly trust model-provided blocking=true. First-round review blocks
+    only obvious semantic responsibility failures; proof/detail/internal-field and
+    runtime-closure requests are advisory and must not trigger localized patches.
+    """
+    severity = str(issue.get("severity") or "error").strip().lower()
+    if severity in {"warning", "info", "note", "advisory"}:
+        return False
+
+    if _review_issue_is_detail_or_proof_request(issue):
+        return False
+
+    if _review_issue_is_clear_reverse_resource_role(issue):
         return True
 
-    # Plain reviewer severity=error is not enough to enter the repair loop.
-    # Reviewers must provide explicit blocking/contract facts above.
+    text = _review_issue_text(issue)
+    if any(term in text for term in _HARD_SEMANTIC_REVIEW_TERMS):
+        return True
+
+    impact = issue.get("contract_impact") or issue.get("impact")
+    if isinstance(impact, dict):
+        return any(bool(impact.get(key)) for key in ("platform_io", "final_artifact", "final_output"))
+
+    user_requirement = issue.get("user_requirement") or issue.get("key_requirement")
+    if isinstance(user_requirement, dict):
+        return bool(user_requirement.get("required") and user_requirement.get("missing"))
+
+    # Plain severity=error or blocking=true is not enough. The reviewer must
+    # identify one of the first-round semantic failures above.
     return False
 
 def _format_skill_md_intent_review_failure(review: dict[str, Any]) -> str:
@@ -1595,6 +1623,12 @@ async def _validate_skill_md_blueprint_alignment(
             skill_plan_entry=skill_plan_entry,
             model=model,
         )
+    except CreatorValidatorReviewError:
+        logger.exception(
+            "[Creator][skill_md] semantic coverage reviewer returned invalid output skill=%s",
+            skill_name,
+        )
+        raise
     except Exception as exc:
         logger.exception(
             "[Creator][skill_md] model blueprint intent review crashed skill=%s",
@@ -1606,16 +1640,12 @@ async def _validate_skill_md_blueprint_alignment(
             "这不是最终失败；生成循环会继续尝试局部返修或重试。"
         ) from exc
 
-    review = model_review if isinstance(model_review, dict) else {
-        "passed": False,
-        "issues": [{
-            "severity": "error",
-            "field": "validator",
-            "message": f"蓝图一致性审查返回类型错误：{type(model_review).__name__}",
-            "expected": "返回 JSON object。",
-            "minimal_edit": "重新审查并修复 SKILL.md 与蓝图不一致区域。",
-        }],
-    }
+    if not isinstance(model_review, dict):
+        raise CreatorValidatorReviewError(
+            f"第一轮 SKILL.md 语义覆盖 reviewer 返回类型错误：{type(model_review).__name__}"
+        )
+
+    review = model_review
 
     if review.get("passed") is not True:
         results = _skill_md_blueprint_review_to_contract_results(review)

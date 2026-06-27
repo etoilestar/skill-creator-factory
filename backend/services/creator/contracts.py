@@ -1092,21 +1092,22 @@ async def _review_skill_md_blueprint_intent_with_model(
     prompt = (
         "你是 superskills Creator 的 SKILL.md 蓝图一致性审查器，只输出严格 JSON object。\n\n"
 
-        "审查目标：判断当前 SKILL.md 是否完成蓝图要求的 Skill 使用说明责任。\n"
-        "这属于第一轮单文件责任审查，不判断脚本实际运行、不判断 stdout 字段闭环、不判断最终 E2E。\n\n"
+        "审查目标：判断当前 SKILL.md 是否在语义上完成蓝图要求的 Skill 使用说明责任。\n"
+        "这属于第一轮单文件审查，只做轻量 gate：格式稳定、真实路径提及、bash 静态模板可解析、用户核心产物/主流程语义覆盖、reference/asset 没有明显反向角色描述。\n"
+        "不判断脚本实际运行、不判断 stdout/placeholder 闭环、不判断最终 E2E。\n\n"
 
-        "Blocking 审查范围（只在影响执行闭环时 severity=error）：\n"
-        "1. 真实文件路径、资源角色、脚本执行顺序、平台输入输出、最终产物契约缺失或冲突。\n"
-        "2. 蓝图/用户需求中用户可控的关键要求（数量、长度、页数、段落、风格、结构、格式、命名、输出组成等）缺失、模糊，或无法从 SKILL.md 传递到脚本输入/最终产物。\n"
-        "3. references/** 被当成执行步骤、可修改文件、artifact、asset；assets/** 在蓝图要求上传或存在真实素材时角色描述错误。\n"
-        "4. 引入蓝图外会改变执行/产物契约的脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程。\n\n"
+        "Blocking 审查范围（只有以下问题才能 severity=error/blocking=true）：\n"
+        "1. 真实 scripts/references/assets 路径在 SKILL.md 中完全缺失，或真实脚本主流程/最终产物语义明显缺失。\n"
+        "2. 用户核心产物和主流程语义被反向描述、遗漏到无法使用，或引入蓝图外会改变执行/产物契约的脚本、资源、外部 API、伪 key、伪数据库或 Creator UI 流程。\n"
+        "3. references/** 被明确描述为执行步骤、可修改文件、artifact、asset；assets/** 被明确描述为 reference 文档/需要读入上下文等明显反向角色。\n\n"
 
-        "Advisory 边界（只能 warning，不阻塞 finalize）：\n"
-        "- 文案没有逐字复述蓝图、表达不够详细、缺少固定话术、缺少 role 标签、章节模板不一致。\n"
-        "- 不判断 bash 命令语法是否完全可执行；后台 parser 会检查。\n"
-        "- 不判断 argv/stdout 字段是否上下游闭环；第二轮 E2E 会检查。\n"
-        "- 不要求固定字段名或固定 SKILL.md 模板。\n"
+        "非阻塞边界（必须 warning 或忽略，不能阻塞 finalize）：\n"
+        "- 不要求逐字匹配内部 manifest / SkillPlan 字段；不要求写 role: asset / role: reference、source: bundled、dependencies。\n"
+        "- 不要求精确证明哪个脚本读取哪个 resource；不要求触发词逐字复述；不要求 stdout/placeholder 闭环。\n"
+        "- 不因 reference/asset 的读取/不可读取措辞、章节模板不一致、文案不够详细、缺少固定话术而阻塞；只有明显把 reference 当 asset/执行产物，或把 asset 当 reference 文档时才阻塞。\n"
+        "- 不判断 bash 命令语法是否完全可执行；后台 parser 只检查静态模板可解析。\n"
         "- 空 assets 或蓝图未要求上传素材时，不要求写固定 assets 话术。\n\n"
+        "请优先放行语义满足的 SKILL.md；不要围绕 role/source/dependencies/读取证明/触发词/stdout 形成 blocking issue。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
@@ -1408,11 +1409,51 @@ def _dedupe_review_issues(issues: Any) -> list[dict[str, Any]]:
     return out
 
 
+_NON_BLOCKING_BLUEPRINT_ALIGNMENT_RE = re.compile(
+    r"role\s*[:=]|source\s*[:=]|dependencies?|bundled|user_upload|"
+    r"stdout|placeholder|触发词|逐字|复述|读取|不可读取|读入|"
+    r"哪个脚本|证明|闭环|manifest|SkillPlan|字段|模板|章节|固定话术",
+    re.I,
+)
+
+
+def _review_issue_matches_first_round_non_blocking_boundary(issue: dict[str, Any]) -> bool:
+    """Return true for over-specific alignment complaints that first round allows.
+
+    First-round SKILL.md review is intentionally semantic: it should not block on
+    internal manifest wording, resource read-proof, trigger phrases, or stdout
+    closure. Obvious reverse resource roles are still handled below by
+    _review_issue_is_blocking through resource_role/claim_type facts.
+    """
+    blob = "\n".join(
+        str(issue.get(key) or "")
+        for key in ("field", "message", "problem", "reason", "evidence", "details", "expected", "minimal_edit", "fix", "suggested_fix")
+    )
+    if not _NON_BLOCKING_BLUEPRINT_ALIGNMENT_RE.search(blob):
+        return False
+
+    role = str(issue.get("resource_role") or "").lower()
+    claim = str(issue.get("claim_type") or "").lower()
+    if role == "reference" and claim in {"execution_step", "artifact", "asset_material", "model_generated", "modifiable", "write_asset"}:
+        return False
+    if role == "asset" and claim in {"reference_document", "context_reference", "read_into_context", "model_generated", "modifiable", "write_asset"}:
+        return False
+
+    impact = issue.get("contract_impact") or issue.get("impact")
+    if isinstance(impact, dict) and any(bool(impact.get(key)) for key in ("execution_closure", "platform_io", "final_artifact", "final_output", "artifact_contract", "user_requirement_transfer", "key_requirement_transfer")):
+        return False
+
+    return True
+
+
 def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     """Classify semantic blueprint issues from structured reviewer/contract facts."""
+    if _review_issue_matches_first_round_non_blocking_boundary(issue):
+        return False
+
     explicit = issue.get("blocking")
     if isinstance(explicit, bool):
-        return explicit
+        return explicit and not _review_issue_matches_first_round_non_blocking_boundary(issue)
 
     severity = str(issue.get("severity") or "error").strip().lower()
     if severity in {"warning", "info", "note", "advisory"}:

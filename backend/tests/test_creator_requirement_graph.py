@@ -349,6 +349,247 @@ def run(payload):
     )
     assert review["failure_type"] == "script_requirement_validator_incomplete"
 
+
+@pytest.mark.asyncio
+async def test_responsibility_review_invalid_json_is_rewritten_before_validating(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    calls = iter([
+        "not json",
+        '{"passed": true, "checks": [{"requirement_id": "' + req.id + '", "status": "passed", "severity": "advisory", "evidence_level": "strong", "missing_evidence": []}], "advisory_notes": []}',
+    ])
+
+    async def fake_complete(*args, **kwargs):
+        return next(calls)
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    script = """
+def run(payload):
+    brief = payload.get('brief_text')
+    blocks = [{'type': 'text', 'text': brief}]
+    result = create_pdf_document(blocks, filename='out.pdf')
+    return {'artifact': result}
+"""
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content=script,
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_responsibility_review_invalid_json_does_not_become_business_patch_without_static_blocker(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return "still not json"
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    script = """
+def run(payload):
+    brief = payload.get('brief_text')
+    blocks = [{'type': 'text', 'text': brief}]
+    result = create_pdf_document(blocks, filename='out.pdf')
+    return {'artifact': result}
+"""
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content=script,
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is True
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
+    assert review["issues"] == []
+
+
+def test_script_requirement_failed_uses_localized_patch_mode():
+    from backend.services.creator.api import _repair_mode_for_first_round
+
+    assert _repair_mode_for_first_round(
+        source="script_requirement_failed",
+        file_path="scripts/generic.py",
+        attempt=1,
+    ) == "localized_patch"
+
+
+def test_markdown_format_rewrite_detection_uses_structured_contract_not_message_text():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractCheckResult, ContractValidationError
+
+    result = ContractCheckResult(
+        id="opaque.format.id",
+        passed=False,
+        target="SKILL.md",
+        message="opaque localized message",
+        expected="opaque expected value",
+        minimal_edit="rewrite the whole generated file",
+        details={"repair_strategy": "full_rewrite", "model_patch_allowed": False},
+        layer="markdown_contract",
+    )
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="markdown_contract",
+        detail="opaque text without markdown ids or severity words",
+        original=ContractValidationError("opaque", [result]),
+    )
+
+    assert is_markdown_hard_format_error(stage_error) is True
+
+
+@pytest.mark.asyncio
+async def test_generate_file_format_stage_regenerates_before_responsibility_or_patch(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    spec = _script_spec(path="scripts/main.py")
+    calls = iter([
+        "```python\nprint('one')\n```\n```python\nprint('two')\n```",
+        "def run(payload):\n    return {'artifact': payload}\n",
+    ])
+    responsibility_calls = []
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return next(calls)
+
+    async def fake_responsibility_review(**_kwargs):
+        responsibility_calls.append(_kwargs["script_content"])
+        return {"passed": True, "issues": []}
+
+    async def fail_patch(**_kwargs):
+        raise AssertionError("FORMAT_STAGE failure must not enter patch")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fail_patch)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate report",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=spec.model_dump(mode="json"),
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert "regenerating" in body
+    assert responsibility_calls == ["def run(payload):\n    return {'artifact': payload}"], body
+
+
+@pytest.mark.asyncio
+async def test_generate_file_responsibility_patch_feedback_is_stage_isolated(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    spec = _script_spec(path="scripts/main.py")
+    reviews = iter([
+        {
+            "passed": False,
+            "failure_type": "script_requirement_failed",
+            "issues": [{
+                "id": "script_requirement_failed",
+                "failed_file": "scripts/main.py",
+                "reason": "semantic responsibility is absent",
+                "minimal_edit": "implement responsibility",
+            }],
+        },
+        {"passed": True, "issues": []},
+    ])
+    feedbacks = []
+    validator_calls = []
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "def run(payload):\n    return {'artifact': 'fixed'}\n"
+
+    async def fake_responsibility_review(**_kwargs):
+        return next(reviews)
+
+    async def fake_validator_round(**_kwargs):
+        validator_calls.append(_kwargs)
+        return {"passed": False, "issues": []}
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        feedbacks.append(kwargs.get("validation_error", ""))
+        return "def run(payload):\n    return {'artifact': payload}\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_run_generated_file_validator_round", fake_validator_round)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate report",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=spec.model_dump(mode="json"),
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+
+    assert validator_calls == []
+    assert feedbacks
+    feedback = feedbacks[0]
+    assert "RESPONSIBILITY_PATCH_STAGE" in feedback
+    assert "semantic responsibility is absent" in feedback
+    assert "argv" not in feedback
+    assert "stdout" not in feedback
+    assert "artifact" not in feedback
+    assert "E2E" not in feedback
+    assert "格式" not in feedback
+    assert "字段" not in feedback
+    assert "运行" not in feedback
+    assert "跨文件" not in feedback
+    assert "表达" not in feedback
+
+
+@pytest.mark.asyncio
+async def test_responsibility_prompt_omits_non_responsibility_counterexamples(monkeypatch):
+    captured_messages = []
+    spec = _script_spec(path="scripts/main.py", purpose="complete the requested task")
+
+    async def fake_complete(messages, model):
+        captured_messages.extend(messages)
+        return '{"passed": true, "advisory_notes": []}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+
+    await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'result': payload}\n",
+        skill_plan_entry=spec,
+        requirements=[],
+        review_context={"phase": "RESPONSIBILITY_STAGE", "policy": "只判断当前文件职责是否完成。"},
+    )
+
+    prompt_text = "\n".join(str(message.get("content") or "") for message in captured_messages)
+    assert "只判断当前脚本是否完成自身职责" in prompt_text
+    for forbidden in ["格式", "字段", "argv", "stdout", "artifact", "E2E", "运行", "跨文件", "表达"]:
+        assert forbidden not in prompt_text
+
+
 def test_error_stdout_bypass_cannot_satisfy_expected_outputs():
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     issues = detect_error_stdout_bypass('try:\n    run()\nexcept Exception:\n    return {"error": "failed"}\n', [req], ["semantic artifact"])

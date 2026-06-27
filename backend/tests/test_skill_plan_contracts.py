@@ -1999,6 +1999,8 @@ python scripts/main.py '{"payload":"{{user_request}}"}'
         return None
 
     monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_against_existing_files", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", async_lambda := (lambda **_kwargs: None))
     monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
 
     result = await creator.finalize_skill_md(FinalizeSkillMdRequest(
@@ -2073,20 +2075,31 @@ async def test_generate_file_hard_format_enters_format_full_rewrite(monkeypatch,
 
     monkeypatch.setattr(settings, "skills_path", tmp_path)
     calls = []
+    repair_calls = []
 
     async def fake_complete_creator_file_generation(**kwargs):
         calls.append(kwargs["prompt_variant"])
         if len(calls) == 1:
-            return "---\nname: demo\ndescription: Demo\n# unclosed frontmatter\n"
+            return "---\nname: demo\ndescription: Demo\n---\n\n```bash\npython scripts/main.py '{}'\n"
         return "---\nname: demo\ndescription: Demo\n---\n\n# Guide\n\nReference body.\n"
 
+    async def fake_alignment(**_kwargs):
+        return None
+
     monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_against_existing_files", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(
+        creator_api,
+        "_repair_generated_file_with_feedback",
+        lambda **kwargs: repair_calls.append(kwargs) or (_ for _ in ()).throw(AssertionError("localized patch must not run for hard format")),
+    )
 
     response = await creator.generate_file(GenerateFileRequest(
         skill_name="demo-skill",
-        file_path="references/guide.md",
+        file_path="SKILL.md",
         purpose="Guide",
-        blueprint_text="references/guide.md",
+        blueprint_text="",
         conversation_history=[],
     ))
     events = []
@@ -2097,8 +2110,55 @@ async def test_generate_file_hard_format_enters_format_full_rewrite(monkeypatch,
             events.append(json.loads(line[6:]))
 
     assert "format_full_rewrite" in calls
-    assert any(event.get("status") == "format_full_rewrite" for event in events)
+    rewrite_events = [event for event in events if event.get("status") == "format_full_rewrite"]
+    assert rewrite_events
+    assert rewrite_events[0]["validation"]["markdown_format_retry_count"] == 1
+    assert rewrite_events[0]["validation"]["business_repair_count"] == 0
+    assert repair_calls == []
     assert any("Guide" in str(event.get("content") or "") for event in events)
+
+
+@pytest.mark.asyncio
+async def test_markdown_full_rewrite_prompt_is_not_patch(monkeypatch, tmp_path):
+    import json
+    from backend.config import settings
+    from backend.routers import creator
+    from backend.services.creator import api as creator_api
+    from backend.routers.creator import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    prompts = []
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        if kwargs["prompt_variant"] == "format_full_rewrite":
+            prompts.append(kwargs["messages"])
+            return "---\nname: demo\ndescription: Demo\n---\n\n# Guide\n\nBody.\n"
+        return "---\nname: demo\ndescription: Demo\n---\n\n```bash\npython scripts/main.py '{}'\n"
+
+    async def fake_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(creator_api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_against_existing_files", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(creator_api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+
+    response = await creator.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="SKILL.md",
+        purpose="Guide",
+        blueprint_text="references/guide.md",
+        conversation_history=[],
+    ))
+    async for _line in response.body_iterator:
+        pass
+
+    prompt_text = "\n".join(message["content"] for message in prompts[0])
+    assert "只输出完整目标 Markdown 文件内容" in prompt_text
+    assert "不要 JSON patch" in prompt_text
+    assert "不要 old_lines/new_lines" in prompt_text
+    assert "frontmatter 必须完整闭合" in prompt_text
+    assert "所有 fenced block 必须成对闭合" in prompt_text
+    assert "不要把 repair proposal JSON 嵌进 Markdown" in prompt_text
 
 
 @pytest.mark.asyncio

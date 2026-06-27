@@ -1277,6 +1277,143 @@ def _canonicalize_generated_candidate(
         )
     return canonical
 
+_SCRIPT_RAW_SOURCE_FORMAT_ERROR_IDS = {
+    "script.raw_source.single_file",
+    "script.raw_source.ambiguous_multi_code_blocks",
+    "script.raw_source.multi_file_bundle",
+    "script.raw_source.ambiguous_script_candidate",
+}
+
+
+def is_script_raw_source_format_error(stage_error: FileGenerationStageError) -> bool:
+    """Route scripts/* raw-source structure failures to regeneration only."""
+    if getattr(stage_error, "source", "") not in {"content_review", "script_raw_source"}:
+        return False
+    original = getattr(stage_error, "original", None)
+    if isinstance(original, ContractValidationError):
+        return any((not result.passed) and result.id in _SCRIPT_RAW_SOURCE_FORMAT_ERROR_IDS for result in original.results)
+    detail = str(getattr(stage_error, "detail", "") or "")
+    return any(error_id in detail for error_id in _SCRIPT_RAW_SOURCE_FORMAT_ERROR_IDS)
+
+
+def is_generation_format_error(stage_error: FileGenerationStageError) -> bool:
+    return is_script_raw_source_format_error(stage_error)
+
+
+def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
+    if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
+        return True
+    detail = str(getattr(stage_error, "detail", "") or "")
+    return (
+        "markdown.fences.unclosed" in detail
+        or "markdown.fences.bash_unclosed" in detail
+        or "markdown.frontmatter.unclosed" in detail
+        or '"severity": "hard_format"' in detail
+        or '"repair_strategy": "full_rewrite"' in detail
+        or '"model_patch_allowed": false' in detail
+    )
+
+
+def _build_markdown_format_full_rewrite_prompt(
+    *,
+    file_path: str,
+    skill_name: str,
+    blueprint_text: str,
+    deterministic_error: str,
+    current_content: str,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 Markdown 文件 hard format 全量重写器。"
+                "你必须只输出完整目标 Markdown 文件内容。"
+                "不要 JSON patch；不要 old_lines/new_lines；不要 diff；不要解释；不要日志；"
+                "不要把 repair proposal JSON 嵌进 Markdown。"
+                "frontmatter 必须完整闭合；所有 fenced block 必须成对闭合。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文件路径：{file_path}\n"
+                f"Skill 名称：{skill_name}\n\n"
+                "后台 Markdown hard format 校验失败项如下；这是格式重试，不是业务语义 repair：\n"
+                f"{deterministic_error}\n\n"
+                "硬性要求：\n"
+                "1. 只输出完整目标 Markdown 文件内容。\n"
+                "2. 不要 JSON patch。\n"
+                "3. 不要 old_lines/new_lines。\n"
+                "4. 不要解释、日志或分析。\n"
+                "5. frontmatter 必须完整闭合。\n"
+                "6. 所有 fenced block 必须成对闭合。\n"
+                "7. 不要把 repair proposal JSON 嵌进 Markdown。\n"
+                "8. 不要混入 command argv / 字段对齐 / workflow dataflow 的局部修复；格式合法后由后续校验处理。\n\n"
+                "蓝图上下文：\n"
+                f"{(blueprint_text or '')[:8000]}\n\n"
+                "当前文件内容：\n"
+                "<<<CURRENT_FILE\n"
+                f"{current_content or ''}\n"
+                "CURRENT_FILE\n"
+            ),
+        },
+    ]
+
+
+def _build_strict_script_source_only_regeneration_prompt(
+    *,
+    file_path: str,
+    skill_name: str,
+    purpose: str,
+    blueprint_text: str,
+    role: str | None,
+    skill_plan_entry: dict[str, Any] | None,
+    deterministic_error: str,
+    previous_content: str,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 scripts/* 单文件源码生成器。必须直接重新生成完整单文件脚本源码。"
+                "只输出目标脚本源码；不要 Markdown；不要 ``` fence；不要解释；不要多个版本；"
+                "不要 Wait / Actually / Let me correct 自我修正；不要文件路径标题；不要多文件包；"
+                "不要把旧内容做 patch；不要输出 diff/JSON；不要输出 old_lines/new_lines。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文件路径：{file_path}\n"
+                f"Skill 名称：{skill_name}\n"
+                f"角色：{role or ''}\n"
+                f"用途：{purpose or ''}\n\n"
+                "上一次生成被判定为 scripts/* raw source 格式失败；这不是业务语义 repair，必须重新生成。\n"
+                "失败信息：\n"
+                f"{deterministic_error}\n\n"
+                "硬性输出要求：\n"
+                "- 只输出目标脚本源码。\n"
+                "- 不要 Markdown。\n"
+                "- 不要 ``` fence。\n"
+                "- 不要解释。\n"
+                "- 不要多个版本。\n"
+                "- 不要 Wait / Actually / Let me correct 自我修正。\n"
+                "- 不要文件路径标题。\n"
+                "- 不要多文件包。\n"
+                "- 不要把旧内容做 patch。\n"
+                "- 直接重新生成完整单文件脚本源码。\n\n"
+                "SkillPlanEntry：\n"
+                f"{json.dumps(skill_plan_entry or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "蓝图上下文：\n"
+                f"{(blueprint_text or '')[:12000]}\n\n"
+                "上一轮错误内容仅供避免重复格式错误，不要 patch：\n"
+                "<<<PREVIOUS_CONTENT\n"
+                f"{(previous_content or '')[:12000]}\n"
+                "PREVIOUS_CONTENT\n"
+            ),
+        },
+    ]
+
 
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
@@ -1373,6 +1510,9 @@ async def generate_file(request: GenerateFileRequest):
 
         candidate = ""
         repair_counts_by_layer: dict[str, int] = {}
+        format_retry_count = 0
+        markdown_format_retry_count = 0
+        business_repair_count = 0
         repair_failure_signatures: dict[str, tuple[int, str]] = {}
 
         try:
@@ -1493,6 +1633,18 @@ async def generate_file(request: GenerateFileRequest):
                         _raise_file_contract_failures(reference_results)
 
                     elif request.file_path.startswith("scripts/"):
+                        raw_source_error_id = script_raw_source_candidate_error_id(content)
+                        if raw_source_error_id:
+                            _raise_file_contract_failures([
+                                ContractCheckResult(
+                                    id=raw_source_error_id,
+                                    passed=False,
+                                    target=request.file_path,
+                                    message=f"{request.file_path} 不是单一纯脚本源码候选，必须重新生成。",
+                                    expected="只输出完整单文件脚本源码；不要 Markdown fence、说明文字、多个代码块、多个版本或多文件包。",
+                                    minimal_edit="重新生成完整单文件脚本源码；不要对旧内容做 patch 或局部修复。",
+                                )
+                            ])
                         _raise_file_contract_failures(_check_script_content_review_contract(
                             request.file_path,
                             content,
@@ -1621,7 +1773,17 @@ async def generate_file(request: GenerateFileRequest):
                 deterministic_error = str(stage_error)
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
-                repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+                if is_generation_format_error(stage_error) and request.file_path.startswith("scripts/"):
+                    format_retry_count += 1
+                elif is_markdown_hard_format_error(stage_error) and (
+                    request.file_path == "SKILL.md"
+                    or request.file_path.startswith("references/")
+                    or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                ):
+                    markdown_format_retry_count += 1
+                else:
+                    business_repair_count += 1
+                    repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
                 failure_signature = _structured_failure_signature(stage_error, deterministic_error)
                 candidate_digest = hashlib.sha256((candidate or "").encode("utf-8")).hexdigest()
                 signature_key = f"{error_layer}:{failure_signature}"
@@ -1629,6 +1791,61 @@ async def generate_file(request: GenerateFileRequest):
                 repeated_same_failure = previous_repeat_count >= 1
                 repeated_same_candidate = previous_digest == candidate_digest
                 repair_failure_signatures[signature_key] = (previous_repeat_count + 1, candidate_digest)
+
+                if is_script_raw_source_format_error(stage_error) and request.file_path.startswith("scripts/"):
+                    layer_limit = _first_round_repair_limit("content_review")
+                    if format_retry_count > layer_limit:
+                        yield _file_done_error_sse(
+                            file_path=request.file_path,
+                            role=request.role,
+                            error=(
+                                f"脚本源码格式重新生成失败：已重新生成 {layer_limit} 次仍未通过。"
+                                f"最后错误：{deterministic_error}"
+                            ),
+                            error_type="script_source_format_regenerate_failed",
+                            content=candidate or "",
+                            recoverable=True,
+                        )
+                        return
+
+                    yield _sse({
+                        "type": "validation",
+                        "status": "regenerating",
+                        "success": False,
+                        "file_path": request.file_path,
+                        "role": request.role,
+                        "validation": {
+                            "status": "regenerating",
+                            "attempt": format_retry_count,
+                            "format_retry_count": format_retry_count,
+                            "business_repair_count": business_repair_count,
+                            "source": error_source,
+                            "layer": stage_error.layer,
+                            "error": deterministic_error,
+                        },
+                    })
+
+                    next_messages = _build_strict_script_source_only_regeneration_prompt(
+                        file_path=request.file_path,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
+                        blueprint_text=request.blueprint_text,
+                        role=request.role,
+                        skill_plan_entry=effective_skill_plan_entry,
+                        deterministic_error=deterministic_error,
+                        previous_content=candidate or "",
+                    )
+                    candidate = await _complete_creator_file_generation(
+                        messages=next_messages,
+                        model=route.model,
+                        skill_name=skill_name,
+                        file_path=request.file_path,
+                        prompt_variant="strict_source_only_regeneration",
+                        retry_index=format_retry_count - 1,
+                    )
+                    prompt_messages = next_messages
+                    prompt_variant = "strict_source_only_regeneration"
+                    continue
 
                 if error_source == "model_empty_content":
                     empty_retry_index = repair_counts_by_layer[error_layer]
@@ -1772,10 +1989,14 @@ async def generate_file(request: GenerateFileRequest):
                     error_layer = f"{stage_error.source}:{stage_error.layer}"
                     repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
-                if error_source == "hard_format":
+                if is_markdown_hard_format_error(stage_error) and (
+                    request.file_path == "SKILL.md"
+                    or request.file_path.startswith("references/")
+                    or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                ):
                     layer_limit = _first_round_repair_limit(error_source)
 
-                    if repair_counts_by_layer[error_layer] > layer_limit:
+                    if markdown_format_retry_count > layer_limit:
                         yield _file_done_error_sse(
                             file_path=request.file_path,
                             role=request.role,
@@ -1799,46 +2020,22 @@ async def generate_file(request: GenerateFileRequest):
                         "disabled": False,
                         "validation": {
                             "status": "format_full_rewrite",
-                            "attempt": repair_counts_by_layer[error_layer],
+                            "attempt": markdown_format_retry_count,
+                            "markdown_format_retry_count": markdown_format_retry_count,
+                            "business_repair_count": business_repair_count,
                             "source": error_source,
                             "layer": stage_error.layer,
                             "error": deterministic_error,
                         },
                     })
 
-                    rewrite_messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "你是 Markdown 文件格式修复器。"
-                                "你必须输出完整文件内容，不要输出 patch，不要输出 JSON，不要解释。"
-                                "本轮只修 Markdown 结构格式，不修业务语义。"
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"文件路径：{request.file_path}\n"
-                                f"Skill 名称：{skill_name}\n\n"
-                                "后台 Markdown 格式校验失败项：\n"
-                                f"{deterministic_error}\n\n"
-                                "要求：\n"
-                                "1. 输出完整 Markdown 文件内容。\n"
-                                "2. 不要用 ``` 包裹整个文件。\n"
-                                "3. 只修 YAML frontmatter、frontmatter 收尾 ---、fenced block 成对闭合等 Markdown 格式问题。\n"
-                                "4. 保留原业务语义、脚本说明、资源说明、最终产物说明。\n"
-                                "5. 不要新增蓝图外能力、脚本、reference、asset。\n"
-                                "6. 如果是 reference 文件，必须保留 reference 的正文内容和用途。\n"
-                                "7. 不要声称已经执行或已经通过 E2E。\n\n"
-                                "蓝图上下文：\n"
-                                f"{(request.blueprint_text or '')[:8000]}\n\n"
-                                "当前文件内容：\n"
-                                "<<<CURRENT_FILE\n"
-                                f"{candidate or ''}\n"
-                                "CURRENT_FILE\n"
-                            ),
-                        },
-                    ]
+                    rewrite_messages = _build_markdown_format_full_rewrite_prompt(
+                        file_path=request.file_path,
+                        skill_name=skill_name,
+                        blueprint_text=request.blueprint_text,
+                        deterministic_error=deterministic_error,
+                        current_content=candidate or "",
+                    )
 
                     candidate = await _complete_creator_file_generation(
                         messages=rewrite_messages,
@@ -1846,7 +2043,7 @@ async def generate_file(request: GenerateFileRequest):
                         skill_name=skill_name,
                         file_path=request.file_path,
                         prompt_variant="format_full_rewrite",
-                        retry_index=repair_counts_by_layer[error_layer] - 1,
+                        retry_index=markdown_format_retry_count - 1,
                     )
                     continue
                 layer_limit = _first_round_repair_limit(error_source)
@@ -1993,6 +2190,70 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                 except Exception as repair_exc:
+                    if (
+                        request.file_path == "SKILL.md"
+                        or request.file_path.startswith("references/")
+                        or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                    ) and (
+                        "hard_format_regression" in str(repair_exc)
+                        or "hard_format failure must not enter localized patch repair" in str(repair_exc)
+                        or "model_patch_allowed" in str(repair_exc)
+                    ):
+                        stage_error = FileGenerationStageError(
+                            source="hard_format",
+                            layer="hard_format",
+                            detail=str(repair_exc),
+                        )
+                        deterministic_error = str(stage_error)
+                        markdown_format_retry_count += 1
+                        layer_limit = _first_round_repair_limit("hard_format")
+                        if markdown_format_retry_count > layer_limit:
+                            yield _file_done_error_sse(
+                                file_path=request.file_path,
+                                role=request.role,
+                                error=(
+                                    f"Markdown 格式修复失败：已整文件重写 {layer_limit} 轮仍未通过。"
+                                    f"最后错误：{deterministic_error}"
+                                ),
+                                error_type="format_full_rewrite_failed",
+                                content=candidate or "",
+                                recoverable=True,
+                            )
+                            return
+                        yield _sse({
+                            "type": "validation",
+                            "status": "format_full_rewrite",
+                            "success": False,
+                            "file_path": request.file_path,
+                            "role": request.role,
+                            "editable": True,
+                            "disabled": False,
+                            "validation": {
+                                "status": "format_full_rewrite",
+                                "attempt": markdown_format_retry_count,
+                                "markdown_format_retry_count": markdown_format_retry_count,
+                                "business_repair_count": business_repair_count,
+                                "source": "hard_format",
+                                "layer": "hard_format",
+                                "error": deterministic_error,
+                            },
+                        })
+                        rewrite_messages = _build_markdown_format_full_rewrite_prompt(
+                            file_path=request.file_path,
+                            skill_name=skill_name,
+                            blueprint_text=request.blueprint_text,
+                            deterministic_error=deterministic_error,
+                            current_content=candidate or "",
+                        )
+                        candidate = await _complete_creator_file_generation(
+                            messages=rewrite_messages,
+                            model=route.model,
+                            skill_name=skill_name,
+                            file_path=request.file_path,
+                            prompt_variant="format_full_rewrite",
+                            retry_index=markdown_format_retry_count - 1,
+                        )
+                        continue
                     logger.exception(
                         "[Creator][generate_file][repair_failed] file=%s source=%s layer=%s attempt=%d",
                         request.file_path,

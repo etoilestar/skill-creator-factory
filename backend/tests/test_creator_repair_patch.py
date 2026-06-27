@@ -125,6 +125,39 @@ async def test_repeated_unapplicable_proposal_is_rejected_without_third_retry(mo
     assert calls == 2
 
 
+@pytest.mark.asyncio
+async def test_markdown_hard_format_regression_stops_patch_retry(monkeypatch):
+    calls = 0
+    current = "---\nname: demo\ndescription: Demo\n---\n\n```bash\npython scripts/main.py '{}'\n```\n"
+    proposal = _proposal(
+        target_file="SKILL.md",
+        old="```bash\npython scripts/main.py '{}'\n```",
+        new="```bash\npython scripts/main.py '{}'",
+    )
+
+    async def fake_request(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return proposal
+
+    monkeypatch.setattr(repair, "_request_repair_diff_proposal", fake_request)
+
+    scope = CreatorRepairScope(phase="test", repair_type="localized_patch", target_file="SKILL.md")
+    with pytest.raises(ValueError, match="hard_format_regression|markdown.fences"):
+        await _request_and_apply_repair_patch(
+            model="test-model",
+            file_path="SKILL.md",
+            current_content=current,
+            failure_text="business failure, not hard format",
+            scope=scope,
+            task_context="ctx",
+            target_rule="rule",
+            patch_retry_limit=3,
+        )
+
+    assert calls == 1
+
+
 def test_old_lines_new_lines_patch_parses_to_exact_replace():
     proposal = _extract_json_or_diff_proposal(
         '{"target_file":"SKILL.md","edits":[{"old_lines":["alpha","beta"],"new_lines":["alpha","BETA"]}]}',

@@ -558,6 +558,36 @@ async def test_generate_file_responsibility_patch_feedback_is_stage_isolated(mon
     assert "stdout" not in feedback
     assert "artifact" not in feedback
     assert "E2E" not in feedback
+    assert "格式" not in feedback
+    assert "字段" not in feedback
+    assert "运行" not in feedback
+    assert "跨文件" not in feedback
+    assert "表达" not in feedback
+
+
+@pytest.mark.asyncio
+async def test_responsibility_prompt_omits_non_responsibility_counterexamples(monkeypatch):
+    captured_messages = []
+    spec = _script_spec(path="scripts/main.py", purpose="complete the requested task")
+
+    async def fake_complete(messages, model):
+        captured_messages.extend(messages)
+        return '{"passed": true, "advisory_notes": []}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+
+    await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'result': payload}\n",
+        skill_plan_entry=spec,
+        requirements=[],
+        review_context={"phase": "RESPONSIBILITY_STAGE", "policy": "只判断当前文件职责是否完成。"},
+    )
+
+    prompt_text = "\n".join(str(message.get("content") or "") for message in captured_messages)
+    assert "只判断当前脚本是否完成自身职责" in prompt_text
+    for forbidden in ["格式", "字段", "argv", "stdout", "artifact", "E2E", "运行", "跨文件", "表达"]:
+        assert forbidden not in prompt_text
 
 
 def test_error_stdout_bypass_cannot_satisfy_expected_outputs():

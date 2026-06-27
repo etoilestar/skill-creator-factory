@@ -1411,33 +1411,6 @@ def _first_round_format_stage_error(
                 ]),
             )
 
-        plan_entry = _skill_plan_entry_for_file(
-            file_path=file_path,
-            role=role,
-            skill_plan_entry=skill_plan_entry,
-        )
-        if getattr(plan_entry, "language", "") == "python":
-            try:
-                ast.parse(content)
-            except SyntaxError as exc:
-                return FileGenerationStageError(
-                    source="format_stage",
-                    layer="script_source_syntax",
-                    detail=f"FORMAT_STAGE failed: source is not parseable for the requested runtime: {exc.msg}",
-                    original=ContractValidationError("FORMAT_STAGE script syntax failed.", [
-                        ContractCheckResult(
-                            id="script.source.syntax",
-                            passed=False,
-                            target=file_path,
-                            message="FORMAT_STAGE failed: candidate source is not parseable.",
-                            expected="Candidate source must parse for the requested runtime.",
-                            minimal_edit="Regenerate the complete current file; do not patch.",
-                            details={"repair_strategy": "full_rewrite", "model_patch_allowed": False},
-                            layer="format_stage",
-                        )
-                    ]),
-                )
-
     return None
 
 
@@ -1775,12 +1748,8 @@ async def generate_file(request: GenerateFileRequest):
                             deterministic_issues=[],
                             requested_model=request.model or route.model,
                             review_context={
-                                "phase": "first_round_no_smoke",
-                                "policy": (
-                                    "第一轮只判断脚本是否完成自身职责；"
-                                    "不检查运行、argv、stdout、artifact、字段名或上下游映射；"
-                                    "这些由第二轮 E2E 负责。"
-                                ),
+                                "phase": "RESPONSIBILITY_STAGE",
+                                "policy": "只判断当前文件职责是否完成。",
                             },
                         )
 
@@ -1809,7 +1778,7 @@ async def generate_file(request: GenerateFileRequest):
                                         or "只修改当前脚本中未完成职责的业务逻辑。"
                                     ),
                                     "allowed_scope": "只允许修改当前脚本职责实现区域。",
-                                    "forbidden_scope": "不得修改 SKILL.md、workflow、字段映射、stdout schema、artifact 或其它脚本。",
+                                    "repair_boundary": "当前文件职责实现区域。",
                                     "details": {"review": responsibility_review},
                                 }],
                                 layer="responsibility",
@@ -2062,11 +2031,9 @@ async def generate_file(request: GenerateFileRequest):
                                 "input/tool result participates in constructed output",
                             ],
                             "minimal_edit": (
-                                "只修改当前文件，让核心输入/工具结果到产物构造/返回的路径更明确；"
-                                "不要为字段名、stdout key 或上下游 schema 做重命名修复。"
+                                "只修改当前文件职责实现区域，让职责证据更明确。"
                             ),
-                            "allowed_scope": "current file only",
-                            "forbidden_scope": "Do not modify SkillPlan, workflow, schemas, other files, or field names only.",
+                            "allowed_scope": "current file responsibility implementation",
                             "details": {"validator_error": deterministic_error},
                         }]
                     stage_error = FileGenerationStageError(

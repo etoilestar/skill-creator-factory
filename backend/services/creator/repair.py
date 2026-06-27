@@ -1753,14 +1753,9 @@ async def _repair_generated_file_with_feedback(
         target_rule = (
             "第一轮单文件修复。\n"
             "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
-            "模型职责校验只负责判断该脚本有没有完成 SkillPlanEntry.purpose / role / capabilities 内的功能责任。\n"
-            "smoke / trial run 才负责判断代码能不能运行、stdout/artifact 是否合规。\n"
-            "如果失败来自模型功能职责校验，你可以修当前脚本中未完成职责的局部逻辑，"
-            "例如 PDF blocks/styles 组装、图片生成/检索参数、表格构造、内容生成调用、工具结果参与输出等。\n"
-            "本轮只修当前脚本的核心责任缺失：让 required inputs 参与核心产物构造，并保证 declared outputs 来自真实 helper result 或构造结果。不要修改 SKILL.md，不要改其它脚本，不要只改字段名，不要删除辅助 stdout metadata。\n"
-            "如果失败来自 smoke/trial run，你只修导致运行失败、stdout 失败或 artifact 失败的局部逻辑。\n"
-            "不要为了绕过试运行而返回空结果或伪造成功。\n"
-            "平台 IO 是否兼容，由后续现有 smoke/sandbox 试运行判断。\n"
+            "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
+            "只使用 selected Tool Registry function cards 中真实存在的 helper；没有可用 helper 时用当前脚本本地逻辑实现职责，不要猜 runtime_tools 函数。\n"
+            "不要只改字段名；不要为了通过校验返回空结果或伪造成功。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
 
@@ -2776,6 +2771,28 @@ def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids:
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
         return False
+    field_interface_markers = (
+        "field_name_mismatch",
+        "input_key_mismatch",
+        "output_key_mismatch",
+        "field name",
+        "input key",
+        "output key",
+        "stdout key",
+        "字段名",
+        "输入 key",
+        "输出 key",
+    )
+    issue_text = " ".join(
+        str(value or "")
+        for value in [
+            item.get("issue_type"),
+            item.get("minimal_edit"),
+            *missing,
+        ]
+    ).lower()
+    if any(marker in issue_text for marker in field_interface_markers):
+        return False
     # Scope is normalized by the backend when producing the repair issue; do
     # not infer blocking from advisory/severity/scope wording.
     return True
@@ -2893,7 +2910,9 @@ def _detect_script_responsibility_static_blockers(
     has_input_read = False
     has_required_key_read = False
     has_tainted_core = False
+    has_core_structure = False
     has_core_output = False
+    has_tool_call = False
 
     def _name(n: ast.AST) -> str:
         if isinstance(n, ast.Name):
@@ -2965,6 +2984,10 @@ def _detect_script_responsibility_static_blockers(
                         core_vars.add(name)
                         if _call_name(node.value):
                             helper_result_vars.add(name)
+            if _is_core_expr(node.value):
+                has_core_structure = True
+            if _call_name(node.value):
+                has_tool_call = True
         elif isinstance(node, ast.AnnAssign):
             value = node.value
             if value is not None and _contains_input_read(value):
@@ -2979,7 +3002,12 @@ def _detect_script_responsibility_static_blockers(
                 name = _name(node.target)
                 if name:
                     core_vars.add(name)
+            if value is not None and _is_core_expr(value):
+                has_core_structure = True
+            if value is not None and _call_name(value):
+                has_tool_call = True
         elif isinstance(node, ast.Call):
+            has_tool_call = True
             if _contains_input_read(node):
                 has_input_read = True
             if _contains_required_literal(node):
@@ -2997,13 +3025,18 @@ def _detect_script_responsibility_static_blockers(
                 has_core_output = True
 
     weak_evidence = has_input_read and (has_required_key_read or has_tainted_core or has_core_output)
-    if weak_evidence or (has_input_read and has_tainted_core and has_core_output):
+    functional_evidence = (
+        (has_input_read or has_required_key_read or has_tool_call)
+        and (has_core_structure or has_tool_call or has_tainted_core)
+        and has_core_output
+    )
+    if weak_evidence or functional_evidence:
         return []
 
     requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), req_items[0].id)
     failed_file = getattr(skill_plan_entry, "path", "") or req_items[0].target_file
     return [{
-        "id": "script_requirement_failed",
+        "id": "semantic_responsibility_missing",
         "requirement_id": requirement_id,
         "failed_file": failed_file,
         "failed_function": "current script",
@@ -3015,12 +3048,189 @@ def _detect_script_responsibility_static_blockers(
     }]
 
 
+def _runtime_tool_contract_static_blockers(
+    script_content: str,
+    skill_plan_entry: SkillPlanEntry,
+    requirements: Any = None,
+) -> list[dict[str, Any]]:
+    """Deterministically validate runtime_tools helper imports/calls.
+
+    This check is intentionally about the tool contract only. It does not
+    validate payload field names, helper argument field names, stdout keys, or
+    downstream interface alignment; those remain E2E responsibilities.
+    """
+    if not str(script_content or "").strip():
+        return []
+    try:
+        tree = ast.parse(script_content or "")
+    except SyntaxError:
+        return []
+
+    runtime_prefix = "backend.services.runtime_tools"
+    imported_helpers: dict[str, str] = {}
+    runtime_module_aliases: dict[str, str] = {}
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = str(node.module or "")
+            if module == runtime_prefix or module.startswith(runtime_prefix + "."):
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    imported_helpers[alias.asname or alias.name] = alias.name
+                    imported_modules.add(module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                name = str(alias.name or "")
+                if name == runtime_prefix or name.startswith(runtime_prefix + "."):
+                    imported_modules.add(name)
+                    runtime_module_aliases[alias.asname or name.rsplit(".", 1)[-1]] = name
+
+    if not imported_helpers and not imported_modules:
+        return []
+
+    selected_tool_names = {
+        str(item or "").strip()
+        for item in (
+            list(getattr(skill_plan_entry, "selected_tools", []) or [])
+            + list(getattr(skill_plan_entry, "required_capabilities", []) or [])
+            + list(getattr(skill_plan_entry, "optional_capabilities", []) or [])
+        )
+        if str(item or "").strip()
+    }
+    allowed_import_paths: set[str] = set()
+    runtime_contract = getattr(skill_plan_entry, "runtime_contract", None)
+    if isinstance(runtime_contract, dict):
+        for key in ("selected_tools", "allowed_tools", "tool_names", "capabilities"):
+            raw = runtime_contract.get(key)
+            if isinstance(raw, list):
+                selected_tool_names.update(str(item or "").strip() for item in raw if str(item or "").strip())
+        raw_imports = runtime_contract.get("allowed_imports")
+        if isinstance(raw_imports, list):
+            for item in raw_imports:
+                value = str(item or "").strip()
+                if not value:
+                    continue
+                if "." in value:
+                    allowed_import_paths.add(value)
+                else:
+                    selected_tool_names.add(value)
+
+    all_caps = list_tool_capabilities()
+    known_tool_names = {str(getattr(cap, "name", "") or "").strip() for cap in all_caps if str(getattr(cap, "name", "") or "").strip()}
+    selected_tool_names = {name for name in selected_tool_names if name in known_tool_names}
+    helper_to_tools: dict[str, set[str]] = {}
+    helper_to_imports: dict[str, set[str]] = {}
+    for cap in all_caps:
+        names = {str(getattr(cap, "name", "") or "").strip()}
+        for value in list(getattr(cap, "helper_imports", []) or []):
+            helper_to_tools.setdefault(str(value), set()).update(names)
+        for fn in list(getattr(cap, "functions", []) or []):
+            function_name = str(getattr(fn, "function_name", "") or "").strip()
+            import_path = str(getattr(fn, "import_path", "") or "").strip()
+            if function_name:
+                helper_to_tools.setdefault(function_name, set()).update(names)
+                if import_path:
+                    helper_to_imports.setdefault(function_name, set()).add(import_path)
+
+    allowed_helpers: set[str] = set()
+    allowlist_present = bool(selected_tool_names or allowed_import_paths)
+    for cap in all_caps:
+        cap_name = str(getattr(cap, "name", "") or "").strip()
+        if cap_name not in selected_tool_names:
+            continue
+        allowed_helpers.update(str(item) for item in (getattr(cap, "helper_imports", []) or []) if str(item))
+        for fn in list(getattr(cap, "functions", []) or []):
+            function_name = str(getattr(fn, "function_name", "") or "").strip()
+            import_path = str(getattr(fn, "import_path", "") or "").strip()
+            if function_name:
+                allowed_helpers.add(function_name)
+            if import_path:
+                allowed_import_paths.add(import_path)
+
+    issues: list[dict[str, Any]] = []
+    req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
+    requirement_id = req_items[0].id if req_items else ""
+    failed_file = getattr(skill_plan_entry, "path", "") or (req_items[0].target_file if req_items else "")
+
+    for local_name, helper_name in sorted(imported_helpers.items()):
+        known = helper_name in helper_to_tools
+        helper_imports = helper_to_imports.get(helper_name) or set()
+        actual_import_ok = not helper_imports or any(module in helper_imports for module in imported_modules)
+        allowed = (
+            not allowlist_present
+            or helper_name in allowed_helpers
+            or bool(helper_imports & allowed_import_paths)
+            or any(module in allowed_import_paths for module in imported_modules)
+        )
+        if not known or not actual_import_ok or not allowed:
+            issues.append({
+                "id": "tool_contract_mismatch",
+                "requirement_id": requirement_id,
+                "failed_file": failed_file,
+                "failed_function": local_name,
+                "code_region": f"runtime_tools import/call: {helper_name}",
+                "reason": (
+                    "Imported runtime helper is not present in the Tool Registry."
+                    if not known or not actual_import_ok
+                    else "Imported runtime helper is not allowed by selected tools / allowed imports."
+                ),
+                "missing_evidence": ["valid runtime helper allowed by selected_tools/allowed_imports/tool registry"],
+                "minimal_edit": "Use only a real helper supplied by the selected Tool Registry function cards, or implement the responsibility without guessing runtime_tools helpers.",
+                "allowed_scope": "current script only",
+                "details": {
+                    "helper": helper_name,
+                    "selected_tools": sorted(selected_tool_names),
+                    "allowed_imports": sorted(allowed_import_paths),
+                    "known_tools": sorted(helper_to_tools.get(helper_name) or []),
+                },
+            })
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if not isinstance(node.func.value, ast.Name) or node.func.value.id not in runtime_module_aliases:
+            continue
+        helper_name = str(node.func.attr or "")
+        known = helper_name in helper_to_tools
+        helper_imports = helper_to_imports.get(helper_name) or set()
+        module_name = next((module for alias, module in runtime_module_aliases.items() if alias == node.func.value.id), "")
+        allowed = (
+            not allowlist_present
+            or helper_name in allowed_helpers
+            or bool(helper_imports & allowed_import_paths)
+            or bool(module_name and module_name in allowed_import_paths)
+        )
+        if not known or not allowed:
+            issues.append({
+                "id": "tool_contract_mismatch",
+                "requirement_id": requirement_id,
+                "failed_file": failed_file,
+                "failed_function": helper_name,
+                "code_region": f"runtime_tools call: {node.func.value.id}.{helper_name}",
+                "reason": (
+                    "Called runtime helper is not present in the Tool Registry."
+                    if not known
+                    else "Called runtime helper is not allowed by selected tools / allowed imports."
+                ),
+                "missing_evidence": ["valid runtime helper allowed by selected_tools/allowed_imports/tool registry"],
+                "minimal_edit": "Use only a real helper supplied by the selected Tool Registry function cards, or implement the responsibility without guessing runtime_tools helpers.",
+                "allowed_scope": "current script only",
+                "details": {
+                    "helper": helper_name,
+                    "selected_tools": sorted(selected_tool_names),
+                    "allowed_imports": sorted(allowed_import_paths),
+                    "known_tools": sorted(helper_to_tools.get(helper_name) or []),
+                },
+            })
+    return issues
+
+
 def detect_error_stdout_bypass(script_content: str, requirements: list[RequirementItem], expected_outputs: list[str] | None = None) -> list[dict[str, Any]]:
     if not requirements:
         return []
     text = str(script_content or "")
     if re.search(r"except\s+Exception[^:]*:([\s\S]{0,500}?)(return|print)\s*\(?\s*\{[^}]*['\"]error['\"]", text):
-        return [{"id": "script_requirement_failed", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
+        return [{"id": "fake_success_or_error_stdout_bypass", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
     return []
 
 
@@ -3153,7 +3363,8 @@ async def _run_script_responsibility_review(
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
-    deterministic_issues = (deterministic_issues or []) + detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
+    deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
+    deterministic_issues += detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
     deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
     review_context = review_context if isinstance(review_context, dict) else {}
 
@@ -3161,7 +3372,7 @@ async def _run_script_responsibility_review(
         return {
             "passed": False,
             "issues": deterministic_issues,
-            "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+            "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
             "failure_type": "script_requirement_failed",
             "model": "deterministic",
         }
@@ -3285,8 +3496,8 @@ async def _run_script_responsibility_review(
                 {
                     "role": "user",
                     "content": (
-                        "上一轮 validator 输出格式不合规或 checks 未覆盖所有 required requirement_id。\n"
-                        "请只重试输出严格 JSON object；不要修改或建议修改脚本；每个 required requirement 必须有一条 checks[]。\n"
+                        "上一轮 validator 输出格式不合规。\n"
+                        "请只重试输出严格 JSON object；不要建议字段名修复。\n"
                         f"上一轮输出片段：{last_text[:1200]}"
                     ),
                 },
@@ -3320,12 +3531,13 @@ async def _run_script_responsibility_review(
         if not isinstance(data, dict) or not data:
             if review_attempt == 0:
                 continue
-            static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+            static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
+            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 return {
                     "passed": False,
                     "issues": static_blockers,
-                    "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
                     "failure_type": "script_requirement_failed",
                     "model": "deterministic",
                 }
@@ -3355,23 +3567,25 @@ async def _run_script_responsibility_review(
                 continue
             if not parsed_review.get("passed"):
                 if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                    static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+                    static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
+                    static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
                     if static_blockers:
                         return {
                             "passed": False,
                             "issues": static_blockers,
-                            "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                            "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
                             "failure_type": "script_requirement_failed",
                             "model": "deterministic",
                             "raw_review": parsed_review.get("raw_review"),
                         }
                 return parsed_review
-            static_blockers = _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+            static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
+            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 return {
                     "passed": False,
                     "issues": static_blockers,
-                    "repair_instructions": "按确定性静态 requirement evidence 检查结果修复当前脚本源码。",
+                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
                     "failure_type": "script_requirement_failed",
                     "model": "deterministic",
                     "raw_review": parsed_review.get("raw_review"),

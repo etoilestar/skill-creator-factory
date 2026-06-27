@@ -955,26 +955,78 @@ def _is_skill_md_finalize_content_patch_failure(failure: dict[str, Any]) -> bool
     """Allow finalize localized patch only for ordinary Markdown content gaps."""
     if not isinstance(failure, dict):
         return False
+    if _is_skill_md_finalize_format_rewrite_failure(failure):
+        return False
     repair_ops = failure.get("repair_ops")
     if isinstance(repair_ops, list) and repair_ops:
         return True
+    failure_id = str(failure.get("id") or "")
     return (
         str(failure.get("layer") or "") == "skill_md_first_round"
-        and str(failure.get("id") or "").endswith(".narrative_quality")
+        and (
+            failure_id.endswith(".narrative_quality")
+            or failure_id.endswith(".reference.mentioned")
+            or failure_id.endswith(".asset.mentioned")
+        )
     )
 
 
-def _split_skill_md_finalize_patch_failures(
+def _is_skill_md_finalize_format_rewrite_failure(failure: dict[str, Any]) -> bool:
+    """Route static SKILL.md document/command shape failures to full regeneration."""
+    if not isinstance(failure, dict):
+        return False
+    failure_id = str(failure.get("id") or "")
+    layer = str(failure.get("layer") or "")
+    details = failure.get("details") if isinstance(failure.get("details"), dict) else {}
+    if details.get("repair_strategy") == "full_rewrite" or details.get("model_patch_allowed") is False:
+        return True
+    if failure_id.startswith("skill_md.command_block."):
+        return True
+    if "json_argv" in failure_id or "shell_command" in failure_id:
+        return True
+    return layer == "hard_format"
+
+
+def _split_skill_md_finalize_failures(
     failures: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    format_rewrite: list[dict[str, Any]] = []
     patchable: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     for failure in failures:
-        if _is_skill_md_finalize_content_patch_failure(failure):
+        if _is_skill_md_finalize_format_rewrite_failure(failure):
+            format_rewrite.append(failure)
+        elif _is_skill_md_finalize_content_patch_failure(failure):
             patchable.append(failure)
         else:
             deferred.append(failure)
-    return patchable, deferred
+    return format_rewrite, patchable, deferred
+
+
+def _build_skill_md_finalize_full_rewrite_messages(
+    *,
+    prompt_messages: list[dict[str, str]],
+    skill_name: str,
+    content: str,
+    failures: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        *prompt_messages,
+        {
+            "role": "user",
+            "content": (
+                "上一版 SKILL.md 的静态文档结构不可稳定使用，请重新输出完整 SKILL.md。\n"
+                "不要输出 patch、JSON 或解释。\n\n"
+                "失败项 JSON：\n"
+                f"{json.dumps(failures, ensure_ascii=False, indent=2, default=str)}\n\n"
+                f"Skill 名称：{skill_name}\n\n"
+                "上一版内容：\n"
+                "<<<CURRENT_SKILL_MD\n"
+                f"{content}\n"
+                "CURRENT_SKILL_MD\n"
+            ),
+        },
+    ]
 
 
 async def _repair_skill_md_model_finalizer(
@@ -1172,7 +1224,30 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                 break
 
-            patchable_failures, deferred_failures = _split_skill_md_finalize_patch_failures(failures)
+            format_rewrite_failures, patchable_failures, deferred_failures = _split_skill_md_finalize_failures(failures)
+            if format_rewrite_failures:
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "format_full_rewrite",
+                    "failures": format_rewrite_failures,
+                })
+                rewrite_messages = _build_skill_md_finalize_full_rewrite_messages(
+                    prompt_messages=prompt_messages,
+                    skill_name=skill_name,
+                    content=content,
+                    failures=format_rewrite_failures,
+                )
+                candidate = await _complete_creator_file_generation(
+                    messages=rewrite_messages,
+                    model=route.model,
+                    skill_name=skill_name,
+                    file_path="SKILL.md",
+                    prompt_variant="finalize_format_full_rewrite",
+                    retry_index=attempt - 1,
+                )
+                continue
+
             if not patchable_failures:
                 repair_events.append({
                     "attempt": attempt,

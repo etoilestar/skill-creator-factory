@@ -597,14 +597,17 @@ def test_error_stdout_bypass_cannot_satisfy_expected_outputs():
 
 
 @pytest.mark.asyncio
-async def test_finalize_skill_md_command_failures_are_deferred_without_patch(monkeypatch, tmp_path):
+async def test_finalize_skill_md_command_failures_trigger_full_rewrite_not_patch(monkeypatch, tmp_path):
     from backend.config import settings
     from backend.services.creator import api
     from backend.services.creator.common import FinalizeSkillMdRequest
 
     monkeypatch.setattr(settings, "skills_path", tmp_path)
 
+    generation_calls = []
+
     async def fake_complete_creator_file_generation(**_kwargs):
+        generation_calls.append(_kwargs)
         return "---\nname: demo-skill\ndescription: demo\n---\n# Demo\n"
 
     async def fail_repair(**_kwargs):
@@ -628,7 +631,8 @@ async def test_finalize_skill_md_command_failures_are_deferred_without_patch(mon
 
     assert result["validation_status"] == "needs_repair"
     assert result["editable"] is True
-    assert result["repair_events"][0]["patch_status"] == "deferred_non_content_failures"
+    assert len(generation_calls) > 1
+    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
 
 
 @pytest.mark.asyncio
@@ -661,6 +665,122 @@ async def test_repair_skill_md_model_finalizer_targets_only_markdown_content(mon
     for forbidden in ["command", "argv", "bash", "JSON argv", "fenced", "single_command", "signature_parseable"]:
         assert forbidden not in combined
     assert captured["patch_retry_limit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_reference_mentioned_uses_content_patch(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    repair_calls = []
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "---\nname: demo-skill\ndescription: demo\n---\n# Demo\n"
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        repair_calls.append(kwargs)
+        return kwargs["previous_content"] + "\n参考资料说明。\n"
+
+    reviews = iter([
+        [{
+            "id": "skill_md.reference.mentioned",
+            "target": "references/guide.md",
+            "layer": "skill_md_first_round",
+            "message": "reference is not described",
+            "minimal_edit": "add ordinary reference explanation",
+        }],
+        [],
+    ])
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_skill_md_first_round_failures", lambda **_kwargs: next(reviews))
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    async def noop_blueprint_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", noop_blueprint_alignment)
+
+    result = await api.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="demo",
+        blueprint_text="demo",
+    ))
+
+    assert repair_calls
+    combined = repair_calls[0]["validation_error"] + repair_calls[0]["targeted_repair"]
+    assert "reference is not described" in combined
+    for forbidden in ["command", "argv", "bash", "JSON argv"]:
+        assert forbidden not in combined
+    assert result["validation_status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_command_failure_precedes_reference_patch(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    generation_calls = []
+    repair_calls = []
+    failure_rounds = iter([
+        [
+            {
+                "id": "skill_md.command_block.json_argv_object",
+                "target": "scripts/main.py",
+                "layer": "skill_md_first_round",
+                "message": "command shape failed",
+                "minimal_edit": "rewrite",
+            },
+            {
+                "id": "skill_md.reference.mentioned",
+                "target": "references/guide.md",
+                "layer": "skill_md_first_round",
+                "message": "reference is not described",
+                "minimal_edit": "add ordinary reference explanation",
+            },
+        ],
+        [
+            {
+                "id": "skill_md.reference.mentioned",
+                "target": "references/guide.md",
+                "layer": "skill_md_first_round",
+                "message": "reference is not described",
+                "minimal_edit": "add ordinary reference explanation",
+            }
+        ],
+        [],
+    ])
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        generation_calls.append(kwargs)
+        return "---\nname: demo-skill\ndescription: demo\n---\n# Demo\n"
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        repair_calls.append(kwargs)
+        return kwargs["previous_content"] + "\n参考资料说明。\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_skill_md_first_round_failures", lambda **_kwargs: next(failure_rounds))
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    async def noop_blueprint_alignment(**_kwargs):
+        return None
+
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", noop_blueprint_alignment)
+
+    result = await api.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="demo",
+        blueprint_text="demo",
+    ))
+
+    assert len(generation_calls) == 2
+    assert repair_calls
+    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
+    assert "command shape failed" not in repair_calls[0]["validation_error"]
+    assert result["validation_status"] == "passed"
 
 
 @pytest.mark.asyncio

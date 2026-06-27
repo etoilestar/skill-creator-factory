@@ -669,7 +669,7 @@ def _repair_mode_for_first_round(*, source: str, file_path: str, attempt: int) -
 
     不再存在 script_smoke。
     """
-    if source in {"script_functional", "script_responsibility"} and file_path.startswith("scripts/"):
+    if source in {"script_functional", "script_responsibility", "script_requirement_failed"} and file_path.startswith("scripts/"):
         return "localized_patch"
 
     if attempt >= 2 and file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(source):
@@ -951,6 +951,32 @@ def _skill_md_first_round_failures(
     return failures
 
 
+def _is_skill_md_finalize_content_patch_failure(failure: dict[str, Any]) -> bool:
+    """Allow finalize localized patch only for ordinary Markdown content gaps."""
+    if not isinstance(failure, dict):
+        return False
+    repair_ops = failure.get("repair_ops")
+    if isinstance(repair_ops, list) and repair_ops:
+        return True
+    return (
+        str(failure.get("layer") or "") == "skill_md_first_round"
+        and str(failure.get("id") or "").endswith(".narrative_quality")
+    )
+
+
+def _split_skill_md_finalize_patch_failures(
+    failures: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    patchable: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for failure in failures:
+        if _is_skill_md_finalize_content_patch_failure(failure):
+            patchable.append(failure)
+        else:
+            deferred.append(failure)
+    return patchable, deferred
+
+
 async def _repair_skill_md_model_finalizer(
     *,
     previous_content: str,
@@ -960,32 +986,19 @@ async def _repair_skill_md_model_finalizer(
     skill_name: str,
     attempt: int,
 ) -> str:
-    """Repair SKILL.md by exact_replace patch, not full regeneration."""
+    """Repair ordinary SKILL.md Markdown content gaps by exact_replace patch."""
 
     failures_text = json.dumps(failures, ensure_ascii=False, indent=2, default=str)
 
     validation_error = (
-        "SKILL.md 合同/责任/蓝图对齐校验未通过。"
-        "本轮只能对上一版 SKILL.md 做局部 patch 修复，不能重新生成完整文件。\n\n"
-        "注意：Markdown 基础格式错误不会进入本函数，已经由整文件重写阶段处理。\n\n"
+        "SKILL.md 普通内容责任缺失，需要做局部 patch。\n"
         "失败项 JSON：\n"
         f"{failures_text}"
     )
 
     targeted_repair = (
-        "只修复 failures 指向的 target/layer/minimal_edit 对应区域。"
-        "未被 failures 指向的 frontmatter、章节、脚本说明、bash fenced block、资源说明、最终产物说明必须保持。"
-        "不得重排整篇文档，不得新增蓝图外脚本、reference、asset 或能力。"
-        "如果失败是资源提及问题，只在已有资源说明附近补充缺失路径。"
-        "\n\n"
-        "如果失败涉及 command_block、fenced block、single_command、signature_parseable、json_argv_object、"
-        "命令块、bash block 或脚本调用格式："
-        "只修改对应的 ```bash fenced block。"
-        "bash block 内必须是一条真实可执行 shell 命令，且能解析出 runner、真实 scripts/*.py 路径、一个 JSON object argv 参数。"
-        "JSON argv 的 key/value 由当前脚本接口和 workflow 自洽决定；不要固定套用某组字段名。"
-        "禁止在 bash block 中保留 JSON 配置对象、伪命令对象、说明文字、列表或多条命令。"
-        "如果当前 block 是 JSON 伪命令，只把该 block 改成等价的真实脚本调用命令，不要重写其它章节。"
-        "\n\n"
+        "只修复 failures 指向的普通 Markdown 说明内容缺失。"
+        "未被 failures 指向的内容必须保持。"
         "不要输出完整 SKILL.md，只输出 exact_replace patch。"
     )
 
@@ -997,13 +1010,13 @@ async def _repair_skill_md_model_finalizer(
         validation_error=validation_error,
         targeted_repair=targeted_repair,
         contract_text=(
-            "SKILL.md 是主 Skill 说明文档，必须保持蓝图意图、真实脚本顺序、资源说明和最终输出说明一致。"
-            "所有 scripts/*.py 必须通过真实可执行 bash 命令调用，不能使用 JSON 伪命令块。"
+            "SKILL.md 是主 Skill 说明文档；本轮只补普通 Markdown 说明内容。"
         ),
         passed_checks_text="",
         failed_checks_text=failures_text,
         repair_mode="localized_patch",
         skill_plan_entry=None,
+        patch_retry_limit=1,
     )
 
 
@@ -1159,16 +1172,27 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                 break
 
-            # 非格式错误继续走原来的局部 diff。
+            patchable_failures, deferred_failures = _split_skill_md_finalize_patch_failures(failures)
+            if not patchable_failures:
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "deferred_non_content_failures",
+                    "failures": failures,
+                })
+                break
+
             try:
                 candidate = await _repair_skill_md_model_finalizer(
                     previous_content=content,
-                    failures=failures,
+                    failures=patchable_failures,
                     prompt_messages=prompt_messages,
                     model=route.model,
                     skill_name=skill_name,
                     attempt=attempt,
                 )
+                if deferred_failures:
+                    previous_remaining_failures = deferred_failures
             except CreatorRepairProposalParseError as parse_exc:
                 repair_events.append({
                     "attempt": attempt,
@@ -1179,7 +1203,8 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "diff_extraction_attempted": parse_exc.diff_extraction_attempted,
                     "old_lines_new_lines_fallback_attempted": parse_exc.lines_fallback_attempted,
                 })
-                raise
+                failures = failures or patchable_failures
+                break
 
         except Exception as exc:
             logger.exception(
@@ -1287,7 +1312,7 @@ _SCRIPT_RAW_SOURCE_FORMAT_ERROR_IDS = {
 
 def is_script_raw_source_format_error(stage_error: FileGenerationStageError) -> bool:
     """Route scripts/* raw-source structure failures to regeneration only."""
-    if getattr(stage_error, "source", "") not in {"content_review", "script_raw_source"}:
+    if getattr(stage_error, "source", "") not in {"content_review", "script_raw_source", "format_stage"}:
         return False
     original = getattr(stage_error, "original", None)
     if isinstance(original, ContractValidationError):
@@ -1297,21 +1322,121 @@ def is_script_raw_source_format_error(stage_error: FileGenerationStageError) -> 
 
 
 def is_generation_format_error(stage_error: FileGenerationStageError) -> bool:
-    return is_script_raw_source_format_error(stage_error)
+    return is_script_raw_source_format_error(stage_error) or (
+        getattr(stage_error, "source", "") == "format_stage"
+        and _stage_error_has_full_format_rewrite_contract(stage_error)
+    )
+
+
+def _result_requires_full_format_rewrite(result: Any) -> bool:
+    """Detect structured first-step format failures without matching prose/id text."""
+    if isinstance(result, ContractCheckResult):
+        if result.passed:
+            return False
+        details = result.details if isinstance(result.details, dict) else {}
+        severity = str(details.get("severity") or "").strip()
+        repair_strategy = str(details.get("repair_strategy") or "").strip()
+        model_patch_allowed = details.get("model_patch_allowed")
+        return (
+            result.layer == "hard_format"
+            or severity == "hard_format"
+            or repair_strategy == "full_rewrite"
+            or model_patch_allowed is False
+        )
+
+    if isinstance(result, dict):
+        if result.get("passed") is True:
+            return False
+        return (
+            str(result.get("layer") or "").strip() == "hard_format"
+            or str(result.get("severity") or "").strip() == "hard_format"
+            or str(result.get("repair_strategy") or "").strip() == "full_rewrite"
+            or result.get("model_patch_allowed") is False
+        )
+
+    return False
+
+
+def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationStageError) -> bool:
+    original = getattr(stage_error, "original", None)
+    if isinstance(original, ContractValidationError):
+        return any(_result_requires_full_format_rewrite(result) for result in original.results)
+
+    detail = str(getattr(stage_error, "detail", "") or "").strip()
+    if not detail:
+        return False
+    try:
+        parsed = json.loads(detail)
+    except Exception:
+        return False
+    items = parsed if isinstance(parsed, list) else [parsed]
+    return any(_result_requires_full_format_rewrite(item) for item in items)
 
 
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
         return True
-    detail = str(getattr(stage_error, "detail", "") or "")
-    return (
-        "markdown.fences.unclosed" in detail
-        or "markdown.fences.bash_unclosed" in detail
-        or "markdown.frontmatter.unclosed" in detail
-        or '"severity": "hard_format"' in detail
-        or '"repair_strategy": "full_rewrite"' in detail
-        or '"model_patch_allowed": false' in detail
-    )
+    return _stage_error_has_full_format_rewrite_contract(stage_error)
+
+
+def _first_round_format_stage_error(
+    *,
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> FileGenerationStageError | None:
+    """FORMAT_STAGE: decide only whether candidate is legal content for file_path.
+
+    This stage runs before any responsibility review.  Failures returned here
+    must be handled by full current-file regeneration, not patch repair.
+    """
+    if not str(content or "").strip():
+        return FileGenerationStageError(
+            source="format_stage",
+            layer="format_stage",
+            detail="FORMAT_STAGE failed: generated candidate is empty.",
+        )
+
+    if (
+        file_path == "SKILL.md"
+        or file_path.startswith("references/")
+        or Path(file_path).suffix.lower() in {".md", ".markdown"}
+    ):
+        format_failures = detect_markdown_hard_format_failures(
+            file_path,
+            content,
+            require_frontmatter=(file_path == "SKILL.md"),
+        )
+        if format_failures:
+            return FileGenerationStageError(
+                source="hard_format",
+                layer="hard_format",
+                detail=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
+            )
+
+    if file_path.startswith("scripts/"):
+        raw_source_error_id = script_raw_source_candidate_error_id(content)
+        if raw_source_error_id:
+            return FileGenerationStageError(
+                source="format_stage",
+                layer="script_raw_source",
+                detail=raw_source_error_id,
+                original=ContractValidationError("FORMAT_STAGE script source structure failed.", [
+                    ContractCheckResult(
+                        id=raw_source_error_id,
+                        passed=False,
+                        target=file_path,
+                        message="FORMAT_STAGE failed: candidate is not a single raw script source file.",
+                        expected="Candidate must be one complete source file for the requested path.",
+                        minimal_edit="Regenerate the complete current file; do not patch.",
+                        details={"repair_strategy": "full_rewrite", "model_patch_allowed": False},
+                        layer="format_stage",
+                    )
+                ]),
+            )
+
+    return None
 
 
 def _build_markdown_format_full_rewrite_prompt(
@@ -1552,37 +1677,18 @@ async def generate_file(request: GenerateFileRequest):
                     purpose=request.purpose,
                 )
 
+                content = candidate
+
+                format_stage_error = _first_round_format_stage_error(
+                    file_path=request.file_path,
+                    content=content,
+                    role=request.role,
+                    skill_plan_entry=effective_skill_plan_entry,
+                )
+                if format_stage_error is not None:
+                    raise format_stage_error
+
                 try:
-                    content = candidate
-
-                    # 阶段 1：Markdown 基础格式错误最早判断。
-                    # 模型回复已在 loop 开始处 canonicalize；后续 review /
-                    # repair / SSE 统一只使用 canonical candidate。
-                    if (
-                            request.file_path == "SKILL.md"
-                            or request.file_path.startswith("references/")
-                            or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
-                    ):
-                        format_failures = detect_markdown_hard_format_failures(
-                            request.file_path,
-                            content,
-                            require_frontmatter=(
-                                    request.file_path == "SKILL.md"
-                            ),
-                        )
-                        if format_failures:
-                            raise FileGenerationStageError(
-                                source="hard_format",
-                                layer="hard_format",
-                                detail=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
-                            )
-
-                    if not content.strip():
-                        raise FileGenerationStageError(
-                            source="content_review",
-                            layer="content_empty",
-                            detail=f"{request.file_path} 生成内容为空。",
-                        )
 
                     if request.file_path == "SKILL.md":
                         _raise_file_contract_failures(validate_file_contract(
@@ -1633,27 +1739,10 @@ async def generate_file(request: GenerateFileRequest):
                         _raise_file_contract_failures(reference_results)
 
                     elif request.file_path.startswith("scripts/"):
-                        raw_source_error_id = script_raw_source_candidate_error_id(content)
-                        if raw_source_error_id:
-                            _raise_file_contract_failures([
-                                ContractCheckResult(
-                                    id=raw_source_error_id,
-                                    passed=False,
-                                    target=request.file_path,
-                                    message=f"{request.file_path} 不是单一纯脚本源码候选，必须重新生成。",
-                                    expected="只输出完整单文件脚本源码；不要 Markdown fence、说明文字、多个代码块、多个版本或多文件包。",
-                                    minimal_edit="重新生成完整单文件脚本源码；不要对旧内容做 patch 或局部修复。",
-                                )
-                            ])
-                        _raise_file_contract_failures(_check_script_content_review_contract(
-                            request.file_path,
-                            content,
-                            role=request.role,
-                            skill_plan_entry=effective_skill_plan_entry,
-                        ))
+                        pass
 
                 except Exception as exc:
-                    raise _stage_error_from_exception("content_review", exc, default_layer="content_review") from exc
+                    raise _stage_error_from_exception("responsibility_stage", exc, default_layer="responsibility_stage") from exc
 
                 if request.file_path.startswith("scripts/"):
                     try:
@@ -1684,12 +1773,8 @@ async def generate_file(request: GenerateFileRequest):
                             deterministic_issues=[],
                             requested_model=request.model or route.model,
                             review_context={
-                                "phase": "first_round_no_smoke",
-                                "policy": (
-                                    "第一轮只判断脚本是否完成自身职责；"
-                                    "不检查运行、argv、stdout、artifact、字段名或上下游映射；"
-                                    "这些由第二轮 E2E 负责。"
-                                ),
+                                "phase": "RESPONSIBILITY_STAGE",
+                                "policy": "只判断当前文件职责是否完成。",
                             },
                         )
 
@@ -1718,7 +1803,7 @@ async def generate_file(request: GenerateFileRequest):
                                         or "只修改当前脚本中未完成职责的业务逻辑。"
                                     ),
                                     "allowed_scope": "只允许修改当前脚本职责实现区域。",
-                                    "forbidden_scope": "不得修改 SKILL.md、workflow、字段映射、stdout schema、artifact 或其它脚本。",
+                                    "repair_boundary": "当前文件职责实现区域。",
                                     "details": {"review": responsibility_review},
                                 }],
                                 layer="responsibility",
@@ -1971,11 +2056,9 @@ async def generate_file(request: GenerateFileRequest):
                                 "input/tool result participates in constructed output",
                             ],
                             "minimal_edit": (
-                                "只修改当前文件，让核心输入/工具结果到产物构造/返回的路径更明确；"
-                                "不要为字段名、stdout key 或上下游 schema 做重命名修复。"
+                                "只修改当前文件职责实现区域，让职责证据更明确。"
                             ),
-                            "allowed_scope": "current file only",
-                            "forbidden_scope": "Do not modify SkillPlan, workflow, schemas, other files, or field names only.",
+                            "allowed_scope": "current file responsibility implementation",
                             "details": {"validator_error": deterministic_error},
                         }]
                     stage_error = FileGenerationStageError(
@@ -2138,34 +2221,49 @@ async def generate_file(request: GenerateFileRequest):
                 })
 
                 try:
-                    validator_report = await _run_generated_file_validator_round(
-                        file_path=request.file_path,
-                        content=candidate,
-                        deterministic_error=deterministic_error,
-                        requested_model=route.model,
-                        targeted_repair=targeted_repair,
-                        contract_text=contract_text,
-                        passed_checks_text=passed_checks_text,
-                        failed_checks_text=failed_checks_text,
-                        repair_mode=("strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
-                            source=error_source,
-                            file_path=request.file_path,
-                            attempt=attempt,
-                        )),
-                    )
-
-                    feedback = _format_file_validator_feedback(
-                        deterministic_error,
-                        validator_report,
-                        targeted_repair=targeted_repair,
-                        file_path=request.file_path,
-                    )
-
                     repair_mode = "strict_patch" if repeated_same_failure else _repair_mode_for_first_round(
                         source=error_source,
                         file_path=request.file_path,
                         attempt=attempt,
                     )
+
+                    if (
+                        error_source in {"script_requirement_failed", "script_functional", "script_responsibility"}
+                        and request.file_path.startswith("scripts/")
+                    ):
+                        responsibility_issues = []
+                        original_exc = stage_error.original
+                        if isinstance(original_exc, ScriptFunctionalValidationError):
+                            responsibility_issues = original_exc.issues
+                        feedback = (
+                            "RESPONSIBILITY_PATCH_STAGE\n"
+                            "只根据 RESPONSIBILITY_STAGE 明确给出的当前文件职责缺失做最小修改。\n\n"
+                            "当前文件职责缺失说明：\n"
+                            f"{json.dumps(responsibility_issues, ensure_ascii=False, indent=2, default=str)}"
+                        )
+                        passed_checks_text = ""
+                        failed_checks_text = ""
+                        contract_text = ""
+                        targeted_repair = "只在当前文件内做满足职责缺失的最小功能实现修改。"
+                    else:
+                        validator_report = await _run_generated_file_validator_round(
+                            file_path=request.file_path,
+                            content=candidate,
+                            deterministic_error=deterministic_error,
+                            requested_model=route.model,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
+                        )
+
+                        feedback = _format_file_validator_feedback(
+                            deterministic_error,
+                            validator_report,
+                            targeted_repair=targeted_repair,
+                            file_path=request.file_path,
+                        )
 
                     repaired_candidate = await _repair_generated_file_with_feedback(
                         prompt_messages=prompt_messages,

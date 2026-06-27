@@ -596,6 +596,60 @@ def test_error_stdout_bypass_cannot_satisfy_expected_outputs():
     assert issues and issues[0]["requirement_id"] == req.id
 
 
+@pytest.mark.parametrize(
+    ("argv_template", "passed"),
+    [
+        ('{"descriptions":{{illustration_descriptions}}}', True),
+        ('{"image_paths":{{image_paths}}}', True),
+        ('{"topic":"{{user_request}}"}', True),
+        ('{"x":{{bad syntax}}}', False),
+        ('{"x":{{value}}', False),
+    ],
+)
+def test_skill_md_command_args_parseable_accepts_json_value_placeholders(argv_template, passed):
+    from backend.services.creator.contracts import _validate_command_is_single_shell_json_invocation
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(
+        file_path="scripts/main.py",
+        purpose="role: generic_script inputs: payload outputs: result",
+    )
+    results = _validate_command_is_single_shell_json_invocation(
+        command=f"python scripts/main.py '{argv_template}'",
+        script_path="scripts/main.py",
+        entry=entry,
+    )
+    args_check = next(result for result in results if result.id == "skill_md.command_block.args_parseable")
+
+    assert args_check.passed is passed
+
+
+def test_valid_templated_json_argv_does_not_enter_finalize_format_rewrite():
+    from backend.services.creator import api
+    from backend.services.creator.contracts import _validate_command_is_single_shell_json_invocation
+    from backend.services.skill_plan import build_skill_plan_entry
+
+    entry = build_skill_plan_entry(file_path="scripts/main.py", purpose="role: generic_script")
+    results = _validate_command_is_single_shell_json_invocation(
+        command='python scripts/main.py \'{"image_paths":{{image_paths}}}\'',
+        script_path="scripts/main.py",
+        entry=entry,
+    )
+    failed = [
+        {
+            "id": result.id,
+            "layer": result.layer,
+            "details": result.details,
+        }
+        for result in results
+        if not result.passed
+    ]
+    format_rewrite, _content_patch, _deferred = api._split_skill_md_finalize_failures(failed)
+
+    assert not any(result.id == "skill_md.command_block.args_parseable" and not result.passed for result in results)
+    assert format_rewrite == []
+
+
 @pytest.mark.asyncio
 async def test_finalize_skill_md_command_failures_trigger_full_rewrite_not_patch(monkeypatch, tmp_path):
     from backend.config import settings

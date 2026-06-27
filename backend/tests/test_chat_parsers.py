@@ -2398,9 +2398,7 @@ print('ok')
     assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
 
 
-def test_creator_sanitize_rejects_multiple_prose_wrapped_script_fences():
-    import pytest
-
+def test_creator_sanitize_preserves_multiple_prose_wrapped_script_fences_for_regeneration():
     from backend.routers.creator import _sanitize_generated_file_content
 
     content = """候选一：
@@ -2413,31 +2411,10 @@ print('two')
 ```
 """
 
-    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+    assert _sanitize_generated_file_content("scripts/main.py", content) == content.strip()
 
 
-def test_creator_sanitize_rejects_multiple_prose_wrapped_script_fences():
-    import pytest
-
-    from backend.routers.creator import _sanitize_generated_file_content
-
-    content = """候选一：
-```python
-print('one')
-```
-候选二：
-```python
-print('two')
-```
-"""
-
-    with pytest.raises(ValueError, match="Markdown 代码块"):
-        _sanitize_generated_file_content("scripts/main.py", content)
-
-
-def test_creator_sanitize_rejects_labeled_multifile_bundle():
-    import pytest
-
+def test_creator_sanitize_preserves_labeled_multifile_bundle_for_regeneration():
     from backend.routers.creator import _sanitize_generated_file_content
 
     content = """写入文件：scripts/main.py
@@ -2451,8 +2428,7 @@ print('target')
 ```
 """
 
-    with pytest.raises(ValueError, match="Markdown 代码块"):
-        _sanitize_generated_file_content("scripts/main.py", content)
+    assert _sanitize_generated_file_content("scripts/main.py", content) == content.strip()
 
 
 def test_creator_sanitize_accepts_single_wrapping_script_fence():
@@ -2474,23 +2450,20 @@ def test_creator_sanitize_accepts_text_wrapped_script_fence():
     )
 
 
-def test_creator_sanitize_accepts_nested_whole_response_script_fences():
+def test_creator_sanitize_preserves_nested_whole_response_script_fences_for_regeneration():
     from backend.routers.creator import _sanitize_generated_file_content
 
     content = "```text\n```python\nprint('ok')\n```\n```"
 
-    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('ok')"
+    assert _sanitize_generated_file_content("scripts/main.py", content) == content
 
 
-def test_creator_sanitize_rejects_invalid_wrapping_script_fence():
-    import pytest
-
+def test_creator_sanitize_extracts_single_wrapping_script_fence_before_syntax_review():
     from backend.routers.creator import _sanitize_generated_file_content
 
     content = "```python\nprint('unterminated'\n```"
 
-    with pytest.raises(ValueError, match="合法 Python 源码|Markdown 代码块"):
-        _sanitize_generated_file_content("scripts/main.py", content)
+    assert _sanitize_generated_file_content("scripts/main.py", content) == "print('unterminated'"
 
 def test_creator_script_repair_output_format_error_uses_retry_budget(monkeypatch):
     import asyncio
@@ -2655,56 +2628,52 @@ def test_creator_script_raw_source_failure_short_circuits_syntax_check():
     assert results[0].passed is False
 
 
-def test_creator_script_repair_normalizes_fenced_model_response(monkeypatch):
+def test_creator_script_repair_rejects_noncanonical_raw_source(monkeypatch):
     import asyncio
 
     from backend.routers import creator
-
-    async def fake_complete_chat_once(_messages, _model):
-        return "```python\nimport json\nprint(json.dumps({'ok': True}))\n```"
-
-    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
-
-    repaired = asyncio.run(creator._repair_generated_file_with_feedback(
-        prompt_messages=[{"role": "system", "content": "generate file"}],
-        model="code-model",
-        file_path="scripts/generate_love_story.py",
-        previous_content="```python\nprint('bad')\n```",
-        validation_error="script.raw_source.single_file",
-        repair_mode="minimal_edit",
-    ))
-
-    assert repaired == "import json\nprint(json.dumps({'ok': True}))"
+    with pytest.raises(ValueError, match="must not enter repair_patch"):
+        asyncio.run(creator._repair_generated_file_with_feedback(
+            prompt_messages=[{"role": "system", "content": "generate file"}],
+            model="code-model",
+            file_path="scripts/generate_love_story.py",
+            previous_content="```python\nprint('bad')\n```",
+            validation_error="script.raw_source.single_file",
+            repair_mode="minimal_edit",
+        ))
 
 
-def test_creator_script_strict_rewrite_uses_extracted_candidate_not_fenced_draft(monkeypatch):
+def test_creator_script_strict_rewrite_rejects_fenced_draft(monkeypatch):
     import asyncio
 
     from backend.routers import creator
+    with pytest.raises(ValueError, match="must not enter repair_patch"):
+        asyncio.run(creator._repair_generated_file_with_feedback(
+            prompt_messages=[{"role": "system", "content": "generate file"}],
+            model="code-model",
+            file_path="scripts/generate_love_story.py",
+            previous_content="下面是代码：\n```python\n# scripts/generate_love_story.py\nimport json\nprint(json.dumps({'ok': True}))\n```",
+            validation_error="script.raw_source.single_file",
+            repair_mode="strict_contract_rewrite",
+        ))
 
-    captured_prompts = []
 
-    async def fake_complete_chat_once(messages, _model):
-        captured_prompts.append(messages[-2]["content"])
-        return "import json\nprint(json.dumps({'ok': True}))"
+def test_script_source_candidate_structural_classification():
+    from backend.routers.creator import (
+        _sanitize_generated_file_content,
+        script_raw_source_candidate_error_id,
+    )
 
-    monkeypatch.setattr(creator, "complete_chat_once", fake_complete_chat_once)
+    multi = "```python\nprint('a')\n```\n```python\nprint('b')\n```"
+    prose_multi = "Here is one:\n```python\nprint('a')\n```\nActually:\n```python\nprint('b')\n```"
+    single = "```python\nprint('ok')\n```"
+    raw = "print('ok')\n"
 
-    asyncio.run(creator._repair_generated_file_with_feedback(
-        prompt_messages=[{"role": "system", "content": "generate file"}],
-        model="code-model",
-        file_path="scripts/generate_love_story.py",
-        previous_content="下面是代码：\n```python\n# scripts/generate_love_story.py\nimport json\nprint(json.dumps({'ok': True}))\n```",
-        validation_error="script.raw_source.single_file",
-        repair_mode="strict_contract_rewrite",
-    ))
-
-    previous_prompt = captured_prompts[0]
-    assert "可参考的源码候选" in previous_prompt
-    previous_body = previous_prompt.split("<previous_content>", 1)[1].split("</previous_content>", 1)[0]
-    assert "```" not in previous_body
-    assert "scripts/generate_love_story.py" not in previous_body
-    assert "import json" in previous_body
+    assert script_raw_source_candidate_error_id(multi) == "script.raw_source.ambiguous_multi_code_blocks"
+    assert script_raw_source_candidate_error_id(prose_multi) == "script.raw_source.ambiguous_multi_code_blocks"
+    assert _sanitize_generated_file_content("scripts/demo.py", multi) == multi
+    assert _sanitize_generated_file_content("scripts/demo.py", single) == "print('ok')"
+    assert script_raw_source_candidate_error_id(raw) is None
 
 
 def test_creator_skeleton_uses_role_not_blueprint_global_image_keyword():

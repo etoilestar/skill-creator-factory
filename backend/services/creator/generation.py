@@ -109,6 +109,55 @@ def _extract_first_fenced_block(content: str) -> str | None:
         return None
     return None
 
+def _count_fenced_blocks(content: str) -> int:
+    """Count complete Markdown fenced code blocks using only fence structure."""
+    lines = str(content or "").strip().lstrip("\ufeff").splitlines()
+    count = 0
+    idx = 0
+    while idx < len(lines):
+        opening_match = re.match(r"^\s*(`{3,}|~{3,})[^`~]*\s*$", lines[idx])
+        if not opening_match:
+            idx += 1
+            continue
+        fence = opening_match.group(1)
+        fence_char = fence[0]
+        min_fence_len = len(fence)
+        idx += 1
+        while idx < len(lines):
+            if re.fullmatch(rf"\s*{re.escape(fence_char)}{{{min_fence_len},}}\s*", lines[idx]):
+                count += 1
+                break
+            idx += 1
+        idx += 1
+    return count
+
+
+def script_raw_source_candidate_error_id(content: str) -> str | None:
+    """Return a structural scripts/* raw-source format error id, if any.
+
+    This is intentionally language-agnostic: it only looks at Markdown fence
+    structure and multi-file bundle markers.  It never picks one candidate from
+    an ambiguous model response.
+    """
+    stripped = str(content or "").strip().lstrip("\ufeff")
+    if not stripped:
+        return "script.raw_source.single_file"
+    fenced_count = _count_fenced_blocks(stripped)
+    if fenced_count > 1:
+        return "script.raw_source.ambiguous_multi_code_blocks"
+    if _MULTI_FILE_MARKER_RE.search(stripped) or re.search(r"(?im)^\s*写入文件[:：]", stripped):
+        return "script.raw_source.multi_file_bundle"
+    if fenced_count == 1:
+        body = _extract_only_fenced_block(stripped)
+        if body is None:
+            return "script.raw_source.ambiguous_script_candidate"
+    return None
+
+
+def is_canonical_script_source_candidate(content: str) -> bool:
+    """Return whether content is already a single raw script source candidate."""
+    return script_raw_source_candidate_error_id(content) is None and _is_valid_normalized_script_source("", content)
+
 
 def _drop_common_non_code_lines(text: str) -> str:
     """Remove common chat/file-label prose that models place around scripts."""
@@ -193,6 +242,13 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     """
     if file_path.startswith("scripts/"):
         stripped = content.strip()
+        structural_error = script_raw_source_candidate_error_id(stripped)
+        if structural_error in {
+            "script.raw_source.ambiguous_multi_code_blocks",
+            "script.raw_source.multi_file_bundle",
+            "script.raw_source.ambiguous_script_candidate",
+        }:
+            return stripped
 
         normalized = stripped
         for _ in range(3):
@@ -209,7 +265,7 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
             if _is_valid_normalized_script_source(file_path, normalized):
                 return normalized
 
-        candidate = _strip_orphan_trailing_fence(stripped)
+        candidate = stripped if structural_error else _strip_orphan_trailing_fence(stripped)
         if _is_valid_normalized_script_source(file_path, candidate):
             return candidate
 
@@ -304,7 +360,11 @@ def _sanitize_generated_file_content(
     - 如果这里提前调用 _validate_generated_file_content，会在 frontmatter 修复前误杀；
     - write-file 阶段也不应再次校验，避免前端展示内容与落盘内容不一致。
     """
-    if file_path.startswith("scripts/") and _MULTI_FILE_MARKER_RE.search(content) and _extract_only_fenced_block(content) is None:
+    if file_path.startswith("scripts/") and script_raw_source_candidate_error_id(content) in {
+        "script.raw_source.ambiguous_multi_code_blocks",
+        "script.raw_source.multi_file_bundle",
+        "script.raw_source.ambiguous_script_candidate",
+    }:
         sanitized = content.strip()
     else:
         sanitized = _normalize_generated_file_content(file_path, content)

@@ -1623,6 +1623,17 @@ async def _request_and_apply_repair_patch(
             last_error = exc
             if proposal_signature is not None:
                 failed_proposal_counts[proposal_signature] = failed_proposal_counts.get(proposal_signature, 0) + 1
+            if (
+                (file_path == "SKILL.md" or file_path.startswith("references/") or _is_markdown_file(file_path))
+                and (
+                    "hard_format_regression" in str(exc)
+                    or "markdown.fences.unclosed" in str(exc)
+                    or "markdown.fences.bash_unclosed" in str(exc)
+                    or "markdown.frontmatter.unclosed" in str(exc)
+                    or "model_patch_allowed" in str(exc)
+                )
+            ):
+                raise
             if isinstance(exc, CreatorRepairNoopPatch) or "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
                 break
 
@@ -1716,6 +1727,26 @@ async def _repair_generated_file_with_feedback(
 
     current_content = previous_content or ""
     is_script = file_path.startswith("scripts/")
+
+    if is_script:
+        has_noncanonical_source_shape = (
+            "```" in current_content
+            or "~~~" in current_content
+            or _MULTI_FILE_MARKER_RE.search(current_content) is not None
+        )
+        if has_noncanonical_source_shape or any(
+            error_id in str(validation_error or "")
+            for error_id in {
+                "script.raw_source.single_file",
+                "script.raw_source.ambiguous_multi_code_blocks",
+                "script.raw_source.multi_file_bundle",
+                "script.raw_source.ambiguous_script_candidate",
+            }
+        ):
+            raise ValueError(
+                "scripts/* raw_source format failure must not enter repair_patch; "
+                "regenerate a single canonical script source instead."
+            )
 
     if file_path == "SKILL.md" or file_path.startswith("references/") or Path(file_path).suffix.lower() in {".md", ".markdown"}:
         from .contracts import detect_markdown_hard_format_failures

@@ -951,6 +951,32 @@ def _skill_md_first_round_failures(
     return failures
 
 
+def _is_skill_md_finalize_content_patch_failure(failure: dict[str, Any]) -> bool:
+    """Allow finalize localized patch only for ordinary Markdown content gaps."""
+    if not isinstance(failure, dict):
+        return False
+    repair_ops = failure.get("repair_ops")
+    if isinstance(repair_ops, list) and repair_ops:
+        return True
+    return (
+        str(failure.get("layer") or "") == "skill_md_first_round"
+        and str(failure.get("id") or "").endswith(".narrative_quality")
+    )
+
+
+def _split_skill_md_finalize_patch_failures(
+    failures: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    patchable: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for failure in failures:
+        if _is_skill_md_finalize_content_patch_failure(failure):
+            patchable.append(failure)
+        else:
+            deferred.append(failure)
+    return patchable, deferred
+
+
 async def _repair_skill_md_model_finalizer(
     *,
     previous_content: str,
@@ -960,32 +986,19 @@ async def _repair_skill_md_model_finalizer(
     skill_name: str,
     attempt: int,
 ) -> str:
-    """Repair SKILL.md by exact_replace patch, not full regeneration."""
+    """Repair ordinary SKILL.md Markdown content gaps by exact_replace patch."""
 
     failures_text = json.dumps(failures, ensure_ascii=False, indent=2, default=str)
 
     validation_error = (
-        "SKILL.md 合同/责任/蓝图对齐校验未通过。"
-        "本轮只能对上一版 SKILL.md 做局部 patch 修复，不能重新生成完整文件。\n\n"
-        "注意：Markdown 基础格式错误不会进入本函数，已经由整文件重写阶段处理。\n\n"
+        "SKILL.md 普通内容责任缺失，需要做局部 patch。\n"
         "失败项 JSON：\n"
         f"{failures_text}"
     )
 
     targeted_repair = (
-        "只修复 failures 指向的 target/layer/minimal_edit 对应区域。"
-        "未被 failures 指向的 frontmatter、章节、脚本说明、bash fenced block、资源说明、最终产物说明必须保持。"
-        "不得重排整篇文档，不得新增蓝图外脚本、reference、asset 或能力。"
-        "如果失败是资源提及问题，只在已有资源说明附近补充缺失路径。"
-        "\n\n"
-        "如果失败涉及 command_block、fenced block、single_command、signature_parseable、json_argv_object、"
-        "命令块、bash block 或脚本调用格式："
-        "只修改对应的 ```bash fenced block。"
-        "bash block 内必须是一条真实可执行 shell 命令，且能解析出 runner、真实 scripts/*.py 路径、一个 JSON object argv 参数。"
-        "JSON argv 的 key/value 由当前脚本接口和 workflow 自洽决定；不要固定套用某组字段名。"
-        "禁止在 bash block 中保留 JSON 配置对象、伪命令对象、说明文字、列表或多条命令。"
-        "如果当前 block 是 JSON 伪命令，只把该 block 改成等价的真实脚本调用命令，不要重写其它章节。"
-        "\n\n"
+        "只修复 failures 指向的普通 Markdown 说明内容缺失。"
+        "未被 failures 指向的内容必须保持。"
         "不要输出完整 SKILL.md，只输出 exact_replace patch。"
     )
 
@@ -997,13 +1010,13 @@ async def _repair_skill_md_model_finalizer(
         validation_error=validation_error,
         targeted_repair=targeted_repair,
         contract_text=(
-            "SKILL.md 是主 Skill 说明文档，必须保持蓝图意图、真实脚本顺序、资源说明和最终输出说明一致。"
-            "所有 scripts/*.py 必须通过真实可执行 bash 命令调用，不能使用 JSON 伪命令块。"
+            "SKILL.md 是主 Skill 说明文档；本轮只补普通 Markdown 说明内容。"
         ),
         passed_checks_text="",
         failed_checks_text=failures_text,
         repair_mode="localized_patch",
         skill_plan_entry=None,
+        patch_retry_limit=1,
     )
 
 
@@ -1159,16 +1172,27 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
             if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
                 break
 
-            # 非格式错误继续走原来的局部 diff。
+            patchable_failures, deferred_failures = _split_skill_md_finalize_patch_failures(failures)
+            if not patchable_failures:
+                repair_events.append({
+                    "attempt": attempt,
+                    "target_file": "SKILL.md",
+                    "patch_status": "deferred_non_content_failures",
+                    "failures": failures,
+                })
+                break
+
             try:
                 candidate = await _repair_skill_md_model_finalizer(
                     previous_content=content,
-                    failures=failures,
+                    failures=patchable_failures,
                     prompt_messages=prompt_messages,
                     model=route.model,
                     skill_name=skill_name,
                     attempt=attempt,
                 )
+                if deferred_failures:
+                    previous_remaining_failures = deferred_failures
             except CreatorRepairProposalParseError as parse_exc:
                 repair_events.append({
                     "attempt": attempt,
@@ -1179,7 +1203,8 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "diff_extraction_attempted": parse_exc.diff_extraction_attempted,
                     "old_lines_new_lines_fallback_attempted": parse_exc.lines_fallback_attempted,
                 })
-                raise
+                failures = failures or patchable_failures
+                break
 
         except Exception as exc:
             logger.exception(

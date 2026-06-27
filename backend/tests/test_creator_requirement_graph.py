@@ -596,6 +596,112 @@ def test_error_stdout_bypass_cannot_satisfy_expected_outputs():
     assert issues and issues[0]["requirement_id"] == req.id
 
 
+@pytest.mark.asyncio
+async def test_finalize_skill_md_command_failures_are_deferred_without_patch(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import FinalizeSkillMdRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "---\nname: demo-skill\ndescription: demo\n---\n# Demo\n"
+
+    async def fail_repair(**_kwargs):
+        raise AssertionError("command-like failures must not enter localized patch")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_skill_md_first_round_failures", lambda **_kwargs: [{
+        "id": "skill_md.command_block.signature_parseable",
+        "target": "scripts/main.py",
+        "layer": "skill_md_first_round",
+        "message": "command contract failed",
+        "minimal_edit": "defer",
+    }])
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fail_repair)
+
+    result = await api.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="demo",
+        blueprint_text="demo",
+    ))
+
+    assert result["validation_status"] == "needs_repair"
+    assert result["editable"] is True
+    assert result["repair_events"][0]["patch_status"] == "deferred_non_content_failures"
+
+
+@pytest.mark.asyncio
+async def test_repair_skill_md_model_finalizer_targets_only_markdown_content(monkeypatch):
+    from backend.services.creator import api
+
+    captured = {}
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        captured.update(kwargs)
+        return kwargs["previous_content"] + "\n补充说明\n"
+
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+
+    await api._repair_skill_md_model_finalizer(
+        previous_content="---\nname: demo\ndescription: demo\n---\n# Demo\n",
+        failures=[{
+            "id": "skill_md.script.narrative_quality",
+            "target": "scripts/main.py",
+            "layer": "skill_md_first_round",
+            "minimal_edit": "补充自然语言职责说明。",
+        }],
+        prompt_messages=[],
+        model="test-model",
+        skill_name="demo",
+        attempt=1,
+    )
+
+    combined = "\n".join(str(captured.get(key) or "") for key in ("validation_error", "targeted_repair", "contract_text"))
+    for forbidden in ["command", "argv", "bash", "JSON argv", "fenced", "single_command", "signature_parseable"]:
+        assert forbidden not in combined
+    assert captured["patch_retry_limit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_skill_md_parse_failed_returns_editable_without_patch_retry(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import FinalizeSkillMdRequest
+    from backend.services.creator.repair import CreatorRepairProposalParseError
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    repair_calls = []
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "---\nname: demo-skill\ndescription: demo\n---\n# Demo\nscripts/main.py\n"
+
+    async def fake_repair_generated_file_with_feedback(**_kwargs):
+        repair_calls.append(_kwargs)
+        raise CreatorRepairProposalParseError("bad proposal", parser_error="bad proposal")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_skill_md_first_round_failures", lambda **_kwargs: [{
+        "id": "skill_md.script.narrative_quality",
+        "target": "scripts/main.py",
+        "layer": "skill_md_first_round",
+        "message": "missing natural language responsibility explanation",
+        "minimal_edit": "add ordinary explanation",
+    }])
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+
+    result = await api.finalize_skill_md(FinalizeSkillMdRequest(
+        skill_name="demo-skill",
+        description="demo",
+        blueprint_text="demo",
+    ))
+
+    assert len(repair_calls) == 1
+    assert result["validation_status"] == "needs_repair"
+    assert result["editable"] is True
+    assert result["repair_events"][0]["patch_status"] == "parse_failed"
+
+
 def test_runtime_metadata_contains_generic_requirement_evidence(monkeypatch, tmp_path):
     monkeypatch.setenv("SKILL_TRIAL_RUN", "1")
     result = create_pdf_document(

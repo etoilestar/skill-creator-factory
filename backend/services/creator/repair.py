@@ -1713,6 +1713,7 @@ async def _repair_generated_file_with_feedback(
     failed_checks_text: str = "",
     repair_mode: str = "minimal_edit",
     skill_plan_entry: dict[str, Any] | None = None,
+    patch_retry_limit: int = 3,
 ) -> str:
     """First-round single-file repair using local patch.
 
@@ -1929,7 +1930,7 @@ async def _repair_generated_file_with_feedback(
             scope=scope,
             task_context=task_context,
             target_rule=target_rule,
-            patch_retry_limit=3,
+            patch_retry_limit=patch_retry_limit,
         )
 
     logger.info(

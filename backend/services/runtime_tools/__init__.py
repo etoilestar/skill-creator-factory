@@ -2,7 +2,6 @@
 
 from .api_tools import api_get, api_post, registered_tool_call
 from .document_tools import (
-    build_pdf_report,
     create_csv,
     create_docx,
     create_pdf,
@@ -32,7 +31,6 @@ __all__ = [
     "analyze_image_with_vision",
     "api_get",
     "api_post",
-    "build_pdf_report",
     "create_csv",
     "create_docx",
     "create_pdf",

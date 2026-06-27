@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.services.runtime_tools import (
     analyze_image_with_vision,
     api_get,
-    build_pdf_report,
     create_wechat_draft,
     describe_database_table,
     fetch_url_text,
@@ -42,7 +41,6 @@ def test_new_runtime_helpers_return_mock_data_in_trial_mode(tmp_path, monkeypatc
     assert read_pptx_text("input.pptx")["text"]
     assert read_spreadsheet("input.xlsx")["rows"]
     assert images_to_pdf([str(image)])["pdf_path"]
-    assert build_pdf_report("Title", [{"title": "A", "text": "B"}])["pdf_path"]
     assert create_wechat_draft("title", "<p>content</p>")["status"] == "draft_created"
     assert publish_wechat_draft("draft") ["status"] == "published"
     assert upload_wechat_media(str(image))["media_id"]

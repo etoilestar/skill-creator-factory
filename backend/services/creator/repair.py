@@ -2880,15 +2880,11 @@ def _detect_script_responsibility_static_blockers(
     req_items = [req for req in _coerce_requirement_items(requirements) if getattr(req, "required", False)]
     if not req_items or not str(script_content or "").strip():
         return []
-    required_inputs: list[tuple[str, str, str]] = []
-    for req in req_items:
-        semantic_inputs = [str(value or "").strip() for value in (getattr(req, "semantic_inputs", []) or []) if str(value or "").strip()]
-        if not semantic_inputs:
-            semantic_inputs = [str(value or "").strip() for value in (getattr(skill_plan_entry, "inputs", []) or []) if str(value or "").strip()]
-        for text in semantic_inputs:
-            required_inputs.append(("requirement", text, req.id))
-    if not required_inputs:
-        return []
+    # First-round responsibility validation must be behavioral, not name-based.
+    # Do not require semantic_inputs / SkillPlanEntry inputs to appear as string
+    # literals, dict keys, variable names, or stdout keys. E2E owns interface and
+    # schema alignment; this static fallback only looks for an input/tool signal
+    # flowing into constructed product/helper/output behavior.
 
     try:
         tree = ast.parse(script_content or "")
@@ -2908,7 +2904,6 @@ def _detect_script_responsibility_static_blockers(
     core_vars: set[str] = set()
     helper_result_vars: set[str] = set()
     has_input_read = False
-    has_required_key_read = False
     has_tainted_core = False
     has_core_structure = False
     has_core_output = False
@@ -2938,19 +2933,6 @@ def _detect_script_responsibility_static_blockers(
                     return True
         return False
 
-    def _contains_required_literal(n: ast.AST) -> bool:
-        literals: list[str] = []
-        for child in ast.walk(n):
-            if isinstance(child, ast.Constant) and isinstance(child.value, str):
-                literals.append(child.value.lower())
-        if not literals:
-            return False
-        for _kind, text, _rid in required_inputs:
-            compact = text.lower().strip()
-            if compact and any(compact in lit or lit in compact for lit in literals):
-                return True
-        return False
-
     def _is_core_expr(n: ast.AST) -> bool:
         call = _call_name(n)
         if call and any(term in call for term in helper_terms):
@@ -2960,7 +2942,7 @@ def _detect_script_responsibility_static_blockers(
         return any(isinstance(child, ast.Name) and child.id in core_names for child in ast.walk(n))
 
     def _is_tainted(n: ast.AST) -> bool:
-        return _contains_input_read(n) or _contains_required_literal(n) or any(isinstance(child, ast.Name) and child.id in core_vars for child in ast.walk(n))
+        return _contains_input_read(n) or any(isinstance(child, ast.Name) and child.id in core_vars for child in ast.walk(n))
 
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2974,8 +2956,6 @@ def _detect_script_responsibility_static_blockers(
                     name = _name(target)
                     if name:
                         aliases.add(name)
-            if _contains_required_literal(node.value):
-                has_required_key_read = True
             if _is_core_expr(node.value) and _is_tainted(node.value):
                 has_tainted_core = True
                 for target in node.targets:
@@ -2995,8 +2975,6 @@ def _detect_script_responsibility_static_blockers(
                 name = _name(node.target)
                 if name:
                     aliases.add(name)
-            if value is not None and _contains_required_literal(value):
-                has_required_key_read = True
             if value is not None and _is_core_expr(value) and _is_tainted(value):
                 has_tainted_core = True
                 name = _name(node.target)
@@ -3010,8 +2988,6 @@ def _detect_script_responsibility_static_blockers(
             has_tool_call = True
             if _contains_input_read(node):
                 has_input_read = True
-            if _contains_required_literal(node):
-                has_required_key_read = True
             call = _call_name(node)
             if call and any(term in call for term in helper_terms) and _is_tainted(node):
                 has_tainted_core = True
@@ -3024,16 +3000,16 @@ def _detect_script_responsibility_static_blockers(
             if call == "print" and (_is_tainted(node.value) or any(isinstance(child, ast.Name) and child.id in helper_result_vars for child in ast.walk(node.value))):
                 has_core_output = True
 
-    weak_evidence = has_input_read and (has_required_key_read or has_tainted_core or has_core_output)
+    weak_evidence = has_input_read and (has_tainted_core or has_core_output)
     functional_evidence = (
-        (has_input_read or has_required_key_read or has_tool_call)
+        (has_input_read or has_tool_call)
         and (has_core_structure or has_tool_call or has_tainted_core)
         and has_core_output
     )
     if weak_evidence or functional_evidence:
         return []
 
-    requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), req_items[0].id)
+    requirement_id = req_items[0].id
     failed_file = getattr(skill_plan_entry, "path", "") or req_items[0].target_file
     return [{
         "id": "semantic_responsibility_missing",
@@ -3041,8 +3017,8 @@ def _detect_script_responsibility_static_blockers(
         "failed_file": failed_file,
         "failed_function": "current script",
         "code_region": "run() input and product construction path",
-        "reason": "Required inputs have no conservative static evidence of participating in core product/helper/output construction.",
-        "missing_evidence": ["required input read", "required input -> blocks/sections/items/pages/document/helper/stdout path", "declared output from helper result or constructed product"],
+        "reason": "Current script lacks conservative static evidence that inputs or registered tool/model results participate in core product/helper/output construction.",
+        "missing_evidence": ["input or tool/model result participates in core product construction", "constructed product/helper result is returned or printed"],
         "minimal_edit": "只修改当前脚本 run() 中的输入读取和产物构造逻辑。",
         "allowed_scope": "current script only",
     }]

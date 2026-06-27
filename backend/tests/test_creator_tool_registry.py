@@ -111,7 +111,8 @@ def test_resolve_tools_for_pdf_builder_exposes_preferred_helpers_without_forcing
 
     assert "pdf_generation" in resolved.allowed_tools
     assert "create_pdf" in resolved.allowed_helper_imports
-    assert "build_pdf_report" in resolved.allowed_helper_imports
+    assert "create_pdf_document" in resolved.allowed_helper_imports
+    assert "build_pdf_report" not in resolved.allowed_helper_imports
     assert resolved.forbidden_imports == []
     assert "create_pdf" in resolved.tool_usage_prompt
     assert "usage_policy=helper_preferred" in resolved.tool_usage_prompt
@@ -399,3 +400,55 @@ def sample_file_tool(payload, config=None):
     assert trial["sample_input"] == expected
     assert finalized["sample_input"] == expected
     assert finalized["tool_contract"]["sample_input"] == expected
+
+
+def test_single_sample_validation_failure_repairs_before_return(monkeypatch):
+    import asyncio
+    import backend.services.creator_tool_registry as registry
+
+    manifest = registry.build_tool_manifest_draft({
+        "tool_name": "repair_sample_tool",
+        "description": "Echo payload after repair",
+        "allowed_roles": ["generic_script"],
+    })
+    bad_script = """
+def run(payload, config=None):
+    raise RuntimeError('boom')
+def repair_sample_tool(payload, config=None):
+    return run(payload, config)
+"""
+    good_script = """
+def run(payload, config=None):
+    return {"success": True, "payload": payload}
+def repair_sample_tool(payload, config=None):
+    return run(payload, config)
+"""
+    calls = []
+
+    async def fake_repair(**kwargs):
+        calls.append(kwargs["validation"])
+        return good_script
+
+    monkeypatch.setattr(registry, "_repair_script_with_model", fake_repair)
+
+    script_code, sample_input, validation, repair_log = asyncio.run(
+        registry._validate_tool_manifest_with_repair(
+            request={"description": "repair sample"},
+            manifest=manifest,
+            script_code=bad_script,
+            sample_input={"q": "demo"},
+            dynamic=True,
+            real_run=False,
+            require_auth_config=False,
+            model_notes=[],
+            warnings=[],
+            max_attempts=3,
+        )
+    )
+
+    assert calls
+    assert repair_log
+    assert validation["success"] is True
+    assert validation["status"] == "validated_after_repair"
+    assert sample_input == {"q": "demo"}
+    assert "boom" not in script_code

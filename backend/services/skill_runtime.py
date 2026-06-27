@@ -23,7 +23,6 @@ from .runtime_tools import (
     analyze_image_with_vision,
     api_get,
     api_post,
-    build_pdf_report,
     create_csv,
     create_docx,
     create_pdf,

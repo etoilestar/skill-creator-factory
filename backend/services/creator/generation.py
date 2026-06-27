@@ -17,12 +17,6 @@ def _is_valid_normalized_script_source(file_path: str, content: str) -> bool:
     if not stripped or "```" in stripped or "~~~" in stripped or _MULTI_FILE_MARKER_RE.search(stripped):
         return False
 
-    if Path(file_path).suffix.lower() == ".py":
-        try:
-            ast.parse(stripped)
-        except SyntaxError:
-            return False
-
     return True
 
 
@@ -199,11 +193,6 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     """
     if file_path.startswith("scripts/"):
         stripped = content.strip()
-
-        if Path(file_path).suffix.lower() == ".py":
-            extracted = _extract_probable_python_source(stripped)
-            if extracted:
-                return extracted
 
         normalized = stripped
         for _ in range(3):

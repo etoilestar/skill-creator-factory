@@ -62,6 +62,7 @@ def test_requirement_graph_missing_required_requirement_is_incomplete():
 def test_requirement_review_requires_check_coverage_and_missing_evidence_for_blocking():
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     incomplete = _parse_requirement_review_result({"passed": True, "checks": []}, requirements=[req], file_path=req.target_file)
+    assert incomplete["passed"] is True
     assert incomplete["failure_type"] == "script_requirement_validator_incomplete"
 
     advisory_only = _parse_requirement_review_result(
@@ -72,7 +73,7 @@ def test_requirement_review_requires_check_coverage_and_missing_evidence_for_blo
     assert advisory_only["passed"] is True
 
     failed = _parse_requirement_review_result(
-        {"passed": False, "checks": [{"requirement_id": req.id, "severity": "blocking", "evidence_level": "missing", "missing_evidence": ["required component"]}]},
+        {"passed": False, "checks": [{"requirement_id": req.id, "scope": "current_file_only", "failure_layer": "responsibility", "semantic_failure": "core transformation is absent", "severity": "blocking", "evidence_level": "missing", "missing_evidence": ["required component"]}]},
         requirements=[req],
         file_path=req.target_file,
     )
@@ -89,6 +90,9 @@ def test_warning_with_required_missing_evidence_is_backend_blocking():
             "passed": True,
             "checks": [{
                 "requirement_id": req.id,
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "semantic_failure": "core product construction is absent",
                 "severity": "warning",
                 "evidence_level": "missing",
                 "missing_evidence": ["core product construction"],
@@ -110,6 +114,9 @@ def test_advisory_collection_with_required_missing_evidence_is_backend_blocking(
             "checks": [{"requirement_id": req.id, "evidence_level": "present", "missing_evidence": []}],
             "advisory_notes": [{
                 "requirement_id": req.id,
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "semantic_failure": "helper result never participates in output",
                 "evidence_level": "missing",
                 "missing_evidence": ["helper result output"],
             }],
@@ -711,6 +718,38 @@ def test_responsibility_advisory_field_repair_instruction_is_ignored():
     assert review["repair_instructions"] == ""
 
 
+def test_script_sanitize_extracts_single_fenced_block_with_prose_for_repair_input():
+    from backend.services.creator.generation import _sanitize_generated_file_content
+
+    raw = "Here is the file:\n```text\n#!/usr/bin/env sh\necho ok\n```\nDone."
+    assert _sanitize_generated_file_content("scripts/run.sh", raw) == "#!/usr/bin/env sh\necho ok"
+
+
+def test_script_repair_fenced_block_is_recanonicalized_to_pure_script():
+    from backend.services.creator.api import _canonicalize_generated_candidate
+
+    raw = "Fixed version:\n```text\n#!/usr/bin/env node\nconsole.log('ok')\n```"
+    assert _canonicalize_generated_candidate(
+        file_path="scripts/run",
+        content=raw,
+        skill_plan_entry={},
+    ) == "#!/usr/bin/env node\nconsole.log('ok')"
+
+
+def test_passed_true_missing_checks_is_advisory_not_business_repair():
+    from backend.services.creator.repair import _parse_requirement_review_result
+
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {"passed": True, "advisory_notes": ["validator omitted optional structure"]},
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+    assert review["issues"] == []
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
+
+
 def test_responsibility_only_field_and_extra_stdout_issues_normalize_to_passed():
     from backend.services.creator.repair import _parse_requirement_review_result
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
@@ -795,7 +834,7 @@ def test_required_missing_blocking_not_downgraded_by_message_text():
     from backend.services.creator.repair import _parse_requirement_review_result
     req = build_default_requirement_graph([_script_spec()]).requirements[0]
     review = _parse_requirement_review_result(
-        {"passed": False, "checks": [{"requirement_id": req.id, "status": "failed", "severity": "blocking", "blocking": True, "evidence_level": "missing", "missing_evidence": ["core evidence"], "reason": "字段名旁边的 required responsibility missing"}]},
+        {"passed": False, "checks": [{"requirement_id": req.id, "scope": "current_file_only", "failure_layer": "responsibility", "semantic_failure": "required responsibility is missing", "status": "failed", "severity": "blocking", "blocking": True, "evidence_level": "missing", "missing_evidence": ["core evidence"], "reason": "字段名旁边的 required responsibility missing"}]},
         requirements=[req],
         file_path=req.target_file,
     )

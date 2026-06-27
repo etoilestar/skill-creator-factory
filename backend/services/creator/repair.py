@@ -2564,11 +2564,13 @@ def _format_file_validator_feedback(
                     "failed_file": failed_file or file_path or "",
                     "failed_function": item.get("failed_function"),
                     "line_region": item.get("line_region"),
-                    "reason": item.get("reason"),
+                    "semantic_failure": item.get("semantic_failure") or item.get("reason"),
                     "minimal_edit": item.get("minimal_edit"),
                     "allowed_scope": item.get("allowed_scope"),
                     "forbidden_scope": item.get("forbidden_scope"),
                 }
+                if item.get("interface_notes"):
+                    safe_item["interface_notes_advisory_only"] = "present but omitted from repair goals"
 
                 safe_item = {
                     key: value
@@ -2682,25 +2684,6 @@ def _normalize_responsibility_review_issues(
 
     normalized: list[dict[str, Any]] = []
 
-    non_current_file_scopes = {
-        "e2e",
-        "workflow",
-        "cross_file",
-        "cross_step",
-        "dataflow",
-        "stdout_schema",
-        "stdout_contract",
-        "artifact",
-        "path",
-        "dependency",
-        "import",
-        "metadata",
-        "skill_md",
-        "interface_only",
-        "argument_mapping",
-        "argument_effect",
-    }
-
     for raw in raw_items:
         if not isinstance(raw, dict):
             if review.get("passed") is False:
@@ -2717,17 +2700,28 @@ def _normalize_responsibility_review_issues(
 
         issue_type = str(raw.get("issue_type") or raw.get("type") or "").strip()
         scope = str(raw.get("scope") or raw.get("category") or "").strip()
+        failed_file = str(raw.get("failed_file") or raw.get("target_file") or file_path).strip()
+        failure_layer = str(raw.get("failure_layer") or raw.get("layer") or raw.get("layer_type") or "").strip()
+        semantic_failure = str(raw.get("semantic_failure") or raw.get("problem") or raw.get("reason") or "").strip()
         severity = str(raw.get("severity") or "").strip().lower()
 
         if severity in {"note", "info", "advisory"}:
             continue
 
-        lowered = f"{issue_type} {scope}".lower()
-        if any(marker in lowered for marker in non_current_file_scopes):
+        if failed_file != file_path:
+            continue
+        if scope and scope not in {"current_file", "current_file_only", "current file", "current-file"}:
+            continue
+        if failure_layer and failure_layer not in {"responsibility", "semantic_responsibility"}:
+            continue
+        if issue_type and issue_type not in {"responsibility_not_met", "content_responsibility", "semantic_responsibility", "responsibility"}:
+            continue
+        if not semantic_failure:
             continue
 
         problem = str(
-            raw.get("problem")
+            raw.get("semantic_failure")
+            or raw.get("problem")
             or raw.get("message")
             or raw.get("reason")
             or raw.get("description")
@@ -2802,27 +2796,14 @@ def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids:
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
         return False
-    field_interface_markers = (
-        "field_name_mismatch",
-        "input_key_mismatch",
-        "output_key_mismatch",
-        "field name",
-        "input key",
-        "output key",
-        "stdout key",
-        "字段名",
-        "输入 key",
-        "输出 key",
-    )
-    issue_text = " ".join(
-        str(value or "")
-        for value in [
-            item.get("issue_type"),
-            item.get("minimal_edit"),
-            *missing,
-        ]
-    ).lower()
-    if any(marker in issue_text for marker in field_interface_markers):
+    semantic_failure = item.get("semantic_failure")
+    failure_layer = str(item.get("failure_layer") or item.get("layer") or "").strip().lower()
+    scope = str(item.get("scope") or "").strip().lower()
+    if scope and scope not in {"current_file", "current_file_only", "current file", "current-file"}:
+        return False
+    if failure_layer and failure_layer not in {"responsibility", "semantic_responsibility"}:
+        return False
+    if not str(semantic_failure or "").strip():
         return False
     # Scope is normalized by the backend when producing the repair issue; do
     # not infer blocking from advisory/severity/scope wording.
@@ -2848,7 +2829,7 @@ def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
 
 def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list[RequirementItem], file_path: str) -> dict[str, Any]:
     if not isinstance(data, dict):
-        return {"passed": False, "failure_type": "script_requirement_validator_error", "issues": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
+        return {"passed": True, "failure_type": "script_requirement_validator_error", "issues": [], "advisory_notes": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
     advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
     for collection_name in ("blocking_issues", "issues"):
         collection = data.get(collection_name)
@@ -2858,12 +2839,12 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
                     advisory_notes.append(raw_issue)
     checks = data.get("checks")
     if not isinstance(checks, list):
-        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": [], "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
     required_ids = {r.id for r in requirements if r.required}
     seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
     missing = sorted(required_ids - seen)
     if missing:
-        return {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": [{"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": checks, "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
     blocking: list[dict[str, Any]] = []
     candidate_items = [item for item in checks if isinstance(item, dict)]
     candidate_items.extend(item for item in advisory_notes if isinstance(item, dict))
@@ -2885,12 +2866,13 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
                 "failed_file": file_path,
                 "failed_function": "current script",
                 "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
-                "reason": str(check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
+                "reason": str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
+                "semantic_failure": str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
                 "missing_evidence": missing_evidence,
                 "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
                 "allowed_scope": "current file only",
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
-                "details": {"check": check},
+                "details": {"check": {k: v for k, v in check.items() if k != "interface_notes"}, "interface_notes_advisory": check.get("interface_notes") if isinstance(check.get("interface_notes"), list) else []},
             })
     return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
 
@@ -2924,12 +2906,8 @@ def _detect_script_responsibility_static_blockers(
 
     input_roots = {"payload", "argv", "args", "input", "inputs", "data", "context", "params", "config", "options"}
     structural_core_names = {"blocks", "sections", "items", "pages", "document", "documents", "rows", "table", "tables", "content", "contents", "result", "results", "artifact", "artifacts", "output", "outputs"}
-    declared_outputs = {str(value or "").strip() for value in (getattr(skill_plan_entry, "outputs", []) or []) if str(value or "").strip()}
-    artifact_contract = getattr(skill_plan_entry, "artifact_contract", None)
-    if isinstance(artifact_contract, dict):
-        declared_outputs.update(str(key) for key in artifact_contract.keys())
-    core_names = structural_core_names | declared_outputs
-    helper_terms = tuple(sorted(structural_core_names | {part for output in declared_outputs for part in re.split(r"[^A-Za-z0-9]+", output) if part}))
+    core_names = structural_core_names
+    helper_terms = tuple(sorted(structural_core_names))
 
     aliases: set[str] = set()
     core_vars: set[str] = set()
@@ -3450,7 +3428,11 @@ async def _run_script_responsibility_review(
                 "    {\n"
                 "      \"issue_type\": \"responsibility_not_met\",\n"
                 "      \"scope\": \"current_file_only\",\n"
+                "      \"failure_layer\": \"responsibility\",\n"
                 "      \"severity\": \"error\",\n"
+                "      \"failed_file\": \"当前脚本路径\",\n"
+                "      \"semantic_failure\": \"当前文件未完成的语义职责；只有这里能作为 blocking\",\n"
+                "      \"interface_notes\": [\"字段名/key/stdout/上下游映射等只能放这里，永远 advisory\"],\n"
                 "      \"function\": \"相关函数或区域\",\n"
                 "      \"line_region\": \"相关源码区域\",\n"
                 "      \"problem\": \"为什么没有完成当前脚本自身职责\",\n"
@@ -3470,13 +3452,10 @@ async def _run_script_responsibility_review(
                 f"目标脚本：{file_path}\n\n"
 
                 "SkillPlanEntry：\n"
-                f"{json.dumps(skill_plan_entry.__dict__, ensure_ascii=False, default=str)[:8000]}\n\n"
+                f"{json.dumps({k: v for k, v in skill_plan_entry.__dict__.items() if k not in {'inputs', 'outputs'}}, ensure_ascii=False, default=str)[:8000]}\n\n"
 
-                "推荐 inputs（非硬约束）：\n"
-                f"{json.dumps(declared_inputs, ensure_ascii=False)}\n\n"
-
-                "推荐 outputs（非硬约束）：\n"
-                f"{json.dumps(declared_outputs, ensure_ascii=False)}\n\n"
+                "interface hints（仅供第二轮 E2E；不得作为 blocking problem、minimal_edit 目标或重命名要求）：\n"
+                f"{json.dumps({'inputs': declared_inputs, 'outputs': declared_outputs}, ensure_ascii=False)}\n\n"
 
                 "额外上下文：\n"
                 f"{json.dumps(review_context, ensure_ascii=False, default=str)[:4000]}\n\n"

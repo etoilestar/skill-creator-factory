@@ -1246,6 +1246,38 @@ def _structured_failure_signature(stage_error: FileGenerationStageError, determi
     payload = {"source": stage_error.source, "layer": stage_error.layer, "records": records}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
+def _canonicalize_generated_candidate(
+    *,
+    file_path: str,
+    content: str,
+    role: str | None = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+    skill_name: str = "",
+    purpose: str = "",
+) -> str:
+    """Return the canonical single-file candidate for validation/repair/SSE."""
+    canonical = _sanitize_generated_file_content(
+        file_path,
+        content,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+    canonical, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
+        file_path=file_path,
+        content=canonical,
+        skill_name=skill_name,
+        purpose=purpose,
+    )
+    if file_path.startswith("references/") and Path(file_path).suffix.lower() == ".md":
+        canonical = _ensure_reference_metadata_frontmatter(
+            file_path=file_path,
+            content=canonical,
+            purpose=purpose,
+            skill_plan_entry=skill_plan_entry,
+        )
+    return canonical
+
+
 @router.post("/generate-file")
 async def generate_file(request: GenerateFileRequest):
     """Generate one Creator file and stream it back as SSE.
@@ -1371,17 +1403,21 @@ async def generate_file(request: GenerateFileRequest):
                         detail="model_empty_content: 模型生成结果 content_chars=0，跳过 validator/repair；进入 prompt 降级重试。",
                     )
 
+                candidate = _canonicalize_generated_candidate(
+                    file_path=request.file_path,
+                    content=candidate,
+                    role=request.role,
+                    skill_plan_entry=effective_skill_plan_entry,
+                    skill_name=skill_name,
+                    purpose=request.purpose,
+                )
+
                 try:
-                    content = _sanitize_generated_file_content(
-                        request.file_path,
-                        candidate,
-                        role=request.role,
-                        skill_plan_entry=effective_skill_plan_entry,
-                    )
+                    content = candidate
 
                     # 阶段 1：Markdown 基础格式错误最早判断。
-                    # 这里必须在 canonicalize / ensure_reference_metadata 之前，
-                    # 避免 reference 里 frontmatter 未闭合等错误被后续逻辑吞掉。
+                    # 模型回复已在 loop 开始处 canonicalize；后续 review /
+                    # repair / SSE 统一只使用 canonical candidate。
                     if (
                             request.file_path == "SKILL.md"
                             or request.file_path.startswith("references/")
@@ -1400,21 +1436,6 @@ async def generate_file(request: GenerateFileRequest):
                                 layer="hard_format",
                                 detail=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
                             )
-
-                    content, _metadata_patched = _canonicalize_markdown_frontmatter_for_file(
-                        file_path=request.file_path,
-                        content=content,
-                        skill_name=skill_name,
-                        purpose=request.purpose,
-                    )
-
-                    if request.file_path.startswith("references/") and Path(request.file_path).suffix.lower() == ".md":
-                        content = _ensure_reference_metadata_frontmatter(
-                            file_path=request.file_path,
-                            content=content,
-                            purpose=request.purpose,
-                            skill_plan_entry=effective_skill_plan_entry,
-                        )
 
                     if not content.strip():
                         raise FileGenerationStageError(
@@ -1962,6 +1983,14 @@ async def generate_file(request: GenerateFileRequest):
                         repair_mode=repair_mode,
                         skill_plan_entry=effective_skill_plan_entry,
                     )
+                    repaired_candidate = _canonicalize_generated_candidate(
+                        file_path=request.file_path,
+                        content=repaired_candidate,
+                        role=request.role,
+                        skill_plan_entry=effective_skill_plan_entry,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
+                    )
 
                 except Exception as repair_exc:
                     logger.exception(
@@ -1991,6 +2020,9 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                     if repair_mode == "strict_patch":
+                        if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
+                            candidate = repaired_candidate
+                            continue
                         yield _file_done_error_sse(
                             file_path=request.file_path,
                             role=request.role,
@@ -2021,6 +2053,14 @@ async def generate_file(request: GenerateFileRequest):
                         failed_checks_text=failed_checks_text,
                         repair_mode="strict_patch",
                         skill_plan_entry=effective_skill_plan_entry,
+                    )
+                    repaired_candidate = _canonicalize_generated_candidate(
+                        file_path=request.file_path,
+                        content=repaired_candidate,
+                        role=request.role,
+                        skill_plan_entry=effective_skill_plan_entry,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
                     )
 
                 candidate = repaired_candidate

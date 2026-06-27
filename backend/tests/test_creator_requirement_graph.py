@@ -187,6 +187,38 @@ def run(payload):
     assert issues[0]["id"] == "tool_contract_mismatch"
 
 
+def test_runtime_tool_contract_allows_known_helper_when_allowlist_absent():
+    spec = _script_spec(selected_tools=[], runtime_contract={})
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+from backend.services.runtime_tools import create_text_file
+
+def run(payload):
+    result = create_text_file(text=str(payload.get('brief_text') or ''), filename='out.txt')
+    return {'artifact': result, 'extra_stdout_metadata': {'ok': True}}
+"""
+    assert _runtime_tool_contract_static_blockers(script, spec, [req]) == []
+
+
+def test_runtime_tool_contract_blocks_known_helper_when_explicitly_not_allowed():
+    spec = _script_spec(
+        selected_tools=[],
+        required_capabilities=[],
+        runtime_contract={"selected_tools": ["text_generation"]},
+    )
+    req = build_default_requirement_graph([spec]).requirements[0]
+    script = """
+from backend.services.runtime_tools import create_text_file
+
+def run(payload):
+    result = create_text_file(text=str(payload.get('brief_text') or ''), filename='out.txt')
+    return {'artifact': result}
+"""
+    issues = _runtime_tool_contract_static_blockers(script, spec, [req])
+    assert issues
+    assert issues[0]["id"] == "tool_contract_mismatch"
+
+
 @pytest.mark.asyncio
 async def test_tool_contract_mismatch_preempts_validator_and_enters_patchable_failure(monkeypatch):
     spec = _script_spec(selected_tools=[], required_capabilities=[])
@@ -194,6 +226,49 @@ async def test_tool_contract_mismatch_preempts_validator_and_enters_patchable_fa
 
     async def fake_complete(*args, **kwargs):
         raise AssertionError("deterministic tool contract should run before validator")
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="from backend.services.runtime_tools import missing_runtime_helper\n\ndef run(payload):\n    return missing_runtime_helper(payload)\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["failure_type"] == "script_requirement_failed"
+    assert review["issues"][0]["id"] == "tool_contract_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_validator_field_name_mismatch_is_advisory_not_first_round_patch(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return '{"passed": false, "checks": [{"requirement_id": "' + req.id + '", "evidence_level": "present", "missing_evidence": []}], "blocking_issues": [{"requirement_id": "' + req.id + '", "evidence_level": "missing", "issue_type": "field_name_mismatch", "missing_evidence": ["output key mismatch"]}]}'
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    script = """
+def run(payload):
+    source = payload.get('brief_text')
+    rows = [{'kind': 'paragraph', 'value': source}]
+    return {'artifact': rows, 'extra_stdout_metadata': {'ok': True}}
+"""
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content=script,
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_validator_blocking_without_checks_tool_mismatch_becomes_patchable(monkeypatch):
+    spec = _script_spec(selected_tools=[], required_capabilities=[])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return '{"passed": false, "blocking_issues": [{"problem": "bad helper"}]}'
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
     review = await _run_script_responsibility_review(
@@ -392,6 +467,68 @@ async def test_generate_file_validator_incomplete_uses_entry_requirements_static
     assert seen_static_requirements, body
     assert repair_modes, body
     assert "script_requirement_failed" in body
+    assert "script_requirement_validator_incomplete" not in body
+
+
+@pytest.mark.asyncio
+async def test_generate_file_tool_contract_mismatch_enters_repair_not_error(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "demo-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: demo\n---\n", encoding="utf-8")
+
+    spec = _script_spec(path="scripts/main.py")
+    req = build_default_requirement_graph([spec]).requirements[0]
+    entry = spec.model_dump(mode="json")
+    entry["requirements"] = [req.model_dump(mode="json")]
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "from backend.services.runtime_tools import missing_runtime_helper\n\ndef run(payload):\n    return missing_runtime_helper(payload)\n"
+
+    reviews = iter([
+        {"passed": False, "failure_type": "script_requirement_validator_incomplete", "issues": []},
+        {"passed": True, "issues": []},
+    ])
+
+    async def fake_responsibility_review(**_kwargs):
+        return next(reviews)
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        assert kwargs.get("file_path") == "scripts/main.py"
+        assert "tool_contract_mismatch" in kwargs.get("validation_error", "")
+        return "def run(payload):\n    return {'artifact': {'ok': True}}\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_load_persisted_requirement_graph", lambda _skill_name: None)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+    async def fake_generated_file_validator_round(**_kwargs):
+        return {"passed": False, "issues": []}
+
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    monkeypatch.setattr(api, "_run_generated_file_validator_round", fake_generated_file_validator_round)
+    monkeypatch.setattr(api, "_check_script_content_review_contract", lambda *args, **kwargs: [])
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate report",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=entry,
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert "tool_contract_mismatch" in body
+    assert "repairing" in body
     assert "script_requirement_validator_incomplete" not in body
 
 def test_validator_error_stage_checks_static_blockers_before_error(monkeypatch):

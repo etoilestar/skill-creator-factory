@@ -1701,7 +1701,12 @@ async def generate_file(request: GenerateFileRequest):
                                 static_requirements = [req for req in static_graph.requirements if req.target_file == request.file_path]
                             if not static_requirements and isinstance(effective_skill_plan_entry, dict):
                                 static_requirements = effective_skill_plan_entry.get("requirements") or []
-                            static_blockers = _detect_script_responsibility_static_blockers(
+                            static_blockers = _runtime_tool_contract_static_blockers(
+                                candidate or "",
+                                static_entry,
+                                static_requirements,
+                            )
+                            static_blockers += _detect_script_responsibility_static_blockers(
                                 candidate or "",
                                 static_entry,
                                 static_requirements,

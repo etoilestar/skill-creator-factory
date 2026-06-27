@@ -1754,6 +1754,7 @@ async def _repair_generated_file_with_feedback(
             "第一轮单文件修复。\n"
             "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
             "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
+            "只使用 selected Tool Registry function cards 中真实存在的 helper；没有可用 helper 时用当前脚本本地逻辑实现职责，不要猜 runtime_tools 函数。\n"
             "不要只改字段名；不要为了通过校验返回空结果或伪造成功。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
@@ -2770,6 +2771,28 @@ def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids:
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
         return False
+    field_interface_markers = (
+        "field_name_mismatch",
+        "input_key_mismatch",
+        "output_key_mismatch",
+        "field name",
+        "input key",
+        "output key",
+        "stdout key",
+        "字段名",
+        "输入 key",
+        "输出 key",
+    )
+    issue_text = " ".join(
+        str(value or "")
+        for value in [
+            item.get("issue_type"),
+            item.get("minimal_edit"),
+            *missing,
+        ]
+    ).lower()
+    if any(marker in issue_text for marker in field_interface_markers):
+        return False
     # Scope is normalized by the backend when producing the repair issue; do
     # not infer blocking from advisory/severity/scope wording.
     return True
@@ -2887,7 +2910,9 @@ def _detect_script_responsibility_static_blockers(
     has_input_read = False
     has_required_key_read = False
     has_tainted_core = False
+    has_core_structure = False
     has_core_output = False
+    has_tool_call = False
 
     def _name(n: ast.AST) -> str:
         if isinstance(n, ast.Name):
@@ -2959,6 +2984,10 @@ def _detect_script_responsibility_static_blockers(
                         core_vars.add(name)
                         if _call_name(node.value):
                             helper_result_vars.add(name)
+            if _is_core_expr(node.value):
+                has_core_structure = True
+            if _call_name(node.value):
+                has_tool_call = True
         elif isinstance(node, ast.AnnAssign):
             value = node.value
             if value is not None and _contains_input_read(value):
@@ -2973,7 +3002,12 @@ def _detect_script_responsibility_static_blockers(
                 name = _name(node.target)
                 if name:
                     core_vars.add(name)
+            if value is not None and _is_core_expr(value):
+                has_core_structure = True
+            if value is not None and _call_name(value):
+                has_tool_call = True
         elif isinstance(node, ast.Call):
+            has_tool_call = True
             if _contains_input_read(node):
                 has_input_read = True
             if _contains_required_literal(node):
@@ -2991,7 +3025,12 @@ def _detect_script_responsibility_static_blockers(
                 has_core_output = True
 
     weak_evidence = has_input_read and (has_required_key_read or has_tainted_core or has_core_output)
-    if weak_evidence or (has_input_read and has_tainted_core and has_core_output):
+    functional_evidence = (
+        (has_input_read or has_required_key_read or has_tool_call)
+        and (has_core_structure or has_tool_call or has_tainted_core)
+        and has_core_output
+    )
+    if weak_evidence or functional_evidence:
         return []
 
     requirement_id = next((rid for _kind, _text, rid in required_inputs if rid), req_items[0].id)
@@ -3029,7 +3068,7 @@ def _runtime_tool_contract_static_blockers(
 
     runtime_prefix = "backend.services.runtime_tools"
     imported_helpers: dict[str, str] = {}
-    runtime_module_aliases: set[str] = set()
+    runtime_module_aliases: dict[str, str] = {}
     imported_modules: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -3045,12 +3084,12 @@ def _runtime_tool_contract_static_blockers(
                 name = str(alias.name or "")
                 if name == runtime_prefix or name.startswith(runtime_prefix + "."):
                     imported_modules.add(name)
-                    runtime_module_aliases.add(alias.asname or name.rsplit(".", 1)[-1])
+                    runtime_module_aliases[alias.asname or name.rsplit(".", 1)[-1]] = name
 
     if not imported_helpers and not imported_modules:
         return []
 
-    allowed_tool_names = {
+    selected_tool_names = {
         str(item or "").strip()
         for item in (
             list(getattr(skill_plan_entry, "selected_tools", []) or [])
@@ -3059,14 +3098,27 @@ def _runtime_tool_contract_static_blockers(
         )
         if str(item or "").strip()
     }
+    allowed_import_paths: set[str] = set()
     runtime_contract = getattr(skill_plan_entry, "runtime_contract", None)
     if isinstance(runtime_contract, dict):
-        for key in ("selected_tools", "allowed_tools", "allowed_imports", "tool_names", "capabilities"):
+        for key in ("selected_tools", "allowed_tools", "tool_names", "capabilities"):
             raw = runtime_contract.get(key)
             if isinstance(raw, list):
-                allowed_tool_names.update(str(item or "").strip() for item in raw if str(item or "").strip())
+                selected_tool_names.update(str(item or "").strip() for item in raw if str(item or "").strip())
+        raw_imports = runtime_contract.get("allowed_imports")
+        if isinstance(raw_imports, list):
+            for item in raw_imports:
+                value = str(item or "").strip()
+                if not value:
+                    continue
+                if "." in value:
+                    allowed_import_paths.add(value)
+                else:
+                    selected_tool_names.add(value)
 
     all_caps = list_tool_capabilities()
+    known_tool_names = {str(getattr(cap, "name", "") or "").strip() for cap in all_caps if str(getattr(cap, "name", "") or "").strip()}
+    selected_tool_names = {name for name in selected_tool_names if name in known_tool_names}
     helper_to_tools: dict[str, set[str]] = {}
     helper_to_imports: dict[str, set[str]] = {}
     for cap in all_caps:
@@ -3082,10 +3134,10 @@ def _runtime_tool_contract_static_blockers(
                     helper_to_imports.setdefault(function_name, set()).add(import_path)
 
     allowed_helpers: set[str] = set()
-    allowed_imports: set[str] = set()
+    allowlist_present = bool(selected_tool_names or allowed_import_paths)
     for cap in all_caps:
         cap_name = str(getattr(cap, "name", "") or "").strip()
-        if cap_name not in allowed_tool_names:
+        if cap_name not in selected_tool_names:
             continue
         allowed_helpers.update(str(item) for item in (getattr(cap, "helper_imports", []) or []) if str(item))
         for fn in list(getattr(cap, "functions", []) or []):
@@ -3094,7 +3146,7 @@ def _runtime_tool_contract_static_blockers(
             if function_name:
                 allowed_helpers.add(function_name)
             if import_path:
-                allowed_imports.add(import_path)
+                allowed_import_paths.add(import_path)
 
     issues: list[dict[str, Any]] = []
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
@@ -3105,7 +3157,12 @@ def _runtime_tool_contract_static_blockers(
         known = helper_name in helper_to_tools
         helper_imports = helper_to_imports.get(helper_name) or set()
         actual_import_ok = not helper_imports or any(module in helper_imports for module in imported_modules)
-        allowed = helper_name in allowed_helpers
+        allowed = (
+            not allowlist_present
+            or helper_name in allowed_helpers
+            or bool(helper_imports & allowed_import_paths)
+            or any(module in allowed_import_paths for module in imported_modules)
+        )
         if not known or not actual_import_ok or not allowed:
             issues.append({
                 "id": "tool_contract_mismatch",
@@ -3123,7 +3180,8 @@ def _runtime_tool_contract_static_blockers(
                 "allowed_scope": "current script only",
                 "details": {
                     "helper": helper_name,
-                    "selected_tools": sorted(allowed_tool_names),
+                    "selected_tools": sorted(selected_tool_names),
+                    "allowed_imports": sorted(allowed_import_paths),
                     "known_tools": sorted(helper_to_tools.get(helper_name) or []),
                 },
             })
@@ -3134,7 +3192,14 @@ def _runtime_tool_contract_static_blockers(
             continue
         helper_name = str(node.func.attr or "")
         known = helper_name in helper_to_tools
-        allowed = helper_name in allowed_helpers
+        helper_imports = helper_to_imports.get(helper_name) or set()
+        module_name = next((module for alias, module in runtime_module_aliases.items() if alias == node.func.value.id), "")
+        allowed = (
+            not allowlist_present
+            or helper_name in allowed_helpers
+            or bool(helper_imports & allowed_import_paths)
+            or bool(module_name and module_name in allowed_import_paths)
+        )
         if not known or not allowed:
             issues.append({
                 "id": "tool_contract_mismatch",
@@ -3152,7 +3217,8 @@ def _runtime_tool_contract_static_blockers(
                 "allowed_scope": "current script only",
                 "details": {
                     "helper": helper_name,
-                    "selected_tools": sorted(allowed_tool_names),
+                    "selected_tools": sorted(selected_tool_names),
+                    "allowed_imports": sorted(allowed_import_paths),
                     "known_tools": sorted(helper_to_tools.get(helper_name) or []),
                 },
             })
@@ -3164,7 +3230,7 @@ def detect_error_stdout_bypass(script_content: str, requirements: list[Requireme
         return []
     text = str(script_content or "")
     if re.search(r"except\s+Exception[^:]*:([\s\S]{0,500}?)(return|print)\s*\(?\s*\{[^}]*['\"]error['\"]", text):
-        return [{"id": "script_requirement_failed", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
+        return [{"id": "fake_success_or_error_stdout_bypass", "requirement_id": requirements[0].id, "failed_file": requirements[0].target_file, "failed_function": "exception handler", "code_region": "except Exception", "reason": "catch Exception returns only an error object without clear expected output evidence.", "missing_evidence": ["expected outputs are not preserved on the error bypass path"], "minimal_edit": "Return/print expected output evidence or re-raise failures instead of treating error-only stdout as success."}]
     return []
 
 

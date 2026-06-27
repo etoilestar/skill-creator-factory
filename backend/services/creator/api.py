@@ -669,7 +669,7 @@ def _repair_mode_for_first_round(*, source: str, file_path: str, attempt: int) -
 
     不再存在 script_smoke。
     """
-    if source in {"script_functional", "script_responsibility"} and file_path.startswith("scripts/"):
+    if source in {"script_functional", "script_responsibility", "script_requirement_failed"} and file_path.startswith("scripts/"):
         return "localized_patch"
 
     if attempt >= 2 and file_path.startswith("scripts/") and _strict_contract_rewrite_allowed(source):
@@ -1300,18 +1300,55 @@ def is_generation_format_error(stage_error: FileGenerationStageError) -> bool:
     return is_script_raw_source_format_error(stage_error)
 
 
+def _result_requires_full_format_rewrite(result: Any) -> bool:
+    """Detect structured first-step format failures without matching prose/id text."""
+    if isinstance(result, ContractCheckResult):
+        if result.passed:
+            return False
+        details = result.details if isinstance(result.details, dict) else {}
+        severity = str(details.get("severity") or "").strip()
+        repair_strategy = str(details.get("repair_strategy") or "").strip()
+        model_patch_allowed = details.get("model_patch_allowed")
+        return (
+            result.layer == "hard_format"
+            or severity == "hard_format"
+            or repair_strategy == "full_rewrite"
+            or model_patch_allowed is False
+        )
+
+    if isinstance(result, dict):
+        if result.get("passed") is True:
+            return False
+        return (
+            str(result.get("layer") or "").strip() == "hard_format"
+            or str(result.get("severity") or "").strip() == "hard_format"
+            or str(result.get("repair_strategy") or "").strip() == "full_rewrite"
+            or result.get("model_patch_allowed") is False
+        )
+
+    return False
+
+
+def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationStageError) -> bool:
+    original = getattr(stage_error, "original", None)
+    if isinstance(original, ContractValidationError):
+        return any(_result_requires_full_format_rewrite(result) for result in original.results)
+
+    detail = str(getattr(stage_error, "detail", "") or "").strip()
+    if not detail:
+        return False
+    try:
+        parsed = json.loads(detail)
+    except Exception:
+        return False
+    items = parsed if isinstance(parsed, list) else [parsed]
+    return any(_result_requires_full_format_rewrite(item) for item in items)
+
+
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
         return True
-    detail = str(getattr(stage_error, "detail", "") or "")
-    return (
-        "markdown.fences.unclosed" in detail
-        or "markdown.fences.bash_unclosed" in detail
-        or "markdown.frontmatter.unclosed" in detail
-        or '"severity": "hard_format"' in detail
-        or '"repair_strategy": "full_rewrite"' in detail
-        or '"model_patch_allowed": false' in detail
-    )
+    return _stage_error_has_full_format_rewrite_contract(stage_error)
 
 
 def _build_markdown_format_full_rewrite_prompt(

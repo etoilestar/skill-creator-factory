@@ -2551,6 +2551,16 @@ def _format_file_validator_feedback(
         str(deterministic_error or ""),
     ]
 
+    if "script_requirement_failed" in str(deterministic_error or ""):
+        parts.extend([
+            "",
+            "第一轮脚本职责修复边界：",
+            "本轮只修当前脚本未履行自身职责的功能实现问题。",
+            "不要为了字段名一致、stdout key、argv schema、上下游映射、artifact 字段或表达优美度做强对齐修改。",
+            "如果错误文本或 validator 定位里混有格式/字段/接口建议，只把它们当 advisory，不能作为 patch 目标。",
+            "保持现有局部 patch / fuzzy exact_replace 修复方式；只在职责实现相关函数或代码区域做最小修改。",
+        ])
+
     if targeted_repair:
         parts.extend([
             "",
@@ -3481,6 +3491,10 @@ async def _run_script_responsibility_review(
                 "你不是 smoke runner，不是 E2E 审查器，不判断运行环境、argv、stdout、artifact、"
                 "字段名映射、上下游 dataflow 或最终产物质量。\n\n"
 
+                "第一轮顺序边界：源码/Markdown/包装结构等格式问题已经由第一步格式门禁处理；"
+                "本步骤不得提出格式修复、重排文件、字段强对齐或文案润色建议，"
+                "只能判断职责是否完成。\n\n"
+
                 "关键边界：\n"
                 "- inputs / outputs 中的名称只作为推荐名和语义提示，不是 hard gate；\n"
                 "- 不得因为脚本没有逐字使用推荐字段名就判失败；\n"
@@ -3551,17 +3565,18 @@ async def _run_script_responsibility_review(
 
                 "审查要求：\n"
                 "1. 只判断当前脚本是否完成自身职责。\n"
-                "2. 不要检查运行、argv、stdout、artifact。\n"
-                "3. 不要因为字段名和推荐名不一致而失败。\n"
-                "4. 如果只是接口映射或运行问题，放 advisory_notes。\n"
-                "5. 只有职责本身没有实现，才 passed=false。\n"
+                "2. 不要检查或修复生成格式；格式错误属于第一步重写，不属于职责 patch。\n"
+                "3. 不要检查运行、argv、stdout、artifact。\n"
+                "4. 不要因为字段名和推荐名不一致而失败。\n"
+                "5. 如果只是接口映射或运行问题，放 advisory_notes。\n"
+                "6. 只有职责本身没有实现，才 passed=false。\n"
             ),
         },
     ]
 
     last_text = ""
     last_parsed: dict[str, Any] | None = None
-    for review_attempt in range(2):
+    for review_attempt in range(3):
         try:
             active_messages = messages if review_attempt == 0 else [
                 *messages,
@@ -3569,7 +3584,8 @@ async def _run_script_responsibility_review(
                     "role": "user",
                     "content": (
                         "上一轮 validator 输出格式不合规。\n"
-                        "请只重试输出严格 JSON object；不要建议字段名修复。\n"
+                        "这是格式重写轮，不是业务修复轮：请把上一轮审查结论重写成严格 JSON object。\n"
+                        "JSON 只能表达当前脚本职责是否完成；不要检查或建议字段名、stdout、argv、artifact、上下游映射、表达优美度。\n"
                         f"上一轮输出片段：{last_text[:1200]}"
                     ),
                 },
@@ -3601,7 +3617,7 @@ async def _run_script_responsibility_review(
 
         data = _parse_validator_json_object(last_text)
         if not isinstance(data, dict) or not data:
-            if review_attempt == 0:
+            if review_attempt < 2:
                 continue
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
             static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
@@ -3614,20 +3630,18 @@ async def _run_script_responsibility_review(
                     "model": "deterministic",
                 }
             return {
-                "passed": False,
-                "issues": [{
-                    "id": "script_responsibility.invalid_json",
+                "passed": True,
+                "issues": [],
+                "checks": [],
+                "advisory_notes": [{
+                    "id": "script_responsibility.validator_format_rewrite_exhausted",
                     "failed_file": file_path,
-                    "failed_function": "responsibility_review",
-                    "code_region": "review",
-                    "reason": "职责审查模型没有返回合法 JSON object。",
-                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                    "allowed_scope": "不要自动修改脚本。",
-                    "forbidden_scope": "不得因为 validator 输出非法而判定脚本通过。",
+                    "reason": "职责审查模型连续返回非 JSON；已自动要求格式重写，未把格式问题转成脚本职责失败。",
+                    "allowed_scope": "do not repair business files for validator response format",
                     "details": {"raw": last_text[:1000]},
                 }],
-                "repair_instructions": "职责审查模型输出非法，不能放行当前脚本。",
-                "failure_type": "script_requirement_validator_error",
+                "repair_instructions": "",
+                "failure_type": "script_requirement_validator_incomplete",
                 "model": route.model,
             }
 

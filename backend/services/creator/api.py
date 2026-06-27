@@ -1714,18 +1714,32 @@ async def generate_file(request: GenerateFileRequest):
                         except Exception:
                             static_blockers = []
                     if not static_blockers:
-                        yield _file_done_error_sse(
-                            file_path=request.file_path,
-                            role=request.role,
-                            error=(
-                                "Requirement validator failed or returned incomplete checks; no localized business blocker was identified. "
-                                f"Last validator error: {deterministic_error}"
+                        # Single-file production validation failures must still enter
+                        # the patch repair loop.  A validator error/incomplete review
+                        # is not a reason to return a terminal error to the frontend;
+                        # repair should make the current script's responsibility path
+                        # explicit enough for the next validation round.
+                        static_blockers = [{
+                            "id": error_source,
+                            "failed_file": request.file_path,
+                            "failed_function": "single_file_production_validation",
+                            "code_region": "current file responsibility implementation",
+                            "reason": (
+                                "Single-file production validator failed or returned incomplete checks; "
+                                "auto-repair the current file instead of returning directly to the frontend."
                             ),
-                            error_type=error_source,
-                            content=candidate or "",
-                            recoverable=True,
-                        )
-                        return
+                            "missing_evidence": [
+                                "validator-readable current-file responsibility evidence",
+                                "input/tool result participates in constructed output",
+                            ],
+                            "minimal_edit": (
+                                "只修改当前文件，让核心输入/工具结果到产物构造/返回的路径更明确；"
+                                "不要为字段名、stdout key 或上下游 schema 做重命名修复。"
+                            ),
+                            "allowed_scope": "current file only",
+                            "forbidden_scope": "Do not modify SkillPlan, workflow, schemas, other files, or field names only.",
+                            "details": {"validator_error": deterministic_error},
+                        }]
                     stage_error = FileGenerationStageError(
                         source="script_requirement_failed",
                         layer="responsibility",

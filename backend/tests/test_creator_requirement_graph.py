@@ -531,22 +531,17 @@ async def test_generate_file_tool_contract_mismatch_enters_repair_not_error(monk
     assert "repairing" in body
     assert "script_requirement_validator_incomplete" not in body
 
-def test_validator_error_stage_checks_static_blockers_before_error(monkeypatch):
+def test_validator_error_stage_enters_repair_instead_of_frontend_error():
     from backend.services.creator import api
 
-    events = []
-
-    async def fake_repair(*args, **kwargs):  # pragma: no cover - should not be called
-        raise AssertionError("business repair should not run")
-
-    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair)
-    assert "script_requirement_validator_error" in api.generate_file.__globals__["FileGenerationStageError"].__name__ or True
-    # Contract-level assertion: validator failures only early-return when no localized static blocker is found.
+    # Contract-level assertion: single-file production validator failures are
+    # converted into current-file repair issues instead of terminal SSE errors.
     import inspect
     source = inspect.getsource(api.generate_file)
     assert "script_requirement_validator_error" in source
-    assert "_detect_script_responsibility_static_blockers" in source
-    assert "no localized business blocker was identified" in source
+    assert "single_file_production_validation" in source
+    assert "auto-repair the current file instead of returning directly to the frontend" in source
+    assert "no localized business blocker was identified" not in source
 
 
 def test_validator_graph_source_quality_marked(monkeypatch):

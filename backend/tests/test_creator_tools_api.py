@@ -71,7 +71,7 @@ def test_creator_tool_test_passes_when_runtime_helper_is_reexported(monkeypatch)
     body = response.json()
     assert body["success"] is True
     assert body["tool"]["configured"] is True
-    assert set(body["tool"]["runtime_helpers_available"]) >= {"create_pdf", "build_pdf_report", "images_to_pdf", "merge_pdfs"}
+    assert set(body["tool"]["runtime_helpers_available"]) >= {"create_pdf", "create_pdf_document", "images_to_pdf", "merge_pdfs"}
     assert body["tool"]["missing_runtime_helpers"] == []
     assert "runtime helpers look ready" in body["message"]
 

@@ -390,7 +390,6 @@ BUILTIN_TOOL_CAPABILITIES["pdf_generation"] = replace(
     helper_imports=[
         "create_pdf",
         "create_pdf_document",
-        "build_pdf_report",
         "images_to_pdf",
         "merge_pdfs",
     ],
@@ -3182,6 +3181,95 @@ async def _repair_script_with_model(
 
     return repaired
 
+
+async def _validate_tool_manifest_with_repair(
+    *,
+    request: dict[str, Any],
+    manifest: dict[str, Any],
+    script_code: str,
+    sample_input: dict[str, Any],
+    dynamic: bool = True,
+    real_run: bool = False,
+    require_auth_config: bool = False,
+    model_notes: list[str],
+    warnings: list[str],
+    max_attempts: int = 3,
+    human_feedback: str = "",
+) -> tuple[str, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Validate one sample execution and repair script failures before surfacing them.
+
+    Single-sample production/trial validation is a repair signal, not a terminal
+    frontend failure.  If the adapter code is present and validation localizes a
+    script/sample execution error, run the normal patch repair loop first.  Only
+    return a failed validation after repair attempts are exhausted or the repair
+    proposal is unsafe/incomplete.
+    """
+
+    current_code = _ensure_named_entrypoint(script_code, manifest)
+    current_sample = sample_input if isinstance(sample_input, dict) else {}
+    repair_log: list[dict[str, Any]] = []
+    validation: dict[str, Any] = {}
+
+    attempts = max(1, int(max_attempts or 1))
+    for attempt in range(attempts):
+        validation = validate_tool_manifest(
+            manifest,
+            adapter_code=current_code,
+            sample_input=current_sample,
+            dynamic=dynamic,
+            real_run=real_run,
+            require_auth_config=require_auth_config,
+        )
+        current_sample = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else current_sample
+        if validation.get("success"):
+            break
+
+        repair_log.append({
+            "attempt": attempt + 1,
+            "errors": validation.get("errors") or [],
+            "dynamic_trial": validation.get("dynamic_trial") or {},
+            "auth_review": validation.get("auth_review") or {},
+            "real_run": bool(real_run),
+        })
+
+        if attempt >= attempts - 1 or not str(current_code or "").strip():
+            break
+
+        repaired_code = await _repair_script_with_model(
+            request=request,
+            manifest=manifest,
+            sample_input=current_sample,
+            script_code=current_code,
+            validation=validation,
+            human_feedback=human_feedback,
+            model_notes=model_notes,
+            warnings=warnings,
+        )
+        repaired_code = _ensure_named_entrypoint(repaired_code, manifest)
+
+        incomplete, reasons = _looks_like_incomplete_repair(
+            original_code=current_code,
+            repaired_code=repaired_code,
+            manifest=manifest,
+        )
+        if incomplete:
+            warnings.append(
+                "single-sample validation repair returned incomplete script; kept previous runtime_code. "
+                + "；".join(reasons)
+            )
+            break
+
+        current_code = repaired_code
+
+    validation = dict(validation or {})
+    validation["repair_log"] = repair_log
+    if repair_log and not validation.get("success"):
+        validation["status"] = "failed_after_repair"
+    elif repair_log and validation.get("success"):
+        validation["status"] = "validated_after_repair"
+    return current_code, current_sample, validation, repair_log
+
+
 async def _author_snippet_with_model(*, request: dict[str, Any], manifest: dict[str, Any], sample_input: dict[str, Any], model_notes: list[str], warnings: list[str]) -> dict[str, Any] | None:
     """Step 5: summarize a generic reusable snippet and IO contract.
 
@@ -3482,15 +3570,19 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             manifest,
         )
 
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=script_code,
+        script_code, sample_input, validation, _repair_log = await _validate_tool_manifest_with_repair(
+            request=request,
+            manifest=manifest,
+            script_code=script_code,
             sample_input=sample_input,
             dynamic=True,
             real_run=bool(request.get("real_run") or request.get("allow_external_network")),
             require_auth_config=False,
+            model_notes=model_notes,
+            warnings=warnings,
+            max_attempts=3,
+            human_feedback=str(request.get("human_feedback") or request.get("feedback") or ""),
         )
-        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
         warnings.extend(validation.get("sample_notes") or [])
 
         return {
@@ -3530,15 +3622,19 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
             manifest,
         )
 
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=script_code,
+        script_code, sample_input, validation, _repair_log = await _validate_tool_manifest_with_repair(
+            request=request,
+            manifest=manifest,
+            script_code=script_code,
             sample_input=sample_input,
             dynamic=True,
             real_run=bool(request.get("allow_external_network")),
             require_auth_config=True,
+            model_notes=model_notes,
+            warnings=warnings,
+            max_attempts=3,
+            human_feedback=str(request.get("human_feedback") or request.get("feedback") or ""),
         )
-        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
         warnings.extend(validation.get("sample_notes") or [])
 
         snippet = None
@@ -3969,64 +4065,18 @@ async def author_tool(request: dict[str, Any]) -> dict[str, Any]:
 
     script_code = _ensure_named_entrypoint(script_code, manifest)
 
-    repair_log: list[dict[str, Any]] = []
-    validation: dict[str, Any] = {}
-
-    for attempt in range(3):
-        validation = validate_tool_manifest(
-            manifest,
-            adapter_code=script_code,
-            sample_input=sample_input,
-            dynamic=True,
-            real_run=False,
-            require_auth_config=False,
-        )
-
-        sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
-        if validation.get("success"):
-            break
-
-        repair_log.append({
-            "attempt": attempt + 1,
-            "errors": validation.get("errors") or [],
-            "dynamic_trial": validation.get("dynamic_trial") or {},
-            "auth_review": validation.get("auth_review") or {},
-        })
-
-        if attempt >= 2:
-            break
-
-        repaired_code = await _repair_script_with_model(
-            request=request,
-            manifest=manifest,
-            sample_input=sample_input,
-            script_code=script_code,
-            validation=validation,
-            human_feedback="",
-            model_notes=model_notes,
-            warnings=warnings,
-        )
-
-        repaired_code = _ensure_named_entrypoint(repaired_code, manifest)
-
-        # 这里不做业务判断，只防止 repair 返回空壳或把完整 run() 弄丢。
-        incomplete, reasons = _looks_like_incomplete_repair(
-            original_code=script_code,
-            repaired_code=repaired_code,
-            manifest=manifest,
-        )
-
-        if incomplete:
-            warnings.append(
-                "auto repair returned incomplete script; kept previous runtime_code. "
-                + "；".join(reasons)
-            )
-            break
-
-        script_code = repaired_code
-
-    sample_input = validation.get("sample_input") if isinstance(validation.get("sample_input"), dict) else sample_input
-    validation["repair_log"] = repair_log
+    script_code, sample_input, validation, repair_log = await _validate_tool_manifest_with_repair(
+        request=request,
+        manifest=manifest,
+        script_code=script_code,
+        sample_input=sample_input,
+        dynamic=True,
+        real_run=False,
+        require_auth_config=False,
+        model_notes=model_notes,
+        warnings=warnings,
+        max_attempts=3,
+    )
     validation["spec_repair_log"] = spec_repair_log
 
     snippet = await _author_snippet_with_model(

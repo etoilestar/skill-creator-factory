@@ -750,6 +750,98 @@ def test_passed_true_missing_checks_is_advisory_not_business_repair():
     assert review["failure_type"] == "script_requirement_validator_incomplete"
 
 
+def test_passed_false_missing_checks_with_structured_semantic_blocker_fails():
+    from backend.services.creator.repair import _parse_requirement_review_result
+
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": False,
+            "blocking_issues": [{
+                "failed_file": req.target_file,
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "semantic_failure": "core semantic construction is absent",
+                "minimal_edit": "Implement the current file semantic construction.",
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["failure_type"] == "script_requirement_failed"
+    assert review["issues"][0]["semantic_failure"] == "core semantic construction is absent"
+
+
+def test_missing_checks_does_not_swallow_current_file_semantic_failure():
+    from backend.services.creator.repair import _parse_requirement_review_result
+
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "issues": [{
+                "target_file": req.target_file,
+                "scope": "current_file",
+                "failure_layer": "semantic_responsibility",
+                "semantic_failure": "tool result is not used to construct the output",
+                "repair_target_file": req.target_file,
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["semantic_failure"] == "tool result is not used to construct the output"
+
+
+def test_missing_checks_with_interface_only_blocking_issue_is_advisory():
+    from backend.services.creator.repair import _parse_requirement_review_result
+
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": True,
+            "blocking_issues": [{
+                "failed_file": req.target_file,
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "interface_notes": ["interface mapping advisory"],
+                "minimal_edit": "Do not force this as a semantic repair.",
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is True
+    assert review["issues"] == []
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
+
+
+def test_checks_structured_semantic_blocker_fails():
+    from backend.services.creator.repair import _parse_requirement_review_result
+
+    req = build_default_requirement_graph([_script_spec()]).requirements[0]
+    review = _parse_requirement_review_result(
+        {
+            "passed": False,
+            "checks": [{
+                "requirement_id": req.id,
+                "failed_file": req.target_file,
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "semantic_failure": "input meaning never reaches the output",
+                "evidence_level": "missing",
+                "missing_evidence": ["current file semantic path"],
+            }],
+        },
+        requirements=[req],
+        file_path=req.target_file,
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["semantic_failure"] == "input meaning never reaches the output"
+
+
 def test_responsibility_only_field_and_extra_stdout_issues_normalize_to_passed():
     from backend.services.creator.repair import _parse_requirement_review_result
     req = build_default_requirement_graph([_script_spec()]).requirements[0]

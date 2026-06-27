@@ -2779,7 +2779,51 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
-def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids: set[str]) -> bool:
+_CURRENT_FILE_SCOPE_VALUES = {"current_file", "current_file_only", "current file", "current-file"}
+_RESPONSIBILITY_LAYER_VALUES = {"responsibility", "semantic_responsibility"}
+
+
+def _is_structured_semantic_responsibility_blocker(item: Any, file_path: str) -> bool:
+    """Return True only for a current-file semantic responsibility blocker.
+
+    This predicate is deliberately structural: it does not inspect business
+    words, field names, extensions, or concrete skill cases.
+    """
+    if not isinstance(item, dict):
+        return False
+
+    failed_file = str(item.get("failed_file") or item.get("target_file") or file_path).strip()
+    if failed_file != file_path:
+        return False
+
+    scope = str(item.get("scope") or item.get("repair_scope") or "").strip().lower()
+    if scope not in _CURRENT_FILE_SCOPE_VALUES:
+        return False
+
+    failure_layer = str(item.get("failure_layer") or item.get("layer") or item.get("layer_type") or "").strip().lower()
+    if failure_layer not in _RESPONSIBILITY_LAYER_VALUES:
+        return False
+
+    if not str(item.get("semantic_failure") or "").strip():
+        return False
+
+    repair_target = str(item.get("repair_target_file") or item.get("minimal_edit_target_file") or "").strip()
+    if repair_target and repair_target != file_path:
+        return False
+
+    change_requests = item.get("change_requests")
+    if isinstance(change_requests, list):
+        for request in change_requests:
+            if not isinstance(request, dict):
+                continue
+            target = str(request.get("target_file") or request.get("file") or file_path).strip()
+            if target != file_path:
+                return False
+
+    return True
+
+
+def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids: set[str], *, file_path: str) -> bool:
     """Backend-owned blocking predicate for first-round responsibility clues.
 
     Do not use severity/warning/advisory wording as the gate. A model item is
@@ -2796,22 +2840,15 @@ def _is_structured_missing_required_evidence(item: dict[str, Any], required_ids:
     missing = item.get("missing_evidence")
     if not isinstance(missing, list) or not missing:
         return False
-    semantic_failure = item.get("semantic_failure")
-    failure_layer = str(item.get("failure_layer") or item.get("layer") or "").strip().lower()
-    scope = str(item.get("scope") or "").strip().lower()
-    if scope and scope not in {"current_file", "current_file_only", "current file", "current-file"}:
-        return False
-    if failure_layer and failure_layer not in {"responsibility", "semantic_responsibility"}:
-        return False
-    if not str(semantic_failure or "").strip():
+    if not _is_structured_semantic_responsibility_blocker(item, file_path):
         return False
     # Scope is normalized by the backend when producing the repair issue; do
     # not infer blocking from advisory/severity/scope wording.
     return True
 
 
-def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str]) -> bool:
-    return _is_structured_missing_required_evidence(item, required_ids)
+def _is_blocking_requirement_check(item: dict[str, Any], required_ids: set[str], *, file_path: str) -> bool:
+    return _is_structured_missing_required_evidence(item, required_ids, file_path=file_path)
 
 
 def _coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
@@ -2831,32 +2868,38 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
     if not isinstance(data, dict):
         return {"passed": True, "failure_type": "script_requirement_validator_error", "issues": [], "advisory_notes": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
     advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
+    raw_issue_items: list[dict[str, Any]] = []
     for collection_name in ("blocking_issues", "issues"):
         collection = data.get(collection_name)
         if isinstance(collection, list):
             for raw_issue in collection:
                 if isinstance(raw_issue, dict):
+                    raw_issue_items.append(raw_issue)
                     advisory_notes.append(raw_issue)
     checks = data.get("checks")
-    if not isinstance(checks, list):
-        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": [], "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
     required_ids = {r.id for r in requirements if r.required}
-    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
-    missing = sorted(required_ids - seen)
-    if missing:
-        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": checks, "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
+    candidate_items: list[dict[str, Any]] = []
+    if isinstance(checks, list):
+        candidate_items.extend(item for item in checks if isinstance(item, dict))
+    candidate_items.extend(raw_issue_items)
+    candidate_items.extend(item for item in advisory_notes if isinstance(item, dict) and item not in candidate_items)
+
     blocking: list[dict[str, Any]] = []
-    candidate_items = [item for item in checks if isinstance(item, dict)]
-    candidate_items.extend(item for item in advisory_notes if isinstance(item, dict))
-    seen_blockers: set[tuple[str, tuple[str, ...]]] = set()
+    seen_blockers: set[tuple[str, tuple[str, ...], str]] = set()
     for check in candidate_items:
         rid = str(check.get("requirement_id") or "")
-        if not _is_blocking_requirement_check(check, required_ids):
+        has_required_evidence_shape = bool(rid and (not required_ids or rid in required_ids))
+        if has_required_evidence_shape:
+            is_blocking = _is_blocking_requirement_check(check, required_ids, file_path=file_path)
+        else:
+            is_blocking = _is_structured_semantic_responsibility_blocker(check, file_path)
+        if not is_blocking:
             if check not in advisory_notes:
                 advisory_notes.append(check)
             continue
         missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
-        key = (rid, tuple(str(item) for item in missing_evidence))
+        semantic_failure = str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence.")
+        key = (rid, tuple(str(item) for item in missing_evidence), semantic_failure)
         if key in seen_blockers:
             continue
         seen_blockers.add(key)
@@ -2866,15 +2909,27 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
                 "failed_file": file_path,
                 "failed_function": "current script",
                 "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
-                "reason": str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
-                "semantic_failure": str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence."),
+                "reason": semantic_failure,
+                "semantic_failure": semantic_failure,
                 "missing_evidence": missing_evidence,
                 "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
                 "allowed_scope": "current file only",
                 "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
                 "details": {"check": {k: v for k, v in check.items() if k != "interface_notes"}, "interface_notes_advisory": check.get("interface_notes") if isinstance(check.get("interface_notes"), list) else []},
             })
-    return {"passed": not blocking, "failure_type": "script_requirement_failed" if blocking else "none", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "" if not blocking else str(data.get("repair_instructions") or ""), "raw_review": data}
+
+    if blocking:
+        normalized_checks = checks if isinstance(checks, list) else []
+        return {"passed": False, "failure_type": "script_requirement_failed", "issues": blocking, "checks": normalized_checks, "advisory_notes": advisory_notes, "repair_instructions": str(data.get("repair_instructions") or ""), "raw_review": data}
+
+    if not isinstance(checks, list):
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": [], "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
+
+    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
+    missing = sorted(required_ids - seen)
+    if missing:
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": checks, "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
+    return {"passed": True, "failure_type": "none", "issues": [], "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "", "raw_review": data}
 
 
 

@@ -4552,6 +4552,418 @@ def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
     return "json.loads" in content and "sys.argv" in content
 
 
+def _python_required_key_get_default_violations(tree: ast.AST, required_keys: set[str]) -> list[int]:
+    """Return lines where code reads a required argv key via .get/default fallback."""
+    if not required_keys:
+        return []
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value in required_keys
+            and len(node.args) >= 2
+        ):
+            lines.append(getattr(node, "lineno", 0))
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            if any(
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "get"
+                and value.args
+                and isinstance(value.args[0], ast.Constant)
+                and isinstance(value.args[0].value, str)
+                and value.args[0].value in required_keys
+                for value in node.values
+            ):
+                lines.append(getattr(node, "lineno", 0))
+    return sorted({line for line in lines if line})
+
+
+def _literal_string_set(node: ast.AST) -> set[str] | None:
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        values: set[str] = set()
+        for item in node.elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                values.add(item.value)
+            else:
+                return None
+        return values
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "set" and not node.args:
+        return set()
+    return None
+
+
+def _type_name_from_ast(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Tuple):
+        names = [_type_name_from_ast(item) for item in node.elts]
+        if all(names):
+            return "|".join(str(name) for name in names)
+    return None
+
+
+def _literal_expected_types(node: ast.AST) -> dict[str, str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    result: dict[str, str] = {}
+    for key_node, value_node in zip(node.keys, node.values):
+        if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+            return None
+        type_name = _type_name_from_ast(value_node)
+        if not type_name:
+            return None
+        result[key_node.value] = type_name
+    return result
+
+
+def _literal_dict_string_keys(node: ast.AST) -> set[str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    keys: set[str] = set()
+    for key_node in node.keys:
+        if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+            keys.add(key_node.value)
+        else:
+            return None
+    return keys
+
+
+def _schema_placeholder_reasons(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    schema_names = {"allowed_keys", "required_keys", "optional_keys", "defaulted_keys", "default_values", "defaults", "expected_types", "arg_schema", "schema"}
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        names = [target.id.lower() for target in targets if isinstance(target, ast.Name)]
+        if not any(name in schema_names or ("allowed" in name and "key" in name) or ("required" in name and "key" in name) or ("optional" in name and "key" in name) or ("default" in name and "key" in name) or ("expected" in name and "type" in name) for name in names):
+            continue
+        if isinstance(value, ast.Constant) and value.value is Ellipsis:
+            reasons.append("schema assignment uses ellipsis placeholder")
+        if isinstance(value, ast.Set) and any(isinstance(item, ast.Constant) and item.value is Ellipsis for item in value.elts):
+            reasons.append("schema assignment uses {...} / ellipsis placeholder")
+        if isinstance(value, ast.Dict) and any(
+            (isinstance(item, ast.Constant) and item.value is Ellipsis)
+            for item in [*(value.keys or []), *value.values]
+            if item is not None
+        ):
+            reasons.append("schema dict uses ellipsis placeholder")
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set" and any(isinstance(arg, ast.Constant) and arg.value is Ellipsis for arg in value.args):
+            reasons.append("schema assignment uses set(...) placeholder")
+        if isinstance(value, ast.Constant) and isinstance(value.value, str) and re.search(r"(?i)\b(todo|placeholder|example)\b", value.value):
+            reasons.append("schema assignment uses TODO/example placeholder")
+        source_keys = _literal_string_set(value)
+        if source_keys == {"input_text"}:
+            reasons.append("schema still contains input_text example placeholder")
+        if isinstance(value, ast.Dict) and set((_literal_expected_types(value) or {}).keys()) == {"input_text"}:
+            reasons.append("schema still contains input_text example placeholder")
+    return sorted(set(reasons))
+
+
+def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
+    """Extract generic strict argv schema declarations from Python source.
+
+    This is intentionally lightweight and business-agnostic. It recognizes
+    common constant declarations and simple ARG_SCHEMA/SCHEMA dictionaries only.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return {"allowed_keys": None, "required_keys": None, "optional_keys": None, "defaulted_keys": None, "expected_types": {}, "placeholder_reasons": ["python syntax invalid"]}
+
+    allowed_keys: set[str] | None = None
+    required_keys: set[str] | None = None
+    optional_keys: set[str] | None = None
+    defaulted_keys: set[str] | None = None
+    expected_types: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if value is None:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            name = target.id.lower()
+            if "allowed" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    allowed_keys = parsed
+            elif "required" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    required_keys = parsed
+            elif "optional" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    optional_keys = parsed
+            elif "default" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    defaulted_keys = parsed
+            elif name in {"default_values", "defaults"}:
+                parsed = _literal_dict_string_keys(value)
+                if parsed is not None:
+                    defaulted_keys = parsed if defaulted_keys is None else defaulted_keys | parsed
+            elif "expected" in name and "type" in name:
+                parsed_types = _literal_expected_types(value)
+                if parsed_types is not None:
+                    expected_types.update(parsed_types)
+            elif name in {"arg_schema", "schema"} and isinstance(value, ast.Dict):
+                for key_node, value_node in zip(value.keys, value.values):
+                    if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                        continue
+                    key = key_node.value.lower()
+                    if key in {"allowed_keys", "allowed"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            allowed_keys = parsed
+                    elif key in {"required_keys", "required"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            required_keys = parsed
+                    elif key in {"optional_keys", "optional"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            optional_keys = parsed
+                    elif key in {"defaulted_keys", "defaulted"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            defaulted_keys = parsed
+                    elif key in {"expected_types", "types"}:
+                        parsed_types = _literal_expected_types(value_node)
+                        if parsed_types is not None:
+                            expected_types.update(parsed_types)
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "strict_json_argv_guard"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Dict)
+        ):
+            continue
+        call_allowed: set[str] = set()
+        call_required: set[str] = set()
+        call_optional: set[str] = set()
+        call_defaulted: set[str] = set()
+        call_types: dict[str, str] = {}
+        for key_node, rule_node in zip(node.args[1].keys, node.args[1].values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                continue
+            key = key_node.value
+            call_allowed.add(key)
+            required = True
+            if isinstance(rule_node, ast.Dict):
+                for rule_key, rule_value in zip(rule_node.keys, rule_node.values):
+                    if not (isinstance(rule_key, ast.Constant) and isinstance(rule_key.value, str)):
+                        continue
+                    if rule_key.value == "required" and isinstance(rule_value, ast.Constant):
+                        required = bool(rule_value.value)
+                    elif rule_key.value == "default":
+                        call_defaulted.add(key)
+                    elif rule_key.value == "type":
+                        type_name = _type_name_from_ast(rule_value)
+                        if type_name:
+                            call_types[key] = type_name
+            if required:
+                call_required.add(key)
+            else:
+                call_optional.add(key)
+        if call_allowed:
+            allowed_keys = call_allowed if allowed_keys is None else allowed_keys | call_allowed
+        if call_required:
+            required_keys = call_required if required_keys is None else required_keys | call_required
+        if call_optional:
+            optional_keys = call_optional if optional_keys is None else optional_keys | call_optional
+        if call_defaulted:
+            defaulted_keys = call_defaulted if defaulted_keys is None else defaulted_keys | call_defaulted
+        expected_types.update(call_types)
+
+    return {
+        "allowed_keys": sorted(allowed_keys) if allowed_keys is not None else None,
+        "required_keys": sorted(required_keys) if required_keys is not None else None,
+        "optional_keys": sorted(optional_keys) if optional_keys is not None else None,
+        "defaulted_keys": sorted(defaulted_keys) if defaulted_keys is not None else None,
+        "expected_types": dict(sorted(expected_types.items())),
+        "placeholder_reasons": _schema_placeholder_reasons(tree),
+    }
+
+
+def _python_imports_strict_argv_guard(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "backend.services.runtime_tools":
+            if any(alias.name == "strict_json_argv_guard" for alias in node.names):
+                return True
+    return False
+
+
+def _python_calls_strict_argv_guard(tree: ast.AST) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "strict_json_argv_guard")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "strict_json_argv_guard")
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _python_strict_argv_guard_spec_placeholder_reasons(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "strict_json_argv_guard"
+            and len(node.args) >= 2
+        ):
+            continue
+        spec = node.args[1]
+        if isinstance(spec, ast.Dict):
+            for key in spec.keys:
+                if isinstance(key, ast.Constant) and key.value == "input_text":
+                    reasons.append("strict_json_argv_guard spec still contains input_text example placeholder")
+                if isinstance(key, ast.Constant) and isinstance(key.value, str) and re.search(r"(?i)example|todo|placeholder", key.value):
+                    reasons.append("strict_json_argv_guard spec contains example/TODO placeholder key")
+                if isinstance(key, ast.Constant) and key.value is Ellipsis:
+                    reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+            if any(isinstance(value, ast.Constant) and value.value is Ellipsis for value in spec.values):
+                reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+        elif not (isinstance(spec, ast.Dict) and not spec.keys):
+            if isinstance(spec, ast.Constant) and spec.value is Ellipsis:
+                reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+    return sorted(set(reasons))
+
+
+def _python_run_reparse_or_payload_bypass(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "run":
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "loads"
+                and isinstance(inner.func.value, ast.Name)
+                and inner.func.value.id == "json"
+            ):
+                reasons.append("run() must not re-parse sys.argv/json argv")
+            if isinstance(inner, ast.Name) and inner.id == "payload":
+                reasons.append("run() must not use unvalidated payload directly")
+    return sorted(set(reasons))
+
+
+def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]]:
+    """Heuristically verify that a Python script owns strict runtime argv schema.
+
+    This intentionally checks generic guard structure only.  It does not impose
+    platform field names or compare against SkillPlan/SKILL.md business keys.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False, ["python syntax invalid"]
+
+    lowered = content.lower()
+    reasons: list[str] = []
+    schema = extract_python_strict_argv_schema(content)
+    required_key_set = set(schema.get("required_keys") or [])
+    default_lines = _python_required_key_get_default_violations(tree, required_key_set)
+    if default_lines:
+        reasons.append(
+            "required argv keys must not be read through .get(..., default) / .get(...) or default "
+            f"(lines: {', '.join(map(str, default_lines[:8]))})"
+        )
+
+    placeholder_reasons = list(schema.get("placeholder_reasons") or [])
+    if placeholder_reasons:
+        reasons.extend(placeholder_reasons)
+
+    if not _script_reads_json_argv(content, "python"):
+        reasons.append("script must parse sys.argv[1] with json.loads")
+
+    imports_guard = _python_imports_strict_argv_guard(tree)
+    calls_guard = _python_calls_strict_argv_guard(tree)
+    if not imports_guard:
+        reasons.append("Python scripts must import strict_json_argv_guard from backend.services.runtime_tools")
+    if not calls_guard:
+        reasons.append("Python scripts must call strict_json_argv_guard(payload, spec) before core logic")
+    reasons.extend(_python_strict_argv_guard_spec_placeholder_reasons(tree))
+    reasons.extend(_python_run_reparse_or_payload_bypass(tree))
+
+    if imports_guard and calls_guard:
+        return not reasons, reasons
+
+    unknown_guard = (
+        (
+            ("unknown" in lowered or "extra" in lowered or "unexpected" in lowered)
+            or re.search(r"set\s*\(\s*(?:payload|data|argv)\s*\)\s*(?:-|!=)", content)
+        )
+        and ("raise" in lowered or "sys.exit" in lowered)
+    )
+    if not unknown_guard:
+        reasons.append("script must reject unknown argv keys fail-fast")
+
+    missing_guard = (
+        (
+            "missing" in lowered
+            or "required" in lowered
+            or re.search(r"['\"][^'\"]+['\"]\s+not\s+in\s+(?:payload|data|argv)", content)
+        )
+        and ("raise" in lowered or "sys.exit" in lowered)
+    )
+    if not missing_guard:
+        reasons.append("script must reject missing required keys fail-fast")
+
+    empty_guard = any(token in lowered for token in (" is none", "== \"\"", "== ''", "not value", "len(value) == 0", "empty"))
+    if not empty_guard:
+        reasons.append("script must reject empty required values")
+
+    type_guard = "isinstance(" in content or "type(" in content
+    if not type_guard:
+        reasons.append("script must validate required value types")
+
+    has_validated_flow = re.search(r"run\s*\(\s*(validated|args|params|config)\s*\)", content) or "validate_payload(" in content
+    if not has_validated_flow:
+        reasons.append("run/main should use validated args from parse/validate logic")
+
+    return not reasons, reasons
+
+
+def _strict_argv_guard_failure_message(file_path: str, content: str, runtime: str) -> str | None:
+    if runtime != "python":
+        return None
+    ok, reasons = _python_has_strict_argv_runtime_guard(content)
+    if ok:
+        return None
+    return (
+        f"{file_path} 必须在脚本内部实现 strict JSON argv runtime guard：在核心逻辑前完成等价的 argv 校验，"
+        "拒绝 unknown/missing/empty/type 错误，并只把已校验参数交给核心逻辑。\n"
+        + "\n".join(f"- {reason}" for reason in reasons)
+    )
+
+
 def _script_uses_input_keys(content: str, keys: list[str]) -> tuple[bool, list[str]]:
     missing = [key for key in keys if key not in content]
     return not missing, missing
@@ -4609,6 +5021,10 @@ def _validate_script_contract_static(
         raise ValueError(
             f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
         )
+
+    guard_failure = _strict_argv_guard_failure_message(file_path, content, plan_entry.runtime)
+    if json_argv_commands and guard_failure:
+        raise ValueError(guard_failure)
 
 
 

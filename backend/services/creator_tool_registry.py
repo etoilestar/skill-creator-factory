@@ -316,6 +316,76 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "authoring_code_protocol_check": _simple_cap("authoring_code_protocol_check", "Authoring 代码协议检查", "authoring", ["tool_authoring"], allow_creator_use=False),
 }
 
+
+BUILTIN_TOOL_CAPABILITIES["script_argv_guard"] = ToolCapability(
+    name="script_argv_guard",
+    display_name="Strict JSON argv guard",
+    category="script_core",
+    roles=[],
+    enabled_by_default=True,
+    allow_creator_use=True,
+    helper_imports=["strict_json_argv_guard"],
+    usage_policy="helper_required",
+    helper_module="backend.services.runtime_tools",
+    safety_level="core",
+    tool_type="python_helper",
+    functions=[
+        ToolFunctionManifest(
+            function_name="strict_json_argv_guard",
+            import_path="backend.services.runtime_tools",
+            short_description="Validate JSON argv before script core logic.",
+            when_to_use="Mandatory for every generated Python script before run() or core logic.",
+            signature="strict_json_argv_guard(payload: dict, spec: dict) -> dict",
+            input_schema={"type": "object", "required": ["payload", "spec"], "properties": {"payload": {"type": "object"}, "spec": {"type": "object"}}},
+            output_schema={"type": "object"},
+            return_contract="Returns validated args. Raises on unknown, missing, empty, or invalid typed argv.",
+            example_call=(
+                "from backend.services.runtime_tools import strict_json_argv_guard\n\n"
+                "args = strict_json_argv_guard(payload, {\n"
+                "    'topic': {'type': str, 'required': True},\n"
+                "})"
+            ),
+            common_mistakes=[
+                "Do not skip this helper in generated scripts.",
+                "Do not pass a platform-wide field list as spec.",
+                "Do not leave input_text/example/TODO placeholders.",
+                "Do not mark core inputs as optional/defaulted.",
+                "Do not use unvalidated payload in run().",
+            ],
+            usage_policy="helper_required",
+            required_capabilities=["script_argv_guard"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="script_argv_guard.strict_json_argv_guard",
+            title="Mandatory argv validation before core logic",
+            kind="minimal_usage",
+            description="Import and call strict_json_argv_guard immediately after parsing sys.argv[1].",
+            code=(
+                "import json\n"
+                "import sys\n"
+                "from backend.services.runtime_tools import strict_json_argv_guard\n\n"
+                "def parse_args() -> dict:\n"
+                "    if len(sys.argv) < 2:\n"
+                "        raise ValueError('missing JSON argv')\n"
+                "    payload = json.loads(sys.argv[1])\n"
+                "    return strict_json_argv_guard(payload, {\n"
+                "        # Replace with parameters actually used by run(args).\n"
+                "        'topic': {'type': str, 'required': True},\n"
+                "    })\n"
+            ),
+            expected_input_shape={"payload": "dict parsed from sys.argv[1]", "spec": "dict describing current script args"},
+            expected_output_shape={"validated_args": "dict"},
+            return_rule="run() must receive and use only the validated args returned by strict_json_argv_guard.",
+            anti_patterns=["Do not omit this helper.", "Do not use payload directly in run().", "Do not re-parse sys.argv in run().", "Do not preserve placeholder spec fields."],
+            requires=["script_argv_guard"],
+            usage_policy="helper_required",
+            priority=10000,
+        )
+    ],
+)
+
 BUILTIN_TOOL_CAPABILITIES["text_generation"] = replace(
     BUILTIN_TOOL_CAPABILITIES["text_generation"],
     helper_imports=["generate_text_with_llm"],
@@ -1833,9 +1903,15 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         return entry.get(name) if isinstance(entry, dict) else getattr(entry, name, None)
 
     selected = [str(item) for item in (raw_attr("selected_tools") or []) if item]
+    entry_path = next(
+        (str(raw_attr(attr) or "") for attr in ("path", "file_path", "script_path") if raw_attr(attr)),
+        "",
+    )
+    is_python_script = str(raw_attr("runtime") or "python") == "python" and entry_path.replace("\\", "/").startswith("scripts/")
+    mandatory_caps = ["script_argv_guard"] if is_python_script else []
     strategies = raw_attr("implementation_strategy") or []
     slots = raw_attr("required_tool_slots") or []
-    caps = list(selected)
+    caps = [*mandatory_caps, *selected]
     for strategy in strategies:
         data = strategy if isinstance(strategy, dict) else getattr(strategy, "__dict__", {})
         if str(data.get("strategy") or "") in {"use_registered_tool", "registered_tool"} and data.get("tool_id"):
@@ -1896,7 +1972,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         if not cap.enabled_by_default or not cap.allow_creator_use:
             warnings.append(f"tool {name} is disabled or not allowed for Creator")
             continue
-        if cap.roles and role and role not in cap.roles and name != "file_output":
+        if cap.roles and role and role not in cap.roles and name not in {"file_output", "script_argv_guard"}:
             warnings.append(f"tool {name} is not allowed for role {role}")
             continue
         if cap.name in allowed_tools:
@@ -1910,7 +1986,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
             record = _normalize_dependency_record(dep)
             if record.get("package"):
                 dependencies.append(record["package"])
-    snippets = resolve_tool_snippets_for_context(role=role, capabilities=allowed_tools, tool_names=allowed_tools, file_path="", max_snippets=5)
+    snippets = resolve_tool_snippets_for_context(role=role, capabilities=allowed_tools, tool_names=allowed_tools, file_path="", max_snippets=10)
     layered_prompt = tool_layer_prompt_for_context(
         role=role,
         required_capabilities=_as_list_attr(entry, "required_capabilities"),

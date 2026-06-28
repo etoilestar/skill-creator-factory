@@ -2013,6 +2013,11 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "当前脚本生成内容为空。"
                 "这不是可保存状态，必须让模型返修为非空、可解析的单文件源码。"
                 "只实现当前脚本职责，保留 JSON argv 入口和 stdout JSON 输出要求。"
+                "脚本必须使用 mandatory helper strict_json_argv_guard：从 backend.services.runtime_tools 正确 import，在核心逻辑前对实际使用 argv 调用 strict_json_argv_guard(payload, spec)；不强制固定字段常量名，"
+                "拒绝 unknown/missing/empty/type 错误；required 参数禁止靠内部默认值补齐，"
+                "可选/defaulted 参数必须在入口 guard spec 中显式声明；"
+                "parse_args 必须返回已校验参数，run() 只能使用已校验参数。"
+                "禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema。"
             )
 
         if file_path.startswith("assets/"):
@@ -2096,7 +2101,11 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "当前失败属于第一轮当前脚本自身语义职责失败，不是 script_smoke 运行失败，也不是 E2E 字段链路失败。"
                 "第一轮修复只补当前脚本缺失的语义输入消费、语义产物生成或明确无效内容；"
                 "只修当前脚本中校验信息指出的函数、行号或代码区域；"
-                "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
+                "保留已经通过的 import、parse_args/main 入口、strict JSON argv guard、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
+                "如果缺少 mandatory guard，必须只修当前脚本：添加 strict_json_argv_guard import，在 parse_args/入口中调用 strict_json_argv_guard(payload, spec)，spec 根据 run() 真实使用参数填写；不要内联 helper，不要改 SKILL.md，不要引入脱离核心逻辑的全局字段词表；"
+                "不要一刀切删除 .get/default；但 required 参数不得用 .get(..., default) 或 .get(...) or default 继续执行，"
+                "可选/defaulted 参数必须在入口 guard spec 中显式声明；默认值可以由 guard spec 的 default 或 SKILL.md command JSON 明确提供，但不要破坏合法 optional/defaulted 逻辑；"
+                "禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
                 "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
                 "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"

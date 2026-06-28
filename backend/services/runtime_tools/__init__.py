@@ -1,5 +1,7 @@
 """Platform runtime tool helpers used by generated Skill scripts."""
 
+from .argv_tools import strict_json_argv_guard
+
 from .api_tools import api_get, api_post, registered_tool_call
 from .document_tools import (
     create_csv,
@@ -28,6 +30,7 @@ from .vision_tools import analyze_image_with_vision, ocr_image
 from .wechat_tools import create_wechat_draft, publish_wechat_draft, upload_wechat_media
 
 __all__ = [
+    "strict_json_argv_guard",
     "analyze_image_with_vision",
     "api_get",
     "api_post",

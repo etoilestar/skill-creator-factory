@@ -240,6 +240,9 @@
             <strong>{{ event.phase || 'e2e_repair' }}</strong>
             <span v-if="event.e2e_session_id"> · session {{ event.e2e_session_id }}</span>
             <span v-if="event.target_file"> · {{ event.target_file }}</span>
+            <span v-if="event.current_step || event.step_index"> · step {{ event.current_step || event.step_index }}<span v-if="event.total_steps">/{{ event.total_steps }}</span></span>
+            <span v-if="event.status"> · status {{ event.status }}</span>
+            <span v-if="event.failure_layer"> · layer {{ event.failure_layer }}</span>
             <span v-if="event.resume_from_step"> · 从第 {{ event.resume_from_step }} 步继续</span>
             <span v-if="Array.isArray(event.reused_checkpoints)"> · 复用 checkpoint: {{ event.reused_checkpoints.join(', ') || '无' }}</span>
             <span v-if="Array.isArray(event.invalidated_checkpoints)"> · 失效 checkpoint: {{ event.invalidated_checkpoints.join(', ') || '无' }}</span>
@@ -250,6 +253,12 @@
             <span v-else-if="event.patch_status"> · patch {{ event.patch_status }}</span>
             <span v-if="event.format_rewrite_status"> · format rewrite {{ event.format_rewrite_status }}</span>
             <span v-if="event.rerun_status"> · rerun {{ event.rerun_status }}</span>
+            <span v-if="event.next_target"> · next {{ event.next_target }}</span>
+            <pre v-if="event.failure_summary" class="post-detail">{{ event.failure_summary }}</pre>
+            <pre v-if="event.rendered_payload_summary" class="post-detail">payload: {{ event.rendered_payload_summary }}</pre>
+            <pre v-if="event.trace_summary" class="post-detail">trace: {{ event.trace_summary }}</pre>
+            <pre v-if="event.stdout_summary || event.stderr_summary" class="post-detail">stdout: {{ event.stdout_summary || '' }}
+stderr: {{ event.stderr_summary || '' }}</pre>
             <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
             <pre v-if="event.patch_status === 'parse_failed'" class="post-detail">parser_error: {{ event.parser_error || event.rejection_reason || 'unknown' }}
 diff_extraction_attempted: {{ Boolean(event.diff_extraction_attempted) }}
@@ -985,7 +994,7 @@ async function runPostValidationAndPackaging() {
     validateResult.value = await validateSkill(localSkillName.value, {
       model: props.model,
       autoRepair: true,
-      maxE2ERepairAttempts: 5,
+      maxE2ERepairAttempts: 10,
     })
   } catch (err) {
     validateResult.value = {

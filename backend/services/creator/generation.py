@@ -497,15 +497,18 @@ def _script_generation_skeleton(
         + helper_hint +
         "import json\n"
         "import sys\n\n"
+        "from backend.services.runtime_tools import strict_json_argv_guard\n\n"
         "def parse_args() -> dict:\n"
         "    if len(sys.argv) < 2:\n"
-        "        return {}\n"
-        "    data = json.loads(sys.argv[1])\n"
-        "    if not isinstance(data, dict):\n"
-        "        raise ValueError('argv JSON must be an object')\n"
-        "    return data\n\n"
-        "def run(payload: dict) -> dict:\n"
+        "        raise ValueError('missing JSON argv')\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    return strict_json_argv_guard(payload, {\n"
+        "        # Replace input_text with args actually used by run(args). Use {} for true no-input scripts.\n"
+        "        'input_text': {'type': str, 'required': True},\n"
+        "    })\n\n"
+        "def run(args: dict) -> dict:\n"
         "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
+        "    # Only read values from args after parse_args validation; use args['required_key'] for required values.\n"
         "    # Return an object containing every required stdout field.\n"
         "    return {}\n\n"
         "def main() -> None:\n"
@@ -803,6 +806,11 @@ def _build_script_generate_file_prompt_variant(
         "scripts/ 生成不会追加聊天历史，也不会注入完整蓝图。",
         "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
+        "系统提供 mandatory script core tool: strict_json_argv_guard；它不是可选 selected business tool，所有 Python scripts/*.py 必须 import 并调用它。",
+        "硬性 argv guard 规则：必须在 parse_args 或等价入口解析 sys.argv[1]，然后调用 strict_json_argv_guard(payload, spec)；spec 由当前脚本核心逻辑实际读取的参数决定，不来自平台字段词表。",
+        "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
+        "硬性 argv guard 规则：run() 只能使用 strict_json_argv_guard 返回的 args；run() 不得重新 json.loads(sys.argv[1])，不得直接使用未校验 payload。",
+        "硬性 argv guard 规则：骨架 spec 中的 input_text 只是示例，必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
         "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
@@ -834,7 +842,7 @@ def _build_script_generate_file_prompt_variant(
         ])
 
     if variant == "minimal":
-        instruction.append("极简要求：返回可运行脚本源码，解析 JSON argv，真实处理输入，打印满足 stdout_schema 的 JSON object。")
+        instruction.append("极简要求：返回可运行脚本源码，import strict_json_argv_guard，在入口解析 sys.argv[1] 后调用 strict_json_argv_guard(payload, spec)，run() 只使用返回的 args，真实处理输入，成功时打印满足 stdout_schema 的 JSON object。")
 
     return _creator_file_generation_messages(
         "\n\n".join(instruction),

@@ -855,7 +855,7 @@ def _build_script_generate_file_prompt_variant(
         ])
 
     if variant == "minimal":
-        instruction.append("极简要求：返回可运行脚本源码，使用 strict JSON argv schema 校验 allowed/required/type/non-empty/unknown keys，真实处理输入，成功时打印满足 stdout_schema 的 JSON object。")
+        instruction.append("极简要求：返回可运行脚本源码，先实现入口 argv guard / validation branch（不强制固定 ALLOWED_KEYS / REQUIRED_KEYS 常量），在核心逻辑前 fail-fast 校验 unknown/missing/empty/type，真实处理输入，成功时打印满足 stdout_schema 的 JSON object。")
 
     return _creator_file_generation_messages(
         "\n\n".join(instruction),

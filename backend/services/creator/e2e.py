@@ -1467,11 +1467,11 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     target_reason = str(details.get("target_reason") or "")
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
-        f"candidate_targets={candidate_targets}。必须对照 rendered_payload、command argv template、allowed_keys、required_keys、expected_types、SkillPlan.inputs 和 previous traces 决定最小修复；"
+        f"candidate_targets={candidate_targets}。必须对照 rendered_payload、command argv template、脚本入口校验分支/局部 schema、SkillPlan.inputs 和 previous traces 决定最小修复；不强制固定 ALLOWED_KEYS / REQUIRED_KEYS 常量；"
         "禁止删除可能正确的语义参数来让脚本通过；required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修 SKILL.md command JSON，传齐 required keys，移除职责外 unknown keys，并把需要的默认值显式写在 command JSON；不要改脚本。"
+        return common + "\nprimary_target=SKILL.md：只修 SKILL.md command JSON，传齐脚本入口校验所需参数，移除职责外 unknown keys；可选/defaulted 参数优先在 command JSON 显式传入，但不要把脚本合法的 optional/defaulted 逻辑改坏；不要改脚本。"
     if primary == script_path:
         return common + f"\nprimary_target={script_path}：只修当前脚本 strict schema / parse_args / validate_payload；不要改 SKILL.md，不要改业务字段为平台词表。"
     return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 还是当前脚本。"
@@ -1524,7 +1524,7 @@ def _parse_e2e_stdout_json(
             stderr=stderr_tail,
             return_code=proc.returncode,
             expected=(
-                "SKILL.md command JSON 必须只传脚本 allowed keys、传齐 required keys，且 required 值非空且类型正确。"
+                "SKILL.md command JSON 必须只传当前脚本入口 argv guard 接受的参数、传齐核心逻辑必需参数，且必需值非空且类型正确。"
                 if is_argv_schema_error
                 else "脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。"
             ),

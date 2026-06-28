@@ -1947,7 +1947,7 @@ async def _repair_existing_file_for_e2e_failure(
     external_context: dict[str, Any] | None = None,
     repair_events: list[dict[str, Any]] | None = None,
     e2e_session: CreatorE2ESession | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Repair existing SKILL.md/script file using local patch + sandbox E2E.
 
     第二轮原则：
@@ -2202,6 +2202,18 @@ async def _repair_existing_file_for_e2e_failure(
                     "请基于这个静态错误继续输出新的 exact_replace patch。"
                 )
                 repair_feedback = deterministic_error + "\n\n" + last_failure
+                e2e_session.events.append({
+                    **e2e_session.to_event_base(),
+                    "attempt": candidate_attempt,
+                    "target_file": target_path,
+                    "patch_status": "static_regression_failed",
+                    "status": "patch_failed",
+                    "rejection_reason": str(preflight_exc)[:2000],
+                    "failed_checks": repair_feedback.split("\n\n")[:8],
+                    "resolved_failures": e2e_session.resolved_failures,
+                    "rerun_status": "skipped",
+                    "writeback_status": "candidate_only",
+                })
                 logger.warning(
                     "[Creator][E2E][repair_candidate_static_failed] skill=%s file=%s attempt=%d/%d error=%s",
                     skill_name,
@@ -2258,7 +2270,8 @@ async def _repair_existing_file_for_e2e_failure(
                 "resolved_failures": e2e_session.resolved_failures,
                 "patch_mode": "exact_replace",
                 "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
-                "patch_status": "applied",
+                "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "same_target_still_failed",
+                "status": "repaired" if sandbox_gate.get("accepted") else "same_target_still_failed",
                 "changed_line_count": diff_stats.get("changed_line_count"),
                 "diff_excerpt": diff_stats.get("generated_diff_excerpt"),
                 "matched_excerpt": (diff_stats.get("applied") or [{}])[0].get("matched_excerpt"),
@@ -2272,21 +2285,43 @@ async def _repair_existing_file_for_e2e_failure(
                 next_target = _e2e_repair_target_from_errors(gate_errors)
                 has_explicit_next_target = any("E2E_REPAIR_TARGET=" in str(error or "") for error in gate_errors)
                 if has_explicit_next_target and next_target and next_target != target_path:
-                    e2e_session.events.append({
+                    for error in e2e_errors:
+                        e2e_session.resolved_failures.append({
+                            "failure_signature": _failure_signature_from_error(error),
+                            "target_file": target_path,
+                            "failure_kind": _failure_layer_from_error_text(error) or "e2e",
+                            "step_index": structured_failure.get("failed_step_index"),
+                            "resolved_by_revision": e2e_session.current_revision,
+                            "verified_by_e2e": True,
+                            "handoff_to_target": next_target,
+                        })
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    target_file.write_text(sanitized, encoding="utf-8")
+                    handoff_event = {
                         **e2e_session.to_event_base(),
                         "attempt": candidate_attempt,
                         "target_file": target_path,
-                        "patch_status": "rejected",
-                        "rejection_reason": "remaining failure target moved to a different file",
+                        "patch_status": "partial_success_target_changed",
+                        "status": "target_changed",
+                        "rejection_reason": "current target failure disappeared; remaining failure moved to a different file",
+                        "next_target": next_target,
+                        "next_failure": gate_errors,
                         "remaining_target_file": next_target,
-                        "failed_checks": sandbox_gate.get("errors") or [],
-                        "rerun_status": "failed",
-                        "writeback_status": "candidate_only",
-                    })
-                    raise ValueError(
-                        "E2E_REPAIR_TARGET_CHANGED：当前 remaining failure 已转移到其它文件，"
-                        f"停止继续修旧 target_file={target_path!r}，next_target={next_target!r}。"
-                    )
+                        "failed_checks": gate_errors,
+                        "resolved_failures": e2e_session.resolved_failures,
+                        "rerun_status": "target_handoff",
+                        "writeback_status": "written",
+                    }
+                    e2e_session.events.append(handoff_event)
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {
+                        "status": "target_changed",
+                        "repaired_target": target_path,
+                        "next_target": next_target,
+                        "next_failure": gate_errors,
+                        "attempt": candidate_attempt,
+                    }
                 working_content = sanitized
                 last_failure = (
                     "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
@@ -2330,7 +2365,13 @@ async def _repair_existing_file_for_e2e_failure(
                 json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000],
             )
 
-            return target_path
+            return {
+                "status": "repaired",
+                "repaired_target": target_path,
+                "next_target": None,
+                "next_failure": [],
+                "attempt": candidate_attempt,
+            }
 
         except Exception as candidate_exc:
             error_text = str(candidate_exc)
@@ -2344,7 +2385,8 @@ async def _repair_existing_file_for_e2e_failure(
                 **e2e_session.to_event_base(),
                 "attempt": candidate_attempt,
                 "target_file": target_path,
-                "patch_status": patch_status,
+                "patch_status": "patch_apply_failed" if patch_status == "rejected" else patch_status,
+                "status": "patch_failed",
                 "rejection_reason": error_text[:2000],
                 "last_output_excerpt": getattr(candidate_exc, "last_output_excerpt", ""),
                 "parser_error": getattr(candidate_exc, "parser_error", "") or (error_text[:1000] if patch_status == "parse_failed" else ""),
@@ -2377,13 +2419,16 @@ async def _repair_existing_file_for_e2e_failure(
 
             continue
 
-    raise ValueError(
-        "端到端自动修复未完成：写代码模型连续提出的 patch 未能通过 apply/static/E2E。\n"
-        f"skill={skill_name}\n"
-        f"target={target_path}\n"
-        f"last_failure={last_failure[:12000]}"
-    )
-
+    if repair_events is not None:
+        repair_events.extend(e2e_session.events)
+    return {
+        "status": "still_failed_same_target",
+        "repaired_target": target_path,
+        "next_target": None,
+        "next_failure": repair_feedback.split("\n\n")[:8],
+        "last_failure": last_failure[:12000],
+        "attempt": max_candidate_attempts,
+    }
 
 def validate_workflow_e2e(
     skill_name: str,

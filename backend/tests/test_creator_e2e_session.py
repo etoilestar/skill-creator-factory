@@ -123,3 +123,64 @@ def test_checkpoint_rejects_changed_script_hash(tmp_path, monkeypatch):
 
     (session.workspace_dir / "scripts" / "one.py").write_text("print('changed')\n", encoding="utf-8")
     assert e2e._load_valid_checkpoint(session, 1) is None
+
+@pytest.mark.asyncio
+async def test_validate_skill_e2e_repair_handoff_continues_to_next_target(monkeypatch, tmp_path):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+
+    skill_name = "handoff-skill"
+    skill_dir = tmp_path / skill_name
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: handoff\n---\n", encoding="utf-8")
+    (skill_dir / "scripts" / "step1.py").write_text("bad1", encoding="utf-8")
+    (skill_dir / "scripts" / "step2.py").write_text("bad2", encoding="utf-8")
+
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "run_action", lambda _payload: {"success": True, "path": str(skill_dir), "message": "ok"})
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: SimpleNamespace(events=[]))
+
+    validation_targets = iter([
+        ["E2E_REPAIR_TARGET=scripts/step1.py\nE2E_LAYER=script_stdout\nstep1 failed"],
+        ["E2E_REPAIR_TARGET=scripts/step2.py\nE2E_LAYER=script_stdout\nstep2 failed"],
+        [],
+    ])
+    repaired_targets = []
+
+    def fake_validate_workflow_e2e(*_args, **_kwargs):
+        return next(validation_targets)
+
+    async def fake_repair_existing_file_for_e2e_failure(**kwargs):
+        target = kwargs["target_path"]
+        repaired_targets.append(target)
+        events = kwargs.get("repair_events")
+        if target == "scripts/step1.py":
+            if events is not None:
+                events.append({
+                    "target_file": target,
+                    "patch_status": "partial_success_target_changed",
+                    "status": "target_changed",
+                    "next_target": "scripts/step2.py",
+                })
+            return {
+                "status": "target_changed",
+                "repaired_target": target,
+                "next_target": "scripts/step2.py",
+                "next_failure": ["E2E_REPAIR_TARGET=scripts/step2.py\nE2E_LAYER=script_stdout\nstep2 failed"],
+            }
+        if events is not None:
+            events.append({"target_file": target, "patch_status": "e2e_fully_passed", "status": "repaired"})
+        return {"status": "repaired", "repaired_target": target, "next_target": None, "next_failure": []}
+
+    monkeypatch.setattr(api, "validate_workflow_e2e", fake_validate_workflow_e2e)
+    monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", fake_repair_existing_file_for_e2e_failure)
+
+    response = await api.validate_skill(SkillActionRequest(skill_name=skill_name, auto_repair=True, max_e2e_repair_attempts=1))
+
+    assert response.success is True
+    assert repaired_targets == ["scripts/step1.py", "scripts/step2.py"]
+    assert "E2E_REPAIR_TARGET_CHANGED" not in response.message
+    assert [event["patch_status"] for event in response.repair_events] == [
+        "partial_success_target_changed",
+        "e2e_fully_passed",
+    ]

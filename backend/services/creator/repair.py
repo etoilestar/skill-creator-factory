@@ -2093,7 +2093,8 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
             or "content_responsibility" in lower_error
         ):
             return (
-                "当前失败属于 script_functional 内容职责闭环失败，不是 script_smoke 运行失败。"
+                "当前失败属于第一轮当前脚本自身语义职责失败，不是 script_smoke 运行失败，也不是 E2E 字段链路失败。"
+                "第一轮修复只补当前脚本自身语义职责或明确无效内容；"
                 "只修当前脚本中校验信息指出的函数、行号或代码区域；"
                 "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
@@ -3422,7 +3423,7 @@ async def _run_script_responsibility_review(
 ) -> dict[str, Any]:
     """First-round script responsibility review.
 
-    第一轮只判断当前脚本源码是否完成自身职责。
+    第一轮只判断当前脚本源码是否覆盖自身负责的语义任务。
 
     不判断：
     - 脚本能不能实际运行；
@@ -3432,6 +3433,9 @@ async def _run_script_responsibility_review(
     - 上下游字段映射；
     - 具体输入输出变量名；
     - 最终 E2E 闭环。
+
+    允许阻断的无效内容仅限非常明确的空内容、空集合、纯占位符、
+    明显默认模板、或与当前脚本职责明显无关的内容。
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
@@ -3478,13 +3482,15 @@ async def _run_script_responsibility_review(
             "content": (
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
-                "你只判断当前 scripts/** 源码是否完成 SkillPlanEntry 描述的自身职责。"
-                "不要判断其它非职责问题。\n\n"
+                "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务。"
+                "不要判断其它文件、workflow、字段名、审美或充分性细节。\n\n"
 
                 "核心原则：\n"
+                "- 第一轮职责检查去字段化：不要求固定字段名，不因字段名不同判失败；可建议可选字段名，但只能作为参考建议。\n"
                 "- 只有当前文件自身语义职责未完成，才 passed=false。\n"
                 "- 如果当前文件已经以等价实现完成同一语义职责，应 passed=true。\n"
-                "- blocking_issues 只能描述当前文件缺失的语义职责和最小实现边界。\n\n"
+                "- 可以阻断非常明确的无效输出倾向：空内容、空集合、纯占位符、明显默认模板、与职责明显无关的内容。\n"
+                "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件缺失的语义职责和最小实现边界。\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -3525,9 +3531,9 @@ async def _run_script_responsibility_review(
                 f"{_numbered_source(script_content)[-16000:]}\n\n"
 
                 "审查要求：\n"
-                "1. 只判断当前脚本是否完成自身职责。\n"
-                "2. 不要判断其它非职责问题。\n"
-                "3. 只有职责本身没有实现，才 passed=false。\n"
+                "1. 只判断当前脚本是否覆盖自身语义职责。\n"
+                "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名判错。\n"
+                "3. 只有职责本身没有实现，或内容明显无效（空、占位、默认模板、明显无关），才 passed=false。\n"
             ),
         },
     ]

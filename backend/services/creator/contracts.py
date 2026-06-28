@@ -4753,6 +4753,52 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
                         if parsed_types is not None:
                             expected_types.update(parsed_types)
 
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "strict_json_argv_guard"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Dict)
+        ):
+            continue
+        call_allowed: set[str] = set()
+        call_required: set[str] = set()
+        call_optional: set[str] = set()
+        call_defaulted: set[str] = set()
+        call_types: dict[str, str] = {}
+        for key_node, rule_node in zip(node.args[1].keys, node.args[1].values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                continue
+            key = key_node.value
+            call_allowed.add(key)
+            required = True
+            if isinstance(rule_node, ast.Dict):
+                for rule_key, rule_value in zip(rule_node.keys, rule_node.values):
+                    if not (isinstance(rule_key, ast.Constant) and isinstance(rule_key.value, str)):
+                        continue
+                    if rule_key.value == "required" and isinstance(rule_value, ast.Constant):
+                        required = bool(rule_value.value)
+                    elif rule_key.value == "default":
+                        call_defaulted.add(key)
+                    elif rule_key.value == "type":
+                        type_name = _type_name_from_ast(rule_value)
+                        if type_name:
+                            call_types[key] = type_name
+            if required:
+                call_required.add(key)
+            else:
+                call_optional.add(key)
+        if call_allowed:
+            allowed_keys = call_allowed if allowed_keys is None else allowed_keys | call_allowed
+        if call_required:
+            required_keys = call_required if required_keys is None else required_keys | call_required
+        if call_optional:
+            optional_keys = call_optional if optional_keys is None else optional_keys | call_optional
+        if call_defaulted:
+            defaulted_keys = call_defaulted if defaulted_keys is None else defaulted_keys | call_defaulted
+        expected_types.update(call_types)
+
     return {
         "allowed_keys": sorted(allowed_keys) if allowed_keys is not None else None,
         "required_keys": sorted(required_keys) if required_keys is not None else None,
@@ -4761,6 +4807,71 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
         "expected_types": dict(sorted(expected_types.items())),
         "placeholder_reasons": _schema_placeholder_reasons(tree),
     }
+
+
+def _python_imports_strict_argv_guard(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "backend.services.runtime_tools":
+            if any(alias.name == "strict_json_argv_guard" for alias in node.names):
+                return True
+    return False
+
+
+def _python_calls_strict_argv_guard(tree: ast.AST) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "strict_json_argv_guard")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "strict_json_argv_guard")
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _python_strict_argv_guard_spec_placeholder_reasons(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "strict_json_argv_guard"
+            and len(node.args) >= 2
+        ):
+            continue
+        spec = node.args[1]
+        if isinstance(spec, ast.Dict):
+            for key in spec.keys:
+                if isinstance(key, ast.Constant) and key.value == "input_text":
+                    reasons.append("strict_json_argv_guard spec still contains input_text example placeholder")
+                if isinstance(key, ast.Constant) and isinstance(key.value, str) and re.search(r"(?i)example|todo|placeholder", key.value):
+                    reasons.append("strict_json_argv_guard spec contains example/TODO placeholder key")
+                if isinstance(key, ast.Constant) and key.value is Ellipsis:
+                    reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+            if any(isinstance(value, ast.Constant) and value.value is Ellipsis for value in spec.values):
+                reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+        elif not (isinstance(spec, ast.Dict) and not spec.keys):
+            if isinstance(spec, ast.Constant) and spec.value is Ellipsis:
+                reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
+    return sorted(set(reasons))
+
+
+def _python_run_reparse_or_payload_bypass(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "run":
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "loads"
+                and isinstance(inner.func.value, ast.Name)
+                and inner.func.value.id == "json"
+            ):
+                reasons.append("run() must not re-parse sys.argv/json argv")
+            if isinstance(inner, ast.Name) and inner.id == "payload":
+                reasons.append("run() must not use unvalidated payload directly")
+    return sorted(set(reasons))
 
 
 def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]]:
@@ -4791,6 +4902,18 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
 
     if not _script_reads_json_argv(content, "python"):
         reasons.append("script must parse sys.argv[1] with json.loads")
+
+    imports_guard = _python_imports_strict_argv_guard(tree)
+    calls_guard = _python_calls_strict_argv_guard(tree)
+    if not imports_guard:
+        reasons.append("Python scripts must import strict_json_argv_guard from backend.services.runtime_tools")
+    if not calls_guard:
+        reasons.append("Python scripts must call strict_json_argv_guard(payload, spec) before core logic")
+    reasons.extend(_python_strict_argv_guard_spec_placeholder_reasons(tree))
+    reasons.extend(_python_run_reparse_or_payload_bypass(tree))
+
+    if imports_guard and calls_guard:
+        return not reasons, reasons
 
     unknown_guard = (
         (

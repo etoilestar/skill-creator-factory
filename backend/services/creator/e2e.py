@@ -1621,6 +1621,14 @@ def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill
         raise ValueError(
             f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
         )
+    if entry.runtime == "python":
+        try:
+            from backend.services.runtime_tools import strict_json_argv_guard as _strict_json_argv_guard  # noqa: F401
+        except Exception as exc:
+            raise ValueError(
+                "mandatory_guard_import_error: runtime_tools 无法导入 strict_json_argv_guard；"
+                "请检查 runtime_tools 导出、tool registry 注册和打包环境。"
+            ) from exc
     guard_failure = _strict_argv_guard_failure_message(file_path, content, entry.runtime)
     if json_argv_commands and guard_failure:
         raise ValueError(guard_failure)

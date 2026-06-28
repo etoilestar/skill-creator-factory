@@ -2693,6 +2693,8 @@ async def validate_skill(request: SkillActionRequest):
 
     max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))
     attempt = 0
+    attempts_by_target: dict[str, int] = {}
+    completed_targets: set[str] = set()
     repair_logs: list[str] = []
     repair_events: list[dict[str, Any]] = []
     e2e_session = _create_e2e_session(skill_name, source_skill_dir=settings.skills_path / skill_name)
@@ -2730,7 +2732,7 @@ async def validate_skill(request: SkillActionRequest):
                 repair_events=repair_events or e2e_session.events,
             )
 
-        if not request.auto_repair or attempt >= max_attempts:
+        if not request.auto_repair:
             return SkillActionResponse(
                 success=False,
                 path=None,
@@ -2757,8 +2759,40 @@ async def validate_skill(request: SkillActionRequest):
             )
 
         target_path = _e2e_repair_target_from_errors(e2e_errors)
+        if target_path in completed_targets:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "严格端到端工作流校验失败：已修复目标出现同目标回归，停止重复修复：\n"
+                    + "\n\n".join(e2e_errors)
+                    + f"\n\n回归目标：{target_path}"
+                    + (
+                        "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+                        if repair_logs else ""
+                    )
+                ),
+                repair_events=repair_events or e2e_session.events,
+            )
+        if attempts_by_target.get(target_path, 0) >= max_attempts:
+            return SkillActionResponse(
+                success=False,
+                path=None,
+                message=(
+                    "严格端到端工作流校验失败，且自动修复达到当前目标最大次数：\n"
+                    + "\n\n".join(e2e_errors)
+                    + f"\n\n自动修复目标：{target_path}"
+                    + f"\n当前目标尝试次数：{attempts_by_target.get(target_path, 0)}/{max_attempts}"
+                    + (
+                        "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+                        if repair_logs else ""
+                    )
+                ),
+                repair_events=repair_events or e2e_session.events,
+            )
         try:
-            repaired_target = await _repair_existing_file_for_e2e_failure(
+            attempts_by_target[target_path] = attempts_by_target.get(target_path, 0) + 1
+            repair_result = await _repair_existing_file_for_e2e_failure(
                 skill_name=skill_name,
                 target_path=target_path,
                 e2e_errors=e2e_errors,
@@ -2768,9 +2802,27 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_session=e2e_session,
             )
             attempt += 1
-            repair_logs.append(
-                f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}"
-            )
+            status = repair_result.get("status")
+            repaired_target = repair_result.get("repaired_target") or target_path
+            if status == "target_changed":
+                completed_targets.add(repaired_target)
+                next_target = repair_result.get("next_target")
+                repair_logs.append(
+                    f"第 {attempt} 轮：{repaired_target} 当前目标错误已消失，失败转移到 {next_target}，继续修复下一个目标"
+                )
+                continue
+            if status == "repaired":
+                completed_targets.add(repaired_target)
+                repair_logs.append(
+                    f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}"
+                )
+                continue
+            if status == "still_failed_same_target":
+                repair_logs.append(
+                    f"第 {attempt} 轮：{repaired_target} 仍报同目标错误，未完成修复"
+                )
+                raise ValueError(repair_result.get("last_failure") or "still_failed_same_target")
+            raise ValueError(json.dumps(repair_result, ensure_ascii=False, default=str))
         except Exception as exc:
             logger.exception(
                 "validate-skill e2e auto repair failed skill=%s target=%s",

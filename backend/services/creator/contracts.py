@@ -4792,35 +4792,22 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
     if not _script_reads_json_argv(content, "python"):
         reasons.append("script must parse sys.argv[1] with json.loads")
 
-    assigned_names = {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Assign, ast.AnnAssign))
-        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-        if isinstance(target, ast.Name)
-    }
-    has_allowed_decl = any("allowed" in name.lower() and "key" in name.lower() for name in assigned_names)
-    if schema.get("allowed_keys") is not None:
-        has_allowed_decl = True
-    if not has_allowed_decl:
-        reasons.append("script must declare allowed keys")
-
-    has_required_decl = any("required" in name.lower() and "key" in name.lower() for name in assigned_names)
-    if schema.get("required_keys") is not None:
-        has_required_decl = True
-    if not has_required_decl:
-        reasons.append("script must declare required keys")
-
     unknown_guard = (
-        ("unknown" in lowered or "extra" in lowered or "unexpected" in lowered)
-        and ("allowed" in lowered)
+        (
+            ("unknown" in lowered or "extra" in lowered or "unexpected" in lowered)
+            or re.search(r"set\s*\(\s*(?:payload|data|argv)\s*\)\s*(?:-|!=)", content)
+        )
         and ("raise" in lowered or "sys.exit" in lowered)
     )
     if not unknown_guard:
         reasons.append("script must reject unknown argv keys fail-fast")
 
     missing_guard = (
-        ("missing" in lowered or "required" in lowered)
+        (
+            "missing" in lowered
+            or "required" in lowered
+            or re.search(r"['\"][^'\"]+['\"]\s+not\s+in\s+(?:payload|data|argv)", content)
+        )
         and ("raise" in lowered or "sys.exit" in lowered)
     )
     if not missing_guard:
@@ -4848,8 +4835,8 @@ def _strict_argv_guard_failure_message(file_path: str, content: str, runtime: st
     if ok:
         return None
     return (
-        f"{file_path} 必须在脚本内部实现 strict JSON argv runtime guard：声明 allowed/required keys，"
-        "拒绝 unknown/missing/empty/type 错误，禁止输入默认值兜底，并只把已校验参数交给 run()。\n"
+        f"{file_path} 必须在脚本内部实现 strict JSON argv runtime guard：在核心逻辑前完成等价的 argv 校验，"
+        "拒绝 unknown/missing/empty/type 错误，并只把已校验参数交给核心逻辑。\n"
         + "\n".join(f"- {reason}" for reason in reasons)
     )
 

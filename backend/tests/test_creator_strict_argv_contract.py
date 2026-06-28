@@ -75,10 +75,48 @@ def test_strict_argv_guard_rejects_missing_unknown_key_guard():
         _validate(code)
 
 
-def test_strict_argv_guard_rejects_missing_required_declaration():
-    code = STRICT_OK.replace('REQUIRED_KEYS = {"text", "style"}', 'NEEDED_KEYS = {"text", "style"}')
-    with pytest.raises(ValueError, match="required keys"):
-        _validate(code)
+DIRECT_GUARD_OK = r'''
+import json
+import sys
+
+def parse_args():
+    if len(sys.argv) != 2:
+        raise ValueError("missing JSON argv")
+    payload = json.loads(sys.argv[1])
+    if not isinstance(payload, dict):
+        raise ValueError("argv JSON must be an object")
+    if set(payload) != {"text", "style"}:
+        unknown = set(payload) - {"text", "style"}
+        missing = {"text", "style"} - set(payload)
+        if unknown:
+            raise ValueError(f"unknown argv keys: {sorted(unknown)}")
+        if missing:
+            raise ValueError(f"missing required argv keys: {sorted(missing)}")
+    text = payload["text"]
+    style = payload["style"]
+    if text is None or text == "" or text == [] or text == {}:
+        raise ValueError("empty required argv value: text")
+    if style is None or style == "" or style == [] or style == {}:
+        raise ValueError("empty required argv value: style")
+    if not isinstance(text, str):
+        raise TypeError("invalid argv type for text")
+    if not isinstance(style, str):
+        raise TypeError("invalid argv type for style")
+    return {"text": text, "style": style}
+
+def run(args):
+    return {"result": args["text"] + args["style"]}
+
+def main():
+    print(json.dumps(run(parse_args()), ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_strict_argv_guard_accepts_direct_core_bound_validation_without_schema_constants():
+    _validate(DIRECT_GUARD_OK)
 
 from types import SimpleNamespace
 from backend.services.creator import e2e

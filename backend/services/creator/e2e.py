@@ -1394,6 +1394,8 @@ def _classify_argv_schema_failure(
     schema = extract_python_strict_argv_schema(content) if entry.runtime == "python" else {"allowed_keys": None, "required_keys": None, "expected_types": {}}
     allowed = schema.get("allowed_keys")
     required = schema.get("required_keys")
+    optional = schema.get("optional_keys")
+    defaulted = schema.get("defaulted_keys")
     expected_types = schema.get("expected_types") or {}
     failed_keys = _extract_failed_argv_keys(f"{stderr}\n{stdout}")
     received_keys = sorted(str(key) for key in (rendered_payload or {}).keys())
@@ -1445,6 +1447,8 @@ def _classify_argv_schema_failure(
         "received_keys": received_keys,
         "allowed_keys": allowed,
         "required_keys": required,
+        "optional_keys": optional,
+        "defaulted_keys": defaulted,
         "expected_types": expected_types,
         "command_argv_keys": command_argv_keys,
         "skill_plan_inputs": semantic_inputs,
@@ -1464,7 +1468,7 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
         f"candidate_targets={candidate_targets}。必须对照 rendered_payload、command argv template、allowed_keys、required_keys、expected_types、SkillPlan.inputs 和 previous traces 决定最小修复；"
-        "禁止删除可能正确的语义参数来让脚本通过，禁止引入脚本内部默认值兜底。"
+        "禁止删除可能正确的语义参数来让脚本通过；required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
         return common + "\nprimary_target=SKILL.md：只修 SKILL.md command JSON，传齐 required keys，移除职责外 unknown keys，并把需要的默认值显式写在 command JSON；不要改脚本。"

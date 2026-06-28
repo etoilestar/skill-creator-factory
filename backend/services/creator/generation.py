@@ -500,6 +500,8 @@ def _script_generation_skeleton(
         "# Replace input_text with this script's real argv keys; use empty sets only for a true no-input script.\n"
         "ALLOWED_KEYS = {\"input_text\"}\n"
         "REQUIRED_KEYS = {\"input_text\"}\n"
+        "OPTIONAL_KEYS = set()\n"
+        "DEFAULT_VALUES = {}\n"
         "EXPECTED_TYPES = {\"input_text\": str}\n\n"
         "def parse_args() -> dict:\n"
         "    if len(sys.argv) < 2:\n"
@@ -507,7 +509,7 @@ def _script_generation_skeleton(
         "    data = json.loads(sys.argv[1])\n"
         "    if not isinstance(data, dict):\n"
         "        raise ValueError('argv JSON must be an object')\n"
-        "    unknown = set(data) - ALLOWED_KEYS\n"
+        "    unknown = set(data) - (ALLOWED_KEYS | OPTIONAL_KEYS)\n"
         "    if unknown:\n"
         "        raise ValueError(f'unknown argv keys: {sorted(unknown)}')\n"
         "    missing = REQUIRED_KEYS - set(data)\n"
@@ -521,12 +523,20 @@ def _script_generation_skeleton(
         "        if key in EXPECTED_TYPES and not isinstance(value, EXPECTED_TYPES[key]):\n"
         "            raise TypeError(f'invalid argv type for {key}')\n"
         "        validated[key] = value\n"
-        "    for key in set(data) - REQUIRED_KEYS:\n"
-        "        validated[key] = data[key]\n"
+        "    for key in OPTIONAL_KEYS:\n"
+        "        if key in data:\n"
+        "            value = data[key]\n"
+        "        elif key in DEFAULT_VALUES:\n"
+        "            value = DEFAULT_VALUES[key]\n"
+        "        else:\n"
+        "            continue\n"
+        "        if key in EXPECTED_TYPES and not isinstance(value, EXPECTED_TYPES[key]):\n"
+        "            raise TypeError(f'invalid argv type for {key}')\n"
+        "        validated[key] = value\n"
         "    return validated\n\n"
         "def run(args: dict) -> dict:\n"
         "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
-        "    # Only read values from args after parse_args validation; do not call payload.get(default).\n"
+        "    # Only read values from args after parse_args validation; use args['required_key'] for required values.\n"
         "    # Return an object containing every required stdout field.\n"
         "    return {}\n\n"
         "def main() -> None:\n"
@@ -826,8 +836,8 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "硬性 argv schema 规则：当前脚本必须在源码内声明自己实际接受的 allowed_keys 和 required_keys（或等价显式结构），parse_args/validate_payload 必须 fail-fast 校验 JSON argv object。",
         "硬性 argv schema 规则：unknown key、missing required key、required 空字符串/空列表/空对象/None、required 类型错误都必须 raise 或非零退出；参数错误时不得输出成功 JSON。",
-        "硬性 argv schema 规则：禁止 payload.get('key', default)、payload.get('key') or default、内部默认主题/文本/图片/PDF/报告/样式/文件名/格式/数量兜底；需要默认值时必须由 SKILL.md command JSON 显式传入。",
-        "硬性 argv schema 规则：禁止忽略未知参数，禁止多传参数静默通过；生成脚本时 parse_args 必须返回已经校验过的参数对象，后续 run() 只能使用该对象，不要再次直接 payload.get。",
+        "硬性 argv schema 规则：不要一刀切禁止默认值；如果某个参数确实可选或可由脚本默认，必须在 schema 中显式标为 OPTIONAL_KEYS/DEFAULT_VALUES 或等价结构；required 参数不得靠默认值补齐。",
+        "硬性 argv schema 规则：禁止忽略未知参数，禁止多传参数静默通过；生成脚本时 parse_args 必须返回已经校验过的参数对象，后续 run() 只能使用该对象；required 参数推荐用 validated['key'] 读取。",
         "硬性 argv schema 规则：骨架中的 input_text 只是示例，必须替换为当前脚本真实参数；禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema；确实无输入时 allowed_keys/required_keys 可为空且 SKILL.md command 传 {}。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",

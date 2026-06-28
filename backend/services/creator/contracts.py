@@ -4552,14 +4552,20 @@ def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
     return "json.loads" in content and "sys.argv" in content
 
 
-def _python_payload_get_default_violations(tree: ast.AST) -> list[int]:
-    """Return line numbers where Python code silently defaults JSON argv values."""
+def _python_required_key_get_default_violations(tree: ast.AST, required_keys: set[str]) -> list[int]:
+    """Return lines where code reads a required argv key via .get/default fallback."""
+    if not required_keys:
+        return []
     lines: list[int] = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value in required_keys
             and len(node.args) >= 2
         ):
             lines.append(getattr(node, "lineno", 0))
@@ -4568,6 +4574,10 @@ def _python_payload_get_default_violations(tree: ast.AST) -> list[int]:
                 isinstance(value, ast.Call)
                 and isinstance(value.func, ast.Attribute)
                 and value.func.attr == "get"
+                and value.args
+                and isinstance(value.args[0], ast.Constant)
+                and isinstance(value.args[0].value, str)
+                and value.args[0].value in required_keys
                 for value in node.values
             ):
                 lines.append(getattr(node, "lineno", 0))
@@ -4614,9 +4624,21 @@ def _literal_expected_types(node: ast.AST) -> dict[str, str] | None:
     return result
 
 
+def _literal_dict_string_keys(node: ast.AST) -> set[str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    keys: set[str] = set()
+    for key_node in node.keys:
+        if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+            keys.add(key_node.value)
+        else:
+            return None
+    return keys
+
+
 def _schema_placeholder_reasons(tree: ast.AST) -> list[str]:
     reasons: list[str] = []
-    schema_names = {"allowed_keys", "required_keys", "expected_types", "arg_schema", "schema"}
+    schema_names = {"allowed_keys", "required_keys", "optional_keys", "defaulted_keys", "default_values", "defaults", "expected_types", "arg_schema", "schema"}
     for node in ast.walk(tree):
         targets: list[ast.AST] = []
         value: ast.AST | None = None
@@ -4629,7 +4651,7 @@ def _schema_placeholder_reasons(tree: ast.AST) -> list[str]:
         if value is None:
             continue
         names = [target.id.lower() for target in targets if isinstance(target, ast.Name)]
-        if not any(name in schema_names or ("allowed" in name and "key" in name) or ("required" in name and "key" in name) or ("expected" in name and "type" in name) for name in names):
+        if not any(name in schema_names or ("allowed" in name and "key" in name) or ("required" in name and "key" in name) or ("optional" in name and "key" in name) or ("default" in name and "key" in name) or ("expected" in name and "type" in name) for name in names):
             continue
         if isinstance(value, ast.Constant) and value.value is Ellipsis:
             reasons.append("schema assignment uses ellipsis placeholder")
@@ -4662,10 +4684,12 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return {"allowed_keys": None, "required_keys": None, "expected_types": {}, "placeholder_reasons": ["python syntax invalid"]}
+        return {"allowed_keys": None, "required_keys": None, "optional_keys": None, "defaulted_keys": None, "expected_types": {}, "placeholder_reasons": ["python syntax invalid"]}
 
     allowed_keys: set[str] | None = None
     required_keys: set[str] | None = None
+    optional_keys: set[str] | None = None
+    defaulted_keys: set[str] | None = None
     expected_types: dict[str, str] = {}
 
     for node in ast.walk(tree):
@@ -4687,6 +4711,18 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
                 parsed = _literal_string_set(value)
                 if parsed is not None:
                     required_keys = parsed
+            elif "optional" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    optional_keys = parsed
+            elif "default" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    defaulted_keys = parsed
+            elif name in {"default_values", "defaults"}:
+                parsed = _literal_dict_string_keys(value)
+                if parsed is not None:
+                    defaulted_keys = parsed if defaulted_keys is None else defaulted_keys | parsed
             elif "expected" in name and "type" in name:
                 parsed_types = _literal_expected_types(value)
                 if parsed_types is not None:
@@ -4704,6 +4740,14 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
                         parsed = _literal_string_set(value_node)
                         if parsed is not None:
                             required_keys = parsed
+                    elif key in {"optional_keys", "optional"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            optional_keys = parsed
+                    elif key in {"defaulted_keys", "defaulted"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            defaulted_keys = parsed
                     elif key in {"expected_types", "types"}:
                         parsed_types = _literal_expected_types(value_node)
                         if parsed_types is not None:
@@ -4712,6 +4756,8 @@ def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
     return {
         "allowed_keys": sorted(allowed_keys) if allowed_keys is not None else None,
         "required_keys": sorted(required_keys) if required_keys is not None else None,
+        "optional_keys": sorted(optional_keys) if optional_keys is not None else None,
+        "defaulted_keys": sorted(defaulted_keys) if defaulted_keys is not None else None,
         "expected_types": dict(sorted(expected_types.items())),
         "placeholder_reasons": _schema_placeholder_reasons(tree),
     }
@@ -4730,14 +4776,15 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
 
     lowered = content.lower()
     reasons: list[str] = []
-    default_lines = _python_payload_get_default_violations(tree)
+    schema = extract_python_strict_argv_schema(content)
+    required_key_set = set(schema.get("required_keys") or [])
+    default_lines = _python_required_key_get_default_violations(tree, required_key_set)
     if default_lines:
         reasons.append(
-            "payload.get(..., default) / payload.get(...) or default is forbidden "
+            "required argv keys must not be read through .get(..., default) / .get(...) or default "
             f"(lines: {', '.join(map(str, default_lines[:8]))})"
         )
 
-    schema = extract_python_strict_argv_schema(content)
     placeholder_reasons = list(schema.get("placeholder_reasons") or [])
     if placeholder_reasons:
         reasons.extend(placeholder_reasons)

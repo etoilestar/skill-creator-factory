@@ -62,7 +62,7 @@ def test_strict_argv_guard_accepts_explicit_schema():
 
 def test_strict_argv_guard_rejects_payload_get_default():
     code = STRICT_OK.replace('return {"result": args["text"] + args["style"]}', 'return {"result": args.get("text", "fallback")}')
-    with pytest.raises(ValueError, match="payload.get"):
+    with pytest.raises(ValueError, match="required argv keys"):
         _validate(code)
 
 
@@ -104,11 +104,17 @@ def test_strict_argv_guard_rejects_schema_placeholders():
             _validate(code)
 
 
-def test_strict_argv_guard_rejects_get_default_on_common_payload_names():
-    for expr in ['payload.get("x", "fallback")', 'args.get("x", "fallback")', 'data.get("x") or "fallback"']:
+def test_strict_argv_guard_rejects_get_default_for_required_keys_only():
+    for expr in ['payload.get("text", "fallback")', 'args.get("text", "fallback")', 'data.get("text") or "fallback"']:
         code = STRICT_OK.replace('return {"result": args["text"] + args["style"]}', f'return {{"result": {expr}}}')
-        with pytest.raises(ValueError, match="default"):
+        with pytest.raises(ValueError, match="required argv keys"):
             _validate(code)
+
+
+def test_strict_argv_guard_allows_schema_declared_optional_default_get():
+    code = STRICT_OK.replace('REQUIRED_KEYS = {"text", "style"}', 'REQUIRED_KEYS = {"text"}\nOPTIONAL_KEYS = {"style"}\nDEFAULT_VALUES = {"style": "plain"}')
+    code = code.replace('return {"result": args["text"] + args["style"]}', 'return {"result": args["text"] + args.get("style", "plain")}')
+    _validate(code)
 
 
 def _argv_details(stderr, *, inputs, rendered, allowed='ALLOWED_KEYS = {"text"}', required='REQUIRED_KEYS = {"text"}', expected='EXPECTED_TYPES = {"text": str}'):
@@ -150,3 +156,9 @@ def test_extract_schema_supports_arg_schema_dict():
     assert schema['allowed_keys'] == ['a', 'b']
     assert schema['required_keys'] == ['a']
     assert schema['expected_types'] == {'a': 'str'}
+
+
+def test_extract_schema_supports_optional_and_defaulted_keys():
+    schema = extract_python_strict_argv_schema('OPTIONAL_KEYS = {"style"}\nDEFAULT_VALUES = {"style": "plain"}')
+    assert schema['optional_keys'] == ['style']
+    assert schema['defaulted_keys'] == ['style']

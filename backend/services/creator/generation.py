@@ -497,15 +497,35 @@ def _script_generation_skeleton(
         + helper_hint +
         "import json\n"
         "import sys\n\n"
+        "ALLOWED_KEYS = set(...)\n"
+        "REQUIRED_KEYS = set(...)\n"
+        "EXPECTED_TYPES = {...}\n\n"
         "def parse_args() -> dict:\n"
         "    if len(sys.argv) < 2:\n"
-        "        return {}\n"
+        "        raise ValueError('missing JSON argv')\n"
         "    data = json.loads(sys.argv[1])\n"
         "    if not isinstance(data, dict):\n"
         "        raise ValueError('argv JSON must be an object')\n"
-        "    return data\n\n"
-        "def run(payload: dict) -> dict:\n"
+        "    unknown = set(data) - ALLOWED_KEYS\n"
+        "    if unknown:\n"
+        "        raise ValueError(f'unknown argv keys: {sorted(unknown)}')\n"
+        "    missing = REQUIRED_KEYS - set(data)\n"
+        "    if missing:\n"
+        "        raise ValueError(f'missing required argv keys: {sorted(missing)}')\n"
+        "    validated = {}\n"
+        "    for key in REQUIRED_KEYS:\n"
+        "        value = data[key]\n"
+        "        if value is None or value == '' or value == [] or value == {}:\n"
+        "            raise ValueError(f'empty required argv value: {key}')\n"
+        "        if key in EXPECTED_TYPES and not isinstance(value, EXPECTED_TYPES[key]):\n"
+        "            raise TypeError(f'invalid argv type for {key}')\n"
+        "        validated[key] = value\n"
+        "    for key in set(data) - REQUIRED_KEYS:\n"
+        "        validated[key] = data[key]\n"
+        "    return validated\n\n"
+        "def run(args: dict) -> dict:\n"
         "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
+        "    # Only read values from args after parse_args validation; do not call payload.get(default).\n"
         "    # Return an object containing every required stdout field.\n"
         "    return {}\n\n"
         "def main() -> None:\n"
@@ -803,6 +823,10 @@ def _build_script_generate_file_prompt_variant(
         "scripts/ 生成不会追加聊天历史，也不会注入完整蓝图。",
         "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
+        "硬性 argv schema 规则：当前脚本必须在源码内声明自己实际接受的 allowed_keys 和 required_keys（或等价显式结构），parse_args/validate_payload 必须 fail-fast 校验 JSON argv object。",
+        "硬性 argv schema 规则：unknown key、missing required key、required 空字符串/空列表/空对象/None、required 类型错误都必须 raise 或非零退出；参数错误时不得输出成功 JSON。",
+        "硬性 argv schema 规则：禁止 payload.get('key', default)、payload.get('key') or default、内部默认主题/文本/图片/PDF/报告/样式/文件名/格式/数量兜底；需要默认值时必须由 SKILL.md command JSON 显式传入。",
+        "硬性 argv schema 规则：禁止忽略未知参数，禁止多传参数静默通过；生成脚本时 parse_args 必须返回已经校验过的参数对象，后续 run() 只能使用该对象，不要再次直接 payload.get。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
         "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
@@ -834,7 +858,7 @@ def _build_script_generate_file_prompt_variant(
         ])
 
     if variant == "minimal":
-        instruction.append("极简要求：返回可运行脚本源码，解析 JSON argv，真实处理输入，打印满足 stdout_schema 的 JSON object。")
+        instruction.append("极简要求：返回可运行脚本源码，使用 strict JSON argv schema 校验 allowed/required/type/non-empty/unknown keys，真实处理输入，成功时打印满足 stdout_schema 的 JSON object。")
 
     return _creator_file_generation_messages(
         "\n\n".join(instruction),

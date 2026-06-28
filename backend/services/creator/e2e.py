@@ -1351,20 +1351,41 @@ def _parse_e2e_stdout_json(
         trial_skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
 
     if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "")[-4000:]
+        stdout_tail = (proc.stdout or "")[-4000:]
+        argv_error_text = f"{stderr_tail}\n{stdout_tail}".lower()
+        argv_schema_markers = (
+            "unknown key", "unknown argv", "unexpected key", "extra key",
+            "missing required", "missing key", "empty required", "invalid type",
+            "argv type", "argv json must be an object", "missing json argv",
+        )
+        is_argv_schema_error = any(marker in argv_error_text for marker in argv_schema_markers)
+        failure_layer = "argv_schema_error" if is_argv_schema_error else "script_exit"
+        target_file = "SKILL.md" if is_argv_schema_error else command.script_path
+        repair_instruction = (
+            "根据脚本真实 argv schema 错误局部修复：若 SKILL.md command 多传、少传、传空值或类型错误，只修改 SKILL.md；"
+            f"若脚本确实应该支持该参数但未声明/未校验，只修改 {command.script_path} 的 strict argv schema。"
+            if is_argv_schema_error
+            else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。"
+        )
         raise ValueError(_format_e2e_failure(E2EFailure(
             failed_step_index=command.ordinal,
-            target_file=command.script_path,
-            target_region="run()",
+            target_file=target_file,
+            target_region="command JSON argv" if is_argv_schema_error else "run()",
             failed_command=command.raw_command,
             input_payload=rendered_payload,
             rendered_payload=rendered_payload,
-            stdout=(proc.stdout or "")[-4000:],
-            stderr=(proc.stderr or "")[-4000:],
+            stdout=stdout_tail,
+            stderr=stderr_tail,
             return_code=proc.returncode,
-            expected="脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。",
+            expected=(
+                "SKILL.md command JSON 必须只传脚本 allowed keys、传齐 required keys，且 required 值非空且类型正确。"
+                if is_argv_schema_error
+                else "脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。"
+            ),
             actual=f"return_code={proc.returncode}",
-            repair_instruction=f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。",
-            layer="script_exit",
+            repair_instruction=repair_instruction,
+            layer=failure_layer,
         )))
 
     try:
@@ -1454,6 +1475,9 @@ def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill
         raise ValueError(
             f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
         )
+    guard_failure = _strict_argv_guard_failure_message(file_path, content, entry.runtime)
+    if json_argv_commands and guard_failure:
+        raise ValueError(guard_failure)
 
     helper_required_capabilities = [
         capability

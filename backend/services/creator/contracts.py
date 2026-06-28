@@ -4552,6 +4552,109 @@ def _script_reads_json_argv(content: str, runtime: str = "python") -> bool:
     return "json.loads" in content and "sys.argv" in content
 
 
+def _python_payload_get_default_violations(tree: ast.AST) -> list[int]:
+    """Return line numbers where Python code silently defaults JSON argv values."""
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and len(node.args) >= 2
+        ):
+            lines.append(getattr(node, "lineno", 0))
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            if any(
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "get"
+                for value in node.values
+            ):
+                lines.append(getattr(node, "lineno", 0))
+    return sorted({line for line in lines if line})
+
+
+def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]]:
+    """Heuristically verify that a Python script owns strict runtime argv schema.
+
+    This intentionally checks generic guard structure only.  It does not impose
+    platform field names or compare against SkillPlan/SKILL.md business keys.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False, ["python syntax invalid"]
+
+    lowered = content.lower()
+    reasons: list[str] = []
+    default_lines = _python_payload_get_default_violations(tree)
+    if default_lines:
+        reasons.append(
+            "payload.get(..., default) / payload.get(...) or default is forbidden "
+            f"(lines: {', '.join(map(str, default_lines[:8]))})"
+        )
+
+    if not _script_reads_json_argv(content, "python"):
+        reasons.append("script must parse sys.argv[1] with json.loads")
+
+    assigned_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+    has_allowed_decl = any("allowed" in name.lower() and "key" in name.lower() for name in assigned_names)
+    if not has_allowed_decl:
+        reasons.append("script must declare allowed keys")
+
+    has_required_decl = any("required" in name.lower() and "key" in name.lower() for name in assigned_names)
+    if not has_required_decl:
+        reasons.append("script must declare required keys")
+
+    unknown_guard = (
+        ("unknown" in lowered or "extra" in lowered or "unexpected" in lowered)
+        and ("allowed" in lowered)
+        and ("raise" in lowered or "sys.exit" in lowered)
+    )
+    if not unknown_guard:
+        reasons.append("script must reject unknown argv keys fail-fast")
+
+    missing_guard = (
+        ("missing" in lowered or "required" in lowered)
+        and ("raise" in lowered or "sys.exit" in lowered)
+    )
+    if not missing_guard:
+        reasons.append("script must reject missing required keys fail-fast")
+
+    empty_guard = any(token in lowered for token in (" is none", "== \"\"", "== ''", "not value", "len(value) == 0", "empty"))
+    if not empty_guard:
+        reasons.append("script must reject empty required values")
+
+    type_guard = "isinstance(" in content or "type(" in content
+    if not type_guard:
+        reasons.append("script must validate required value types")
+
+    has_validated_flow = re.search(r"run\s*\(\s*(validated|args|params|config)\s*\)", content) or "validate_payload(" in content
+    if not has_validated_flow:
+        reasons.append("run/main should use validated args from parse/validate logic")
+
+    return not reasons, reasons
+
+
+def _strict_argv_guard_failure_message(file_path: str, content: str, runtime: str) -> str | None:
+    if runtime != "python":
+        return None
+    ok, reasons = _python_has_strict_argv_runtime_guard(content)
+    if ok:
+        return None
+    return (
+        f"{file_path} 必须在脚本内部实现 strict JSON argv runtime guard：声明 allowed/required keys，"
+        "拒绝 unknown/missing/empty/type 错误，禁止输入默认值兜底，并只把已校验参数交给 run()。\n"
+        + "\n".join(f"- {reason}" for reason in reasons)
+    )
+
+
 def _script_uses_input_keys(content: str, keys: list[str]) -> tuple[bool, list[str]]:
     missing = [key for key in keys if key not in content]
     return not missing, missing
@@ -4609,6 +4712,10 @@ def _validate_script_contract_static(
         raise ValueError(
             f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
         )
+
+    guard_failure = _strict_argv_guard_failure_message(file_path, content, plan_entry.runtime)
+    if json_argv_commands and guard_failure:
+        raise ValueError(guard_failure)
 
 
 

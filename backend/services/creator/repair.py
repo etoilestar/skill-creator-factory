@@ -2013,6 +2013,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "当前脚本生成内容为空。"
                 "这不是可保存状态，必须让模型返修为非空、可解析的单文件源码。"
                 "只实现当前脚本职责，保留 JSON argv 入口和 stdout JSON 输出要求。"
+                "脚本必须内置 strict argv schema：声明 allowed_keys/required_keys 或等价显式校验，"
+                "拒绝 unknown/missing/empty/type 错误，禁止 payload.get(..., default) 和内部默认输入兜底；"
+                "parse_args 必须返回已校验参数，run() 只能使用已校验参数。"
             )
 
         if file_path.startswith("assets/"):
@@ -2096,7 +2099,9 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "当前失败属于第一轮当前脚本自身语义职责失败，不是 script_smoke 运行失败，也不是 E2E 字段链路失败。"
                 "第一轮修复只补当前脚本缺失的语义输入消费、语义产物生成或明确无效内容；"
                 "只修当前脚本中校验信息指出的函数、行号或代码区域；"
-                "保留已经通过的 import、parse_args/main 入口、JSON argv 协议、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
+                "保留已经通过的 import、parse_args/main 入口、strict JSON argv schema、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
+                "如果缺少 strict argv guard，必须在当前脚本补齐 allowed_keys/required_keys、unknown/missing/empty/type fail-fast 校验；"
+                "禁止 payload.get(..., default)、payload.get(...) or default 和脚本内部默认输入兜底，默认值应由 SKILL.md command JSON 显式传入；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
                 "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
                 "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"

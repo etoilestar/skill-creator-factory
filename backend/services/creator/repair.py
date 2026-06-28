@@ -2016,6 +2016,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "脚本必须内置 strict argv schema：声明 allowed_keys/required_keys 或等价显式校验，"
                 "拒绝 unknown/missing/empty/type 错误，禁止 payload.get(..., default) 和内部默认输入兜底；"
                 "parse_args 必须返回已校验参数，run() 只能使用已校验参数。"
+                "禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema。"
             )
 
         if file_path.startswith("assets/"):
@@ -2102,6 +2103,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "保留已经通过的 import、parse_args/main 入口、strict JSON argv schema、stdout 字段名和文件输出协议；不要把修复变成固定字段名改名；"
                 "如果缺少 strict argv guard，必须在当前脚本补齐 allowed_keys/required_keys、unknown/missing/empty/type fail-fast 校验；"
                 "禁止 payload.get(..., default)、payload.get(...) or default 和脚本内部默认输入兜底，默认值应由 SKILL.md command JSON 显式传入；"
+                "禁止保留 input_text/example placeholder、ellipsis、set(...)、{...}、TODO schema 或 placeholder schema；"
                 "不得改 SKILL.md、其它脚本或 SkillPlan；不得进入全量重写；"
                 "不得通过 try/except 吞错后输出假成功、固定模板、空值或 mock 数据。"
                 "核心 stdout 字段必须具有 provenance：来自 argv JSON、上游 stdout、reference/assets、工具结果、模型结果或确定性计算。"

@@ -264,7 +264,7 @@ export async function validateSkill(
   {
     model = null,
     autoRepair = true,
-    maxE2ERepairAttempts = 5,
+    maxE2ERepairAttempts = 10,
   } = {}
 ) {
   const resp = await fetch('/api/creator/validate-skill', {

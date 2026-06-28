@@ -47,6 +47,7 @@ class E2EFailure:
     repair_instruction: str = ""
     layer: str = ""
     artifact_paths: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +65,7 @@ class E2EFailure:
             "repair_instruction": self.repair_instruction,
             "layer": self.layer,
             "artifact_paths": self.artifact_paths,
+            "details": self.details,
         }
 
 
@@ -1330,6 +1332,147 @@ def _execute_e2e_shell_command(
     )
 
 
+def _extract_failed_argv_keys(text: str) -> list[str]:
+    keys: set[str] = set()
+    for bracketed in re.findall(r"\[([^\]]+)\]", text):
+        keys.update(key for key in re.findall(r"['\"]([^'\"]+)['\"]", bracketed) if key)
+    for pattern in (
+        r"(?:unknown|unexpected|extra)(?:\s+argv)?\s+keys?\s*[:=]\s*([A-Za-z_][\w.-]*)",
+        r"missing(?:\s+required)?(?:\s+argv)?\s+keys?\s*[:=]\s*([A-Za-z_][\w.-]*)",
+        r"empty(?:\s+required)?(?:\s+argv)?\s+(?:value|key)\s*[:=]\s*([A-Za-z_][\w.-]*)",
+        r"invalid(?:\s+argv)?\s+type(?:\s+for)?\s*[:=]\s*([A-Za-z_][\w.-]*)",
+    ):
+        keys.update(str(match) for match in re.findall(pattern, text, flags=re.I))
+    return sorted(keys)
+
+
+def _argv_schema_error_kind(stderr: str, stdout: str) -> str | None:
+    text = f"{stderr}\n{stdout}".lower()
+    if "argv json must be an object" in text or "json argv must be an object" in text:
+        return "non_object_argv"
+    if "missing json argv" in text:
+        return "missing_json_argv"
+    if "unknown key" in text or "unknown argv" in text or "unexpected key" in text or "extra key" in text:
+        return "unknown_key"
+    if "missing required" in text or "missing key" in text:
+        return "missing_required"
+    if "empty required" in text or "empty argv" in text:
+        return "empty_required"
+    if "invalid type" in text or "argv type" in text:
+        return "invalid_type"
+    return None
+
+
+def _argv_value_shape(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "empty_string" if value == "" else "string"
+    if isinstance(value, list):
+        return "empty_list" if not value else "list"
+    if isinstance(value, dict):
+        return "empty_object" if not value else "object"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return type(value).__name__
+
+
+def _classify_argv_schema_failure(
+    *,
+    command: E2EWorkflowCommand,
+    content: str,
+    entry: SkillPlanEntry,
+    rendered_payload: dict[str, Any],
+    stdout: str,
+    stderr: str,
+) -> dict[str, Any]:
+    kind = _argv_schema_error_kind(stderr, stdout)
+    if not kind:
+        return {}
+    schema = extract_python_strict_argv_schema(content) if entry.runtime == "python" else {"allowed_keys": None, "required_keys": None, "expected_types": {}}
+    allowed = schema.get("allowed_keys")
+    required = schema.get("required_keys")
+    expected_types = schema.get("expected_types") or {}
+    failed_keys = _extract_failed_argv_keys(f"{stderr}\n{stdout}")
+    received_keys = sorted(str(key) for key in (rendered_payload or {}).keys())
+    command_argv_keys = sorted(str(key) for key in (command.argv_template or {}).keys())
+    semantic_inputs = sorted(str(key) for key in (getattr(entry, "inputs", []) or []) if str(key or "").strip())
+    semantic_set = set(semantic_inputs)
+
+    primary_target = ""
+    target_reason = ""
+    if kind in {"non_object_argv", "missing_json_argv"}:
+        primary_target = "SKILL.md"
+        target_reason = "SKILL.md command did not provide a JSON object argv."
+    elif kind == "empty_required":
+        primary_target = "SKILL.md"
+        target_reason = "SKILL.md command rendered an empty required argv value."
+    elif kind == "unknown_key":
+        if failed_keys and semantic_set and any(key in semantic_set for key in failed_keys):
+            primary_target = command.script_path
+            target_reason = "Rendered argv contains semantic input keys, but the script allowed schema appears to omit them."
+        elif failed_keys and allowed is not None and all(key not in (allowed or []) for key in failed_keys):
+            primary_target = "SKILL.md"
+            target_reason = "SKILL.md command passed keys outside the script allowed schema."
+        else:
+            target_reason = "Unable to determine whether SKILL.md over-sent argv keys or the script schema under-declared semantic parameters."
+    elif kind == "missing_required":
+        if failed_keys and semantic_set and all(key not in semantic_set for key in failed_keys):
+            primary_target = command.script_path
+            target_reason = "Script required schema declares keys that are not semantic inputs for this step."
+        elif failed_keys and all(key not in rendered_payload for key in failed_keys):
+            primary_target = "SKILL.md"
+            target_reason = "SKILL.md command did not render keys required by the script schema."
+        else:
+            target_reason = "Unable to determine whether SKILL.md omitted a required semantic input or the script required schema is too broad."
+    elif kind == "invalid_type":
+        if failed_keys and semantic_set and all(key not in semantic_set for key in failed_keys):
+            primary_target = command.script_path
+            target_reason = "Script type schema constrains non-semantic keys for this step."
+        elif failed_keys and any(key in rendered_payload for key in failed_keys):
+            primary_target = "SKILL.md"
+            target_reason = "SKILL.md command rendered values whose JSON types do not match the script schema."
+        else:
+            target_reason = "Unable to determine whether SKILL.md sent the wrong JSON type or the script EXPECTED_TYPES is wrong."
+
+    if not primary_target:
+        primary_target = command.script_path
+    uncertain = "Unable to determine" in target_reason
+    return {
+        "argv_schema_error_kind": kind,
+        "received_keys": received_keys,
+        "allowed_keys": allowed,
+        "required_keys": required,
+        "expected_types": expected_types,
+        "command_argv_keys": command_argv_keys,
+        "skill_plan_inputs": semantic_inputs,
+        "failed_keys": failed_keys,
+        "primary_target": primary_target,
+        "candidate_targets": ["SKILL.md", command.script_path] if uncertain else [primary_target],
+        "target_reason": target_reason,
+        "rendered_payload_shape": {str(key): _argv_value_shape(value) for key, value in (rendered_payload or {}).items()},
+        "previous_trace_summary": [],
+    }
+
+
+def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -> str:
+    primary = str(details.get("primary_target") or "")
+    candidate_targets = details.get("candidate_targets") or ["SKILL.md", script_path]
+    target_reason = str(details.get("target_reason") or "")
+    common = (
+        f"argv_schema_error 归因：{target_reason}\n"
+        f"candidate_targets={candidate_targets}。必须对照 rendered_payload、command argv template、allowed_keys、required_keys、expected_types、SkillPlan.inputs 和 previous traces 决定最小修复；"
+        "禁止删除可能正确的语义参数来让脚本通过，禁止引入脚本内部默认值兜底。"
+    )
+    if primary == "SKILL.md":
+        return common + "\nprimary_target=SKILL.md：只修 SKILL.md command JSON，传齐 required keys，移除职责外 unknown keys，并把需要的默认值显式写在 command JSON；不要改脚本。"
+    if primary == script_path:
+        return common + f"\nprimary_target={script_path}：只修当前脚本 strict schema / parse_args / validate_payload；不要改 SKILL.md，不要改业务字段为平台词表。"
+    return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 还是当前脚本。"
+
+
 def _parse_e2e_stdout_json(
     *,
     command: E2EWorkflowCommand,
@@ -1353,21 +1496,19 @@ def _parse_e2e_stdout_json(
     if proc.returncode != 0:
         stderr_tail = (proc.stderr or "")[-4000:]
         stdout_tail = (proc.stdout or "")[-4000:]
-        argv_error_text = f"{stderr_tail}\n{stdout_tail}".lower()
-        argv_schema_markers = (
-            "unknown key", "unknown argv", "unexpected key", "extra key",
-            "missing required", "missing key", "empty required", "invalid type",
-            "argv type", "argv json must be an object", "missing json argv",
+        argv_details = _classify_argv_schema_failure(
+            command=command,
+            content=content,
+            entry=entry,
+            rendered_payload=rendered_payload,
+            stdout=stdout_tail,
+            stderr=stderr_tail,
         )
-        is_argv_schema_error = any(marker in argv_error_text for marker in argv_schema_markers)
+        is_argv_schema_error = bool(argv_details)
         failure_layer = "argv_schema_error" if is_argv_schema_error else "script_exit"
-        target_file = "SKILL.md" if is_argv_schema_error else command.script_path
-        repair_instruction = (
-            "根据脚本真实 argv schema 错误局部修复：若 SKILL.md command 多传、少传、传空值或类型错误，只修改 SKILL.md；"
-            f"若脚本确实应该支持该参数但未声明/未校验，只修改 {command.script_path} 的 strict argv schema。"
-            if is_argv_schema_error
-            else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。"
-        )
+        target_file = str(argv_details.get("primary_target") or command.script_path) if is_argv_schema_error else command.script_path
+        target_reason = str(argv_details.get("target_reason") or "")
+        repair_instruction = _argv_schema_repair_instruction(command.script_path, argv_details) if is_argv_schema_error else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。"
         raise ValueError(_format_e2e_failure(E2EFailure(
             failed_step_index=command.ordinal,
             target_file=target_file,
@@ -1383,9 +1524,10 @@ def _parse_e2e_stdout_json(
                 if is_argv_schema_error
                 else "脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。"
             ),
-            actual=f"return_code={proc.returncode}",
+            actual=f"return_code={proc.returncode}" + (f"; target_reason={target_reason}" if target_reason else ""),
             repair_instruction=repair_instruction,
             layer=failure_layer,
+            details=argv_details if is_argv_schema_error else {},
         )))
 
     try:
@@ -1756,6 +1898,18 @@ def _run_skill_workflow_e2e_once(
                     payload=payload,
                     traces=traces,
                 )
+                if e2e_session is not None:
+                    e2e_session.events.append({
+                        **e2e_session.to_event_base(),
+                        "event": "step_started",
+                        "phase": "e2e_run",
+                        "status": "running",
+                        "current_step": command.ordinal,
+                        "total_steps": len(commands),
+                        "target_file": command.script_path,
+                        "rendered_payload_summary": json.dumps(_json_object_shape(rendered_payload), ensure_ascii=False, sort_keys=True),
+                        "trace_summary": _format_e2e_trace(traces)[-2000:],
+                    })
 
                 if entry.runtime == "python":
                     if venv_python is None:
@@ -1874,7 +2028,7 @@ def _run_skill_workflow_e2e_once(
                         artifact_paths=artifact_paths,
                         proc=proc,
                     )
-                    e2e_session.events.append({**e2e_session.to_event_base(), "event": "checkpoint_saved", "step_index": command.ordinal, "script_path": command.script_path})
+                    e2e_session.events.append({**e2e_session.to_event_base(), "event": "checkpoint_saved", "phase": "e2e_run", "status": "passed", "step_index": command.ordinal, "current_step": command.ordinal, "total_steps": len(commands), "script_path": command.script_path, "target_file": command.script_path})
 
                 traces.append(trace)
 
@@ -1896,6 +2050,23 @@ def _run_skill_workflow_e2e_once(
 
             except ValueError as exc:
                 message = str(exc)
+                if e2e_session is not None:
+                    structured = _structured_failure_from_errors([message])
+                    e2e_session.events.append({
+                        **e2e_session.to_event_base(),
+                        "event": "step_failed",
+                        "phase": "e2e_run",
+                        "status": "failed",
+                        "current_step": command.ordinal,
+                        "total_steps": len(commands),
+                        "target_file": structured.get("target_file") or command.script_path,
+                        "failure_layer": structured.get("layer") or _failure_layer_from_error_text(message),
+                        "failure_summary": (structured.get("actual") or message)[-2000:],
+                        "stdout_summary": str(structured.get("stdout") or "")[-1000:],
+                        "stderr_summary": str(structured.get("stderr") or "")[-1000:],
+                        "rendered_payload_summary": json.dumps(_json_object_shape(structured.get("rendered_payload") or {}), ensure_ascii=False, sort_keys=True),
+                        "trace_summary": _format_e2e_trace(traces)[-2000:],
+                    })
                 if "已成功执行的前序边界 trace" not in message and "已成功执行的前序步骤" not in message:
                     message += "\n\n已成功执行的前序边界 trace：\n" + _format_e2e_trace(traces)
                 errors.append(message)
@@ -2168,7 +2339,7 @@ async def _repair_existing_file_for_e2e_failure(
 
     repair_feedback = "\n\n".join(repair_state.get("remaining_failed_checks") or e2e_errors)[-12000:]
     last_failure = ""
-    max_candidate_attempts = 5
+    max_candidate_attempts = 10
     working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):

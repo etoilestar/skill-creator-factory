@@ -4574,6 +4574,149 @@ def _python_payload_get_default_violations(tree: ast.AST) -> list[int]:
     return sorted({line for line in lines if line})
 
 
+def _literal_string_set(node: ast.AST) -> set[str] | None:
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        values: set[str] = set()
+        for item in node.elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                values.add(item.value)
+            else:
+                return None
+        return values
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "set" and not node.args:
+        return set()
+    return None
+
+
+def _type_name_from_ast(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Tuple):
+        names = [_type_name_from_ast(item) for item in node.elts]
+        if all(names):
+            return "|".join(str(name) for name in names)
+    return None
+
+
+def _literal_expected_types(node: ast.AST) -> dict[str, str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+    result: dict[str, str] = {}
+    for key_node, value_node in zip(node.keys, node.values):
+        if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+            return None
+        type_name = _type_name_from_ast(value_node)
+        if not type_name:
+            return None
+        result[key_node.value] = type_name
+    return result
+
+
+def _schema_placeholder_reasons(tree: ast.AST) -> list[str]:
+    reasons: list[str] = []
+    schema_names = {"allowed_keys", "required_keys", "expected_types", "arg_schema", "schema"}
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        names = [target.id.lower() for target in targets if isinstance(target, ast.Name)]
+        if not any(name in schema_names or ("allowed" in name and "key" in name) or ("required" in name and "key" in name) or ("expected" in name and "type" in name) for name in names):
+            continue
+        if isinstance(value, ast.Constant) and value.value is Ellipsis:
+            reasons.append("schema assignment uses ellipsis placeholder")
+        if isinstance(value, ast.Set) and any(isinstance(item, ast.Constant) and item.value is Ellipsis for item in value.elts):
+            reasons.append("schema assignment uses {...} / ellipsis placeholder")
+        if isinstance(value, ast.Dict) and any(
+            (isinstance(item, ast.Constant) and item.value is Ellipsis)
+            for item in [*(value.keys or []), *value.values]
+            if item is not None
+        ):
+            reasons.append("schema dict uses ellipsis placeholder")
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set" and any(isinstance(arg, ast.Constant) and arg.value is Ellipsis for arg in value.args):
+            reasons.append("schema assignment uses set(...) placeholder")
+        if isinstance(value, ast.Constant) and isinstance(value.value, str) and re.search(r"(?i)\b(todo|placeholder|example)\b", value.value):
+            reasons.append("schema assignment uses TODO/example placeholder")
+        source_keys = _literal_string_set(value)
+        if source_keys == {"input_text"}:
+            reasons.append("schema still contains input_text example placeholder")
+        if isinstance(value, ast.Dict) and set((_literal_expected_types(value) or {}).keys()) == {"input_text"}:
+            reasons.append("schema still contains input_text example placeholder")
+    return sorted(set(reasons))
+
+
+def extract_python_strict_argv_schema(content: str) -> dict[str, Any]:
+    """Extract generic strict argv schema declarations from Python source.
+
+    This is intentionally lightweight and business-agnostic. It recognizes
+    common constant declarations and simple ARG_SCHEMA/SCHEMA dictionaries only.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return {"allowed_keys": None, "required_keys": None, "expected_types": {}, "placeholder_reasons": ["python syntax invalid"]}
+
+    allowed_keys: set[str] | None = None
+    required_keys: set[str] | None = None
+    expected_types: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if value is None:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            name = target.id.lower()
+            if "allowed" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    allowed_keys = parsed
+            elif "required" in name and "key" in name:
+                parsed = _literal_string_set(value)
+                if parsed is not None:
+                    required_keys = parsed
+            elif "expected" in name and "type" in name:
+                parsed_types = _literal_expected_types(value)
+                if parsed_types is not None:
+                    expected_types.update(parsed_types)
+            elif name in {"arg_schema", "schema"} and isinstance(value, ast.Dict):
+                for key_node, value_node in zip(value.keys, value.values):
+                    if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                        continue
+                    key = key_node.value.lower()
+                    if key in {"allowed_keys", "allowed"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            allowed_keys = parsed
+                    elif key in {"required_keys", "required"}:
+                        parsed = _literal_string_set(value_node)
+                        if parsed is not None:
+                            required_keys = parsed
+                    elif key in {"expected_types", "types"}:
+                        parsed_types = _literal_expected_types(value_node)
+                        if parsed_types is not None:
+                            expected_types.update(parsed_types)
+
+    return {
+        "allowed_keys": sorted(allowed_keys) if allowed_keys is not None else None,
+        "required_keys": sorted(required_keys) if required_keys is not None else None,
+        "expected_types": dict(sorted(expected_types.items())),
+        "placeholder_reasons": _schema_placeholder_reasons(tree),
+    }
+
+
 def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]]:
     """Heuristically verify that a Python script owns strict runtime argv schema.
 
@@ -4594,6 +4737,11 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
             f"(lines: {', '.join(map(str, default_lines[:8]))})"
         )
 
+    schema = extract_python_strict_argv_schema(content)
+    placeholder_reasons = list(schema.get("placeholder_reasons") or [])
+    if placeholder_reasons:
+        reasons.extend(placeholder_reasons)
+
     if not _script_reads_json_argv(content, "python"):
         reasons.append("script must parse sys.argv[1] with json.loads")
 
@@ -4605,10 +4753,14 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
         if isinstance(target, ast.Name)
     }
     has_allowed_decl = any("allowed" in name.lower() and "key" in name.lower() for name in assigned_names)
+    if schema.get("allowed_keys") is not None:
+        has_allowed_decl = True
     if not has_allowed_decl:
         reasons.append("script must declare allowed keys")
 
     has_required_decl = any("required" in name.lower() and "key" in name.lower() for name in assigned_names)
+    if schema.get("required_keys") is not None:
+        has_required_decl = True
     if not has_required_decl:
         reasons.append("script must declare required keys")
 

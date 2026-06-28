@@ -51,6 +51,19 @@ def test_runtime_tools_exports_strict_json_argv_guard():
     assert strict_json_argv_guard({"text": "ok"}, {"text": {"type": str}}) == {"text": "ok"}
 
 
+def test_strict_json_argv_guard_supports_string_type_aliases():
+    payload = {"name": "Ada", "count": 2, "items": ["a"], "meta": {"ok": True}}
+    spec = {
+        "name": {"type": "string"},
+        "count": {"type": "integer"},
+        "items": {"type": "array"},
+        "meta": {"type": "object"},
+    }
+    assert strict_json_argv_guard(payload, spec) == payload
+    with pytest.raises(TypeError, match="unknown argv type alias"):
+        strict_json_argv_guard({"name": "Ada"}, {"name": {"type": "unsupported"}})
+
+
 def test_strict_json_argv_guard_failures_and_no_input():
     spec = {"text": {"type": str, "required": True}}
     with pytest.raises(ValueError, match="unknown argv keys"):
@@ -80,6 +93,12 @@ def test_resolve_tools_injects_guard_for_python_scripts_without_affecting_busine
     assert "strict_json_argv_guard" in result.allowed_helper_imports
     assert any("strict_json_argv_guard" in card for card in result.tool_function_cards)
     assert any(item.get("tool") == "script_argv_guard" for item in result.tool_snippets)
+
+    for path_attr in ("path", "file_path", "script_path"):
+        data = {"role": "custom_role", "runtime": "python", path_attr: "scripts/alt.py", "outputs": ["result"]}
+        result = resolve_tools_for_skill_plan_entry(data)
+        assert "script_argv_guard" in result.allowed_tools
+        assert "strict_json_argv_guard" in result.allowed_helper_imports
 
 
 def test_strict_argv_guard_accepts_mandatory_helper_call():

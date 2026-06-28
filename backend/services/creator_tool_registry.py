@@ -1903,7 +1903,11 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         return entry.get(name) if isinstance(entry, dict) else getattr(entry, name, None)
 
     selected = [str(item) for item in (raw_attr("selected_tools") or []) if item]
-    is_python_script = str(raw_attr("runtime") or "python") == "python" and str(raw_attr("path") or "").replace("\\", "/").startswith("scripts/")
+    entry_path = next(
+        (str(raw_attr(attr) or "") for attr in ("path", "file_path", "script_path") if raw_attr(attr)),
+        "",
+    )
+    is_python_script = str(raw_attr("runtime") or "python") == "python" and entry_path.replace("\\", "/").startswith("scripts/")
     mandatory_caps = ["script_argv_guard"] if is_python_script else []
     strategies = raw_attr("implementation_strategy") or []
     slots = raw_attr("required_tool_slots") or []
@@ -1968,7 +1972,7 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
         if not cap.enabled_by_default or not cap.allow_creator_use:
             warnings.append(f"tool {name} is disabled or not allowed for Creator")
             continue
-        if cap.roles and role and role not in cap.roles and name != "file_output":
+        if cap.roles and role and role not in cap.roles and name not in {"file_output", "script_argv_guard"}:
             warnings.append(f"tool {name} is not allowed for role {role}")
             continue
         if cap.name in allowed_tools:

@@ -370,6 +370,9 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "",
         "D. workflow / 平台边界:",
         "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
+        "- 用户输入要区分必需项和可选项：依据蓝图语义中的可选、建议、若不指定、可以提供、默认等表达判断，不写固定业务字段词表。",
+        "- 第一条 workflow command 不能引用平台输入 envelope 中不存在的 placeholder；只能引用 guaranteed input envelope 字段，或传入通用 user_request/input payload/envelope 由入口脚本解析。",
+        "- 蓝图可选用户参数若平台 payload 没有同名字段，不应写成必填 placeholder；应由入口脚本内部提供默认值，或从 fields/options/payload 中存在则读取、不存在则默认。",
         "- 命令 placeholder 应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。",
         "- 第一轮不要求固定字段名；可建议字段名，但不能让字段名成为判错依据。",
         "- 不要固定特定中间字段名；内部脚本流转只在第二轮 E2E 真实执行时验证。",
@@ -412,7 +415,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
+        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；不确定具体字段时，传入通用 user_request/input payload/envelope 让入口脚本解析。",
         "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
         "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
@@ -432,7 +437,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             if str(item).strip()
         ]
 
-        if input_keys:
+        if idx == 1:
+            payload = {"user_request": "{{user_request}}"}
+        elif input_keys:
             payload = {
                 key: "{{" + key + "}}"
                 for key in input_keys

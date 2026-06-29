@@ -152,6 +152,19 @@ async def _allocate_workflow_script_responsibilities(
     if not targets:
         return ""
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
+    all_nodes = [
+        {
+            "path": item.path,
+            "purpose": item.purpose,
+            "role": item.role,
+            "required": item.required,
+            "inputs": item.inputs,
+            "outputs": item.outputs,
+            "dependencies": item.dependencies,
+        }
+        for item in files_out
+        if item.path == "SKILL.md" or item.path.startswith(("scripts/", "references/", "assets/"))
+    ]
     payload = [
         {
             "path": item.path,
@@ -166,16 +179,18 @@ async def _allocate_workflow_script_responsibilities(
     messages = [
         {"role": "system", "content": (
             "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
-            "你只做职责分配检查：判断每个 required script 的局部职责是否足以交付下游需要的完整结果。\n"
-            "如果 workflow 存在重复处理、集合处理、聚合交付、顺序对应、结构对应等语义要求，必须把要求压到某个可执行脚本 purpose 短合同里。\n"
-            "不要按字段名逐字匹配，不写业务词表，不用单复数机械判断；依赖蓝图语义判断。\n"
-            "只输出 compact patches，主要修正 purpose；不要新增文件，不改接口字段。\n"
-            "purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
-            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\"}]}"
+            "先在内部构建轻量责任图谱作为推理依据（不要输出复杂结构）：节点包括平台 guaranteed input envelope、每个 required script、reference、asset、最终产物；边描述上游 stdout/artifact/resource 如何被下游消费。\n"
+            "逐边判断：上游交付什么、下游需要什么、中间是否丢失结构、顺序、引用、约束或能力边界。\n"
+            "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
+            "workflow_allocation_summary 必须描述图上的责任边界；每个 required script 都说明：消费哪类上游结果、交付哪类下游结果、需保留哪些可观察关系、哪些责任由上游建立当前只保留、哪些责任当前无法观察或验证不能压给它。\n"
+            "如果下游需要结构化中间结果且上游已有对应结构化输出，可以 patch 当前脚本 purpose，并可在 patch 中给 inputs/outputs 做最小补齐；只能基于图中已有节点和边，不能凭空发明字段。\n"
+            "只输出 compact patches；不要新增文件，不硬编码业务案例。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[]}]}"
         )},
         {"role": "user", "content": (
             "blueprint_text:\n" + (blueprint_text or "")[:14000] + "\n\n"
-            "required_scripts:\n" + json.dumps(payload, ensure_ascii=False, default=str)[:16000]
+            "graph_nodes_from_file_plan:\n" + json.dumps(all_nodes, ensure_ascii=False, default=str)[:20000] + "\n\n"
+            "required_scripts_to_patch:\n" + json.dumps(payload, ensure_ascii=False, default=str)[:16000]
         )},
     ]
     logger.info("[Creator][workflow_allocation][start] %s", json.dumps({
@@ -197,7 +212,17 @@ async def _allocate_workflow_script_responsibilities(
             target = str(patch.get("target_file") or "").strip()
             purpose = str(patch.get("purpose") or "").strip()
             if target in by_path and purpose:
-                by_path[target].purpose = purpose
+                script = by_path[target]
+                script.purpose = purpose
+                for field_name in ("inputs", "outputs"):
+                    values = patch.get(field_name)
+                    if isinstance(values, list) and all(isinstance(v, str) for v in values):
+                        existing = list(getattr(script, field_name) or [])
+                        for value in values:
+                            value = value.strip()
+                            if value and value not in existing:
+                                existing.append(value)
+                        setattr(script, field_name, existing)
                 applied.append(target)
         logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
             "event": "workflow_allocation_result",
@@ -845,17 +870,19 @@ def _build_skill_md_model_finalizer_prompt(
                 "5. 标准命令格式必须是：python scripts/<真实脚本名>.py '<JSON object argv>'。\n"
                 "6. 脚本路径后的第一个参数必须是 json.loads 可解析的 JSON object 字符串。\n"
                 "7. JSON argv 必须是 object，但 object 内字段名必须由当前脚本真实接口、蓝图需求和上下游数据流决定。\n"
-                "8. 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。\n"
-                "9. 如果脚本需要主题参数，就传主题参数；如果脚本需要图片路径，就传图片路径；如果脚本需要前序输出，就使用对应前序输出 placeholder。\n"
-                "10. 动态 placeholder 必须作为 JSON 字符串值出现；不要把未加引号的动态 placeholder 放进 JSON。\n"
-                "11. 禁止在 ```bash block 中直接放 JSON 配置对象。\n"
-                "12. 禁止在 ```bash block 中放 runner/script/argv 伪命令对象。\n"
-                "13. 禁止在 ```bash block 中放说明文字、列表、多条命令或 `<真实参数>` 占位说明。\n"
-                "14. 默认不要使用 --argv CLI flag，除非脚本源码明确实现了 --argv；Creator 默认脚本协议是 sys.argv[1] JSON object。\n"
-                "15. references/*.md 只作为参考资料说明，不是执行源。不要把 reference 正文全文复制进 SKILL.md。\n"
-                "16. assets/** 只能作为上传素材或静态资源引用，不能描述为 Creator 生成素材。\n"
-                "17. 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建文件等平台创建流程文案。\n"
-                "18. 不要声称“已通过 E2E 校验”“可直接投入运行”，SKILL.md 是使用说明，不是校验报告。\n\n"
+                "8. 第一条 workflow command 只能引用平台 guaranteed input envelope 中存在的字段；如不确定，传入通用 user_request/input payload/envelope，由入口脚本内部解析。不要引用 envelope 中不存在的独立 placeholder。\n"
+                "9. 区分蓝图用户输入的必需项和可选项：依据‘可选/建议/若不指定/可以提供/默认’等语义判断，不写固定业务字段词表；可选项不能在 SKILL.md 中写成必填 placeholder。\n"
+                "10. 如果蓝图存在可选用户参数但平台 payload 没有同名字段，应让入口脚本从 fields/options/payload 中存在则读取、不存在则内部默认化，或接收通用 user_request/input payload；不要要求 SKILL.md 传入不存在的独立 placeholder。\n"
+                "11. 入口脚本命令必须兼容平台输入 envelope；入口脚本生成合同应在脚本内部填充可选参数默认值。\n"
+                "12. 动态 placeholder 必须作为 JSON 字符串值出现；不要把未加引号的动态 placeholder 放进 JSON。\n"
+                "13. 禁止在 ```bash block 中直接放 JSON 配置对象。\n"
+                "14. 禁止在 ```bash block 中放 runner/script/argv 伪命令对象。\n"
+                "15. 禁止在 ```bash block 中放说明文字、列表、多条命令或 `<真实参数>` 占位说明。\n"
+                "16. 默认不要使用 --argv CLI flag，除非脚本源码明确实现了 --argv；Creator 默认脚本协议是 sys.argv[1] JSON object。\n"
+                "17. references/*.md 只作为参考资料说明，不是执行源。不要把 reference 正文全文复制进 SKILL.md。\n"
+                "18. assets/** 只能作为上传素材或静态资源引用，不能描述为 Creator 生成素材。\n"
+                "19. 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建文件等平台创建流程文案。\n"
+                "20. 不要声称“已通过 E2E 校验”“可直接投入运行”，SKILL.md 是使用说明，不是校验报告。\n\n"
                 "标准命令示例只说明形态，不代表固定字段：\n"
                 "```bash\n"
                 "python scripts/generate_story.py '{\"topic\":\"{{topic}}\",\"chapter_count\":5}'\n"

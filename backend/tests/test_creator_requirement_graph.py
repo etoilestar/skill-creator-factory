@@ -720,7 +720,48 @@ async def test_finalize_skill_md_command_failures_trigger_full_rewrite_not_patch
     assert result["validation_status"] == "needs_repair"
     assert result["editable"] is True
     assert len(generation_calls) > 1
-    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
+    assert result["repair_events"][0]["patch_status"] == "format_region_rewrite"
+
+
+@pytest.mark.asyncio
+async def test_initial_markdown_generation_rewrites_bad_metadata_before_body(monkeypatch):
+    from backend.services.creator import api
+
+    calls = []
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        calls.append(kwargs["prompt_variant"])
+        if kwargs["prompt_variant"] == "generate_markdown_metadata_region":
+            return "---\nname: demo\ndescription: bad\n"
+        if kwargs["prompt_variant"] == "rewrite_markdown_metadata_region":
+            return "---\nname: demo\ndescription: ok\n---\n"
+        if kwargs["prompt_variant"] == "generate_markdown_body_region":
+            return "# Body\n\nContent.\n"
+        raise AssertionError(kwargs["prompt_variant"])
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    result = await api._generate_markdown_initial_regions(
+        file_path="SKILL.md",
+        skill_name="demo",
+        purpose="demo",
+        blueprint_text="demo",
+        model="test-model",
+    )
+
+    assert calls == [
+        "generate_markdown_metadata_region",
+        "rewrite_markdown_metadata_region",
+        "generate_markdown_body_region",
+    ]
+    assert result.startswith("---\nname: demo\ndescription: ok\n---")
+    assert "# Body" in result
+
+
+def test_reference_markdown_warning_uses_reference_content_warning():
+    from backend.services.creator import api
+
+    assert api._markdown_warning_error_type("references/guide.md") == "reference_content_warning"
+    assert api._markdown_warning_error_type("SKILL.md") == "md_format_warning"
 
 
 @pytest.mark.asyncio
@@ -866,7 +907,7 @@ async def test_finalize_skill_md_command_failure_precedes_reference_patch(monkey
 
     assert len(generation_calls) == 2
     assert repair_calls
-    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
+    assert result["repair_events"][0]["patch_status"] == "format_region_rewrite"
     assert "command shape failed" not in repair_calls[0]["validation_error"]
     assert result["validation_status"] == "passed"
 

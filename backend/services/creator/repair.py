@@ -3500,15 +3500,13 @@ async def _run_script_responsibility_review(
         model=requested_model,
     )
 
-    declared_inputs = [
-        str(item).strip()
-        for item in (getattr(skill_plan_entry, "inputs", []) or [])
-        if str(item).strip()
-    ]
-    declared_outputs = [
-        str(item).strip()
-        for item in (getattr(skill_plan_entry, "outputs", []) or [])
-        if str(item).strip()
+    short_contract = str(getattr(skill_plan_entry, "purpose", "") or "").strip()
+    blueprint_text = str(review_context.get("blueprint_text") or review_context.get("blueprint") or "").strip()
+    trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
+    artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
+    req_payload = [
+        item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item) if isinstance(item, dict) else str(item)
+        for item in req_items
     ]
 
     messages = [
@@ -3517,14 +3515,15 @@ async def _run_script_responsibility_review(
             "content": (
                 "你是 Creator 第一轮单脚本职责审查模型，只输出严格 JSON object。\n\n"
 
-                "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责。"
+                "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成 purpose 短合同表达的职责。"
                 "不要判断其它文件、workflow、字段名、审美或充分性细节。\n\n"
 
                 "核心原则：\n"
-                "- 第一轮职责检查去字段化：不要求固定字段名，不因字段名不同判失败；可建议可选字段名，但只能作为参考建议。\n"
-                "- SkillPlan.inputs / outputs 和 requirements 的 semantic_inputs / semantic_outputs 是语义职责槽位参考，不是固定字段名要求。\n"
-                "- 脚本可以使用不同变量名、字段名或数据结构，但必须覆盖对应语义输入消费和语义产物生成。\n"
-                "- 如果脚本只产出通用外壳结果，但没有整合自身职责要求的核心语义输入，应 passed=false。\n"
+                "- 当前脚本的语义职责以 purpose 中的短合同为准；inputs/outputs 只是接口提示，不是完整职责替代。\n"
+                "- 按语义覆盖审查来源、动作、交付、约束；不要围绕字段名逐字对齐，不因变量名不同判失败。\n"
+                "- 脚本可以使用不同 argv 兼容方式、变量名或数据结构，但不能弱化 purpose 短合同中的来源、动作、交付、约束。\n"
+                "- 如果脚本能运行、能输出 JSON，但只完成更小/更弱/更默认的任务，应 passed=false。\n"
+                "- 如果脚本没有使用短合同中的主要来源、核心动作不完整、交付缺失或关键约束被丢弃，应 passed=false。\n"
                 "- 只有当前文件自身语义职责未完成，才 passed=false。\n"
                 "- 如果当前文件已经以等价实现完成同一语义职责，应 passed=true。\n"
                 "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
@@ -3535,7 +3534,7 @@ async def _run_script_responsibility_review(
                 "  \"passed\": true|false,\n"
                 "  \"blocking_issues\": [\n"
                 "    {\n"
-                "      \"issue_type\": \"responsibility_not_met\",\n"
+                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped\",\n"
                 "      \"scope\": \"current_file_only\",\n"
                 "      \"failure_layer\": \"responsibility\",\n"
                 "      \"severity\": \"error\",\n"
@@ -3558,9 +3557,23 @@ async def _run_script_responsibility_review(
             "role": "user",
             "content": (
                 f"目标脚本：{file_path}\n\n"
+                "原始 blueprint_text：\n"
+                f"{blueprint_text[:8000]}\n\n"
+
+                "当前文件 purpose 短合同：\n"
+                f"{short_contract}\n\n"
 
                 "SkillPlanEntry：\n"
                 f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
+
+                "当前文件 requirements / must_do：\n"
+                f"{json.dumps(req_payload, ensure_ascii=False, default=str)[:8000]}\n\n"
+
+                "脚本试运行 stdout（如本阶段尚未运行则为空或说明未提供）：\n"
+                f"{json.dumps(trial_stdout, ensure_ascii=False, default=str)[:4000]}\n\n"
+
+                "脚本生成的 artifact 信息（如本阶段尚未运行则为空或说明未提供）：\n"
+                f"{json.dumps(artifact_info, ensure_ascii=False, default=str)[:4000]}\n\n"
 
                 "额外上下文：\n"
                 f"{json.dumps(review_context, ensure_ascii=False, default=str)[:4000]}\n\n"
@@ -3569,10 +3582,10 @@ async def _run_script_responsibility_review(
                 f"{_numbered_source(script_content)[-16000:]}\n\n"
 
                 "审查要求：\n"
-                "1. 只判断当前脚本是否覆盖自身语义职责。\n"
+                "1. 只判断当前脚本是否完成 purpose 短合同表达的语义职责。\n"
                 "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名判错。\n"
-                "3. 把 SkillPlan.inputs/outputs 当作语义槽位，检查脚本是否真正消费对应语义输入并生成对应语义产物。\n"
-                "4. 只有职责本身没有实现，或内容明显无效（空、占位、默认模板、明显无关），才 passed=false。\n"
+                "3. 检查脚本是否使用主要来源、完成核心动作、交付下游结果/产物、保留关键约束。\n"
+                "4. 如果失败，说明缺失来源/动作/交付/约束中的哪一部分，并说明为什么这是没履职而不是接口问题。\n"
             ),
         },
     ]

@@ -291,7 +291,7 @@ export async function validateSkill(
     throw new Error(err.detail || '校验请求失败')
   }
   const payload = await resp.json()
-  return assertActionSuccess(payload, '严格端到端校验失败')
+  return payload
 }
 
 /**

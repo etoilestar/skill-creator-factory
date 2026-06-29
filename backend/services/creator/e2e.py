@@ -465,12 +465,14 @@ def _render_e2e_command_payload(
     if missing:
         unique_missing = sorted(set(missing))
         available = sorted(payload.keys())
-        key_sources = payload.get("_key_sources") if isinstance(payload.get("_key_sources"), dict) else {}
-        source_lines = [
-            f"- {key}: step {meta.get('step')} / {meta.get('script')}"
-            for key, meta in sorted(key_sources.items())
-            if isinstance(meta, dict)
-        ]
+        logger.info("[Creator][E2E][interface_repair_risk] %s", json.dumps({
+            "event": "e2e_interface_repair_risk",
+            "script_path": command.script_path,
+            "ordinal": command.ordinal,
+            "missing_placeholders": unique_missing,
+            "available_keys": available,
+            "source_path": command.source_path,
+        }, ensure_ascii=False, default=str))
 
         raise ValueError(
             _e2e_error(
@@ -2032,15 +2034,12 @@ def _run_skill_workflow_e2e_once(
                     )
 
                 context_before = dict(payload)
-                key_sources = payload.setdefault("_key_sources", {})
-                if not isinstance(key_sources, dict):
-                    key_sources = {}
-                    payload["_key_sources"] = key_sources
-                for key in stdout_json.keys():
-                    key_sources[str(key)] = {
-                        "step": command.ordinal,
-                        "script": command.script_path,
-                    }
+                logger.info("[Creator][E2E][stdout_key_sources] %s", json.dumps({
+                    "event": "e2e_stdout_key_sources",
+                    "script_path": command.script_path,
+                    "ordinal": command.ordinal,
+                    "stdout_keys": sorted(str(key) for key in stdout_json.keys()),
+                }, ensure_ascii=False, default=str))
                 payload.update(stdout_json)
 
                 if artifact_paths:

@@ -3480,6 +3480,12 @@ async def _run_script_responsibility_review(
     review_context = review_context if isinstance(review_context, dict) else {}
 
     if deterministic_issues:
+        logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
+            "event": "script_responsibility_failed",
+            "file_path": file_path,
+            "model": "deterministic",
+            "issue_count": len(deterministic_issues),
+        }, ensure_ascii=False, default=str))
         return {
             "passed": False,
             "issues": deterministic_issues,
@@ -3502,6 +3508,7 @@ async def _run_script_responsibility_review(
 
     short_contract = str(getattr(skill_plan_entry, "purpose", "") or "").strip()
     blueprint_text = str(review_context.get("blueprint_text") or review_context.get("blueprint") or "").strip()
+    workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
     req_payload = [
@@ -3523,6 +3530,7 @@ async def _run_script_responsibility_review(
                 "- 按语义覆盖审查来源、动作、交付、约束；不要围绕字段名逐字对齐，不因变量名不同判失败。\n"
                 "- 脚本可以使用不同 argv 兼容方式、变量名或数据结构，但不能弱化 purpose 短合同中的来源、动作、交付、约束。\n"
                 "- 如果脚本能运行、能输出 JSON，但只完成更小/更弱/更默认的任务，应 passed=false。\n"
+                "- 如果 workflow_allocation_summary 指出集合处理、聚合交付、顺序对应或结构对应要求，而脚本把多个内容单元简单合并成一个输入并只生成一个结果，导致完整中间结果或结构对应丢失，应 passed=false。\n"
                 "- 如果脚本没有使用短合同中的主要来源、核心动作不完整、交付缺失或关键约束被丢弃，应 passed=false。\n"
                 "- 只有当前文件自身语义职责未完成，才 passed=false。\n"
                 "- 如果当前文件已经以等价实现完成同一语义职责，应 passed=true。\n"
@@ -3534,7 +3542,7 @@ async def _run_script_responsibility_review(
                 "  \"passed\": true|false,\n"
                 "  \"blocking_issues\": [\n"
                 "    {\n"
-                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped\",\n"
+                "      \"issue_type\": \"responsibility_weakened|semantic_source_missing|semantic_action_incomplete|semantic_delivery_incomplete|semantic_constraint_dropped|aggregation_boundary_lost\",\n"
                 "      \"scope\": \"current_file_only\",\n"
                 "      \"failure_layer\": \"responsibility\",\n"
                 "      \"severity\": \"error\",\n"
@@ -3563,6 +3571,9 @@ async def _run_script_responsibility_review(
                 "当前文件 purpose 短合同：\n"
                 f"{short_contract}\n\n"
 
+                "workflow_allocation_summary：\n"
+                f"{workflow_allocation_summary[:4000]}\n\n"
+
                 "SkillPlanEntry：\n"
                 f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
 
@@ -3585,10 +3596,17 @@ async def _run_script_responsibility_review(
                 "1. 只判断当前脚本是否完成 purpose 短合同表达的语义职责。\n"
                 "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名判错。\n"
                 "3. 检查脚本是否使用主要来源、完成核心动作、交付下游结果/产物、保留关键约束。\n"
-                "4. 如果失败，说明缺失来源/动作/交付/约束中的哪一部分，并说明为什么这是没履职而不是接口问题。\n"
+                "4. 如果存在集合/聚合/顺序/结构对应职责，检查脚本是否保留完整中间结果和对应关系，而不是把多个单元压成一个结果。\n"
+                "5. 如果失败，说明缺失来源/动作/交付/约束中的哪一部分，并说明为什么这是没履职而不是接口问题。\n"
             ),
         },
     ]
+    logger.info("[Creator][script_responsibility][start] %s", json.dumps({
+        "event": "script_responsibility_start",
+        "file_path": file_path,
+        "has_workflow_allocation_summary": bool(workflow_allocation_summary),
+        "requirement_count": len(req_items),
+    }, ensure_ascii=False, default=str))
 
     last_text = ""
     last_parsed: dict[str, Any] | None = None
@@ -3671,6 +3689,12 @@ async def _run_script_responsibility_review(
                     static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
                     static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
                     if static_blockers:
+                        logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
+                            "event": "script_responsibility_failed",
+                            "file_path": file_path,
+                            "model": "deterministic",
+                            "issue_count": len(static_blockers),
+                        }, ensure_ascii=False, default=str))
                         return {
                             "passed": False,
                             "issues": static_blockers,
@@ -3679,10 +3703,23 @@ async def _run_script_responsibility_review(
                             "model": "deterministic",
                             "raw_review": parsed_review.get("raw_review"),
                         }
+                logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
+                    "event": "script_responsibility_failed",
+                    "file_path": file_path,
+                    "model": route.model,
+                    "issue_count": len(parsed_review.get("issues") or []),
+                    "failure_type": parsed_review.get("failure_type"),
+                }, ensure_ascii=False, default=str))
                 return parsed_review
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
             static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
+                logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
+                    "event": "script_responsibility_failed",
+                    "file_path": file_path,
+                    "model": "deterministic",
+                    "issue_count": len(static_blockers),
+                }, ensure_ascii=False, default=str))
                 return {
                     "passed": False,
                     "issues": static_blockers,
@@ -3691,6 +3728,12 @@ async def _run_script_responsibility_review(
                     "model": "deterministic",
                     "raw_review": parsed_review.get("raw_review"),
                 }
+            logger.info("[Creator][script_responsibility][result] %s", json.dumps({
+                "event": "script_responsibility_result",
+                "file_path": file_path,
+                "model": route.model,
+                "passed": True,
+            }, ensure_ascii=False, default=str))
             return parsed_review
         break
 
@@ -3724,7 +3767,17 @@ async def _run_script_responsibility_review(
                     "blocking_issues": blocking_issues,
                 },
             }]
-
+        logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
+            "event": "script_responsibility_failed",
+            "file_path": file_path,
+            "model": route.model,
+            "issue_count": len(issues),
+            "failure_types": sorted({
+                str(issue.get("issue_type") or issue.get("id") or "")
+                for issue in issues
+                if isinstance(issue, dict)
+            }),
+        }, ensure_ascii=False, default=str))
         return {
             "passed": False,
             "issues": issues,
@@ -3735,7 +3788,12 @@ async def _run_script_responsibility_review(
             "model": route.model,
             "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
         }
-
+    logger.info("[Creator][script_responsibility][result] %s", json.dumps({
+        "event": "script_responsibility_result",
+        "file_path": file_path,
+        "model": route.model,
+        "passed": True,
+    }, ensure_ascii=False, default=str))
     return {
         "passed": True,
         "issues": [],

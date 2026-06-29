@@ -1831,6 +1831,7 @@ def _build_script_file_contract_text(
         f"- 当前脚本的语义职责以 purpose 中的短合同为准：{entry.purpose or purpose or '未声明'}",
         "- inputs/outputs 是接口提示，不是完整职责的替代。",
         "- 脚本可以兼容不同 argv 形式，但不能弱化 purpose 中的来源、动作、交付、约束。",
+        "- 可执行职责必须落到脚本内部，不能依赖 SKILL.md 自然语言隐式循环、隐式聚合或人工理解来补完。",
         "- role 只是实现提示；不得覆盖或缩小 purpose 短合同。",
         "",
         "A. 输出形态:",

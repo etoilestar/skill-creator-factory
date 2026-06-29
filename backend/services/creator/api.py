@@ -52,6 +52,7 @@ async def _extract_requirement_graph_with_validator(
             raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
         by_file = {item.target_file: item for item in graph.requirements}
         allowed = {"target_file", "purpose", "must_do", "must_not_do", "depends_on"}
+        applied_purpose_targets: list[str] = []
         for idx, patch in enumerate(patches):
             if not isinstance(patch, dict):
                 raise RequirementGraphValidationError("Responsibility graph patch item must be object.", code="validator_incomplete", details={"index": idx})
@@ -64,6 +65,7 @@ async def _extract_requirement_graph_with_validator(
             purpose = str(patch.get("purpose") or "").strip()
             if purpose:
                 item.purpose = purpose
+                applied_purpose_targets.append(target)
             for field_name in ("must_do", "must_not_do", "depends_on"):
                 values = RequirementItem._coerce_string_list(patch.get(field_name))
                 if values:
@@ -82,6 +84,11 @@ async def _extract_requirement_graph_with_validator(
             patched_purpose = purpose_by_file.get(file_spec.path)
             if patched_purpose:
                 file_spec.purpose = patched_purpose
+        logger.info("[Creator][purpose_short_contract_patch][result] %s", json.dumps({
+            "event": "purpose_short_contract_patch_result",
+            "patch_count": len(patches),
+            "purpose_targets": applied_purpose_targets,
+        }, ensure_ascii=False, default=str))
         return graph
     except Exception as exc:
         if warnings is not None:
@@ -94,6 +101,10 @@ async def _extract_requirement_graph_with_validator(
                 "field": "requirement_graph",
                 "message": f"Responsibility graph patch model failed; using deterministic graph: {exc}",
             })
+        logger.info("[Creator][purpose_short_contract_patch][failed] %s", json.dumps({
+            "event": "purpose_short_contract_patch_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }, ensure_ascii=False, default=str))
         return graph
 
 
@@ -106,11 +117,109 @@ def _persist_requirement_graph(skill_name: str, graph: RequirementGraph) -> None
     )
 
 
+def _persist_workflow_allocation_summary(skill_name: str, summary: str) -> None:
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "workflow_allocation_summary.txt").write_text(str(summary or "").strip(), encoding="utf-8")
+
+
+def _load_workflow_allocation_summary(skill_name: str) -> str:
+    path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_allocation_summary.txt"
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
 def _load_persisted_requirement_graph(skill_name: str) -> RequirementGraph | None:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "requirement_graph.json"
     if not path.is_file():
         return None
     return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
+
+async def _allocate_workflow_script_responsibilities(
+    *,
+    blueprint_text: str,
+    files_out: list[FileSpecOut],
+    requested_model: str | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> str:
+    """Patch script purposes so executable workflow responsibilities are not left implicit."""
+    targets = [
+        file_spec
+        for file_spec in files_out
+        if file_spec.path.startswith("scripts/") and file_spec.required
+    ]
+    if not targets:
+        return ""
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
+    payload = [
+        {
+            "path": item.path,
+            "purpose": item.purpose,
+            "role": item.role,
+            "inputs": item.inputs,
+            "outputs": item.outputs,
+            "dependencies": item.dependencies,
+        }
+        for item in targets
+    ]
+    messages = [
+        {"role": "system", "content": (
+            "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
+            "你只做职责分配检查：判断每个 required script 的局部职责是否足以交付下游需要的完整结果。\n"
+            "如果 workflow 存在重复处理、集合处理、聚合交付、顺序对应、结构对应等语义要求，必须把要求压到某个可执行脚本 purpose 短合同里。\n"
+            "不要按字段名逐字匹配，不写业务词表，不用单复数机械判断；依赖蓝图语义判断。\n"
+            "只输出 compact patches，主要修正 purpose；不要新增文件，不改接口字段。\n"
+            "purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\"}]}"
+        )},
+        {"role": "user", "content": (
+            "blueprint_text:\n" + (blueprint_text or "")[:14000] + "\n\n"
+            "required_scripts:\n" + json.dumps(payload, ensure_ascii=False, default=str)[:16000]
+        )},
+    ]
+    logger.info("[Creator][workflow_allocation][start] %s", json.dumps({
+        "event": "workflow_allocation_start",
+        "script_count": len(targets),
+        "scripts": [item.path for item in targets],
+    }, ensure_ascii=False, default=str))
+    try:
+        data = _parse_validator_json_object(await complete_chat_once(messages, route.model))
+        patches = data.get("patches") if isinstance(data, dict) else None
+        summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
+        if not isinstance(patches, list):
+            raise ValueError("missing patches list")
+        by_path = {item.path: item for item in targets}
+        applied: list[str] = []
+        for patch in patches:
+            if not isinstance(patch, dict):
+                continue
+            target = str(patch.get("target_file") or "").strip()
+            purpose = str(patch.get("purpose") or "").strip()
+            if target in by_path and purpose:
+                by_path[target].purpose = purpose
+                applied.append(target)
+        logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
+            "event": "workflow_allocation_result",
+            "applied_targets": applied,
+            "summary": summary,
+        }, ensure_ascii=False, default=str))
+        return summary
+    except Exception as exc:
+        logger.info("[Creator][workflow_allocation][failed] %s", json.dumps({
+            "event": "workflow_allocation_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }, ensure_ascii=False, default=str))
+        if warnings is not None:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": "workflow_allocation_failed",
+                "source": "analyze_blueprint",
+                "path": "",
+                "field": "purpose",
+                "message": f"Workflow responsibility allocation failed; keeping parsed purposes: {exc}",
+            })
+        return ""
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
     value = str(text or "")
@@ -130,6 +239,10 @@ async def _normalize_script_purpose_short_contracts(
     ]
     if not targets:
         return
+    logger.info("[Creator][purpose_short_contract][start] %s", json.dumps({
+        "event": "purpose_short_contract_start",
+        "targets": [item.path for item in targets],
+    }, ensure_ascii=False, default=str))
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator script purpose short-contract normalization")
     messages = [
         {"role": "system", "content": (
@@ -167,7 +280,17 @@ async def _normalize_script_purpose_short_contracts(
             purpose = str(patch.get("purpose") or "").strip()
             if target in by_path and _looks_like_semantic_short_contract(purpose):
                 by_path[target].purpose = purpose
+        logger.info("[Creator][purpose_short_contract][result] %s", json.dumps({
+            "event": "purpose_short_contract_result",
+            "patched_targets": [
+                item.path for item in targets if _looks_like_semantic_short_contract(item.purpose)
+            ],
+        }, ensure_ascii=False, default=str))
     except Exception as exc:
+        logger.info("[Creator][purpose_short_contract][failed] %s", json.dumps({
+            "event": "purpose_short_contract_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }, ensure_ascii=False, default=str))
         if warnings is not None:
             warnings.append({
                 "severity": "validator_warning",
@@ -375,6 +498,12 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
+    workflow_allocation_summary = await _allocate_workflow_script_responsibilities(
+        blueprint_text=blueprint_text,
+        files_out=files_out,
+        requested_model=request.model,
+        warnings=warnings,
+    )
     await _normalize_script_purpose_short_contracts(
         blueprint_text=blueprint_text,
         files_out=files_out,
@@ -405,6 +534,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     for file_spec in files_out:
         file_spec.requirements = list(requirements_by_file.get(file_spec.path, []))
     _persist_requirement_graph(plan.skill_name, requirement_graph)
+    _persist_workflow_allocation_summary(plan.skill_name, workflow_allocation_summary)
 
     asset_requirements = [
         AssetRequirementOut(
@@ -2276,6 +2406,7 @@ async def generate_file(request: GenerateFileRequest):
                             entry_requirements = [req for req in persisted_graph.requirements if req.target_file == request.file_path]
                         if not entry_requirements and isinstance(effective_skill_plan_entry, dict):
                             entry_requirements = effective_skill_plan_entry.get("requirements") or []
+                        workflow_allocation_summary = _load_workflow_allocation_summary(skill_name)
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
                             script_content=content,
@@ -2288,6 +2419,7 @@ async def generate_file(request: GenerateFileRequest):
                                 "policy": "只判断当前文件职责是否完成。",
                                 "blueprint_text": request.blueprint_text,
                                 "purpose_short_contract": getattr(entry, "purpose", request.purpose),
+                                "workflow_allocation_summary": workflow_allocation_summary,
                                 "trial_stdout": "第一轮责任审查在局部 patch 前可能尚未执行试运行；如为空，不得把缺 stdout 当接口失败。",
                                 "artifact_info": "第一轮责任审查只用 artifact 信息辅助判断语义交付；真实存在性由运行/E2E 检查。",
                             },

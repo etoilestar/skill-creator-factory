@@ -179,10 +179,14 @@ async def _allocate_workflow_script_responsibilities(
     messages = [
         {"role": "system", "content": (
             "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
-            "先在内部构建轻量责任图谱作为推理依据（不要输出复杂结构）：节点包括平台 guaranteed input envelope、每个 required script、reference、asset、最终产物；边描述上游 stdout/artifact/resource 如何被下游消费。\n"
-            "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游结果；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
+            "先在内部区分 executable workflow graph 与 reference/context graph（不要输出复杂结构）。\n"
+            "executable workflow graph 只能包含：platform guaranteed input envelope、required scripts/*.py、scripts stdout、scripts artifacts、final artifact；只有这些节点/边可以承担运行时 dataflow。\n"
+            "SKILL.md、references/*.md、assets/** 只能作为 reference/context graph 中的说明、规范或资源上下文，不能作为可执行 dataflow 节点：SKILL.md 不承担字段转换、循环、聚合、排序、映射或产物生成；references/*.md 不产生 stdout 字段，不补齐 producer，不补齐集合结果；assets/** 只是上传或静态资源输入，不主动生成中间结果。\n"
+            "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游 stdout/artifact 或 platform runtime 输入；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
             "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
+            "任何运行链路闭环、字段转换、子字段提取、集合遍历、聚合交付、顺序映射，都必须落到 scripts/*.py 或平台真实 runtime 能力中；不得用 SKILL.md 的自然语言、reference 的规则说明、assets 的存在来解释缺失的 producer、loop、aggregation 或 field mapping。\n"
             "当前平台没有显式可执行 loop/map/foreach 节点。如果蓝图语义需要逐项处理、批量处理、一一对应、多输入单元生成多输出单元、聚合交付或顺序映射，必须把该执行责任落到某个脚本内部；不得只在 purpose 或 SKILL.md 中写逐项调用、每个生成一个、依次处理、保持对应，却没有任何脚本承担真实循环/聚合。\n"
+            "如果下游脚本需要消费上游集合元素中的子字段（例如从某个 structured collection item 中读取 description/text/scene/metadata），这不是自动存在的 workflow 顶层变量。除非上游脚本明确把该字段作为 stdout 顶层输出，否则下游不能直接把它作为 input；若平台没有显式 loop/map/foreach 节点，遍历集合并提取子字段的责任必须落到某个脚本内部。\n"
             "workflow_allocation_summary 必须描述图上的责任边界；每个 required script 都说明：消费哪类上游结果、交付哪类下游结果、需保留哪些可观察关系、哪些责任由上游建立当前只保留、哪些责任当前无法观察或验证不能压给它。\n"
             "patch 默认只改当前脚本 purpose/inputs/outputs；如果当前职责调整影响直接上游或直接下游，可以同步 patch 相邻 required scripts 的 purpose/inputs/outputs，做最小联动。不要新增文件，不硬编码业务字段，不按字段名、文件名、role、单复数机械判断。\n"
             "inputs/outputs 默认追加；只有当旧接口会造成错误单项字段残留时，才在 patch 中显式设置 replace_inputs=true 或 replace_outputs=true，用新列表替换旧列表。\n"

@@ -1,5 +1,7 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
+import hashlib
+
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
@@ -142,7 +144,7 @@ async def _allocate_workflow_script_responsibilities(
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
-) -> str:
+) -> tuple[str, set[str]]:
     """Patch script purposes so executable workflow responsibilities are not left implicit."""
     targets = [
         file_spec
@@ -150,7 +152,7 @@ async def _allocate_workflow_script_responsibilities(
         if file_spec.path.startswith("scripts/") and file_spec.required
     ]
     if not targets:
-        return ""
+        return "", set()
     route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
     all_nodes = [
         {
@@ -179,13 +181,21 @@ async def _allocate_workflow_script_responsibilities(
     messages = [
         {"role": "system", "content": (
             "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
-            "先在内部构建轻量责任图谱作为推理依据（不要输出复杂结构）：节点包括平台 guaranteed input envelope、每个 required script、reference、asset、最终产物；边描述上游 stdout/artifact/resource 如何被下游消费。\n"
-            "逐边判断：上游交付什么、下游需要什么、中间是否丢失结构、顺序、引用、约束或能力边界。\n"
+            "先在内部区分 executable workflow graph 与 reference/context graph（不要输出复杂结构）。\n"
+            "executable workflow graph 只能包含：platform guaranteed input envelope、required scripts/*.py、scripts stdout、scripts artifacts、final artifact；只有这些节点/边可以承担运行时 dataflow。\n"
+            "SKILL.md、references/*.md、assets/** 只能作为 reference/context graph 中的说明、规范或资源上下文，不能作为可执行 dataflow 节点：SKILL.md 不承担字段转换、循环、聚合、排序、映射或产物生成；references/*.md 不产生 stdout 字段，不补齐 producer，不补齐集合结果；assets/** 只是上传或静态资源输入，不主动生成中间结果。\n"
+            "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游 stdout/artifact 或 platform runtime 输入；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
+            "责任分配必须先从全局可执行合同推导，再落到单个脚本。全局合同由最终产物目标、下游消费者 inputs、平台执行能力边界、可执行脚本链路闭环共同决定；原始 SkillPlanEntry inputs/outputs 只作为局部能力提示，不能覆盖全局闭环。\n"
             "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
-            "workflow_allocation_summary 必须描述图上的责任边界；每个 required script 都说明：消费哪类上游结果、交付哪类下游结果、需保留哪些可观察关系、哪些责任由上游建立当前只保留、哪些责任当前无法观察或验证不能压给它。\n"
-            "如果下游需要结构化中间结果且上游已有对应结构化输出，可以 patch 当前脚本 purpose，并可在 patch 中给 inputs/outputs 做最小补齐；只能基于图中已有节点和边，不能凭空发明字段。\n"
-            "只输出 compact patches；不要新增文件，不硬编码业务案例。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
-            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[]}]}"
+            "任何运行链路闭环、字段转换、子字段提取、集合遍历、聚合交付、顺序映射，都必须落到 scripts/*.py 或平台真实 runtime 能力中；不得用 SKILL.md 的自然语言、reference 的规则说明、assets 的存在来解释缺失的 producer、loop、aggregation 或 field mapping。\n"
+            "当前平台没有显式可执行 loop/map/foreach 节点。如果蓝图语义需要逐项处理、批量处理、一一对应、多输入单元生成多输出单元、聚合交付或顺序映射，必须把该执行责任落到某个脚本内部；不得只在 purpose 或 SKILL.md 中写逐项调用、每个生成一个、依次处理、保持对应，却没有任何脚本承担真实循环/聚合。\n"
+            "如果原始单脚本合同表达‘单项输入 -> 单项输出’，但下游需要集合/聚合结果且平台没有 loop/map/foreach，则该脚本最终责任必须提升为‘集合/整体输入 -> 集合/聚合输出’；单项处理只能作为脚本内部循环体，不能作为 workflow 级 final inputs/final outputs。\n"
+            "如果下游脚本需要消费上游集合元素中的子字段（例如从某个 structured collection item 中读取 description/text/scene/metadata），这不是自动存在的 workflow 顶层变量。除非上游脚本明确把该字段作为 stdout 顶层输出，否则下游不能直接把它作为 input；若平台没有显式 loop/map/foreach 节点，遍历集合并提取子字段的责任必须落到某个脚本内部。\n"
+            "workflow_allocation_summary、patch purpose、patch inputs、patch outputs 必须描述同一个全局责任合同；summary 不得继续描述被替换掉的旧脚本级 inputs/outputs。purpose 的来源必须与 patch inputs 字段名和粒度一致，purpose 的交付必须与 patch outputs 字段名和粒度一致，不得出现 outputs 与 purpose 中单复数/类型/字段名模糊或冲突。\n"
+            "patch 默认只改当前脚本 purpose/final inputs/final outputs；如果当前职责调整影响直接上游或直接下游，可以同步 patch 相邻 required scripts 的 purpose/inputs/outputs，做最小联动。不要新增文件，不硬编码业务字段，不按字段名、文件名、role、单复数机械判断。\n"
+            "workflow allocation patch 中的 inputs/outputs 表示 final inputs/final outputs；如果 patch 提供 inputs/outputs，默认替换原始 inputs/outputs，不再默认 append。只有明确设置 replace_inputs=false 或 replace_outputs=false 时才按 legacy append 兼容。需要把旧单项接口升级为整体/集合接口时，应提供 inputs/outputs 并保持默认替换，避免错误旧字段残留。\n"
+            "只输出 compact patches；不要新增复杂结构。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[],\"replace_inputs\":true,\"replace_outputs\":true}]}"
         )},
         {"role": "user", "content": (
             "blueprint_text:\n" + (blueprint_text or "")[:14000] + "\n\n"
@@ -199,9 +209,40 @@ async def _allocate_workflow_script_responsibilities(
         "scripts": [item.path for item in targets],
     }, ensure_ascii=False, default=str))
     try:
-        data = _parse_validator_json_object(await complete_chat_once(messages, route.model))
-        patches = data.get("patches") if isinstance(data, dict) else None
-        summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
+        conflict_feedback = ""
+        data: dict[str, Any] = {}
+        patches: list[Any] = []
+        summary = ""
+        for attempt in range(2):
+            attempt_messages = list(messages)
+            if conflict_feedback:
+                attempt_messages.append({
+                    "role": "user",
+                    "content": (
+                        "上一次 workflow allocation JSON 存在 final contract 一致性冲突；"
+                        "请只修正 JSON，不新增复杂结构。冲突如下：\n"
+                        f"{conflict_feedback[:6000]}\n\n"
+                        "修正要求：workflow_allocation_summary、patch purpose、patch inputs、patch outputs "
+                        "必须描述同一个全局责任合同；inputs/outputs 是 final inputs/final outputs。"
+                    ),
+                })
+            data = _parse_validator_json_object(await complete_chat_once(attempt_messages, route.model))
+            patches_candidate = data.get("patches") if isinstance(data, dict) else None
+            summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
+            if not isinstance(patches_candidate, list):
+                raise ValueError("missing patches list")
+            conflicts = _workflow_allocation_patch_conflicts(patches_candidate)
+            if not conflicts:
+                patches = patches_candidate
+                break
+            conflict_feedback = json.dumps(conflicts, ensure_ascii=False, default=str)
+            logger.info("[Creator][workflow_allocation][contract_conflict] %s", json.dumps({
+                "event": "workflow_allocation_contract_conflict",
+                "attempt": attempt + 1,
+                "conflicts": conflicts,
+            }, ensure_ascii=False, default=str))
+        else:
+            raise ValueError(f"workflow allocation final contract conflicts: {conflict_feedback}")
         if not isinstance(patches, list):
             raise ValueError("missing patches list")
         by_path = {item.path: item for item in targets}
@@ -214,22 +255,24 @@ async def _allocate_workflow_script_responsibilities(
             if target in by_path and purpose:
                 script = by_path[target]
                 script.purpose = purpose
-                for field_name in ("inputs", "outputs"):
-                    values = patch.get(field_name)
-                    if isinstance(values, list) and all(isinstance(v, str) for v in values):
-                        existing = list(getattr(script, field_name) or [])
-                        for value in values:
-                            value = value.strip()
-                            if value and value not in existing:
-                                existing.append(value)
-                        setattr(script, field_name, existing)
+                for field_name, replace_flag in (("inputs", "replace_inputs"), ("outputs", "replace_outputs")):
+                    cleaned = _clean_allocation_io_values(patch.get(field_name))
+                    if cleaned is not None:
+                        if patch.get(replace_flag) is not False:
+                            setattr(script, field_name, cleaned)
+                        else:
+                            existing = list(getattr(script, field_name) or [])
+                            for value in cleaned:
+                                if value not in existing:
+                                    existing.append(value)
+                            setattr(script, field_name, existing)
                 applied.append(target)
         logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
             "event": "workflow_allocation_result",
             "applied_targets": applied,
             "summary": summary,
         }, ensure_ascii=False, default=str))
-        return summary
+        return summary, set(applied)
     except Exception as exc:
         logger.info("[Creator][workflow_allocation][failed] %s", json.dumps({
             "event": "workflow_allocation_failed",
@@ -244,23 +287,76 @@ async def _allocate_workflow_script_responsibilities(
                 "field": "purpose",
                 "message": f"Workflow responsibility allocation failed; keeping parsed purposes: {exc}",
             })
-        return ""
+        return "", set()
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
     value = str(text or "")
     return all(marker in value for marker in ("来源：", "动作：", "交付：", "约束：", "说明："))
 
+
+def _clean_allocation_io_values(values: Any) -> list[str] | None:
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        return None
+    cleaned: list[str] = []
+    for value in values:
+        item = value.strip()
+        if item and item not in cleaned:
+            cleaned.append(item)
+    return cleaned
+
+
+def _workflow_allocation_patch_conflicts(patches: list[Any]) -> list[dict[str, Any]]:
+    """Lightweight final-contract consistency check for allocation patches.
+
+    This deliberately stays local to the returned compact patches: it does not
+    build or validate a graph.  It only verifies that final inputs/outputs and
+    purpose text name the same contract before purpose normalization can run.
+    """
+    conflicts: list[dict[str, Any]] = []
+    for patch in patches:
+        if not isinstance(patch, dict):
+            continue
+        target = str(patch.get("target_file") or "").strip()
+        purpose = str(patch.get("purpose") or "").strip()
+        if not target or not purpose:
+            continue
+        purpose_lower = purpose.lower()
+        for field_name in ("inputs", "outputs"):
+            values = _clean_allocation_io_values(patch.get(field_name))
+            if values is None or not values:
+                continue
+            missing = [value for value in values if value.lower() not in purpose_lower]
+            if missing:
+                conflicts.append({
+                    "target_file": target,
+                    "field": field_name,
+                    "missing_from_purpose": missing,
+                    "message": (
+                        "patch purpose must describe the same final "
+                        f"{field_name} names/granularity as patch {field_name}"
+                    ),
+                })
+    return conflicts
+
 async def _normalize_script_purpose_short_contracts(
     *,
     blueprint_text: str,
     files_out: list[FileSpecOut],
+    workflow_allocation_summary: str = "",
+    skip_targets: set[str] | None = None,
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> None:
+    skip_targets = set(skip_targets or set())
     targets = [
         file_spec
         for file_spec in files_out
-        if file_spec.path.startswith("scripts/") and file_spec.required and not _looks_like_semantic_short_contract(file_spec.purpose)
+        if (
+            file_spec.path.startswith("scripts/")
+            and file_spec.required
+            and file_spec.path not in skip_targets
+            and not _looks_like_semantic_short_contract(file_spec.purpose)
+        )
     ]
     if not targets:
         return
@@ -274,10 +370,12 @@ async def _normalize_script_purpose_short_contracts(
             "你是 Creator 脚本职责短合同压缩器，只输出严格 JSON object。\n"
             "为每个 required script 生成简短 purpose；不要新增结构字段，不复制蓝图长文。\n"
             "格式必须是：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
-            "来源/动作/交付/约束要来自蓝图语义；inputs/outputs 只是接口提示。"
+            "来源/动作/交付/约束要来自蓝图语义；inputs/outputs 只是接口提示。\n"
+            "必须同时读取 workflow_allocation_summary：如果其中已表达完整交付、批量处理、聚合交付、顺序映射、结构映射或集合边界要求，normalizer 不得把 purpose 重新压窄为单项局部职责。"
         )},
         {"role": "user", "content": (
             "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
+            "workflow_allocation_summary:\n" + (workflow_allocation_summary or "")[:6000] + "\n\n"
             "scripts:\n" + json.dumps([
                 {
                     "path": item.path,
@@ -523,7 +621,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
-    workflow_allocation_summary = await _allocate_workflow_script_responsibilities(
+    workflow_allocation_summary, allocation_patched_targets = await _allocate_workflow_script_responsibilities(
         blueprint_text=blueprint_text,
         files_out=files_out,
         requested_model=request.model,
@@ -532,9 +630,24 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     await _normalize_script_purpose_short_contracts(
         blueprint_text=blueprint_text,
         files_out=files_out,
+        workflow_allocation_summary=workflow_allocation_summary,
+        skip_targets=allocation_patched_targets,
         requested_model=request.model,
         warnings=warnings,
     )
+    logger.info("[Creator][global_contract][resolved] %s", json.dumps({
+        "event": "creator_global_contract_resolved",
+        "contracts": [
+            {
+                "path": file_spec.path,
+                "final_inputs": list(file_spec.inputs or []),
+                "final_outputs": list(file_spec.outputs or []),
+                "purpose_digest": hashlib.sha256(str(file_spec.purpose or "").encode("utf-8")).hexdigest()[:12],
+            }
+            for file_spec in files_out
+            if file_spec.path.startswith("scripts/") and file_spec.required
+        ],
+    }, ensure_ascii=False, default=str))
     fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(

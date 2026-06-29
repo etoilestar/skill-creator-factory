@@ -260,6 +260,7 @@
             <pre v-if="event.stdout_summary || event.stderr_summary" class="post-detail">stdout: {{ event.stdout_summary || '' }}
 stderr: {{ event.stderr_summary || '' }}</pre>
             <pre v-if="event.diff_excerpt" class="post-detail">{{ event.diff_excerpt }}</pre>
+            <pre v-if="event.rejection_reason && event.patch_status !== 'parse_failed'" class="post-detail">rejection: {{ event.rejection_reason }}</pre>
             <pre v-if="event.patch_status === 'parse_failed'" class="post-detail">parser_error: {{ event.parser_error || event.rejection_reason || 'unknown' }}
 diff_extraction_attempted: {{ Boolean(event.diff_extraction_attempted) }}
 old_lines_new_lines_fallback_attempted: {{ Boolean(event.old_lines_new_lines_fallback_attempted) }}
@@ -468,6 +469,16 @@ function formatBytes(n) {
 
 function normalizeSkillPath(path) {
   return String(path || '').replace(/\\/g, '/').trim()
+}
+
+function isMarkdownSkillFile(path) {
+  const normalized = normalizeSkillPath(path)
+  return normalized === 'SKILL.md' || normalized.startsWith('references/') || /\.md(?:own)?$/i.test(normalized)
+}
+
+function isEditableMarkdownWarning(file, payload = {}) {
+  if (!isMarkdownSkillFile(file?.path)) return false
+  return payload.editable === true && payload.disabled === false
 }
 
 function pathBasename(path) {
@@ -824,6 +835,15 @@ async function generateOneFile(idx) {
                   : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
       } else if (chunk?.error) {
+        if (typeof chunk.content === 'string' && chunk.content.trim()) {
+          file.generatedContent = chunk.content
+        }
+        if (isEditableMarkdownWarning(file, chunk)) {
+          file.status = 'preview'
+          file.showPreview = true
+          file.repairMessage = `${chunk.errorType || 'md_content_repair_warning'}：${chunk.error || 'Markdown 仍需手动微调'}`
+          return
+        }
         throw new Error(chunk.error)
       }
     }
@@ -841,9 +861,9 @@ async function generateOneFile(idx) {
       : ''
     file.error = failedChecks || err.message || String(err)
 
-    if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
+    if (isMarkdownSkillFile(file.path) && file.generatedContent?.trim()) {
       file.showPreview = true
-      file.repairMessage = 'SKILL.md 校验失败，可在下方手动微调后点击“写入”或“重新生成”。'
+      file.repairMessage = 'Markdown 校验/修复未完全通过，但草稿可编辑。可在下方手动微调后点击“写入”或“重新生成”。'
     }
   }
 }

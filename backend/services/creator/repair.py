@@ -1623,7 +1623,7 @@ async def _request_and_apply_repair_patch(
             last_error = exc
             if proposal_signature is not None:
                 failed_proposal_counts[proposal_signature] = failed_proposal_counts.get(proposal_signature, 0) + 1
-            if (
+            is_markdown_hard_format_regression = (
                 (file_path == "SKILL.md" or file_path.startswith("references/") or _is_markdown_file(file_path))
                 and (
                     "hard_format_regression" in str(exc)
@@ -1632,7 +1632,19 @@ async def _request_and_apply_repair_patch(
                     or "markdown.frontmatter.unclosed" in str(exc)
                     or "model_patch_allowed" in str(exc)
                 )
-            ):
+            )
+            if is_markdown_hard_format_regression and scope.phase == "workflow_e2e":
+                last_failure = (
+                    "PATCH_CANDIDATE_FORMAT_REGRESSED：原始 Markdown 格式已通过，但候选 patch 造成 hard_format_regression，已拒绝且未修改原文件。\n"
+                    "继续生成更小的 content-only patch：不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行；"
+                    "只修改失败命令那一行；old_lines 必须包含当前文件中的完整真实命令行；"
+                    "不要把 ```bash 和闭合 ``` 纳入 old_lines，除非完整包含闭合 fence。\n"
+                    f"validator_error={exc}"
+                )
+                accumulated_failure = failure_text + "\n\n" + last_failure
+                accumulated_context = task_context + "\n\n" + last_failure
+                continue
+            if is_markdown_hard_format_regression:
                 raise
             if isinstance(exc, CreatorRepairNoopPatch) or "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
                 break

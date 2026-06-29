@@ -640,6 +640,11 @@ class SkillActionResponse(BaseModel):
     path: Optional[str] = None
     message: str
     repair_events: list[dict[str, Any]] = Field(default_factory=list)
+    validation_status: str | None = None
+    error_type: str | None = None
+    editable: bool = True
+    disabled: bool = False
+    recoverable: bool = True
 
 
 class ListFilesRequest(BaseModel):

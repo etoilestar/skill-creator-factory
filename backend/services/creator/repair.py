@@ -1562,8 +1562,20 @@ async def _request_and_apply_repair_patch(
             "不要修改与 Traceback 无关的位置。"
         )
 
-    accumulated_failure = failure_text + ("\n\n" + runtime_priority_note if runtime_priority_note else "")
-    accumulated_context = task_context + ("\n\n" + runtime_priority_note if runtime_priority_note else "")
+    argv_probe_note = ""
+    if scope.phase == "workflow_e2e" and any(
+        marker in f"{failure_text}\n{task_context}"
+        for marker in ("argv_schema_error", "strict_json_argv_guard")
+    ):
+        argv_probe_note = (
+            "ARGV_SCHEMA_REPAIR_ALIGNMENT：strict_json_argv_guard 是探针，不是默认修复目标；"
+            "禁止只 patch guard schema。修复要对齐 SKILL.md block 调用、script entry、script core；"
+            "不能删除业务参数/功能覆盖面。"
+        )
+
+    extra_notes = "\n\n".join(note for note in (runtime_priority_note, argv_probe_note) if note)
+    accumulated_failure = failure_text + ("\n\n" + extra_notes if extra_notes else "")
+    accumulated_context = task_context + ("\n\n" + extra_notes if extra_notes else "")
     last_error: Exception | None = None
     last_proposal_excerpt = ""
     failed_proposal_counts: dict[str, int] = {}

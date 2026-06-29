@@ -467,3 +467,33 @@ def test_multiple_repair_ops_are_batched():
     assert "new one" in candidate and "new two" in candidate
     assert stats["mode"] == "deterministic_micro_patch_batch"
     assert stats["repair_ops"]["applied"] == 2
+
+
+@pytest.mark.asyncio
+async def test_workflow_e2e_argv_schema_context_treats_guard_as_probe(monkeypatch):
+    seen = {}
+
+    async def fake_request(**kwargs):
+        seen["failure_text"] = kwargs.get("failure_text", "")
+        seen["task_context"] = kwargs.get("task_context", "")
+        return _proposal(target_file="SKILL.md", old="old", new="new")
+
+    monkeypatch.setattr(repair, "_request_repair_diff_proposal", fake_request)
+
+    scope = CreatorRepairScope(phase="workflow_e2e", repair_type="cross_step_io_alignment", target_file="SKILL.md")
+    await _request_and_apply_repair_patch(
+        model="test-model",
+        file_path="SKILL.md",
+        current_content="old\n",
+        failure_text="argv_schema_error: missing required argv keys from strict_json_argv_guard",
+        scope=scope,
+        task_context="ctx",
+        target_rule="rule",
+        patch_retry_limit=1,
+    )
+
+    combined = seen["failure_text"] + "\n" + seen["task_context"]
+    assert "strict_json_argv_guard 是探针，不是默认修复目标" in combined
+    assert "禁止只 patch guard schema" in combined
+    assert "SKILL.md block 调用、script entry、script core" in combined
+    assert "不能删除业务参数/功能覆盖面" in combined

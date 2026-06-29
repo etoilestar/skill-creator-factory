@@ -1839,6 +1839,8 @@ def _build_script_file_contract_text(
         "- inputs/outputs 是接口提示，不是完整职责的替代。",
         "- 脚本可以兼容不同 argv 形式，但不能弱化 purpose 中的来源、动作、交付、约束。",
         "- 可执行职责必须落到脚本内部，不能依赖 SKILL.md 自然语言隐式循环、隐式聚合或人工理解来补完。",
+        "- 如果 purpose 或 workflow_allocation_summary 表明当前脚本负责整体处理、逐项处理、批量生成、一一对应、聚合交付、保留顺序或结构映射，则脚本必须在自身逻辑中真实完成。",
+        "- 当前平台没有显式 loop/map/foreach 时，逐项处理必须在当前脚本内部循环完成；不得只取首项、join 压扁、只返回单个结果、放宽 guard 或让下游猜测补齐。",
         "- role 只是实现提示；不得覆盖或缩小 purpose 短合同。",
         "",
         "A. 输出形态:",

@@ -24,8 +24,10 @@ async def _extract_requirement_graph_with_validator(
             "content": (
                 "你是 Creator responsibility graph patcher，只输出严格 JSON object。\n"
                 "后端已经根据 file_plan/contracts 生成 deterministic responsibility graph；你只能返回 compact patches。\n"
-                "patch 只能补充 must_do、must_not_do、depends_on；不得输出 constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
-                "返回格式：{\"patches\":[{\"target_file\":...,\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
+                "patch 只能补充或修正 purpose、must_do、must_not_do、depends_on；不得输出 constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
+                "purpose 必须是简短语义短合同，不复制蓝图长文，格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+                "must_do 只补关键职责缺口，保持短句、少量条目。\n"
+                "返回格式：{\"patches\":[{\"target_file\":...,\"purpose\":\"...\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
             ),
         },
         {
@@ -49,7 +51,7 @@ async def _extract_requirement_graph_with_validator(
         if not isinstance(patches, list):
             raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
         by_file = {item.target_file: item for item in graph.requirements}
-        allowed = {"target_file", "must_do", "must_not_do", "depends_on"}
+        allowed = {"target_file", "purpose", "must_do", "must_not_do", "depends_on"}
         for idx, patch in enumerate(patches):
             if not isinstance(patch, dict):
                 raise RequirementGraphValidationError("Responsibility graph patch item must be object.", code="validator_incomplete", details={"index": idx})
@@ -59,6 +61,9 @@ async def _extract_requirement_graph_with_validator(
             item = by_file.get(target)
             if not item:
                 continue
+            purpose = str(patch.get("purpose") or "").strip()
+            if purpose:
+                item.purpose = purpose
             for field_name in ("must_do", "must_not_do", "depends_on"):
                 values = RequirementItem._coerce_string_list(patch.get(field_name))
                 if values:
@@ -68,6 +73,15 @@ async def _extract_requirement_graph_with_validator(
                             existing.append(value)
                     setattr(item, field_name, existing)
         graph.requirement_graph_source = "deterministic+patch"
+        purpose_by_file = {
+            item.target_file: item.purpose
+            for item in graph.requirements
+            if item.target_file and str(item.purpose or "").strip()
+        }
+        for file_spec in files_out:
+            patched_purpose = purpose_by_file.get(file_spec.path)
+            if patched_purpose:
+                file_spec.purpose = patched_purpose
         return graph
     except Exception as exc:
         if warnings is not None:
@@ -97,6 +111,72 @@ def _load_persisted_requirement_graph(skill_name: str) -> RequirementGraph | Non
     if not path.is_file():
         return None
     return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
+
+def _looks_like_semantic_short_contract(text: str) -> bool:
+    value = str(text or "")
+    return all(marker in value for marker in ("来源：", "动作：", "交付：", "约束：", "说明："))
+
+async def _normalize_script_purpose_short_contracts(
+    *,
+    blueprint_text: str,
+    files_out: list[FileSpecOut],
+    requested_model: str | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> None:
+    targets = [
+        file_spec
+        for file_spec in files_out
+        if file_spec.path.startswith("scripts/") and file_spec.required and not _looks_like_semantic_short_contract(file_spec.purpose)
+    ]
+    if not targets:
+        return
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator script purpose short-contract normalization")
+    messages = [
+        {"role": "system", "content": (
+            "你是 Creator 脚本职责短合同压缩器，只输出严格 JSON object。\n"
+            "为每个 required script 生成简短 purpose；不要新增结构字段，不复制蓝图长文。\n"
+            "格式必须是：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+            "来源/动作/交付/约束要来自蓝图语义；inputs/outputs 只是接口提示。"
+        )},
+        {"role": "user", "content": (
+            "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
+            "scripts:\n" + json.dumps([
+                {
+                    "path": item.path,
+                    "purpose": item.purpose,
+                    "role": item.role,
+                    "inputs": item.inputs,
+                    "outputs": item.outputs,
+                    "dependencies": item.dependencies,
+                }
+                for item in targets
+            ], ensure_ascii=False, default=str)[:16000] + "\n\n"
+            "返回：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\"}]}"
+        )},
+    ]
+    try:
+        data = _parse_validator_json_object(await complete_chat_once(messages, route.model))
+        patches = data.get("patches") if isinstance(data, dict) else None
+        if not isinstance(patches, list):
+            raise ValueError("missing patches list")
+        by_path = {item.path: item for item in targets}
+        for patch in patches:
+            if not isinstance(patch, dict):
+                continue
+            target = str(patch.get("target_file") or "").strip()
+            purpose = str(patch.get("purpose") or "").strip()
+            if target in by_path and _looks_like_semantic_short_contract(purpose):
+                by_path[target].purpose = purpose
+    except Exception as exc:
+        if warnings is not None:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": "purpose_short_contract_failed",
+                "source": "analyze_blueprint",
+                "path": "",
+                "field": "purpose",
+                "message": f"Script purpose short-contract normalization failed; keeping parsed purposes: {exc}",
+            })
 
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
@@ -295,6 +375,12 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
+    await _normalize_script_purpose_short_contracts(
+        blueprint_text=blueprint_text,
+        files_out=files_out,
+        requested_model=request.model,
+        warnings=warnings,
+    )
     fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
@@ -2200,6 +2286,10 @@ async def generate_file(request: GenerateFileRequest):
                             review_context={
                                 "phase": "RESPONSIBILITY_STAGE",
                                 "policy": "只判断当前文件职责是否完成。",
+                                "blueprint_text": request.blueprint_text,
+                                "purpose_short_contract": getattr(entry, "purpose", request.purpose),
+                                "trial_stdout": "第一轮责任审查在局部 patch 前可能尚未执行试运行；如为空，不得把缺 stdout 当接口失败。",
+                                "artifact_info": "第一轮责任审查只用 artifact 信息辅助判断语义交付；真实存在性由运行/E2E 检查。",
                             },
                         )
 

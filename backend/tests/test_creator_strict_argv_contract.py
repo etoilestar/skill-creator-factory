@@ -160,7 +160,10 @@ def _argv_details(stderr, *, inputs, rendered, allowed='ALLOWED_KEYS = {"text"}'
 def test_argv_schema_attribution_targets():
     assert _argv_details("ValueError: unknown argv keys: ['extra']", inputs=["text"], rendered={"text": "ok", "extra": "x"})["primary_target"] == "SKILL.md"
     assert _argv_details("ValueError: unknown argv keys: ['text']", inputs=["text"], rendered={"text": "ok"}, allowed='ALLOWED_KEYS = set()')["primary_target"] == "scripts/main.py"
-    assert _argv_details("ValueError: missing required argv keys: ['extra']", inputs=["text"], rendered={"text": "ok"}, required='REQUIRED_KEYS = {"text", "extra"}')["primary_target"] == "scripts/main.py"
+    missing = _argv_details("ValueError: missing required argv keys: ['extra']", inputs=["text"], rendered={"text": "ok"}, required='REQUIRED_KEYS = {"text", "extra"}')
+    assert missing["primary_target"] == "SKILL.md"
+    assert missing["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
+    assert "不得降低功能覆盖面" in missing["target_reason"]
     uncertain = _argv_details("ValueError: unknown argv schema error", inputs=[], rendered={"mystery": "ok"}, allowed='ALLOWED_KEYS = {"other"}')
     assert uncertain["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
 
@@ -172,3 +175,21 @@ def test_generation_skeleton_uses_mandatory_guard_import_call_not_inline_validat
     assert "from backend.services.runtime_tools import strict_json_argv_guard" in skeleton
     assert "strict_json_argv_guard(payload" in skeleton
     assert "def validate_payload" not in skeleton
+
+
+def test_argv_schema_repair_instruction_treats_guard_as_probe():
+    instruction = e2e._argv_schema_repair_instruction(
+        "scripts/main.py",
+        {"primary_target": "scripts/main.py", "candidate_targets": ["SKILL.md", "scripts/main.py"], "target_reason": "x"},
+    )
+    assert "strict_json_argv_guard 是接口不对齐探针" in instruction
+    assert "禁止只改 guard schema" in instruction
+    assert "不要只修 guard" in instruction
+    assert "只修当前脚本 mandatory argv guard import/call 或 guard spec" not in instruction
+
+
+def test_e2e_script_target_rule_contains_coverage_guardrail():
+    source = e2e._repair_existing_file_for_e2e_failure.__code__.co_consts
+    joined = "\n".join(str(item) for item in source if isinstance(item, str))
+    assert "strict_json_argv_guard 是接口不对齐探针" in joined
+    assert "不能通过删除参数降低功能覆盖面" in joined

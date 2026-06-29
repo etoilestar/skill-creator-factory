@@ -1421,12 +1421,12 @@ def _classify_argv_schema_failure(
         else:
             target_reason = "Unable to determine whether SKILL.md over-sent argv keys or the script schema under-declared semantic parameters."
     elif kind == "missing_required":
-        if failed_keys and semantic_set and all(key not in semantic_set for key in failed_keys):
-            primary_target = command.script_path
-            target_reason = "Script required schema declares keys that are not semantic inputs for this step."
-        elif failed_keys and all(key not in rendered_payload for key in failed_keys):
+        if failed_keys and all(key not in rendered_payload for key in failed_keys):
             primary_target = "SKILL.md"
-            target_reason = "SKILL.md command did not render keys required by the script schema."
+            target_reason = (
+                "Missing required argv key is absent from the rendered SKILL.md command payload. "
+                "This indicates block call 与 script interface/core logic 的不对齐；repair 应对齐调用和实际执行，不得降低功能覆盖面。"
+            )
         else:
             target_reason = "Unable to determine whether SKILL.md omitted a required semantic input or the script required schema is too broad."
     elif kind == "invalid_type":
@@ -1442,6 +1442,7 @@ def _classify_argv_schema_failure(
     if not primary_target:
         primary_target = command.script_path
     uncertain = "Unable to determine" in target_reason
+    cross_alignment_probe = kind == "missing_required" and primary_target == "SKILL.md"
     return {
         "argv_schema_error_kind": kind,
         "received_keys": received_keys,
@@ -1454,7 +1455,7 @@ def _classify_argv_schema_failure(
         "skill_plan_inputs": semantic_inputs,
         "failed_keys": failed_keys,
         "primary_target": primary_target,
-        "candidate_targets": ["SKILL.md", command.script_path] if uncertain else [primary_target],
+        "candidate_targets": ["SKILL.md", command.script_path] if (uncertain or cross_alignment_probe) else [primary_target],
         "target_reason": target_reason,
         "rendered_payload_shape": {str(key): _argv_value_shape(value) for key, value in (rendered_payload or {}).items()},
         "previous_trace_summary": [],
@@ -1467,14 +1468,17 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     target_reason = str(details.get("target_reason") or "")
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
-        f"candidate_targets={candidate_targets}。必须对照 rendered_payload、command argv template、脚本入口校验分支/局部 schema、SkillPlan.inputs 和 previous traces 决定最小修复；不强制固定字段常量名；"
-        "禁止删除可能正确的语义参数来让脚本通过；required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
+        f"candidate_targets={candidate_targets}。strict_json_argv_guard 是接口不对齐探针，不是默认修复目标；"
+        "禁止只改 guard schema 或只 patch guard spec。必须综合对齐 SKILL.md 当前失败 step 的 bash command JSON argv、"
+        "script 入口解析/strict_json_argv_guard、script 核心 run/main 业务逻辑；"
+        "不能通过删除参数、删除业务参数或删除功能分支降低功能覆盖面；不强制固定字段常量名；"
+        "required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修 SKILL.md command JSON，传齐脚本入口校验所需参数，移除职责外 unknown keys；可选/defaulted 参数按脚本 guard spec 处理；不要把脚本合法的 optional/defaulted 逻辑改坏；不要改脚本。"
+        return common + "\nprimary_target=SKILL.md：只修当前失败 command JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，移除确属职责外的 unknown keys；不要改其它已通过步骤或脚本。"
     if primary == script_path:
-        return common + f"\nprimary_target={script_path}：只修当前脚本 mandatory argv guard import/call 或 guard spec；不要改 SKILL.md，不要改业务字段为平台词表。"
-    return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 还是当前脚本。"
+        return common + f"\nprimary_target={script_path}：修入口接口和核心逻辑的一致性，确保 parse_args/strict_json_argv_guard 与 run/main 实际使用参数对齐；不要只修 guard；不要改 SKILL.md，不要改业务字段为平台词表。"
+    return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 当前失败 command JSON argv，还是当前脚本入口接口与核心逻辑一致性。"
 
 
 def _parse_e2e_stdout_json(
@@ -2315,6 +2319,10 @@ async def _repair_existing_file_for_e2e_failure(
             "你正在修复脚本源码的 E2E 接口串接问题。\n"
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
+            "strict_json_argv_guard 是接口不对齐探针；不要只改 guard。\n"
+            "同步检查 SKILL.md command argv、脚本入口校验、核心 run/main，使三者对齐。\n"
+            "保持功能覆盖面；不能通过删除参数降低功能覆盖面，也不能删除业务参数或功能分支来绕过失败。\n"
+            "如果 command 没传核心逻辑需要的参数，不要简单删功能，要做接口对齐或合理默认。\n"
             "不要重新设计业务功能；PDF 样式、图片风格、表格样式、内容质量属于第一轮功能 smoke。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整源码。"

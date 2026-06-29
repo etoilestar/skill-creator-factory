@@ -465,6 +465,14 @@ def _render_e2e_command_payload(
     if missing:
         unique_missing = sorted(set(missing))
         available = sorted(payload.keys())
+        logger.info("[Creator][E2E][interface_repair_risk] %s", json.dumps({
+            "event": "e2e_interface_repair_risk",
+            "script_path": command.script_path,
+            "ordinal": command.ordinal,
+            "missing_placeholders": unique_missing,
+            "available_keys": available,
+            "source_path": command.source_path,
+        }, ensure_ascii=False, default=str))
 
         raise ValueError(
             _e2e_error(
@@ -2024,6 +2032,12 @@ def _run_skill_workflow_e2e_once(
                     )
 
                 context_before = dict(payload)
+                logger.info("[Creator][E2E][stdout_key_sources] %s", json.dumps({
+                    "event": "e2e_stdout_key_sources",
+                    "script_path": command.script_path,
+                    "ordinal": command.ordinal,
+                    "stdout_keys": sorted(str(key) for key in stdout_json.keys()),
+                }, ensure_ascii=False, default=str))
                 payload.update(stdout_json)
 
                 if artifact_paths:

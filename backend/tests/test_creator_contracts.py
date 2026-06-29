@@ -236,39 +236,52 @@ def test_partial_tool_schema_becomes_available_tool_candidate():
     finally:
         clear_registered_tool_capabilities()
 
-from backend.services.creator.contracts import detect_markdown_hard_format_failures, _command_signature
+from backend.services.creator.contracts import detect_markdown_hard_format_failures, _command_signature, split_markdown_regions, merge_markdown_regions, markdown_failure_region
 
 
-def test_hard_format_skill_missing_frontmatter_full_rewrite():
+def test_hard_format_skill_missing_frontmatter_region_rewrite():
     failures = detect_markdown_hard_format_failures("SKILL.md", "# Body\n", True)
     assert failures
     assert failures[0]["severity"] == "hard_format"
-    assert failures[0]["repair_strategy"] == "full_rewrite"
-    assert failures[0]["model_patch_allowed"] is False
+    assert failures[0]["details"]["region"] == "metadata_region"
     assert any(f["id"] == "markdown.frontmatter.missing" for f in failures)
 
 
-def test_hard_format_frontmatter_unclosed_full_rewrite():
+def test_hard_format_frontmatter_unclosed_region_rewrite():
     failures = detect_markdown_hard_format_failures("SKILL.md", "---\nname: x\ndescription: y\n# swallowed\n", True)
     assert any(f["id"] == "markdown.frontmatter.unclosed" for f in failures)
 
 
-def test_hard_format_fenced_block_unclosed_full_rewrite():
+def test_hard_format_fenced_block_unclosed_region_rewrite():
     content = "---\nname: x\ndescription: y\n---\n\n```bash\npython scripts/a.py '{}'\n"
     failures = detect_markdown_hard_format_failures("SKILL.md", content, True)
     assert any(f["id"] == "markdown.fences.bash_unclosed" for f in failures)
 
 
-def test_hard_format_no_body_full_rewrite():
+def test_hard_format_no_body_region_rewrite():
     failures = detect_markdown_hard_format_failures("SKILL.md", "---\nname: x\ndescription: y\n---\n", True)
     assert any(f["id"] == "markdown.body.missing" for f in failures)
+
+
+def test_markdown_region_split_and_merge_preserves_body_when_metadata_changes():
+    content = "---\nname: old\ndescription: old\n---\n\n# Body\n\n```bash\npython scripts/a.py '{} ' \n```\n"
+    regions = split_markdown_regions(content)
+    updated = merge_markdown_regions("---\nname: new\ndescription: new\n---\n", regions.body_region)
+    assert "name: new" in updated
+    assert "# Body" in updated
+    assert "```bash" in updated
+
+
+def test_markdown_failure_region_routes_metadata_and_body_failures():
+    assert markdown_failure_region({"id": "markdown.frontmatter.invalid_yaml"}) == "metadata_region"
+    assert markdown_failure_region({"id": "markdown.fences.bash_unclosed"}) == "body_region"
 
 
 def test_reference_without_frontmatter_allowed_by_hard_gate():
     assert detect_markdown_hard_format_failures("references/guide.md", "# Guide\n\nText.\n", False) == []
 
 
-def test_reference_unclosed_frontmatter_requires_full_rewrite():
+def test_reference_unclosed_frontmatter_requires_region_rewrite():
     failures = detect_markdown_hard_format_failures("references/guide.md", "---\ntitle: Guide\n# Body\n", False)
     assert any(f["id"] == "markdown.frontmatter.unclosed" for f in failures)
 
@@ -281,7 +294,7 @@ def test_closed_bash_block_bad_json_argv_is_not_hard_format():
     assert sig["arg_mode"] == "invalid_json_arg"
 
 
-def test_hard_format_entire_file_fenced_without_language_full_rewrite():
+def test_hard_format_entire_file_fenced_without_language_region_rewrite():
     failures = detect_markdown_hard_format_failures("SKILL.md", "```\n---\nname: x\ndescription: y\n---\n# Body\n```\n", True)
     assert any(f["id"] == "markdown.file.wrapped_in_code_fence" for f in failures)
 

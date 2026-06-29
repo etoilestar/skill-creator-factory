@@ -1029,6 +1029,14 @@ def _build_skill_md_finalize_full_rewrite_messages(
     ]
 
 
+def _skill_md_finalize_failure_region(failures: list[dict[str, Any]]) -> str:
+    for failure in failures:
+        region = markdown_failure_region(failure)
+        if region == "metadata_region":
+            return region
+    return "body_region"
+
+
 async def _repair_skill_md_model_finalizer(
     *,
     previous_content: str,
@@ -1169,7 +1177,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
     """Finalize SKILL.md with staged repair.
 
     阶段：
-    1. Markdown 格式错误：整文件重写，最多 3 轮；
+    1. Markdown 格式错误：metadata/body 区域重写，最多 3 轮；
     2. 合同/责任/蓝图错误：局部 diff 修复；
     3. 最终失败也返回可编辑草稿，不抛 400，避免前端文件变灰。
     """
@@ -1222,7 +1230,7 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                     "attempt": attempt,
                     "target_file": "SKILL.md",
                     "patch_status": "hard_format_failed",
-                    "format_rewrite_status": "format_full_rewrite",
+                    "format_rewrite_status": "format_region_rewrite",
                     "failures": format_failures,
                 })
 
@@ -1249,46 +1257,25 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
                         candidate = fallback
                     break
 
-                rewrite_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是 SKILL.md Markdown 格式修复器。"
-                            "你必须输出完整 SKILL.md 文件内容，不要输出 patch，不要输出 JSON，不要解释。"
-                            "本轮只修 Markdown 结构格式，不修业务语义。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Skill 名称：{skill_name}\n\n"
-                            "后台 Markdown 格式校验失败项：\n"
-                            f"{json.dumps(format_failures, ensure_ascii=False, indent=2, default=str)}\n\n"
-                            "要求：\n"
-                            "1. 输出完整 SKILL.md 文件内容。\n"
-                            "2. 不要用 ``` 包裹整个文件。\n"
-                            "3. 只修 YAML frontmatter、frontmatter 收尾 ---、fenced block 成对闭合等 Markdown 格式问题。\n"
-                            "4. 保留原有业务语义、脚本说明、资源说明、最终产物说明。\n"
-                            "5. 不要新增蓝图外能力、脚本、reference 或 asset。\n"
-                            "6. 不要声称已经执行或已经通过 E2E。\n\n"
-                            "蓝图上下文：\n"
-                            f"{(request.blueprint_text or '')[:8000]}\n\n"
-                            "当前 SKILL.md 内容：\n"
-                            "<<<CURRENT_FILE\n"
-                            f"{content}\n"
-                            "CURRENT_FILE\n"
-                        ),
-                    },
-                ]
+                failed_region = markdown_failure_region(format_failures[0])
+                rewrite_messages = _build_markdown_region_rewrite_prompt(
+                    file_path="SKILL.md",
+                    skill_name=skill_name,
+                    blueprint_text=request.blueprint_text or "",
+                    deterministic_error=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
+                    current_content=content,
+                    region=failed_region,
+                )
 
-                candidate = await _complete_creator_file_generation(
+                rewritten_region = await _complete_creator_file_generation(
                     messages=rewrite_messages,
                     model=route.model,
                     skill_name=skill_name,
                     file_path="SKILL.md",
-                    prompt_variant="format_full_rewrite",
+                    prompt_variant=f"rewrite_markdown_{failed_region}",
                     retry_index=attempt - 1,
                 )
+                candidate = _merge_markdown_region_rewrite(content, rewritten_region, failed_region)
                 rewritten_content = _sanitize_generated_file_content("SKILL.md", candidate)
                 rewritten_failures = detect_markdown_hard_format_failures(
                     "SKILL.md",
@@ -1365,26 +1352,31 @@ async def finalize_skill_md(request: FinalizeSkillMdRequest):
 
             format_rewrite_failures, patchable_failures, deferred_failures = _split_skill_md_finalize_failures(failures)
             if format_rewrite_failures:
+                failed_region = _skill_md_finalize_failure_region(format_rewrite_failures)
                 repair_events.append({
                     "attempt": attempt,
                     "target_file": "SKILL.md",
-                    "patch_status": "format_full_rewrite",
+                    "patch_status": "format_region_rewrite",
+                    "region": failed_region,
                     "failures": format_rewrite_failures,
                 })
-                rewrite_messages = _build_skill_md_finalize_full_rewrite_messages(
-                    prompt_messages=prompt_messages,
+                rewrite_messages = _build_markdown_region_rewrite_prompt(
+                    file_path="SKILL.md",
                     skill_name=skill_name,
-                    content=content,
-                    failures=format_rewrite_failures,
+                    blueprint_text=request.blueprint_text or "",
+                    deterministic_error=json.dumps(format_rewrite_failures, ensure_ascii=False, indent=2, default=str),
+                    current_content=content,
+                    region=failed_region,
                 )
-                candidate = await _complete_creator_file_generation(
+                rewritten_region = await _complete_creator_file_generation(
                     messages=rewrite_messages,
                     model=route.model,
                     skill_name=skill_name,
                     file_path="SKILL.md",
-                    prompt_variant="finalize_format_full_rewrite",
+                    prompt_variant=f"finalize_rewrite_markdown_{failed_region}",
                     retry_index=attempt - 1,
                 )
+                candidate = _merge_markdown_region_rewrite(content, rewritten_region, failed_region)
                 continue
 
             if not patchable_failures:
@@ -1716,6 +1708,116 @@ def _build_markdown_format_full_rewrite_prompt(
     ]
 
 
+def _build_markdown_region_rewrite_prompt(
+    *,
+    file_path: str,
+    skill_name: str,
+    blueprint_text: str,
+    deterministic_error: str,
+    current_content: str,
+    region: str,
+) -> list[dict[str, str]]:
+    regions = split_markdown_regions(current_content or "")
+    metadata_summary = regions.metadata_region[:1200] if regions.metadata_region else "（无 metadata_region）"
+    if region == "metadata_region":
+        system = (
+            "你是 Markdown metadata_region 格式修复器。"
+            "只输出修复后的 metadata_region；不要输出正文 body；不要解释。"
+            "metadata_region 必须是闭合、可解析的 YAML frontmatter。"
+        )
+        user = (
+            f"文件路径：{file_path}\nSkill 名称：{skill_name}\n\n"
+            "失败项：\n"
+            f"{deterministic_error}\n\n"
+            "只修 metadata_region。禁止输出 body_region，禁止修改正文语义。\n"
+            "输出必须以 --- 开始，并以单独一行 --- 闭合。\n"
+            "metadata 只描述当前文件自身，不要写其它 scripts 的 capability/runtime/tool 边界。\n\n"
+            "当前 metadata_region：\n<<<METADATA_REGION\n"
+            f"{regions.metadata_region or ''}\n"
+            "METADATA_REGION\n\n"
+            "当前 body_region 摘要（仅供理解，禁止输出）：\n<<<BODY_SUMMARY\n"
+            f"{(regions.body_region or '')[:3000]}\n"
+            "BODY_SUMMARY\n\n"
+            "蓝图上下文：\n"
+            f"{(blueprint_text or '')[:6000]}"
+        )
+    else:
+        system = (
+            "你是 Markdown body_region 格式修复器。"
+            "只输出修复后的 body_region；不要输出 YAML frontmatter；不要解释。"
+            "body_region 可包含普通 Markdown、bash/json/code fence，但 fence 必须闭合。"
+        )
+        user = (
+            f"文件路径：{file_path}\nSkill 名称：{skill_name}\n\n"
+            "失败项：\n"
+            f"{deterministic_error}\n\n"
+            "只修 body_region。禁止重新生成 metadata/frontmatter，禁止输出文件开头 ---。\n"
+            "如果 command/bash block 格式错误，只修正文中的 block。"
+            "reference 正文不得重新定义 scripts/*.py 的 capability/runtime/tool 边界。\n\n"
+            "已校验 metadata_region 摘要（只供遵循，禁止输出）：\n<<<METADATA_REGION\n"
+            f"{metadata_summary}\n"
+            "METADATA_REGION\n\n"
+            "当前 body_region：\n<<<BODY_REGION\n"
+            f"{regions.body_region or current_content or ''}\n"
+            "BODY_REGION\n\n"
+            "蓝图上下文：\n"
+            f"{(blueprint_text or '')[:6000]}"
+        )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _merge_markdown_region_rewrite(current_content: str, rewritten_region: str, region: str) -> str:
+    regions = split_markdown_regions(current_content or "")
+    if region == "metadata_region":
+        return merge_markdown_regions(rewritten_region, regions.body_region)
+    body = rewritten_region
+    # Guard against model accidentally returning a second frontmatter while body
+    # repair is requested; preserve already-validated metadata.
+    accidental = split_markdown_regions(body)
+    if accidental.metadata_region and accidental.metadata_closed:
+        body = accidental.body_region
+    return merge_markdown_regions(regions.metadata_region, body)
+
+
+def _build_markdown_initial_region_prompt(
+    *,
+    file_path: str,
+    skill_name: str,
+    purpose: str,
+    blueprint_text: str,
+    region: str,
+    metadata_region: str = "",
+) -> list[dict[str, str]]:
+    if region == "metadata_region":
+        return [
+            {"role": "system", "content": "你是 Markdown metadata_region 生成器。只输出闭合 YAML frontmatter。"},
+            {"role": "user", "content": (
+                f"为 {file_path} 生成 metadata_region。\n"
+                f"Skill 名称：{skill_name}\n职责：{purpose}\n\n"
+                "metadata 只描述当前文件自身；必须可解析、闭合；不要写正文长段落；"
+                "不要定义其它 scripts/*.py 的 capability/runtime/tool 边界。\n"
+                + ("SKILL.md 必须包含 name 和 description。\n" if file_path == "SKILL.md" else "")
+                + "只输出 metadata_region，不输出 body。\n\n蓝图：\n"
+                f"{(blueprint_text or '')[:8000]}"
+            )},
+        ]
+    return [
+        {"role": "system", "content": "你是 Markdown body_region 生成器。只输出正文，不输出 YAML frontmatter。"},
+        {"role": "user", "content": (
+            f"为 {file_path} 生成 body_region。\n"
+            f"Skill 名称：{skill_name}\n职责：{purpose}\n\n"
+            "已校验 metadata_region：\n<<<METADATA_REGION\n"
+            f"{metadata_region}\n"
+            "METADATA_REGION\n\n"
+            "body 可包含普通说明、工作流、bash/json/markdown code block、示例和注意事项；"
+            "所有 code fence 必须闭合。SKILL.md 的 bash command block 仍由你生成。"
+            "reference body 不要重新定义 scripts/*.py 的 capability/runtime/tool 边界。\n"
+            "只输出 body_region，不输出 frontmatter。\n\n蓝图：\n"
+            f"{(blueprint_text or '')[:8000]}"
+        )},
+    ]
+
+
 def _build_strict_script_source_only_regeneration_prompt(
     *,
     file_path: str,
@@ -1872,14 +1974,60 @@ async def generate_file(request: GenerateFileRequest):
         repair_failure_signatures: dict[str, tuple[int, str]] = {}
 
         try:
-            candidate = await _complete_creator_file_generation(
-                messages=prompt_messages,
-                model=route.model,
-                skill_name=skill_name,
-                file_path=request.file_path,
-                prompt_variant=prompt_variant,
-                retry_index=0,
-            )
+            if request.file_path == "SKILL.md" or request.file_path.startswith("references/") or Path(request.file_path).suffix.lower() in {".md", ".markdown"}:
+                metadata_region = await _complete_creator_file_generation(
+                    messages=_build_markdown_initial_region_prompt(
+                        file_path=request.file_path,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
+                        blueprint_text=request.blueprint_text,
+                        region="metadata_region",
+                    ),
+                    model=route.model,
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    prompt_variant="generate_markdown_metadata_region",
+                    retry_index=0,
+                )
+                metadata_failures = [
+                    failure for failure in detect_markdown_hard_format_failures(
+                        request.file_path,
+                        merge_markdown_regions(metadata_region, "# temporary body\n"),
+                        require_frontmatter=(request.file_path == "SKILL.md"),
+                    )
+                    if markdown_failure_region(failure) == "metadata_region"
+                ]
+                if metadata_failures:
+                    raise FileGenerationStageError(
+                        source="hard_format",
+                        layer="hard_format",
+                        detail=json.dumps(metadata_failures, ensure_ascii=False, default=str),
+                    )
+                body_region = await _complete_creator_file_generation(
+                    messages=_build_markdown_initial_region_prompt(
+                        file_path=request.file_path,
+                        skill_name=skill_name,
+                        purpose=request.purpose,
+                        blueprint_text=request.blueprint_text,
+                        region="body_region",
+                        metadata_region=metadata_region,
+                    ),
+                    model=route.model,
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    prompt_variant="generate_markdown_body_region",
+                    retry_index=0,
+                )
+                candidate = merge_markdown_regions(metadata_region, body_region)
+            else:
+                candidate = await _complete_creator_file_generation(
+                    messages=prompt_messages,
+                    model=route.model,
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    prompt_variant=prompt_variant,
+                    retry_index=0,
+                )
         except Exception as exc:
             logger.exception("Creator generate_file initial model call failed: %s", exc)
             yield _file_done_error_sse(
@@ -2315,10 +2463,10 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                             role=request.role,
                             error=(
-                                f"Markdown 格式修复失败：已整文件重写 {layer_limit} 轮仍未通过。"
+                                f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
                                 f"最后错误：{deterministic_error}"
                             ),
-                            error_type="format_full_rewrite_failed",
+                            error_type="md_format_warning",
                             content=candidate or "",
                             recoverable=True,
                         )
@@ -2326,14 +2474,14 @@ async def generate_file(request: GenerateFileRequest):
 
                     yield _sse({
                         "type": "validation",
-                        "status": "format_full_rewrite",
+                        "status": "format_region_rewrite",
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
                         "editable": True,
                         "disabled": False,
                         "validation": {
-                            "status": "format_full_rewrite",
+                            "status": "format_region_rewrite",
                             "attempt": markdown_format_retry_count,
                             "markdown_format_retry_count": markdown_format_retry_count,
                             "business_repair_count": business_repair_count,
@@ -2343,22 +2491,25 @@ async def generate_file(request: GenerateFileRequest):
                         },
                     })
 
-                    rewrite_messages = _build_markdown_format_full_rewrite_prompt(
+                    failed_region = markdown_failure_region(deterministic_error)
+                    rewrite_messages = _build_markdown_region_rewrite_prompt(
                         file_path=request.file_path,
                         skill_name=skill_name,
                         blueprint_text=request.blueprint_text,
                         deterministic_error=deterministic_error,
                         current_content=candidate or "",
+                        region=failed_region,
                     )
 
-                    candidate = await _complete_creator_file_generation(
+                    rewritten_region = await _complete_creator_file_generation(
                         messages=rewrite_messages,
                         model=route.model,
                         skill_name=skill_name,
                         file_path=request.file_path,
-                        prompt_variant="format_full_rewrite",
+                        prompt_variant=f"rewrite_markdown_{failed_region}",
                         retry_index=markdown_format_retry_count - 1,
                     )
+                    candidate = _merge_markdown_region_rewrite(candidate or "", rewritten_region, failed_region)
                     continue
                 layer_limit = _first_round_repair_limit(error_source)
                 if repair_counts_by_layer[error_layer] > layer_limit:
@@ -2541,24 +2692,24 @@ async def generate_file(request: GenerateFileRequest):
                                 file_path=request.file_path,
                                 role=request.role,
                                 error=(
-                                    f"Markdown 格式修复失败：已整文件重写 {layer_limit} 轮仍未通过。"
+                                    f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
                                     f"最后错误：{deterministic_error}"
                                 ),
-                                error_type="format_full_rewrite_failed",
+                                error_type="md_format_warning",
                                 content=candidate or "",
                                 recoverable=True,
                             )
                             return
                         yield _sse({
                             "type": "validation",
-                            "status": "format_full_rewrite",
+                            "status": "format_region_rewrite",
                             "success": False,
                             "file_path": request.file_path,
                             "role": request.role,
                             "editable": True,
                             "disabled": False,
                             "validation": {
-                                "status": "format_full_rewrite",
+                                "status": "format_region_rewrite",
                                 "attempt": markdown_format_retry_count,
                                 "markdown_format_retry_count": markdown_format_retry_count,
                                 "business_repair_count": business_repair_count,
@@ -2567,21 +2718,24 @@ async def generate_file(request: GenerateFileRequest):
                                 "error": deterministic_error,
                             },
                         })
-                        rewrite_messages = _build_markdown_format_full_rewrite_prompt(
+                        failed_region = markdown_failure_region(deterministic_error)
+                        rewrite_messages = _build_markdown_region_rewrite_prompt(
                             file_path=request.file_path,
                             skill_name=skill_name,
                             blueprint_text=request.blueprint_text,
                             deterministic_error=deterministic_error,
                             current_content=candidate or "",
+                            region=failed_region,
                         )
-                        candidate = await _complete_creator_file_generation(
+                        rewritten_region = await _complete_creator_file_generation(
                             messages=rewrite_messages,
                             model=route.model,
                             skill_name=skill_name,
                             file_path=request.file_path,
-                            prompt_variant="format_full_rewrite",
+                            prompt_variant=f"rewrite_markdown_{failed_region}",
                             retry_index=markdown_format_retry_count - 1,
                         )
+                        candidate = _merge_markdown_region_rewrite(candidate or "", rewritten_region, failed_region)
                         continue
                     logger.exception(
                         "[Creator][generate_file][repair_failed] file=%s source=%s layer=%s attempt=%d",

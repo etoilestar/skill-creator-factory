@@ -32,6 +32,48 @@ class CreatorValidatorReviewError(ValueError):
         self.raw_excerpt = str(raw_excerpt or "")[:1000]
 
 
+@dataclass(frozen=True)
+class MarkdownRegions:
+    """Two independently repairable regions for generated Markdown files."""
+
+    metadata_region: str
+    body_region: str
+    metadata_closed: bool
+
+
+def split_markdown_regions(content: str) -> MarkdownRegions:
+    """Split Markdown into metadata/frontmatter and body without mutating text."""
+    text = (content or "").lstrip("\ufeff")
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return MarkdownRegions("", text, False)
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            return MarkdownRegions("".join(lines[: idx + 1]), "".join(lines[idx + 1:]), True)
+    return MarkdownRegions(text, "", False)
+
+
+def merge_markdown_regions(metadata_region: str, body_region: str) -> str:
+    metadata = (metadata_region or "").rstrip() + "\n"
+    body = (body_region or "").lstrip("\n")
+    return metadata + ("\n" if body else "") + body
+
+
+def markdown_failure_region(failure: Mapping[str, Any] | str) -> str:
+    """Map a Markdown failure to the region that must be repaired."""
+    failure_id = ""
+    text = ""
+    if isinstance(failure, Mapping):
+        failure_id = str(failure.get("id") or failure.get("check_id") or "")
+        text = json.dumps(failure, ensure_ascii=False, default=str)
+    else:
+        text = str(failure or "")
+    combined = f"{failure_id}\n{text}".lower()
+    if "frontmatter" in combined or "metadata" in combined:
+        return "metadata_region"
+    return "body_region"
+
+
 def _infer_script_input_keys_from_blueprint(script_path: str, blueprint_text: str) -> list[str]:
     """Compatibility shim: Creator no longer guesses business argv keys.
 
@@ -4356,9 +4398,9 @@ def _hard_format_failure(
 def detect_markdown_hard_format_failures(file_path: str, content: str, require_frontmatter: bool) -> list[dict[str, Any]]:
     """Deterministic hard Markdown format gate.
 
-    This gate owns global Markdown structure decisions.  Any failure returned
-    here requires full-file rewrite and is forbidden from localized patch
-    repair.
+    This gate owns global Markdown structure decisions.  Failures are tagged
+    with metadata_region/body_region so repair can rewrite only the failing
+    region instead of the whole Markdown file.
     """
     raw = content or ""
     text = raw.lstrip("\ufeff")
@@ -4371,7 +4413,7 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
             file_path=file_path,
             message=f"{file_path} 内容为空。",
             expected="Markdown 文件必须包含合法 frontmatter（如需要）和非空正文。",
-            minimal_edit="整文件重写为完整 Markdown 文件。",
+            minimal_edit="重写 metadata_region 和 body_region 后合并为完整 Markdown 文件。",
         )]
 
     if re.fullmatch(r"(```|~~~)[^\n`~]*\n[\s\S]*\n\1\s*", stripped, flags=re.I):
@@ -4380,7 +4422,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
             file_path=file_path,
             message=f"{file_path} 被整体包裹在 ```markdown/```text fenced block 中。",
             expected="文件内容本身必须是 Markdown，不得整体再套一层 fenced block。",
-            minimal_edit="整文件重写，移除最外层 fenced block。",
+            minimal_edit="重写 body_region，移除最外层 fenced block。",
+            details={"region": "body_region"},
         ))
 
     lines = text.splitlines(keepends=True)
@@ -4399,7 +4442,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
             file_path=file_path,
             message=f"{file_path} 缺少 YAML frontmatter。",
             expected="文件必须以单独一行 --- 开始，并在正文前用单独一行 --- 闭合。",
-            minimal_edit="整文件重写，补齐合法 frontmatter 和正文。",
+            minimal_edit="只重写 metadata_region，补齐合法 frontmatter。",
+            details={"region": "metadata_region"},
         ))
 
     if had_frontmatter:
@@ -4413,7 +4457,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                 file_path=file_path,
                 message=f"{file_path} frontmatter 开始/结束 --- 不成对。",
                 expected="YAML frontmatter 必须用单独一行 --- 闭合。",
-                minimal_edit="整文件重写，确保 frontmatter 边界明确闭合。",
+                minimal_edit="只重写 metadata_region，确保 frontmatter 边界明确闭合。",
+                details={"region": "metadata_region"},
             ))
         else:
             raw_yaml = "".join(lines[1:close_idx])
@@ -4425,7 +4470,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                         file_path=file_path,
                         message=f"{file_path} frontmatter 必须是 YAML object。",
                         expected="frontmatter 顶层必须是 key/value object。",
-                        minimal_edit="整文件重写，修正 frontmatter object。",
+                        minimal_edit="只重写 metadata_region，修正 frontmatter object。",
+                        details={"region": "metadata_region"},
                     ))
                 else:
                     parsed_frontmatter = parsed
@@ -4435,7 +4481,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                     file_path=file_path,
                     message=f"{file_path} frontmatter YAML 无法解析：{type(exc).__name__}: {exc}",
                     expected="frontmatter 必须是合法 YAML。",
-                    minimal_edit="整文件重写，修正 YAML 并保留正文。",
+                    minimal_edit="只重写 metadata_region，修正 YAML 并保留正文。",
+                    details={"region": "metadata_region"},
                 ))
 
             if parsed_frontmatter is not None:
@@ -4446,8 +4493,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                         file_path=file_path,
                         message=f"{file_path} frontmatter 顶层字段非法：{', '.join(illegal)}。",
                         expected=f"frontmatter 顶层字段只允许：{', '.join(sorted(frontmatter_allowed))}。",
-                        minimal_edit="整文件重写，移除非法顶层字段。",
-                        details={"illegal_fields": illegal},
+                        minimal_edit="只重写 metadata_region，移除非法顶层字段。",
+                        details={"illegal_fields": illegal, "region": "metadata_region"},
                     ))
                 if file_path == "SKILL.md":
                     missing = [key for key in ("name", "description") if not str(parsed_frontmatter.get(key) or "").strip()]
@@ -4457,8 +4504,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                             file_path=file_path,
                             message=f"SKILL.md frontmatter 缺少必填字段：{', '.join(missing)}。",
                             expected="SKILL.md frontmatter 必须包含非空 name 和 description。",
-                            minimal_edit="整文件重写，补齐 name/description。",
-                            details={"missing_fields": missing},
+                            minimal_edit="只重写 metadata_region，补齐 name/description。",
+                            details={"missing_fields": missing, "region": "metadata_region"},
                         ))
                 body = "".join(lines[close_idx + 1:])
                 if require_frontmatter and not body.strip():
@@ -4467,7 +4514,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
                         file_path=file_path,
                         message=f"{file_path} frontmatter 后缺少非空正文。",
                         expected="frontmatter 闭合后必须有 Markdown 正文。",
-                        minimal_edit="整文件重写，在 frontmatter 后补齐正文。",
+                        minimal_edit="只重写 body_region，在 frontmatter 后补齐正文。",
+                        details={"region": "body_region"},
                     ))
 
     fence_stack: list[tuple[str, str, int]] = []
@@ -4490,8 +4538,8 @@ def detect_markdown_hard_format_failures(file_path: str, content: str, require_f
             file_path=file_path,
             message=f"{file_path} 存在未闭合的 {'bash ' if first_unclosed[1] in {'bash', 'sh', 'shell'} else ''}fenced code block。",
             expected="所有 fenced code block 必须成对闭合；bash block 未闭合属于 hard_format。",
-            minimal_edit="整文件重写，确保 fenced block 开闭结构正确。",
-            details={"line": first_unclosed[2], "info": first_unclosed[1]},
+            minimal_edit="只重写 body_region，确保 fenced block 开闭结构正确。",
+            details={"line": first_unclosed[2], "info": first_unclosed[1], "region": "body_region"},
         ))
 
     return failures

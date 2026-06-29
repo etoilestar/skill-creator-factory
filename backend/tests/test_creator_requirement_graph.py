@@ -720,7 +720,7 @@ async def test_finalize_skill_md_command_failures_trigger_full_rewrite_not_patch
     assert result["validation_status"] == "needs_repair"
     assert result["editable"] is True
     assert len(generation_calls) > 1
-    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
+    assert result["repair_events"][0]["patch_status"] == "format_region_rewrite"
 
 
 @pytest.mark.asyncio
@@ -866,7 +866,7 @@ async def test_finalize_skill_md_command_failure_precedes_reference_patch(monkey
 
     assert len(generation_calls) == 2
     assert repair_calls
-    assert result["repair_events"][0]["patch_status"] == "format_full_rewrite"
+    assert result["repair_events"][0]["patch_status"] == "format_region_rewrite"
     assert "command shape failed" not in repair_calls[0]["validation_error"]
     assert result["validation_status"] == "passed"
 

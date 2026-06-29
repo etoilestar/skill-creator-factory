@@ -484,6 +484,8 @@ def _render_e2e_command_payload(
                     + f"第 {command.ordinal} 步 {command.script_path} 的命令模板引用了当前 payload 中不存在的字段："
                     f"{', '.join(unique_missing)}。\n"
                     f"当前可用字段：{', '.join(available) or '(无)'}。\n"
+                    "当前可用字段来源：\n"
+                    f"{chr(10).join(source_lines) if source_lines else '(仅外部输入或无前序 stdout 来源记录)'}\n"
                     f"命令来源：{command.source_path}\n"
                     f"原始命令：{command.raw_command}\n\n"
                     "已成功执行的前序边界 trace：\n"

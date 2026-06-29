@@ -1,7 +1,7 @@
 """Skill/file contract and blueprint validation helpers."""
 
 from .common import *  # noqa: F403
-
+from typing import Any, Iterable, Mapping
 
 @dataclass(frozen=True)
 class ContractCheckResult:

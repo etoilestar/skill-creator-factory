@@ -2302,6 +2302,9 @@ async def _repair_existing_file_for_e2e_failure(
             "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
             "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
             "不要重写 SKILL.md 正文。\n"
+            "当前 Markdown 格式已经通过；不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行。\n"
+            "只修改失败命令那一行；old_lines 必须包含完整、真实、当前文件中的命令行。\n"
+            "不要把 ```bash 和 ``` 纳入 old_lines，除非同时完整包含闭合 fence。\n"
             "不要修改 frontmatter 边界；不要修改 fenced block 开闭结构。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
@@ -2353,6 +2356,7 @@ async def _repair_existing_file_for_e2e_failure(
     last_failure = ""
     max_candidate_attempts = 10
     working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
+    consecutive_format_regressions = 0
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
@@ -2586,8 +2590,24 @@ async def _repair_existing_file_for_e2e_failure(
 
         except Exception as candidate_exc:
             error_text = str(candidate_exc)
+            is_format_regression_rejection = (
+                target_path == "SKILL.md"
+                and (
+                    "hard_format_regression" in error_text
+                    or "PATCH_CANDIDATE_FORMAT_REGRESSED" in error_text
+                    or "markdown.fences.unclosed" in error_text
+                    or "markdown.fences.bash_unclosed" in error_text
+                    or "markdown.frontmatter.unclosed" in error_text
+                )
+            )
+            if is_format_regression_rejection:
+                consecutive_format_regressions += 1
+            else:
+                consecutive_format_regressions = 0
             if "proposal_noop" in error_text or "no-op" in error_text:
                 patch_status = "noop"
+            elif is_format_regression_rejection:
+                patch_status = "hard_format_regression_rejected"
             elif "FORMAT_VIOLATION" in error_text or "JSON" in error_text or "parse" in error_text:
                 patch_status = "parse_failed"
             else:
@@ -2615,9 +2635,28 @@ async def _repair_existing_file_for_e2e_failure(
                 f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
                 f"error_type={type(candidate_exc).__name__}\n"
                 f"error={candidate_exc}\n"
-                "请继续输出新的 exact_replace patch。"
+                + (
+                    "\n原始 Markdown 格式已经通过；候选 patch 造成格式回归并已拒绝。"
+                    "继续只修 E2E 内容问题：不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行；"
+                    "只修改失败命令那一行；old_lines 必须包含当前文件中的完整真实命令行。"
+                    if is_format_regression_rejection
+                    else "\n请继续输出新的 exact_replace patch。"
+                )
             )
             repair_feedback = deterministic_error + "\n\n" + last_failure
+
+            if consecutive_format_regressions >= 2:
+                if repair_events is not None:
+                    repair_events.extend(e2e_session.events)
+                return {
+                    "status": "still_failed_same_target",
+                    "repaired_target": target_path,
+                    "next_target": None,
+                    "next_failure": repair_feedback.split("\n\n")[:8],
+                    "last_failure": last_failure[:12000],
+                    "attempt": candidate_attempt,
+                    "error_type": "e2e_content_repair_warning",
+                }
 
             logger.warning(
                 "[Creator][E2E][repair_candidate_failed] skill=%s file=%s attempt=%d/%d error=%s",

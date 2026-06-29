@@ -2566,7 +2566,11 @@ async def generate_file(request: GenerateFileRequest):
                             f"文件内容生成失败：同一阶段/层 {error_layer} "
                             f"已修复 {layer_limit} 次仍未通过。最后错误：{deterministic_error}"
                         ),
-                        error_type="repair_layer_limit_exceeded",
+                        error_type=(
+                            _markdown_warning_error_type(request.file_path, default="md_content_repair_warning")
+                            if request.file_path == "SKILL.md" or request.file_path.startswith("references/") or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                            else "repair_layer_limit_exceeded"
+                        ),
                         content=candidate or "",
                         recoverable=True,
                     )
@@ -3153,7 +3157,26 @@ async def validate_skill(request: SkillActionRequest):
                 repair_logs.append(
                     f"第 {attempt} 轮：{repaired_target} 仍报同目标错误，未完成修复"
                 )
-                raise ValueError(repair_result.get("last_failure") or "still_failed_same_target")
+                return SkillActionResponse(
+                    success=False,
+                    path=None,
+                    message=(
+                        "严格端到端工作流校验失败，且内容补丁修复未完成；文件保持可编辑草稿：\n"
+                        + "\n\n".join(e2e_errors)
+                        + f"\n\n自动修复目标：{target_path}"
+                        + f"\n自动修复反馈：{repair_result.get('last_failure') or 'still_failed_same_target'}"
+                        + (
+                            "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
+                            if repair_logs else ""
+                        )
+                    ),
+                    repair_events=repair_events or e2e_session.events,
+                    validation_status="needs_repair",
+                    error_type="e2e_content_repair_warning",
+                    editable=True,
+                    disabled=False,
+                    recoverable=True,
+                )
             raise ValueError(json.dumps(repair_result, ensure_ascii=False, default=str))
         except Exception as exc:
             logger.exception(

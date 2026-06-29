@@ -158,6 +158,49 @@ async def test_markdown_hard_format_regression_stops_patch_retry(monkeypatch):
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_e2e_markdown_hard_format_regression_requests_content_only_retry(monkeypatch):
+    calls = 0
+    current = "---\nname: demo\ndescription: Demo\n---\n\n```bash\npython scripts/main.py '{}'\n```\n"
+    bad = _proposal(
+        target_file="SKILL.md",
+        old="```bash\npython scripts/main.py '{}'\n```",
+        new="```bash\npython scripts/main.py '{}'",
+    )
+    good = _proposal(
+        target_file="SKILL.md",
+        old="python scripts/main.py '{}'",
+        new='python scripts/main.py \'{"fixed": true}\'',
+    )
+    seen_context = []
+
+    async def fake_request(**kwargs):
+        nonlocal calls
+        calls += 1
+        seen_context.append(kwargs.get("task_context", ""))
+        return bad if calls == 1 else good
+
+    monkeypatch.setattr(repair, "_request_repair_diff_proposal", fake_request)
+
+    scope = CreatorRepairScope(phase="workflow_e2e", repair_type="cross_step_io_alignment", target_file="SKILL.md")
+    _proposal_result, candidate, stats = await _request_and_apply_repair_patch(
+        model="test-model",
+        file_path="SKILL.md",
+        current_content=current,
+        failure_text="E2E command_json_parse failed",
+        scope=scope,
+        task_context="ctx",
+        target_rule="rule",
+        patch_retry_limit=3,
+    )
+
+    assert calls == 2
+    assert "fixed" in candidate
+    assert stats["repair_patch_attempt"] == 2
+    assert "PATCH_CANDIDATE_FORMAT_REGRESSED" in seen_context[-1]
+    assert "不要新增/删除 ``` 行" in seen_context[-1]
+
+
 def test_old_lines_new_lines_patch_parses_to_exact_replace():
     proposal = _extract_json_or_diff_proposal(
         '{"target_file":"SKILL.md","edits":[{"old_lines":["alpha","beta"],"new_lines":["alpha","BETA"]}]}',

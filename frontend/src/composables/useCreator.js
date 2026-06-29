@@ -133,7 +133,16 @@ export async function* generateFileStream({
       try {
         const parsed = JSON.parse(raw)
         if (parsed.error) {
-          yield { error: parsed.error }
+          yield {
+            error: parsed.error,
+            errorType: parsed.error_type,
+            editable: parsed.editable,
+            disabled: parsed.disabled,
+            recoverable: parsed.recoverable,
+            content: parsed.content || parsed.draft_content || '',
+            validationStatus: parsed.validation_status || parsed.status,
+            raw: parsed,
+          }
           return
         }
         if (parsed.done) {

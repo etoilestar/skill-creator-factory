@@ -12,28 +12,20 @@ async def _extract_requirement_graph_with_validator(
     blueprint_text: str,
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
-    """Use the validator model as the primary path for fine-grained requirements.
-
-    The deterministic graph remains a fallback/retry scaffold; backend schema
-    validation remains the authority and never routes failures into business-file
-    repair.
-    """
-    fallback_graph = build_default_requirement_graph(files_out)
-    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator requirement graph extraction")
-    file_payload = [file_spec.model_dump(mode="json") for file_spec in files_out]
+    """Build deterministic responsibility graph and optionally apply compact model patches."""
+    graph = validate_requirement_graph_schema(build_default_requirement_graph(files_out), files_out)
+    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator responsibility graph patch")
+    file_payload = [file_spec.model_dump(mode="json", exclude={"requirements"}) for file_spec in files_out]
     messages = [
         {
             "role": "system",
             "content": (
-                "你是 Creator requirement graph 提取器，只输出严格 JSON object。\n"
-                "从 blueprint、file_plan、runtime_contract、artifact_contract、required_capabilities、implementation_strategy 中提取细粒度 requirements。\n"
-                "不要硬编码任何具体 Skill、脚本名、字段名、变量名或业务词表；semantic_inputs/semantic_outputs 是语义，不是字段名 hard gate。\n"
-                "kind 只能使用通用类别：component, layout_style, media_property, quantity, naming, format, transformation, io, artifact, tool_use。\n"
-                "constraints 必须优先输出结构化对象：name, kind, value, comparator, unit, source, required, evidence_policy。\n"
-                "主观质量词只能作为 non_requirements 或 advisory，不得 required blocking。\n"
-                "每个有实质职责的 scripts/** 文件必须至少有一个 required=true requirement。\n"
-                "返回：{\"requirements\": [{\"id\":..., \"target_file\":..., \"owner_step\":..., \"kind\":..., \"required\": true|false, \"source\":..., \"description\":..., \"semantic_inputs\": [], \"semantic_outputs\": [], \"required_components\": [], \"constraints\": [], \"evidence_policy\": {}, \"non_requirements\": []}]}"
+                "你是 Creator responsibility graph patcher，只输出严格 JSON object。\n"
+                "后端已经根据 file_plan/contracts 生成 deterministic responsibility graph；你只能返回 compact patches。\n"
+                "patch 只能补充 must_do、must_not_do、depends_on；不得输出 constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
+                "返回格式：{\"patches\":[{\"target_file\":...,\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
             ),
         },
         {
@@ -41,22 +33,54 @@ async def _extract_requirement_graph_with_validator(
             "content": (
                 "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
                 "file_plan_and_contracts:\n" + json.dumps(file_payload, ensure_ascii=False, default=str)[:20000] + "\n\n"
-                "fallback_requirement_graph_for_reference_only:\n" + fallback_graph.model_dump_json()[:12000]
+                "deterministic_responsibility_graph:\n" + graph.model_dump_json()[:12000]
             ),
         },
     ]
     try:
         text = await complete_chat_once(messages, route.model)
-        graph = normalize_requirement_graph(parse_requirement_graph_result(text))
-        return validate_requirement_graph_schema(graph, files_out)
-    except RequirementGraphValidationError:
-        raise
+        data = parse_requirement_graph_result(text)
+        if warnings is None and isinstance(data, dict) and "patches" not in data and "requirements" in data:
+            legacy_graph = normalize_requirement_graph(data)
+            legacy_graph.requirement_graph_source = "validator"
+            legacy_graph.requirement_graph_quality = "full"
+            return validate_requirement_graph_schema(legacy_graph, files_out)
+        patches = data.get("patches", []) if isinstance(data, dict) else []
+        if not isinstance(patches, list):
+            raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
+        by_file = {item.target_file: item for item in graph.requirements}
+        allowed = {"target_file", "must_do", "must_not_do", "depends_on"}
+        for idx, patch in enumerate(patches):
+            if not isinstance(patch, dict):
+                raise RequirementGraphValidationError("Responsibility graph patch item must be object.", code="validator_incomplete", details={"index": idx})
+            if set(patch) - allowed:
+                raise RequirementGraphValidationError("Responsibility graph patch contains unsupported fields.", code="validator_incomplete", details={"index": idx, "fields": sorted(set(patch) - allowed)})
+            target = str(patch.get("target_file") or "").strip()
+            item = by_file.get(target)
+            if not item:
+                continue
+            for field_name in ("must_do", "must_not_do", "depends_on"):
+                values = RequirementItem._coerce_string_list(patch.get(field_name))
+                if values:
+                    existing = list(getattr(item, field_name))
+                    for value in values:
+                        if value not in existing:
+                            existing.append(value)
+                    setattr(item, field_name, existing)
+        graph.requirement_graph_source = "deterministic+patch"
+        return graph
     except Exception as exc:
-        raise RequirementGraphValidationError(
-            f"Requirement graph validator failed: {type(exc).__name__}: {exc}",
-            code="validator_error",
-            details={"error": str(exc)},
-        ) from exc
+        if warnings is not None:
+            code = getattr(exc, "code", "validator_error")
+            warnings.append({
+                "severity": "validator_warning",
+                "code": str(code),
+                "source": "responsibility_graph",
+                "path": "",
+                "field": "requirement_graph",
+                "message": f"Responsibility graph patch model failed; using deterministic graph: {exc}",
+            })
+        return graph
 
 
 def _persist_requirement_graph(skill_name: str, graph: RequirementGraph) -> None:
@@ -270,47 +294,24 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         )
 
+    warnings: list[dict[str, Any]] = []
     fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
             blueprint_text=blueprint_text,
             files_out=files_out,
             requested_model=request.model,
+            warnings=warnings,
         )
     except RequirementGraphValidationError as exc:
-        if exc.code == "validator_incomplete":
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": "validator_incomplete",
-                    "source": "requirement_graph",
-                    "message": str(exc),
-                    "details": exc.details,
-                    "recoverable": True,
-                    "repair_target": "validator",
-                },
-            ) from exc
-        try:
-            requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
-        except RequirementGraphValidationError as fallback_exc:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "code": fallback_exc.code,
-                    "source": "requirement_graph",
-                    "message": str(fallback_exc),
-                    "details": fallback_exc.details,
-                    "recoverable": True,
-                    "repair_target": "validator",
-                },
-            ) from fallback_exc
+        requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
         warnings.append({
             "severity": "validator_warning",
             "code": exc.code,
-            "source": "requirement_graph",
+            "source": "responsibility_graph",
             "path": str((exc.details or {}).get("path") or ""),
             "field": "requirement_graph",
-            "message": f"Requirement graph validator failed; using backend fallback graph: {exc}",
+            "message": f"Responsibility graph patch failed; using deterministic graph: {exc}",
         })
     requirements_by_file: dict[str, list[RequirementItem]] = {}
     for req in requirement_graph.requirements:
@@ -360,7 +361,6 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             "message": text,
         }
 
-    warnings = []
     seen_warning_keys: set[str] = set()
     for raw_warning in [*list(plan.warnings), *extra_path_warnings, *blueprint_contract_warnings]:
         warning = normalize_warning(raw_warning)

@@ -272,6 +272,24 @@ def test_markdown_region_split_and_merge_preserves_body_when_metadata_changes():
     assert "```bash" in updated
 
 
+def test_markdown_body_region_rewrite_preserves_metadata_non_regression():
+    from backend.services.creator import api
+
+    content = "---\nname: stable\ndescription: keep me\n---\n\n# Old\n"
+    updated = api._merge_markdown_region_rewrite(content, "# New\n\n```bash\npython scripts/a.py '{}'\n```\n", "body_region")
+    assert updated.startswith("---\nname: stable\ndescription: keep me\n---")
+    assert "# New" in updated
+
+
+def test_markdown_metadata_region_rewrite_preserves_body_non_regression():
+    from backend.services.creator import api
+
+    content = "---\nname: old\ndescription: old\n---\n\n# Body\n\nDetails.\n"
+    updated = api._merge_markdown_region_rewrite(content, "---\nname: new\ndescription: new\n---\n", "metadata_region")
+    assert "name: new" in updated
+    assert "# Body\n\nDetails." in updated
+
+
 def test_markdown_failure_region_routes_metadata_and_body_failures():
     assert markdown_failure_region({"id": "markdown.frontmatter.invalid_yaml"}) == "metadata_region"
     assert markdown_failure_region({"id": "markdown.fences.bash_unclosed"}) == "body_region"

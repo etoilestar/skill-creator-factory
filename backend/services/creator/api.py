@@ -1818,6 +1818,89 @@ def _build_markdown_initial_region_prompt(
     ]
 
 
+async def _generate_markdown_initial_regions(
+    *,
+    file_path: str,
+    skill_name: str,
+    purpose: str,
+    blueprint_text: str,
+    model: str,
+) -> str:
+    """Generate .md files as metadata/body regions with metadata rewrite retry."""
+
+    metadata_region = ""
+    metadata_failures: list[dict[str, Any]] = []
+    retry_limit = _first_round_repair_limit("hard_format")
+    for retry_index in range(0, retry_limit + 1):
+        if retry_index == 0:
+            messages = _build_markdown_initial_region_prompt(
+                file_path=file_path,
+                skill_name=skill_name,
+                purpose=purpose,
+                blueprint_text=blueprint_text,
+                region="metadata_region",
+            )
+            prompt_variant = "generate_markdown_metadata_region"
+        else:
+            messages = _build_markdown_region_rewrite_prompt(
+                file_path=file_path,
+                skill_name=skill_name,
+                blueprint_text=blueprint_text,
+                deterministic_error=json.dumps(metadata_failures, ensure_ascii=False, indent=2, default=str),
+                current_content=merge_markdown_regions(metadata_region, ""),
+                region="metadata_region",
+            )
+            prompt_variant = "rewrite_markdown_metadata_region"
+
+        metadata_region = await _complete_creator_file_generation(
+            messages=messages,
+            model=model,
+            skill_name=skill_name,
+            file_path=file_path,
+            prompt_variant=prompt_variant,
+            retry_index=retry_index,
+        )
+        metadata_failures = [
+            failure for failure in detect_markdown_hard_format_failures(
+                file_path,
+                merge_markdown_regions(metadata_region, "# temporary body\n"),
+                require_frontmatter=(file_path == "SKILL.md"),
+            )
+            if markdown_failure_region(failure) == "metadata_region"
+        ]
+        if not metadata_failures:
+            break
+    else:
+        raise FileGenerationStageError(
+            source="hard_format",
+            layer="hard_format",
+            detail=json.dumps(metadata_failures, ensure_ascii=False, default=str),
+        )
+
+    body_region = await _complete_creator_file_generation(
+        messages=_build_markdown_initial_region_prompt(
+            file_path=file_path,
+            skill_name=skill_name,
+            purpose=purpose,
+            blueprint_text=blueprint_text,
+            region="body_region",
+            metadata_region=metadata_region,
+        ),
+        model=model,
+        skill_name=skill_name,
+        file_path=file_path,
+        prompt_variant="generate_markdown_body_region",
+        retry_index=0,
+    )
+    return merge_markdown_regions(metadata_region, body_region)
+
+
+def _markdown_warning_error_type(file_path: str, default: str = "md_format_warning") -> str:
+    if file_path.startswith("references/"):
+        return "reference_content_warning"
+    return default
+
+
 def _build_strict_script_source_only_regeneration_prompt(
     *,
     file_path: str,
@@ -1975,50 +2058,13 @@ async def generate_file(request: GenerateFileRequest):
 
         try:
             if request.file_path == "SKILL.md" or request.file_path.startswith("references/") or Path(request.file_path).suffix.lower() in {".md", ".markdown"}:
-                metadata_region = await _complete_creator_file_generation(
-                    messages=_build_markdown_initial_region_prompt(
-                        file_path=request.file_path,
-                        skill_name=skill_name,
-                        purpose=request.purpose,
-                        blueprint_text=request.blueprint_text,
-                        region="metadata_region",
-                    ),
-                    model=route.model,
-                    skill_name=skill_name,
+                candidate = await _generate_markdown_initial_regions(
                     file_path=request.file_path,
-                    prompt_variant="generate_markdown_metadata_region",
-                    retry_index=0,
-                )
-                metadata_failures = [
-                    failure for failure in detect_markdown_hard_format_failures(
-                        request.file_path,
-                        merge_markdown_regions(metadata_region, "# temporary body\n"),
-                        require_frontmatter=(request.file_path == "SKILL.md"),
-                    )
-                    if markdown_failure_region(failure) == "metadata_region"
-                ]
-                if metadata_failures:
-                    raise FileGenerationStageError(
-                        source="hard_format",
-                        layer="hard_format",
-                        detail=json.dumps(metadata_failures, ensure_ascii=False, default=str),
-                    )
-                body_region = await _complete_creator_file_generation(
-                    messages=_build_markdown_initial_region_prompt(
-                        file_path=request.file_path,
-                        skill_name=skill_name,
-                        purpose=request.purpose,
-                        blueprint_text=request.blueprint_text,
-                        region="body_region",
-                        metadata_region=metadata_region,
-                    ),
-                    model=route.model,
                     skill_name=skill_name,
-                    file_path=request.file_path,
-                    prompt_variant="generate_markdown_body_region",
-                    retry_index=0,
+                    purpose=request.purpose,
+                    blueprint_text=request.blueprint_text,
+                    model=route.model,
                 )
-                candidate = merge_markdown_regions(metadata_region, body_region)
             else:
                 candidate = await _complete_creator_file_generation(
                     messages=prompt_messages,
@@ -2466,7 +2512,7 @@ async def generate_file(request: GenerateFileRequest):
                                 f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
                                 f"最后错误：{deterministic_error}"
                             ),
-                            error_type="md_format_warning",
+                            error_type=_markdown_warning_error_type(request.file_path),
                             content=candidate or "",
                             recoverable=True,
                         )
@@ -2695,7 +2741,7 @@ async def generate_file(request: GenerateFileRequest):
                                     f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
                                     f"最后错误：{deterministic_error}"
                                 ),
-                                error_type="md_format_warning",
+                                error_type=_markdown_warning_error_type(request.file_path),
                                 content=candidate or "",
                                 recoverable=True,
                             )
@@ -2748,7 +2794,11 @@ async def generate_file(request: GenerateFileRequest):
                         file_path=request.file_path,
                         role=request.role,
                         error=f"文件内容修复阶段异常：{type(repair_exc).__name__}: {repair_exc}",
-                        error_type="repair_failed",
+                        error_type=(
+                            _markdown_warning_error_type(request.file_path, default="md_format_warning")
+                            if request.file_path.startswith("references/")
+                            else "repair_failed"
+                        ),
                         content=candidate or "",
                         recoverable=True,
                     )

@@ -24,12 +24,12 @@ async def _extract_requirement_graph_with_validator(
         {
             "role": "system",
             "content": (
-                "你是 Creator responsibility graph patcher，只输出严格 JSON object。\n"
-                "后端已经根据 file_plan/contracts 生成 deterministic responsibility graph；你只能返回 compact patches。\n"
-                "patch 只能补充或修正 purpose、must_do、must_not_do、depends_on；不得输出 constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
-                "purpose 必须是简短语义短合同，不复制蓝图长文，格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
+                "你是 Creator requirement graph patcher，只输出严格 JSON object。\n"
+                "后端已经根据 file_plan/contracts 生成 deterministic requirement graph；你只能返回 compact patches。\n"
+                "patch 只能补充 must_do、must_not_do、depends_on；不得输出 purpose、constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
+                "purpose 已由 workflow_allocation 或原始文件计划确定；requirement_graph 阶段不得修改 purpose，不得重新划分脚本职责，不得改写 final inputs / final outputs。\n"
                 "must_do 只补关键职责缺口，保持短句、少量条目。\n"
-                "返回格式：{\"patches\":[{\"target_file\":...,\"purpose\":\"...\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
+                "返回格式：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
             ),
         },
         {
@@ -44,30 +44,34 @@ async def _extract_requirement_graph_with_validator(
     try:
         text = await complete_chat_once(messages, route.model)
         data = parse_requirement_graph_result(text)
-        if warnings is None and isinstance(data, dict) and "patches" not in data and "requirements" in data:
-            legacy_graph = normalize_requirement_graph(data)
-            legacy_graph.requirement_graph_source = "validator"
-            legacy_graph.requirement_graph_quality = "full"
-            return validate_requirement_graph_schema(legacy_graph, files_out)
+        if isinstance(data, dict) and "patches" not in data and "requirements" in data:
+            raise RequirementGraphValidationError(
+                "Requirement graph patch JSON must use patches format.",
+                code="validator_incomplete",
+            )
         patches = data.get("patches", []) if isinstance(data, dict) else []
         if not isinstance(patches, list):
             raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
         by_file = {item.target_file: item for item in graph.requirements}
-        allowed = {"target_file", "purpose", "must_do", "must_not_do", "depends_on"}
-        applied_purpose_targets: list[str] = []
+        allowed = {"target_file", "must_do", "must_not_do", "depends_on"}
+        ignored_purpose_targets: list[str] = []
+        requirement_targets: list[str] = []
         for idx, patch in enumerate(patches):
             if not isinstance(patch, dict):
                 raise RequirementGraphValidationError("Responsibility graph patch item must be object.", code="validator_incomplete", details={"index": idx})
-            if set(patch) - allowed:
-                raise RequirementGraphValidationError("Responsibility graph patch contains unsupported fields.", code="validator_incomplete", details={"index": idx, "fields": sorted(set(patch) - allowed)})
+            unknown_fields = set(patch) - allowed
+            if "purpose" in unknown_fields:
+                target_for_log = str(patch.get("target_file") or "").strip()
+                if target_for_log:
+                    ignored_purpose_targets.append(target_for_log)
+                unknown_fields.remove("purpose")
+            if unknown_fields:
+                raise RequirementGraphValidationError("Requirement graph patch contains unsupported fields.", code="validator_incomplete", details={"index": idx, "fields": sorted(unknown_fields)})
             target = str(patch.get("target_file") or "").strip()
             item = by_file.get(target)
             if not item:
                 continue
-            purpose = str(patch.get("purpose") or "").strip()
-            if purpose:
-                item.purpose = purpose
-                applied_purpose_targets.append(target)
+            patched_requirement = False
             for field_name in ("must_do", "must_not_do", "depends_on"):
                 values = RequirementItem._coerce_string_list(patch.get(field_name))
                 if values:
@@ -75,21 +79,16 @@ async def _extract_requirement_graph_with_validator(
                     for value in values:
                         if value not in existing:
                             existing.append(value)
+                            patched_requirement = True
                     setattr(item, field_name, existing)
+            if patched_requirement:
+                requirement_targets.append(target)
         graph.requirement_graph_source = "deterministic+patch"
-        purpose_by_file = {
-            item.target_file: item.purpose
-            for item in graph.requirements
-            if item.target_file and str(item.purpose or "").strip()
-        }
-        for file_spec in files_out:
-            patched_purpose = purpose_by_file.get(file_spec.path)
-            if patched_purpose:
-                file_spec.purpose = patched_purpose
-        logger.info("[Creator][purpose_short_contract_patch][result] %s", json.dumps({
-            "event": "purpose_short_contract_patch_result",
+        logger.info("[Creator][requirement_graph_patch][result] %s", json.dumps({
+            "event": "requirement_graph_patch_result",
             "patch_count": len(patches),
-            "purpose_targets": applied_purpose_targets,
+            "requirement_targets": sorted(set(requirement_targets)),
+            "ignored_purpose_targets": sorted(set(ignored_purpose_targets)),
         }, ensure_ascii=False, default=str))
         return graph
     except Exception as exc:
@@ -103,8 +102,8 @@ async def _extract_requirement_graph_with_validator(
                 "field": "requirement_graph",
                 "message": f"Responsibility graph patch model failed; using deterministic graph: {exc}",
             })
-        logger.info("[Creator][purpose_short_contract_patch][failed] %s", json.dumps({
-            "event": "purpose_short_contract_patch_failed",
+        logger.info("[Creator][requirement_graph_patch][failed] %s", json.dumps({
+            "event": "requirement_graph_patch_failed",
             "error": f"{type(exc).__name__}: {exc}",
         }, ensure_ascii=False, default=str))
         return graph

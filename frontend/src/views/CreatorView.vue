@@ -67,6 +67,8 @@
             :warnings="creationPlan.warnings"
             :asset-requirements="creationPlan.asset_requirements || []"
             :final-outputs="creationPlan.final_outputs || []"
+            :requirement-graph="creationPlan.requirement_graph || null"
+            :workflow-allocation-summary="creationPlan.workflow_allocation_summary || ''"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />

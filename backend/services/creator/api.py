@@ -1033,74 +1033,6 @@ async def _complete_creator_file_generation(
     )
     return content
 
-def _build_skill_md_model_finalizer_prompt(
-    *,
-    skill_name: str,
-    description: str,
-    blueprint_text: str,
-    references: list[str] | None,
-    assets: list[str] | None,
-    final_outputs: list[str] | None,
-) -> list[dict[str, str]]:
-    resource_reference = {
-        "references": references or [],
-        "assets": assets or [],
-        "final_outputs": final_outputs or [],
-    }
-
-    return [
-        {
-            "role": "system",
-            "content": (
-                "你是 SKILL.md 最终说明文档编辑器。"
-                "请基于蓝图创作完整、自然、用户可读的 SKILL.md。"
-                "不要泄露 runtime_contract、artifact_contract、ToolSlot、implementation_strategy 等内部字段。"
-                "不要把本文档退化成合同字段清单。"
-                "只输出 SKILL.md 文件内容，不要 Markdown 外层代码块。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Skill 名称：{skill_name}\n"
-                f"描述：{description}\n\n"
-                "蓝图：\n"
-                f"{clean_blueprint_body_text(blueprint_text or '')}\n\n"
-                "资源和最终输出参考：\n"
-                f"{json.dumps(resource_reference, ensure_ascii=False, indent=2)}\n\n"
-                "请输出完整 SKILL.md 文件正文，必须满足：\n"
-                "1. 文件必须以 YAML frontmatter 开头，包含 name 和 description。\n"
-                "2. 正文应包含适用场景、用户需提供内容、执行流程、脚本调用说明、references/assets 使用说明、最终产物和注意事项。\n"
-                "3. 如果蓝图包含 scripts/*.py，必须为每个真实脚本写一个标准、独立、无缩进的 ```bash fenced code block。\n"
-                "4. 每个 ```bash block 内只能有一条真实 shell 命令。\n"
-                "5. 标准命令格式必须是：python scripts/<真实脚本名>.py '<JSON object argv>'。\n"
-                "6. 脚本路径后的第一个参数必须是 json.loads 可解析的 JSON object 字符串。\n"
-                "7. JSON argv 必须是 object，但 object 内字段名必须由当前脚本真实接口、蓝图需求和上下游数据流决定。\n"
-                "8. 第一条 workflow command 只能引用平台 guaranteed input envelope 中存在的字段；如不确定，传入通用 user_request/input payload/envelope，由入口脚本内部解析。不要引用 envelope 中不存在的独立 placeholder。\n"
-                "9. 区分蓝图用户输入的必需项和可选项：依据‘可选/建议/若不指定/可以提供/默认’等语义判断，不写固定业务字段词表；可选项不能在 SKILL.md 中写成必填 placeholder。\n"
-                "10. 如果蓝图存在可选用户参数但平台 payload 没有同名字段，应让入口脚本从 fields/options/payload 中存在则读取、不存在则内部默认化，或接收通用 user_request/input payload；不要要求 SKILL.md 传入不存在的独立 placeholder。\n"
-                "11. 入口脚本命令必须兼容平台输入 envelope；入口脚本生成合同应在脚本内部填充可选参数默认值。\n"
-                "12. 动态 placeholder 必须作为 JSON 字符串值出现；不要把未加引号的动态 placeholder 放进 JSON。\n"
-                "13. 禁止在 ```bash block 中直接放 JSON 配置对象。\n"
-                "14. 禁止在 ```bash block 中放 runner/script/argv 伪命令对象。\n"
-                "15. 禁止在 ```bash block 中放说明文字、列表、多条命令或 `<真实参数>` 占位说明。\n"
-                "16. 默认不要使用 --argv CLI flag，除非脚本源码明确实现了 --argv；Creator 默认脚本协议是 sys.argv[1] JSON object。\n"
-                "17. references/*.md 只作为参考资料说明，不是执行源。不要把 reference 正文全文复制进 SKILL.md。\n"
-                "18. assets/** 只能作为上传素材或静态资源引用，不能描述为 Creator 生成素材。\n"
-                "19. 不要包含 Creator 创建流程、确认清单、点击开始创建、系统将自动创建文件等平台创建流程文案。\n"
-                "20. 不要声称“已通过 E2E 校验”“可直接投入运行”，SKILL.md 是使用说明，不是校验报告。\n\n"
-                "标准命令示例只说明形态，不代表固定字段：\n"
-                "```bash\n"
-                "python scripts/generate_story.py '{\"topic\":\"{{topic}}\",\"chapter_count\":5}'\n"
-                "```\n\n"
-                "```bash\n"
-                "python scripts/build_pdf.py '{\"story_text\":\"{{story_text}}\",\"image_paths\":\"{{image_paths}}\"}'\n"
-                "```\n\n"
-                "注意：实际字段必须根据当前蓝图和脚本接口调整，禁止照抄示例字段。"
-            ),
-        },
-    ]
-
 def _strict_contract_rewrite_allowed(source: str) -> bool:
     # First-round repairs must stay localized: the validator identifies the
     # failed function/region, and the repair model edits only that region while
@@ -1271,634 +1203,6 @@ def normalize_skill_md_failures(failures: list[dict[str, Any]]) -> list[dict[str
             failure["repair_ops"] = ops
     return [failure for failure in resolved if classify_skill_md_failure_severity(failure) == "hard"]
 
-
-def failure_ledger_for_skill_md_finalize(
-    failures: list[dict[str, Any]],
-    *,
-    previous_remaining: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    normalized_all = resolve_resource_role_conflicts(merge_duplicate_failures([*(previous_remaining or []), *failures]))
-    hard = normalize_skill_md_failures(failures)
-    current_signatures = {_failure_signature(failure) for failure in failures}
-    resolved = [
-        failure for failure in (previous_remaining or [])
-        if _failure_signature(failure) not in current_signatures
-    ]
-    return {
-        "resolved_failures": resolved,
-        "remaining_failures": hard,
-        "hard_failures": hard,
-        "advisory_notes": [
-            failure for failure in normalized_all
-            if classify_skill_md_failure_severity(failure) != "hard"
-        ],
-    }
-
-
-def _non_code_text_near_script(content: str, script_path: str, window: int = 360) -> str:
-    normalized = content.replace("\r\n", "\n")
-    idx = normalized.find(script_path)
-    if idx < 0:
-        return ""
-    start = max(0, idx - window)
-    end = min(len(normalized), idx + len(script_path) + window)
-    nearby = normalized[start:end]
-    nearby = re.sub(r"```[\s\S]*?```", " ", nearby)
-    nearby = re.sub(r"`[^`]*`", " ", nearby)
-    nearby = re.sub(r"[#>*_\-\[\]()`]", " ", nearby)
-    return re.sub(r"\s+", " ", nearby).strip()
-
-
-def _is_generic_script_description(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text or "").lower()
-    if len(compact) < 24:
-        return True
-    generic_patterns = [
-        "执行脚本", "运行脚本", "处理任务", "运行该步骤", "执行该步骤",
-        "调用脚本", "script", "runthisscript", "processtask",
-    ]
-    return any(pattern in compact for pattern in generic_patterns) and len(compact) < 60
-
-
-def _check_skill_md_script_narrative_quality(content: str, script_paths: list[str]) -> list[ContractCheckResult]:
-    results: list[ContractCheckResult] = []
-    for script_path in dict.fromkeys(path for path in script_paths if path.startswith("scripts/")):
-        mentioned = script_path in content
-        results.append(ContractCheckResult(
-            id="skill_md.script.mentioned",
-            passed=mentioned,
-            target=script_path,
-            message=f"{script_path} 已在 SKILL.md 中出现。" if mentioned else f"{script_path} 未在 SKILL.md 中出现。",
-            expected="每个真实 scripts/** 都必须在 SKILL.md 中被提及。",
-            minimal_edit=f"添加 {script_path} 的自然语言功能说明和对应 bash fenced block。",
-            layer="skill_md_first_round",
-        ))
-        commands = _extract_script_command_templates(content, script_path) if mentioned else []
-        results.append(ContractCheckResult(
-            id="skill_md.script.bash_block_nearby",
-            passed=bool(commands),
-            target=script_path,
-            message=f"{script_path} 有对应 bash fenced block。" if commands else f"{script_path} 缺少对应 bash fenced block。",
-            expected="每个脚本必须有对应 ```bash fenced block，且 block 调用真实脚本路径。",
-            minimal_edit=f"为 {script_path} 添加调用真实脚本路径且 argv 为 JSON object 的 bash fenced block。",
-            layer="skill_md_first_round",
-        ))
-        nearby_text = _non_code_text_near_script(content, script_path)
-        has_specific_description = bool(nearby_text) and not _is_generic_script_description(nearby_text)
-        results.append(ContractCheckResult(
-            id="skill_md.script.narrative_quality",
-            passed=has_specific_description,
-            target=script_path,
-            message=f"{script_path} 附近有非代码块的具体功能说明。" if has_specific_description else f"{script_path} 附近缺少具体自然语言功能说明，或说明过于空泛。",
-            expected="每个脚本附近必须说明它在整体流程中的作用，不能只有“执行脚本/处理任务/运行该步骤”。",
-            minimal_edit=f"在 {script_path} 的 bash block 前后添加一句具体说明：它读取什么、完成什么流程步骤、产出什么用户可理解结果。",
-            details={"nearby_text": nearby_text[:240]},
-            layer="skill_md_first_round",
-        ))
-    return results
-
-def _skill_md_first_round_failures(
-    *,
-    skill_name: str,
-    content: str,
-    blueprint_text: str,
-) -> list[dict[str, Any]]:
-    failures: list[dict[str, Any]] = []
-
-    # 1. 最早先做 Markdown 基础格式检查。
-    # 格式不对，不进入后面的模型内容审查。
-    raw_failures = _basic_markdown_format_failures(
-        "SKILL.md",
-        content,
-        require_frontmatter=True,
-    )
-    if raw_failures:
-        return raw_failures
-
-    # 2. 再跑你现有的平台合同规则。
-    try:
-        _raise_file_contract_failures(validate_file_contract(
-            file_path="SKILL.md",
-            content=content,
-            blueprint_text=blueprint_text or "",
-            skill_plan_entry=None,
-        ))
-    except Exception as exc:
-        failures.extend(_exception_to_skill_md_failures(exc, source="skill_md_contract"))
-
-    # 3. 再检查文件引用。
-    try:
-        _validate_skill_md_against_existing_files(
-            skill_name,
-            content,
-            blueprint_text=blueprint_text or "",
-            require_existing=False,
-        )
-    except Exception as exc:
-        failures.extend(_exception_to_skill_md_failures(exc, source="skill_md_files"))
-
-    return failures
-
-
-def _is_skill_md_finalize_content_patch_failure(failure: dict[str, Any]) -> bool:
-    """Allow finalize localized patch only for ordinary Markdown content gaps."""
-    if not isinstance(failure, dict):
-        return False
-    if _is_skill_md_finalize_format_rewrite_failure(failure):
-        return False
-    repair_ops = failure.get("repair_ops")
-    if isinstance(repair_ops, list) and repair_ops:
-        return True
-    failure_id = str(failure.get("id") or "")
-    return (
-        str(failure.get("layer") or "") == "skill_md_first_round"
-        and (
-            failure_id.endswith(".narrative_quality")
-            or failure_id.endswith(".reference.mentioned")
-            or failure_id.endswith(".asset.mentioned")
-        )
-    )
-
-
-def _is_skill_md_finalize_format_rewrite_failure(failure: dict[str, Any]) -> bool:
-    """Route static SKILL.md document/command shape failures to full regeneration."""
-    if not isinstance(failure, dict):
-        return False
-    failure_id = str(failure.get("id") or "")
-    layer = str(failure.get("layer") or "")
-    details = failure.get("details") if isinstance(failure.get("details"), dict) else {}
-    if details.get("repair_strategy") == "full_rewrite" or details.get("model_patch_allowed") is False:
-        return True
-    if failure_id.startswith("skill_md.command_block."):
-        return True
-    if "json_argv" in failure_id or "shell_command" in failure_id:
-        return True
-    return layer == "hard_format"
-
-
-def _split_skill_md_finalize_failures(
-    failures: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    format_rewrite: list[dict[str, Any]] = []
-    patchable: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    for failure in failures:
-        if _is_skill_md_finalize_format_rewrite_failure(failure):
-            format_rewrite.append(failure)
-        elif classify_skill_md_failure_severity(failure) == "hard":
-            patchable.append(failure)
-        else:
-            deferred.append(failure)
-    return format_rewrite, patchable, deferred
-
-
-def _build_skill_md_finalize_full_rewrite_messages(
-    *,
-    prompt_messages: list[dict[str, str]],
-    skill_name: str,
-    content: str,
-    failures: list[dict[str, Any]],
-) -> list[dict[str, str]]:
-    return [
-        *prompt_messages,
-        {
-            "role": "user",
-            "content": (
-                "上一版 SKILL.md 的静态文档结构不可稳定使用，请重新输出完整 SKILL.md。\n"
-                "不要输出 patch、JSON 或解释。\n\n"
-                "失败项 JSON：\n"
-                f"{json.dumps(failures, ensure_ascii=False, indent=2, default=str)}\n\n"
-                f"Skill 名称：{skill_name}\n\n"
-                "上一版内容：\n"
-                "<<<CURRENT_SKILL_MD\n"
-                f"{content}\n"
-                "CURRENT_SKILL_MD\n"
-            ),
-        },
-    ]
-
-
-def _skill_md_finalize_failure_region(failures: list[dict[str, Any]]) -> str:
-    for failure in failures:
-        region = markdown_failure_region(failure)
-        if region == "metadata_region":
-            return region
-    return "body_region"
-
-
-async def _repair_skill_md_model_finalizer(
-    *,
-    previous_content: str,
-    failures: list[dict[str, Any]],
-    prompt_messages: list[dict[str, str]],
-    model: str,
-    skill_name: str,
-    attempt: int,
-) -> str:
-    """Repair ordinary SKILL.md Markdown content gaps by exact_replace patch."""
-
-    failures_text = json.dumps(failures, ensure_ascii=False, indent=2, default=str)
-
-    validation_error = (
-        "SKILL.md 第一轮只修真正缺失的语义责任内容，需要做局部 patch。\n"
-        "如果 failure 只是说法不够精确、证明不够细、内部字段未写、字段来源/运行时闭环未解释，不要生成 patch。\n"
-        "失败项 JSON：\n"
-        f"{failures_text}"
-    )
-
-    targeted_repair = (
-        "只修复 failures 指向的真正缺失内容：用户需求、真实路径、主流程、最终产物或明显写反的资源角色。"
-        "不要做措辞优化，不要补 role/source/dependencies/bundled 等内部 manifest 字段，"
-        "不要补 stdout/placeholder 来源证明或第二轮 E2E 才负责的运行时闭环说明。"
-        "未被 failures 指向的内容必须保持。"
-        "不要输出完整 SKILL.md，只输出 exact_replace patch。"
-    )
-
-    return await _repair_generated_file_with_feedback(
-        prompt_messages=prompt_messages,
-        model=model,
-        file_path="SKILL.md",
-        previous_content=previous_content,
-        validation_error=validation_error,
-        targeted_repair=targeted_repair,
-        contract_text=(
-            "SKILL.md 是主 Skill 说明文档；本轮只补用户无法理解或无法启动 Skill 的缺失内容。"
-        ),
-        passed_checks_text="",
-        failed_checks_text=failures_text,
-        repair_mode="localized_patch",
-        skill_plan_entry=None,
-        patch_retry_limit=1,
-    )
-
-
-def _strip_unclosed_or_invalid_frontmatter_for_skill_md(content: str) -> str:
-    """Return the best-effort Markdown body without trusting invalid frontmatter."""
-    text = str(content or "").replace("\r\n", "\n")
-    if not text.lstrip().startswith("---"):
-        return text.strip()
-    lines = text.splitlines()
-    start = next((idx for idx, line in enumerate(lines) if line.strip() == "---"), None)
-    if start is None:
-        return text.strip()
-    end = next((idx for idx in range(start + 1, len(lines)) if lines[idx].strip() == "---"), None)
-    markdown_start = next(
-        (idx for idx in range(start + 1, len(lines)) if re.match(r"\s*(#{1,6}\s+|```|~~~|[-*+]\s+|\d+[.)]\s+)", lines[idx])),
-        None,
-    )
-    if end is not None:
-        raw_meta = "\n".join(lines[start + 1:end])
-        try:
-            parsed = yaml.safe_load(raw_meta) or {}
-            if isinstance(parsed, dict):
-                return "\n".join(lines[end + 1:]).strip()
-        except Exception:
-            pass
-        if markdown_start is not None and markdown_start < end:
-            body_lines = lines[markdown_start:]
-            if body_lines and body_lines[-1].strip() == "---":
-                body_lines = body_lines[:-1]
-            return "\n".join(body_lines).strip()
-        return "\n".join(lines[end + 1:]).strip()
-    # Frontmatter never closed. Prefer preserving the first Markdown-looking body
-    # boundary if present; otherwise keep non-boundary text as editable body.
-    if markdown_start is not None:
-        return "\n".join(lines[markdown_start:]).strip()
-    return "\n".join(line for line in lines[start + 1:] if line.strip() != "---").strip()
-
-
-def _balance_markdown_fences_for_skill_md_body(body: str) -> str:
-    markers = re.findall(r"(?m)^\s*(```|~~~)", body or "")
-    if len(markers) % 2 == 1:
-        return (body or "").rstrip() + "\n" + markers[-1] + "\n"
-    return body or ""
-
-
-def _minimal_skill_md_hard_format_fallback(
-    *,
-    skill_name: str,
-    description: str,
-    current_content: str,
-) -> str:
-    """Deterministically repair only SKILL.md hard Markdown boundaries.
-
-    This is a last-resort hard-format fallback: rebuild legal frontmatter and
-    preserve the best-effort body without changing business semantics.
-    """
-    safe_name = _validate_skill_name(skill_name)
-    safe_description = str(description or "Skill usage instructions.").strip() or "Skill usage instructions."
-    body = _strip_unclosed_or_invalid_frontmatter_for_skill_md(current_content)
-    body = _balance_markdown_fences_for_skill_md_body(body).strip()
-    if not body:
-        body = f"# {safe_name}\n\n{safe_description}"
-    elif not re.search(r"(?m)^#{1,6}\s+\S", body):
-        body = f"# {safe_name}\n\n{body}"
-    fallback = (
-        "---\n"
-        f"name: {json.dumps(safe_name, ensure_ascii=False)[1:-1]}\n"
-        f"description: {json.dumps(safe_description, ensure_ascii=False)[1:-1]}\n"
-        "---\n"
-        f"{body.rstrip()}\n"
-    )
-    hard_failures = detect_markdown_hard_format_failures("SKILL.md", fallback, require_frontmatter=True)
-    return fallback if not hard_failures else ""
-
-
-def _safe_finalize_failure_content(
-    *,
-    skill_name: str,
-    description: str,
-    content: str,
-    candidate: str,
-) -> str:
-    raw = content or candidate or ""
-    if not detect_markdown_hard_format_failures("SKILL.md", raw, require_frontmatter=True):
-        return raw
-    return _minimal_skill_md_hard_format_fallback(
-        skill_name=skill_name,
-        description=description,
-        current_content=raw,
-    )
-
-
-@router.post("/finalize-skill-md")
-async def finalize_skill_md(request: FinalizeSkillMdRequest):
-    """Finalize SKILL.md with staged repair.
-
-    阶段：
-    1. Markdown 格式错误：metadata/body 区域重写，最多 3 轮；
-    2. 合同/责任/蓝图错误：局部 diff 修复；
-    3. 最终失败也返回可编辑草稿，不抛 400，避免前端文件变灰。
-    """
-    skill_name = _validate_skill_name(request.skill_name)
-    route = route_creator_file_model(
-        file_path="SKILL.md",
-        purpose=request.description or "final SKILL.md",
-        requested_model=request.model,
-    )
-
-    prompt_messages = _build_skill_md_model_finalizer_prompt(
-        skill_name=skill_name,
-        description=request.description or "",
-        blueprint_text=request.blueprint_text or "",
-        references=request.references,
-        assets=request.assets,
-        final_outputs=request.final_outputs,
-    )
-
-    failures: list[dict[str, Any]] = []
-    repair_events: list[dict[str, Any]] = []
-    previous_remaining_failures: list[dict[str, Any]] = []
-    candidate = ""
-    content = ""
-    skip_semantic_review_after_patch = False
-
-    for attempt in range(1, _MAX_FILE_REPAIR_ATTEMPTS + 1):
-        try:
-            if attempt == 1:
-                candidate = await _complete_creator_file_generation(
-                    messages=prompt_messages,
-                    model=route.model,
-                    skill_name=skill_name,
-                    file_path="SKILL.md",
-                    prompt_variant="model_finalizer",
-                    retry_index=0,
-                )
-
-            content = _sanitize_generated_file_content("SKILL.md", candidate)
-
-            # 阶段 1：Markdown 基础格式错误，直接整文件重写，不走 diff。
-            format_failures = detect_markdown_hard_format_failures(
-                "SKILL.md",
-                content,
-                require_frontmatter=True,
-            )
-            if format_failures:
-                failures = format_failures
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "hard_format_failed",
-                    "format_rewrite_status": "format_region_rewrite",
-                    "failures": format_failures,
-                })
-
-                if attempt >= 3:
-                    fallback = _minimal_skill_md_hard_format_fallback(
-                        skill_name=skill_name,
-                        description=request.description or "final SKILL.md",
-                        current_content=content,
-                    )
-                    fallback_failures = (
-                        detect_markdown_hard_format_failures("SKILL.md", fallback, require_frontmatter=True)
-                        if fallback
-                        else format_failures
-                    )
-                    repair_events.append({
-                        "attempt": attempt,
-                        "target_file": "SKILL.md",
-                        "patch_status": "deterministic_hard_format_fallback",
-                        "success": bool(fallback) and not fallback_failures,
-                        "failures": fallback_failures,
-                    })
-                    if fallback and not fallback_failures:
-                        content = fallback
-                        candidate = fallback
-                    break
-
-                failed_region = markdown_failure_region(format_failures[0])
-                rewrite_messages = _build_markdown_region_rewrite_prompt(
-                    file_path="SKILL.md",
-                    skill_name=skill_name,
-                    blueprint_text=request.blueprint_text or "",
-                    deterministic_error=json.dumps(format_failures, ensure_ascii=False, indent=2, default=str),
-                    current_content=content,
-                    region=failed_region,
-                )
-
-                rewritten_region = await _complete_creator_file_generation(
-                    messages=rewrite_messages,
-                    model=route.model,
-                    skill_name=skill_name,
-                    file_path="SKILL.md",
-                    prompt_variant=f"rewrite_markdown_{failed_region}",
-                    retry_index=attempt - 1,
-                )
-                candidate = _merge_markdown_region_rewrite(content, rewritten_region, failed_region)
-                rewritten_content = _sanitize_generated_file_content("SKILL.md", candidate)
-                rewritten_failures = detect_markdown_hard_format_failures(
-                    "SKILL.md",
-                    rewritten_content,
-                    require_frontmatter=True,
-                )
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "format_full_rewrite_validation",
-                    "success": not rewritten_failures,
-                    "failures": rewritten_failures,
-                })
-                continue
-
-            # 阶段 2：平台合同、文件引用等非基础 Markdown 格式问题。
-            failures = _skill_md_first_round_failures(
-                skill_name=skill_name,
-                content=content,
-                blueprint_text=request.blueprint_text or "",
-            )
-            ledger = failure_ledger_for_skill_md_finalize(
-                failures,
-                previous_remaining=previous_remaining_failures,
-            )
-            failures = list(ledger["remaining_failures"])
-            previous_remaining_failures = failures
-
-            # 阶段 3：格式/合同通过后，再做第一轮语义覆盖审查。
-            # 如果上一轮已经应用 localized patch，本轮只做通用安全校验
-            # （Markdown/命令块/本地路径），避免 reviewer 为新措辞反复返修。
-            if not failures and skip_semantic_review_after_patch:
-                return {
-                    "success": True,
-                    "content": content,
-                    "repair_attempts": attempt - 1,
-                    "validation_status": "passed",
-                    "editable": True,
-                    "disabled": False,
-                    "repair_events": repair_events,
-                }
-
-            if not failures:
-                try:
-                    await _validate_skill_md_blueprint_alignment(
-                        skill_name=skill_name,
-                        content=content,
-                        blueprint_text=request.blueprint_text or "",
-                        skill_plan_entry=None,
-                        model=request.model or route.model,
-                    )
-                except Exception as exc:
-                    raw_failures = _exception_to_skill_md_failures(exc, source="blueprint_alignment")
-                    ledger = failure_ledger_for_skill_md_finalize(
-                        raw_failures,
-                        previous_remaining=previous_remaining_failures,
-                    )
-                    failures = list(ledger["remaining_failures"])
-                    previous_remaining_failures = failures
-
-            if not failures:
-                return {
-                    "success": True,
-                    "content": content,
-                    "repair_attempts": attempt - 1,
-                    "validation_status": "passed",
-                    "editable": True,
-                    "disabled": False,
-                    "repair_events": repair_events,
-                }
-
-            if attempt >= _MAX_FILE_REPAIR_ATTEMPTS:
-                break
-
-            format_rewrite_failures, patchable_failures, deferred_failures = _split_skill_md_finalize_failures(failures)
-            if format_rewrite_failures:
-                failed_region = _skill_md_finalize_failure_region(format_rewrite_failures)
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "format_region_rewrite",
-                    "region": failed_region,
-                    "failures": format_rewrite_failures,
-                })
-                rewrite_messages = _build_markdown_region_rewrite_prompt(
-                    file_path="SKILL.md",
-                    skill_name=skill_name,
-                    blueprint_text=request.blueprint_text or "",
-                    deterministic_error=json.dumps(format_rewrite_failures, ensure_ascii=False, indent=2, default=str),
-                    current_content=content,
-                    region=failed_region,
-                )
-                rewritten_region = await _complete_creator_file_generation(
-                    messages=rewrite_messages,
-                    model=route.model,
-                    skill_name=skill_name,
-                    file_path="SKILL.md",
-                    prompt_variant=f"finalize_rewrite_markdown_{failed_region}",
-                    retry_index=attempt - 1,
-                )
-                candidate = _merge_markdown_region_rewrite(content, rewritten_region, failed_region)
-                continue
-
-            if not patchable_failures:
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "deferred_non_content_failures",
-                    "failures": failures,
-                })
-                break
-
-            try:
-                candidate = await _repair_skill_md_model_finalizer(
-                    previous_content=content,
-                    failures=patchable_failures,
-                    prompt_messages=prompt_messages,
-                    model=route.model,
-                    skill_name=skill_name,
-                    attempt=attempt,
-                )
-                skip_semantic_review_after_patch = True
-                if deferred_failures:
-                    previous_remaining_failures = deferred_failures
-            except CreatorRepairProposalParseError as parse_exc:
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "parse_failed",
-                    "parser_error": parse_exc.parser_error,
-                    "last_output_excerpt": parse_exc.last_output_excerpt,
-                    "diff_extraction_attempted": parse_exc.diff_extraction_attempted,
-                    "old_lines_new_lines_fallback_attempted": parse_exc.lines_fallback_attempted,
-                })
-                failures = failures or patchable_failures
-                break
-            except Exception as repair_exc:
-                repair_events.append({
-                    "attempt": attempt,
-                    "target_file": "SKILL.md",
-                    "patch_status": "patch_failed",
-                    "error": f"{type(repair_exc).__name__}: {repair_exc}",
-                    "failures": patchable_failures,
-                })
-                failures = failures or patchable_failures
-                break
-
-        except Exception as exc:
-            logger.exception(
-                "[Creator][skill_md][finalize_attempt_failed] skill=%s attempt=%s",
-                skill_name,
-                attempt,
-            )
-            failures = _exception_to_skill_md_failures(exc, source="skill_md_model_finalize")
-            break
-
-    safe_failure_content = _safe_finalize_failure_content(
-        skill_name=skill_name,
-        description=request.description or "final SKILL.md",
-        content=content,
-        candidate=candidate,
-    )
-    return {
-        "success": False,
-        "content": safe_failure_content,
-        "repair_attempts": max(0, attempt if "attempt" in locals() else 0),
-        "validation_status": "needs_repair",
-        "needs_repair": True,
-        "editable": True,
-        "disabled": False,
-        "failures": failures,
-        "repair_events": repair_events,
-        "error": "SKILL.md finalize did not pass after repair attempts.",
-    }
 
 
 
@@ -2228,6 +1532,76 @@ def _merge_markdown_region_rewrite(current_content: str, rewritten_region: str, 
     return merge_markdown_regions(regions.metadata_region, body)
 
 
+def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
+    """Return a small responsibility ledger for Markdown prompts.
+
+    This intentionally preserves only contract-level context and never expands
+    into generated source/reference content or a second responsibility author.
+    """
+
+    if raw_graph is None:
+        return {"requirements": []}
+    if hasattr(raw_graph, "model_dump"):
+        raw_graph = raw_graph.model_dump(mode="json")
+    if not isinstance(raw_graph, dict):
+        return {"requirements": []}
+
+    def trunc(value: Any, limit: int = 500) -> str:
+        text = str(value or "").strip()
+        return text[:limit]
+
+    def string_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, tuple):
+            items = list(value)
+        elif value in (None, ""):
+            items = []
+        else:
+            items = [value]
+        out: list[str] = []
+        for item in items:
+            text = trunc(item)
+            if text:
+                out.append(text)
+        return out[:50]
+
+    requirements: list[dict[str, Any]] = []
+    raw_requirements = raw_graph.get("requirements")
+    if not isinstance(raw_requirements, list):
+        raw_requirements = []
+    for item in raw_requirements[:50]:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump(mode="json")
+        if not isinstance(item, dict):
+            continue
+        compact = {
+            "target_file": trunc(item.get("target_file")),
+            "role": trunc(item.get("role")),
+            "runtime": trunc(item.get("runtime")),
+            "purpose": trunc(item.get("purpose")),
+            "inputs": string_list(item.get("inputs")),
+            "outputs": string_list(item.get("outputs")),
+            "depends_on": string_list(item.get("depends_on")),
+            "must_do": string_list(item.get("must_do")),
+            "must_not_do": string_list(item.get("must_not_do")),
+        }
+        if compact["target_file"]:
+            requirements.append(compact)
+
+    compact_graph = {"requirements": requirements}
+    serialized = json.dumps(compact_graph, ensure_ascii=False, default=str)
+    if len(serialized) <= 14000:
+        return compact_graph
+    trimmed: list[dict[str, Any]] = []
+    for item in requirements:
+        trimmed.append(item)
+        if len(json.dumps({"requirements": trimmed}, ensure_ascii=False, default=str)) > 14000:
+            trimmed.pop()
+            break
+    return {"requirements": trimmed}
+
+
 def _build_markdown_initial_region_prompt(
     *,
     file_path: str,
@@ -2236,20 +1610,70 @@ def _build_markdown_initial_region_prompt(
     blueprint_text: str,
     region: str,
     metadata_region: str = "",
+    requirement_graph: dict[str, Any] | None = None,
+    workflow_allocation_summary: str = "",
+    final_outputs: list[Any] | None = None,
 ) -> list[dict[str, str]]:
     if region == "metadata_region":
+        if file_path == "SKILL.md":
+            allowed = (
+                "SKILL.md metadata 只生成闭合 YAML frontmatter；默认只允许 name 和 description。"
+                "只有蓝图明确要求时才允许 license 或 allowed-tools。"
+            )
+        elif file_path.startswith("references/"):
+            allowed = (
+                "references/*.md metadata 只生成闭合 YAML frontmatter；默认只允许 title 和 description。"
+                "只有蓝图明确要求时才允许 source 或 license。"
+            )
+        else:
+            allowed = "Markdown metadata 只描述当前文件自身，保持最小可解析 YAML frontmatter。"
         return [
             {"role": "system", "content": "你是 Markdown metadata_region 生成器。只输出闭合 YAML frontmatter。"},
             {"role": "user", "content": (
                 f"为 {file_path} 生成 metadata_region。\n"
                 f"Skill 名称：{skill_name}\n职责：{purpose}\n\n"
+                f"{allowed}\n"
+                "不要主动生成 metadata.creator；不要输出 body。\n"
+                "所有 Markdown metadata 禁止生成这些键：workflow, inputs, outputs, dependencies, "
+                "required_capabilities, business_forbidden_capabilities, references, assets, role, path, type, "
+                "scope, script_order, resource_references, runtime_contract, artifact_contract, "
+                "implementation_strategy, file_plan, capabilities。\n"
                 "metadata 只描述当前文件自身；必须可解析、闭合；不要写正文长段落；"
                 "不要定义其它 scripts/*.py 的 capability/runtime/tool 边界。\n"
-                + ("SKILL.md 必须包含 name 和 description。\n" if file_path == "SKILL.md" else "")
                 + "只输出 metadata_region，不输出 body。\n\n蓝图：\n"
                 f"{(blueprint_text or '')[:8000]}"
             )},
         ]
+    compact_graph = _compact_requirement_graph_for_prompt(requirement_graph)
+    contract_context = (
+        "compact_requirement_graph:\n"
+        f"{json.dumps(compact_graph, ensure_ascii=False, default=str)[:14000]}\n\n"
+        "workflow_allocation_summary:\n"
+        f"{(workflow_allocation_summary or '')[:6000]}\n\n"
+        "final_outputs:\n"
+        f"{json.dumps(final_outputs or [], ensure_ascii=False, default=str)[:4000]}\n\n"
+    )
+    if file_path == "SKILL.md":
+        body_rules = (
+            "SKILL.md body 必须基于 blueprint_text、compact requirement_graph、workflow_allocation_summary、"
+            "final_outputs 以及 references/assets 路径写最终用户说明。\n"
+            "应包含：Skill 用途；用户需要提供什么；高层执行流程；每个真实脚本的自然语言职责说明；"
+            "每个真实脚本的 bash 命令块；references 的只读参考角色；assets 的上传/静态素材角色；"
+            "最终产物；注意事项。\n"
+            "不要写 Creator 创建流程、点击开始创建、已通过 E2E、系统将自动生成文件、Runtime Contract JSON、"
+            "ToolSlot/implementation_strategy/capability cards、reference 正文全文、脚本源码解释、validator/repair 日志。"
+        )
+    elif file_path.startswith("references/"):
+        body_rules = (
+            "references/*.md body 只写参考资料正文；不作为执行步骤；不要写可执行 bash/sh/shell block 调用 scripts/*.py；"
+            "不重新定义 scripts 的 final inputs/outputs；可以包含普通说明、模板、示例、格式规则；"
+            "命令示例必须是非执行性质，优先用 text code block。"
+        )
+    else:
+        body_rules = (
+            "body 可包含普通说明、工作流、bash/json/markdown code block、示例和注意事项；"
+            "所有 code fence 必须闭合。reference body 不要重新定义 scripts/*.py 的 capability/runtime/tool 边界。"
+        )
     return [
         {"role": "system", "content": "你是 Markdown body_region 生成器。只输出正文，不输出 YAML frontmatter。"},
         {"role": "user", "content": (
@@ -2258,11 +1682,10 @@ def _build_markdown_initial_region_prompt(
             "已校验 metadata_region：\n<<<METADATA_REGION\n"
             f"{metadata_region}\n"
             "METADATA_REGION\n\n"
-            "body 可包含普通说明、工作流、bash/json/markdown code block、示例和注意事项；"
-            "所有 code fence 必须闭合。SKILL.md 的 bash command block 仍由你生成。"
-            "reference body 不要重新定义 scripts/*.py 的 capability/runtime/tool 边界。\n"
+            f"{body_rules}\n"
             "只输出 body_region，不输出 frontmatter。\n\n蓝图：\n"
-            f"{(blueprint_text or '')[:8000]}"
+            f"{(blueprint_text or '')[:8000]}\n\n"
+            f"{contract_context}"
         )},
     ]
 
@@ -2274,6 +1697,9 @@ async def _generate_markdown_initial_regions(
     purpose: str,
     blueprint_text: str,
     model: str,
+    requirement_graph: dict[str, Any] | None = None,
+    workflow_allocation_summary: str = "",
+    final_outputs: list[Any] | None = None,
 ) -> str:
     """Generate .md files as metadata/body regions with metadata rewrite retry."""
 
@@ -2288,6 +1714,9 @@ async def _generate_markdown_initial_regions(
                 purpose=purpose,
                 blueprint_text=blueprint_text,
                 region="metadata_region",
+                requirement_graph=requirement_graph,
+                workflow_allocation_summary=workflow_allocation_summary,
+                final_outputs=final_outputs,
             )
             prompt_variant = "generate_markdown_metadata_region"
         else:
@@ -2334,6 +1763,9 @@ async def _generate_markdown_initial_regions(
             blueprint_text=blueprint_text,
             region="body_region",
             metadata_region=metadata_region,
+            requirement_graph=requirement_graph,
+            workflow_allocation_summary=workflow_allocation_summary,
+            final_outputs=final_outputs,
         ),
         model=model,
         skill_name=skill_name,
@@ -2513,6 +1945,9 @@ async def generate_file(request: GenerateFileRequest):
                     purpose=request.purpose,
                     blueprint_text=request.blueprint_text,
                     model=route.model,
+                    requirement_graph=request.requirement_graph,
+                    workflow_allocation_summary=request.workflow_allocation_summary,
+                    final_outputs=request.final_outputs,
                 )
             else:
                 candidate = await _complete_creator_file_generation(

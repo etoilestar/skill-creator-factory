@@ -265,7 +265,9 @@ def test_creator_artifact_outputs_must_not_be_assets(tmp_path: Path):
 
     assert not result.ok
     assert result.issues[0]["code"] == "file_output_missing"
-    assert "OUTPUT_DIR/outputs" in result.issues[0]["message"]
+    assert "当前 Skill 工作目录的 outputs/" in result.issues[0]["message"]
+    assert "OUTPUT_DIR 已经指向 outputs，不要再拼 outputs" in result.issues[0]["message"]
+    assert "OUTPUT_DIR/outputs" not in result.issues[0]["message"]
 
 
 def test_skill_action_and_package_requests_build_same_external_context():

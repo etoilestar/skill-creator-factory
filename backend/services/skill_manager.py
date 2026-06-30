@@ -1,4 +1,5 @@
 import io
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -208,7 +209,9 @@ def update_asset(skill_name: str, folder: str, filename: str, content: str) -> d
 
 _MAX_ZIP_BYTES = 50 * 1024 * 1024
 _MAX_UNZIP_BYTES = 50 * 1024 * 1024
-_ALLOWED_ZIP_SUBDIRS = {"scripts", "references", "assets"}
+_ALLOWED_ZIP_SUBDIRS = {"scripts", "references", "assets", "_portable_runtime"}
+_ALLOWED_ZIP_ROOT_FILES = {"SKILL.md", "requirements-portable.txt", ".env.example", "skill-portability.json"}
+_FORBIDDEN_ZIP_SUFFIXES = {".pyc", ".pyo"}
 
 
 def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, bytes]], dict]:
@@ -260,20 +263,62 @@ def _parse_zip_payload(data: bytes) -> tuple[str, dict, str, list[tuple[str, byt
             if not rel or rel.endswith("/"):
                 continue
             rel_parts = Path(rel).parts
+            if any(part in {"__pycache__", ""} for part in rel_parts):
+                continue
+            if any(part.startswith(".") for part in rel_parts[:-1]):
+                continue
             if len(rel_parts) == 1:
-                if rel_parts[0] != "SKILL.md":
+                if rel_parts[0] not in _ALLOWED_ZIP_ROOT_FILES:
                     continue
             elif rel_parts[0] not in _ALLOWED_ZIP_SUBDIRS:
                 continue
             fname = rel_parts[-1]
-            if fname.startswith(".") or "\x00" in fname or len(fname) > 255:
+            if "\x00" in fname or len(fname) > 255:
+                continue
+            if fname.startswith(".") and fname != ".env.example":
+                continue
+            if fname == ".env" or Path(fname).suffix in _FORBIDDEN_ZIP_SUFFIXES:
                 continue
             entries_to_extract.append((rel, zf.read(info.filename)))
 
-        return safe_skill_name, meta, skill_md_content, entries_to_extract, {
+        portability = None
+        if any(rel == "skill-portability.json" for rel, _ in entries_to_extract):
+            try:
+                portability = json.loads(zf.read(prefix + "skill-portability.json").decode("utf-8"))
+            except Exception:
+                portability = {"warning": "invalid skill-portability.json"}
+
+        details = {
             "archive_entries": len(entries_to_extract),
             "zip_size": len(data),
         }
+        if portability is not None:
+            details["portability"] = portability
+        return safe_skill_name, meta, skill_md_content, entries_to_extract, details
+
+
+def export_skill_zip(skill_name: str, *, portable: bool = False, mode: str = "manage") -> bytes:
+    skill_dir = _resolved_skill_dir(skill_name, mode=mode)
+    buffer = io.BytesIO()
+    from .skill_portability import add_portable_files_to_zip
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        prefix = f"{skill_dir.name}/"
+        portable_scripts: set[str] = set()
+        if portable:
+            report = add_portable_files_to_zip(zipf, skill_dir, arc_prefix=prefix)
+            portable_scripts.update(report.patched_scripts)
+            scripts_dir = skill_dir / "scripts"
+            if scripts_dir.exists():
+                portable_scripts.update(p.relative_to(skill_dir).as_posix() for p in scripts_dir.rglob("*.py"))
+        for file_path in skill_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            rel = file_path.relative_to(skill_dir).as_posix()
+            if portable and (rel in portable_scripts or rel.startswith("_portable_runtime/") or rel in {"requirements-portable.txt", ".env.example", "skill-portability.json"}):
+                continue
+            zipf.write(file_path, f"{prefix}{rel}")
+    return buffer.getvalue()
 
 
 def import_skill_zip(data: bytes, overwrite: bool = False) -> dict:

@@ -3053,7 +3053,15 @@ async def validate_skill(request: SkillActionRequest):
     """
     skill_name = _validate_skill_name(request.skill_name)
 
-    result = run_action({"action": "validate", "name": skill_name})
+    skill_dir = settings.skills_path / skill_name
+    skill_md_path = skill_dir / "SKILL.md"
+    if not skill_dir.is_dir():
+        result = {"success": False, "path": str(skill_dir), "message": f"Skill directory does not exist: {skill_dir}"}
+    elif not skill_md_path.is_file():
+        result = {"success": False, "path": str(skill_dir), "message": f"SKILL.md does not exist: {skill_md_path}"}
+    else:
+        result = {"success": True, "path": str(skill_dir), "message": "Skill files exist; running E2E."}
+
     if not result["success"]:
         return SkillActionResponse(
             success=False,

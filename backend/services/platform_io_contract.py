@@ -15,6 +15,18 @@ def build_platform_io_contract() -> dict[str, Any]:
         "environment": {
             "OUTPUT_DIR": "already points to the final outputs directory for the current skill workspace",
         },
+        "platform_skill_boundary": {
+            "input_envelope_fields": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
+            "preferred_structured_input_root": "fields",
+            "final_output_fields": ["text", "markdown", "image_path", "image_paths", "pdf_path", "docx_path", "pptx_path", "html_path", "file_paths", "file_outputs"],
+            "protocol_notes": [
+                "These fields are the hard platform-to-generated-SKILL protocol and may be hardcoded at that boundary.",
+                "Do not hardcode the platform field vocabulary for business fields passed between scripts inside a generated SKILL; internal fields are determined by the requirement graph, script argv schema, and actual stdout.",
+                "If the first command needs structured business parameters, bind them through fields.<name> placeholders, for example {{fields.keywords}}.",
+                "Subsequent commands may only reference previous stdout fields, for example {{story_text}} or {{image_paths}}.",
+                "Command argv must not contain case sample values such as [\"童年\",\"分别\",\"重逢\"], \"用户输入的故事内容\", or \"/output/story_1.png\".",
+            ],
+        },
         "hard_rules": [
             "OUTPUT_DIR already points to final outputs directory.",
             "Do not append 'outputs' to OUTPUT_DIR.",
@@ -59,6 +71,11 @@ def platform_io_contract_prompt_text() -> str:
         "- Do not manually rewrite helper-returned pdf_path/file_outputs.",
         "- Artifact allowed roots: outputs/ and assets/generated/.",
         "- Absolute paths under current skill workspace outputs/ or assets/generated/ are valid if the files exist.",
+        "- Platform ↔ generated SKILL boundary input fields are hard protocol: user_request, input, text, payload, fields, options, input_files, files, resources.",
+        "- Prefer structured first-command business input via fields.<name>, e.g. {{fields.keywords}}; these boundary field names may be hardcoded.",
+        "- Generated SKILL internal script fields must not hardcode the platform vocabulary; derive them from requirement graph, script argv schema, and previous stdout.",
+        "- Subsequent commands may only reference previous stdout fields such as {{story_text}} or {{image_paths}}.",
+        "- Command argv must not contain case sample values like [\"童年\",\"分别\",\"重逢\"], \"用户输入的故事内容\", or fixed downstream paths such as \"/output/story_1.png\".",
         "- Contract payload: " + str(contract),
     ]
     return "\n".join(lines)

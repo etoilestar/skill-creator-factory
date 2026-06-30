@@ -1777,7 +1777,7 @@ python scripts/build_pdf.py '{"text":"{{text}}"}'
     assert not any("不允许 capability" in warning for warning in plan.warnings)
 
 
-def test_runtime_spec_command_prefers_accepted_argv_over_old_template():
+def test_runtime_spec_command_does_not_write_accepted_sample_argv_to_skill_md():
     from backend.services.skill_plan import SkillPlanEntry, ScriptRuntimeSpec, command_payload_placeholders, render_script_command_from_skill_plan
 
     entry = SkillPlanEntry(
@@ -1802,7 +1802,66 @@ def test_runtime_spec_command_prefers_accepted_argv_over_old_template():
 
     command = render_script_command_from_skill_plan(entry, runtime_spec=spec)
 
-    assert command_payload_placeholders(command, "scripts/run.py") == {"verified": "verified"}
+    assert command_payload_placeholders(command, "scripts/run.py") == {"legacy": "legacy"}
+    assert "verified" not in command
+
+
+def test_runtime_schema_renders_first_step_fields_placeholder_without_samples():
+    from backend.services.skill_plan import SkillPlanEntry, command_payload_placeholders, render_script_command_from_runtime_schema
+
+    entry = SkillPlanEntry(
+        path="scripts/generate_story.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+    )
+
+    command = render_script_command_from_runtime_schema(
+        entry,
+        {"required_keys": ["keywords"], "expected_types": {"keywords": "list"}},
+        is_first_step=True,
+    )
+
+    assert command.endswith('\'{"keywords":"{{fields.keywords}}"}\'')
+    assert command_payload_placeholders(command, "scripts/generate_story.py") == {"keywords": "fields.keywords"}
+    assert "童年" not in command
+    assert '"payload":"{{user_request}}"' not in command
+
+
+def test_runtime_schema_renders_subsequent_stdout_placeholders():
+    from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
+
+    image_entry = SkillPlanEntry(
+        path="scripts/generate_images.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+    )
+    pdf_entry = SkillPlanEntry(
+        path="scripts/build_pdf.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+    )
+
+    image_command = render_script_command_from_runtime_schema(
+        image_entry,
+        {"required_keys": ["story_text"], "expected_types": {"story_text": "str"}},
+        previous_stdout_fields={"story_text"},
+    )
+    pdf_command = render_script_command_from_runtime_schema(
+        pdf_entry,
+        {"required_keys": ["story_text", "image_paths"], "expected_types": {"story_text": "str", "image_paths": "list"}},
+        previous_stdout_fields={"story_text", "image_paths"},
+    )
+
+    assert image_command.endswith('\'{"story_text":"{{story_text}}"}\'')
+    assert pdf_command.endswith('\'{"image_paths":"{{image_paths}}","story_text":"{{story_text}}"}\'')
+    assert "用户输入的故事内容" not in image_command
+    assert "/output/story_1.png" not in pdf_command
 
 
 def test_trial_run_generated_script_returns_runtime_spec(tmp_path, monkeypatch):

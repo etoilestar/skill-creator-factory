@@ -421,10 +421,13 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
-        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；不确定具体字段时，传入通用 user_request/input payload/envelope 让入口脚本解析。",
-        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；结构化业务参数必须使用 fields.<name> 整值占位符，例如 \"{{fields.keywords}}\"。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、fields、options，或显式 input_binding。",
+        "- 禁止在 command JSON argv 中写业务样本数组/文本/路径，例如 [\"童年\",\"分别\",\"重逢\"]、\"用户输入的故事内容\"、\"示例文本\"、\"sample\"、\"example\"、\"/output/story_1.png\"；用户内容和前序产物只能用占位符表达。",
+        "- 允许固定配置常量（如 count=3、style=\"watercolor\"），但不得用样本值冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
-        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
+        "- 后续命令只能引用前序 stdout 字段占位符，例如 \"{{story_text}}\"、\"{{image_paths}}\"、\"{{pdf_path}}\"；不得写自然语言样例或固定文件路径充当前序 stdout。",
+        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定平台词表为内部字段；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
         "- references/ 是只读参考资料：可按需读取用于格式/模板/规则，但不替代主流程命令块，不作为产物或上传素材。",
@@ -444,7 +447,11 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         ]
 
         if idx == 1:
-            payload = {"user_request": "{{user_request}}"}
+            first_key = input_keys[0] if input_keys else ""
+            if first_key and "/" not in first_key and "\\" not in first_key and len(first_key) <= 80:
+                payload = {first_key: "{{fields." + first_key + "}}"}
+            else:
+                payload = {"user_request": "{{user_request}}"}
         elif input_keys:
             payload = {
                 key: "{{" + key + "}}"

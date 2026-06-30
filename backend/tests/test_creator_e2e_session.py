@@ -63,6 +63,41 @@ def test_e2e_session_reuses_workspace_venv_and_dependency_signature(tmp_path, mo
     assert any(event["event"] == "dependencies_reused" for event in session.events)
 
 
+def test_seed_initial_e2e_payload_populates_typed_fields_from_script_schema(tmp_path):
+    skill_dir = tmp_path / "typed-skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "generate_story.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        "    return strict_json_argv_guard(payload, {\"keywords\": {\"type\": list, \"required\": True}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1,
+        "SKILL.md",
+        "scripts/generate_story.py",
+        "python scripts/generate_story.py '{\"keywords\":\"{{fields.keywords}}\"}'",
+        "python",
+        {"keywords": "{{fields.keywords}}"},
+    )
+
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+
+    assert payload["fields"]["keywords"] == ["e2e-placeholder-value"]
+    assert rendered["keywords"] == ["e2e-placeholder-value"]
+
+    payload = e2e._seed_initial_e2e_payload(
+        [command],
+        skill_dir=skill_dir,
+        external_context={"fields": {"keywords": ["童年", "分别", "重逢"]}},
+    )
+    rendered = e2e._render_e2e_command_payload(command, payload=payload)
+
+    assert payload["fields"]["keywords"] == ["童年", "分别", "重逢"]
+    assert rendered["keywords"] == ["童年", "分别", "重逢"]
+
+
 def test_checkpoint_saved_and_resume_from_changed_step(tmp_path, monkeypatch):
     skill_dir = _make_skill(tmp_path)
     _patch_fast_e2e(monkeypatch)
@@ -137,7 +172,7 @@ async def test_validate_skill_e2e_repair_handoff_continues_to_next_target(monkey
     (skill_dir / "scripts" / "step2.py").write_text("bad2", encoding="utf-8")
 
     monkeypatch.setattr(api.settings, "skills_path", tmp_path)
-    monkeypatch.setattr(api, "run_action", lambda _payload: {"success": True, "path": str(skill_dir), "message": "ok"})
+    monkeypatch.setattr(api, "run_action", lambda _payload: pytest.fail("validate_skill must not call quick_validate/run_action"))
     monkeypatch.setattr(api, "_create_e2e_session", lambda *_args, **_kwargs: SimpleNamespace(events=[]))
 
     validation_targets = iter([

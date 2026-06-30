@@ -9,12 +9,13 @@ from pathlib import Path as _Path
 from typing import Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from ..services.skill_manager import (
     delete_asset,
     delete_skill,
+    export_skill_zip,
     get_asset,
     get_execution_skill_dir,
     get_skill,
@@ -485,6 +486,22 @@ async def list_skill_outputs(skill_name: str):
             "modified": stat.st_mtime,
         })
     return {"files": files}
+
+
+@router.get("/{skill_name}/export")
+async def export_skill(skill_name: str, portable: bool = Query(False), mode: SkillMode = Query("manage")):
+    try:
+        data = export_skill_zip(skill_name, portable=portable, mode=mode)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    suffix = "portable" if portable else "skill"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{skill_name}-{suffix}.zip"'},
+    )
 
 
 @router.get("/{skill_name}/files/{filepath:path}")

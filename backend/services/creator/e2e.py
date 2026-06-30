@@ -521,6 +521,7 @@ def _seed_initial_e2e_payload(
     commands: list[E2EWorkflowCommand],
     *,
     external_context: dict[str, Any] | None = None,
+    skill_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Seed Creator E2E with a non-empty generic external input envelope.
 
@@ -528,7 +529,8 @@ def _seed_initial_e2e_payload(
     也必须给 {{user_request}} / {{input}} / {{text}} / {{payload}}
     一个非空通用测试值，否则第一步会收到空字符串，导致参数接入审查误判。
 
-    这里仍然不发明业务字段，只补平台通用外部输入 envelope。
+    fields.<key> 占位符按第一步脚本 strict_json_argv_guard schema 补 typed E2E
+    测试值；这些值只存在于 runtime payload，不写回 SKILL.md。
     """
     base_context = external_context
     if not isinstance(base_context, dict):
@@ -564,6 +566,43 @@ def _seed_initial_e2e_payload(
 
     if not isinstance(payload.get("files"), list):
         payload["files"] = list(payload.get("input_files") or [])
+
+    if commands:
+        first = commands[0]
+        schema: dict[str, Any] = {"expected_types": {}}
+        if skill_dir is not None and first.script_path.endswith(".py"):
+            script_file = skill_dir / first.script_path
+            if script_file.is_file():
+                try:
+                    schema = extract_python_strict_argv_schema(script_file.read_text(encoding="utf-8"))
+                except Exception:
+                    schema = {"expected_types": {}}
+        expected_types = schema.get("expected_types") if isinstance(schema, dict) else {}
+        if not isinstance(expected_types, dict):
+            expected_types = {}
+        placeholders = _placeholder_exprs_from_value(first.argv_template)
+        fields = payload.get("fields")
+        if isinstance(fields, dict):
+            for expr in placeholders:
+                parts = str(expr or "").strip().split(".")
+                if len(parts) != 2 or parts[0] != "fields" or not parts[1]:
+                    continue
+                key = parts[1]
+                if _json_value_non_empty(fields.get(key)):
+                    continue
+                value_type = str(expected_types.get(key) or "").lower()
+                if value_type in {"list", "array"}:
+                    fields[key] = ["__creator_e2e_typed_seed__"]
+                elif value_type in {"dict", "object"}:
+                    fields[key] = {"value": "__creator_e2e_typed_seed__"}
+                elif value_type in {"int", "integer"}:
+                    fields[key] = 1
+                elif value_type in {"float", "number"}:
+                    fields[key] = 1.0
+                elif value_type in {"bool", "boolean"}:
+                    fields[key] = True
+                else:
+                    fields[key] = seed_value
 
     return payload
 
@@ -1526,13 +1565,15 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
         f"candidate_targets={candidate_targets}。strict_json_argv_guard 是接口不对齐探针，不是默认修复目标；"
         "E2E 阶段以已经生成的 script 为主要接口事实，SKILL.md command block 是 orchestration 描述；"
         "如果 script 自身接口自洽而 SKILL.md command argv 不一致，优先修 SKILL.md 当前失败 command JSON argv。"
+        "missing_required keys 时优先修 SKILL.md command JSON argv 或 graph/command binding，传齐脚本 required keys；不要让脚本为了适配错误 SKILL.md 把 required schema 改成泛化 payload。"
+        "如果 command argv 对图谱标记为 dynamic 的输入使用 literal runtime data，target_file=SKILL.md 或 graph/command binding，改为图谱边派生的占位符。"
         "只有 script 语法/导入/入口/JSON argv 读取、guard 与 run/main 读取字段不一致、未消费正确字段、stdout/artifact 输出错误时才改 script。"
         "禁止只改 guard schema 或只 patch guard spec；不得为了适配错误 SKILL.md command 而重命名脚本接口。"
         "不能通过删除参数、删除业务参数或删除功能分支降低功能覆盖面；不强制固定字段常量名；"
         "required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，移除确属职责外的 unknown keys；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
+        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，第一步输入只能从 platform_input_node 边界字段派生，后续步骤只能从前序 stdout 边派生；移除确属职责外的 unknown keys；不得写 dynamic literal runtime data；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
     if primary == script_path:
         return common + f"\nprimary_target={script_path}：只修改当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout 输出逻辑；确保入口校验与 run/main 实际使用参数对齐；不要只修 guard；不得改 SKILL.md，不得为了适配错误 SKILL.md 而重命名脚本接口，不得删除 guard、核心功能或用默认值绕过必需输入。"
     return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 当前失败 command JSON argv，还是当前脚本入口接口与核心逻辑一致性。"
@@ -1871,6 +1912,7 @@ def _run_skill_workflow_e2e_once(
         payload: dict[str, Any] = _seed_initial_e2e_payload(
             commands,
             external_context=external_context,
+            skill_dir=trial_skill_dir,
         )
         traces: list[E2EStepTrace] = []
 

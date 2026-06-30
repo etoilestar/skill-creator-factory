@@ -27,6 +27,20 @@ FileRole = str
 
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 
+
+class MissingCommandArgBindingError(ValueError):
+    """Raised when required argv keys have no graph/command binding."""
+
+    code = "missing_command_arg_binding"
+
+    def __init__(self, script_path: str, missing_keys: list[str]) -> None:
+        self.script_path = script_path
+        self.missing_keys = missing_keys
+        super().__init__(
+            "missing_command_arg_binding: "
+            f"{script_path} missing graph/command binding for required argv keys: {', '.join(missing_keys)}"
+        )
+
 PLATFORM_LAYER_NAMES: frozenset[str] = frozenset({
     "creator_internal",
     "business_skill",
@@ -234,6 +248,8 @@ class SkillPlanEntry:
     runtime: Runtime = "none"
     entrypoint: str = ""
     command_template: str = ""
+    input_binding: list[dict[str, object]] = field(default_factory=list)
+    command_arg_bindings: list[dict[str, object]] = field(default_factory=list)
     workflow_order: int = 0
     logical_edges: list[dict[str, object]] = field(default_factory=list)
     required_tool_slots: list[ToolSlot] = field(default_factory=list)
@@ -386,6 +402,51 @@ def command_template_for_entry(path: str, runtime: Runtime, inputs: list[str], r
     return _render_command(path, runtime, payload)
 
 
+def render_script_command_from_runtime_schema(
+    entry: SkillPlanEntry,
+    script_argv_schema: dict[str, object],
+    *,
+    previous_stdout_fields: set[str] | None = None,
+    is_first_step: bool = False,
+) -> str:
+    """Render a deterministic SKILL.md argv template from script schema/bindings.
+
+    The generated command contains placeholders derived from graph/bindings only.
+    """
+    previous_stdout_fields = previous_stdout_fields or set()
+    expected_types = script_argv_schema.get("expected_types") if isinstance(script_argv_schema, dict) else {}
+    if not isinstance(expected_types, dict):
+        expected_types = {}
+    required = script_argv_schema.get("required_keys") if isinstance(script_argv_schema, dict) else []
+    if not isinstance(required, list):
+        required = []
+
+    bindings = list(getattr(entry, "command_arg_bindings", []) or []) or list(getattr(entry, "input_binding", []) or [])
+    binding_by_key = {
+        str(binding.get("argv_key")): binding
+        for binding in bindings
+        if isinstance(binding, dict) and str(binding.get("argv_key") or "").strip()
+    }
+
+    payload: dict[str, object] = {}
+    missing_bindings: list[str] = []
+    for key in sorted(str(item) for item in required if str(item or "").strip()):
+        binding = binding_by_key.get(key)
+        template = binding.get("value_template") if isinstance(binding, dict) else None
+        if isinstance(template, str) and re.fullmatch(r"\{\{\s*[^{}]+?\s*\}\}", template.strip()):
+            payload[key] = template.strip()
+            continue
+        # Without a graph edge/binding, do not invent an internal field name or
+        # value template. E2E/dataflow validation should surface a repairable
+        # binding failure.
+        missing_bindings.append(key)
+
+    if missing_bindings:
+        raise MissingCommandArgBindingError(entry.path, missing_bindings)
+
+    return _render_command(entry.path, entry.runtime, payload)
+
+
 def render_script_command_from_skill_plan(
     entry: SkillPlanEntry,
     values: dict[str, str] | None = None,
@@ -393,20 +454,18 @@ def render_script_command_from_skill_plan(
 ) -> str:
     """Render a SKILL.md script command from verified runtime args when available.
 
-    Priority: ScriptRuntimeSpec.accepted_sample_argv, runtime_contract.command_args,
+    Priority: schema/bindings supplied by E2E repair, runtime_contract.command_args,
     entry.command_template, then the platform-stable external envelope.
     SkillPlan.inputs remain generation hints and are not used as argv keys.
     """
     if runtime_spec is not None:
         if isinstance(runtime_spec, ScriptRuntimeSpec):
-            if runtime_spec.accepted_sample_argv:
-                return _render_command(runtime_spec.script_path or entry.path, runtime_spec.runtime or entry.runtime, dict(runtime_spec.accepted_sample_argv))
             if runtime_spec.command_template:
                 return runtime_spec.command_template
         elif isinstance(runtime_spec, dict):
-            accepted = runtime_spec.get("accepted_sample_argv")
-            if isinstance(accepted, dict) and accepted:
-                return _render_command(str(runtime_spec.get("script_path") or entry.path), str(runtime_spec.get("runtime") or entry.runtime), dict(accepted))
+            schema = runtime_spec.get("script_argv_schema")
+            if isinstance(schema, dict):
+                return render_script_command_from_runtime_schema(entry, schema)
             template = str(runtime_spec.get("command_template") or "")
             if template:
                 return template

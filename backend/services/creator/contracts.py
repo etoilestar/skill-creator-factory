@@ -421,16 +421,19 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 对蓝图真实规划的 scripts/ 文件，使用标准 Markdown 独立 ```bash fenced code block。",
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
-        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；不确定具体字段时，传入通用 user_request/input payload/envelope 让入口脚本解析。",
-        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、input_files、files、fields、options，或显式 fields/default_values/input_binding。",
+        "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；结构化业务参数必须使用平台结构化输入 root 与图谱/schema 派生的目标字段组成整值占位符。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、fields、options，或显式 input_binding。",
+        "- 禁止在 command JSON argv 中写动态用户内容、前序产物内容、运行时文件路径或 E2E seed 值；这些动态数据只能由图谱边派生的占位符表达。",
+        "- 允许写入图谱/schema 明确声明为静态配置的 literal 常量；不得用 literal 冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
-        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定特定中间字段名；内部流转交给第二轮 E2E 执行验证。",
+        "- 后续命令只能引用由前序 stdout 字段和图谱边派生的占位符；不得写 literal 充当前序 stdout。",
+        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定平台词表为内部字段；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
         "- references/ 是只读参考资料：可按需读取用于格式/模板/规则，但不替代主流程命令块，不作为产物或上传素材。",
         "- assets/ 只能作为上传素材/静态资源引用，不能描述为模型生成。",
         "",
-        "C. 可用脚本路径与静态命令示例:",
+        "C. 可用脚本路径与静态命令形态:",
     ]
 
     for idx, script_path in enumerate(script_paths, start=1):
@@ -443,16 +446,16 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             if str(item).strip()
         ]
 
-        if idx == 1:
-            payload = {"user_request": "{{user_request}}"}
-        elif input_keys:
-            payload = {
-                key: "{{" + key + "}}"
-                for key in input_keys
-                if "/" not in key and "\\" not in key and len(key) <= 80
-            }
-        else:
-            payload = {}
+        bindings = [
+            binding for binding in (getattr(entry, "command_arg_bindings", []) or [])
+            if isinstance(binding, dict)
+            and str(binding.get("argv_key") or "").strip()
+            and str(binding.get("value_template") or "").strip()
+        ]
+        payload = {
+            str(binding.get("argv_key")).strip(): str(binding.get("value_template")).strip()
+            for binding in bindings
+        }
 
         json_command = f"{runner} {script_path} {shlex.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))}"
 
@@ -460,9 +463,9 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             f"{idx}. {script_path}",
             f"   role: {entry.role}",
             f"   suggested inputs: {', '.join(input_keys) if input_keys else '无显式输入字段'}",
-            "   command shape examples（只说明形态，实际参数必须由脚本真实接口决定）:",
+            "   command shape（只说明形态，实际参数必须由脚本真实接口决定）:",
             "```bash",
-            json_command,
+            json_command if payload else "# 待 E2E dataflow binding 修复：缺少 graph edge / command_arg_bindings 时不要发明 argv。",
             "```",
             "   Creator 默认生成只使用上述 JSON argv 命令形态；外部已有 CLI 应由包装入口适配。",
         ])

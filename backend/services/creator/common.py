@@ -392,6 +392,96 @@ def _normalize_dataflow_edges(raw_edges: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _validate_requirement_graph_edges(graph: RequirementGraph, files: list[Any]) -> None:
+    platform_input = graph.platform_input_node or {}
+    platform_output = graph.platform_output_node or {}
+    platform_input_id = str(platform_input.get("node_id") or "platform_input_node")
+    platform_output_id = str(platform_output.get("node_id") or "platform_output_node")
+    platform_input_fields = {str(field) for field in (platform_input.get("outputs") or [])}
+    platform_output_fields = {str(field) for field in (platform_output.get("inputs") or [])}
+
+    script_nodes = {
+        str(item.target_file)
+        for item in graph.requirements
+        if str(item.target_file or "").startswith("scripts/")
+    }
+    for file_spec in files or []:
+        path = str(getattr(file_spec, "path", "") or "")
+        if path.startswith("scripts/"):
+            script_nodes.add(path)
+
+    outputs_by_script: dict[str, set[str]] = {
+        str(item.target_file): {str(field) for field in (item.outputs or []) if str(field or "").strip()}
+        for item in graph.requirements
+        if str(item.target_file or "").startswith("scripts/")
+    }
+    for file_spec in files or []:
+        path = str(getattr(file_spec, "path", "") or "")
+        if not path.startswith("scripts/"):
+            continue
+        outputs_by_script.setdefault(path, set()).update(
+            str(field).strip()
+            for field in (getattr(file_spec, "outputs", []) or [])
+            if str(field or "").strip()
+        )
+
+    for idx, edge in enumerate(graph.dataflow_edges or []):
+        from_node = str(edge.get("from_node") or "")
+        from_field = str(edge.get("from_field") or "")
+        to_node = str(edge.get("to_node") or "")
+        to_field = str(edge.get("to_field") or "")
+
+        if from_node == platform_input_id:
+            if from_field not in platform_input_fields:
+                raise RequirementGraphValidationError(
+                    "Dataflow edge references an undefined platform input field.",
+                    code="dataflow_edge_invalid",
+                    details={"index": idx, "from_field": from_field},
+                )
+            if to_node not in script_nodes:
+                raise RequirementGraphValidationError(
+                    "Platform input edge must target an existing script node.",
+                    code="dataflow_edge_invalid",
+                    details={"index": idx, "to_node": to_node},
+                )
+            continue
+
+        if to_node == platform_output_id:
+            if from_node not in script_nodes:
+                raise RequirementGraphValidationError(
+                    "Platform output edge must originate from an existing script node.",
+                    code="dataflow_edge_invalid",
+                    details={"index": idx, "from_node": from_node},
+                )
+            if to_field not in platform_output_fields:
+                raise RequirementGraphValidationError(
+                    "Dataflow edge references an undefined platform output field.",
+                    code="dataflow_edge_invalid",
+                    details={"index": idx, "to_field": to_field},
+                )
+            continue
+
+        if from_node in {platform_output_id} or to_node in {platform_input_id}:
+            raise RequirementGraphValidationError(
+                "Dataflow edge uses a platform boundary node in an invalid direction.",
+                code="dataflow_edge_invalid",
+                details={"index": idx, "from_node": from_node, "to_node": to_node},
+            )
+
+        if from_node not in script_nodes or to_node not in script_nodes:
+            raise RequirementGraphValidationError(
+                "Script-to-script dataflow edge references a missing script node.",
+                code="dataflow_edge_invalid",
+                details={"index": idx, "from_node": from_node, "to_node": to_node},
+            )
+        if from_field not in outputs_by_script.get(from_node, set()):
+            raise RequirementGraphValidationError(
+                "Script-to-script dataflow edge references a field not declared by the source script outputs.",
+                code="dataflow_edge_invalid",
+                details={"index": idx, "from_node": from_node, "from_field": from_field},
+            )
+
+
 def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
     return bool(
         getattr(file_spec, "outputs", None)
@@ -520,6 +610,8 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
 
 
 def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:
+    graph = normalize_requirement_graph(graph)
+    _validate_requirement_graph_edges(graph, files)
     required_by_file: dict[str, list[RequirementItem]] = {}
     for item in graph.requirements:
         if item.required:

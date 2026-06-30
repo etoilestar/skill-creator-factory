@@ -592,9 +592,9 @@ def _seed_initial_e2e_payload(
                     continue
                 value_type = str(expected_types.get(key) or "").lower()
                 if value_type in {"list", "array"}:
-                    fields[key] = ["e2e-placeholder-value"]
+                    fields[key] = ["__creator_e2e_typed_seed__"]
                 elif value_type in {"dict", "object"}:
-                    fields[key] = {"value": "e2e-placeholder-value"}
+                    fields[key] = {"value": "__creator_e2e_typed_seed__"}
                 elif value_type in {"int", "integer"}:
                     fields[key] = 1
                 elif value_type in {"float", "number"}:

@@ -1838,6 +1838,27 @@ def test_runtime_schema_renders_first_step_fields_placeholder_without_samples():
     assert '"payload":"{{user_request}}"' not in command
 
 
+def test_runtime_schema_missing_binding_reports_diagnostic():
+    from backend.services.skill_plan import MissingCommandArgBindingError, SkillPlanEntry, render_script_command_from_runtime_schema
+    argv_key = "dynamic_required_field"
+    entry = SkillPlanEntry(
+        path="scripts/step_missing_binding.py",
+        file_type="script",
+        role="generic_script",
+        purpose="generic",
+        runtime="python",
+    )
+
+    with pytest.raises(MissingCommandArgBindingError) as exc_info:
+        render_script_command_from_runtime_schema(
+            entry,
+            {"required_keys": [argv_key], "expected_types": {argv_key: "str"}},
+        )
+
+    assert exc_info.value.code == "missing_command_arg_binding"
+    assert exc_info.value.missing_keys == [argv_key]
+
+
 def test_runtime_schema_renders_subsequent_stdout_placeholders():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
     first_stdout_field = "dynamic_stdout_field"
@@ -1928,6 +1949,99 @@ def test_requirement_graph_injects_immutable_platform_boundary_nodes():
     assert graph.platform_output_node["node_type"] == "platform_output"
     assert graph.platform_output_node["immutable"] is True
     assert graph.platform_output_node["inputs"] == boundary["final_output_fields"]
+
+
+def test_requirement_graph_validates_platform_boundary_edge_directions():
+    from types import SimpleNamespace
+
+    from backend.services.creator.common import RequirementGraphValidationError, normalize_requirement_graph, validate_requirement_graph_schema
+    from backend.services.platform_io_contract import build_platform_io_contract
+
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+    script_path = "scripts/step.py"
+    argv_key = "dynamic_target_field"
+    graph = normalize_requirement_graph({
+        "requirements": [{
+            "target_file": script_path,
+            "purpose": "Process graph-declared data.",
+            "outputs": [argv_key],
+        }],
+        "dataflow_edges": [{
+            "from_node": "platform_input_node",
+            "from_field": boundary["input_envelope_fields"][0],
+            "to_node": script_path,
+            "to_field": argv_key,
+            "value_template": "{{" + boundary["input_envelope_fields"][0] + "}}",
+            "source_kind": "platform_input",
+            "value_type": "str",
+        }, {
+            "from_node": script_path,
+            "from_field": argv_key,
+            "to_node": "platform_output_node",
+            "to_field": boundary["final_output_fields"][0],
+            "value_template": "{{" + argv_key + "}}",
+            "source_kind": "final_stdout",
+            "value_type": "str",
+        }],
+    })
+
+    assert validate_requirement_graph_schema(graph, [SimpleNamespace(path=script_path, outputs=[argv_key])]).dataflow_edges
+
+    bad_input = graph.model_copy(update={"dataflow_edges": [dict(graph.dataflow_edges[0], from_node="scripts/not_platform.py")]})
+    with pytest.raises(RequirementGraphValidationError, match="missing script node"):
+        validate_requirement_graph_schema(bad_input, [SimpleNamespace(path=script_path, outputs=[argv_key])])
+
+    bad_output = graph.model_copy(update={"dataflow_edges": [dict(graph.dataflow_edges[1], to_node="scripts/not_platform.py")]})
+    with pytest.raises(RequirementGraphValidationError, match="missing script node"):
+        validate_requirement_graph_schema(bad_output, [SimpleNamespace(path=script_path, outputs=[argv_key])])
+
+
+def test_requirement_graph_rejects_undefined_platform_and_missing_script_fields():
+    from types import SimpleNamespace
+
+    from backend.services.creator.common import RequirementGraphValidationError, normalize_requirement_graph, validate_requirement_graph_schema
+    from backend.services.platform_io_contract import build_platform_io_contract
+
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+    source_script = "scripts/source.py"
+    target_script = "scripts/target.py"
+    produced_field = "dynamic_produced_field"
+    consumed_field = "dynamic_consumed_field"
+
+    graph = normalize_requirement_graph({
+        "requirements": [
+            {"target_file": source_script, "purpose": "Produce graph field.", "outputs": [produced_field]},
+            {"target_file": target_script, "purpose": "Consume graph field."},
+        ],
+        "dataflow_edges": [{
+            "from_node": source_script,
+            "from_field": produced_field,
+            "to_node": target_script,
+            "to_field": consumed_field,
+            "value_template": "{{" + produced_field + "}}",
+            "source_kind": "previous_stdout",
+            "value_type": "str",
+        }],
+    })
+
+    files = [SimpleNamespace(path=source_script, outputs=[produced_field]), SimpleNamespace(path=target_script, outputs=[])]
+    assert validate_requirement_graph_schema(graph, files).dataflow_edges
+
+    bad_platform_field = graph.model_copy(update={"dataflow_edges": [{
+        "from_node": "platform_input_node",
+        "from_field": "not_a_platform_field",
+        "to_node": target_script,
+        "to_field": consumed_field,
+        "value_template": "{{not_a_platform_field}}",
+        "source_kind": "platform_input",
+        "value_type": "str",
+    }]})
+    with pytest.raises(RequirementGraphValidationError, match="undefined platform input"):
+        validate_requirement_graph_schema(bad_platform_field, files)
+
+    bad_script_field = graph.model_copy(update={"dataflow_edges": [dict(graph.dataflow_edges[0], from_field=boundary["final_output_fields"][0])]})
+    with pytest.raises(RequirementGraphValidationError, match="not declared"):
+        validate_requirement_graph_schema(bad_script_field, files)
 
 
 def test_trial_run_generated_script_returns_runtime_spec(tmp_path, monkeypatch):

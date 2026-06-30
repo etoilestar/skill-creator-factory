@@ -446,20 +446,16 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             if str(item).strip()
         ]
 
-        if idx == 1:
-            first_key = input_keys[0] if input_keys else ""
-            if first_key and "/" not in first_key and "\\" not in first_key and len(first_key) <= 80:
-                payload = {first_key: "{{fields." + first_key + "}}"}
-            else:
-                payload = {"user_request": "{{user_request}}"}
-        elif input_keys:
-            payload = {
-                key: "{{" + key + "}}"
-                for key in input_keys
-                if "/" not in key and "\\" not in key and len(key) <= 80
-            }
-        else:
-            payload = {}
+        bindings = [
+            binding for binding in (getattr(entry, "command_arg_bindings", []) or [])
+            if isinstance(binding, dict)
+            and str(binding.get("argv_key") or "").strip()
+            and str(binding.get("value_template") or "").strip()
+        ]
+        payload = {
+            str(binding.get("argv_key")).strip(): str(binding.get("value_template")).strip()
+            for binding in bindings
+        }
 
         json_command = f"{runner} {script_path} {shlex.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))}"
 
@@ -469,7 +465,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             f"   suggested inputs: {', '.join(input_keys) if input_keys else '无显式输入字段'}",
             "   command shape（只说明形态，实际参数必须由脚本真实接口决定）:",
             "```bash",
-            json_command,
+            json_command if payload else "# 待 E2E dataflow binding 修复：缺少 graph edge / command_arg_bindings 时不要发明 argv。",
             "```",
             "   Creator 默认生成只使用上述 JSON argv 命令形态；外部已有 CLI 应由包装入口适配。",
         ])

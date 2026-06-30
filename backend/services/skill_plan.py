@@ -27,6 +27,20 @@ FileRole = str
 
 SCRIPT_ROLES: frozenset[str] = frozenset(get_script_roles())
 
+
+class MissingCommandArgBindingError(ValueError):
+    """Raised when required argv keys have no graph/command binding."""
+
+    code = "missing_command_arg_binding"
+
+    def __init__(self, script_path: str, missing_keys: list[str]) -> None:
+        self.script_path = script_path
+        self.missing_keys = missing_keys
+        super().__init__(
+            "missing_command_arg_binding: "
+            f"{script_path} missing graph/command binding for required argv keys: {', '.join(missing_keys)}"
+        )
+
 PLATFORM_LAYER_NAMES: frozenset[str] = frozenset({
     "creator_internal",
     "business_skill",
@@ -415,6 +429,7 @@ def render_script_command_from_runtime_schema(
     }
 
     payload: dict[str, object] = {}
+    missing_bindings: list[str] = []
     for key in sorted(str(item) for item in required if str(item or "").strip()):
         binding = binding_by_key.get(key)
         template = binding.get("value_template") if isinstance(binding, dict) else None
@@ -424,6 +439,10 @@ def render_script_command_from_runtime_schema(
         # Without a graph edge/binding, do not invent an internal field name or
         # value template. E2E/dataflow validation should surface a repairable
         # binding failure.
+        missing_bindings.append(key)
+
+    if missing_bindings:
+        raise MissingCommandArgBindingError(entry.path, missing_bindings)
 
     return _render_command(entry.path, entry.runtime, payload)
 

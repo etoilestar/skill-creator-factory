@@ -57,7 +57,8 @@ def test_portable_zip_skill_runtime_env_and_no_secret(tmp_path, monkeypatch):
     assert not any(name.startswith("_portable_runtime/") for name in names)
     assert "LLM_API_BASE=<FILL_ME>" in env and "LLM_API_KEY=<FILL_ME>" in env and "LLM_MODEL=<FILL_ME>" in env
     manifest = json.loads(zipfile.ZipFile(io.BytesIO(buf.getvalue())).read("skill-portability.json").decode())
-    assert manifest["manual_host_adapter_required"] is True
+    assert manifest["manual_host_adapter_required"] is False
+    assert "generate_text_with_llm" in manifest["portable_adapters"]
     assert b"real-secret" not in blob
 
 
@@ -177,6 +178,8 @@ def test_runtime_closure_requirements_and_env_placeholders(tmp_path, monkeypatch
     assert "SEARCHXNG_BASE_URL=<FILL_ME>" in env
     assert manifest["env_placeholders"]["SEARCHXNG_BASE_URL"] == "<FILL_ME>"
     assert "web_search" in manifest["adapted_tools"]
+    assert "web_search" in manifest["portable_adapters"]
+    assert manifest["manual_host_adapter_required"] is False
     assert isinstance(requirements, str)
 
 
@@ -200,6 +203,8 @@ def test_skill_runtime_adapter_signature_accepts_real_call_and_errors_at_runtime
     generate_text_with_llm = namespace["generate_text_with_llm"]
 
     assert "generate_text_with_llm" in manifest["adapted_tools"]
+    assert "generate_text_with_llm" in manifest["portable_adapters"]
+    assert manifest["manual_host_adapter_required"] is False
     assert not (extract_dir / "_portable_runtime").exists()
     with pytest.raises(RuntimeError, match="LLM_BASE_URL|LLM_API_BASE|fill .env.example"):
         generate_text_with_llm("hello", system="sys", temperature=0.1)
@@ -322,3 +327,111 @@ def test_inline_same_helper_names_from_two_modules_do_not_override(tmp_path, mon
     assert "_portable_" in script
     namespace = runpy.run_path(str(extract_dir / "scripts" / "same.py"))
     assert namespace["RESULT"] == "ab"
+
+
+
+def test_inline_headers_are_per_script_not_global(tmp_path):
+    from backend.services.skill_portability import add_portable_files_to_zip
+
+    d = _skill(tmp_path)
+    (d / "scripts" / "generate_illustrations.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\nfrom backend.services.skill_runtime import generate_stable_diffusion_image\n",
+        encoding="utf-8",
+    )
+    (d / "scripts" / "build_pdf.py").write_text(
+        "from backend.services.runtime_tools import create_pdf_document\n",
+        encoding="utf-8",
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        add_portable_files_to_zip(zf, d)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        illustration = zf.read("scripts/generate_illustrations.py").decode()
+        pdf = zf.read("scripts/build_pdf.py").decode()
+        manifest = json.loads(zf.read("skill-portability.json").decode())
+    illustration_header = illustration.split("# --- END PORTABLE INLINE TOOLS ---", 1)[0]
+    pdf_header = pdf.split("# --- END PORTABLE INLINE TOOLS ---", 1)[0]
+    assert "strict_json_argv_guard" in illustration_header
+    assert "generate_stable_diffusion_image" in illustration_header
+    assert "create_pdf_document" not in illustration_header
+    assert "_normalize_pdf_styles" not in illustration_header
+    assert "create_pdf_document" in pdf_header
+    assert "generate_stable_diffusion_image" not in pdf_header
+    assert manifest["inlined_tools"].count("strict_json_argv_guard") == 1
+    assert manifest["inlined_constants"].count("_TYPE_ALIASES") <= 1
+
+
+def test_generate_stable_diffusion_image_adapter_runs_with_b64_response(tmp_path, monkeypatch):
+    from backend.services.skill_portability import add_portable_files_to_zip
+
+    d = _skill(tmp_path)
+    (d / "scripts" / "image.py").write_text(
+        "from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+        encoding="utf-8",
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        add_portable_files_to_zip(zf, d)
+    extract_dir = tmp_path / "image_extract"
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        zf.extractall(extract_dir)
+        manifest = json.loads((extract_dir / "skill-portability.json").read_text())
+    assert manifest["manual_host_adapter_required"] is False
+    assert "generate_stable_diffusion_image" in manifest["portable_adapters"]
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return json.dumps({"data": [{"b64_json": "iVBORw0KGgo="}]}).encode()
+
+    monkeypatch.setenv("IMAGE_API_BASE", "https://images.example/v1")
+    monkeypatch.setenv("IMAGE_API_KEY", "test-key")
+    monkeypatch.setenv("IMAGE_MODEL", "test-image")
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse())
+    namespace = runpy.run_path(str(extract_dir / "scripts" / "image.py"))
+    result = namespace["generate_stable_diffusion_image"]("cat", filename_prefix="cat")
+    assert Path(result["image_path"]).is_file()
+    assert result["image_paths"] == [result["image_path"]]
+    assert result["file_outputs"] == [result["image_path"]]
+
+
+def test_generate_stable_diffusion_image_missing_env_errors_at_runtime(tmp_path, monkeypatch):
+    from backend.services.skill_portability import add_portable_files_to_zip
+
+    for name in ["IMAGE_API_BASE", "IMAGE_API_KEY", "IMAGE_MODEL"]:
+        monkeypatch.delenv(name, raising=False)
+    d = _skill(tmp_path)
+    (d / "scripts" / "image_missing.py").write_text(
+        "from backend.services.skill_runtime import generate_stable_diffusion_image\n",
+        encoding="utf-8",
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        add_portable_files_to_zip(zf, d)
+    extract_dir = tmp_path / "image_missing_extract"
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        zf.extractall(extract_dir)
+    namespace = runpy.run_path(str(extract_dir / "scripts" / "image_missing.py"))
+    with pytest.raises(RuntimeError, match="IMAGE_API_BASE|IMAGE_API_KEY|IMAGE_MODEL"):
+        namespace["generate_stable_diffusion_image"]("cat")
+
+
+def test_registered_tool_call_marks_manual_host_adapter(tmp_path):
+    from backend.services.skill_portability import add_portable_files_to_zip
+
+    d = _skill(tmp_path)
+    (d / "scripts" / "registered.py").write_text(
+        "from backend.services.runtime_tools import registered_tool_call\n",
+        encoding="utf-8",
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        add_portable_files_to_zip(zf, d)
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        manifest = json.loads(zf.read("skill-portability.json").decode())
+        env = zf.read(".env.example").decode()
+    assert manifest["manual_host_adapter_required"] is True
+    assert "registered_tool_call" in manifest["manual_adapter_tools"]
+    assert "manual host adapter implementation" in env

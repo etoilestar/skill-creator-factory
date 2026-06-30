@@ -1285,6 +1285,106 @@ _SCRIPT_RAW_SOURCE_FORMAT_ERROR_IDS = {
     "script.raw_source.ambiguous_script_candidate",
 }
 
+_MARKDOWN_FORMAT_ERROR_ID_PREFIXES = (
+    "skill_md.frontmatter",
+    "skill_md.markdown_body_structure",
+    "skill_md.command_block",
+    "skill_md.script_command",
+    "command_block",
+)
+
+_MARKDOWN_FORMAT_ERROR_TEXT_MARKERS = (
+    "hard_format",
+    "markdown_format",
+    "frontmatter",
+    "metadata_region",
+    "body_region",
+    "fenced_block",
+    "fence",
+    "code fence",
+    "command_block",
+    "json_argv",
+    "shell_command",
+    "markdown_body_structure",
+    "yaml",
+)
+
+_SKILL_MD_BODY_FORMAT_REQUIREMENTS = """SKILL.md body_region 格式硬要求：
+1. 只输出 Markdown 正文，不输出 YAML frontmatter。
+2. 所有 fenced code block 必须完整闭合。
+3. 每个真实 scripts/*.py 必须有一个独立、无缩进的 ```bash fenced code block。
+4. 每个 ```bash block 内只能包含一条真实 shell 命令。
+5. ```bash block 内禁止出现多条命令、说明文字、列表、注释、JSON 配置对象或伪命令对象。
+6. 命令必须直接调用真实 scripts/*.py 路径。
+7. 默认命令格式是：python scripts/<file>.py '<JSON object argv>'。
+8. JSON argv 必须是 shell-quoted 的 JSON object 字符串。
+9. 动态 placeholder 必须作为 JSON 字符串值出现。
+10. 禁止在 ```bash block 内放 runtime/entrypoint/argv JSON 对象。
+11. 禁止在 ```bash block 内放 runner/script/argv JSON 对象。
+12. 禁止使用 --argv，除非当前脚本源码明确实现了 --argv。
+13. Creator 默认脚本协议是 sys.argv[1] JSON object。
+14. compact_requirement_graph 只是职责上下文，不是命令块格式。
+15. 不得把 compact_requirement_graph 条目复制成 JSON block。
+16. 不得把 runtime、target_file、inputs、outputs 这些图谱字段原样写成 bash block 内容。"""
+
+_REFERENCE_MD_BODY_FORMAT_REQUIREMENTS = """references/*.md body_region 格式硬要求：
+references/*.md 是参考资料正文，不是执行步骤。
+不得输出调用 scripts/*.py 的 executable ```bash block。
+不得重新定义 scripts 的 final inputs/outputs。
+不得把 reference 写成 workflow 执行入口。
+如需展示命令形态，只能使用 ```text 或普通说明。
+所有 fenced block 必须完整闭合。"""
+
+
+def _is_markdown_creator_file(file_path: str) -> bool:
+    return (
+        file_path == "SKILL.md"
+        or file_path.startswith("references/")
+        or Path(file_path).suffix.lower() in {".md", ".markdown"}
+    )
+
+
+def _markdown_format_requirements_for_prompt(file_path: str, region: str) -> str:
+    if region != "body_region":
+        return (
+            "metadata_region 格式硬要求：只输出闭合 YAML frontmatter；"
+            "不得输出正文；不得输出未闭合 fence；不得写 workflow/inputs/outputs/runtime_contract 等内部合同字段。"
+        )
+    if file_path == "SKILL.md":
+        return _SKILL_MD_BODY_FORMAT_REQUIREMENTS
+    if file_path.startswith("references/"):
+        return _REFERENCE_MD_BODY_FORMAT_REQUIREMENTS
+    return (
+        "Markdown body_region 格式硬要求：只输出正文，不输出 YAML frontmatter；"
+        "所有 fenced code block 必须完整闭合。"
+    )
+
+
+def _contract_result_id(result: Any) -> str:
+    if isinstance(result, ContractCheckResult):
+        return str(result.id or "")
+    if isinstance(result, dict):
+        return str(result.get("id") or result.get("check_id") or "")
+    return ""
+
+
+def _contract_result_layer(result: Any) -> str:
+    if isinstance(result, ContractCheckResult):
+        return str(result.layer or "")
+    if isinstance(result, dict):
+        return str(result.get("layer") or "")
+    return ""
+
+
+def _is_markdown_format_result(result: Any) -> bool:
+    result_id = _contract_result_id(result)
+    layer = _contract_result_layer(result)
+    combined = f"{result_id}\n{layer}".lower()
+    return (
+        any(result_id.startswith(prefix) for prefix in _MARKDOWN_FORMAT_ERROR_ID_PREFIXES)
+        or any(marker in combined for marker in _MARKDOWN_FORMAT_ERROR_TEXT_MARKERS)
+    )
+
 
 def is_script_raw_source_format_error(stage_error: FileGenerationStageError) -> bool:
     """Route scripts/* raw-source structure failures to regeneration only."""
@@ -1314,7 +1414,8 @@ def _result_requires_full_format_rewrite(result: Any) -> bool:
         repair_strategy = str(details.get("repair_strategy") or "").strip()
         model_patch_allowed = details.get("model_patch_allowed")
         return (
-            result.layer == "hard_format"
+            _is_markdown_format_result(result)
+            or result.layer == "hard_format"
             or severity == "hard_format"
             or repair_strategy == "full_rewrite"
             or model_patch_allowed is False
@@ -1324,7 +1425,8 @@ def _result_requires_full_format_rewrite(result: Any) -> bool:
         if result.get("passed") is True:
             return False
         return (
-            str(result.get("layer") or "").strip() == "hard_format"
+            _is_markdown_format_result(result)
+            or str(result.get("layer") or "").strip() == "hard_format"
             or str(result.get("severity") or "").strip() == "hard_format"
             or str(result.get("repair_strategy") or "").strip() == "full_rewrite"
             or result.get("model_patch_allowed") is False
@@ -1351,6 +1453,8 @@ def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationSta
 
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
+        return True
+    if str(getattr(stage_error, "layer", "") or "") == "markdown_format":
         return True
     return _stage_error_has_full_format_rewrite_contract(stage_error)
 
@@ -1482,6 +1586,7 @@ def _build_markdown_region_rewrite_prompt(
             f"文件路径：{file_path}\nSkill 名称：{skill_name}\n\n"
             "失败项：\n"
             f"{deterministic_error}\n\n"
+            f"{_markdown_format_requirements_for_prompt(file_path, 'metadata_region')}\n\n"
             "只修 metadata_region。禁止输出 body_region，禁止修改正文语义。\n"
             "输出必须以 --- 开始，并以单独一行 --- 闭合。\n"
             "metadata 只描述当前文件自身，不要写其它 scripts 的 capability/runtime/tool 边界。\n\n"
@@ -1495,6 +1600,7 @@ def _build_markdown_region_rewrite_prompt(
             f"{(blueprint_text or '')[:6000]}"
         )
     else:
+        body_format_requirements = _markdown_format_requirements_for_prompt(file_path, "body_region")
         system = (
             "你是 Markdown body_region 格式修复器。"
             "只输出修复后的 body_region；不要输出 YAML frontmatter；不要解释。"
@@ -1504,6 +1610,7 @@ def _build_markdown_region_rewrite_prompt(
             f"文件路径：{file_path}\nSkill 名称：{skill_name}\n\n"
             "失败项：\n"
             f"{deterministic_error}\n\n"
+            f"{body_format_requirements}\n\n"
             "只修 body_region。禁止重新生成 metadata/frontmatter，禁止输出文件开头 ---。\n"
             "如果 command/bash block 格式错误，只修正文中的 block。"
             "reference 正文不得重新定义 scripts/*.py 的 capability/runtime/tool 边界。\n\n"
@@ -1655,6 +1762,7 @@ def _build_markdown_initial_region_prompt(
     )
     if file_path == "SKILL.md":
         body_rules = (
+            f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n"
             "SKILL.md body 必须基于 blueprint_text、compact requirement_graph、workflow_allocation_summary、"
             "final_outputs 以及 references/assets 路径写最终用户说明。\n"
             "应包含：Skill 用途；用户需要提供什么；高层执行流程；每个真实脚本的自然语言职责说明；"
@@ -1665,6 +1773,7 @@ def _build_markdown_initial_region_prompt(
         )
     elif file_path.startswith("references/"):
         body_rules = (
+            f"{_REFERENCE_MD_BODY_FORMAT_REQUIREMENTS}\n\n"
             "references/*.md body 只写参考资料正文；不作为执行步骤；不要写可执行 bash/sh/shell block 调用 scripts/*.py；"
             "不重新定义 scripts 的 final inputs/outputs；可以包含普通说明、模板、示例、格式规则；"
             "命令示例必须是非执行性质，优先用 text code block。"
@@ -2175,11 +2284,7 @@ async def generate_file(request: GenerateFileRequest):
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
                 if is_generation_format_error(stage_error) and request.file_path.startswith("scripts/"):
                     format_retry_count += 1
-                elif is_markdown_hard_format_error(stage_error) and (
-                    request.file_path == "SKILL.md"
-                    or request.file_path.startswith("references/")
-                    or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
-                ):
+                elif is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
                     markdown_format_retry_count += 1
                 else:
                     business_repair_count += 1
@@ -2387,11 +2492,7 @@ async def generate_file(request: GenerateFileRequest):
                     error_layer = f"{stage_error.source}:{stage_error.layer}"
                     repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
 
-                if is_markdown_hard_format_error(stage_error) and (
-                    request.file_path == "SKILL.md"
-                    or request.file_path.startswith("references/")
-                    or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
-                ):
+                if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
                     layer_limit = _first_round_repair_limit(error_source)
 
                     if markdown_format_retry_count > layer_limit:
@@ -2458,7 +2559,7 @@ async def generate_file(request: GenerateFileRequest):
                         ),
                         error_type=(
                             _markdown_warning_error_type(request.file_path, default="md_content_repair_warning")
-                            if request.file_path == "SKILL.md" or request.file_path.startswith("references/") or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                            if _is_markdown_creator_file(request.file_path)
                             else "repair_layer_limit_exceeded"
                         ),
                         content=candidate or "",
@@ -2611,9 +2712,7 @@ async def generate_file(request: GenerateFileRequest):
 
                 except Exception as repair_exc:
                     if (
-                        request.file_path == "SKILL.md"
-                        or request.file_path.startswith("references/")
-                        or Path(request.file_path).suffix.lower() in {".md", ".markdown"}
+                        _is_markdown_creator_file(request.file_path)
                     ) and (
                         "hard_format_regression" in str(repair_exc)
                         or "hard_format failure must not enter localized patch repair" in str(repair_exc)

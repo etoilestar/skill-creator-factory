@@ -1340,3 +1340,29 @@ def test_structured_failure_signature_ignores_candidate_digest():
     err1 = FileGenerationStageError(source="script_functional", layer="responsibility", detail="one")
     err2 = FileGenerationStageError(source="script_functional", layer="responsibility", detail="one")
     assert api._structured_failure_signature(err1, "same failure") == api._structured_failure_signature(err2, "same failure")
+
+
+def test_skill_md_format_stage_no_longer_blocks_bad_frontmatter():
+    from backend.services.creator import api
+
+    assert api._first_round_format_stage_error(
+        file_path="SKILL.md",
+        content="# Runtime instructions only\n\n```bash\npython scripts/main.py '{}'\n```",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_write_file_accepts_skill_md_without_frontmatter(monkeypatch, tmp_path):
+    from backend.services.creator import api
+
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    (tmp_path / "demo").mkdir()
+
+    response = await api.write_file(api.WriteFileRequest(
+        skill_name="demo",
+        file_path="SKILL.md",
+        content="# Runtime instructions only\n\n```bash\npython scripts/main.py '{}'\n```",
+    ))
+
+    assert response.success is True
+    assert (tmp_path / "demo" / "SKILL.md").read_text(encoding="utf-8").startswith("# Runtime instructions only")

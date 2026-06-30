@@ -1111,13 +1111,59 @@ def _deterministic_skill_md_blueprint_alignment_checks(
     return []
 
 
+def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, Any]:
+    """Keep only source-proof context needed by the SKILL.md semantic reviewer."""
+    if raw_graph is None:
+        return {"requirements": []}
+    if hasattr(raw_graph, "model_dump"):
+        raw_graph = raw_graph.model_dump(mode="json")
+    if not isinstance(raw_graph, dict):
+        return {"requirements": []}
+
+    def trunc(value: Any, limit: int = 300) -> str:
+        return str(value or "").strip()[:limit]
+
+    def string_list(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple)):
+            raw_items = list(value)
+        elif value in (None, ""):
+            raw_items = []
+        else:
+            raw_items = [value]
+        return [text for text in (trunc(item) for item in raw_items) if text][:50]
+
+    requirements: list[dict[str, Any]] = []
+    raw_requirements = raw_graph.get("requirements")
+    if not isinstance(raw_requirements, list):
+        raw_requirements = []
+    for item in raw_requirements[:50]:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump(mode="json")
+        if not isinstance(item, dict):
+            continue
+        target_file = trunc(item.get("target_file"))
+        if not target_file:
+            continue
+        requirements.append({
+            "target_file": target_file,
+            "role": trunc(item.get("role")),
+            "runtime": trunc(item.get("runtime")),
+            "purpose": trunc(item.get("purpose")),
+            "inputs": string_list(item.get("inputs")),
+            "outputs": string_list(item.get("outputs")),
+            "depends_on": string_list(item.get("depends_on")),
+        })
+    return {"requirements": requirements}
+
+
 async def _review_skill_md_blueprint_intent_with_model(
     *,
     skill_name: str,
     content: str,
     blueprint_text: str,
     skill_plan_entry: dict[str, Any] | None,
-    model: str | None,
+    requirement_graph: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Model review for first-round SKILL.md semantic coverage.
 
@@ -1128,6 +1174,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         blueprint_text=blueprint_text,
         skill_plan_entry=skill_plan_entry,
     )
+    graph_context = _compact_requirement_graph_for_skill_md_review(requirement_graph)
 
     route = route_model(
         VALIDATOR_TASK,
@@ -1170,11 +1217,21 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- 没写 role/source/dependencies/bundled 等内部 manifest 字段；\n"
         "- 触发词、章节模板、固定话术没有逐字一致。\n\n"
         "不要为了让文案更精确而提出 blocking repair；不要要求 SKILL.md 写内部 manifest 字段。\n\n"
+        "SKILL.md bash command block 语义审查规则：\n"
+        "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
+        "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
+        "- 对每个 command JSON argv 中的动态参数值，判断它是否有来源证明：平台输入 envelope placeholder、requirement_graph 中上游 outputs placeholder、当前脚本允许的配置常量、蓝图明确声明的固定常量。\n"
+        "- 如果某个参数没有可靠来源，应省略并由脚本内部默认化；不得为了让命令看起来完整而编造字面值。\n"
+        "- 如果某个动态参数值是没有来源证明的字面值，应判为 error；这是命令模板语义错误，不是 Markdown hard_format。\n"
+        "- 输出这类 issue 时 category 使用 command_template_source_proof，field 使用 workflow，minimal_edit 必须要求只修改对应 bash command block 的 JSON argv，不改 metadata，不重写整篇文档。\n"
+        "- 这类 issue 的通用 message 使用：SKILL.md bash command block 的 JSON argv 包含缺少来源证明的字面值；命令块应是运行模板。\n"
+        "- 这类 issue 的 expected 使用：将缺少来源证明的字面值替换为平台输入 placeholder 或上游 output placeholder；无可靠来源的可选字段应省略并由脚本内部默认化。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
         "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
+        "- category 可选；命令模板参数来源证明问题必须填写 command_template_source_proof。\n"
         "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件和资源角色判断原则：\n"
@@ -1202,6 +1259,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
+        '      "category": "command_template_source_proof|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1222,6 +1280,9 @@ async def _review_skill_md_blueprint_intent_with_model(
 
         "【解析器提取路径，供参考；不是最终裁决】\n"
         f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
+
+        "【compact requirement_graph 上下文，仅用于判断上游 outputs placeholder 来源；不得改写 purpose/inputs/outputs，不得重新划分职责】\n"
+        f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
 
         "【蓝图原文】\n"
         f"{(blueprint_text or '')[-18000:]}\n\n"
@@ -1502,6 +1563,28 @@ def _review_issue_is_detail_or_proof_request(issue: dict[str, Any]) -> bool:
     return any(term in text for term in _DETAIL_OR_PROOF_REVIEW_TERMS)
 
 
+def _review_issue_is_command_template_source_proof_error(issue: dict[str, Any]) -> bool:
+    category = str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
+    field = str(issue.get("field") or "").strip().lower()
+    if field not in {"workflow", "execution", "platform_io", "command_template"}:
+        return False
+    impact = issue.get("contract_impact") or issue.get("impact")
+    if not isinstance(impact, dict):
+        return False
+    has_relevant_impact = any(bool(impact.get(key)) for key in (
+        "execution_closure", "platform_io", "user_requirement_transfer"
+    ))
+    if not has_relevant_impact:
+        return False
+    if category == "command_template_source_proof":
+        return True
+    text = _review_issue_text(issue)
+    return (
+        "来源证明" in text
+        and ("command block" in text or "bash" in text or "命令" in text or "JSON argv" in text or "运行模板" in text)
+    )
+
+
 def _review_issue_is_clear_reverse_resource_role(issue: dict[str, Any]) -> bool:
     role = str(issue.get("resource_role") or "").lower()
     claim = str(issue.get("claim_type") or "").lower()
@@ -1524,6 +1607,9 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
         return False
     if issue.get("blocking") is False:
         return False
+
+    if _review_issue_is_command_template_source_proof_error(issue):
+        return True
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False
@@ -1628,6 +1714,7 @@ async def _validate_skill_md_blueprint_alignment(
     content: str,
     blueprint_text: str,
     skill_plan_entry: dict[str, Any] | None = None,
+    requirement_graph: dict[str, Any] | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     """Validate SKILL.md against blueprint as a first-round hard repair gate.
@@ -1690,6 +1777,7 @@ async def _validate_skill_md_blueprint_alignment(
             content=content,
             blueprint_text=blueprint_text,
             skill_plan_entry=skill_plan_entry,
+            requirement_graph=requirement_graph,
             model=model,
         )
     except CreatorValidatorReviewError:

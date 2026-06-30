@@ -80,7 +80,10 @@ export async function initSkill(skillName) {
  *   conversationHistory: Array,
  *   model?: string|null,
  *   role?: string|null,
- *   skillPlanEntry?: object|null
+ *   skillPlanEntry?: object|null,
+ *   requirementGraph?: object|null,
+ *   workflowAllocationSummary?: string,
+ *   finalOutputs?: Array
  * }} params
  * @yields {string | {done:true} | {validation:object} | {error:string}}
  */
@@ -93,6 +96,9 @@ export async function* generateFileStream({
   model = null,
   role = null,
   skillPlanEntry = null,
+  requirementGraph = null,
+  workflowAllocationSummary = '',
+  finalOutputs = [],
 }) {
   const resp = await fetch('/api/creator/generate-file', {
     method: 'POST',
@@ -106,6 +112,9 @@ export async function* generateFileStream({
       model,
       role,
       skill_plan_entry: skillPlanEntry,
+      requirement_graph: requirementGraph,
+      workflow_allocation_summary: workflowAllocationSummary,
+      final_outputs: finalOutputs,
     }),
   })
 
@@ -166,44 +175,6 @@ export async function* generateFileStream({
   }
 }
 
-
-/**
- * Finalize SKILL.md with the model using verified script runtime specs as bash-block references.
- */
-export async function finalizeSkillMd({
-  skillName,
-  description = '',
-  blueprintText = '',
-  model = null,
-  references = [],
-  assets = [],
-  scriptRuntimeSpecs = [],
-  finalOutputs = [],
-}) {
-  const resp = await fetch('/api/creator/finalize-skill-md', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      skill_name: skillName,
-      description,
-      blueprint_text: blueprintBodyOnly(blueprintText),
-      model,
-      references,
-      assets,
-      script_runtime_specs: scriptRuntimeSpecs,
-      final_outputs: finalOutputs,
-    }),
-  })
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
-    const detail = err.detail || 'SKILL.md 最终生成失败'
-    const message = typeof detail === 'string' ? detail : (detail.message || JSON.stringify(detail))
-    const error = new Error(message)
-    error.detail = detail
-    throw error
-  }
-  return resp.json()
-}
 
 /**
  * Write the final file content to disk.

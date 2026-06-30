@@ -42,6 +42,7 @@ from ..model_router import VALIDATOR_TASK, route_creator_file_model, route_model
 from ..skill_executor import _build_script_runtime_env, run_action
 from ..skill_creator_dry_run import build_creator_external_input_context
 from ..artifact_validator import validate_stdout_file_outputs, FileOutputValidationError
+from ..platform_io_contract import build_platform_io_contract, platform_io_contract_prompt_text
 from ..markdown_metadata import (
     parse_frontmatter,
     validate_skill_frontmatter,
@@ -329,6 +330,7 @@ class RequirementItem(BaseModel):
 
 class RequirementGraph(BaseModel):
     requirements: list[RequirementItem] = Field(default_factory=list)
+    platform_io_contract: dict[str, Any] = Field(default_factory=build_platform_io_contract)
     requirement_graph_source: str = Field("validator", exclude=True)
     requirement_graph_quality: str = Field("full", exclude=True)
 
@@ -405,6 +407,7 @@ def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
         ))
     return RequirementGraph(
         requirements=items,
+        platform_io_contract=build_platform_io_contract(),
         requirement_graph_source="fallback",
         requirement_graph_quality="fallback_coarse",
     )
@@ -427,7 +430,7 @@ def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]
 
 def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> RequirementGraph:
     if isinstance(data, RequirementGraph):
-        return data
+        return data.model_copy(update={"platform_io_contract": build_platform_io_contract()})
     raw_items = data.get("requirements", data.get("items", [])) if isinstance(data, dict) else []
     if not isinstance(raw_items, list):
         raise RequirementGraphValidationError("Responsibility graph requirements must be a list.", code="validator_incomplete")
@@ -444,7 +447,7 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
         items.append(item)
     source = str(data.get("requirement_graph_source") or data.get("source") or "validator") if isinstance(data, dict) else "validator"
     quality = str(data.get("requirement_graph_quality") or data.get("quality") or "responsibility") if isinstance(data, dict) else "responsibility"
-    return RequirementGraph(requirements=items, requirement_graph_source=source, requirement_graph_quality=quality)
+    return RequirementGraph(requirements=items, platform_io_contract=build_platform_io_contract(), requirement_graph_source=source, requirement_graph_quality=quality)
 
 
 def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:

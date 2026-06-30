@@ -165,7 +165,9 @@ def test_argv_schema_attribution_targets():
     assert missing["candidate_targets"] == ["scripts/main.py"]
     assert "not self-consistent" in missing["target_reason"]
     uncertain = _argv_details("ValueError: unknown argv schema error", inputs=[], rendered={"mystery": "ok"}, allowed='ALLOWED_KEYS = {"other"}')
+    assert uncertain["primary_target"] == "SKILL.md"
     assert uncertain["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
+    assert "do not blindly modify" in uncertain["target_reason"]
 
 
 def test_argv_schema_prefers_skill_md_when_script_interface_self_consistent():

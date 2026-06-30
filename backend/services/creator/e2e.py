@@ -1476,9 +1476,13 @@ def _classify_argv_schema_failure(
         else:
             target_reason = "Unable to determine whether SKILL.md sent the wrong JSON type or the script EXPECTED_TYPES is wrong."
 
-    if not primary_target:
-        primary_target = command.script_path
     uncertain = "Unable to determine" in target_reason
+    if not primary_target:
+        primary_target = "SKILL.md"
+        if not target_reason:
+            target_reason = "Uncertain argv schema attribution; prefer repairing SKILL.md command JSON argv unless script self-inconsistency is proven."
+        elif uncertain:
+            target_reason += " Prefer repairing SKILL.md command JSON argv first; do not blindly modify the generated script."
     cross_alignment_probe = kind == "missing_required" and primary_target == "SKILL.md"
     return {
         "argv_schema_error_kind": kind,

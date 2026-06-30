@@ -112,7 +112,7 @@ def resolve_declared_artifact_path(raw_path: str, *, skill_dir: Path, cwd: Path 
     outputs_root = (skill_dir.resolve() / "outputs").resolve()
     assets_generated_root = (skill_dir.resolve() / "assets" / "generated").resolve()
     if not _is_within(candidate, outputs_root) and not _is_within(candidate, assets_generated_root):
-        raise FileOutputValidationError(f"file_output_missing: 输出路径必须位于 OUTPUT_DIR/outputs 或 assets/generated/ 下，不能使用其他目录: {raw_path}")
+        raise FileOutputValidationError(f"file_output_missing: 输出路径必须位于当前 Skill 工作目录的 outputs/；OUTPUT_DIR 已经指向 outputs，不要再拼 outputs；或 assets/generated/ 下，不能使用其他目录: {raw_path}")
     return candidate
 
 

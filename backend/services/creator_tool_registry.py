@@ -1726,7 +1726,17 @@ def snippets_for_tool(capability: ToolCapability) -> list[ToolSnippet]:
 
 
 def format_tool_snippet(capability: ToolCapability, snippet: ToolSnippet) -> str:
-    anti = "\n".join(f"- {item}" for item in snippet.anti_patterns) or "- Follow the tool contract."
+    anti_items = list(snippet.anti_patterns)
+    if snippet.kind == "file_output_usage" or capability.artifact_outputs or any(name in capability.name for name in ("pdf", "file", "docx", "pptx", "xlsx", "csv")):
+        for item in (
+            "Do not append 'outputs' to OUTPUT_DIR.",
+            "Do not pass full paths to filename=; filename must be a basename.",
+            "Do not rewrite helper-returned pdf_path/file_outputs.",
+            "Do not replace '/tmp/' with 'outputs/'.",
+        ):
+            if item not in anti_items:
+                anti_items.append(item)
+    anti = "\n".join(f"- {item}" for item in anti_items) or "- Follow the tool contract."
     return "\n".join([
         "[Tool Snippet]",
         f"Tool: {capability.name}",

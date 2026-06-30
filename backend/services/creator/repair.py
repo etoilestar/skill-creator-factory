@@ -1205,6 +1205,25 @@ def _apply_unified_diff_or_convert_to_exact(
         return candidate, stats
 
 
+
+_PLATFORM_IO_FORBIDDEN_PATCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("os.path.join(...OUTPUT_DIR..., 'outputs')", re.compile(r"os\.path\.join\([^\n)]*OUTPUT_DIR[^\n)]*[,][^\n)]*['\"]outputs['\"]", re.I)),
+    ("os.path.join(output_dir, 'outputs')", re.compile(r"os\.path\.join\([^\n)]*\boutput_dir\b[^\n)]*[,][^\n)]*['\"]outputs['\"]", re.I)),
+    (".replace('/tmp/', 'outputs/')", re.compile(r"\.replace\(\s*['\"]/tmp/['\"]\s*,\s*['\"]outputs/['\"]\s*\)", re.I)),
+    ("filename=full_path", re.compile(r"\bfilename\s*=\s*full_path\b", re.I)),
+    ("filename=absolute_path", re.compile(r"\bfilename\s*=\s*absolute_path\b", re.I)),
+)
+
+
+def _platform_io_patch_violation(before: str, after: str) -> str | None:
+    """Return violation name when a candidate newly introduces forbidden platform IO anti-patterns."""
+    before_text = str(before or "")
+    after_text = str(after or "")
+    for label, pattern in _PLATFORM_IO_FORBIDDEN_PATCH_PATTERNS:
+        if pattern.search(after_text) and not pattern.search(before_text):
+            return label
+    return None
+
 def _validate_repair_diff_scope(
     *,
     proposal: CreatorDiffProposal,
@@ -1247,6 +1266,14 @@ def _validate_repair_diff_scope(
 
     else:
         raise ValueError(f"未知 repair proposal mode：{proposal.mode}")
+
+    violation = _platform_io_patch_violation(current_content, candidate)
+    if violation:
+        raise ValueError(
+            "platform_io_contract_violation: repair patch newly introduces forbidden platform IO pattern: "
+            f"{violation}. OUTPUT_DIR is already the final outputs dir; helper filename must be basename; "
+            "do not rewrite helper-returned artifact paths."
+        )
 
     changed_line_count = int(stats.get("changed_line_count") or 0)
     if changed_line_count > scope.max_changed_lines:

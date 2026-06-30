@@ -6,6 +6,18 @@ import uuid
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 
+
+
+def _platform_io_repair_summary() -> str:
+    return (
+        platform_io_contract_prompt_text()
+        + "\nE2E repair prohibitions: do not use os.path.join(OUTPUT_DIR, \"outputs\"), "
+        + "do not use os.path.join(output_dir, \"outputs\"), do not replace(\"/tmp/\", \"outputs/\"), "
+        + "do not use filename=full_path, and do not manually rewrite helper-returned pdf_path/file_outputs. "
+        + "If a helper already returns pdf_path/file_outputs, prefer return result or forward those fields unchanged. "
+        + "If a stdout-declared path resolves under trial_skill_dir/outputs or trial_skill_dir/assets/generated and exists, it is legal."
+    )
+
 @dataclass(frozen=True)
 class E2EStepTrace:
     """Creator E2E workflow boundary trace.
@@ -1561,7 +1573,7 @@ def _parse_e2e_stdout_json(
         failure_layer = "argv_schema_error" if is_argv_schema_error else "script_exit"
         target_file = str(argv_details.get("primary_target") or command.script_path) if is_argv_schema_error else command.script_path
         target_reason = str(argv_details.get("target_reason") or "")
-        repair_instruction = _argv_schema_repair_instruction(command.script_path, argv_details) if is_argv_schema_error else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。"
+        repair_instruction = _argv_schema_repair_instruction(command.script_path, argv_details) if is_argv_schema_error else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。\n" + _platform_io_repair_summary()
         raise ValueError(_format_e2e_failure(E2EFailure(
             failed_step_index=command.ordinal,
             target_file=target_file,
@@ -1615,7 +1627,8 @@ def _parse_e2e_stdout_json(
             repair_instruction=(
                 f"只修改 {command.script_path} 的 stdout/artifact 输出逻辑，不修改其它文件。"
                 "如果失败字段是普通业务 stdout 字段，不要把它改成文件路径；"
-                "如果失败字段是 pdf_path/image_path/file_outputs 等产物字段，则确保真实写入文件并返回正确路径。"
+                "如果失败字段是 pdf_path/image_path/file_outputs 等产物字段，则确保真实写入文件并返回正确路径。\n"
+                + _platform_io_repair_summary()
             ),
             layer="stdout_contract",
         ))) from exc

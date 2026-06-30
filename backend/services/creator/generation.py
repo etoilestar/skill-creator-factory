@@ -619,6 +619,8 @@ def _script_local_contract_payload(
             "stdout_schema": stdout_schema,
             "artifact_contract": canonical_contract.artifact_contract,
         },
+        "platform_io_contract": build_platform_io_contract(),
+        "platform_io_rules": platform_io_contract_prompt_text(),
         "runtime_envelope": {
             "description": (
                 "Creator/Skill runtime may provide a generic JSON argv envelope. "
@@ -820,6 +822,9 @@ def _build_script_generate_file_prompt_variant(
         "当前脚本可以定义局部 helper，使用标准库或运行环境中已有通用库做字段适配、内容组织、格式转换、文件处理和产物组装。",
         "可以调用一个或多个 available_tools，也可以完全用本地确定性逻辑实现；关键是核心输入必须影响核心输出或产物内容。",
         "工具/helper/标准库如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
+        "平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。",
+        "helper filename 硬规则：create_pdf_document/create_pdf/create_docx/create_pptx 等 artifact helper 的 filename 只传 basename，例如 filename=\"report.pdf\"；禁止 filename=full_path 或 filename=absolute_path。",
+        "helper 返回硬规则：优先 return result 或原样转发 result[\"pdf_path\"]/result[\"file_outputs\"]；不要手动重写 helper 返回路径；不要用 cwd-relative os.path.exists(\"outputs/...\") 校验产物。",
         "如果当前脚本需要外部文件或用户上传资源，应从 JSON argv 的显式合同字段或通用 envelope 字段读取，例如 input_files/files/resources；不要在源码中写死 smoke 样例路径。",
         "Creator smoke 可能会在 input_files/files/resources 中提供真实样例文件，用于验证脚本是否能处理外部文件；这只是试运行输入，不是业务逻辑常量。",
         "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。",
@@ -925,6 +930,8 @@ def _build_generate_file_prompt(
             "4. SKILL.md 第一轮只需生成静态可解析的使用说明和命令块；内部脚本流转由第二轮 E2E 真实执行验证。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
+            "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role: ...、inputs: ...、outputs: ...。\n"
+            "6b. command JSON argv keys 必须和附近 inputs 声明对齐；不要声明 inputs 后传入无关 argv key。\n"
             "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
             "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
@@ -966,6 +973,9 @@ def _build_generate_file_prompt(
             "生成前只使用以下轻量上下文：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。\n"
             "统一按 script_composition 理解：根据功能目标组合 argv 输入、本地逻辑和 available_tools；available_tools 只做候选召回，不是最终裁决。\n"
             "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。\n"
+"平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。\n"
+            "helper filename 硬规则：create_pdf_document/create_pdf/create_docx/create_pptx 等 artifact helper 的 filename 只传 basename，例如 filename=\"report.pdf\"；禁止 filename=full_path 或 filename=absolute_path。\n"
+            "helper 返回硬规则：优先 return result 或原样转发 result[\"pdf_path\"]/result[\"file_outputs\"]；不要手动重写 helper 返回路径；不要用 cwd-relative os.path.exists(\"outputs/...\") 校验产物。\n"
             "references/assets 只能作为 resource_refs/asset_refs 读取，不能作为 dependencies、allowed_imports 或 pip install 依赖。\n"
             "生成后第一轮只校验协议 + 运行 + 产物：argv JSON、入口、stdout JSON object、required outputs、artifact_created、import/dependency 和危险系统操作。\n\n"
             "轻量脚本上下文：\n"

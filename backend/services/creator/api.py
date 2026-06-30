@@ -27,6 +27,7 @@ async def _extract_requirement_graph_with_validator(
                 "你是 Creator requirement graph patcher，只输出严格 JSON object。\n"
                 "后端已经根据 file_plan/contracts 生成 deterministic requirement graph；你只能返回 compact patches。\n"
                 "patch 只能补充 must_do、must_not_do、depends_on；不得输出 purpose、constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
+                "platform_io_contract 是 deterministic and immutable，只读参考；不得输出、修改或 patch platform_io_contract。\n"
                 "purpose 已由 workflow_allocation 或原始文件计划确定；requirement_graph 阶段不得修改 purpose，不得重新划分脚本职责，不得改写 final inputs / final outputs。\n"
                 "must_do 只补关键职责缺口，保持短句、少量条目。\n"
                 "返回格式：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
@@ -37,6 +38,7 @@ async def _extract_requirement_graph_with_validator(
             "content": (
                 "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
                 "file_plan_and_contracts:\n" + json.dumps(file_payload, ensure_ascii=False, default=str)[:20000] + "\n\n"
+                "platform_io_contract (read-only, deterministic, immutable):\n" + platform_io_contract_prompt_text() + "\n\n"
                 "deterministic_responsibility_graph:\n" + graph.model_dump_json()[:12000]
             ),
         },

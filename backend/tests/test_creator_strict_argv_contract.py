@@ -145,8 +145,8 @@ def test_extract_schema_supports_arg_schema_and_defaults_for_attribution():
     assert schema["expected_types"] == {"a": "str"}
 
 
-def _argv_details(stderr, *, inputs, rendered, allowed='ALLOWED_KEYS = {"text"}', required='REQUIRED_KEYS = {"text"}', expected='EXPECTED_TYPES = {"text": str}'):
-    content = STRICT_OK + "\n" + allowed + "\n" + required + "\n" + expected
+def _argv_details(stderr, *, inputs, rendered, allowed='ALLOWED_KEYS = {"text"}', required='REQUIRED_KEYS = {"text"}', expected='EXPECTED_TYPES = {"text": str}', content=None):
+    content = content or (STRICT_OK + "\n" + allowed + "\n" + required + "\n" + expected)
     return e2e._classify_argv_schema_failure(
         command=E2EWorkflowCommand(1, "SKILL.md", "scripts/main.py", "python scripts/main.py {}", "python", rendered),
         content=content,
@@ -161,11 +161,34 @@ def test_argv_schema_attribution_targets():
     assert _argv_details("ValueError: unknown argv keys: ['extra']", inputs=["text"], rendered={"text": "ok", "extra": "x"})["primary_target"] == "SKILL.md"
     assert _argv_details("ValueError: unknown argv keys: ['text']", inputs=["text"], rendered={"text": "ok"}, allowed='ALLOWED_KEYS = set()')["primary_target"] == "scripts/main.py"
     missing = _argv_details("ValueError: missing required argv keys: ['extra']", inputs=["text"], rendered={"text": "ok"}, required='REQUIRED_KEYS = {"text", "extra"}')
-    assert missing["primary_target"] == "SKILL.md"
-    assert missing["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
-    assert "不得降低功能覆盖面" in missing["target_reason"]
+    assert missing["primary_target"] == "scripts/main.py"
+    assert missing["candidate_targets"] == ["scripts/main.py"]
+    assert "not self-consistent" in missing["target_reason"]
     uncertain = _argv_details("ValueError: unknown argv schema error", inputs=[], rendered={"mystery": "ok"}, allowed='ALLOWED_KEYS = {"other"}')
     assert uncertain["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
+
+
+def test_argv_schema_prefers_skill_md_when_script_interface_self_consistent():
+    content = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv.get("input_text")}\n'
+    details = _argv_details(
+        "ValueError: missing required argv keys: ['input_text']",
+        inputs=["input_text"],
+        rendered={"title": "wrong"},
+        content=content,
+    )
+    assert details["primary_target"] == "SKILL.md"
+
+
+def test_argv_schema_targets_script_when_guard_and_run_keys_disagree():
+    content = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv.get("title")}\n'
+    details = _argv_details(
+        "ValueError: missing required argv keys: ['input_text']",
+        inputs=["input_text"],
+        rendered={"title": "wrong"},
+        content=content,
+    )
+    assert details["primary_target"] == "scripts/main.py"
+    assert details["script_guard_run_mismatch"] is True
 
 from backend.services.creator.generation import _script_generation_skeleton
 

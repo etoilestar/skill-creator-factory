@@ -924,11 +924,13 @@ def _run_e2e_step_argument_effect_review(
                 "- 不判断完整 SKILL.md 写得好不好。\n"
                 "- 不判断最终产物审美质量。\n"
                 "- 不要求平台统一字段名，不允许套用业务字段词表。\n"
-                "- 但 workflow 中实际选择的字段名必须严格对齐：传入 key 和脚本读取 key 不一致，应失败。\n"
-                "- 上游 stdout key 和下游 placeholder 不一致，应失败；通过默认值绕过真实传参，应失败。\n"
+                "- E2E 阶段以已经生成的 script 为主要接口事实；SKILL.md command block 是 orchestration 描述。\n"
+                "- 当 SKILL.md command argv 与 script 入口接口不一致时，优先修改 SKILL.md 当前 command JSON argv 去对齐 script。\n"
+                "- 只有 script 自身语法错误、入口/JSON argv 读取错误、guard 与 run/main 实际读取不一致、没消费已传正确参数、stdout/artifact 输出错误时，才 target_file=当前脚本。\n"
+                "- 上游 stdout key 和下游 placeholder 不一致，应失败，并优先 target_file=SKILL.md；通过默认值绕过真实传参，应失败。\n"
                 "- 允许脚本通过 payload、input、fields、options、统一对象、别名字段或等价结构接收参数，但必须能证明实际传入的 key 被读取并影响输出。\n"
-                "- 如果 rendered_payload 缺少当前 step 必需信息，failure_kind=missing_payload，target_file=SKILL.md。\n"
-                "- 如果 rendered_payload 已传入合理信息，但脚本没有读取、读取了不同 key、或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
+                "- 如果 rendered_payload 缺少当前 step 必需信息或 SKILL.md 传入 key 与自洽 script 接口不一致，failure_kind=missing_payload，target_file=SKILL.md。\n"
+                "- 如果 SKILL.md 已传对但脚本没有读取、读取了不同 key、或被默认值覆盖，failure_kind=script_not_consuming_payload，target_file=当前脚本。\n"
                 "- 如果当前 step 输出了内容，但后续 placeholder/字段映射接不上，failure_kind=output_mapping_mismatch，target_file=SKILL.md。\n"
                 "- 如果没有接口问题，返回 passed=true。\n\n"
 
@@ -1393,6 +1395,21 @@ def _argv_value_shape(value: Any) -> str:
     return type(value).__name__
 
 
+
+
+def _python_run_main_read_keys(content: str) -> set[str]:
+    """Best-effort keys actually read from parsed argv in run/main code.
+
+    This is intentionally generic and business-word agnostic: it only detects
+    literal string keys used with common argv/payload variables.
+    """
+    keys: set[str] = set()
+    for match in re.finditer(r"(?:argv|args|payload|data|params|input_data)\s*\.\s*get\(\s*['\"]([^'\"]+)['\"]", content or ""):
+        keys.add(match.group(1))
+    for match in re.finditer(r"(?:argv|args|payload|data|params|input_data)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]", content or ""):
+        keys.add(match.group(1))
+    return keys
+
 def _classify_argv_schema_failure(
     *,
     command: E2EWorkflowCommand,
@@ -1416,6 +1433,9 @@ def _classify_argv_schema_failure(
     command_argv_keys = sorted(str(key) for key in (command.argv_template or {}).keys())
     semantic_inputs = sorted(str(key) for key in (getattr(entry, "inputs", []) or []) if str(key or "").strip())
     semantic_set = set(semantic_inputs)
+    run_read_keys = sorted(_python_run_main_read_keys(content)) if entry.runtime == "python" else []
+    required_set = set(str(key) for key in (required or []) if str(key or "").strip())
+    guard_run_mismatch = bool(required_set and run_read_keys and not required_set.issubset(set(run_read_keys)))
 
     primary_target = ""
     target_reason = ""
@@ -1435,11 +1455,14 @@ def _classify_argv_schema_failure(
         else:
             target_reason = "Unable to determine whether SKILL.md over-sent argv keys or the script schema under-declared semantic parameters."
     elif kind == "missing_required":
-        if failed_keys and all(key not in rendered_payload for key in failed_keys):
+        if guard_run_mismatch:
+            primary_target = command.script_path
+            target_reason = "Script strict_json_argv_guard required keys do not match keys actually read by run/main; script interface is not self-consistent."
+        elif failed_keys and all(key not in rendered_payload for key in failed_keys):
             primary_target = "SKILL.md"
             target_reason = (
-                "Missing required argv key is absent from the rendered SKILL.md command payload. "
-                "This indicates block call 与 script interface/core logic 的不对齐；repair 应对齐调用和实际执行，不得降低功能覆盖面。"
+                "Script interface appears self-consistent, and missing required argv key is absent from the rendered SKILL.md command payload; "
+                "prefer repairing the current SKILL.md command JSON argv to align with the generated script."
             )
         else:
             target_reason = "Unable to determine whether SKILL.md omitted a required semantic input or the script required schema is too broad."
@@ -1467,6 +1490,8 @@ def _classify_argv_schema_failure(
         "expected_types": expected_types,
         "command_argv_keys": command_argv_keys,
         "skill_plan_inputs": semantic_inputs,
+        "script_run_read_keys": run_read_keys,
+        "script_guard_run_mismatch": guard_run_mismatch,
         "failed_keys": failed_keys,
         "primary_target": primary_target,
         "candidate_targets": ["SKILL.md", command.script_path] if (uncertain or cross_alignment_probe) else [primary_target],
@@ -1483,15 +1508,17 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
         f"candidate_targets={candidate_targets}。strict_json_argv_guard 是接口不对齐探针，不是默认修复目标；"
-        "禁止只改 guard schema 或只 patch guard spec。必须综合对齐 SKILL.md 当前失败 step 的 bash command JSON argv、"
-        "script 入口解析/strict_json_argv_guard、script 核心 run/main 业务逻辑；"
+        "E2E 阶段以已经生成的 script 为主要接口事实，SKILL.md command block 是 orchestration 描述；"
+        "如果 script 自身接口自洽而 SKILL.md command argv 不一致，优先修 SKILL.md 当前失败 command JSON argv。"
+        "只有 script 语法/导入/入口/JSON argv 读取、guard 与 run/main 读取字段不一致、未消费正确字段、stdout/artifact 输出错误时才改 script。"
+        "禁止只改 guard schema 或只 patch guard spec；不得为了适配错误 SKILL.md command 而重命名脚本接口。"
         "不能通过删除参数、删除业务参数或删除功能分支降低功能覆盖面；不强制固定字段常量名；"
         "required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修当前失败 command JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，移除确属职责外的 unknown keys；不要改其它已通过步骤或脚本。"
+        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，移除确属职责外的 unknown keys；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
     if primary == script_path:
-        return common + f"\nprimary_target={script_path}：修入口接口和核心逻辑的一致性，确保 parse_args/strict_json_argv_guard 与 run/main 实际使用参数对齐；不要只修 guard；不要改 SKILL.md，不要改业务字段为平台词表。"
+        return common + f"\nprimary_target={script_path}：只修改当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout 输出逻辑；确保入口校验与 run/main 实际使用参数对齐；不要只修 guard；不得改 SKILL.md，不得为了适配错误 SKILL.md 而重命名脚本接口，不得删除 guard、核心功能或用默认值绕过必需输入。"
     return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 当前失败 command JSON argv，还是当前脚本入口接口与核心逻辑一致性。"
 
 
@@ -2325,9 +2352,9 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
             "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
-            "修复 command_json_parse/missing_placeholder 时，必须参考结构化失败对象中的当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
-            "先分类为 JSON 语法、placeholder 不存在、argv schema 不一致或可选参数误必填。\n"
-            "优先改命令使用平台 guaranteed input，或让入口脚本接受 envelope 并内部默认化可选项；不要反复给不存在 placeholder 加引号。\n"
+            "修复 command_json_parse/missing_placeholder/argv_schema_error 时，必须参考结构化失败对象中的当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
+            "如果 script 自身接口自洽而 command argv 不一致，优先只改 SKILL.md 当前失败 command JSON argv。\n"
+            "不得改 YAML frontmatter；不得重写整篇 SKILL.md；不得改其它已通过 command；不得改 script；不得新增脚本路径；不得引入 --argv；不得引入 runtime/entrypoint/argv 伪命令对象。\n"
             "不要重写 SKILL.md 正文。\n"
             "当前 Markdown 格式已经通过；不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行。\n"
             "只修改失败命令那一行；old_lines 必须包含完整、真实、当前文件中的命令行。\n"
@@ -2343,11 +2370,10 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
             "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
             "修复前核对当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
-            "如果可选参数被误当成必填，入口脚本应从 envelope/fields/options/payload 中存在则读、不存在则默认。\n"
             "strict_json_argv_guard 是接口不对齐探针；不要只改 guard。\n"
-            "同步检查 SKILL.md command argv、脚本入口校验、核心 run/main，使三者对齐。\n"
-            "保持功能覆盖面；不能通过删除参数降低功能覆盖面，也不能删除业务参数或功能分支来绕过失败。\n"
-            "如果 command 没传核心逻辑需要的参数，不要简单删功能，要做接口对齐或合理默认。\n"
+            "只允许修改当前脚本中与失败相关的 parse_args / strict_json_argv_guard / run / main / stdout 输出逻辑。\n"
+            "不得改 SKILL.md；不得为了适配错误的 SKILL.md 而重命名脚本接口；不得删除 guard；不得删除核心功能；不能通过删除参数降低功能覆盖面；不得通过默认值绕过必需输入。\n"
+            "如果 command 没传核心逻辑需要的参数且脚本自身自洽，应修 SKILL.md 而不是污染 script。\n"
             "不要重新设计业务功能；PDF 样式、图片风格、表格样式、内容质量属于第一轮功能 smoke。\n"
             "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整源码。"

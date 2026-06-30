@@ -1337,17 +1337,17 @@ references/*.md 是参考资料正文，不是执行步骤。
 
 _SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES = """SKILL.md bash command block 语义规则：
 1. bash command block 是运行模板，不是示例调用。
-2. 普通说明文字可以出现示例；```bash block 内必须表达可运行模板。
-3. JSON argv 中的动态参数值必须有来源证明。
-4. 来源证明只能来自：平台输入 envelope placeholder、requirement_graph 中声明的上游 outputs placeholder、当前脚本明确允许的配置常量、蓝图明确声明的固定常量。
-5. 如果某个参数没有可靠来源，优先省略该字段，并由脚本内部默认化或从 payload 中解析。
-6. 不得为了让命令看起来完整而编造字面值。
-7. 不得把说明性示例值放入 bash command JSON argv。
-8. 不得把下游脚本的输入写成字面值；应引用上游 output placeholder。
-9. 不得把用户输入写成字面值；应引用平台输入 placeholder。
-10. 如果不确定具体字段如何传递，优先传通用 payload/user_request/input，由入口脚本内部解析。
-11. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema。
-12. 不得把 compact_requirement_graph 条目复制成 JSON block。"""
+2. requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；argv key 可以与图谱字段不逐字一致。
+3. 生成 JSON argv 时必须先语义理解图谱中的输入、输出和依赖关系。
+4. argv key/value 必须语义上可追踪到用户输入、上游脚本 stdout、当前脚本配置或蓝图明确常量。
+5. 不得为了让命令看起来完整而编造无来源字面值或占位参数。
+6. 不得把示例调用、示例值或说明性样例写进 bash command block。
+7. 不得把下游脚本输入写成无来源字面值；应语义上来自上游 stdout，字段名可由第二轮 E2E 对齐。
+8. 不得把用户输入写成字面值；应引用平台输入 placeholder 或传入通用 payload。
+9. 如果不确定具体字段名，优先使用通用 user_request/input/payload，由脚本解析。
+10. 第一轮只判断是否语义可追踪、是否明显示例调用、是否明显无来源占位、是否完全脱离图谱 IO 语义。
+11. 第一轮不得要求 argv key 必须逐字等于 graph.inputs，也不得要求 placeholder 必须逐字等于 graph.outputs。
+12. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema；不得把条目机械复制成 JSON block。"""
 
 
 def _is_markdown_creator_file(file_path: str) -> bool:

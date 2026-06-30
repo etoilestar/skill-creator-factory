@@ -2282,6 +2282,168 @@ def test_skill_md_blueprint_alignment_does_not_trust_blocking_for_detail_request
     assert _skill_md_blueprint_review_to_contract_results(review) == []
 
 
+def test_skill_md_command_template_source_proof_issue_is_semantic_patch_not_hard_format():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import (
+        ContractValidationError,
+        _skill_md_blueprint_review_to_contract_results,
+    )
+
+    review = {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "blocking": True,
+            "field": "workflow",
+            "message": "SKILL.md bash command block 的 JSON argv 包含缺少来源证明的字面值；命令块应是运行模板。",
+            "expected": "将缺少来源证明的字面值替换为平台输入 placeholder 或上游 output placeholder；无可靠来源的可选字段应省略并由脚本内部默认化。",
+            "minimal_edit": "只修改对应 bash command block 的 JSON argv，不改 metadata，不重写整篇文档。",
+            "contract_impact": {
+                "execution_closure": True,
+                "resource_role": False,
+                "platform_io": True,
+                "final_artifact": False,
+                "user_requirement_transfer": True,
+            },
+        }],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].layer == "skill_md_blueprint_alignment"
+    assert "hard_format" not in results[0].layer
+
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer=results[0].layer,
+        detail=results[0].message,
+        original=ContractValidationError("semantic", results),
+    )
+    assert not is_markdown_hard_format_error(stage_error)
+
+
+def test_skill_md_downstream_literal_source_proof_issue_is_semantic_patch_not_region_rewrite():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import (
+        ContractValidationError,
+        _skill_md_blueprint_review_to_contract_results,
+    )
+
+    review = {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "blocking": True,
+            "category": "command_template_source_proof",
+            "field": "workflow",
+            "message": "运行模板中的下游 JSON argv 值缺少来源证明。",
+            "expected": "引用上游 output placeholder；无可靠来源的可选字段省略。",
+            "minimal_edit": "只修改对应 bash command block 的 JSON argv。",
+            "contract_impact": {"execution_closure": True, "platform_io": True, "user_requirement_transfer": True},
+        }],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer=results[0].layer,
+        detail=results[0].message,
+        original=ContractValidationError("semantic", results),
+    )
+    assert results
+    assert not is_markdown_hard_format_error(stage_error)
+
+
+def test_skill_md_plain_text_example_does_not_create_source_proof_failure():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": True,
+        "issues": [{
+            "severity": "warning",
+            "blocking": False,
+            "field": "user_facing",
+            "message": "普通说明文字中的示例值仅用于解释，不在 bash fenced command block 内。",
+        }],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_placeholder_command_template_review_passes():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": True,
+        "issues": [],
+    }
+
+    assert _skill_md_blueprint_review_to_contract_results(review) == []
+
+
+def test_skill_md_pseudo_runner_object_remains_markdown_body_format_error():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractCheckResult, ContractValidationError, markdown_failure_region
+
+    result = ContractCheckResult(
+        id="skill_md.command_block.signature_parseable",
+        passed=False,
+        target="SKILL.md",
+        message="runtime/entrypoint/argv JSON 伪命令对象不是 shell command。",
+        expected="bash block 内必须是一条真实 shell command。",
+        minimal_edit="改成 python scripts/entry.py '<JSON object argv>'。",
+        layer="skill_md_command_block",
+    )
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_command_block",
+        detail=result.message,
+        original=ContractValidationError("format", [result]),
+    )
+
+    assert is_markdown_hard_format_error(stage_error)
+    assert markdown_failure_region(str(stage_error)) == "body_region"
+
+
+def test_skill_md_multi_command_and_bad_json_argv_remain_markdown_body_format_errors():
+    from backend.services.creator.api import is_markdown_hard_format_error
+    from backend.services.creator.common import FileGenerationStageError
+    from backend.services.creator.contracts import ContractCheckResult, ContractValidationError, markdown_failure_region
+
+    results = [
+        ContractCheckResult(
+            id="skill_md.command_block.single_command",
+            passed=False,
+            target="SKILL.md",
+            message="bash block 内包含多条命令。",
+            expected="每个 bash block 内只能有一条 shell command。",
+            minimal_edit="拆分或删除额外命令。",
+            layer="skill_md_command_block",
+        ),
+        ContractCheckResult(
+            id="skill_md.command_block.args_parseable",
+            passed=False,
+            target="SKILL.md",
+            message="JSON argv 不可解析。",
+            expected="脚本路径后必须是 shell-quoted JSON object argv。",
+            minimal_edit="修正 JSON argv 结构。",
+            layer="skill_md_command_block",
+        ),
+    ]
+    stage_error = FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_command_block",
+        detail="command block format",
+        original=ContractValidationError("format", results),
+    )
+
+    assert is_markdown_hard_format_error(stage_error)
+    assert markdown_failure_region(str(stage_error)) == "body_region"
+
+
 def test_skill_md_blueprint_alignment_blocks_missing_final_artifact_semantics():
     from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 

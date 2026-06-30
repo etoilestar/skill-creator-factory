@@ -1335,6 +1335,20 @@ references/*.md 是参考资料正文，不是执行步骤。
 如需展示命令形态，只能使用 ```text 或普通说明。
 所有 fenced block 必须完整闭合。"""
 
+_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES = """SKILL.md bash command block 语义规则：
+1. bash command block 是运行模板，不是示例调用。
+2. 普通说明文字可以出现示例；```bash block 内必须表达可运行模板。
+3. JSON argv 中的动态参数值必须有来源证明。
+4. 来源证明只能来自：平台输入 envelope placeholder、requirement_graph 中声明的上游 outputs placeholder、当前脚本明确允许的配置常量、蓝图明确声明的固定常量。
+5. 如果某个参数没有可靠来源，优先省略该字段，并由脚本内部默认化或从 payload 中解析。
+6. 不得为了让命令看起来完整而编造字面值。
+7. 不得把说明性示例值放入 bash command JSON argv。
+8. 不得把下游脚本的输入写成字面值；应引用上游 output placeholder。
+9. 不得把用户输入写成字面值；应引用平台输入 placeholder。
+10. 如果不确定具体字段如何传递，优先传通用 payload/user_request/input，由入口脚本内部解析。
+11. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema。
+12. 不得把 compact_requirement_graph 条目复制成 JSON block。"""
+
 
 def _is_markdown_creator_file(file_path: str) -> bool:
     return (
@@ -1351,7 +1365,7 @@ def _markdown_format_requirements_for_prompt(file_path: str, region: str) -> str
             "不得输出正文；不得输出未闭合 fence；不得写 workflow/inputs/outputs/runtime_contract 等内部合同字段。"
         )
     if file_path == "SKILL.md":
-        return _SKILL_MD_BODY_FORMAT_REQUIREMENTS
+        return f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n{_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES}"
     if file_path.startswith("references/"):
         return _REFERENCE_MD_BODY_FORMAT_REQUIREMENTS
     return (
@@ -1763,6 +1777,7 @@ def _build_markdown_initial_region_prompt(
     if file_path == "SKILL.md":
         body_rules = (
             f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n"
+            f"{_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES}\n\n"
             "SKILL.md body 必须基于 blueprint_text、compact requirement_graph、workflow_allocation_summary、"
             "final_outputs 以及 references/assets 路径写最终用户说明。\n"
             "应包含：Skill 用途；用户需要提供什么；高层执行流程；每个真实脚本的自然语言职责说明；"
@@ -2128,6 +2143,7 @@ async def generate_file(request: GenerateFileRequest):
                             content=content,
                             blueprint_text=request.blueprint_text,
                             skill_plan_entry=effective_skill_plan_entry,
+                            requirement_graph=request.requirement_graph,
                             model=request.model or route.model,
                         )
 

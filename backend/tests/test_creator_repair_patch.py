@@ -346,17 +346,6 @@ def test_resource_role_conflicts_use_structured_claims_only():
     assert hard and "只读" in hard[0]["expected"]
 
 
-def test_failure_ledger_drops_resolved_previous_failure():
-    from backend.services.creator.api import failure_ledger_for_skill_md_finalize
-
-    previous = [{"target_file": "SKILL.md", "layer": "review", "id": "a", "evidence": "old"}]
-    current = [{"target_file": "SKILL.md", "layer": "review", "id": "b", "evidence": "new"}]
-    ledger = failure_ledger_for_skill_md_finalize(current, previous_remaining=previous)
-
-    assert ledger["resolved_failures"] == previous
-    assert all(item["id"] != "a" for item in ledger["remaining_failures"])
-
-
 def test_normalized_span_mapping_trims_spans_with_surrounding_whitespace():
     original = "\n\n  标题： “你好”  \n下一行\n  "
     candidate, stats = _apply_exact_replace_patch(

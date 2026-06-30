@@ -304,7 +304,6 @@ import { ref, computed, nextTick } from 'vue'
 import {
   initSkill,
   generateFileStream,
-  finalizeSkillMd,
   writeFile,
   validateSkill,
   packageSkill,
@@ -324,6 +323,8 @@ const props = defineProps({
   warnings: { type: Array, default: () => [] },
   assetRequirements: { type: Array, default: () => [] },
   finalOutputs: { type: Array, default: () => [] },
+  requirementGraph: { type: Object, default: null },
+  workflowAllocationSummary: { type: String, default: '' },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -378,7 +379,7 @@ const localFiles = ref(
                 : null
       ),
       status: f.path === 'SKILL.md' ? 'pending' : 'pending',
-      pendingLabel: f.path === 'SKILL.md' ? '待最终生成 / finalize pending' : '',
+      pendingLabel: f.path === 'SKILL.md' ? '待生成' : '',
       generatedContent: '',
       bytesWritten: 0,
       error: '',
@@ -776,32 +777,6 @@ async function generateOneFile(idx) {
   file.repairMessage = ''
 
   try {
-    if (file.path === 'SKILL.md') {
-      const result = await finalizeSkillMd({
-        skillName: localSkillName.value,
-        description: file.purpose || props.skillName,
-        blueprintText: props.blueprintText,
-        model: props.model,
-        references: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('references/')),
-        assets: localFiles.value.map(f => normalizeSkillPath(f.path)).filter(p => p.startsWith('assets/')),
-        finalOutputs: props.finalOutputs,
-      })
-      if (result?.success !== true) {
-        const failures = Array.isArray(result?.failures)
-          ? result.failures.map(item => `${item.id || 'check'}: ${item.message || ''}`).join('\n')
-          : ''
-        const error = new Error(failures || result?.error || 'SKILL.md finalize 未通过校验，已阻止预览/写入')
-        error.detail = { failed_checks: result?.failures || [] }
-        throw error
-      }
-      file.generatedContent = result.content || ''
-      if (!file.generatedContent.trim()) {
-        throw new Error('SKILL.md finalizer 未返回任何内容')
-      }
-      file.repairMessage = result.repair_attempts ? `SKILL.md 已完成 ${result.repair_attempts} 轮模型修复并通过校验。` : ''
-      file.status = 'preview'
-      return
-    }
     for await (const chunk of generateFileStream({
       skillName: localSkillName.value,
       filePath: file.path,
@@ -811,6 +786,9 @@ async function generateOneFile(idx) {
       model: props.model,
       role: file.role || null,
       skillPlanEntry: file,
+      requirementGraph: props.requirementGraph,
+      workflowAllocationSummary: props.workflowAllocationSummary || '',
+      finalOutputs: props.finalOutputs || [],
     })) {
       if (typeof chunk === 'string') {
         file.generatedContent += chunk

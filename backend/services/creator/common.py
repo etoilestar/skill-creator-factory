@@ -589,6 +589,9 @@ class GenerateFileRequest(BaseModel):
     model: Optional[str] = None
     role: Optional[str] = None
     skill_plan_entry: Optional[dict[str, Any]] = None
+    requirement_graph: dict[str, Any] | None = None
+    workflow_allocation_summary: str = ""
+    final_outputs: list[Any] = Field(default_factory=list)
 
 
 class WriteFileRequest(BaseModel):
@@ -606,15 +609,6 @@ class WriteFileResponse(BaseModel):
     bytes: int = 0
     message: str
 
-
-class FinalizeSkillMdRequest(BaseModel):
-    skill_name: str
-    description: str = ""
-    blueprint_text: str = ""
-    model: Optional[str] = None
-    references: list[str] = Field(default_factory=list)
-    assets: list[str] = Field(default_factory=list)
-    final_outputs: list[str] = Field(default_factory=list)
 
 class UploadAssetResponse(BaseModel):
     success: bool

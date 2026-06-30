@@ -397,7 +397,7 @@ def render_script_command_from_runtime_schema(
 ) -> str:
     """Render a deterministic SKILL.md argv template from script schema/bindings.
 
-    The generated command contains placeholders only, never E2E sample values.
+    The generated command contains placeholders derived from graph/bindings only.
     """
     previous_stdout_fields = previous_stdout_fields or set()
     expected_types = script_argv_schema.get("expected_types") if isinstance(script_argv_schema, dict) else {}
@@ -421,13 +421,9 @@ def render_script_command_from_runtime_schema(
         if isinstance(template, str) and re.fullmatch(r"\{\{\s*[^{}]+?\s*\}\}", template.strip()):
             payload[key] = template.strip()
             continue
-        if not is_first_step and key in previous_stdout_fields:
-            payload[key] = "{{" + key + "}}"
-            continue
-        # First-step business argv comes through the platform protocol fields root.
-        # String inputs may still be structured; user_request fallback remains for
-        # scripts that explicitly use natural language via graph/runtime contract.
-        payload[key] = "{{fields." + key + "}}"
+        # Without a graph edge/binding, do not invent an internal field name or
+        # value template. E2E/dataflow validation should surface a repairable
+        # binding failure.
 
     return _render_command(entry.path, entry.runtime, payload)
 

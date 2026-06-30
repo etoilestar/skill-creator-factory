@@ -331,6 +331,9 @@ class RequirementItem(BaseModel):
 class RequirementGraph(BaseModel):
     requirements: list[RequirementItem] = Field(default_factory=list)
     platform_io_contract: dict[str, Any] = Field(default_factory=build_platform_io_contract)
+    platform_input_node: dict[str, Any] = Field(default_factory=dict)
+    platform_output_node: dict[str, Any] = Field(default_factory=dict)
+    dataflow_edges: list[dict[str, Any]] = Field(default_factory=list)
     requirement_graph_source: str = Field("validator", exclude=True)
     requirement_graph_quality: str = Field("full", exclude=True)
 
@@ -339,6 +342,54 @@ def _requirement_id_for_file(path: str, suffix: str) -> str:
     base = re.sub(r"[^a-zA-Z0-9]+", "_", str(path or "file")).strip("_").lower() or "file"
     tail = re.sub(r"[^a-zA-Z0-9]+", "_", str(suffix or "requirement")).strip("_").lower() or "requirement"
     return f"req_{base}_{tail}"[:120]
+
+
+def _platform_boundary_nodes() -> tuple[dict[str, Any], dict[str, Any]]:
+    contract = build_platform_io_contract()
+    boundary = contract.get("platform_skill_boundary") if isinstance(contract, dict) else {}
+    if not isinstance(boundary, dict):
+        boundary = {}
+    input_fields = boundary.get("input_envelope_fields")
+    output_fields = boundary.get("final_output_fields")
+    if not isinstance(input_fields, list):
+        input_fields = []
+    if not isinstance(output_fields, list):
+        output_fields = []
+    return (
+        {
+            "node_id": "platform_input_node",
+            "node_type": "platform_input",
+            "immutable": True,
+            "outputs": [str(field) for field in input_fields if str(field or "").strip()],
+        },
+        {
+            "node_id": "platform_output_node",
+            "node_type": "platform_output",
+            "immutable": True,
+            "inputs": [str(field) for field in output_fields if str(field or "").strip()],
+        },
+    )
+
+
+def _normalize_dataflow_edges(raw_edges: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_edges, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_edges:
+        if not isinstance(raw, dict):
+            continue
+        edge = {
+            "from_node": str(raw.get("from_node") or "").strip(),
+            "from_field": str(raw.get("from_field") or "").strip(),
+            "to_node": str(raw.get("to_node") or "").strip(),
+            "to_field": str(raw.get("to_field") or "").strip(),
+            "value_template": str(raw.get("value_template") or "").strip(),
+            "source_kind": str(raw.get("source_kind") or "").strip(),
+            "value_type": str(raw.get("value_type") or "").strip(),
+        }
+        if edge["from_node"] and edge["from_field"] and edge["to_node"] and edge["to_field"]:
+            normalized.append(edge)
+    return normalized
 
 
 def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
@@ -405,9 +456,13 @@ def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
                 "e2e": "E2E validates runtime execution and IO alignment.",
             },
         ))
+    platform_input_node, platform_output_node = _platform_boundary_nodes()
     return RequirementGraph(
         requirements=items,
         platform_io_contract=build_platform_io_contract(),
+        platform_input_node=platform_input_node,
+        platform_output_node=platform_output_node,
+        dataflow_edges=[],
         requirement_graph_source="fallback",
         requirement_graph_quality="fallback_coarse",
     )
@@ -429,8 +484,14 @@ def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]
 
 
 def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> RequirementGraph:
+    platform_input_node, platform_output_node = _platform_boundary_nodes()
     if isinstance(data, RequirementGraph):
-        return data.model_copy(update={"platform_io_contract": build_platform_io_contract()})
+        return data.model_copy(update={
+            "platform_io_contract": build_platform_io_contract(),
+            "platform_input_node": platform_input_node,
+            "platform_output_node": platform_output_node,
+            "dataflow_edges": _normalize_dataflow_edges(data.dataflow_edges),
+        })
     raw_items = data.get("requirements", data.get("items", [])) if isinstance(data, dict) else []
     if not isinstance(raw_items, list):
         raise RequirementGraphValidationError("Responsibility graph requirements must be a list.", code="validator_incomplete")
@@ -447,7 +508,15 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
         items.append(item)
     source = str(data.get("requirement_graph_source") or data.get("source") or "validator") if isinstance(data, dict) else "validator"
     quality = str(data.get("requirement_graph_quality") or data.get("quality") or "responsibility") if isinstance(data, dict) else "responsibility"
-    return RequirementGraph(requirements=items, platform_io_contract=build_platform_io_contract(), requirement_graph_source=source, requirement_graph_quality=quality)
+    return RequirementGraph(
+        requirements=items,
+        platform_io_contract=build_platform_io_contract(),
+        platform_input_node=platform_input_node,
+        platform_output_node=platform_output_node,
+        dataflow_edges=_normalize_dataflow_edges(data.get("dataflow_edges") if isinstance(data, dict) else []),
+        requirement_graph_source=source,
+        requirement_graph_quality=quality,
+    )
 
 
 def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:

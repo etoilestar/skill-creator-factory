@@ -31,6 +31,7 @@ async def _extract_requirement_graph_with_validator(
                 "purpose 已由 workflow_allocation 或原始文件计划确定；requirement_graph 阶段不得修改 purpose，不得重新划分脚本职责，不得改写 final inputs / final outputs。\n"
                 "must_do 只补关键职责缺口，保持短句、少量条目。\n"
                 "返回格式：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
+                "不得 patch platform_input_node 或 platform_output_node；平台边界节点由系统确定性注入并覆盖模型输出。"
             ),
         },
         {

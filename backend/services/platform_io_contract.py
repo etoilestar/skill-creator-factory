@@ -22,9 +22,9 @@ def build_platform_io_contract() -> dict[str, Any]:
             "protocol_notes": [
                 "These fields are the hard platform-to-generated-SKILL protocol and may be hardcoded at that boundary.",
                 "Do not hardcode the platform field vocabulary for business fields passed between scripts inside a generated SKILL; internal fields are determined by the requirement graph, script argv schema, and actual stdout.",
-                "If the first command needs structured business parameters, bind them through fields.<name> placeholders, for example {{fields.keywords}}.",
-                "Subsequent commands may only reference previous stdout fields, for example {{story_text}} or {{image_paths}}.",
-                "Command argv must not contain case sample values such as [\"童年\",\"分别\",\"重逢\"], \"用户输入的故事内容\", or \"/output/story_1.png\".",
+                "If the first command needs structured business parameters, bind them through the platform structured input root and the target argv field.",
+                "Subsequent commands may only reference fields produced by previous stdout according to graph edges.",
+                "Command argv must express dynamic dataflow with placeholders instead of literal runtime data.",
             ],
         },
         "hard_rules": [
@@ -66,16 +66,16 @@ def platform_io_contract_prompt_text() -> str:
         "- Do not append 'outputs' to OUTPUT_DIR; never use os.path.join(OUTPUT_DIR, 'outputs') or os.path.join(output_dir, 'outputs').",
         "- Do not replace '/tmp/' with 'outputs/'.",
         "- Runtime artifact helpers write artifacts under OUTPUT_DIR.",
-        "- Helper filename= arguments must be basenames only, e.g. filename='report.pdf'; never filename=full_path or filename=absolute_path.",
+        "- Helper filename= arguments must be basenames only; never filename=full_path or filename=absolute_path.",
         "- Prefer return helper result unchanged, or forward result['pdf_path'] and result['file_outputs'] unchanged.",
         "- Do not manually rewrite helper-returned pdf_path/file_outputs.",
         "- Artifact allowed roots: outputs/ and assets/generated/.",
         "- Absolute paths under current skill workspace outputs/ or assets/generated/ are valid if the files exist.",
         "- Platform ↔ generated SKILL boundary input fields are hard protocol: user_request, input, text, payload, fields, options, input_files, files, resources.",
-        "- Prefer structured first-command business input via fields.<name>, e.g. {{fields.keywords}}; these boundary field names may be hardcoded.",
+        "- Prefer structured first-command business input via the platform structured input root and a graph/schema-derived target field.",
         "- Generated SKILL internal script fields must not hardcode the platform vocabulary; derive them from requirement graph, script argv schema, and previous stdout.",
-        "- Subsequent commands may only reference previous stdout fields such as {{story_text}} or {{image_paths}}.",
-        "- Command argv must not contain case sample values like [\"童年\",\"分别\",\"重逢\"], \"用户输入的故事内容\", or fixed downstream paths such as \"/output/story_1.png\".",
+        "- Subsequent commands may only reference previous stdout fields through graph edges.",
+        "- Command argv must express dynamic dataflow with placeholders instead of literal runtime data.",
         "- Contract payload: " + str(contract),
     ]
     return "\n".join(lines)

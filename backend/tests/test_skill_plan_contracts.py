@@ -1808,60 +1808,126 @@ def test_runtime_spec_command_does_not_write_accepted_sample_argv_to_skill_md():
 
 def test_runtime_schema_renders_first_step_fields_placeholder_without_samples():
     from backend.services.skill_plan import SkillPlanEntry, command_payload_placeholders, render_script_command_from_runtime_schema
+    argv_key = "dynamic_input_field"
 
     entry = SkillPlanEntry(
-        path="scripts/generate_story.py",
+        path="scripts/step_one.py",
         file_type="script",
         role="generic_script",
         purpose="generic",
         runtime="python",
+        command_arg_bindings=[{
+            "argv_key": argv_key,
+            "from_node": "platform_input_node",
+            "from_field": "fields",
+            "to_node": "scripts/step_one.py",
+            "to_field": argv_key,
+            "value_template": "{{fields." + argv_key + "}}",
+            "source_kind": "platform_input",
+            "value_type": "list",
+        }],
     )
 
     command = render_script_command_from_runtime_schema(
         entry,
-        {"required_keys": ["keywords"], "expected_types": {"keywords": "list"}},
+        {"required_keys": [argv_key], "expected_types": {argv_key: "list"}},
         is_first_step=True,
     )
 
-    assert command.endswith('\'{"keywords":"{{fields.keywords}}"}\'')
-    assert command_payload_placeholders(command, "scripts/generate_story.py") == {"keywords": "fields.keywords"}
-    assert "童年" not in command
+    assert command_payload_placeholders(command, "scripts/step_one.py") == {argv_key: f"fields.{argv_key}"}
     assert '"payload":"{{user_request}}"' not in command
 
 
 def test_runtime_schema_renders_subsequent_stdout_placeholders():
     from backend.services.skill_plan import SkillPlanEntry, render_script_command_from_runtime_schema
+    first_stdout_field = "dynamic_stdout_field"
+    second_stdout_field = "dynamic_artifact_field"
 
     image_entry = SkillPlanEntry(
-        path="scripts/generate_images.py",
+        path="scripts/step_two.py",
         file_type="script",
         role="generic_script",
         purpose="generic",
         runtime="python",
+        command_arg_bindings=[{
+            "argv_key": first_stdout_field,
+            "from_node": "scripts/step_one.py",
+            "from_field": first_stdout_field,
+            "to_node": "scripts/step_two.py",
+            "to_field": first_stdout_field,
+            "value_template": "{{" + first_stdout_field + "}}",
+            "source_kind": "previous_stdout",
+            "value_type": "str",
+        }],
     )
     pdf_entry = SkillPlanEntry(
-        path="scripts/build_pdf.py",
+        path="scripts/step_three.py",
         file_type="script",
         role="generic_script",
         purpose="generic",
         runtime="python",
+        command_arg_bindings=[
+            {
+                "argv_key": first_stdout_field,
+                "from_node": "scripts/step_one.py",
+                "from_field": first_stdout_field,
+                "to_node": "scripts/step_three.py",
+                "to_field": first_stdout_field,
+                "value_template": "{{" + first_stdout_field + "}}",
+                "source_kind": "previous_stdout",
+                "value_type": "str",
+            },
+            {
+                "argv_key": second_stdout_field,
+                "from_node": "scripts/step_two.py",
+                "from_field": second_stdout_field,
+                "to_node": "scripts/step_three.py",
+                "to_field": second_stdout_field,
+                "value_template": "{{" + second_stdout_field + "}}",
+                "source_kind": "previous_stdout",
+                "value_type": "list",
+            },
+        ],
     )
 
     image_command = render_script_command_from_runtime_schema(
         image_entry,
-        {"required_keys": ["story_text"], "expected_types": {"story_text": "str"}},
-        previous_stdout_fields={"story_text"},
+        {"required_keys": [first_stdout_field], "expected_types": {first_stdout_field: "str"}},
+        previous_stdout_fields={first_stdout_field},
     )
     pdf_command = render_script_command_from_runtime_schema(
         pdf_entry,
-        {"required_keys": ["story_text", "image_paths"], "expected_types": {"story_text": "str", "image_paths": "list"}},
-        previous_stdout_fields={"story_text", "image_paths"},
+        {"required_keys": [first_stdout_field, second_stdout_field], "expected_types": {first_stdout_field: "str", second_stdout_field: "list"}},
+        previous_stdout_fields={first_stdout_field, second_stdout_field},
     )
 
-    assert image_command.endswith('\'{"story_text":"{{story_text}}"}\'')
-    assert pdf_command.endswith('\'{"image_paths":"{{image_paths}}","story_text":"{{story_text}}"}\'')
-    assert "用户输入的故事内容" not in image_command
-    assert "/output/story_1.png" not in pdf_command
+    assert f'"{first_stdout_field}":"{{{{{first_stdout_field}}}}}"' in image_command
+    assert f'"{first_stdout_field}":"{{{{{first_stdout_field}}}}}"' in pdf_command
+    assert f'"{second_stdout_field}":"{{{{{second_stdout_field}}}}}"' in pdf_command
+
+
+def test_requirement_graph_injects_immutable_platform_boundary_nodes():
+    from backend.services.creator.common import normalize_requirement_graph
+    from backend.services.platform_io_contract import build_platform_io_contract
+
+    graph = normalize_requirement_graph({
+        "requirements": [{
+            "target_file": "scripts/step.py",
+            "purpose": "Process graph-declared inputs.",
+        }],
+        "platform_input_node": {"node_id": "model_supplied", "outputs": ["not-protocol"]},
+        "platform_output_node": {"node_id": "model_supplied", "inputs": ["not-protocol"]},
+    })
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+
+    assert graph.platform_input_node["node_id"] == "platform_input_node"
+    assert graph.platform_input_node["node_type"] == "platform_input"
+    assert graph.platform_input_node["immutable"] is True
+    assert graph.platform_input_node["outputs"] == boundary["input_envelope_fields"]
+    assert graph.platform_output_node["node_id"] == "platform_output_node"
+    assert graph.platform_output_node["node_type"] == "platform_output"
+    assert graph.platform_output_node["immutable"] is True
+    assert graph.platform_output_node["inputs"] == boundary["final_output_fields"]
 
 
 def test_trial_run_generated_script_returns_runtime_spec(tmp_path, monkeypatch):

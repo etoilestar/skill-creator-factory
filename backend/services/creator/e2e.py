@@ -1565,15 +1565,15 @@ def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -
         f"candidate_targets={candidate_targets}。strict_json_argv_guard 是接口不对齐探针，不是默认修复目标；"
         "E2E 阶段以已经生成的 script 为主要接口事实，SKILL.md command block 是 orchestration 描述；"
         "如果 script 自身接口自洽而 SKILL.md command argv 不一致，优先修 SKILL.md 当前失败 command JSON argv。"
-        "missing_required keys 时优先修 SKILL.md command JSON argv 传齐脚本 required keys；不要让脚本为了适配错误 SKILL.md 把 required schema 改成 payload。"
-        "如果 command argv 中出现样本值（如 [\"童年\",\"分别\",\"重逢\"]、\"用户输入的故事内容\"、\"示例文本\"、sample/example、\"/output/story_1.png\"），target_file=SKILL.md，改为占位符（如 {{fields.keywords}}、{{story_text}}、{{image_paths}}）。"
+        "missing_required keys 时优先修 SKILL.md command JSON argv 或 graph/command binding，传齐脚本 required keys；不要让脚本为了适配错误 SKILL.md 把 required schema 改成泛化 payload。"
+        "如果 command argv 对图谱标记为 dynamic 的输入使用 literal runtime data，target_file=SKILL.md 或 graph/command binding，改为图谱边派生的占位符。"
         "只有 script 语法/导入/入口/JSON argv 读取、guard 与 run/main 读取字段不一致、未消费正确字段、stdout/artifact 输出错误时才改 script。"
         "禁止只改 guard schema 或只 patch guard spec；不得为了适配错误 SKILL.md command 而重命名脚本接口。"
         "不能通过删除参数、删除业务参数或删除功能分支降低功能覆盖面；不强制固定字段常量名；"
         "required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，第一步结构化业务输入用 {{fields.<key>}}，后续步骤引用前序 stdout 字段 {{<key>}}；移除确属职责外的 unknown keys；不得写样本值；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
+        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，第一步输入只能从 platform_input_node 边界字段派生，后续步骤只能从前序 stdout 边派生；移除确属职责外的 unknown keys；不得写 dynamic literal runtime data；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
     if primary == script_path:
         return common + f"\nprimary_target={script_path}：只修改当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout 输出逻辑；确保入口校验与 run/main 实际使用参数对齐；不要只修 guard；不得改 SKILL.md，不得为了适配错误 SKILL.md 而重命名脚本接口，不得删除 guard、核心功能或用默认值绕过必需输入。"
     return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 当前失败 command JSON argv，还是当前脚本入口接口与核心逻辑一致性。"

@@ -329,7 +329,12 @@ def render_canonical_command_from_verified_contract(
 
 
 def replace_skill_md_command_block(skill_md: str, block: SkillMdCommandBlock, canonical_command: str) -> str:
-    return str(skill_md or "")[:block.start] + f"```bash\n{canonical_command.strip()}\n```\n" + str(skill_md or "")[block.end:]
+    text = str(canonical_command or "").strip()
+    contract = ""
+    if "\n**argv JSON contract**" in text:
+        text, contract = text.split("\n**argv JSON contract**", 1)
+        contract = "\n**argv JSON contract**" + contract.rstrip() + "\n"
+    return str(skill_md or "")[:block.start] + f"```bash\n{text.strip()}\n```\n{contract}" + str(skill_md or "")[block.end:]
 
 
 def canonicalize_skill_md_runtime_commands(

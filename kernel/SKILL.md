@@ -276,7 +276,6 @@ Creator prepare-plan 不能无限追问。
 - 工作流步骤
 - 将创建/更新的文件
 - 需要上传的素材（`review_summary.assets_to_upload` 只表示 Creator 创建阶段必须上传的静态 assets；运行 Skill 时用户上传的输入文件不得写入；如果没有 Creator 静态素材上传需求，必须为空数组）
-- 风险或注意事项
 
 用户可以直接点击“开始生成”，也可以输入修改意见重新准备 plan。
 

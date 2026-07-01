@@ -225,3 +225,26 @@ python scripts/extract.py '{"parse_rules":"{{references/parse_rules.md}}"}'
 def test_standard_safe_argv_command_passes_without_contract_source():
     command = "python scripts/extract.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\",\"parse_rules\":\"references/parse_rules.md\",\"model\":\"TEXT_MODEL\"}'"
     assert validate_runtime_command_format(command) == []
+
+
+def test_sanitized_contract_is_written_outside_bash_fence_and_validates_idempotently():
+    skill_md = """Before
+```bash
+python scripts/extract.py '{"input_file":"{{input_files[0]}}","parse_rules":"{{references/parse_rules.md}}","model":"{{model}}"}'
+```
+After
+"""
+    first = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
+    assert first.changed
+    assert not first.blocked
+
+    blocks = parse_skill_md_bash_command_blocks(first.content)
+    assert len(blocks) == 1
+    assert "argv JSON contract" not in blocks[0].content
+    assert "**argv JSON contract**" in first.content
+    assert validate_runtime_command_format(blocks[0].content) == []
+
+    second = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=first.content)
+    assert not second.changed
+    assert not second.blocked
+    assert second.content == first.content

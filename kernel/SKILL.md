@@ -39,7 +39,7 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 
 ### 1.2 仅追问阻塞信息
 
-只有缺少会阻止生成或 E2E 打通的信息时才追问。最多一次提出 1～3 个问题，并且问题必须直接对应阻塞点。
+只有缺少会阻止生成或 E2E 打通的信息时才追问。每轮只提出 1 个问题，并且问题必须直接对应当前最阻塞的未解决点。
 
 可追问的阻塞信息示例：
 - 必需输入/输出无法确定，导致脚本 argv、stdout JSON 或最终回答协议无法设计。
@@ -54,13 +54,96 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 - 是否拆模块。
 - 是否需要完整架构讲解。
 
-**Phase 1 完成标志**：需求足以生成内部蓝图；或已返回最多 1～3 个真正必要的澄清问题。
+
+### 1.3 Prepare readiness gate（需求成熟度判断）
+
+在生成 `internal_blueprint_text` 之前，必须判断用户需求是否达到 ready。以下任一情况不明确时，不得直接 ready，必须返回 `needs_clarification`：
+
+1. 运行时输入来源不明确。
+2. 最终输出结构不明确。
+3. 是否需要脚本执行不明确。
+4. 是否需要外部模型、平台工具、API、数据库、上传文件或静态素材不明确。
+5. 用户提到“文档、文件、图片、表格、数据集、素材”等输入，但不清楚它是运行时输入还是 Creator 静态 assets。
+6. 输出字段会影响 stdout JSON schema，但字段名、层级或格式不明确。
+7. 文件计划可能产生 assets、references、scripts 不一致风险。
+8. 无法判断是否能生成合法 SkillPlan / 文件职责计划。
+
+只有在输入、输出、执行方式、资源边界、文件计划都足够明确时，才能 `status=ready`。用户运行 Skill 时上传或粘贴的输入文件，不属于 Creator assets；这类内容应写入 I/O 契约和脚本 inputs，例如 runtime input 字段。只有 Skill 自带的模板、固定示例、图标、字体、静态参考素材，才属于 assets。
+
+### 1.4 澄清问题模板库
+
+当 `status=needs_clarification` 时，`clarifying_questions` 必须只包含 1 个带选项的问题。每个问题 2～4 个选项，尽量包含推荐项。问题必须聚焦当前最阻塞点，不要恢复长问卷。
+
+通用模板：
+
+1. 输入来源不明确时：输入来源希望支持哪种？A. 只支持粘贴文本 B. 只支持上传文件 C. 两者都支持（推荐）
+2. 文件类型不明确时：需要支持哪些输入文件类型？A. 只支持纯文本 B. 支持 PDF/DOCX/TXT（推荐） C. 支持表格/图片等更多类型
+3. 输出格式不明确时：输出格式希望是哪种？A. 严格 JSON B. JSON + 可读 Markdown（推荐） C. 只要可读文本
+4. 输出详细程度不明确时：输出详细程度希望是哪种？A. 简短摘要 B. 中等要点式（推荐） C. 尽量详细
+5. 结构化字段不明确时：结果字段希望如何组织？A. 使用固定 JSON 字段（推荐） B. 按用户原文结构自由组织 C. 同时返回结构化字段和可读说明
+6. 是否生成文件不明确时：最终结果需要生成文件吗？A. 不需要，只返回文本/JSON（推荐） B. 需要生成 PDF/DOCX C. 需要同时返回文本和文件
+7. 运行时输入和静态素材边界不明确时：你提到的文件是运行时每次上传的输入，还是创建 Skill 时固定使用的素材？A. 每次运行时上传的输入（推荐） B. 创建 Skill 时固定上传的静态素材 C. 两者都有
+8. 外部依赖不明确时：是否允许调用外部服务或 API？A. 不允许，只用本地/平台能力（推荐） B. 允许调用指定 API C. 暂时不确定
+9. 修改已有 Skill 但目标不明确时：这次主要想修改哪部分？A. 修改输入/输出 B. 修改执行逻辑 C. 修复报错 D. 增加新功能
+
+### 单问推进规则
+
+当 `status=needs_clarification` 时，`clarifying_questions` 必须只包含 1 个问题。
+
+不要一次性列出多个问题。不要把输入来源、输出格式、补充确认等多个问题合并到同一轮。每轮只问当前最阻塞、最需要用户确认的一个问题。
+
+用户回答后，下一轮 prepare-plan 必须结合 `conversation_history`、`human_feedback`、上一轮问题和用户选择，再判断：
+
+1. 是否还有未解决的阻塞点；
+2. 如果有，只问下一个最关键问题；
+3. 如果没有，单独询问用户是否还有其他补充内容；
+4. 如果用户明确没有补充，才允许生成 `internal_blueprint_text` 并进入 ready。
+
+澄清问题模板库只是候选问题来源。每次 `needs_clarification` 只能从模板库中选择或改写 1 个最关键问题，不得一次性返回多个模板问题。
+
+### 补充内容确认规则
+
+“还有其他需要补充的要求吗？”必须作为最后阶段的单独问题出现。
+
+只有当所有必要阻塞问题都已经根据前文回答解决后，才问：
+
+还有其他需要补充的要求吗？A. 没有，按上面的选择继续 B. 有，我补充说明
+
+不要把这个问题和其他业务问题放在同一轮。不要在还有未解决阻塞问题时提前询问补充内容。
+
+如果用户选择 “A. 没有，按上面的选择继续”，下一轮可以进入 ready 判断。如果用户选择 “B. 有，我补充说明”，不要 ready，应等待用户输入补充内容。用户补充内容后，需要重新判断是否还有新的阻塞点；如果没有，再次单独询问是否还有其他补充内容。
+
+不要问以下非阻塞偏好：
+
+- 使用平台。
+- 使用频率。
+- 质量优先还是速度优先。
+- 是否拆模块。
+- 是否需要完整架构讲解。
+- 是否确认进入下一阶段。
+- 是否要我现在开始创建。
+
+**Phase 1 完成标志**：需求足以生成内部蓝图；或已返回 1 个真正必要的澄清问题。
 
 ---
 
 ## Phase 2: 内部 plan 生成 (Internal Blueprint)
 
 在编写任何代码前，生成完整的内部蓝图 `internal_blueprint_text`。蓝图仍然必须存在，并且必须满足现有 `analyze_blueprint` 可解析的格式；但它是后端 plan 准备链路的内部中间产物，不默认展示给用户。
+
+
+### 2.0 status=ready 的必要条件
+
+1. `internal_blueprint_text` 已生成。
+2. `internal_blueprint_text` 能被 `analyze_blueprint(strict=True)` 解析。
+3. SkillPlan 中每个 path 都是具体文件路径。
+4. 目录结构和 SkillPlan 文件计划不冲突。
+5. assets 只表示 Creator 创建阶段的静态素材，不表示运行时用户输入。
+6. 运行时产物只出现在脚本 outputs/stdout JSON/file_outputs 中。
+7. `review_summary.files_to_create_or_update` 能由最终 `plan.files` 回填。
+8. `review_summary.assets_to_upload` 只包含 Creator 静态素材上传需求，不包含运行时输入文件。
+9. 如果上一轮用户选择“有，我补充说明”，但尚未给出补充内容，不得 ready。
+10. 如果本轮之前曾进入澄清流程，则必须满足：所有必要阻塞问题都已有用户回答；已经单独询问过“是否还有其他补充内容”；用户明确选择“没有，按上面的选择继续”，或用户补充完内容后再次确认没有其他补充。否则不得 `status=ready`。
 
 ### 2.1 生成内部蓝图
 
@@ -80,7 +163,7 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 ├── SKILL.md
 ├── scripts/      [如需要]
 ├── references/   [如需要]
-└── assets/       [仅静态上传/预置素材；运行时产物不要列入目录结构]
+└── assets/       [仅静态素材需要时才出现]
 
 ### 工作流逻辑
 1. [步骤1]
@@ -90,7 +173,7 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 ### SkillPlan / 文件职责计划
 > 每一个将被 Creator 创建的文件都必须在这里显式声明职责合同；scripts/ 文件必须选择一个 role，不要留空。
 > `required_capabilities` / `forbidden_capabilities` 必须由模型基于当前文件的真实运行需求显式声明；不要因为相邻概念、全局描述、文件名或业务描述自动扩展能力。后端只校验显式能力是否在当前 role 边界内，不会用业务词补 capability；资源文件（`SKILL.md`、`references/*.md`、`assets/*`）不声明 runtime capabilities。helper_required 能力必须调用平台 runtime helper；helper_preferred/self_implementation_allowed 能力可按 Tool Registry 指引使用 helper 或自实现。
-> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。目录结构只负责展示，真正驱动创建的是 SkillPlan 文件职责计划；目录结构中的路径不能覆盖 SkillPlan 同路径合同。`assets/*` 必须显式声明 `source: user_upload` 或 `source: bundled`；如不需要 assets，应明确写“无需创建”。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
+> 文件计划只包含 Creator 需要创建或上传的源文件：`SKILL.md`、`scripts/*`、`references/*`、`assets/*` 静态素材。目录结构只展示目录级结构，不要列具体 `scripts/*`、`references/*`、`assets/*` 文件名；具体文件只能出现在 SkillPlan / 文件职责计划中。如果目录结构中列出了具体文件，则必须与 SkillPlan path 完全一致，否则视为 invalid blueprint。`assets/*` 必须显式声明 `source: user_upload` 或 `source: bundled`；如不需要 assets，不要输出任何 assets path。用户运行 Skill 时上传或粘贴的输入文件不属于 Creator assets，应写入 I/O 契约和脚本 inputs。脚本运行后生成的 PDF/DOCX/PPTX/图片/JSON/中间文件/最终结果不得写入目录结构或 `assets/*` 文件计划；它们只能写在对应脚本的 `outputs`、stdout JSON schema、`file_paths` / `file_outputs` 中。`dependencies` 只能表示运行前要读取的输入依赖，不得填写输出目录、最终产物目录、动态文件名或脚本运行后才生成的文件。最终文件产物应由脚本运行时写入 `OUTPUT_DIR` 并通过 stdout JSON 返回路径。
 > `inputs` / `outputs` 必须是确定字段名列表，不要写候选字段、别名字段或组合表达；若存在多种可能，请先选定一个字段名。蓝图第一轮只检查文件边界、role/capability、安全边界、命令块基础格式和 JSON argv 可解析性，不在蓝图阶段要求脚本 output 必须被后续 input 静态同名消费；内部字段流转由第二轮 E2E 真实执行验证。
 
 - path: `SKILL.md`
@@ -126,15 +209,17 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
   required_capabilities: []
   forbidden_capabilities: [runtime_execution, image_generation]
   references: []
-- path: `assets/<name.ext>`
-  role: asset
-  source: <user_upload | bundled>
-  inputs: []
-  outputs: []
-  dependencies: []
-  required_capabilities: []
-  forbidden_capabilities: [runtime_execution, image_generation]
-  references: []
+只有确实需要 Creator 静态素材时，才添加 assets 文件计划。assets 文件计划必须满足：
+
+- path 必须是具体文件路径，例如 `assets/template.docx`。
+- path 不能是 `assets/`、`assets/<name.ext>`、`assets/*`、`assets/{name}.ext` 或任何动态占位符。
+- source 必须是 `user_upload` 或 `bundled`。
+- inputs / outputs / dependencies 必须为空。
+- required_capabilities 必须为空。
+- forbidden_capabilities 至少包含 `runtime_execution`。
+- 运行时用户输入文件不属于 assets。
+- 运行时生成产物不属于 assets。
+- 如果不需要静态素材，不要输出任何 assets path。
 
 ### 宿主执行方式
 - **直接回答**: [哪些请求由模型直接生成文本/Markdown]
@@ -143,7 +228,7 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 - **执行后回答**: assistant 必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。最终 SKILL.md 只描述运行时触发、命令、observation 消费和结果返回，不得包含“输出蓝图等待确认”“用户确认后开始创建文件”等 Creator 创建阶段动作。
 
 ### 资源清单
-- [ ] [仅列静态 references、静态 assets、用户上传且已声明的输入文件；不要列运行时输入、运行时中间数据或最终生成产物]
+- [ ] [仅列静态 references 和 Creator 创建阶段静态 assets；不要列运行时输入、运行时中间数据或最终生成产物]
 ```
 
 ### 2.2 用户侧展示
@@ -154,7 +239,7 @@ Creator 前半段应尽量短：用户已经给出需求、选择已有 Skill �
 - 输出
 - 工作流步骤
 - 将创建/更新的文件
-- 需要上传的素材
+- 需要上传的素材（`review_summary.assets_to_upload` 只表示 Creator 创建阶段必须上传的静态 assets；运行 Skill 时用户上传的输入文件不得写入；如果没有 Creator 静态素材上传需求，必须为空数组）
 - 风险或注意事项
 
 用户可以直接点击“开始生成”，也可以输入修改意见重新准备 plan。

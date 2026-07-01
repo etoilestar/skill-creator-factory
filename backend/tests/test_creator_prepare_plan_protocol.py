@@ -118,7 +118,7 @@ async def test_feedback_wants_supplement_blocks_ready(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_asset_placeholder_ready_is_translated_to_blocked_not_http_400(monkeypatch):
+async def test_asset_placeholder_ready_returns_confirmation_not_blocked(monkeypatch):
     async def fake_generate(_request):
         return {"status": "ready", "internal_blueprint_text": _ready_blueprint("- path: `assets/<name.ext>`\n  role: asset\n  source: user_upload")}
     async def no_repair(**kwargs):
@@ -126,11 +126,13 @@ async def test_asset_placeholder_ready_is_translated_to_blocked_not_http_400(mon
     monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
     monkeypatch.setattr(api, "_repair_prepare_blueprint_protocol", no_repair)
     resp = await api.prepare_plan(_request())
-    assert resp.status == "blocked"
+    assert resp.status == "needs_clarification"
+    assert resp.review_summary.risks == []
+    assert "要点" in resp.clarifying_questions[0] or "按这些" in resp.clarifying_questions[0]
 
 
 @pytest.mark.asyncio
-async def test_analyze_blueprint_error_is_translated_to_blocked(monkeypatch):
+async def test_analyze_blueprint_error_returns_confirmation_not_blocked(monkeypatch):
     async def fake_generate(_request):
         return {"status": "ready", "internal_blueprint_text": _ready_blueprint()}
     async def fake_analyze(_request):
@@ -141,7 +143,7 @@ async def test_analyze_blueprint_error_is_translated_to_blocked(monkeypatch):
     monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
     monkeypatch.setattr(api, "_repair_prepare_blueprint_protocol", no_repair)
     resp = await api.prepare_plan(_request())
-    assert resp.status == "blocked"
+    assert resp.status == "needs_clarification"
 
 
 @pytest.mark.asyncio
@@ -160,3 +162,56 @@ async def test_ready_uses_strict_analyze_plan_and_filters_dynamic_paths(monkeypa
     assert resp.review_summary.files_to_create_or_update == ["SKILL.md"]
     assert not any("<" in p or p == "assets/" for p in resp.review_summary.files_to_create_or_update)
     assert resp.review_summary.assets_to_upload == []
+
+@pytest.mark.asyncio
+async def test_limit_reached_returns_summary_confirmation_not_business_question(monkeypatch):
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输出格式？A. JSON B. Markdown"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="目标功能", input="运行时输入", output="JSON", risks=["should drop"])
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    history = [
+        {"role": "assistant", "content": "我还需要确认一个必要信息：\n输入？A. 文本 B. 文件"},
+        {"role": "assistant", "content": "我还需要确认一个必要信息：\n输出？A. JSON B. Markdown"},
+    ]
+    resp = await api.prepare_plan(_request(conversation_history=history))
+    assert resp.status == "needs_clarification"
+    assert "补充" in resp.clarifying_questions[0]
+    assert resp.review_summary.goal == "目标功能"
+
+
+@pytest.mark.asyncio
+async def test_supplement_content_resummarizes_and_asks_confirmation(monkeypatch):
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输入？A. 文本 B. 文件"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="更新后的创建要点", input="补充后的输入", output="JSON", risks=[])
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    resp = await api.prepare_plan(_request(human_feedback="问题：以上创建要点是否还需要补充？\n选择：B. 有，我补充说明\n补充：增加 CSV 输入"))
+    assert resp.status == "needs_clarification"
+    assert resp.review_summary.goal == "更新后的创建要点"
+    assert "更新创建要点" in resp.clarifying_questions[0]
+
+
+@pytest.mark.asyncio
+async def test_supplement_limit_generates_blueprint_and_strict_analyze(monkeypatch):
+    calls = []
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输入？A. 文本 B. 文件"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="最终要点", input="输入", output="JSON", risks=[])
+    async def fake_blueprint(**kwargs):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+    async def fake_analyze(request):
+        calls.append(request)
+        return _plan(path="SKILL.md")
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    monkeypatch.setattr(api, "_generate_internal_blueprint_from_confirmed_summary", fake_blueprint)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    history = [{"role": "user", "content": "补充：第一次补充"}]
+    resp = await api.prepare_plan(_request(conversation_history=history, human_feedback="补充：第二次补充"))
+    assert resp.status == "ready"
+    assert calls and calls[0].strict is True

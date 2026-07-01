@@ -58,7 +58,7 @@
 
           <div v-if="reviewSummary" class="review-card">
             <div class="review-header">
-              <h3>创建要点</h3>
+              <h3>{{ creationPlan ? '创建要点' : '已整理的创建要点' }}</h3>
               <button class="btn-ghost" @click="showInternalBlueprint = !showInternalBlueprint">
                 {{ showInternalBlueprint ? '隐藏内部蓝图' : '查看内部蓝图' }}
               </button>
@@ -70,7 +70,6 @@
               <li v-if="reviewSummary.workflow?.length"><strong>工作流：</strong>{{ reviewSummary.workflow.join(' → ') }}</li>
               <li v-if="reviewSummary.files_to_create_or_update?.length"><strong>文件：</strong>{{ reviewSummary.files_to_create_or_update.join('、') }}</li>
               <li v-if="reviewSummary.assets_to_upload?.length"><strong>需上传素材：</strong>{{ reviewSummary.assets_to_upload.join('、') }}</li>
-              <li v-if="reviewSummary.risks?.length"><strong>风险/注意：</strong>{{ reviewSummary.risks.join('；') }}</li>
             </ul>
             <details v-if="showInternalBlueprint && blueprintText" open>
               <summary>内部蓝图</summary>
@@ -198,6 +197,7 @@ const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
+const pendingSupplementQuestion = ref('')
 
 // The raw blueprint text extracted from the latest blueprint assistant message
 const blueprintText = computed(() => creationPlan.value?.blueprint_text || '')
@@ -238,8 +238,9 @@ async function handleQuickAction(value) {
   quickActions.value = []
   if (action.waitForInput) {
     input.value = ''
+    pendingSupplementQuestion.value = action.value
     messages.value.push({ role: 'user', content: action.value })
-    messages.value.push({ role: 'assistant', content: '好的，请在输入框补充你的其他要求。' })
+    messages.value.push({ role: 'assistant', content: '好的，请补充你的其他要求。' })
     await scrollBottom()
     return
   }
@@ -254,8 +255,12 @@ async function handleQuickAction(value) {
 // ---------------------------------------------------------------------------
 
 async function send() {
-  const text = input.value.trim()
+  let text = input.value.trim()
   if (!text || streaming.value) return
+  if (pendingSupplementQuestion.value) {
+    text = `${pendingSupplementQuestion.value}\n补充：${text}`
+    pendingSupplementQuestion.value = ''
+  }
 
   error.value = ''
   quickActions.value = []
@@ -270,7 +275,7 @@ async function send() {
   try {
     const currentSkillName = resolveCurrentSkillName()
     const previousBlueprintText = blueprintText.value
-    const humanFeedback = currentSkillName || previousBlueprintText ? text : ''
+    const humanFeedback = text
     const mode = shouldPreparePlanRevise({
       skillName: currentSkillName,
       previousBlueprintText,
@@ -287,13 +292,16 @@ async function send() {
       model: null,
     }
     const plan = await prepareCreationPlan(payload)
-    reviewSummary.value = plan.review_summary || null
+    const summary = plan.review_summary || null
+    reviewSummary.value = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length) ? { ...summary, risks: [] } : null
 
     if (plan.status === 'needs_clarification') {
       const question = (plan.clarifying_questions || [])[0]
       messages.value.push({
         role: 'assistant',
-        content: `我还需要确认一个必要信息：
+        content: reviewSummary.value
+          ? `${question || '请确认是否需要补充。'}`
+          : `我还需要确认一个必要信息：
 
 ${question || '请补充当前最阻塞创建计划的信息。'}`,
       })

@@ -419,7 +419,7 @@ def _compose_creator_workflow_contract() -> str:
 
 def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
     """Create phase-specific creator workflow contract.
-    
+
     Progressive disclosure: only show constraints relevant to current phase.
     """
     base_contract = (
@@ -433,7 +433,26 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
         "1. 在推进到下一阶段前，必须确认当前阶段的完成标志已满足。\n"
         "2. 如果未满足，继续提问或总结确认，不得提前输出下一阶段内容。\n\n"
     )
-    
+
+    if phase == "prepare_plan":
+        return base_contract + (
+            "当前阶段：prepare_plan（需求快速解析 → 内部蓝图/plan 准备）\n\n"
+            "执行要求：\n"
+            "1. 一次性解析用户需求、已有 Skill 上下文、上传文件和修改意见。\n"
+            "2. 信息足够时，直接生成满足 analyze_blueprint 可解析格式的内部蓝图；不要输出固定问卷。\n"
+            "3. 信息不足时，只返回真正阻塞生成或 E2E 打通的澄清问题，最多 1-3 个。\n"
+            "4. 不要默认询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞偏好。\n"
+            "5. 不要强制把完整蓝图展示给用户确认，不要依赖固定确认语进入生成。\n"
+            "6. assets/** 只能来自用户上传或 bundled 静态素材；运行时产物必须通过 OUTPUT_DIR/stdout JSON 表达。\n\n"
+            "输出边界：\n"
+            "- prepare-plan API 会要求结构化 JSON；此阶段禁止文件写入/命令执行格式。\n"
+            "- 内部蓝图仍需保留 SkillPlan / 文件职责计划、宿主执行方式、资源清单等平台合同。\n\n"
+            "运行时安全：\n"
+            "1. 不要假装已经读取 references/assets/scripts 的正文；这些资源只有在宿主明确加载后才可使用。\n"
+            "2. 不要假装已经读取子 Skill 的正文；子 Skill 正文只有在宿主明确加载后才可使用。\n"
+            "3. 不要输出自定义 `<skill_action>` 标签。\n"
+        )
+
     if phase == "first_time" or phase == "phase1":
         # Phase 1: only show Phase 1 constraints
         return base_contract + (
@@ -612,7 +631,7 @@ def compose_kernel_creator_body_prompt(skill: SkillPackage) -> str:
 
 def compose_kernel_creator_metadata_prompt(skill: SkillPackage) -> str:
     """Compose creator-specific metadata-only prompt (no full SKILL.md body).
-    
+
     精简版 creator prompt：
     - 只包含元数据和核心流程定义
     - 不加载完整 SKILL.md 正文
@@ -648,7 +667,7 @@ def compose_kernel_creator_metadata_prompt(skill: SkillPackage) -> str:
 
 def compose_kernel_creator_first_part_prompt(skill: SkillPackage, first_part_content: str) -> str:
     """Compose creator prompt with only the first part of SKILL.md.
-    
+
     初始版 creator prompt：
     - 只包含元数据和 SKILL.md 的第一部分（到第一个 --- 分隔符）
     - 包含启动对话的指令，适合首次进入页面
@@ -676,7 +695,7 @@ def compose_kernel_creator_first_part_prompt(skill: SkillPackage, first_part_con
 
 def _split_skill_md_into_blocks(skill_root: Path) -> list[str]:
     """Split SKILL.md into blocks separated by --- separators.
-    
+
     Returns a list of blocks, where:
     - Block 0: Frontmatter + intro (to first ---)
     - Block 1: Phase 1
@@ -689,13 +708,13 @@ def _split_skill_md_into_blocks(skill_root: Path) -> list[str]:
     skill_md_path = skill_root / "SKILL.md"
     if not skill_md_path.exists():
         raise FileNotFoundError(f"SKILL.md not found at {skill_md_path}")
-    
+
     with open(skill_md_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
-    
+
     # Split by --- separators
     parts = content.split("\n---\n")
-    
+
     # The first part includes frontmatter, we need to process it
     blocks = []
     for i, part in enumerate(parts):
@@ -705,13 +724,13 @@ def _split_skill_md_into_blocks(skill_root: Path) -> list[str]:
         else:
             # Subsequent parts: add back the separator context
             blocks.append("---\n" + part.strip() + "\n")
-    
+
     return blocks
 
 
 def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int], phase: str) -> str:
     """Compose creator prompt with specific blocks from SKILL.md.
-    
+
     Args:
         skill: SkillPackage with metadata
         blocks: List of block indices to include (0 = intro, 1 = Phase1, etc.)
@@ -719,17 +738,37 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
     """
     # Load the full content first to extract blocks
     all_blocks = _split_skill_md_into_blocks(settings.kernel_path)
-    
+
     # Build combined content from selected blocks
     selected_content = []
     for block_idx in blocks:
         if block_idx < len(all_blocks):
             selected_content.append(all_blocks[block_idx])
-    
+
     combined_content = "\n".join(selected_content)
-    
-    # Phase 1/2 特殊处理：在 SKILL.md 前面增加执行提示
-    if phase == "first_time" or phase == "phase1":
+
+    # prepare_plan 特殊处理：新前半段主流程，不使用固定问卷/确认语
+    if phase == "prepare_plan":
+        prepare_instruction = """
+==================== prepare_plan 执行指南 ====================
+
+目标：把用户需求/已有 Skill/上传文件/修改意见快速转成内部蓝图和 creation plan。
+
+要求：
+1. 用户已给出需求时，不要重新问开场分类问题。
+2. 直接抽取目标、输入、输出、素材需求、外部依赖、约束。
+3. 能合理默认的内容不要问；只问真正阻塞生成或 E2E 的信息。
+4. 如需澄清，一次最多 1～3 个问题。
+5. 信息足够时生成完整 internal_blueprint_text，格式必须满足 analyze_blueprint 的 Skill 架构蓝图协议。
+6. 不要求用户阅读完整蓝图，不使用固定确认语作为流程开关。
+7. 用户侧只需要创建要点摘要；完整蓝图仅作为内部调试/高级查看。
+8. 不要为具体 Skill 类型、文件名或业务场景写硬编码特判。
+
+==============================================================
+
+"""
+        combined_content = prepare_instruction + combined_content
+    elif phase == "first_time" or phase == "phase1":
         phase1_instruction = """
 ==================== Phase 1 执行指南 ====================
 
@@ -784,7 +823,7 @@ Phase 2 的任务是：
 
 """
         combined_content = phase2_instruction + combined_content
-    
+
     return (
         "你处于 Skill Creator 模式。\n\n"
         "请严格按照下面 SKILL.md 中的流程和要求执行。\n"
@@ -812,7 +851,7 @@ def load_kernel_creator_for_phase(phase: str) -> str:
     - first_time / phase1: blocks [0, 1, 2] (intro + Phase1)
     - phase2: blocks [0, 1, 2, 3] (intro + Phase1 + Phase2)
     - phase3+: load FULL SKILL.md (need full implementation instructions)
-    
+
     Block mapping from SKILL.md split:
     - Block 0: frontmatter
     - Block 1: intro + SOP overview
@@ -822,7 +861,10 @@ def load_kernel_creator_for_phase(phase: str) -> str:
     """
     skill = load_kernel_package(include_body=False)
 
-    if phase == "first_time" or phase == "phase1":
+    if phase == "prepare_plan":
+        # New Creator front-half: intro + quick prepare + internal blueprint contract.
+        return _compose_kernel_creator_blocks_prompt(skill, [0, 1, 2, 3], phase)
+    elif phase == "first_time" or phase == "phase1":
         # First time or Phase1: only need intro + Phase1
         return _compose_kernel_creator_blocks_prompt(skill, [0, 1, 2], phase)
     elif phase == "phase2":
@@ -886,7 +928,7 @@ def load_kernel_creator_metadata_prompt() -> str:
 
 def load_kernel_creator_first_part_prompt() -> str:
     """Load kernel Skill with only the first part of SKILL.md (until first --- separator).
-    
+
     适合首次进入 Creator 页面的场景：
     - 包含元数据和启动对话指令
     - 比完整加载更轻量

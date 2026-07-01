@@ -22,6 +22,28 @@ function assertActionSuccess(payload, fallbackMessage) {
   return payload
 }
 
+
+/**
+ * Prepare an internal blueprint and creation plan from a user request.
+ * This is the new Creator front-half entrypoint; analyzeBlueprintPlan remains
+ * available for legacy/debug flows.
+ *
+ * @param {object} payload
+ * @returns {Promise<object>}
+ */
+export async function prepareCreationPlan(payload) {
+  const resp = await fetch('/api/creator/prepare-plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+    throw new Error(err.detail || '创建计划准备失败')
+  }
+  return resp.json()
+}
+
 /**
  * Analyze the conversation blueprint and extract a file-creation plan.
  * This is a pure rule-based call — no LLM is involved.

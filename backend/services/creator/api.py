@@ -1,12 +1,166 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import hashlib
+from typing import Literal
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
+from ..kernel_loader import load_kernel_creator_for_phase
+
+
+class PreparePlanRequest(BaseModel):
+    mode: Literal["create", "revise"] = "create"
+    skill_name: str | None = None
+    user_request: str = ""
+    conversation_history: list[dict[str, Any]] = []
+    uploaded_files: list[dict[str, Any]] = []
+    previous_blueprint_text: str = ""
+    human_feedback: str = ""
+    model: str | None = None
+
+
+class PreparePlanReviewSummary(BaseModel):
+    goal: str = ""
+    input: str = ""
+    output: str = ""
+    workflow: list[str] = []
+    files_to_create_or_update: list[str] = []
+    assets_to_upload: list[str] = []
+    risks: list[str] = []
+    changes: list[str] = []
+
+
+class PreparePlanResponse(BaseModel):
+    status: Literal["ready", "needs_clarification", "blocked"]
+    clarifying_questions: list[str] = []
+    review_summary: PreparePlanReviewSummary = Field(default_factory=PreparePlanReviewSummary)
+    blueprint_text: str = ""
+    skill_name: str = ""
+    files: list[FileSpecOut] = []
+    warnings: list[Any] = []
+    asset_requirements: list[AssetRequirementOut] = []
+    final_outputs: list[Any] = []
+    available_tools: list[dict[str, Any]] = []
+    missing_tool_configs: list[dict[str, Any]] = []
+    tool_requirements: list[dict[str, Any]] = []
+    creation_blockers: list[Any] = []
+    requirement_graph: dict[str, Any] = {}
+    workflow_allocation_summary: str = ""
+
+
+def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, Any]:
+    if not skill_name:
+        return {}
+    safe_name = _validate_skill_name(skill_name)
+    root = settings.skills_path / safe_name
+    if not root.is_dir():
+        return {"skill_name": safe_name, "missing": True}
+
+    def read_text(rel: str) -> str:
+        path = root / rel
+        return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+    def list_dir(rel: str) -> list[str]:
+        base = root / rel
+        if not base.is_dir():
+            return []
+        return sorted(p.relative_to(root).as_posix() for p in base.rglob("*") if p.is_file())
+
+    return {
+        "skill_name": safe_name,
+        "skill_md": read_text("SKILL.md")[:20000],
+        "scripts": list_dir("scripts"),
+        "references": list_dir("references"),
+        "assets": list_dir("assets"),
+        "requirement_graph": read_text(".creator/requirement_graph.json")[:20000],
+        "workflow_allocation_summary": read_text(".creator/workflow_allocation_summary.txt")[:12000],
+    }
+
+
+def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise ValueError("prepare-plan model did not return JSON")
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("prepare-plan JSON must be an object")
+    return data
+
+
+def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
+    if not isinstance(data, dict):
+        return PreparePlanReviewSummary()
+    return PreparePlanReviewSummary(
+        goal=str(data.get("goal") or ""),
+        input=str(data.get("input") or ""),
+        output=str(data.get("output") or ""),
+        workflow=[str(x) for x in (data.get("workflow") or []) if str(x).strip()],
+        files_to_create_or_update=[str(x) for x in (data.get("files_to_create_or_update") or []) if str(x).strip()],
+        assets_to_upload=[str(x) for x in (data.get("assets_to_upload") or []) if str(x).strip()],
+        risks=[str(x) for x in (data.get("risks") or []) if str(x).strip()],
+        changes=[str(x) for x in (data.get("changes") or []) if str(x).strip()],
+    )
+
+
+async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest) -> dict[str, Any]:
+    existing_context = _read_prepare_existing_skill_context(request.skill_name) if request.mode == "revise" else {}
+    system_prompt = load_kernel_creator_for_phase("prepare_plan") + """
+
+你现在服务 /api/creator/prepare-plan。只输出严格 JSON object，不要 Markdown，不要解释文本。
+
+返回格式：
+{
+  "status": "ready" | "needs_clarification" | "blocked",
+  "clarifying_questions": ["最多三个真正必要的问题"],
+  "review_summary": {
+    "goal": "",
+    "input": "",
+    "output": "",
+    "workflow": [],
+    "files_to_create_or_update": [],
+    "assets_to_upload": [],
+    "risks": [],
+    "changes": []
+  },
+  "internal_blueprint_text": "当 status=ready 时填写完整 Skill 架构蓝图",
+  "skill_name": "可选",
+  "blockers": []
+}
+
+约束：
+- 信息足够时 status=ready，并生成完整 internal_blueprint_text。
+- 信息不足时 status=needs_clarification，clarifying_questions 最多 3 个，且只能问阻塞生成/E2E 的问题。
+- 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
+- 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
+- assets/** 只能声明 user_upload 或 bundled；不要把运行时产物放入 assets。
+"""
+    payload = {
+        "mode": request.mode,
+        "skill_name": request.skill_name,
+        "user_request": request.user_request,
+        "conversation_history": request.conversation_history,
+        "uploaded_files": request.uploaded_files,
+        "previous_blueprint_text": request.previous_blueprint_text,
+        "human_feedback": request.human_feedback,
+        "existing_skill_context": existing_context,
+    }
+    route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare plan")
+    text = await complete_chat_once([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ], route.model)
+    return _parse_prepare_plan_json(text)
+
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
@@ -575,6 +729,66 @@ async def _normalize_script_purpose_short_contracts(
                 "field": "purpose",
                 "message": f"Script purpose short-contract normalization failed; keeping parsed purposes: {exc}",
             })
+
+
+@router.post("/prepare-plan", response_model=PreparePlanResponse)
+async def prepare_plan(request: PreparePlanRequest):
+    try:
+        prepared = await _generate_internal_blueprint_or_questions(request)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"prepare-plan 生成失败：{exc}") from exc
+
+    raw_status = str(prepared.get("status") or "").strip()
+    status = raw_status if raw_status in {"ready", "needs_clarification", "blocked"} else "blocked"
+    summary = _coerce_prepare_summary(prepared.get("review_summary"))
+
+    if status == "needs_clarification":
+        return PreparePlanResponse(
+            status="needs_clarification",
+            clarifying_questions=[str(q) for q in (prepared.get("clarifying_questions") or []) if str(q).strip()][:3],
+            review_summary=summary,
+            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
+        )
+
+    if status == "blocked":
+        return PreparePlanResponse(
+            status="blocked",
+            review_summary=summary,
+            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
+            creation_blockers=[str(x) for x in (prepared.get("blockers") or prepared.get("creation_blockers") or []) if str(x).strip()],
+            warnings=[{"severity": "user_warning", "code": "prepare_plan_blocked", "source": "prepare_plan", "path": "", "field": "", "message": "Creator plan preparation is blocked."}],
+        )
+
+    blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
+    if not blueprint_text:
+        raise HTTPException(status_code=502, detail="prepare-plan 未返回 internal_blueprint_text")
+
+    plan = await analyze_blueprint(AnalyzeBlueprintRequest(
+        messages=[{"role": "assistant", "content": blueprint_text}],
+        model=request.model,
+        strict=True,
+        refine_contract=True,
+        refine_rounds=3,
+    ))
+
+    graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
+    return PreparePlanResponse(
+        status="ready",
+        review_summary=summary,
+        blueprint_text=plan.blueprint_text or blueprint_text,
+        skill_name=plan.skill_name,
+        files=plan.files,
+        warnings=plan.warnings,
+        asset_requirements=plan.asset_requirements,
+        final_outputs=plan.final_outputs,
+        available_tools=plan.available_tools,
+        missing_tool_configs=plan.missing_tool_configs,
+        tool_requirements=plan.tool_requirements,
+        creation_blockers=plan.creation_blockers,
+        requirement_graph=graph_payload,
+        workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
+    )
+
 
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):

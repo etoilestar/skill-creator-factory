@@ -2961,30 +2961,41 @@ def _run_generated_tool_script(*, script_code: str, manifest: dict[str, Any], pa
         if temp_root is not None:
             temp_root.cleanup()
 
-def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None = None, sample_input: dict[str, Any] | None = None, dynamic: bool = True, real_run: bool = False, require_auth_config: bool = True) -> dict[str, Any]:
+def validate_tool_manifest(manifest: dict[str, Any], *, adapter_code: str | None = None, sample_input: dict[str, Any] | None = None, dynamic: bool = True, real_run: bool = False, require_auth_config: bool = True, direct_run: bool = False) -> dict[str, Any]:
     manifest = _sync_auth_into_manifest(dict(manifest or {}), None)
     script_code = _strip_code_fence(str(adapter_code or ""))
     if script_code.strip():
         manifest = _normalize_dependencies_for_script(manifest, script_code)
     errors = _script_tool_spec_errors(manifest)
     warnings: list[str] = []
-    resolved_sample_input, sample_notes = resolve_tool_trial_sample_input(manifest, sample_input if isinstance(sample_input, dict) else {})
-    warnings.extend(sample_notes)
+    raw_sample_input = sample_input if isinstance(sample_input, dict) else {}
+    if direct_run:
+        resolved_sample_input, sample_notes = dict(raw_sample_input), []
+    else:
+        resolved_sample_input, sample_notes = resolve_tool_trial_sample_input(manifest, raw_sample_input)
+        warnings.extend(sample_notes)
     if not script_code.strip():
         errors.append("adapter_code/script_code is required and must contain the generated Python script")
         auth_report = _auth_validation_report(manifest, "", require_auth_config=require_auth_config)
     else:
         errors.extend(_script_static_errors(script_code, manifest))
         auth_report = _auth_validation_report(manifest, script_code, require_auth_config=require_auth_config)
-    errors.extend(auth_report.get("errors") or [])
+    if not direct_run:
+        errors.extend(auth_report.get("errors") or [])
     warnings.extend(auth_report.get("warnings") or [])
     dynamic_result: dict[str, Any] = {"skipped": not dynamic}
     auth_gate = auth_report.get("auth_gate") or _auth_gate_for_manifest(manifest, require_config=require_auth_config)
     if dynamic and not errors:
-        if auth_gate.get("missing_env") and not require_auth_config:
+        if auth_gate.get("missing_env") and not require_auth_config and not direct_run:
             dynamic_result = {"skipped": True, "reason": "auth_config_missing", "auth_gate": auth_gate, "temporary_environment": {"success": True, "status": "skipped_auth_config_missing", "reason": "auth config is missing; script execution is skipped until credentials are configured"}}
         else:
-            dynamic_result = _run_generated_tool_script(script_code=script_code, manifest=manifest, payload=resolved_sample_input, config={}, trial=not real_run)
+            dynamic_result = _run_generated_tool_script(
+                script_code=script_code,
+                manifest=manifest,
+                payload=resolved_sample_input,
+                config={},
+                trial=False if direct_run else not real_run,
+            )
             if not dynamic_result.get("success"):
                 dyn_errors = dynamic_result.get("errors") or ["dynamic script validation failed"]
                 if sample_notes:

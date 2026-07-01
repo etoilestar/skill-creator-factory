@@ -2351,8 +2351,8 @@ function validateTool() {
 
       sample_input: parsedSample.value,
       dynamic: true,
-      allow_external_network: allowExternalNetwork.value || Boolean(liveTestResult.value?.success),
-      real_run: allowExternalNetwork.value || Boolean(liveTestResult.value?.success)
+      allow_external_network: true,
+      real_run: true
     })
 
     debugSections.value = mergeDebugSections(

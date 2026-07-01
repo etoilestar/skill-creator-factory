@@ -347,13 +347,12 @@ def test_resolve_sample_input_missing_sample_warns_without_fabricating(monkeypat
     assert "missing" in notes[0]
 
 
-def test_validate_dynamic_trial_receives_resolved_sample_input(monkeypatch, tmp_path):
-    registry, sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
+def test_validate_direct_run_uses_raw_sample_input_without_autofill(monkeypatch, tmp_path):
+    registry, _sample_pdf = _make_sample_pdf(monkeypatch, tmp_path)
 
     script = """
 def run(payload, config=None):
-    import os
-    return {"success": True, "seen_basename": os.path.basename(payload.get("file", "")), "seen_exists": os.path.exists(payload.get("file", ""))}
+    return {"success": True, "missing_file": "file" not in dict(payload or {})}
 def sample_file_tool(payload, config=None):
     return run(payload, config)
 """
@@ -363,12 +362,14 @@ def sample_file_tool(payload, config=None):
         sample_input={},
         dynamic=True,
         require_auth_config=False,
+        direct_run=True,
     )
 
     assert validation["success"] is True
-    assert validation["sample_input"] == {"file": str(sample_pdf.resolve())}
-    assert validation["dynamic_trial"]["result"]["seen_basename"] == "sample.pdf"
-    assert validation["dynamic_trial"]["result"]["seen_exists"] is True
+    assert validation["sample_input"] == {}
+    assert validation["sample_notes"] == []
+    assert validation["dynamic_trial"]["result"]["missing_file"] is True
+    assert validation["dynamic_trial"]["temporary_environment"]["env"]["TOOL_TRIAL_RUN"] == "0"
 
 
 def test_author_trial_run_and_finalize_return_resolved_sample_input(monkeypatch, tmp_path):

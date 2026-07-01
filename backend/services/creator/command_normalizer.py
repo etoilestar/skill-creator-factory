@@ -177,6 +177,16 @@ def _explicit_bindings_from_requirement_graph(requirement_graph: Any) -> dict[st
     bindings: dict[str, str] = {}
     edges = _get(requirement_graph, "dataflow_edges", None) or _get(requirement_graph, "edges", None) or []
     for edge in edges if isinstance(edges, list) else []:
+        to_field = _get(edge, "to_field")
+        from_field = _get(edge, "from_field")
+        from_node = _get(edge, "from_node")
+        if isinstance(to_field, str) and to_field.strip() and isinstance(from_field, str) and from_field.strip():
+            source = from_field.strip()
+            if isinstance(from_node, str) and from_node.strip():
+                source = f"{from_node.strip()}.{source}"
+            bindings[to_field.strip()] = source
+            continue
+
         target = _get(edge, "target") or _get(edge, "to") or _get(edge, "target_key")
         source = _get(edge, "source") or _get(edge, "from") or _get(edge, "source_key")
         if isinstance(target, str) and isinstance(source, str) and target:
@@ -211,7 +221,8 @@ def render_canonical_command_from_verified_contract(
     schema = _get(runtime_spec, "script_argv_schema", None)
     if isinstance(schema, dict):
         props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        required = [str(key) for key in schema.get("required", []) if isinstance(key, str)]
+        raw_required = schema.get("required", schema.get("required_keys", []))
+        required = [str(key) for key in raw_required if isinstance(key, str)]
         bindings = _explicit_bindings_from_requirement_graph(requirement_graph)
         missing = [key for key in required if key not in bindings]
         if missing:

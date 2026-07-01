@@ -50,6 +50,56 @@ def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) 
         "available_contract_sources": [source for issue in issues for source in (getattr(issue, "detail", {}) or {}).get("available_contract_sources", [])],
     }
 
+
+
+def _skill_md_command_normalizer_context(
+    *,
+    skill_dir: Path,
+    skill_md: str,
+) -> tuple[list[Any], dict[str, Any], Any | None]:
+    """Collect existing E2E contract context for command normalization."""
+    script_files = (
+        sorted((skill_dir / "scripts").glob("*.py"))
+        if (skill_dir / "scripts").is_dir()
+        else []
+    )
+    entries: list[Any] = []
+    runtime_specs: dict[str, Any] = {}
+    for script_file in script_files:
+        rel = script_file.relative_to(skill_dir).as_posix()
+        try:
+            entry = _skill_plan_entry_for_file(file_path=rel, blueprint_text=skill_md)
+        except Exception:
+            continue
+        entries.append(entry)
+        command_template = str(getattr(entry, "command_template", "") or "")
+        if command_template:
+            runtime_specs[rel] = {"command_template": command_template}
+    try:
+        requirement_graph = _load_requirement_graph_for_e2e(skill_dir)
+    except Exception:
+        requirement_graph = None
+    return entries, runtime_specs, requirement_graph
+
+
+def _normalize_skill_md_runtime_commands_for_e2e(
+    *,
+    skill_name: str,
+    skill_dir: Path,
+    skill_md: str,
+):
+    files, runtime_specs, requirement_graph = _skill_md_command_normalizer_context(
+        skill_dir=skill_dir,
+        skill_md=skill_md,
+    )
+    return canonicalize_skill_md_runtime_commands(
+        skill_name=skill_name,
+        skill_md=skill_md,
+        files=files,
+        requirement_graph=requirement_graph,
+        runtime_specs=runtime_specs,
+    )
+
 def _platform_io_repair_summary() -> str:
     return (
         platform_io_contract_prompt_text()
@@ -2148,8 +2198,9 @@ def _run_skill_workflow_e2e_once(
         ]
 
     skill_md = skill_md_path.read_text(encoding="utf-8")
-    normalization = canonicalize_skill_md_runtime_commands(
+    normalization = _normalize_skill_md_runtime_commands_for_e2e(
         skill_name=skill_name,
+        skill_dir=source_skill_dir,
         skill_md=skill_md,
     )
     if normalization.blocked:
@@ -2661,8 +2712,9 @@ async def _repair_existing_file_for_e2e_failure(
             and event.get("target_file") == "SKILL.md"
             for event in (repair_events or [])
         )
-        normalization = canonicalize_skill_md_runtime_commands(
+        normalization = _normalize_skill_md_runtime_commands_for_e2e(
             skill_name=skill_name,
+            skill_dir=skill_dir,
             skill_md=skill_md,
         )
         if repair_events is not None:

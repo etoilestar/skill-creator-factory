@@ -127,3 +127,70 @@ def test_normalizer_blocked_command_format_error_does_not_enter_llm_patch_route(
         "E2E_REPAIR_TARGET=SKILL.md\nE2E_LAYER=command_json_parse\nE2E_STRUCTURED_FAILURE={}\ninvalid_json_arg"
     ]
     assert _is_skill_md_command_format_error(errors)
+
+
+def test_requirement_graph_from_to_field_edges_render_required_schema_command():
+    graph = type("Graph", (), {"dataflow_edges": [
+        {"from_node": "upstream", "from_field": "source_value", "to_node": "runner", "to_field": "value"}
+    ]})()
+    skill_md = """```bash
+python scripts/run.py '{"value": {{value | default("x")}}}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(
+        skill_name="s",
+        skill_md=skill_md,
+        runtime_specs={"scripts/run.py": RuntimeSpec(script_argv_schema={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]})},
+        requirement_graph=graph,
+    )
+    assert result.changed
+    assert not result.blocked
+    assert "{{upstream.source_value}}" in result.content
+
+
+def test_e2e_normalizer_helper_passes_contract_context_for_template_replacement(tmp_path, monkeypatch):
+    from backend.services.creator import e2e
+
+    skill_dir = tmp_path / "skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "run.py").write_text("print('{}')\n", encoding="utf-8")
+    skill_md = """```bash
+python scripts/run.py '{"value": {{value | default("x")}}}'
+```
+"""
+
+    monkeypatch.setattr(
+        e2e,
+        "_skill_plan_entry_for_file",
+        lambda *, file_path, blueprint_text: Entry(
+            path=file_path,
+            command_template="python scripts/run.py '{\"value\":\"{{value}}\"}'",
+        ),
+    )
+
+    result = e2e._normalize_skill_md_runtime_commands_for_e2e(
+        skill_name="s",
+        skill_dir=skill_dir,
+        skill_md=skill_md,
+    )
+    assert result.changed
+    assert not result.blocked
+    assert "python scripts/run.py '{\"value\":\"{{value}}\"}'" in result.content
+
+
+def test_from_to_field_edges_still_block_when_required_binding_missing():
+    graph = type("Graph", (), {"dataflow_edges": [
+        {"from_node": "upstream", "from_field": "source_value", "to_node": "runner", "to_field": "other"}
+    ]})()
+    skill_md = """```bash
+python scripts/run.py '{"value": {{value | default("x")}}}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(
+        skill_name="s",
+        skill_md=skill_md,
+        runtime_specs={"scripts/run.py": RuntimeSpec(script_argv_schema={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]})},
+        requirement_graph=graph,
+    )
+    assert result.blocked
+    assert any(issue.code == "missing_command_arg_binding" for issue in result.issues)

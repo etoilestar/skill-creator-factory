@@ -5,8 +5,50 @@ import uuid
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
+from .command_normalizer import canonicalize_skill_md_runtime_commands
 
 
+
+
+_COMMAND_FORMAT_ERROR_LAYERS = {
+    "invalid_json_arg",
+    "command_parse_failed",
+    "bash_fence_invalid",
+    "runtime_command_invalid",
+    "placeholder_json_invalid",
+    "command_parse",
+    "command_json_parse",
+    "command_json_type",
+    "command_argv_missing",
+    "command_argv_extra",
+    "command_protocol",
+    "command_block_multiple",
+}
+
+
+def _is_skill_md_command_format_error(errors: list[str]) -> bool:
+    for error in errors or []:
+        if "E2E_REPAIR_TARGET=SKILL.md" not in error:
+            continue
+        layer = ""
+        match = re.search(r"^E2E_LAYER=([^\n]+)", error, re.M)
+        if match:
+            layer = match.group(1).strip()
+        lowered = error.lower()
+        if layer in _COMMAND_FORMAT_ERROR_LAYERS or any(code in lowered for code in _COMMAND_FORMAT_ERROR_LAYERS):
+            return True
+    return False
+
+
+def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) -> dict[str, Any]:
+    return {
+        "target_file": target_file,
+        "error_code": "command_normalizer_blocked",
+        "script_path": next((getattr(issue, "script_path", None) for issue in issues if getattr(issue, "script_path", None)), None),
+        "issues": [getattr(issue, "__dict__", {}) for issue in issues],
+        "missing_keys": [key for issue in issues for key in (getattr(issue, "detail", {}) or {}).get("missing_keys", [])],
+        "available_contract_sources": [source for issue in issues for source in (getattr(issue, "detail", {}) or {}).get("available_contract_sources", [])],
+    }
 
 def _platform_io_repair_summary() -> str:
     return (
@@ -2106,6 +2148,22 @@ def _run_skill_workflow_e2e_once(
         ]
 
     skill_md = skill_md_path.read_text(encoding="utf-8")
+    normalization = canonicalize_skill_md_runtime_commands(
+        skill_name=skill_name,
+        skill_md=skill_md,
+    )
+    if normalization.blocked:
+        return [
+            _e2e_error(
+                target="SKILL.md",
+                layer="runtime_command_invalid",
+                message=json.dumps(_command_normalizer_blocked_payload(target_file="SKILL.md", issues=normalization.issues), ensure_ascii=False, default=str),
+            )
+        ]
+    if normalization.changed:
+        skill_md_path.write_text(normalization.content, encoding="utf-8")
+        skill_md = normalization.content
+
     errors: list[str] = []
 
     try:
@@ -2596,6 +2654,37 @@ async def _repair_existing_file_for_e2e_failure(
 
     skill_md_path = skill_dir / "SKILL.md"
     skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+
+    if target_path == "SKILL.md" and _is_skill_md_command_format_error(e2e_errors):
+        normalizer_attempted = any(
+            event.get("type") == "command_normalizer_attempt"
+            and event.get("target_file") == "SKILL.md"
+            for event in (repair_events or [])
+        )
+        normalization = canonicalize_skill_md_runtime_commands(
+            skill_name=skill_name,
+            skill_md=skill_md,
+        )
+        if repair_events is not None:
+            repair_events.append({
+                "type": "command_normalizer_attempt",
+                "target_file": "SKILL.md",
+                "changed": normalization.changed,
+                "blocked": normalization.blocked,
+                "issues": [getattr(issue, "__dict__", {}) for issue in normalization.issues],
+            })
+        if normalization.changed:
+            skill_md_path.write_text(normalization.content, encoding="utf-8")
+            (e2e_session.workspace_dir / "SKILL.md").write_text(normalization.content, encoding="utf-8")
+            return {
+                "status": "repaired",
+                "repaired_target": "SKILL.md",
+                "patch_status": "deterministic_command_normalized",
+                "diff_stats": {"mode": "command_normalizer"},
+            }
+        payload = _command_normalizer_blocked_payload(target_file="SKILL.md", issues=normalization.issues)
+        if normalization.blocked or normalizer_attempted:
+            raise ValueError("command_normalizer_blocked: " + json.dumps(payload, ensure_ascii=False, default=str))
 
     if target_path == "SKILL.md":
         hard_format_failures = detect_markdown_hard_format_failures(

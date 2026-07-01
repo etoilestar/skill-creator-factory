@@ -259,7 +259,7 @@ Creator prepare-plan 不能无限追问。
 
 ### 宿主执行方式
 - **直接回答**: [哪些请求由模型直接生成文本/Markdown]
-- **需要脚本/命令**: assistant 必须在 Sandbox 当轮回复中输出标准 Markdown fenced code block（如 ```bash ... ```），宿主只执行当轮回复中出现的 block。脚本命令必须使用 JSON object argv，不要生成位置参数命令说明；第一条命令应引用 external input envelope 中确定存在的字段，后续命令可以引用前序 stdout 中真实产生的 placeholder 字段。
+- **需要脚本/命令**: assistant 必须在 Sandbox 当轮回复中输出标准 Markdown fenced code block（如 ```bash ... ```），宿主只执行当轮回复中出现的 block。脚本命令必须使用标准 JSON object argv，不要生成位置参数命令说明；JSON argv 值中不得写 `{{input_files[0]}}`、`{{references/...}}`、`{{assets/...}}` 等复杂模板表达式。运行时输入文件使用 `__RUNTIME_INPUT_FILE__` / `__RUNTIME_INPUT_FILE_0__` 等安全占位符；reference/assets 文件使用普通相对路径字符串（如 `references/parse_rules.md`）；模型名称使用 `TEXT_MODEL`。每个核心命令附近必须写 **argv JSON contract**，声明每个 argv 字段的 type、source、placeholder/path、required。
 - **禁止隐式执行**: 不要把行内脚本路径或“立即调用脚本”的自然语言当成执行触发器；脚本存在只代表可用资源和安全校验条件。只有在运行时当轮回复中输出标准 ```bash fenced code block，宿主才会解析并执行命令。
 - **执行后回答**: assistant 必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。最终 SKILL.md 只描述运行时触发、命令、observation 消费和结果返回，不得包含“输出蓝图等待确认”“用户确认后开始创建文件”等 Creator 创建阶段动作。
 

@@ -194,3 +194,34 @@ python scripts/run.py '{"value": {{value | default("x")}}}'
     )
     assert result.blocked
     assert any(issue.code == "missing_command_arg_binding" for issue in result.issues)
+
+
+def test_json_argv_input_files_template_is_safely_sanitized():
+    skill_md = """```bash
+python scripts/extract.py '{"input_file":"{{input_files[0]}}","model":"{{model}}"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
+    assert result.changed
+    assert not result.blocked
+    assert "{{input_files[0]}}" not in result.content
+    assert "__RUNTIME_INPUT_FILE__" in result.content
+    assert "TEXT_MODEL" in result.content
+    assert "argv JSON contract" in result.content
+
+
+def test_json_argv_reference_template_is_safely_sanitized_to_path():
+    skill_md = """```bash
+python scripts/extract.py '{"parse_rules":"{{references/parse_rules.md}}"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
+    assert result.changed
+    assert not result.blocked
+    assert "{{references/parse_rules.md}}" not in result.content
+    assert '"parse_rules":"references/parse_rules.md"' in result.content
+
+
+def test_standard_safe_argv_command_passes_without_contract_source():
+    command = "python scripts/extract.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\",\"parse_rules\":\"references/parse_rules.md\",\"model\":\"TEXT_MODEL\"}'"
+    assert validate_runtime_command_format(command) == []

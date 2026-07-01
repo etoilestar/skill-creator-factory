@@ -112,8 +112,63 @@ def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
     )
 
 
-_PREPARE_SUPPLEMENT_QUESTION = "还有其他需要补充的要求吗？A. 没有，按上面的选择继续 B. 有，我补充说明"
+MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
+MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
 
+_PREPARE_SUPPLEMENT_QUESTION = "以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明"
+
+
+def _prepare_history_text(request: PreparePlanRequest) -> str:
+    parts = [str(request.user_request or ""), str(request.human_feedback or "")]
+    for item in request.conversation_history or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("content") or ""))
+    return "\n".join(parts)
+
+
+def _count_prepare_business_clarification_rounds(request: PreparePlanRequest) -> int:
+    count = 0
+    for item in request.conversation_history or []:
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        text = str(item.get("content") or "")
+        if any(token in text for token in ("以上创建要点是否还需要补充", "是否还需要继续补充", "还有其他需要补充")):
+            continue
+        if "我还需要确认一个必要信息" in text or "needs_clarification" in text or _prepare_questions_have_options([text]):
+            count += 1
+    return count
+
+
+def _prepare_business_clarification_limit_reached(request: PreparePlanRequest) -> bool:
+    return _count_prepare_business_clarification_rounds(request) >= MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS
+
+
+def _prepare_supplement_check_seen(request: PreparePlanRequest) -> bool:
+    return any(token in _prepare_history_text(request) for token in ("以上创建要点是否还需要补充", "是否还需要继续补充", "还有其他需要补充"))
+
+
+def _prepare_user_confirmed_no_more_supplement(request: PreparePlanRequest) -> bool:
+    text = str(request.human_feedback or "").strip()
+    return bool(re.search(r"(没有|无|暫時沒有|暂时没有).{0,12}补充|按(这些|上面|已有)信息继续|按这些要点继续|按上面的选择继续", text))
+
+
+def _prepare_user_wants_to_add_supplement(request: PreparePlanRequest) -> bool:
+    text = str(request.human_feedback or "").strip()
+    if not text or _prepare_user_confirmed_no_more_supplement(request):
+        return False
+    return any(marker in text for marker in ("有，我补充说明", "我补充", "有补充", "继续补充"))
+
+
+def _prepare_user_has_provided_supplement_content(request: PreparePlanRequest) -> bool:
+    text = str(request.human_feedback or "").strip()
+    if not text or _prepare_user_confirmed_no_more_supplement(request):
+        return False
+    return "补充：" in text or (_prepare_user_wants_to_add_supplement(request) and len(text) > 80)
+
+
+def _count_prepare_supplement_rounds(request: PreparePlanRequest) -> int:
+    text = _prepare_history_text(request)
+    return len(re.findall(r"补充：", text))
 
 def _prepare_questions_have_options(questions: list[str]) -> bool:
     option_marker = re.compile(r"(?<![A-Za-z0-9])(?:[A-D][\.、)]|[①②③④]|\([A-D]\))")
@@ -295,8 +350,12 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 约束：
 - status=ready 之前必须先判断需求成熟度；不要直接把粗需求扩写成 ready 蓝图。
 - 信息足够时 status=ready，并生成完整 internal_blueprint_text。
-- 信息不足时 status=needs_clarification，clarifying_questions 必须只包含 1 个问题，且只能问当前最阻塞生成/E2E 的问题；问题必须带 2-4 个选项。
+- 信息不足且 clarification_rounds 未达到上限时 status=needs_clarification，clarifying_questions 必须只包含 1 个问题，且只能问当前最阻塞生成/E2E 的问题；问题必须带 2-4 个选项。
 - 每轮 needs_clarification 只能问一个问题；下一个问题必须基于 conversation_history 和 human_feedback 中上一轮的回答继续判断。
+- 如果 clarification_rounds 达到上限，不得继续返回业务澄清问题；达到上限后必须归纳创建要点，并询问用户是否补充。
+- 创建要点必须体现蓝图和责任图谱合同需要落实的功能，不要输出风险项。
+- 用户确认无补充后，不得继续 needs_clarification，必须生成 internal_blueprint_text。
+- 用户补充后，重新归纳要点；达到补充上限后必须生成 internal_blueprint_text。
 - “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；不要和业务问题放在同一轮。
 - 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充；如果用户选择“没有，按上面的选择继续”，且其他阻塞点已解决，才可以 ready。
 - 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
@@ -313,6 +372,12 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
         "previous_blueprint_text": request.previous_blueprint_text,
         "human_feedback": request.human_feedback,
         "existing_skill_context": existing_context,
+        "clarification_rounds": _count_prepare_business_clarification_rounds(request),
+        "max_clarification_rounds": MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS,
+        "clarification_limit_reached": _prepare_business_clarification_limit_reached(request),
+        "supplement_rounds": _count_prepare_supplement_rounds(request),
+        "max_supplement_rounds": MAX_PREPARE_SUPPLEMENT_ROUNDS,
+        "user_confirmed_no_more_supplement": _prepare_user_confirmed_no_more_supplement(request),
     }
     route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare plan")
     text = await complete_chat_once([
@@ -321,6 +386,77 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
     ], route.model)
     return _parse_prepare_plan_json(text)
 
+
+async def _prepare_summarize_confirmed_requirements(
+    *,
+    request: PreparePlanRequest,
+    prepared: dict[str, Any] | None = None,
+) -> PreparePlanReviewSummary:
+    prepared = prepared or {}
+    base = _coerce_prepare_summary(prepared.get("review_summary"))
+    prompt = load_kernel_creator_for_phase("prepare_plan") + """
+你只归纳 Creator 创建要点，不生成蓝图，不提风险。只输出严格 JSON object，字段为 goal/input/output/workflow/files_to_create_or_update/assets_to_upload/risks/changes。
+创建要点必须体现后续 internal_blueprint_text、SkillPlan 和 requirement graph 需要落实的功能合同：目标功能、运行时输入、运行时输出、处理流程、文件职责、脚本 inputs/outputs/stdout JSON 字段、资源边界、默认决策。
+risks 必须输出空数组。assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得放入。未明确但必须落地的部分使用默认推荐项：最小可用、可执行可验证、JSON + 可读 Markdown、最小文件集、不确定不创建 assets path。
+"""
+    payload = {
+        "user_request": request.user_request,
+        "conversation_history": request.conversation_history,
+        "human_feedback": request.human_feedback,
+        "uploaded_files": request.uploaded_files,
+        "model_summary": base.model_dump(mode="json"),
+    }
+    try:
+        route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare requirements summary")
+        text = await complete_chat_once([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        ], route.model)
+        summary = _coerce_prepare_summary(_parse_prepare_plan_json(text))
+    except Exception:
+        summary = base
+    if not summary.goal:
+        summary.goal = str(request.user_request or "创建一个可执行 Skill").strip()[:500]
+    if not summary.input:
+        summary.input = "运行时由用户提供文本、文件、参数或素材；未明确的文件默认作为运行时输入。"
+    if not summary.output:
+        summary.output = "默认返回结构化 JSON + 可读 Markdown；如生成文件则返回 OUTPUT_DIR 文件路径。"
+    if not summary.workflow:
+        summary.workflow = ["读取运行时输入", "按 Skill 目标处理并验证关键字段", "返回 stdout JSON 和可读结果"]
+    if not summary.files_to_create_or_update:
+        summary.files_to_create_or_update = ["SKILL.md"]
+    summary.risks = []
+    if not summary.changes:
+        summary.changes = ["默认决策：优先最小可用、可执行可验证；不确定的素材按运行时输入处理，不创建 assets path。"]
+    summary.assets_to_upload = [p for p in summary.assets_to_upload if str(p).strip().startswith("assets/")]
+    return summary
+
+
+async def _generate_internal_blueprint_from_confirmed_summary(
+    *,
+    request: PreparePlanRequest,
+    summary: PreparePlanReviewSummary,
+) -> dict[str, Any]:
+    prompt = load_kernel_creator_for_phase("prepare_plan") + """
+基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text。只输出严格 JSON object：{"status":"ready","internal_blueprint_text":"...","review_summary":{...},"skill_name":"..."}。
+不得继续返回 needs_clarification，不得询问问题。未明确的非关键偏好使用默认推荐项。运行时输入默认不作为 Creator assets。输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
+"""
+    payload = {
+        "confirmed_summary": summary.model_dump(mode="json"),
+        "user_request": request.user_request,
+        "conversation_history": request.conversation_history,
+        "human_feedback": request.human_feedback,
+        "uploaded_files": request.uploaded_files,
+    }
+    route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator confirmed summary to blueprint")
+    text = await complete_chat_once([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ], route.model)
+    data = _parse_prepare_plan_json(text)
+    data["status"] = "ready"
+    data.setdefault("review_summary", summary.model_dump(mode="json"))
+    return data
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
@@ -899,37 +1035,58 @@ async def prepare_plan(request: PreparePlanRequest):
         raise HTTPException(status_code=502, detail=f"prepare-plan 生成失败：{exc}") from exc
 
     raw_status = str(prepared.get("status") or "").strip()
-    status = raw_status if raw_status in {"ready", "needs_clarification", "blocked"} else "blocked"
+    status = raw_status if raw_status in {"ready", "needs_clarification", "blocked"} else "needs_clarification"
     summary = _coerce_prepare_summary(prepared.get("review_summary"))
+    skill_name = str(prepared.get("skill_name") or request.skill_name or "")
 
-    if _prepare_feedback_wants_supplement(request):
+    async def summarize_and_confirm(question: str) -> PreparePlanResponse:
+        confirmed = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        return PreparePlanResponse(status="needs_clarification", clarifying_questions=[question], review_summary=confirmed, skill_name=skill_name)
+
+    if _prepare_user_confirmed_no_more_supplement(request) and status != "ready":
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
+        status = "ready"
+        skill_name = str(prepared.get("skill_name") or skill_name)
+    elif _prepare_user_has_provided_supplement_content(request):
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        current_feedback_has_supplement = "补充：" in str(request.human_feedback or "")
+        prior_supplement_rounds = max(0, _count_prepare_supplement_rounds(request) - (1 if current_feedback_has_supplement else 0))
+        if prior_supplement_rounds >= MAX_PREPARE_SUPPLEMENT_ROUNDS:
+            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
+            status = "ready"
+            skill_name = str(prepared.get("skill_name") or skill_name)
+        else:
+            return PreparePlanResponse(
+                status="needs_clarification",
+                clarifying_questions=["已根据补充内容更新创建要点。是否还需要继续补充？A. 没有，按这些要点继续 B. 有，我继续补充"],
+                review_summary=summary,
+                skill_name=skill_name,
+            )
+    elif _prepare_feedback_wants_supplement(request):
         return PreparePlanResponse(
             status="needs_clarification",
             clarifying_questions=["请补充你的其他要求。A. 我现在补充 B. 暂时没有补充，按已有信息继续"],
-            review_summary=summary,
-            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
+            review_summary=PreparePlanReviewSummary(),
+            skill_name=skill_name,
         )
 
     if status == "needs_clarification":
-        return PreparePlanResponse(
-            status="needs_clarification",
-            clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
-            review_summary=summary,
-            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
-        )
+        if not _prepare_business_clarification_limit_reached(request):
+            return PreparePlanResponse(
+                status="needs_clarification",
+                clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
+                review_summary=PreparePlanReviewSummary(),
+                skill_name=skill_name,
+            )
+        return await summarize_and_confirm(_PREPARE_SUPPLEMENT_QUESTION)
 
     if status == "blocked":
-        return PreparePlanResponse(
-            status="blocked",
-            review_summary=summary,
-            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
-            creation_blockers=[str(x) for x in (prepared.get("blockers") or prepared.get("creation_blockers") or []) if str(x).strip()],
-            warnings=[{"severity": "user_warning", "code": "prepare_plan_blocked", "source": "prepare_plan", "path": "", "field": "", "message": "Creator plan preparation is blocked."}],
-        )
+        return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
 
     blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
     if not blueprint_text:
-        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=[_prepare_protocol_issue("missing_internal_blueprint_text", "prepare-plan 未返回 internal_blueprint_text")])
+        return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
 
     protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
     if protocol_errors:
@@ -939,7 +1096,15 @@ async def prepare_plan(request: PreparePlanRequest):
         except Exception:
             pass
     if protocol_errors:
-        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=protocol_errors)
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        try:
+            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
+            blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
+            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+        except Exception:
+            pass
+    if protocol_errors:
+        return PreparePlanResponse(status="needs_clarification", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=summary, skill_name=skill_name)
 
     plan = None
     analyze_errors: list[dict[str, Any]] = []
@@ -966,7 +1131,7 @@ async def prepare_plan(request: PreparePlanRequest):
                 analyze_errors = protocol_errors
                 break
     if plan is None:
-        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=analyze_errors)
+        return PreparePlanResponse(status="needs_clarification", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=summary, skill_name=skill_name)
 
     summary.files_to_create_or_update = [
         file_spec.path

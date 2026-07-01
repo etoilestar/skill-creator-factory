@@ -104,6 +104,21 @@ async def test_needs_clarification_response_has_one_optioned_question(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_under_limit_needs_clarification_drops_model_review_summary(monkeypatch):
+    async def fake_generate(_request):
+        return {
+            "status": "needs_clarification",
+            "clarifying_questions": ["输入来源？A. 粘贴文本 B. 上传文件"],
+            "review_summary": {"goal": "不应提前展示", "input": "x", "output": "y", "risks": ["hidden"]},
+        }
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    resp = await api.prepare_plan(_request())
+    assert resp.status == "needs_clarification"
+    assert resp.clarifying_questions == ["输入来源？A. 粘贴文本 B. 上传文件"]
+    assert resp.review_summary == api.PreparePlanReviewSummary()
+
+
+@pytest.mark.asyncio
 async def test_feedback_wants_supplement_blocks_ready(monkeypatch):
     async def fake_generate(_request):
         return {"status": "ready", "internal_blueprint_text": _ready_blueprint()}

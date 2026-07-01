@@ -1067,7 +1067,7 @@ async def prepare_plan(request: PreparePlanRequest):
         return PreparePlanResponse(
             status="needs_clarification",
             clarifying_questions=["请补充你的其他要求。A. 我现在补充 B. 暂时没有补充，按已有信息继续"],
-            review_summary=summary,
+            review_summary=PreparePlanReviewSummary(),
             skill_name=skill_name,
         )
 
@@ -1076,7 +1076,7 @@ async def prepare_plan(request: PreparePlanRequest):
             return PreparePlanResponse(
                 status="needs_clarification",
                 clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
-                review_summary=summary,
+                review_summary=PreparePlanReviewSummary(),
                 skill_name=skill_name,
             )
         return await summarize_and_confirm(_PREPARE_SUPPLEMENT_QUESTION)

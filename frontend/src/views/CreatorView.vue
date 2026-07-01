@@ -293,10 +293,12 @@ async function send() {
     }
     const plan = await prepareCreationPlan(payload)
     const summary = plan.review_summary || null
-    reviewSummary.value = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length) ? { ...summary, risks: [] } : null
+    const question = (plan.clarifying_questions || [])[0]
+    const hasSummaryContent = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length)
+    const isCreationPointsConfirmation = plan.status === 'ready' || (plan.status === 'needs_clarification' && /创建要点|补充|按这些要点/.test(String(question || '')))
+    reviewSummary.value = hasSummaryContent && isCreationPointsConfirmation ? { ...summary, risks: [] } : null
 
     if (plan.status === 'needs_clarification') {
-      const question = (plan.clarifying_questions || [])[0]
       messages.value.push({
         role: 'assistant',
         content: reviewSummary.value

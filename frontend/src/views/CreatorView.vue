@@ -153,7 +153,7 @@
 
 <script setup>
 import { ref, computed, nextTick } from 'vue'
-import { prepareCreationPlan } from '../composables/useCreator.js'
+import { prepareCreationPlan, buildClarificationQuickActions } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
@@ -248,24 +248,6 @@ async function handleQuickAction(value) {
   await send()
 }
 
-function extractQuestionOptions(question) {
-  const text = String(question || '')
-  const matches = [...text.matchAll(/(^|\s)([A-D])[\.\)、]\s*([^A-D\n]+?)(?=\s+[A-D][\.\)、]\s*|$)/g)]
-  return matches
-    .map((match) => {
-      const label = `${match[2]}. ${match[3].trim()}`
-      return {
-        text: label,
-        value: label,
-        waitForInput: /有.*补充|补充说明|我补充/.test(label),
-      }
-    })
-    .filter((item) => item.text.length > 3)
-}
-
-function buildClarificationQuickActions(questions) {
-  return questions.flatMap((question) => extractQuestionOptions(question)).slice(0, 8)
-}
 
 // ---------------------------------------------------------------------------
 // Send

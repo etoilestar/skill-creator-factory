@@ -6,6 +6,30 @@
  */
 
 
+
+export function extractClarificationQuestionOptions(question) {
+  const text = String(question || '')
+  const optionPattern = /(?:^|[\s？?])([A-D])[\.\)、]\s*([\s\S]*?)(?=(?:\s+[A-D][\.\)、]\s*)|$)/g
+  return [...text.matchAll(optionPattern)]
+    .map((match) => {
+      const label = `${match[1]}. ${String(match[2] || '').trim()}`.trim()
+      if (label.length <= 3) return null
+      return {
+        text: label,
+        value: `问题：${text}\n选择：${label}`,
+        question: text,
+        waitForInput: /有.*补充|补充说明|我补充/.test(label),
+      }
+    })
+    .filter(Boolean)
+}
+
+export function buildClarificationQuickActions(questions) {
+  return (questions || [])
+    .flatMap((question) => extractClarificationQuestionOptions(question))
+    .slice(0, 8)
+}
+
 function blueprintBodyOnly(text) {
   const raw = String(text || '').trim()
   if (!raw) return ''

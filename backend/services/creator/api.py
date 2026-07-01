@@ -112,6 +112,149 @@ def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
     )
 
 
+_PREPARE_SUPPLEMENT_QUESTION = "还有其他需要补充的要求吗？A. 没有，按上面的选择继续 B. 有，我补充说明"
+
+
+def _prepare_questions_have_options(questions: list[str]) -> bool:
+    option_marker = re.compile(r"(?<![A-Za-z0-9])(?:[A-D][\.、)]|[①②③④]|\([A-D]\))")
+    for question in questions:
+        text = str(question or "")
+        if "选项" in text:
+            continue
+        markers = option_marker.findall(text)
+        if not (("A." in text or "A、" in text or "A)" in text) and ("B." in text or "B、" in text or "B)" in text)) and len(markers) < 2:
+            return False
+    return bool(questions)
+
+
+def _prepare_questions_include_supplement_check(questions: list[str]) -> bool:
+    if not questions:
+        return False
+    last = str(questions[-1] or "")
+    return any(token in last for token in ("补充", "其他要求", "其他内容", "还有", "需要补充"))
+
+
+def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
+    questions = [str(q).strip() for q in (raw_questions or []) if str(q).strip()][:3]
+    if not questions:
+        questions = ["请补充一个阻塞创建计划的信息？A. 补充输入来源 B. 补充输出格式"]
+    if not _prepare_questions_include_supplement_check(questions):
+        questions = questions[:2] + [_PREPARE_SUPPLEMENT_QUESTION]
+    elif len(questions) > 3:
+        questions = questions[:3]
+    if not _prepare_questions_have_options(questions):
+        fixed: list[str] = []
+        for q in questions:
+            fixed.append(q if re.search(r"(?<![A-Za-z0-9])A[\.、)]", q) and re.search(r"(?<![A-Za-z0-9])B[\.、)]", q) else f"{q} A. 按推荐方式继续 B. 我补充说明")
+        questions = fixed[:3]
+    if not _prepare_questions_include_supplement_check(questions):
+        questions = questions[:2] + [_PREPARE_SUPPLEMENT_QUESTION]
+    return questions[:3]
+
+
+def _prepare_protocol_issue(code: str, message: str, *, path: str = "", field: str = "") -> dict[str, Any]:
+    return {"code": code, "path": path, "field": field, "message": message, "severity": "error"}
+
+
+def _extract_prepare_skill_plan_paths(blueprint_text: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(r"(?im)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$", blueprint_text or ""):
+        path = _normalize_skill_path(match.group(1).strip().strip("'\""))
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _preflight_prepare_blueprint_text(blueprint_text: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    text = str(blueprint_text or "")
+    plan_paths = _extract_prepare_skill_plan_paths(text)
+    plan_path_set = set(plan_paths)
+    dynamic_re = re.compile(r"[<>{}\*]|\$\{|\[[^\]]*(?:name|path|file|ext|文件|名称)[^\]]*\]", re.I)
+    runtime_dir_re = re.compile(r"^(?:outputs?|OUTPUT_DIR|generated|build|dist|tmp)(?:/|$)", re.I)
+
+    for path in plan_paths:
+        normalized = _normalize_skill_path(path)
+        if normalized in {"assets", "assets/"}:
+            issues.append(_prepare_protocol_issue("invalid_asset_directory_path", "assets 不能声明为目录路径。", path=path))
+        if normalized.startswith("assets/") and dynamic_re.search(normalized):
+            issues.append(_prepare_protocol_issue("invalid_asset_placeholder_path", "assets path 不能包含占位符或通配符。", path=path))
+        if not normalized or normalized.endswith("/") or _is_directory_like_skill_path(normalized) or dynamic_re.search(normalized):
+            issues.append(_prepare_protocol_issue("invalid_dynamic_or_directory_path", "SkillPlan path 必须是具体文件路径。", path=path))
+        if runtime_dir_re.search(normalized):
+            issues.append(_prepare_protocol_issue("runtime_artifact_path_in_skill_plan", "运行时产物目录不能出现在 SkillPlan path。", path=path))
+        if normalized.startswith("assets/"):
+            block_match = re.search(rf"(?ims)^\s*-\s*path\s*:\s*`?{re.escape(path)}`?\s*$([\s\S]*?)(?=^\s*-\s*path\s*:|\Z)", text)
+            block = block_match.group(1) if block_match else ""
+            if not re.search(r"(?im)^\s*source\s*:\s*(user_upload|bundled)\s*$", block):
+                issues.append(_prepare_protocol_issue("asset_missing_source", "assets path 必须声明 source=user_upload 或 source=bundled。", path=path, field="source"))
+            if re.search(r"运行时|每次上传|用户输入|runtime\s+input|粘贴|待用户上传", block, re.I):
+                issues.append(_prepare_protocol_issue("runtime_input_described_as_asset", "运行时用户输入文件不能描述为 Creator assets。", path=path))
+
+    for dep_match in re.finditer(r"(?im)^\s*dependencies\s*:\s*\[?([^\]\n]*)\]?", text):
+        deps = dep_match.group(1)
+        if re.search(r"outputs?/|OUTPUT_DIR|generated/|build/|dist/|tmp/|[<>{}\*]", deps, re.I):
+            issues.append(_prepare_protocol_issue("invalid_runtime_dependency", "dependencies 只能写运行前静态依赖，不能包含运行时产物、动态文件名或输出目录。", field="dependencies"))
+
+    declared_paths = set(_extract_declared_skill_paths(text))
+    concrete_declared = {
+        p for p in declared_paths
+        if p.startswith(("scripts/", "references/", "assets/")) and _has_file_extension(p)
+    }
+    for path in sorted(concrete_declared - plan_path_set):
+        issues.append(_prepare_protocol_issue("directory_or_text_path_missing_from_skill_plan", "蓝图中出现的具体文件必须在 SkillPlan path 中声明。", path=path))
+    return issues
+
+
+async def _repair_prepare_blueprint_protocol(
+    *,
+    request: PreparePlanRequest,
+    blueprint_text: str,
+    protocol_errors: list[dict[str, Any]],
+) -> str:
+    repaired = str(blueprint_text or "")
+    seen = {repaired}
+    for _ in range(2):
+        prompt = load_kernel_creator_for_phase("prepare_plan") + """
+你只修复 internal_blueprint_text 的 Creator 硬协议问题。只输出修复后的蓝图正文，不要 JSON，不要 Markdown 解释。
+修复要求：
+- 不要把运行时用户输入文件写入 assets；
+- 不要输出 assets/、assets/<name.ext>、assets/* 或动态 assets path；
+- 如果不需要静态素材，删除 assets 文件计划；
+- 目录结构不要列具体文件名；
+- 目录结构与 SkillPlan path 必须一致；
+- dependencies 只能写运行前静态依赖；
+- 运行时产物只能出现在脚本 outputs/stdout JSON/file_outputs。
+"""
+        route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare blueprint protocol repair")
+        text = await complete_chat_once([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": json.dumps({"blueprint_text": repaired, "protocol_errors": protocol_errors}, ensure_ascii=False, default=str)},
+        ], route.model)
+        candidate = str(text or "").strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:markdown|md)?\s*", "", candidate, flags=re.IGNORECASE).strip()
+            candidate = re.sub(r"\s*```$", "", candidate).strip()
+        if not candidate or candidate in seen:
+            break
+        repaired = candidate
+        seen.add(repaired)
+        protocol_errors = _preflight_prepare_blueprint_text(repaired)
+        if not protocol_errors:
+            break
+    return repaired
+
+
+def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanReviewSummary, *, skill_name: str, issues: list[dict[str, Any]]) -> PreparePlanResponse:
+    return PreparePlanResponse(
+        status="blocked",
+        review_summary=summary,
+        skill_name=skill_name or request.skill_name or "",
+        creation_blockers=["创建计划暂时无法通过平台协议预检，请补充更明确的输入、输出、资源边界或文件计划后重试。"],
+        warnings=[{"severity": "user_warning", "code": "prepare_plan_protocol_blocked", "source": "prepare_plan", "path": "", "field": "", "message": "Creator plan preparation is blocked by protocol validation.", "issues": issues[:5]}],
+    )
+
+
 async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest) -> dict[str, Any]:
     existing_context = _read_prepare_existing_skill_context(request.skill_name) if request.mode == "revise" else {}
     system_prompt = load_kernel_creator_for_phase("prepare_plan") + """
@@ -121,7 +264,7 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 返回格式：
 {
   "status": "ready" | "needs_clarification" | "blocked",
-  "clarifying_questions": ["最多三个真正必要的问题"],
+  "clarifying_questions": ["最多三个真正必要且带选项的问题"],
   "review_summary": {
     "goal": "",
     "input": "",
@@ -138,11 +281,14 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 }
 
 约束：
+- status=ready 之前必须先判断需求成熟度；不要直接把粗需求扩写成 ready 蓝图。
 - 信息足够时 status=ready，并生成完整 internal_blueprint_text。
-- 信息不足时 status=needs_clarification，clarifying_questions 最多 3 个，且只能问阻塞生成/E2E 的问题。
+- 信息不足时 status=needs_clarification，clarifying_questions 最多 3 个，且只能问阻塞生成/E2E 的问题；每题必须带 2-4 个选项。
+- 每次 needs_clarification 的最后一个问题必须询问用户是否还需要补充其他内容。
 - 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
 - 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
-- assets/** 只能声明 user_upload 或 bundled；不要把运行时产物放入 assets。
+- assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
+- 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path；目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。
 """
     payload = {
         "mode": request.mode,
@@ -745,7 +891,7 @@ async def prepare_plan(request: PreparePlanRequest):
     if status == "needs_clarification":
         return PreparePlanResponse(
             status="needs_clarification",
-            clarifying_questions=[str(q) for q in (prepared.get("clarifying_questions") or []) if str(q).strip()][:3],
+            clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
             review_summary=summary,
             skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
         )
@@ -761,21 +907,58 @@ async def prepare_plan(request: PreparePlanRequest):
 
     blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
     if not blueprint_text:
-        raise HTTPException(status_code=502, detail="prepare-plan 未返回 internal_blueprint_text")
+        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=[_prepare_protocol_issue("missing_internal_blueprint_text", "prepare-plan 未返回 internal_blueprint_text")])
 
-    plan = await analyze_blueprint(AnalyzeBlueprintRequest(
-        messages=[{"role": "assistant", "content": blueprint_text}],
-        model=request.model,
-        strict=True,
-        refine_contract=True,
-        refine_rounds=3,
-    ))
+    protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+    if protocol_errors:
+        try:
+            blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=protocol_errors)
+            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+        except Exception:
+            pass
+    if protocol_errors:
+        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=protocol_errors)
 
-    summary.files_to_create_or_update = [file_spec.path for file_spec in (plan.files or []) if getattr(file_spec, "path", "")]
+    plan = None
+    analyze_errors: list[dict[str, Any]] = []
+    for attempt in range(3):
+        try:
+            plan = await analyze_blueprint(AnalyzeBlueprintRequest(
+                messages=[{"role": "assistant", "content": blueprint_text}],
+                model=request.model,
+                strict=True,
+                refine_contract=True,
+                refine_rounds=3,
+            ))
+            break
+        except HTTPException as exc:
+            analyze_errors = [_prepare_protocol_issue("strict_analyze_failed", "内部蓝图未通过 strict analyze。", field="analyze_blueprint")]
+            if attempt >= 2:
+                break
+            try:
+                blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=[{**analyze_errors[0], "detail": str(exc.detail)}])
+            except Exception:
+                break
+            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
+            if protocol_errors:
+                analyze_errors = protocol_errors
+                break
+    if plan is None:
+        return _blocked_prepare_response(request, summary, skill_name=str(prepared.get("skill_name") or ""), issues=analyze_errors)
+
+    summary.files_to_create_or_update = [
+        file_spec.path
+        for file_spec in (plan.files or [])
+        if getattr(file_spec, "path", "")
+        and not _is_directory_like_skill_path(getattr(file_spec, "path", ""))
+        and not re.search(r"[<>{}\*]", getattr(file_spec, "path", ""))
+    ]
     summary.assets_to_upload = [
         str(getattr(asset, "path", "") or "").strip()
         for asset in (plan.asset_requirements or [])
         if str(getattr(asset, "path", "") or "").strip()
+        and str(getattr(asset, "source", "") or "").strip() in {"user_upload", "bundled"}
+        and not re.search(r"运行时|每次上传|用户输入|runtime", str(getattr(asset, "description", "") or ""), re.I)
     ]
     graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
     return PreparePlanResponse(

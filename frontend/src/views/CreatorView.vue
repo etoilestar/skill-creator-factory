@@ -110,7 +110,7 @@
                 :key="index"
                 class="quick-action-btn"
                 :class="action.style"
-                @click="handleQuickAction(action.value)"
+                @click="handleQuickAction(action)"
                 :disabled="streaming"
               >
                 {{ action.text }}
@@ -232,12 +232,39 @@ async function scrollBottom() {
 
 // Handle quick action button click
 async function handleQuickAction(value) {
-  if (!value || streaming.value) return
+  const action = typeof value === 'object' && value !== null ? value : { value }
+  if (!action.value || streaming.value) return
   // Clear previous quick actions
   quickActions.value = []
+  if (action.waitForInput) {
+    input.value = ''
+    messages.value.push({ role: 'user', content: action.value })
+    messages.value.push({ role: 'assistant', content: '好的，请在输入框补充你的其他要求。' })
+    await scrollBottom()
+    return
+  }
   // Send the value as user input
-  input.value = value
+  input.value = action.value
   await send()
+}
+
+function extractQuestionOptions(question) {
+  const text = String(question || '')
+  const matches = [...text.matchAll(/(^|\s)([A-D])[\.\)、]\s*([^A-D\n]+?)(?=\s+[A-D][\.\)、]\s*|$)/g)]
+  return matches
+    .map((match) => {
+      const label = `${match[2]}. ${match[3].trim()}`
+      return {
+        text: label,
+        value: label,
+        waitForInput: /有.*补充|补充说明|我补充/.test(label),
+      }
+    })
+    .filter((item) => item.text.length > 3)
+}
+
+function buildClarificationQuickActions(questions) {
+  return questions.flatMap((question) => extractQuestionOptions(question)).slice(0, 8)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +315,7 @@ async function send() {
 
 ${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
       })
-      quickActions.value = []
+      quickActions.value = buildClarificationQuickActions(questions)
       return
     }
 

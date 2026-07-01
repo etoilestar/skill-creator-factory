@@ -35,19 +35,19 @@ class PreparePlanReviewSummary(BaseModel):
 
 class PreparePlanResponse(BaseModel):
     status: Literal["ready", "needs_clarification", "blocked"]
-    clarifying_questions: list[str] = []
+    clarifying_questions: list[str] = Field(default_factory=list)
     review_summary: PreparePlanReviewSummary = Field(default_factory=PreparePlanReviewSummary)
     blueprint_text: str = ""
     skill_name: str = ""
-    files: list[FileSpecOut] = []
-    warnings: list[Any] = []
-    asset_requirements: list[AssetRequirementOut] = []
-    final_outputs: list[Any] = []
-    available_tools: list[dict[str, Any]] = []
-    missing_tool_configs: list[dict[str, Any]] = []
-    tool_requirements: list[dict[str, Any]] = []
-    creation_blockers: list[Any] = []
-    requirement_graph: dict[str, Any] = {}
+    files: list[FileSpecOut] = Field(default_factory=list)
+    warnings: list[Any] = Field(default_factory=list)
+    asset_requirements: list[AssetRequirementOut] = Field(default_factory=list)
+    final_outputs: list[Any] = Field(default_factory=list)
+    available_tools: list[Any] = Field(default_factory=list)
+    missing_tool_configs: list[Any] = Field(default_factory=list)
+    tool_requirements: list[Any] = Field(default_factory=list)
+    creation_blockers: list[Any] = Field(default_factory=list)
+    requirement_graph: Any = Field(default_factory=dict)
     workflow_allocation_summary: str = ""
 
 
@@ -771,6 +771,12 @@ async def prepare_plan(request: PreparePlanRequest):
         refine_rounds=3,
     ))
 
+    summary.files_to_create_or_update = [file_spec.path for file_spec in (plan.files or []) if getattr(file_spec, "path", "")]
+    summary.assets_to_upload = [
+        str(getattr(asset, "path", "") or "").strip()
+        for asset in (plan.asset_requirements or [])
+        if str(getattr(asset, "path", "") or "").strip()
+    ]
     graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
     return PreparePlanResponse(
         status="ready",

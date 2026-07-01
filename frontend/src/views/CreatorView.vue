@@ -196,12 +196,32 @@ const showCreationPanel = ref(false)
 const creationPlan = ref(null)
 const reviewSummary = ref(null)
 const showInternalBlueprint = ref(false)
+const skillName = ref('')
+const selectedExistingSkillName = ref('')
 
 // The raw blueprint text extracted from the latest blueprint assistant message
 const blueprintText = computed(() => creationPlan.value?.blueprint_text || '')
 
 // History sent to the LLM excludes system action-result messages
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
+
+
+function resolveCurrentSkillName() {
+  return (
+    creationPlan.value?.skill_name ||
+    skillName.value ||
+    selectedExistingSkillName.value ||
+    ''
+  )
+}
+
+function collectUploadedFileMetadata() {
+  return []
+}
+
+function shouldPreparePlanRevise({ skillName, previousBlueprintText, humanFeedback }) {
+  return Boolean(skillName || previousBlueprintText || humanFeedback)
+}
 
 async function scrollBottom() {
   await nextTick()
@@ -239,13 +259,22 @@ async function send() {
   currentStatus.value = { message: '正在解析需求并准备创建计划…' }
 
   try {
+    const currentSkillName = resolveCurrentSkillName()
+    const previousBlueprintText = blueprintText.value
+    const humanFeedback = currentSkillName || previousBlueprintText ? text : ''
+    const mode = shouldPreparePlanRevise({
+      skillName: currentSkillName,
+      previousBlueprintText,
+      humanFeedback,
+    }) ? 'revise' : 'create'
     const payload = {
-      mode: creationPlan.value ? 'revise' : 'create',
+      mode,
+      skill_name: currentSkillName,
       user_request: text,
       conversation_history: chatHistory.value,
-      previous_blueprint_text: blueprintText.value,
-      human_feedback: creationPlan.value ? text : '',
-      uploaded_files: [],
+      previous_blueprint_text: previousBlueprintText,
+      human_feedback: humanFeedback,
+      uploaded_files: collectUploadedFileMetadata(),
       model: null,
     }
     const plan = await prepareCreationPlan(payload)
@@ -275,6 +304,7 @@ ${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || 
     }
 
     creationPlan.value = plan
+    skillName.value = plan.skill_name || currentSkillName
     showCreationPanel.value = true
     messages.value.push({
       role: 'system',
@@ -328,6 +358,8 @@ function clearChat() {
   creationPlan.value = null
   reviewSummary.value = null
   showInternalBlueprint.value = false
+  skillName.value = ''
+  selectedExistingSkillName.value = ''
 }
 
 </script>

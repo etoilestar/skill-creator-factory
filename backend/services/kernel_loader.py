@@ -440,13 +440,16 @@ def _compose_creator_workflow_contract_for_phase(phase: str) -> str:
             "执行要求：\n"
             "1. 一次性解析用户需求、已有 Skill 上下文、上传文件和修改意见；status=ready 之前必须先判断需求成熟度。\n"
             "2. 如果输入来源、输出结构、执行方式、资源边界、文件计划任一不明确，返回 needs_clarification。\n"
-            "3. needs_clarification 的问题必须带选项，每个问题 2-4 个选项，最多 1-3 个问题；最后一个问题必须询问用户是否还需要补充其他内容。\n"
-            "4. 问题示例和选项优先遵循 kernel/SKILL.md 的澄清问题模板库；不要直接把粗需求扩写成 ready 蓝图。\n"
-            "5. 不要默认询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞偏好。\n"
-            "6. 不要强制把完整蓝图展示给用户确认，不要依赖固定确认语进入生成。\n"
-            "7. 不要把运行时用户输入文件当作 Creator assets；不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path。\n"
-            "8. internal_blueprint_text 中目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。\n"
-            "9. 信息足够时，生成满足 analyze_blueprint(strict=True) 可解析格式的内部蓝图。\n\n"
+            "3. needs_clarification 的 clarifying_questions 必须只包含 1 个带 2-4 个选项的问题；每轮只能问一个问题。\n"
+            "4. 下一个问题必须基于 conversation_history 和 human_feedback 中上一轮的回答继续判断，不要一次性列出多个问题。\n"
+            "5. “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；不要和业务问题放在同一轮。\n"
+            "6. 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充；如果用户选择“没有，按上面的选择继续”，且其他阻塞点已解决，才可以 ready。\n"
+            "7. 问题示例和选项优先遵循 kernel/SKILL.md 的澄清问题模板库；不要直接把粗需求扩写成 ready 蓝图。\n"
+            "8. 不要默认询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞偏好。\n"
+            "9. 不要强制把完整蓝图展示给用户确认，不要依赖固定确认语进入生成。\n"
+            "10. 不要把运行时用户输入文件当作 Creator assets；不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path。\n"
+            "11. internal_blueprint_text 中目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。\n"
+            "12. 信息足够时，生成满足 analyze_blueprint(strict=True) 可解析格式的内部蓝图。\n\n"
             "输出边界：\n"
             "- prepare-plan API 会要求结构化 JSON；此阶段禁止文件写入/命令执行格式。\n"
             "- 内部蓝图仍需保留 SkillPlan / 文件职责计划、宿主执行方式、资源清单等平台合同。\n\n"
@@ -761,8 +764,8 @@ def _compose_kernel_creator_blocks_prompt(skill: SkillPackage, blocks: list[int]
 1. 用户已给出需求时，不要重新问开场分类问题。
 2. 直接抽取目标、输入、输出、素材需求、外部依赖、约束。
 3. 能合理默认的内容不要问；只问真正阻塞生成或 E2E 的信息。
-4. 如需澄清，一次最多 1～3 个问题。
-5. 信息足够时生成完整 internal_blueprint_text，格式必须满足 analyze_blueprint 的 Skill 架构蓝图协议。
+4. 如需澄清，每轮只问 1 个当前最阻塞的问题；下轮必须结合 conversation_history / human_feedback 再判断是否继续追问。
+5. “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；用户选择没有补充且信息足够时，生成完整 internal_blueprint_text，格式必须满足 analyze_blueprint 的 Skill 架构蓝图协议。
 6. 不要求用户阅读完整蓝图，不使用固定确认语作为流程开关。
 7. 用户侧只需要创建要点摘要；完整蓝图仅作为内部调试/高级查看。
 8. 不要为具体 Skill 类型、文件名或业务场景写硬编码特判。

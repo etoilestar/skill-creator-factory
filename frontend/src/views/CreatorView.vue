@@ -290,14 +290,14 @@ async function send() {
     reviewSummary.value = plan.review_summary || null
 
     if (plan.status === 'needs_clarification') {
-      const questions = (plan.clarifying_questions || []).slice(0, 3)
+      const question = (plan.clarifying_questions || [])[0]
       messages.value.push({
         role: 'assistant',
-        content: `我还需要确认以下必要信息：
+        content: `我还需要确认一个必要信息：
 
-${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+${question || '请补充当前最阻塞创建计划的信息。'}`,
       })
-      quickActions.value = buildClarificationQuickActions(questions)
+      quickActions.value = buildClarificationQuickActions(question ? [question] : [])
       return
     }
 

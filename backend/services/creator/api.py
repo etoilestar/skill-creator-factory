@@ -135,21 +135,33 @@ def _prepare_questions_include_supplement_check(questions: list[str]) -> bool:
 
 
 def _normalize_prepare_clarifying_questions(raw_questions: Any) -> list[str]:
-    questions = [str(q).strip() for q in (raw_questions or []) if str(q).strip()][:3]
+    questions = [str(q).strip() for q in (raw_questions or []) if str(q).strip()]
     if not questions:
-        questions = ["请补充一个阻塞创建计划的信息？A. 补充输入来源 B. 补充输出格式"]
-    if not _prepare_questions_include_supplement_check(questions):
-        questions = questions[:2] + [_PREPARE_SUPPLEMENT_QUESTION]
-    elif len(questions) > 3:
-        questions = questions[:3]
-    if not _prepare_questions_have_options(questions):
-        fixed: list[str] = []
-        for q in questions:
-            fixed.append(q if re.search(r"(?<![A-Za-z0-9])A[\.、)]", q) and re.search(r"(?<![A-Za-z0-9])B[\.、)]", q) else f"{q} A. 按推荐方式继续 B. 我补充说明")
-        questions = fixed[:3]
-    if not _prepare_questions_include_supplement_check(questions):
-        questions = questions[:2] + [_PREPARE_SUPPLEMENT_QUESTION]
-    return questions[:3]
+        questions = ["请补充当前最阻塞创建计划的信息。A. 我现在补充 B. 暂时没有补充，按已有信息继续"]
+    question = questions[0]
+    if not _prepare_questions_have_options([question]):
+        question = f"{question} A. 按推荐方式继续 B. 我补充说明"
+    return [question]
+
+
+def _prepare_feedback_wants_supplement(request: PreparePlanRequest) -> bool:
+    feedback = str(request.human_feedback or "").strip()
+    if not feedback:
+        return False
+    if re.search(r"(没有|暫時沒有|暂时没有).{0,8}补充", feedback):
+        return False
+    supplement_markers = ("有，我补充说明", "我补充", "有补充")
+    if any(marker in feedback for marker in supplement_markers):
+        # A frontend quick action sends only the choice. Once the user types real
+        # supplementary content, the feedback should contain more than just that
+        # short choice/context wrapper and may proceed through normal model logic.
+        compact = re.sub(r"\s+", "", feedback)
+        choice_only_patterns = (
+            "B.有,我补充说明", "B.有，我补充说明", "选择:B.有,我补充说明",
+            "选择：B.有，我补充说明", "我补充", "有补充",
+        )
+        return len(feedback) <= 80 or any(pattern.replace(" ", "") in compact for pattern in choice_only_patterns)
+    return False
 
 
 def _prepare_protocol_issue(code: str, message: str, *, path: str = "", field: str = "") -> dict[str, Any]:
@@ -264,7 +276,7 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 返回格式：
 {
   "status": "ready" | "needs_clarification" | "blocked",
-  "clarifying_questions": ["最多三个真正必要且带选项的问题"],
+  "clarifying_questions": ["只包含一个真正必要且带选项的问题"],
   "review_summary": {
     "goal": "",
     "input": "",
@@ -283,8 +295,10 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 约束：
 - status=ready 之前必须先判断需求成熟度；不要直接把粗需求扩写成 ready 蓝图。
 - 信息足够时 status=ready，并生成完整 internal_blueprint_text。
-- 信息不足时 status=needs_clarification，clarifying_questions 最多 3 个，且只能问阻塞生成/E2E 的问题；每题必须带 2-4 个选项。
-- 每次 needs_clarification 的最后一个问题必须询问用户是否还需要补充其他内容。
+- 信息不足时 status=needs_clarification，clarifying_questions 必须只包含 1 个问题，且只能问当前最阻塞生成/E2E 的问题；问题必须带 2-4 个选项。
+- 每轮 needs_clarification 只能问一个问题；下一个问题必须基于 conversation_history 和 human_feedback 中上一轮的回答继续判断。
+- “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；不要和业务问题放在同一轮。
+- 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充；如果用户选择“没有，按上面的选择继续”，且其他阻塞点已解决，才可以 ready。
 - 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
 - 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
 - assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
@@ -887,6 +901,14 @@ async def prepare_plan(request: PreparePlanRequest):
     raw_status = str(prepared.get("status") or "").strip()
     status = raw_status if raw_status in {"ready", "needs_clarification", "blocked"} else "blocked"
     summary = _coerce_prepare_summary(prepared.get("review_summary"))
+
+    if _prepare_feedback_wants_supplement(request):
+        return PreparePlanResponse(
+            status="needs_clarification",
+            clarifying_questions=["请补充你的其他要求。A. 我现在补充 B. 暂时没有补充，按已有信息继续"],
+            review_summary=summary,
+            skill_name=str(prepared.get("skill_name") or request.skill_name or ""),
+        )
 
     if status == "needs_clarification":
         return PreparePlanResponse(

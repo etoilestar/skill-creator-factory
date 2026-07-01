@@ -52,11 +52,32 @@ def test_prepare_question_protocol_helpers_require_options_and_supplement():
     assert api._prepare_questions_include_supplement_check(questions)
 
 
-def test_prepare_questions_missing_supplement_are_completed():
-    questions = api._normalize_prepare_clarifying_questions(["输出格式希望是哪种？A. JSON B. Markdown"])
-    assert len(questions) == 2
-    assert "补充" in questions[-1]
+def test_prepare_questions_multiple_model_questions_are_truncated_to_one():
+    questions = api._normalize_prepare_clarifying_questions([
+        "输入来源希望支持哪种？A. 粘贴文本 B. 上传文件",
+        "输出格式希望是哪种？A. JSON B. Markdown",
+        "还有其他需要补充的要求吗？A. 没有 B. 有，我补充说明",
+    ])
+    assert questions == ["输入来源希望支持哪种？A. 粘贴文本 B. 上传文件"]
     assert api._prepare_questions_have_options(questions)
+
+
+def test_prepare_questions_do_not_auto_append_supplement_question():
+    questions = api._normalize_prepare_clarifying_questions(["输出格式希望是哪种？A. JSON B. Markdown"])
+    assert len(questions) == 1
+    assert "补充" not in questions[0]
+
+
+def test_prepare_question_without_options_gets_options_on_same_question_only():
+    questions = api._normalize_prepare_clarifying_questions(["输入是什么？"])
+    assert len(questions) == 1
+    assert questions[0].startswith("输入是什么？")
+    assert api._prepare_questions_have_options(questions)
+
+
+def test_prepare_single_supplement_question_is_preserved():
+    questions = api._normalize_prepare_clarifying_questions([api._PREPARE_SUPPLEMENT_QUESTION])
+    assert questions == [api._PREPARE_SUPPLEMENT_QUESTION]
 
 
 def test_preflight_rejects_asset_placeholder_and_directory_paths():
@@ -71,14 +92,29 @@ def test_preflight_rejects_runtime_input_assets_and_missing_skillplan_path():
 
 
 @pytest.mark.asyncio
-async def test_needs_clarification_response_has_options_and_supplement(monkeypatch):
+async def test_needs_clarification_response_has_one_optioned_question(monkeypatch):
     async def fake_generate(_request):
-        return {"status": "needs_clarification", "clarifying_questions": ["输入是什么？"]}
+        return {"status": "needs_clarification", "clarifying_questions": ["输入是什么？", api._PREPARE_SUPPLEMENT_QUESTION]}
     monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
     resp = await api.prepare_plan(_request())
     assert resp.status == "needs_clarification"
+    assert len(resp.clarifying_questions) == 1
     assert api._prepare_questions_have_options(resp.clarifying_questions)
-    assert "补充" in resp.clarifying_questions[-1]
+    assert resp.clarifying_questions[0].startswith("输入是什么？")
+
+
+@pytest.mark.asyncio
+async def test_feedback_wants_supplement_blocks_ready(monkeypatch):
+    async def fake_generate(_request):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint()}
+    async def fake_analyze(_request):
+        raise AssertionError("analyze_blueprint should not be called before supplement content exists")
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    resp = await api.prepare_plan(_request(human_feedback="问题：还有其他需要补充的要求吗？\n选择：B. 有，我补充说明"))
+    assert resp.status == "needs_clarification"
+    assert len(resp.clarifying_questions) == 1
+    assert "请补充你的其他要求" in resp.clarifying_questions[0]
 
 
 @pytest.mark.asyncio

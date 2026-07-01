@@ -18,7 +18,7 @@ export function extractClarificationQuestionOptions(question) {
         text: label,
         value: `问题：${text}\n选择：${label}`,
         question: text,
-        waitForInput: /有.*补充|补充说明|我补充/.test(label),
+        waitForInput: /有.*补充|补充说明|我补充/.test(label) && !/没有补充|暂时没有/.test(label),
       }
     })
     .filter(Boolean)

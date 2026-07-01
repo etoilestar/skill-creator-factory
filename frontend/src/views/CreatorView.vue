@@ -2,7 +2,7 @@
   <div class="creator">
     <div class="header">
       <h2>技能创建器</h2>
-      <p class="muted">由 <code>kernel/SKILL.md</code> 驱动 · 支持多轮对话</p>
+      <p class="muted">快速解析需求 · 生成创建要点与文件清单</p>
     </div>
 
     <div class="toolbar">
@@ -21,7 +21,7 @@
       <div class="messages-column">
         <div class="messages" ref="messagesEl">
           <div v-if="messages.length === 0" class="empty">
-            <p>向 AI 说明你想创建什么 Skill，它会引导你一步步完成。</p>
+            <p>说明你想创建或修改什么 Skill。信息足够时会直接生成创建要点和文件清单；只有真正缺少阻塞信息时才会追问。</p>
           </div>
           <template v-for="(msg, i) in messages" :key="i">
             <!-- action result card -->
@@ -56,7 +56,29 @@
             </div>
           </div>
 
-          <!-- Skill creation panel (shown after user confirms blueprint) -->
+          <div v-if="reviewSummary" class="review-card">
+            <div class="review-header">
+              <h3>创建要点</h3>
+              <button class="btn-ghost" @click="showInternalBlueprint = !showInternalBlueprint">
+                {{ showInternalBlueprint ? '隐藏内部蓝图' : '查看内部蓝图' }}
+              </button>
+            </div>
+            <ul>
+              <li v-if="reviewSummary.goal"><strong>目标：</strong>{{ reviewSummary.goal }}</li>
+              <li v-if="reviewSummary.input"><strong>输入：</strong>{{ reviewSummary.input }}</li>
+              <li v-if="reviewSummary.output"><strong>输出：</strong>{{ reviewSummary.output }}</li>
+              <li v-if="reviewSummary.workflow?.length"><strong>工作流：</strong>{{ reviewSummary.workflow.join(' → ') }}</li>
+              <li v-if="reviewSummary.files_to_create_or_update?.length"><strong>文件：</strong>{{ reviewSummary.files_to_create_or_update.join('、') }}</li>
+              <li v-if="reviewSummary.assets_to_upload?.length"><strong>需上传素材：</strong>{{ reviewSummary.assets_to_upload.join('、') }}</li>
+              <li v-if="reviewSummary.risks?.length"><strong>风险/注意：</strong>{{ reviewSummary.risks.join('；') }}</li>
+            </ul>
+            <details v-if="showInternalBlueprint && blueprintText" open>
+              <summary>内部蓝图</summary>
+              <pre>{{ blueprintText }}</pre>
+            </details>
+          </div>
+
+          <!-- Skill creation panel (shown after prepare-plan is ready) -->
           <SkillCreationPanel
             v-if="showCreationPanel && creationPlan"
             :skill-name="creationPlan.skill_name"
@@ -130,40 +152,11 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted } from 'vue'
-import { streamChat } from '../composables/useChat.js'
-import { analyzeBlueprintPlan } from '../composables/useCreator.js'
+import { ref, computed, nextTick } from 'vue'
+import { prepareCreationPlan } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
-
-// ---------------------------------------------------------------------------
-// Keywords kept in sync with backend/_CONFIRM_KEYWORDS and _BLUEPRINT_MARKERS
-// ---------------------------------------------------------------------------
-const CONFIRM_KEYWORDS = [
-  '对，开始做吧',
-  '开始做吧',
-  '开始创建',
-  '开始生成',
-  '确认，开始',
-  '确认，继续构建',
-  '继续构建',
-  '确认继续',
-  '确认开始',
-  '可以开始',
-  '没问题，开始',
-]
-const BLUEPRINT_MARKER = '📋 Skill 架构蓝图'
-
-function isCreationConfirmation(text) {
-  return CONFIRM_KEYWORDS.some(kw => text.includes(kw))
-}
-
-function hasBlueprintInHistory() {
-  return messages.value.some(
-    m => m.role === 'assistant' && (m.content || '').includes(BLUEPRINT_MARKER)
-  )
-}
 
 // ---------------------------------------------------------------------------
 // State
@@ -184,7 +177,7 @@ function actionLabel(action) {
 }
 
 const messages = ref([])
-const input = ref('帮我创建一个查询系统时间的skill')
+const input = ref('')
 const streaming = ref(false)
 const streamBuffer = ref('')
 const error = ref('')
@@ -201,20 +194,34 @@ const showThoughts = ref(false)
 // Creation panel state
 const showCreationPanel = ref(false)
 const creationPlan = ref(null)
+const reviewSummary = ref(null)
+const showInternalBlueprint = ref(false)
+const skillName = ref('')
+const selectedExistingSkillName = ref('')
 
 // The raw blueprint text extracted from the latest blueprint assistant message
-const blueprintText = computed(() => {
-  for (let i = messages.value.length - 1; i >= 0; i--) {
-    const m = messages.value[i]
-    if (m.role === 'assistant' && (m.content || '').includes(BLUEPRINT_MARKER)) {
-      return m.content
-    }
-  }
-  return ''
-})
+const blueprintText = computed(() => creationPlan.value?.blueprint_text || '')
 
 // History sent to the LLM excludes system action-result messages
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
+
+
+function resolveCurrentSkillName() {
+  return (
+    creationPlan.value?.skill_name ||
+    skillName.value ||
+    selectedExistingSkillName.value ||
+    ''
+  )
+}
+
+function collectUploadedFileMetadata() {
+  return []
+}
+
+function shouldPreparePlanRevise({ skillName, previousBlueprintText, humanFeedback }) {
+  return Boolean(skillName || previousBlueprintText || humanFeedback)
+}
 
 async function scrollBottom() {
   await nextTick()
@@ -242,78 +249,74 @@ async function send() {
   if (!text || streaming.value) return
 
   error.value = ''
-  // Clear quick actions when user sends a message
   quickActions.value = []
+  showCreationPanel.value = false
   messages.value.push({ role: 'user', content: text })
   input.value = ''
   await scrollBottom()
 
-  // If the user just confirmed the blueprint, switch to the explicit
-  // file-creation panel and do not call /api/chat/creator again.  The chat
-  // endpoint still supports a legacy Phase 3 auto-execution path that validates
-  // artifacts immediately; here the user should stay in control and validation
-  // must wait until they click "开始创建".
-  if (isCreationConfirmation(text) && hasBlueprintInHistory()) {
-    streaming.value = true
-    try {
-      const plan = await analyzeBlueprintPlan(chatHistory.value)
-      creationPlan.value = plan
-      showCreationPanel.value = true
-      messages.value.push({
-        role: 'system',
-        action: 'creator_panel',
-        name: plan.skill_name,
-        success: true,
-        message: '已整理文件清单，准备生成脚本',
-      })
-      await scrollBottom()
-    } catch (err) {
-      error.value = `蓝图解析失败：${err.message}，请重试`
-    } finally {
-      streaming.value = false
-    }
-    return
-  }
-
   streaming.value = true
-  streamBuffer.value = ''
+  currentStatus.value = { message: '正在解析需求并准备创建计划…' }
 
   try {
-    for await (const chunk of streamChat('/api/chat/creator', { messages: chatHistory.value })) {
-      if (typeof chunk === 'string') {
-        streamBuffer.value += chunk
-        await scrollBottom()
-      } else if (chunk.type === 'status') {
-        currentStatus.value = chunk.data
-        await scrollBottom()
-      } else if (chunk.type === 'thought') {
-        thoughts.value.push(chunk.data)
-        if (!showThoughts.value) showThoughts.value = true
-        await scrollBottom()
-      } else if (chunk.type === 'action_result') {
-        const r = chunk.data
-        messages.value.push({
-          role: 'system',
-          action: r.action,
-          name: r.name,
-          success: r.success,
-          message: r.message,
-          path: r.path,
-        })
-        await scrollBottom()
-      } else if (chunk.type === 'quick_actions') {
-        // Show quick action buttons
-        quickActions.value = chunk.data.actions || []
-        await scrollBottom()
-      }
+    const currentSkillName = resolveCurrentSkillName()
+    const previousBlueprintText = blueprintText.value
+    const humanFeedback = currentSkillName || previousBlueprintText ? text : ''
+    const mode = shouldPreparePlanRevise({
+      skillName: currentSkillName,
+      previousBlueprintText,
+      humanFeedback,
+    }) ? 'revise' : 'create'
+    const payload = {
+      mode,
+      skill_name: currentSkillName,
+      user_request: text,
+      conversation_history: chatHistory.value,
+      previous_blueprint_text: previousBlueprintText,
+      human_feedback: humanFeedback,
+      uploaded_files: collectUploadedFileMetadata(),
+      model: null,
     }
-    if (streamBuffer.value) {
-      messages.value.push({ role: 'assistant', content: streamBuffer.value })
-      streamBuffer.value = ''
+    const plan = await prepareCreationPlan(payload)
+    reviewSummary.value = plan.review_summary || null
+
+    if (plan.status === 'needs_clarification') {
+      const questions = (plan.clarifying_questions || []).slice(0, 3)
+      messages.value.push({
+        role: 'assistant',
+        content: `我还需要确认以下必要信息：
+
+${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
+      })
+      quickActions.value = []
+      return
     }
+
+    if (plan.status === 'blocked') {
+      const blockers = plan.creation_blockers || []
+      messages.value.push({
+        role: 'assistant',
+        content: `当前暂时无法继续创建：
+
+${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || JSON.stringify(b))}`).join('\n')}`,
+      })
+      return
+    }
+
+    creationPlan.value = plan
+    skillName.value = plan.skill_name || currentSkillName
+    showCreationPanel.value = true
+    messages.value.push({
+      role: 'system',
+      action: 'creator_panel',
+      name: plan.skill_name,
+      success: true,
+      message: '已生成创建要点和文件清单，可直接开始生成。',
+    })
   } catch (e) {
     error.value = e.message
   } finally {
+    currentStatus.value = null
     streaming.value = false
     await scrollBottom()
   }
@@ -353,66 +356,12 @@ function clearChat() {
   showThoughts.value = false
   showCreationPanel.value = false
   creationPlan.value = null
+  reviewSummary.value = null
+  showInternalBlueprint.value = false
+  skillName.value = ''
+  selectedExistingSkillName.value = ''
 }
 
-// ---------------------------------------------------------------------------
-// 自动启动对话
-// ---------------------------------------------------------------------------
-
-async function autoStartConversation() {
-  if (messages.value.length > 0 || streaming.value) return
-  
-  error.value = ''
-  quickActions.value = []
-  streaming.value = true
-  streamBuffer.value = ''
-
-  try {
-    for await (const chunk of streamChat('/api/chat/creator', { messages: [] })) {
-      if (typeof chunk === 'string') {
-        streamBuffer.value += chunk
-        await scrollBottom()
-      } else if (chunk.type === 'status') {
-        currentStatus.value = chunk.data
-        await scrollBottom()
-      } else if (chunk.type === 'thought') {
-        thoughts.value.push(chunk.data)
-        if (!showThoughts.value) showThoughts.value = true
-        await scrollBottom()
-      } else if (chunk.type === 'action_result') {
-        const r = chunk.data
-        messages.value.push({
-          role: 'system',
-          action: r.action,
-          name: r.name,
-          success: r.success,
-          message: r.message,
-          path: r.path,
-        })
-        await scrollBottom()
-      } else if (chunk.type === 'quick_actions') {
-        quickActions.value = chunk.data.actions || []
-        await scrollBottom()
-      }
-    }
-    if (streamBuffer.value) {
-      messages.value.push({ role: 'assistant', content: streamBuffer.value })
-      streamBuffer.value = ''
-    }
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    streaming.value = false
-    await scrollBottom()
-  }
-}
-
-// 组件挂载时自动启动对话
-onMounted(() => {
-  if (messages.value.length === 0) {
-    autoStartConversation()
-  }
-})
 </script>
 
 <style scoped>
@@ -744,4 +693,30 @@ onMounted(() => {
     opacity: 1;
   }
 }
+.review-card {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+.review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.review-header h3 { margin: 0; font-size: 16px; }
+.review-card ul { margin: 0; padding-left: 20px; }
+.review-card li { margin: 6px 0; }
+.review-card pre {
+  white-space: pre-wrap;
+  overflow: auto;
+  max-height: 360px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.04);
+}
+
 </style>

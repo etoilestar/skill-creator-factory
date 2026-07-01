@@ -110,7 +110,7 @@
                 :key="index"
                 class="quick-action-btn"
                 :class="action.style"
-                @click="handleQuickAction(action.value)"
+                @click="handleQuickAction(action)"
                 :disabled="streaming"
               >
                 {{ action.text }}
@@ -153,7 +153,7 @@
 
 <script setup>
 import { ref, computed, nextTick } from 'vue'
-import { prepareCreationPlan } from '../composables/useCreator.js'
+import { prepareCreationPlan, buildClarificationQuickActions } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
@@ -232,13 +232,22 @@ async function scrollBottom() {
 
 // Handle quick action button click
 async function handleQuickAction(value) {
-  if (!value || streaming.value) return
+  const action = typeof value === 'object' && value !== null ? value : { value }
+  if (!action.value || streaming.value) return
   // Clear previous quick actions
   quickActions.value = []
+  if (action.waitForInput) {
+    input.value = ''
+    messages.value.push({ role: 'user', content: action.value })
+    messages.value.push({ role: 'assistant', content: '好的，请在输入框补充你的其他要求。' })
+    await scrollBottom()
+    return
+  }
   // Send the value as user input
-  input.value = value
+  input.value = action.value
   await send()
 }
+
 
 // ---------------------------------------------------------------------------
 // Send
@@ -288,7 +297,7 @@ async function send() {
 
 ${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`,
       })
-      quickActions.value = []
+      quickActions.value = buildClarificationQuickActions(questions)
       return
     }
 

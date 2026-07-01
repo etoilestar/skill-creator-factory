@@ -230,3 +230,43 @@ async def test_supplement_limit_generates_blueprint_and_strict_analyze(monkeypat
     resp = await api.prepare_plan(_request(conversation_history=history, human_feedback="补充：第二次补充"))
     assert resp.status == "ready"
     assert calls and calls[0].strict is True
+
+
+@pytest.mark.asyncio
+async def test_limit_reached_sets_creation_points_stage_and_strips_risks(monkeypatch):
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输出？A. JSON B. Markdown"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="目标功能", input="运行时输入", output="JSON", risks=["不展示"])
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    history = [
+        {"role": "assistant", "content": "我还需要确认一个必要信息：输入？A. 文本 B. 文件"},
+        {"role": "assistant", "content": "我还需要确认一个必要信息：输出？A. JSON B. Markdown"},
+    ]
+    resp = await api.prepare_plan(_request(conversation_history=history))
+    assert resp.prepare_stage == "creation_points_confirmation"
+    assert resp.review_summary.goal == "目标功能"
+    assert resp.review_summary.risks == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_after_supplement_generates_blueprint(monkeypatch):
+    calls = []
+    async def fake_generate(_request):
+        return {"status": "needs_clarification", "clarifying_questions": ["输入？A. 文本 B. 文件"]}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="确认后的要点", input="输入", output="JSON", risks=[])
+    async def fake_blueprint(**kwargs):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+    async def fake_analyze(request):
+        calls.append(request)
+        return _plan(path="SKILL.md")
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    monkeypatch.setattr(api, "_generate_internal_blueprint_from_confirmed_summary", fake_blueprint)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+    resp = await api.prepare_plan(_request(human_feedback="问题：已根据补充内容更新创建要点。是否按这些要点继续？\n选择：A. 没有其他补充，按这些要点继续"))
+    assert resp.status == "ready"
+    assert resp.prepare_stage == "ready"
+    assert calls and calls[0].strict is True

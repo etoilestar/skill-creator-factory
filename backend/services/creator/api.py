@@ -35,6 +35,7 @@ class PreparePlanReviewSummary(BaseModel):
 
 class PreparePlanResponse(BaseModel):
     status: Literal["ready", "needs_clarification", "blocked"]
+    prepare_stage: Literal["business_clarification", "creation_points_confirmation", "supplement_confirmation", "ready"] = "business_clarification"
     clarifying_questions: list[str] = Field(default_factory=list)
     review_summary: PreparePlanReviewSummary = Field(default_factory=PreparePlanReviewSummary)
     blueprint_text: str = ""
@@ -95,6 +96,11 @@ def _parse_prepare_plan_json(raw: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("prepare-plan JSON must be an object")
     return data
+
+
+def _strip_prepare_summary_risks(summary: PreparePlanReviewSummary) -> PreparePlanReviewSummary:
+    summary.risks = []
+    return summary
 
 
 def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
@@ -315,6 +321,7 @@ async def _repair_prepare_blueprint_protocol(
 def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanReviewSummary, *, skill_name: str, issues: list[dict[str, Any]]) -> PreparePlanResponse:
     return PreparePlanResponse(
         status="blocked",
+        prepare_stage="creation_points_confirmation",
         review_summary=summary,
         skill_name=skill_name or request.skill_name or "",
         creation_blockers=["创建计划暂时无法通过平台协议预检，请补充更明确的输入、输出、资源边界或文件计划后重试。"],
@@ -1041,7 +1048,7 @@ async def prepare_plan(request: PreparePlanRequest):
 
     async def summarize_and_confirm(question: str) -> PreparePlanResponse:
         confirmed = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        return PreparePlanResponse(status="needs_clarification", clarifying_questions=[question], review_summary=confirmed, skill_name=skill_name)
+        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=[question], review_summary=_strip_prepare_summary_risks(confirmed), skill_name=skill_name)
 
     if _prepare_user_confirmed_no_more_supplement(request) and status != "ready":
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
@@ -1059,14 +1066,16 @@ async def prepare_plan(request: PreparePlanRequest):
         else:
             return PreparePlanResponse(
                 status="needs_clarification",
-                clarifying_questions=["已根据补充内容更新创建要点。是否还需要继续补充？A. 没有，按这些要点继续 B. 有，我继续补充"],
-                review_summary=summary,
+                prepare_stage="supplement_confirmation",
+                clarifying_questions=["已根据补充内容更新创建要点。是否按这些要点继续？A. 没有其他补充，按这些要点继续 B. 继续补充说明"],
+                review_summary=_strip_prepare_summary_risks(summary),
                 skill_name=skill_name,
             )
     elif _prepare_feedback_wants_supplement(request):
         return PreparePlanResponse(
             status="needs_clarification",
-            clarifying_questions=["请补充你的其他要求。A. 我现在补充 B. 暂时没有补充，按已有信息继续"],
+            prepare_stage="creation_points_confirmation",
+            clarifying_questions=["好的，请补充你的其他要求。"],
             review_summary=PreparePlanReviewSummary(),
             skill_name=skill_name,
         )
@@ -1075,6 +1084,7 @@ async def prepare_plan(request: PreparePlanRequest):
         if not _prepare_business_clarification_limit_reached(request):
             return PreparePlanResponse(
                 status="needs_clarification",
+                prepare_stage="business_clarification",
                 clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
                 review_summary=PreparePlanReviewSummary(),
                 skill_name=skill_name,
@@ -1104,7 +1114,7 @@ async def prepare_plan(request: PreparePlanRequest):
         except Exception:
             pass
     if protocol_errors:
-        return PreparePlanResponse(status="needs_clarification", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=summary, skill_name=skill_name)
+        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
     plan = None
     analyze_errors: list[dict[str, Any]] = []
@@ -1131,7 +1141,7 @@ async def prepare_plan(request: PreparePlanRequest):
                 analyze_errors = protocol_errors
                 break
     if plan is None:
-        return PreparePlanResponse(status="needs_clarification", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=summary, skill_name=skill_name)
+        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
     summary.files_to_create_or_update = [
         file_spec.path
@@ -1150,6 +1160,7 @@ async def prepare_plan(request: PreparePlanRequest):
     graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
     return PreparePlanResponse(
         status="ready",
+        prepare_stage="ready",
         review_summary=summary,
         blueprint_text=plan.blueprint_text or blueprint_text,
         skill_name=plan.skill_name,

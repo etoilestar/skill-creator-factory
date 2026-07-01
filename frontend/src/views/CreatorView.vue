@@ -58,7 +58,7 @@
 
           <div v-if="reviewSummary" class="review-card">
             <div class="review-header">
-              <h3>{{ creationPlan ? '创建要点' : '已整理的创建要点' }}</h3>
+              <h3>{{ reviewSummaryTitle }}</h3>
               <button class="btn-ghost" @click="showInternalBlueprint = !showInternalBlueprint">
                 {{ showInternalBlueprint ? '隐藏内部蓝图' : '查看内部蓝图' }}
               </button>
@@ -198,6 +198,12 @@ const showInternalBlueprint = ref(false)
 const skillName = ref('')
 const selectedExistingSkillName = ref('')
 const pendingSupplementQuestion = ref('')
+const reviewSummaryStage = ref('')
+const reviewSummaryTitle = computed(() => {
+  if (creationPlan.value) return '创建要点'
+  if (reviewSummaryStage.value === 'supplement_confirmation') return '已根据补充内容更新的创建要点'
+  return '已整理的创建要点'
+})
 
 // The raw blueprint text extracted from the latest blueprint assistant message
 const blueprintText = computed(() => creationPlan.value?.blueprint_text || '')
@@ -295,7 +301,9 @@ async function send() {
     const summary = plan.review_summary || null
     const question = (plan.clarifying_questions || [])[0]
     const hasSummaryContent = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length)
-    const isCreationPointsConfirmation = plan.status === 'ready' || (plan.status === 'needs_clarification' && /创建要点|补充|按这些要点/.test(String(question || '')))
+    const stage = plan.prepare_stage || ''
+    const isCreationPointsConfirmation = stage === 'creation_points_confirmation' || stage === 'supplement_confirmation' || plan.status === 'ready' || (plan.status === 'needs_clarification' && /创建要点|补充|按这些要点/.test(String(question || '')))
+    reviewSummaryStage.value = stage
     reviewSummary.value = hasSummaryContent && isCreationPointsConfirmation ? { ...summary, risks: [] } : null
 
     if (plan.status === 'needs_clarification') {
@@ -376,6 +384,7 @@ function clearChat() {
   showCreationPanel.value = false
   creationPlan.value = null
   reviewSummary.value = null
+  reviewSummaryStage.value = ''
   showInternalBlueprint.value = false
   skillName.value = ''
   selectedExistingSkillName.value = ''

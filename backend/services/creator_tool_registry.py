@@ -131,6 +131,18 @@ class ToolCapability:
     allow_creator_use: bool = True
     allow_external_side_effect: bool = False
     helper_imports: list[str] = field(default_factory=list)
+    capability_aliases: list[str] = field(default_factory=list)
+    semantic_tags: list[str] = field(default_factory=list)
+    accepted_input_extensions: list[str] = field(default_factory=list)
+    accepted_input_mime_types: list[str] = field(default_factory=list)
+    output_content_types: list[str] = field(default_factory=list)
+    output_extensions: list[str] = field(default_factory=list)
+    task_verbs: list[str] = field(default_factory=list)
+    domain_terms: list[str] = field(default_factory=list)
+    negative_tags: list[str] = field(default_factory=list)
+    preference_score: float = 0.0
+    tool_quality_score: float = 0.0
+    structured_output_score: float = 0.0
     allowed_roles: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)
@@ -1057,6 +1069,30 @@ BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"] = replace(
     usage_policy="helper_preferred",
 )
 
+# Semantic metadata for built-in text/PDF readers.
+BUILTIN_TOOL_CAPABILITIES["pdf_parsing"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["pdf_parsing"],
+    capability_aliases=["pdf_parsing", "pdf_text_extraction", "document_parse"],
+    semantic_tags=["pdf", "text_extraction", "document_parse"],
+    accepted_input_extensions=[".pdf"],
+    output_content_types=["text"],
+    task_verbs=["parse", "extract", "read", "summarize_preprocess"],
+    domain_terms=["pdf", "pdf解析", "提取pdf文本", "pdf转文本"],
+    preference_score=0.55,
+    tool_quality_score=0.55,
+)
+BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"],
+    capability_aliases=["file_text_read", "multi_format_text_read", "pdf_text_extraction", "document_text_extraction"],
+    semantic_tags=["pdf", "docx", "pptx", "spreadsheet", "csv", "markdown", "text_extraction"],
+    accepted_input_extensions=[".pdf", ".docx", ".pptx", ".xlsx", ".xlsm", ".csv", ".tsv", ".txt", ".md"],
+    output_content_types=["text"],
+    task_verbs=["read", "extract", "parse", "summarize_preprocess"],
+    domain_terms=["读取文本", "提取文本", "pdf转文本", "普通pdf纯文本", "摘要", "信息抽取"],
+    preference_score=0.65,
+    tool_quality_score=0.65,
+)
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1820,6 +1856,28 @@ def set_tool_capability_override(name: str, *, enabled: bool | None = None, allo
     _TOOL_OVERRIDES[name] = current
     return get_tool_capability(name)
 
+
+
+def update_registered_tool_state(name: str, *, enabled: bool | None = None, allow_creator_use: bool | None = None) -> ToolCapability | None:
+    cap = _REGISTERED_TOOL_CAPABILITIES.get(name)
+    if cap is None:
+        return None
+    payload = asdict(cap)
+    if enabled is not None:
+        payload["enabled_by_default"] = bool(enabled)
+        payload["approval_status"] = "enabled" if enabled else "disabled"
+    if allow_creator_use is not None:
+        payload["allow_creator_use"] = bool(allow_creator_use)
+    updated = ToolCapability(**payload)
+    _REGISTERED_TOOL_CAPABILITIES[name] = updated
+    return updated
+
+def delete_registered_tool(name: str) -> bool:
+    if name not in _REGISTERED_TOOL_CAPABILITIES:
+        return False
+    del _REGISTERED_TOOL_CAPABILITIES[name]
+    _TOOL_OVERRIDES.pop(name, None)
+    return True
 
 def roles() -> list[str]:
     return sorted({role for cap in list_tool_capabilities() for role in cap.roles})

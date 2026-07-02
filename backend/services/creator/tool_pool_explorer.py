@@ -2,54 +2,159 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from pydantic import BaseModel, Field
+from backend.services.creator_tool_registry import ToolCapability, list_tool_capabilities
 from .tool_pool_models import ToolPoolAddToolRequest
 
-EXT_TO_TOOL = {'.pdf':'pdf_parsing','.docx':'docx_parsing','.pptx':'pptx_parsing','.xlsx':'spreadsheet_read','.xlsm':'spreadsheet_read','.csv':'csv_read','.tsv':'csv_read'}
-MULTI_TEXT_EXTS = set(EXT_TO_TOOL)|{'.txt','.md'}
-IMAGE_EXTS = {'.png','.jpg','.jpeg','.webp','.gif'}
+SYNONYMS = {
+    'pdf': ['pdf', '文档', '论文', '报告文件'],
+    'text_extraction': ['文本', '提取文本', '读取文本', '转文本', '抽取内容', '解析内容', '内容提取'],
+    'markdown': ['markdown', 'md', '转md', '转 markdown', '转markdown', 'markdown格式'],
+    'parse': ['解析', '提取', '读取', '转换', 'convert', 'parse', 'extract', 'read'],
+    'structure': ['结构', '版面', '表格', '公式', '标题', '层级', 'layout', 'structure', 'table', 'formula'],
+    'image': ['图片', '图像', '照片', '视觉', 'image', 'vision'],
+    'spreadsheet': ['表格', 'excel', 'xlsx', 'csv', 'sheet'],
+}
 
 class ToolPoolExplorationResult(BaseModel):
     candidate_tool_requests: list[ToolPoolAddToolRequest] = Field(default_factory=list)
     missing_capability_requests: list[dict[str, Any]] = Field(default_factory=list)
     denied_by_explorer: list[dict[str, Any]] = Field(default_factory=list)
+    scored_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    uploaded_file_triggers: list[dict[str, Any]] = Field(default_factory=list)
     confidence: float = 0.8
     reason: str = ''
 
-def _file_exts(values: Any) -> set[str]:
-    out=set()
-    if isinstance(values, dict): values = list(values.values()) + list(values.keys())
-    if not isinstance(values, list): values=[values]
-    for v in values:
-        if isinstance(v, dict):
-            out |= _file_exts(list(v.values()))
-        else:
-            ext=Path(str(v)).suffix.lower()
-            if ext: out.add(ext)
+def _as_list(value: Any) -> list[Any]:
+    if value is None: return []
+    if isinstance(value, list): return value
+    if isinstance(value, (tuple, set)): return list(value)
+    return [value]
+
+def _texts(value: Any) -> list[str]:
+    out=[]
+    if isinstance(value, dict):
+        for k,v in value.items(): out.extend(_texts(k)); out.extend(_texts(v))
+    elif isinstance(value, list):
+        for item in value: out.extend(_texts(item))
+    elif value is not None:
+        out.append(str(value))
     return out
 
+def _file_exts(values: Any) -> set[str]:
+    out=set()
+    for text in _texts(values):
+        ext=Path(text).suffix.lower()
+        if ext: out.add(ext)
+    return out
+
+def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tuple[set[str], list[dict[str, Any]]]:
+    tools=set(); triggers=[]
+    for item in uploaded_files or []:
+        if not isinstance(item, dict): continue
+        for tool in _as_list(item.get('candidate_tools')):
+            if str(tool).strip():
+                tools.add(str(tool).strip()); triggers.append({'source':'uploaded_files.candidate_tools','tool_id':str(tool).strip(),'file':item.get('name') or item.get('path') or item.get('filename')})
+    return tools, triggers
+
+def _normalize_tokens(text: str) -> set[str]:
+    raw=(text or '').lower().replace(' ', '')
+    tokens={raw} if raw else set()
+    for key, terms in SYNONYMS.items():
+        if any(term.lower().replace(' ', '') in raw for term in terms):
+            tokens.add(key)
+    for chunk in ['pdf','markdown','md','text','convert','parse','extract','read','summary','摘要','纯文本']:
+        if chunk in raw: tokens.add(chunk)
+    return tokens
+
+def _cap_meta(cap: ToolCapability, key: str) -> list[str]:
+    return [str(x) for x in getattr(cap, key, []) or [] if str(x).strip()]
+
+def _function_text(cap: ToolCapability) -> str:
+    parts=[cap.name, cap.display_name, cap.category, cap.prompt_guidance]
+    for fn in cap.functions or []:
+        parts.extend([fn.short_description, fn.when_to_use, fn.signature])
+    return ' '.join(str(p) for p in parts if p)
+
+def _role_match(cap: ToolCapability, role: str) -> bool:
+    roles=set(cap.roles or [])|set(cap.allowed_roles or [])
+    return not roles or not role or role in roles or 'generic_script' in roles
+
+def score_tool_for_file_request(cap: ToolCapability, *, text: str, tokens: set[str], exts: set[str], outputs: list[str], role: str, selected_tools: set[str], required_slots: set[str], uploaded_candidate_tools: set[str]) -> tuple[float, list[str], list[str], str]:
+    score=0.0; features=[]; terms=[]
+    if cap.name in selected_tools:
+        score+=100; features.append('exact_selected_tool_match')
+    if cap.name in required_slots or set(_cap_meta(cap,'capability_aliases')) & required_slots:
+        score+=90; features.append('required_tool_slot_exact_match')
+    if cap.name in uploaded_candidate_tools:
+        score+=80; features.append('uploaded_candidate_tool_match')
+    accepted={e.lower() for e in _cap_meta(cap,'accepted_input_extensions')}
+    for ext in sorted(exts & accepted):
+        score+=30; features.append(f'accepted_input_extension:{ext}'); terms.append(ext)
+    output_types={x.lower() for x in _cap_meta(cap,'output_content_types') + _cap_meta(cap,'output_extensions')}
+    for out in outputs:
+        low=out.lower()
+        for ot in output_types:
+            if ot and ot.strip('.') in low:
+                score+=30; features.append(f'output_content_type:{ot}'); terms.append(ot); break
+    aliases={x.lower() for x in _cap_meta(cap,'capability_aliases')}
+    tags={x.lower() for x in _cap_meta(cap,'semantic_tags')}
+    for token in sorted(tokens):
+        if token.lower() in aliases or token.lower() in tags:
+            score+=25; features.append(f'capability_alias:{token}'); terms.append(token)
+    raw=text.lower().replace(' ', '')
+    for term in _cap_meta(cap,'domain_terms'):
+        norm=term.lower().replace(' ', '')
+        if norm and norm in raw:
+            score+=20; features.append(f'domain_term:{term}'); terms.append(term)
+    for verb in _cap_meta(cap,'task_verbs'):
+        if verb.lower().replace(' ', '') in raw or verb.lower() in tokens:
+            score+=15; features.append(f'task_verb:{verb}'); terms.append(verb)
+    hay=_function_text(cap).lower()
+    if any(token in hay for token in tokens if len(token)>2):
+        score+=10; features.append('description_keyword_match')
+    if _role_match(cap, role):
+        score+=10; features.append('role_match')
+    if cap.input_schema: score+=10; features.append('schema_input_match')
+    if cap.output_schema: score+=10; features.append('schema_output_match')
+    score += max(0.0, min(float(getattr(cap,'preference_score',0.0) or 0.0), 1.0))*20
+    score += max(0.0, min(float(getattr(cap,'tool_quality_score',0.0) or 0.0), 1.0))*20
+    score += max(0.0, min(float(getattr(cap,'structured_output_score',0.0) or 0.0), 1.0))*20
+    for neg in _cap_meta(cap,'negative_tags'):
+        if neg.lower() in tokens or neg.lower().replace(' ', '') in raw:
+            score-=30; features.append(f'negative_tag:{neg}')
+    return score, features, sorted(set(terms)), '; '.join(features[:6])
+
 def explore_tool_pool(*, user_request: str = '', blueprint_text: str = '', file_specs: list[dict[str, Any]] | None = None, uploaded_files: list[dict[str, Any]] | None = None, current_tool_pool: Any = None, available_tool_registry: Any = None, missing_tool_configs: Any = None) -> ToolPoolExplorationResult:
-    reqs=[]; text=(user_request+'\n'+blueprint_text).lower()
-    uploaded_exts=_file_exts(uploaded_files or [])
+    uploaded_files=[u.model_dump(mode='json') if hasattr(u,'model_dump') else dict(u) for u in (uploaded_files or []) if isinstance(u, dict) or hasattr(u,'model_dump')]
+    registry=list(available_tool_registry or list_tool_capabilities())
+    uploaded_candidate_tools, triggers=_candidate_tools_from_uploaded(uploaded_files)
+    scored=[]; requests=[]
     for spec in file_specs or []:
         target=str(spec.get('path') or spec.get('target_file') or '')
         if not target.startswith('scripts/'): continue
-        exts=uploaded_exts | _file_exts(spec.get('inputs') or {}) | _file_exts(spec.get('required_capabilities') or [])
-        selected=[str(x) for x in (spec.get('selected_tools') or spec.get('required_tool_slots') or [])]
-        tools=[]
-        if len(exts & MULTI_TEXT_EXTS) > 1 or 'multi-format' in text or '多格式' in text:
-            tools.append(('unified_file_text_read','multi-format text read'))
-        else:
-            for ext in sorted(exts):
-                if ext in EXT_TO_TOOL: tools.append((EXT_TO_TOOL[ext], f'{ext} input'))
-        if exts & IMAGE_EXTS or 'image' in text or '图片' in text:
-            tools.append(('vision_understanding','image understanding'))
-        if 'pdf' in text and any(w in text for w in ['output','生成','report','报告']):
-            tools.append(('pdf_generation','pdf output'))
-        for tool in selected:
-            if tool and not tool.startswith('read_'): tools.append((tool,'selected by blueprint'))
-        seen=set()
-        for tool, reason in tools:
-            if tool in seen: continue
-            seen.add(tool)
-            reqs.append(ToolPoolAddToolRequest(target_file=target, requested_capability=tool, candidate_tool_id=tool, source='registry_exploration', reason=reason, confidence=0.85))
-    return ToolPoolExplorationResult(candidate_tool_requests=reqs, reason='deterministic registry exploration')
+        text='\n'.join([user_request, blueprint_text, ' '.join(_texts(spec)), ' '.join(_texts(uploaded_files))])
+        tokens=_normalize_tokens(text)
+        exts=_file_exts(spec) | _file_exts(uploaded_files)
+        outputs=[str(x) for x in _texts(spec.get('outputs') or spec.get('output_schema') or {})]
+        role=str(spec.get('role') or 'generic_script')
+        selected={str(x) for x in _as_list(spec.get('selected_tools')) if str(x)}
+        raw_slots=_as_list(spec.get('required_tool_slots'))
+        slots={str(x.get('tool_id') or x.get('capability') or x.get('capability_id') or x.get('name') or x) for x in raw_slots if str(x)}
+        candidates=[]
+        for cap in registry:
+            score, features, terms, reason=score_tool_for_file_request(cap, text=text, tokens=tokens, exts=exts, outputs=outputs, role=role, selected_tools=selected, required_slots=slots, uploaded_candidate_tools=uploaded_candidate_tools)
+            if score <= 0 and cap.name not in selected and cap.name not in uploaded_candidate_tools:
+                continue
+            row={'target_file':target,'tool_id':cap.name,'score':score,'matched_features':features,'matched_terms':terms,'semantic_reason':reason,'candidate_source':'semantic_registry'}
+            candidates.append(row)
+        candidates.sort(key=lambda r: r['score'], reverse=True)
+        # keep top candidates but always include explicit selected/uploaded candidates
+        keep=[]
+        for row in candidates:
+            if len(keep) < 3 or row['tool_id'] in selected or row['tool_id'] in uploaded_candidate_tools:
+                keep.append(row)
+        for rank,row in enumerate(keep,1):
+            row['rank']=rank; scored.append(row)
+            capability_group = 'pdf_text_extraction' if '.pdf' in exts and (tokens & {'pdf','text_extraction','markdown','parse','structure'} or any('pdf' in o.lower() for o in outputs)) else row['tool_id']
+            requests.append(ToolPoolAddToolRequest(target_file=target, requested_capability=capability_group, candidate_tool_id=row['tool_id'], source='registry_exploration', reason=row['semantic_reason'], confidence=min(1.0, row['score']/100.0), score=row['score'], matched_features=row['matched_features'], matched_terms=row['matched_terms'], rank=rank, candidate_source=row['candidate_source'], semantic_reason=row['semantic_reason']))
+    return ToolPoolExplorationResult(candidate_tool_requests=requests, scored_candidates=scored, uploaded_file_triggers=triggers, confidence=0.85, reason='semantic registry recall and scoring')

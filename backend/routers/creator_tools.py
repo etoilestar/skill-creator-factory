@@ -37,6 +37,8 @@ from ..services.creator_tool_registry import (
     tool_authoring_config_status,
     tool_status,
     write_registered_adapter,
+    update_registered_tool_state,
+    delete_registered_tool,
     _capability_from_dict,
     _snippet_from_dict,
 )
@@ -301,7 +303,11 @@ def register_creator_tool(request: ToolRegisterRequest) -> dict[str, Any]:
 
 @router.post("/tools/{name}/enable")
 def enable_creator_tool(name: str) -> dict[str, Any]:
-    cap = set_tool_capability_override(name, enabled=True, allow_creator_use=True)
+    cap = update_registered_tool_state(name, enabled=True, allow_creator_use=True)
+    if cap is not None:
+        persist_registered_tools()
+    else:
+        cap = set_tool_capability_override(name, enabled=True, allow_creator_use=True)
     if cap is None:
         raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
     return {"tool": tool_status(cap)}
@@ -309,7 +315,11 @@ def enable_creator_tool(name: str) -> dict[str, Any]:
 
 @router.post("/tools/{name}/disable")
 def disable_creator_tool(name: str) -> dict[str, Any]:
-    cap = set_tool_capability_override(name, enabled=False, allow_creator_use=False)
+    cap = update_registered_tool_state(name, enabled=False, allow_creator_use=False)
+    if cap is not None:
+        persist_registered_tools()
+    else:
+        cap = set_tool_capability_override(name, enabled=False, allow_creator_use=False)
     if cap is None:
         raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
     return {"tool": tool_status(cap)}
@@ -406,7 +416,22 @@ def test_creator_tool_snippet(name: str, snippet_id: str) -> dict[str, Any]:
 
 @router.get("/tools/{name}")
 def get_creator_tool(name: str) -> dict[str, Any]:
-    return {"tool": tool_status(_tool_or_404(name))}
+    cap = _tool_or_404(name)
+    return {
+        "tool": tool_status(cap),
+        "functions": [fn.__dict__ for fn in (cap.functions or [])],
+        "snippets": [snippet.__dict__ for snippet in snippets_for_tool(cap)],
+    }
+
+@router.delete("/tools/{name}")
+def delete_creator_tool(name: str) -> dict[str, Any]:
+    cap = _tool_or_404(name)
+    if cap.created_by == "system" or name not in {item.name for item in list_tool_capabilities() if item.created_by != "system"}:
+        raise HTTPException(status_code=400, detail="Only registered custom tools can be deleted")
+    if not delete_registered_tool(name):
+        raise HTTPException(status_code=404, detail=f"Unknown creator tool capability: {name}")
+    persist_registered_tools()
+    return {"deleted": True, "tool": name}
 
 
 @router.patch("/tools/{name}")

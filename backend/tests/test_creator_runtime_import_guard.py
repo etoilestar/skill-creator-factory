@@ -18,3 +18,19 @@ def test_import_guard_blocks_star_and_pool_forbidden():
 def test_import_guard_allows_bound_helper():
     result = guard_runtime_imports('from backend.services.runtime_tools import read_file_text\n', 'scripts/a.py', {'allowed_helper_imports': ['read_file_text']})
     assert result.success
+
+
+def test_import_guard_allows_bound_custom_tool():
+    src = 'from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\n'
+    result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
+    assert result.success
+
+
+def test_import_guard_blocks_unbound_custom_tool_and_wildcard():
+    src = 'from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\n'
+    result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': [], 'allowed_function_imports': []})
+    assert not result.success
+    assert result.error_type == 'generated_pool_forbidden_custom_tool_import'
+    wildcard = guard_runtime_imports('from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import *\n', 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
+    assert not wildcard.success
+    assert wildcard.error_type == 'generated_custom_tool_wildcard_import'

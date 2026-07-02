@@ -21,12 +21,24 @@ class ToolPoolAddToolRequest(BaseModel):
     expected_input: dict[str, Any] = Field(default_factory=dict)
     expected_output: dict[str, Any] = Field(default_factory=dict)
     confidence: float = 1.0
+    score: float = 0.0
+    matched_features: list[str] = Field(default_factory=list)
+    matched_terms: list[str] = Field(default_factory=list)
+    rank: int = 0
+    candidate_source: str = ''
+    semantic_reason: str = ''
 
 class ToolPoolGateEvent(BaseModel):
     decision: GateDecision
     tool_id: str
     target_file: str
     allowed_helper_imports: list[str] = Field(default_factory=list)
+    allowed_import_paths: list[str] = Field(default_factory=list)
+    allowed_function_imports: list[str] = Field(default_factory=list)
+    checked_import_paths: list[str] = Field(default_factory=list)
+    checked_functions: list[str] = Field(default_factory=list)
+    score: float = 0.0
+    matched_features: list[str] = Field(default_factory=list)
     denied_helper_imports: list[str] = Field(default_factory=list)
     required_env: list[str] = Field(default_factory=list)
     missing_env: list[str] = Field(default_factory=list)
@@ -43,6 +55,13 @@ class ToolPoolTool(BaseModel):
     source_phase: str = ''
     target_files: list[str] = Field(default_factory=list)
     allowed_helper_imports: list[str] = Field(default_factory=list)
+    allowed_import_paths: list[str] = Field(default_factory=list)
+    allowed_function_imports: list[str] = Field(default_factory=list)
+    primary_for_capabilities: list[str] = Field(default_factory=list)
+    secondary_for_capabilities: list[str] = Field(default_factory=list)
+    score: float = 0.0
+    matched_features: list[str] = Field(default_factory=list)
+    matched_terms: list[str] = Field(default_factory=list)
     allowed_roles: list[str] = Field(default_factory=list)
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
@@ -56,7 +75,13 @@ class ToolPoolTool(BaseModel):
 class ToolPoolFileBinding(BaseModel):
     target_file: str
     allowed_tool_ids: list[str] = Field(default_factory=list)
+    primary_tool_ids: list[str] = Field(default_factory=list)
+    secondary_tool_ids: list[str] = Field(default_factory=list)
     allowed_helper_imports: list[str] = Field(default_factory=list)
+    allowed_import_paths: list[str] = Field(default_factory=list)
+    allowed_function_imports: list[str] = Field(default_factory=list)
+    scored_tools: list[dict[str, Any]] = Field(default_factory=list)
+    matched_features_by_tool: dict[str, list[str]] = Field(default_factory=dict)
     required_env: list[str] = Field(default_factory=list)
     dependencies: list[Any] = Field(default_factory=list)
     snippets: list[dict[str, Any]] = Field(default_factory=list)
@@ -93,6 +118,9 @@ class ToolPoolModel(BaseModel):
     denied_requests: list[ToolPoolDeniedRequest] = Field(default_factory=list)
     missing_requests: list[ToolPoolMissingRequest] = Field(default_factory=list)
     gate_events: list[ToolPoolGateEvent] = Field(default_factory=list)
+    exploration_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    scored_candidates: list[dict[str, Any]] = Field(default_factory=list)
+    uploaded_file_triggers: list[dict[str, Any]] = Field(default_factory=list)
 
 class ToolPoolPatch(BaseModel):
     add_tool_requests: list[ToolPoolAddToolRequest] = Field(default_factory=list)

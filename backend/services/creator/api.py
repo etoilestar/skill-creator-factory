@@ -1365,7 +1365,12 @@ async def prepare_plan(request: PreparePlanRequest):
     ]
     graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
     file_specs_payload = [f.model_dump(mode="json") if hasattr(f, "model_dump") else dict(f) for f in (plan.files or [])]
-    tool_pool = build_tool_pool(skill_name=plan.skill_name, user_request=getattr(request, "user_request", "") or "", blueprint_text=plan.blueprint_text or blueprint_text, file_specs=file_specs_payload, uploaded_files=[])
+    uploaded_files_payload = [
+        item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        for item in (getattr(request, "uploaded_files", []) or [])
+        if isinstance(item, dict) or hasattr(item, "model_dump")
+    ]
+    tool_pool = build_tool_pool(skill_name=plan.skill_name, user_request=getattr(request, "user_request", "") or "", blueprint_text=plan.blueprint_text or blueprint_text, file_specs=file_specs_payload, uploaded_files=uploaded_files_payload)
     binding_by_path = {binding.target_file: binding for binding in tool_pool.file_bindings}
     for file_spec in plan.files or []:
         binding = binding_by_path.get(getattr(file_spec, "path", ""))
@@ -1375,11 +1380,21 @@ async def prepare_plan(request: PreparePlanRequest):
                 "allowed_helper_imports": binding.allowed_helper_imports,
                 "denied_helper_imports": binding.denied_helper_imports,
             }
+    gate_events = [g.model_dump(mode="json") for g in tool_pool.gate_events]
     tool_pool_summary = {
-        "tools": [{"tool_id": t.tool_id, "status": t.status, "target_files": t.target_files, "allowed_helper_imports": t.allowed_helper_imports} for t in tool_pool.tools],
-        "file_bindings": [{"target_file": b.target_file, "allowed_tool_ids": b.allowed_tool_ids, "allowed_helper_imports": b.allowed_helper_imports} for b in tool_pool.file_bindings],
+        "tools": [{"tool_id": t.tool_id, "status": t.status, "target_files": t.target_files, "allowed_helper_imports": t.allowed_helper_imports, "allowed_import_paths": t.allowed_import_paths, "allowed_function_imports": t.allowed_function_imports, "score": t.score, "matched_features": t.matched_features} for t in tool_pool.tools],
+        "file_bindings": [{"target_file": b.target_file, "allowed_tool_ids": b.allowed_tool_ids, "primary_tool_ids": b.primary_tool_ids, "secondary_tool_ids": b.secondary_tool_ids, "allowed_helper_imports": b.allowed_helper_imports, "allowed_import_paths": b.allowed_import_paths, "allowed_function_imports": b.allowed_function_imports, "scored_tools": b.scored_tools, "matched_features_by_tool": b.matched_features_by_tool} for b in tool_pool.file_bindings],
+        "exploration_candidates": tool_pool.exploration_candidates,
+        "scored_candidates": tool_pool.scored_candidates,
+        "uploaded_file_triggers": tool_pool.uploaded_file_triggers,
+        "gate_events": gate_events,
+        "selected_primary_tools": {b.target_file: b.primary_tool_ids for b in tool_pool.file_bindings},
+        "fallback_tools": {b.target_file: b.secondary_tool_ids for b in tool_pool.file_bindings},
         "denied_requests": [d.model_dump(mode="json") for d in tool_pool.denied_requests],
         "missing_requests": [m.model_dump(mode="json") for m in tool_pool.missing_requests],
+        "denied_tools": [d.tool_id for d in tool_pool.denied_requests],
+        "missing_tools": [m.tool_id for m in tool_pool.missing_requests],
+        "rejected_candidates": [event for event in gate_events if event.get("decision") not in {"allow", "require_config", "require_dependency"}],
     }
     return PreparePlanResponse(
         status="ready",

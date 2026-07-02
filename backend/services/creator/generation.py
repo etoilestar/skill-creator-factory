@@ -937,7 +937,7 @@ def _build_generate_file_prompt(
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role: ...、inputs: ...、outputs: ...。\n"
             "6b. command JSON argv keys 是当前脚本接口字段，不是平台字段白名单；argv keys 应优先参考当前脚本职责、SkillPlan inputs/outputs、RequirementGraph inputs/outputs、local_contract inputs/outputs 和附近 action schema，以便 SKILL.md 与 script 使用同一套推荐词汇，但第一轮不要求这些字段严格一致。\n"
             "6c. 允许脚本需要的 optional/default/config 参数、reference/assets 路径、runtime constants、格式控制参数出现在 argv 中；不要要求所有 argv key 都来自平台 IO，也不要要求使用所有平台输入字段。\n"
-            "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
+            "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。argv key 不必等于这些平台字段名。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
             "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
             "10. JSON argv 必须是标准 JSON：不得在 JSON argv 值里写 {{input_files[0]}}、{{references/...}}、{{assets/...}} 等复杂模板表达式；运行时输入文件使用 __RUNTIME_INPUT_FILE__ / __RUNTIME_INPUT_FILE_0__ 等安全占位符；reference/assets 文件使用普通相对路径字符串；模型名使用 TEXT_MODEL。\n"

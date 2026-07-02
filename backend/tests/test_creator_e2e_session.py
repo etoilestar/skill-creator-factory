@@ -315,11 +315,43 @@ def test_e2e_typed_seed_materializes_requirement_shapes(tmp_path):
 
     payload = e2e._seed_initial_e2e_payload(commands, skill_dir=skill_dir, requirements_by_file=reqs)
 
-    assert payload["items"] == ["sample item 1", "sample item 2"]
-    assert len(payload["attachments"]) == 2
-    assert all(Path(path).is_file() for path in payload["attachments"])
-    assert Path(payload["source_file"]).is_file()
-    assert payload["config"] == {"value": "sample value"}
+    assert "items" not in payload
+    assert "attachments" not in payload
+    assert "source_file" not in payload
+    assert "config" not in payload
+
+
+def test_e2e_seed_does_not_materialize_recommended_or_argv_schema_root_fields(tmp_path):
+    recommended_key = "generic_arg_key"
+    skill_dir = tmp_path / "recommended-root"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "consume.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def parse(payload):\n"
+        f"    return strict_json_argv_guard(payload, {{'{recommended_key}': {{'type': 'string', 'required': True}}}})\n",
+        encoding="utf-8",
+    )
+    command = E2EWorkflowCommand(
+        1,
+        "SKILL.md",
+        "scripts/consume.py",
+        "python scripts/consume.py '{}'",
+        "python",
+        {recommended_key: "{{generic_arg_key}}"},
+    )
+    reqs = {
+        "scripts/consume.py": [
+            e2e.RequirementItem(target_file="scripts/consume.py", inputs=[f"{recommended_key}: string"])
+        ]
+    }
+
+    payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir, requirements_by_file=reqs)
+
+    assert recommended_key not in payload
+    assert recommended_key not in payload["fields"]
+    with pytest.raises(ValueError) as exc:
+        e2e._render_e2e_command_payload(command, payload=payload)
+    assert "external_input_missing" in str(exc.value)
 
 
 def test_e2e_placeholder_bracket_and_dot_indexes_are_equivalent():
@@ -372,8 +404,7 @@ def test_e2e_infers_indexed_placeholder_root_item_shape_from_argv_file_path(tmp_
     payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
 
     assert by_name["items"].shape == "list[file_path]"
-    assert len(payload["items"]) == 2
-    assert all(Path(path).is_file() for path in payload["items"])
+    assert "items" not in payload
 
 
 def test_e2e_infers_indexed_placeholder_root_item_shape_from_argv_object(tmp_path):
@@ -409,7 +440,7 @@ def test_e2e_infers_unindexed_placeholder_root_shape_from_list_argv(tmp_path):
     payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
 
     assert by_name["documents"].shape == "list[string]"
-    assert payload["documents"] == ["sample item 1", "sample item 2"]
+    assert "documents" not in payload
 
 
 def test_e2e_input_files_files_alias_sync_preserves_non_empty_external_context(tmp_path):

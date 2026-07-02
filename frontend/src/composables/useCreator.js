@@ -7,25 +7,32 @@
 
 
 
-function inferPrepareActionFromOptionLabel(label) {
+function isSupplementGatePrepareStage(prepareStage) {
+  return prepareStage === 'creation_points_confirmation' || prepareStage === 'supplement_confirmation'
+}
+
+function inferPrepareActionFromOptionLabel(label, { isSupplementGate = false, optionIndex = -1 } = {}) {
+  if (!isSupplementGate) return 'none'
+
   const text = String(label || '')
-  if (/^(A|Ａ)[\.\)、]|没有|无|暂时没有|沒有|按这些要点继续|按推荐方式继续/.test(text) && !/继续补充|我补充/.test(text)) {
-    return 'confirm'
-  }
-  if (/^(B|Ｂ)[\.\)、]|补充|我补充|继续补充/.test(text) && !/没有补充|暂时没有/.test(text)) {
+  if (/补充|我补充|继续补充/.test(text) && !/没有.*补充|无.*补充|暂时没有/.test(text)) {
     return 'request_supplement'
+  }
+  if (optionIndex === 0) {
+    return 'confirm'
   }
   return 'none'
 }
 
-export function extractClarificationQuestionOptions(question) {
+export function extractClarificationQuestionOptions(question, { prepareStage = '' } = {}) {
   const text = String(question || '')
+  const isSupplementGate = isSupplementGatePrepareStage(prepareStage)
   const optionPattern = /(?:^|[\s？?])([A-D])[\.\)、]\s*([\s\S]*?)(?=(?:\s+[A-D][\.\)、]\s*)|$)/g
   return [...text.matchAll(optionPattern)]
-    .map((match) => {
+    .map((match, index) => {
       const label = `${match[1]}. ${String(match[2] || '').trim()}`.trim()
       if (label.length <= 3) return null
-      const prepareAction = inferPrepareActionFromOptionLabel(label)
+      const prepareAction = inferPrepareActionFromOptionLabel(label, { isSupplementGate, optionIndex: index })
       return {
         text: label,
         value: `问题：${text}\n选择：${label}`,
@@ -37,9 +44,9 @@ export function extractClarificationQuestionOptions(question) {
     .filter(Boolean)
 }
 
-export function buildClarificationQuickActions(questions) {
+export function buildClarificationQuickActions(questions, { prepareStage = '' } = {}) {
   return (questions || [])
-    .flatMap((question) => extractClarificationQuestionOptions(question))
+    .flatMap((question) => extractClarificationQuestionOptions(question, { prepareStage }))
     .slice(0, 8)
 }
 

@@ -244,7 +244,7 @@ async function handleQuickAction(value) {
   // Clear previous quick actions
   quickActions.value = []
   pendingPrepareAction.value = action.prepareAction || 'none'
-  if (action.waitForInput) {
+  if (action.prepareAction === 'request_supplement') {
     input.value = action.value
     await send()
     pendingSupplementQuestion.value = action.value
@@ -323,7 +323,7 @@ async function send() {
 
 ${question || '请补充当前最阻塞创建计划的信息。'}`,
       })
-      quickActions.value = buildClarificationQuickActions(question ? [question] : [])
+      quickActions.value = buildClarificationQuickActions(question ? [question] : [], { prepareStage: stage })
       return
     }
 
@@ -344,7 +344,7 @@ ${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || 
         role: 'assistant',
         content: '系统已整理出创建要点，请先确认是否按这些要点继续。',
       })
-      quickActions.value = buildClarificationQuickActions([question || '以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明'])
+      quickActions.value = buildClarificationQuickActions([question || '以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明'], { prepareStage: plan.prepare_stage || '' })
       return
     }
 

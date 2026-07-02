@@ -10,6 +10,38 @@ from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 
+_VALIDATOR_ONLY_LAYERS = {
+    "e2e_requirement_validator_error",
+    "e2e_requirement_validator_incomplete",
+    "validator_unavailable",
+    "validator_timeout",
+    "validator_invalid_json",
+}
+
+def _split_e2e_blocking_errors(errors: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Separate deterministic workflow failures from advisory validator issues."""
+    blocking: list[str] = []
+    warnings: list[dict[str, Any]] = []
+    for error in errors or []:
+        text = str(error or "")
+        structured = _structured_failure_from_errors([text])
+        target = str(structured.get("target_file") or "")
+        layer = str(structured.get("layer") or _failure_layer_from_error_text(text) or "")
+        if target == "__validator__" or layer in _VALIDATOR_ONLY_LAYERS or "E2E_REPAIR_TARGET=__validator__" in text:
+            warnings.append({
+                "severity": "validator_warning",
+                "code": layer or "validator_unavailable",
+                "source": "e2e_advisory_validator",
+                "target_file": target or "__validator__",
+                "message": text,
+            })
+        else:
+            blocking.append(text)
+    return blocking, warnings
+
+def _e2e_advisory_status_from_warnings(warnings: list[Any]) -> str:
+    return "unavailable" if warnings else "skipped"
+
 
 class PreparePlanRequest(BaseModel):
     mode: Literal["create", "revise"] = "create"
@@ -612,10 +644,10 @@ async def _extract_requirement_graph_with_validator(
         text = await complete_chat_once(messages, route.model)
         data = parse_requirement_graph_result(text)
         if isinstance(data, dict) and "patches" not in data and "requirements" in data:
-            raise RequirementGraphValidationError(
-                "Requirement graph patch JSON must use patches format.",
-                code="validator_incomplete",
-            )
+            graph_from_validator = normalize_requirement_graph(data)
+            graph_from_validator.requirement_graph_source = "validator"
+            graph_from_validator.requirement_graph_quality = "full"
+            return validate_requirement_graph_schema(graph_from_validator, files_out)
         patches = data.get("patches", []) if isinstance(data, dict) else []
         if not isinstance(patches, list):
             raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
@@ -704,6 +736,109 @@ def _load_persisted_requirement_graph(skill_name: str) -> RequirementGraph | Non
         return None
     return normalize_requirement_graph(parse_requirement_graph_result(path.read_text(encoding="utf-8")))
 
+
+
+def _coverage_terms_from_text(text: str) -> list[str]:
+    """Extract generic declared capability tokens from requirement text.
+
+    This is intentionally not a business whitelist: it preserves words that the
+    user/planner explicitly declared around input/source/format/action/output
+    obligations, then checks that executable script contracts mention them.
+    """
+    raw = re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{1,40}|[\u4e00-\u9fff]{2,12}", str(text or ""))
+    stop = {"the", "and", "with", "for", "from", "into", "this", "that", "skill", "script", "file", "files", "支持", "生成", "输出", "输入", "文件"}
+    terms: list[str] = []
+    for item in raw:
+        token = item.strip().lower()
+        if token in stop or len(token) < 2:
+            continue
+        if token not in terms:
+            terms.append(token)
+    return terms[:80]
+
+
+def _script_contract_text(file_spec: FileSpecOut) -> str:
+    return "\n".join([
+        str(file_spec.path or ""),
+        str(file_spec.purpose or ""),
+        " ".join(str(x) for x in (file_spec.inputs or [])),
+        " ".join(str(x) for x in (file_spec.outputs or [])),
+        json.dumps(file_spec.runtime_contract or {}, ensure_ascii=False, default=str),
+        json.dumps(file_spec.artifact_contract or {}, ensure_ascii=False, default=str),
+    ]).lower()
+
+
+def _normalize_file_plan_for_requirement_coverage(
+    *,
+    blueprint_text: str,
+    review_summary: PreparePlanReviewSummary | None,
+    files_out: list[FileSpecOut],
+    final_outputs: list[Any] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> None:
+    """Attach declared requirement coverage as script responsibility metadata.
+
+    Coverage is a planning/generation constraint only. It must never be
+    converted into runtime argv/stdout fields, and this pass must not create
+    generic bridge scripts that hide real planning gaps.
+    """
+    warnings = warnings if warnings is not None else []
+    review_text = ""
+    if review_summary is not None:
+        review_text = json.dumps(review_summary.model_dump(mode="json"), ensure_ascii=False, default=str)
+    declared_terms = _coverage_terms_from_text("\n".join([blueprint_text or "", review_text, json.dumps(final_outputs or [], ensure_ascii=False, default=str)]))
+    if not declared_terms:
+        return
+    scripts = [item for item in files_out if item.path.startswith("scripts/") and item.required]
+    if not scripts:
+        return
+
+    covered_terms: set[str] = set()
+    for item in scripts:
+        text = _script_contract_text(item)
+        covered_terms.update(term for term in declared_terms if term in text)
+    missing_terms = [term for term in declared_terms if term not in covered_terms]
+
+    coverage_requirements = {
+        "declared_requirement_terms": declared_terms,
+        "declared_input_sources": _coverage_terms_from_text(str(getattr(review_summary, "input", "") if review_summary else "")),
+        "declared_input_formats": _coverage_terms_from_text(blueprint_text),
+        "required_core_actions": _coverage_terms_from_text(" ".join(getattr(review_summary, "workflow", []) if review_summary else [])),
+        "required_output_variants": _coverage_terms_from_text("\n".join([str(getattr(review_summary, "output", "") if review_summary else ""), json.dumps(final_outputs or [], ensure_ascii=False, default=str)])),
+        "required_reference_reads": [item.path for item in files_out if item.path.startswith("references/")],
+        "final_platform_output_obligations": [str(x) for x in (final_outputs or []) if str(x).strip()],
+    }
+
+    single_script = len(scripts) == 1
+    if single_script:
+        coverage_requirements["single_script_full_coverage_contract"] = True
+
+    for script in scripts:
+        runtime_contract = dict(script.runtime_contract or {})
+        runtime_contract["coverage_requirements"] = dict(coverage_requirements)
+        script.runtime_contract = runtime_contract
+
+    if single_script:
+        warnings.append({
+            "severity": "info",
+            "code": "single_script_full_coverage_contract",
+            "source": "analyze_blueprint",
+            "path": scripts[0].path,
+            "field": "runtime_contract.coverage_requirements",
+            "message": "Single required script must satisfy the declared full-coverage responsibility contract; coverage is not an argv/stdout field.",
+            "missing_terms": missing_terms[:20],
+        })
+    if missing_terms:
+        warnings.append({
+            "severity": "planning_warning",
+            "code": "requirement_coverage_incomplete",
+            "source": "analyze_blueprint",
+            "path": "",
+            "field": "runtime_contract.coverage_requirements",
+            "missing_terms": missing_terms[:30],
+            "message": "File plan does not explicitly cover all declared requirement terms; planner should expand real script responsibilities or decompose into real workflow scripts.",
+        })
+
 async def _allocate_workflow_script_responsibilities(
     *,
     blueprint_text: str,
@@ -761,6 +896,7 @@ async def _allocate_workflow_script_responsibilities(
             "如果下游脚本需要消费上游集合元素中的子字段（例如从某个 structured collection item 中读取 description/text/scene/metadata），这不是自动存在的 workflow 顶层变量。除非上游脚本明确把该字段作为 stdout 顶层输出，否则下游不能直接把它作为 input；若平台没有显式 loop/map/foreach 节点，遍历集合并提取子字段的责任必须落到某个脚本内部。\n"
             "workflow_allocation_summary、patch purpose、patch inputs、patch outputs 必须描述同一个全局责任合同；summary 不得继续描述被替换掉的旧脚本级 inputs/outputs。purpose 的来源必须与 patch inputs 字段名和粒度一致，purpose 的交付必须与 patch outputs 字段名和粒度一致，不得出现 outputs 与 purpose 中单复数/类型/字段名模糊或冲突。\n"
             "patch 默认只改当前脚本 purpose/final inputs/final outputs；如果当前职责调整影响直接上游或直接下游，可以同步 patch 相邻 required scripts 的 purpose/inputs/outputs，做最小联动。不要新增文件，不硬编码业务字段，不按字段名、文件名、role、单复数机械判断。\n"
+            "coverage_requirements 是职责约束，不是运行时 argv/stdout 字段；不得把 coverage:* 或 covered:* 写进 inputs/outputs，不得把 coverage bridge 当成真实 workflow step。coverage 不足时只能扩展真实脚本 purpose/contract，不能制造伪字段。\n"
             "workflow allocation patch 中的 inputs/outputs 表示 final inputs/final outputs；如果 patch 提供 inputs/outputs，默认替换原始 inputs/outputs，不再默认 append。只有明确设置 replace_inputs=false 或 replace_outputs=false 时才按 legacy append 兼容。需要把旧单项接口升级为整体/集合接口时，应提供 inputs/outputs 并保持默认替换，避免错误旧字段残留。\n"
             "只输出 compact patches；不要新增复杂结构。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
             "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[],\"replace_inputs\":true,\"replace_outputs\":true}]}"
@@ -1433,6 +1569,13 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         )
 
     warnings: list[dict[str, Any]] = []
+    _normalize_file_plan_for_requirement_coverage(
+        blueprint_text=blueprint_text,
+        review_summary=plan.review_summary if hasattr(plan, "review_summary") else None,
+        files_out=files_out,
+        final_outputs=getattr(plan, "final_outputs", []),
+        warnings=warnings,
+    )
     workflow_allocation_summary, allocation_patched_targets, workflow_allocation_resolved = await _allocate_workflow_script_responsibilities(
         blueprint_text=blueprint_text,
         files_out=files_out,
@@ -3873,15 +4016,25 @@ async def validate_skill(request: SkillActionRequest):
                     ),
                 )
             ]
-        if not e2e_errors:
+        blocking_errors, advisory_warnings = _split_e2e_blocking_errors(e2e_errors)
+        if not blocking_errors:
             suffix = ""
             if repair_logs:
                 suffix = "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
             return SkillActionResponse(
                 success=True,
                 path=result.get("path"),
-                message=result["message"] + "\n严格端到端工作流校验通过：SKILL.md 命令已按顺序真实执行，中间 JSON 边界已流转，最终 stdout 已对齐 sandbox 平台输出协议。" + suffix,
+                message=(
+                    result["message"]
+                    + "\n严格端到端工作流校验通过：SKILL.md 命令已按顺序真实执行，中间 JSON 边界已流转，最终 stdout 已对齐 sandbox 平台输出协议。"
+                    + ("\nLLM advisory validator 暂不可用，已跳过；不影响打包。" if advisory_warnings else "")
+                    + suffix
+                ),
                 repair_events=repair_events or e2e_session.events,
+                deterministic_workflow_passed=True,
+                advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
+                blocking_errors=[],
+                warnings=advisory_warnings,
             )
 
         if not request.auto_repair:
@@ -3890,34 +4043,39 @@ async def validate_skill(request: SkillActionRequest):
                 path=None,
                 message=(
                     "严格端到端工作流校验失败：\n"
-                    + "\n\n".join(e2e_errors)
+                    + "\n\n".join(blocking_errors)
                     + (
                         "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
                         if repair_logs else ""
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                deterministic_workflow_passed=False,
+                advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
+                blocking_errors=blocking_errors,
+                warnings=advisory_warnings,
             )
 
-        if any(re.search(r"^E2E_LAYER=e2e_requirement_validator_(?:error|incomplete)", err, re.M) for err in e2e_errors):
+        target_path = _e2e_repair_target_from_errors(blocking_errors)
+        if target_path == "__validator__":
             return SkillActionResponse(
-                success=False,
-                path=None,
-                message=(
-                    "严格端到端 requirement validator 失败；这不是业务文件修复目标，请重试 validator 或切换 validator 模型：\n"
-                    + "\n\n".join(e2e_errors)
-                ),
+                success=True,
+                path=result.get("path"),
+                message=result["message"] + "\n严格 E2E 工作流已通过。LLM advisory validator 暂不可用，已跳过；Skill 已允许打包。",
                 repair_events=repair_events or e2e_session.events,
+                deterministic_workflow_passed=True,
+                advisory_validator_status="unavailable",
+                blocking_errors=[],
+                warnings=advisory_warnings,
             )
 
-        target_path = _e2e_repair_target_from_errors(e2e_errors)
         if target_path in completed_targets:
             return SkillActionResponse(
                 success=False,
                 path=None,
                 message=(
                     "严格端到端工作流校验失败：已修复目标出现同目标回归，停止重复修复：\n"
-                    + "\n\n".join(e2e_errors)
+                    + "\n\n".join(blocking_errors)
                     + f"\n\n回归目标：{target_path}"
                     + (
                         "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
@@ -3932,7 +4090,7 @@ async def validate_skill(request: SkillActionRequest):
                 path=None,
                 message=(
                     "严格端到端工作流校验失败，且自动修复达到当前目标最大次数：\n"
-                    + "\n\n".join(e2e_errors)
+                    + "\n\n".join(blocking_errors)
                     + f"\n\n自动修复目标：{target_path}"
                     + f"\n当前目标尝试次数：{attempts_by_target.get(target_path, 0)}/{max_attempts}"
                     + (
@@ -3947,7 +4105,7 @@ async def validate_skill(request: SkillActionRequest):
             repair_result = await _repair_existing_file_for_e2e_failure(
                 skill_name=skill_name,
                 target_path=target_path,
-                e2e_errors=e2e_errors,
+                e2e_errors=blocking_errors,
                 requested_model=request.model,
                 external_context=external_context,
                 repair_events=repair_events,
@@ -3978,7 +4136,7 @@ async def validate_skill(request: SkillActionRequest):
                     path=None,
                     message=(
                         "严格端到端工作流校验失败，且内容补丁修复未完成；文件保持可编辑草稿：\n"
-                        + "\n\n".join(e2e_errors)
+                        + "\n\n".join(blocking_errors)
                         + f"\n\n自动修复目标：{target_path}"
                         + f"\n自动修复反馈：{repair_result.get('last_failure') or 'still_failed_same_target'}"
                         + (
@@ -4005,7 +4163,7 @@ async def validate_skill(request: SkillActionRequest):
                 path=None,
                 message=(
                     "严格端到端工作流校验失败，且自动修复未完成：\n"
-                    + "\n\n".join(e2e_errors)
+                    + "\n\n".join(blocking_errors)
                     + f"\n\n自动修复目标：{target_path}"
                     + f"\n自动修复异常：{exc}"
                     + (
@@ -4040,7 +4198,8 @@ async def package_skill(request: PackageSkillRequest):
             external_context=external_context,
             requested_model=request.model,
         )
-        if e2e_errors:
+        blocking_errors, advisory_warnings = _split_e2e_blocking_errors(e2e_errors)
+        if blocking_errors:
             return SkillActionResponse(
                 success=False,
                 path=None,
@@ -4048,9 +4207,15 @@ async def package_skill(request: PackageSkillRequest):
                     "打包已中止：严格端到端工作流校验未通过。\n"
                     "请先调用 /api/creator/validate-skill 完成自动修复，"
                     "或根据以下错误手动修改后重试：\n"
-                    + "\n\n".join(e2e_errors)
+                    + "\n\n".join(blocking_errors)
                 ),
+                deterministic_workflow_passed=False,
+                advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
+                blocking_errors=blocking_errors,
+                warnings=advisory_warnings,
             )
+        if advisory_warnings:
+            logger.info("[Creator][package][advisory_validator_skipped] skill=%s warnings=%d", skill_name, len(advisory_warnings))
 
     try:
         _validate_skill_md_final_resource_existence(skill_name)

@@ -803,6 +803,10 @@ class SkillActionResponse(BaseModel):
     path: Optional[str] = None
     message: str
     repair_events: list[dict[str, Any]] = Field(default_factory=list)
+    deterministic_workflow_passed: bool | None = None
+    advisory_validator_status: str = "skipped"
+    blocking_errors: list[str] = Field(default_factory=list)
+    warnings: list[Any] = Field(default_factory=list)
     validation_status: str | None = None
     error_type: str | None = None
     editable: bool = True

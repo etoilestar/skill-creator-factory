@@ -2103,6 +2103,50 @@ def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill
         )
 
 
+
+
+def _e2e_argv_key_consistency_error(
+    *,
+    command: E2EWorkflowCommand,
+    content: str,
+    entry: SkillPlanEntry,
+) -> str | None:
+    """Deterministic argv contract smoke for obvious command/guard mismatches."""
+    if entry.runtime != "python":
+        return None
+    if not command.argv_template:
+        return None
+    try:
+        schema = extract_python_strict_argv_schema(content)
+    except Exception:
+        return None
+    required = {str(key) for key in (schema.get("required_keys") or []) if str(key or "").strip()}
+    allowed_raw = schema.get("allowed_keys")
+    allowed = {str(key) for key in (allowed_raw or []) if str(key or "").strip()} if allowed_raw is not None else set()
+    command_keys = {str(key) for key in (command.argv_template or {}).keys() if str(key or "").strip()}
+    if not required or not command_keys:
+        return None
+    generic_keys = {"payload", "input", "user_request", "fields", "options", "files", "input_files", "resources"}
+    missing_required = sorted(required - command_keys)
+    # If the command intentionally passes a generic envelope, the script can
+    # derive local fields internally; only block the clear renamed-key case.
+    if not missing_required or command_keys & generic_keys:
+        return None
+    unknown_command = sorted(command_keys - allowed) if allowed else []
+    return _e2e_error(
+        target=command.script_path,
+        layer="argv_schema_error",
+        message=(
+            f"第 {command.ordinal} 步 {command.script_path} 的 SKILL.md command argv keys 与脚本 strict_json_argv_guard required keys 明显不一致。\n"
+            f"command_argv_keys={sorted(command_keys)}\n"
+            f"script_required_keys={sorted(required)}\n"
+            f"script_allowed_keys={sorted(allowed) if allowed else '(unbounded)'}\n"
+            f"missing_required_from_command={missing_required}\n"
+            f"unknown_command_keys={unknown_command}\n"
+            "如果 command 传 input_file，脚本 guard/run 不得自行要求 input_path；应使用 command 已传 key，或同步修 SKILL.md command。"
+        ),
+    )
+
 def _validate_e2e_command_static(
     *,
     command: E2EWorkflowCommand,
@@ -2150,6 +2194,14 @@ def _validate_e2e_command_static(
                 message=f"第 {command.ordinal} 步 {command.script_path} 静态合同失败：{exc}",
             )
         ) from exc
+
+    argv_consistency_error = _e2e_argv_key_consistency_error(
+        command=command,
+        content=content,
+        entry=entry,
+    )
+    if argv_consistency_error:
+        raise ValueError(argv_consistency_error)
 
     return entry
 
@@ -2478,28 +2530,13 @@ def _run_skill_workflow_e2e_once(
                     stdout_shape=_json_object_shape(stdout_json),
                 )
 
-                argument_effect_review = _run_e2e_requirement_flow_review(
-                    command=command,
-                    script_content=content,
-                    skill_plan_entry=entry,
-                    rendered_payload=rendered_payload,
-                    stdout_json=stdout_json,
-                    artifact_paths=artifact_paths,
-                    trace=trace,
-                    previous_traces=traces,
-                    requested_model=requested_model,
-                    requirements=requirements_by_file.get(command.script_path, []),
-                )
-
-                if not argument_effect_review.get("passed"):
-                    raise ValueError(_e2e_argument_effect_failure(
-                        command=command,
-                        review=argument_effect_review,
-                        rendered_payload=rendered_payload,
-                        stdout_json=stdout_json,
-                        artifact_paths=artifact_paths,
-                        traces=traces,
-                    ))
+                # Strict E2E is deterministic: once the command renders, the script
+                # exits successfully, stdout is a valid JSON object that satisfies
+                # the declared stdout/artifact contract, and the final platform
+                # output is consumable, the workflow is accepted.  The legacy
+                # requirement/argument-effect LLM review is intentionally not run
+                # here because validator availability or semantic judgement must
+                # not block packaging or trigger business-file repair.
 
                 is_final_step = index == len(commands) - 1
                 if is_final_step:
@@ -3268,15 +3305,11 @@ def validate_workflow_e2e(
 ) -> list[str]:
     """Second-round Creator validator.
 
-    第二轮负责：
-    - SKILL.md workflow 能否真实执行；
-    - 上下游 JSON 字段能否串起来；
-    - 当前 step 接口是否对齐；
-    - 最后一步 stdout 是否符合现有 sandbox 平台协议；
-    - artifact 是否真实存在并基础合法。
-
-    不写业务字段词表。
-    不重新做第一轮责任审查。
+    Strict E2E is a deterministic workflow gate only: command rendering,
+    placeholder resolution, script static preflight, real process exit status,
+    stdout JSON/object contract, artifact existence, and final sandbox output.
+    LLM requirement/argument-effect review is advisory only and is not invoked
+    from this blocking path.
     """
 
     return _run_skill_workflow_e2e_once(

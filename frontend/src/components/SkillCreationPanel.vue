@@ -337,6 +337,7 @@ const props = defineProps({
   workflowAllocationSummary: { type: String, default: '' },
   toolRequirements: { type: Array, default: () => [] },
   creationBlockers: { type: Array, default: () => [] },
+  confirmedUploadedAssets: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['creation-complete', 'creation-error'])
@@ -349,6 +350,18 @@ const emit = defineEmits(['creation-complete', 'creation-error'])
 const localFiles = ref(
   [
     ...props.files,
+    ...(props.confirmedUploadedAssets || []).map(asset => ({
+      path: asset.asset_target_path,
+      generation_order: 3,
+      purpose: `用户已确认上传素材：${asset.original_name || asset.name || asset.asset_target_path}`,
+      required: true,
+      can_skip: false,
+      file_type: 'asset',
+      file_kind: 'asset',
+      role: 'asset',
+      asset_source: 'user_upload',
+      uploaded_provided: true,
+    })),
     ...props.assetRequirements.map((requirement, index) => ({
       path: normalizeAssetRequirementPath(requirement, index),
       generation_order: Number.isFinite(requirement.generation_order) ? requirement.generation_order : 3,
@@ -390,14 +403,14 @@ const localFiles = ref(
                 ? 'generic_script'
                 : null
       ),
-      status: f.path === 'SKILL.md' ? 'pending' : 'pending',
       pendingLabel: f.path === 'SKILL.md' ? '待生成' : '',
       generatedContent: '',
       bytesWritten: 0,
       error: '',
       showPreview: false,
       repairMessage: '',
-      uploaded: false,
+      uploaded: Boolean(f.uploaded_provided),
+      status: f.uploaded_provided ? 'done' : (f.path === 'SKILL.md' ? 'pending' : 'pending'),
     }))
 )
 
@@ -891,7 +904,7 @@ const skillInitialized = ref(false)
 
 async function ensureSkillInitialized() {
   if (skillInitialized.value) return
-  const r = await initSkill(localSkillName.value)
+  const r = await initSkill(localSkillName.value, { confirmedUploadedAssets: props.confirmedUploadedAssets || [] })
   if (!r.success) throw new Error(r.message)
   skillInitialized.value = true
 }

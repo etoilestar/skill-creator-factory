@@ -92,6 +92,7 @@
             :workflow-allocation-summary="creationPlan.workflow_allocation_summary || ''"
             :tool-requirements="creationPlan.tool_requirements || []"
             :creation-blockers="creationPlan.creation_blockers || []"
+            :confirmed-uploaded-assets="creationPlan.confirmed_uploaded_assets || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />
@@ -112,11 +113,32 @@
               />
             </label>
             <div v-if="uploadError" class="error">{{ uploadError }}</div>
+            <div v-if="showAssetDecisionDialog" class="asset-decision-modal">
+              <div class="asset-decision-card">
+                <h3>选择上传文件用途</h3>
+                <p class="muted">只有选择“固定加入 Skill assets”的文件会复制到 assets/**。</p>
+                <div v-for="file in pendingAssetDecisionFiles" :key="file.file_id" class="asset-decision-row">
+                  <strong>{{ file.original_name || file.name }}</strong>
+                  <select v-model="file.asset_decision">
+                    <option value="include_as_asset">固定加入 Skill assets</option>
+                    <option value="reference_only">只作为本次创建参考</option>
+                    <option value="runtime_input">作为 Skill 运行时输入参考</option>
+                    <option value="unknown">暂不决定</option>
+                  </select>
+                  <input v-if="file.asset_decision === 'include_as_asset'" v-model="file.asset_target_path" placeholder="assets/example.ext" />
+                </div>
+                <div class="actions">
+                  <button class="btn-primary" type="button" @click="confirmAssetDecisions">确认</button>
+                </div>
+              </div>
+            </div>
             <div v-if="uploadedContextFiles.length" class="uploaded-context-list">
               <div v-for="file in uploadedContextFiles" :key="file.file_id" class="uploaded-context-item">
                 <span class="context-file-name">{{ file.original_name || file.name }}</span>
                 <span class="context-file-kind">{{ file.content_kind }} / {{ file.extension }}</span>
                 <span v-if="file.candidate_tools?.length" class="context-file-tools">tools: {{ file.candidate_tools.join(', ') }}</span>
+                <span v-if="file.asset_decision === 'include_as_asset'" class="asset-selected-badge">已选择加入 assets: {{ file.asset_target_path }}</span>
+                <button class="btn-ghost" type="button" @click="editAssetDecision(file)" :disabled="streaming">修改用途</button>
                 <button class="btn-ghost" type="button" @click="removeUploadedContextFile(file.file_id)" :disabled="streaming">移除</button>
               </div>
             </div>
@@ -207,6 +229,8 @@ const currentStatus = ref(null)
 const uploadedContextFiles = ref([])
 const uploadError = ref('')
 const creatorUploadSessionId = ref(`creator-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+const showAssetDecisionDialog = ref(false)
+const pendingAssetDecisionFiles = ref([])
 
 // Quick actions state
 const quickActions = ref([])
@@ -261,6 +285,7 @@ function collectUploadedFileMetadata() {
     asset_decision: file.asset_decision,
     candidate_tools: file.candidate_tools || [],
     content_kind: file.content_kind,
+    asset_target_path: file.asset_target_path || '',
   }))
 }
 
@@ -272,11 +297,32 @@ async function handleContextFileUpload(event) {
   for (const file of files) {
     try {
       const metadata = await uploadCreatorContextFile({ file, sessionId: creatorUploadSessionId.value })
-      uploadedContextFiles.value.push(metadata)
+      uploadedContextFiles.value.push({ ...metadata, asset_target_path: defaultAssetTargetPath(metadata) })
+      pendingAssetDecisionFiles.value.push(uploadedContextFiles.value[uploadedContextFiles.value.length - 1])
     } catch (e) {
       uploadError.value = e.message || '上下文文件上传失败'
     }
   }
+  if (pendingAssetDecisionFiles.value.length) showAssetDecisionDialog.value = true
+}
+
+function defaultAssetTargetPath(file) {
+  const name = String(file?.original_name || file?.name || 'upload').split(/[\\/]/).pop().replace(/[^A-Za-z0-9_.-]+/g, '_')
+  return `assets/${name || 'upload'}`
+}
+
+function editAssetDecision(file) {
+  pendingAssetDecisionFiles.value = [file]
+  showAssetDecisionDialog.value = true
+}
+
+function confirmAssetDecisions() {
+  pendingAssetDecisionFiles.value.forEach(file => {
+    if (!file.asset_decision) file.asset_decision = 'unknown'
+    if (file.asset_decision === 'include_as_asset' && !file.asset_target_path) file.asset_target_path = defaultAssetTargetPath(file)
+  })
+  pendingAssetDecisionFiles.value = []
+  showAssetDecisionDialog.value = false
 }
 
 function removeUploadedContextFile(fileId) {

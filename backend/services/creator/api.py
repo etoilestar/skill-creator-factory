@@ -1,6 +1,8 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import hashlib
+import shutil
+from pathlib import Path
 from typing import Literal
 
 from .common import *  # noqa: F403
@@ -9,7 +11,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from .upload_context import save_creator_context_upload
+from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
 from .runtime_import_guard import guard_runtime_imports
 
@@ -87,7 +89,55 @@ class PreparePlanResponse(BaseModel):
     requirement_graph: Any = Field(default_factory=dict)
     workflow_allocation_summary: str = ""
     tool_pool_summary: dict[str, Any] = Field(default_factory=dict)
+    confirmed_uploaded_assets: list[dict[str, Any]] = Field(default_factory=list)
+    unselected_uploaded_files: list[dict[str, Any]] = Field(default_factory=list)
 
+
+
+def _split_uploaded_asset_decisions(uploaded_files: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    confirmed: list[dict[str, Any]] = []
+    unselected: list[dict[str, Any]] = []
+    for raw in uploaded_files or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        decision = str(item.get("asset_decision") or "unknown").strip() or "unknown"
+        item["asset_decision"] = decision
+        if decision == "include_as_asset":
+            try:
+                item["asset_target_path"] = _validate_asset_upload_path(str(item.get("asset_target_path") or ""))
+            except Exception:
+                unselected.append({**item, "asset_decision": "unknown", "asset_validation_error": "invalid_asset_target_path"})
+                continue
+            confirmed.append(item)
+        else:
+            unselected.append(item)
+    return confirmed, unselected
+
+def _creator_upload_source_path(item: dict[str, Any]) -> Path:
+    session_id = sanitize_session_id(str(item.get("session_id") or ""))
+    session_dir = (UPLOAD_ROOT / session_id).resolve()
+    source = Path(str(item.get("path") or "")).resolve()
+    if not source.is_file() or not source.is_relative_to(session_dir):
+        raise HTTPException(status_code=400, detail="confirmed_uploaded_assets 源文件必须来自 Creator 上传目录。")
+    return source
+
+def _copy_confirmed_uploaded_assets_to_skill(skill_name: str, confirmed_uploaded_assets: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    assets_dir = (skill_dir / "assets").resolve()
+    copied: list[dict[str, Any]] = []
+    for item in confirmed_uploaded_assets or []:
+        if not isinstance(item, dict) or str(item.get("asset_decision") or "") != "include_as_asset":
+            continue
+        target_rel = _validate_asset_upload_path(str(item.get("asset_target_path") or ""))
+        source = _creator_upload_source_path(item)
+        target = (skill_dir / target_rel).resolve()
+        if not target.is_relative_to(assets_dir):
+            raise HTTPException(status_code=400, detail="confirmed_uploaded_assets 目标必须落在 assets/**。")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        copied.append({**item, "asset_target_path": target_rel, "provided": True, "bytes": target.stat().st_size})
+    return copied
 
 def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, Any]:
     if not skill_name:
@@ -428,6 +478,8 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 - 原子任务或高度耦合任务可用 1 个脚本；存在清晰阶段边界、不同工具族、不同产物类型、解析-生成-构建链路、fanout/aggregate 边界时应拆为多个脚本。
 - 当前平台没有显式 loop/map/foreach 节点；批量、逐项、顺序映射和聚合交付必须由某个脚本内部承担。
 - uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets；先判断 reference_only/runtime_input/asset_candidate。没有用户明确确认“固定加入 Skill assets”不得写入 assets/**。
+- confirmed_uploaded_assets 是用户确认过的可用素材；蓝图中来自上传文件的 assets/** 只能引用这里列出的 asset_target_path，并标记 uploaded/source/provided/user_upload，不得生成其内容。
+- unselected_uploaded_files 只能作为上下文或运行时输入参考；asset_decision=reference_only/runtime_input/unknown 的文件不得写入 assets/**。
 - 如果上传文件用途不明确，必须追问并区分：只作为本次创建参考、作为未来运行 Skill 的输入、固定加入 Skill assets。
 - assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
 - 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path；目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。
@@ -435,12 +487,15 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 - 当 uploaded_files 的 candidate_tools 包含 vision_understanding 且需求需要理解图片内容时，应在脚本中声明 required_tool_slots: [vision_understanding] 或 selected_tools: [vision_understanding]；不要只写 required_capabilities。
 - 上传图片需要理解内容时使用 vision_understanding，不要要求用户手动描述图片，不要把图像理解误当 image_generation，不要把上传图片默认加入 assets。
 """
+    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
     payload = {
         "mode": request.mode,
         "skill_name": request.skill_name,
         "user_request": request.user_request,
         "conversation_history": request.conversation_history,
         "uploaded_files": request.uploaded_files,
+        "confirmed_uploaded_assets": confirmed_uploaded_assets,
+        "unselected_uploaded_files": unselected_uploaded_files,
         "previous_blueprint_text": request.previous_blueprint_text,
         "human_feedback": request.human_feedback,
         "existing_skill_context": existing_context,
@@ -465,6 +520,7 @@ async def _prepare_summarize_confirmed_requirements(
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
     prepared = prepared or {}
+    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
     base = _coerce_prepare_summary(prepared.get("review_summary"))
     prompt = load_kernel_creator_for_phase("prepare_plan") + """
 你只归纳 Creator 创建要点，不生成蓝图，不提风险。只输出严格 JSON object，字段为 goal/input/output/workflow/files_to_create_or_update/assets_to_upload/risks/changes。
@@ -476,6 +532,8 @@ risks 必须输出空数组。assets_to_upload 只包含 Creator 静态 assets�
         "conversation_history": request.conversation_history,
         "human_feedback": request.human_feedback,
         "uploaded_files": request.uploaded_files,
+        "confirmed_uploaded_assets": confirmed_uploaded_assets,
+        "unselected_uploaded_files": unselected_uploaded_files,
         "model_summary": base.model_dump(mode="json"),
     }
     try:
@@ -513,12 +571,15 @@ async def _generate_internal_blueprint_from_confirmed_summary(
 基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text。只输出严格 JSON object：{"status":"ready","internal_blueprint_text":"...","review_summary":{...},"skill_name":"..."}。
 不得继续返回 needs_clarification，不得询问问题。未明确的非关键偏好使用默认推荐项。运行时输入默认不作为 Creator assets。输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
 """
+    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
     payload = {
         "confirmed_summary": summary.model_dump(mode="json"),
         "user_request": request.user_request,
         "conversation_history": request.conversation_history,
         "human_feedback": request.human_feedback,
         "uploaded_files": request.uploaded_files,
+        "confirmed_uploaded_assets": confirmed_uploaded_assets,
+        "unselected_uploaded_files": unselected_uploaded_files,
     }
     route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator confirmed summary to blueprint")
     text = await complete_chat_once([
@@ -1351,6 +1412,22 @@ async def prepare_plan(request: PreparePlanRequest):
     if plan is None:
         return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
+    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
+    confirmed_asset_paths = {str(item.get("asset_target_path") or "").strip() for item in confirmed_uploaded_assets}
+    plan.files = [
+        file_spec for file_spec in (plan.files or [])
+        if not (
+            str(getattr(file_spec, "path", "") or "").startswith("assets/")
+            and str(getattr(file_spec, "asset_source", "") or "") == "user_upload"
+            and str(getattr(file_spec, "path", "") or "") not in confirmed_asset_paths
+        )
+    ]
+    plan.asset_requirements = [
+        asset for asset in (plan.asset_requirements or [])
+        if str(getattr(asset, "source", "") or "") != "user_upload"
+        or str(getattr(asset, "path", "") or "") in confirmed_asset_paths
+    ]
+
     summary.files_to_create_or_update = [
         file_spec.path
         for file_spec in (plan.files or [])
@@ -1424,6 +1501,8 @@ async def prepare_plan(request: PreparePlanRequest):
         requirement_graph=graph_payload,
         workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
         tool_pool_summary=tool_pool_summary,
+        confirmed_uploaded_assets=confirmed_uploaded_assets,
+        unselected_uploaded_files=unselected_uploaded_files,
     )
 
 
@@ -1824,6 +1903,8 @@ async def init_skill(request: InitSkillRequest):
     """Initialise a new Skill directory structure."""
     skill_name = _validate_skill_name(request.skill_name)
     result = run_action({"action": "init", "name": skill_name})
+    if result.get("success"):
+        _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
     return InitSkillResponse(
         success=result["success"],
         path=result.get("path"),
@@ -4385,6 +4466,8 @@ async def init_from_blueprint(request: InitFromBlueprintRequest):
         dirs_created = 0
         seen_dirs: set[Path] = set()
 
+        copied_assets = _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
+
         for file_spec in request.files:
             rel_path = _normalize_skill_path(file_spec.path)
             if not rel_path:
@@ -4412,7 +4495,7 @@ async def init_from_blueprint(request: InitFromBlueprintRequest):
             path=str(skill_root),
             files_created=0,
             message=(
-                f"已初始化 Skill 目录结构，创建目录 {dirs_created} 个。"
+                f"已初始化 Skill 目录结构，创建目录 {dirs_created} 个，复制已确认 assets {len(copied_assets)} 个。"
                 "文件将在 generate-file 成功返回非空内容后写入，不再预创建 0 B 空文件。"
             ),
         )

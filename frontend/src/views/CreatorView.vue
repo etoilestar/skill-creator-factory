@@ -92,6 +92,7 @@
             :workflow-allocation-summary="creationPlan.workflow_allocation_summary || ''"
             :tool-requirements="creationPlan.tool_requirements || []"
             :creation-blockers="creationPlan.creation_blockers || []"
+            :confirmed-uploaded-assets="creationPlan.confirmed_uploaded_assets || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
           />
@@ -112,11 +113,41 @@
               />
             </label>
             <div v-if="uploadError" class="error">{{ uploadError }}</div>
+            <div v-if="showAssetDecisionDialog" class="asset-decision-modal" role="dialog" aria-modal="true" @click.self="closeAssetDecisionDialog">
+              <div class="asset-decision-card">
+                <div class="asset-decision-header">
+                  <div>
+                    <h3>选择上传文件用途</h3>
+                    <p class="muted">只有选择“固定加入 Skill assets”的文件会复制到 assets/**；关闭未选择项会默认作为参考。</p>
+                  </div>
+                  <button class="btn-ghost asset-decision-close" type="button" @click="closeAssetDecisionDialog">✕</button>
+                </div>
+                <div class="asset-decision-body">
+                  <div v-for="file in pendingAssetDecisionFiles" :key="file.file_id" class="asset-decision-row">
+                    <strong>{{ file.original_name || file.name }}</strong>
+                    <select v-model="file.asset_decision">
+                      <option value="include_as_asset">固定加入 Skill assets</option>
+                      <option value="reference_only">只作为本次创建参考</option>
+                      <option value="runtime_input">作为 Skill 运行时输入参考</option>
+                      <option value="unknown">暂不决定</option>
+                    </select>
+                    <input v-if="file.asset_decision === 'include_as_asset'" v-model="file.asset_target_path" placeholder="assets/example.ext" />
+                  </div>
+                </div>
+                <div class="asset-decision-actions">
+                  <button class="btn-ghost" type="button" @click="markAllAssetDecisionsAsReference">全部作为参考</button>
+                  <button class="btn-primary" type="button" @click="confirmAssetDecisions">确认选择</button>
+                  <button class="btn-ghost" type="button" @click="closeAssetDecisionDialog">关闭</button>
+                </div>
+              </div>
+            </div>
             <div v-if="uploadedContextFiles.length" class="uploaded-context-list">
               <div v-for="file in uploadedContextFiles" :key="file.file_id" class="uploaded-context-item">
                 <span class="context-file-name">{{ file.original_name || file.name }}</span>
                 <span class="context-file-kind">{{ file.content_kind }} / {{ file.extension }}</span>
                 <span v-if="file.candidate_tools?.length" class="context-file-tools">tools: {{ file.candidate_tools.join(', ') }}</span>
+                <span v-if="file.asset_decision === 'include_as_asset'" class="asset-selected-badge">已选择加入 assets: {{ file.asset_target_path }}</span>
+                <button class="btn-ghost" type="button" @click="editAssetDecision(file)" :disabled="streaming">修改用途</button>
                 <button class="btn-ghost" type="button" @click="removeUploadedContextFile(file.file_id)" :disabled="streaming">移除</button>
               </div>
             </div>
@@ -207,6 +238,8 @@ const currentStatus = ref(null)
 const uploadedContextFiles = ref([])
 const uploadError = ref('')
 const creatorUploadSessionId = ref(`creator-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+const showAssetDecisionDialog = ref(false)
+const pendingAssetDecisionFiles = ref([])
 
 // Quick actions state
 const quickActions = ref([])
@@ -261,6 +294,7 @@ function collectUploadedFileMetadata() {
     asset_decision: file.asset_decision,
     candidate_tools: file.candidate_tools || [],
     content_kind: file.content_kind,
+    asset_target_path: file.asset_target_path || '',
   }))
 }
 
@@ -272,11 +306,49 @@ async function handleContextFileUpload(event) {
   for (const file of files) {
     try {
       const metadata = await uploadCreatorContextFile({ file, sessionId: creatorUploadSessionId.value })
-      uploadedContextFiles.value.push(metadata)
+      uploadedContextFiles.value.push({ ...metadata, asset_target_path: defaultAssetTargetPath(metadata) })
+      pendingAssetDecisionFiles.value.push(uploadedContextFiles.value[uploadedContextFiles.value.length - 1])
     } catch (e) {
       uploadError.value = e.message || '上下文文件上传失败'
     }
   }
+  if (pendingAssetDecisionFiles.value.length) showAssetDecisionDialog.value = true
+}
+
+function defaultAssetTargetPath(file) {
+  const name = String(file?.original_name || file?.name || 'upload').split(/[\\/]/).pop().replace(/[^A-Za-z0-9_.-]+/g, '_')
+  return `assets/${name || 'upload'}`
+}
+
+function editAssetDecision(file) {
+  pendingAssetDecisionFiles.value = [file]
+  showAssetDecisionDialog.value = true
+}
+
+function normalizePendingAssetDecisions({ defaultDecision = 'reference_only' } = {}) {
+  pendingAssetDecisionFiles.value.forEach(file => {
+    if (!file.asset_decision || file.asset_decision === 'unknown') file.asset_decision = defaultDecision
+    if (file.asset_decision === 'include_as_asset' && !file.asset_target_path) file.asset_target_path = defaultAssetTargetPath(file)
+  })
+}
+
+function markAllAssetDecisionsAsReference() {
+  pendingAssetDecisionFiles.value.forEach(file => {
+    file.asset_decision = 'reference_only'
+  })
+  closeAssetDecisionDialog()
+}
+
+function confirmAssetDecisions() {
+  normalizePendingAssetDecisions({ defaultDecision: 'reference_only' })
+  pendingAssetDecisionFiles.value = []
+  showAssetDecisionDialog.value = false
+}
+
+function closeAssetDecisionDialog() {
+  normalizePendingAssetDecisions({ defaultDecision: 'reference_only' })
+  pendingAssetDecisionFiles.value = []
+  showAssetDecisionDialog.value = false
 }
 
 function removeUploadedContextFile(fileId) {
@@ -829,6 +901,82 @@ function clearChat() {
   padding: 12px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
+}
+
+.asset-decision-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.56);
+  backdrop-filter: blur(2px);
+}
+
+.asset-decision-card {
+  width: min(720px, 96vw);
+  max-height: min(720px, 86vh);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+  background: var(--surface, #fff);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+}
+
+.asset-decision-header,
+.asset-decision-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-decision-header h3 {
+  margin: 0 0 6px;
+}
+
+.asset-decision-close {
+  align-self: flex-start;
+}
+
+.asset-decision-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.asset-decision-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(180px, 220px) minmax(180px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.asset-decision-row select,
+.asset-decision-row input {
+  width: 100%;
+}
+
+.asset-decision-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 720px) {
+  .asset-decision-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 </style>

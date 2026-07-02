@@ -835,6 +835,7 @@ class ListFilesResponse(BaseModel):
 class InitFromBlueprintRequest(BaseModel):
     skill_name: str
     files: list[FileSpecOut]
+    confirmed_uploaded_assets: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InitFromBlueprintResponse(BaseModel):

@@ -4458,7 +4458,7 @@ async def init_from_blueprint(request: InitFromBlueprintRequest):
     - 这会掩盖模型生成失败或空内容问题。
     """
     skill_name = _validate_skill_name(request.skill_name)
-    skill_root = settings.skill_public_dir / skill_name
+    skill_root = getattr(settings, "skill_public_dir", settings.skills_path) / skill_name
 
     try:
         skill_root.mkdir(parents=True, exist_ok=True)
@@ -4518,7 +4518,7 @@ async def list_files(request: ListFilesRequest):
     """
     skill_name = _validate_skill_name(request.skill_name)
     
-    skill_root = settings.skill_public_dir / skill_name
+    skill_root = getattr(settings, "skill_public_dir", settings.skills_path) / skill_name
     if not skill_root.exists():
         return ListFilesResponse(
             success=False,

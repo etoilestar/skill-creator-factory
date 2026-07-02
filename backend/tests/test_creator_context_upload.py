@@ -58,3 +58,50 @@ def test_vision_understanding_registry_manifest_and_resolution():
     result = resolve_tools_for_skill_plan_entry({"path": "scripts/vision.py", "role": "vision_analyzer", "required_tool_slots": ["vision_understanding"]})
     assert "vision_understanding" in result.allowed_tools
     assert "analyze_image_with_vision" in result.allowed_helper_imports
+
+@pytest.mark.asyncio
+async def test_init_from_blueprint_without_confirmed_assets_defaults_to_empty(tmp_path, monkeypatch):
+    from backend.services.creator import api
+    from backend.services.creator.common import FileSpecOut, InitFromBlueprintRequest
+
+    skills_dir = tmp_path / "skills"
+    monkeypatch.setattr(api.settings, "skills_path", skills_dir)
+
+    response = await api.init_from_blueprint(InitFromBlueprintRequest(
+        skill_name="demo-skill",
+        files=[FileSpecOut(path="SKILL.md", purpose="overview", required=True, can_skip=False)],
+    ))
+
+    assert response.success is True
+    assert (skills_dir / "demo-skill").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_init_from_blueprint_copies_confirmed_uploaded_assets(tmp_path, monkeypatch):
+    from backend.services.creator import api
+    from backend.services.creator.common import FileSpecOut, InitFromBlueprintRequest
+
+    skills_dir = tmp_path / "skills"
+    upload_root = tmp_path / "creator_uploads"
+    session_dir = upload_root / "session-1"
+    session_dir.mkdir(parents=True)
+    source = session_dir / "file-id_logo.png"
+    source.write_bytes(b"png-bytes")
+
+    monkeypatch.setattr(api.settings, "skills_path", skills_dir)
+    monkeypatch.setattr(api, "UPLOAD_ROOT", upload_root)
+
+    response = await api.init_from_blueprint(InitFromBlueprintRequest(
+        skill_name="demo-skill",
+        files=[FileSpecOut(path="SKILL.md", purpose="overview", required=True, can_skip=False)],
+        confirmed_uploaded_assets=[{
+            "asset_decision": "include_as_asset",
+            "asset_target_path": "assets/logo.png",
+            "session_id": "session-1",
+            "path": str(source),
+            "original_name": "logo.png",
+        }],
+    ))
+
+    assert response.success is True
+    assert (skills_dir / "demo-skill" / "assets" / "logo.png").read_bytes() == b"png-bytes"

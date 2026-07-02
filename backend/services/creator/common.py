@@ -329,6 +329,9 @@ class RequirementItem(BaseModel):
 
 
 class RequirementGraph(BaseModel):
+    # RequirementGraph inputs/outputs are recommended shared vocabulary for SKILL.md
+    # and scripts to converge on field names. They are not a field-level hard
+    # validation contract; real closure is verified by E2E execution.
     requirements: list[RequirementItem] = Field(default_factory=list)
     platform_io_contract: dict[str, Any] = Field(default_factory=build_platform_io_contract)
     platform_input_node: dict[str, Any] = Field(default_factory=dict)

@@ -570,6 +570,8 @@ async def _extract_requirement_graph_with_validator(
                 "后端已经根据 file_plan/contracts 生成 deterministic requirement graph；你只能返回 compact patches。\n"
                 "patch 只能补充 must_do、must_not_do、depends_on；不得输出 purpose、constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
                 "platform_io_contract 是 deterministic and immutable，只读参考；不得输出、修改或 patch platform_io_contract。\n"
+                "requirement graph patcher 不负责字段级强对齐；inputs/outputs 是共同推荐字段；platform_io_contract 只读。不得把平台字段词表复制成内部业务字段，不得输出字段映射硬规则。\n"
+                "不得 patch platform_input_node/platform_output_node/platform_io_contract，不得输出 dataflow_edges 作为 hard contract。\n"
                 "purpose 已由 workflow_allocation 或原始文件计划确定；requirement_graph 阶段不得修改 purpose，不得重新划分脚本职责，不得改写 final inputs / final outputs。\n"
                 "must_do 只补关键职责缺口，保持短句、少量条目。\n"
                 "返回格式：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
@@ -727,6 +729,7 @@ async def _allocate_workflow_script_responsibilities(
             "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
             "先在内部区分 executable workflow graph 与 reference/context graph（不要输出复杂结构）。\n"
             "executable workflow graph 只能包含：platform guaranteed input envelope、required scripts/*.py、scripts stdout、scripts artifacts、final artifact；只有这些节点/边可以承担运行时 dataflow。\n"
+            "输出的 inputs/outputs 是 recommended shared vocabulary，用于 SKILL.md 和 script 生成时尽量采用一致字段；它们不是 hard validation schema，不要求与平台 IO 字段名相等，也不要求第一轮图谱阶段完全闭合。平台 IO 只作为来源/出口层说明。\n"
             "SKILL.md、references/*.md、assets/** 只能作为 reference/context graph 中的说明、规范或资源上下文，不能作为可执行 dataflow 节点：SKILL.md 不承担字段转换、循环、聚合、排序、映射或产物生成；references/*.md 不产生 stdout 字段，不补齐 producer，不补齐集合结果；assets/** 只是上传或静态资源输入，不主动生成中间结果。\n"
             "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游 stdout/artifact 或 platform runtime 输入；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
             "责任分配必须先从全局可执行合同推导，再落到单个脚本。全局合同由最终产物目标、下游消费者 inputs、上游已能交付的 outputs、平台执行能力边界、可执行脚本链路闭环共同决定；原始 SkillPlanEntry inputs/outputs 只作为局部能力提示，不能覆盖全局闭环。\n"
@@ -1093,6 +1096,16 @@ async def prepare_plan(request: PreparePlanRequest):
 
     if status == "blocked":
         return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
+
+    if status == "ready" and not _prepare_supplement_check_seen(request) and not _prepare_user_confirmed_no_more_supplement(request):
+        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+        return PreparePlanResponse(
+            status="needs_clarification",
+            prepare_stage="creation_points_confirmation",
+            clarifying_questions=[_PREPARE_SUPPLEMENT_QUESTION],
+            review_summary=_strip_prepare_summary_risks(summary),
+            skill_name=skill_name,
+        )
 
     blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
     if not blueprint_text:

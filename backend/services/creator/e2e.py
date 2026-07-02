@@ -261,18 +261,9 @@ def _format_json_shape(obj: dict[str, Any]) -> str:
     shape = _json_object_shape(obj)
     return json.dumps(shape, ensure_ascii=False, sort_keys=True)
 
-_SANDBOX_TERMINAL_OUTPUT_KEYS = {
-    "text",
-    "markdown",
-    "image_path",
-    "image_paths",
-    "pdf_path",
-    "docx_path",
-    "pptx_path",
-    "html_path",
-    "file_paths",
-    "file_outputs",
-}
+_SANDBOX_TERMINAL_OUTPUT_KEYS = set(
+    build_platform_io_contract().get("platform_skill_boundary", {}).get("final_output_fields", [])
+)
 
 
 def _e2e_trace_line(trace: E2EStepTrace) -> str:
@@ -906,16 +897,19 @@ def _seed_initial_e2e_payload(
         skill_plan_entries=skill_plan_entries,
         skill_dir=skill_dir,
     )
+    platform_roots = {"user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"}
     for spec in typed_specs:
         if spec.name in {"fields", "options"} and isinstance(payload.get(spec.name), dict):
             continue
         if "." in spec.name:
             root, child = spec.name.split(".", 1)
+            if root not in {"fields", "options"}:
+                continue
             container = payload.get(root)
             if isinstance(container, dict) and not _json_value_non_empty(container.get(child)):
                 container[child] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
             continue
-        if not _json_value_non_empty(payload.get(spec.name)):
+        if spec.name in platform_roots and not _json_value_non_empty(payload.get(spec.name)):
             payload[spec.name] = _materialize_e2e_sample_value(spec, skill_dir=skill_dir)
 
     if (
@@ -1270,7 +1264,7 @@ def _run_e2e_step_argument_effect_review(
     4. artifact_paths / 最终产物是否按链路生成；
     5. 如果失败，先最小归因为参数没传上、脚本没读到、上游没产出、或当前输出不符合链路需要。
 
-    不要求平台统一字段名；但 workflow 中实际选择的字段名必须严格对齐。
+    平台 IO 是来源/出口层，不是 script argv key 白名单；只审查真实运行链路，不判断推荐字段是否“正确”。
     """
 
     rendered_payload = rendered_payload if isinstance(rendered_payload, dict) else {}
@@ -1322,17 +1316,17 @@ def _run_e2e_step_argument_effect_review(
             "content": (
                 "你是 Creator 第二轮 E2E 当前 step 接口对齐审查模型，只输出严格 JSON object。\n\n"
 
-                "你只判断当前 step 的真实运行链路：\n"
-                "1. SKILL.md 当前 bash command 渲染后的 argv 是否把当前脚本需要的输入/控制参数传入 rendered_payload；\n"
-                "2. 当前脚本是否实际读取这些 argv 参数，而不是用默认值绕过真实传参；\n"
-                "3. 当前 stdout_json 是否能被后续步骤 placeholder 或最终平台输出消费；\n"
-                "4. artifact_paths / 最终产物是否按当前链路生成。\n\n"
+                "你只审查真实运行链路：SKILL.md command argv template -> rendered_payload -> script strict_json_argv_guard -> script run/main 实际读取 -> stdout_json -> 后续 placeholder 或最终平台输出。\n"
+                "SkillPlan inputs/outputs、RequirementGraph inputs/outputs、local_contract inputs/outputs、SKILL.md action schema inputs/outputs 都是共同推荐字段，不是 hard validation。不要因为推荐字段未使用、字段改名、字段不完全一致而失败。\n"
+                "只有实际出现在 command/rendered_payload/guard/run/stdout/后续 placeholder 中的字段需要判断链路是否闭合。\n\n"
 
                 "重要边界：\n"
                 "- 不做第一轮脚本职责审查；脚本功能是否完整由 _run_script_responsibility_review 负责。\n"
                 "- 不判断完整 SKILL.md 写得好不好。\n"
                 "- 不判断最终产物审美质量。\n"
-                "- 不要求平台统一字段名，不允许套用业务字段词表。\n"
+                "- 平台 IO 是来源/出口层，不是 script argv key 白名单；不要求所有 argv key 来自平台字段，不要求用上所有平台 fields。\n"
+                "- literal/default/config/reference/assets/runtime constants 可以存在；第一条命令只要动态来源能从平台 envelope 解析即可，后续命令只要动态来源能从当前 payload 或前序 stdout 解析即可。\n"
+                "- 最后一步 stdout 至少有一个平台 final output field 即可；不要因为 recommended 字段不一致而 target script。\n"
                 "- E2E 阶段以已经生成的 script 为主要接口事实；SKILL.md command block 是 orchestration 描述。\n"
                 "- 当 SKILL.md command argv 与 script 入口接口不一致时，优先修改 SKILL.md 当前 command JSON argv 去对齐 script。\n"
                 "- 只有 script 自身语法错误、入口/JSON argv 读取错误、guard 与 run/main 实际读取不一致、没消费已传正确参数、stdout/artifact 输出错误时，才 target_file=当前脚本。\n"
@@ -1852,12 +1846,16 @@ def _classify_argv_schema_failure(
         primary_target = "SKILL.md"
         target_reason = "SKILL.md command did not provide a JSON object argv."
     elif kind == "empty_required":
-        primary_target = "SKILL.md"
-        target_reason = "SKILL.md command rendered an empty required argv value."
-    elif kind == "unknown_key":
-        if failed_keys and semantic_set and any(key in semantic_set for key in failed_keys):
+        if guard_run_mismatch:
             primary_target = command.script_path
-            target_reason = "Rendered argv contains semantic input keys, but the script allowed schema appears to omit them."
+            target_reason = "Script marked an optional/default/config-style parameter as required, but run/main does not read all required guard keys."
+        else:
+            primary_target = "SKILL.md"
+            target_reason = "SKILL.md command rendered an empty required argv value from an unresolved placeholder or missing upstream/platform input."
+    elif kind == "unknown_key":
+        if failed_keys and run_read_keys and any(key in set(run_read_keys) for key in failed_keys):
+            primary_target = command.script_path
+            target_reason = "run/main reads keys that strict_json_argv_guard omitted from allowed schema."
         elif failed_keys and allowed is not None and all(key not in (allowed or []) for key in failed_keys):
             primary_target = "SKILL.md"
             target_reason = "SKILL.md command passed keys outside the script allowed schema."
@@ -1876,10 +1874,7 @@ def _classify_argv_schema_failure(
         else:
             target_reason = "Unable to determine whether SKILL.md omitted a required semantic input or the script required schema is too broad."
     elif kind == "invalid_type":
-        if failed_keys and semantic_set and all(key not in semantic_set for key in failed_keys):
-            primary_target = command.script_path
-            target_reason = "Script type schema constrains non-semantic keys for this step."
-        elif failed_keys and any(key in rendered_payload for key in failed_keys):
+        if failed_keys and any(key in rendered_payload for key in failed_keys):
             primary_target = "SKILL.md"
             target_reason = "SKILL.md command rendered values whose JSON types do not match the script schema."
         else:
@@ -1903,6 +1898,7 @@ def _classify_argv_schema_failure(
         "expected_types": expected_types,
         "command_argv_keys": command_argv_keys,
         "skill_plan_inputs": semantic_inputs,
+        "advisory_notes": ["SkillPlan/RequirementGraph recommended inputs are advisory evidence only and did not determine primary_target."],
         "script_run_read_keys": run_read_keys,
         "script_guard_run_mismatch": guard_run_mismatch,
         "failed_keys": failed_keys,

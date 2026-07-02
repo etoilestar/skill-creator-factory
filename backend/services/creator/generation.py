@@ -809,7 +809,11 @@ def _build_script_generate_file_prompt_variant(
         "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "系统提供 mandatory script core tool: strict_json_argv_guard；它不是可选 selected business tool，所有 Python scripts/*.py 必须 import 并调用它。",
-        "硬性 argv guard 规则：必须在 parse_args 或等价入口解析 sys.argv[1]，然后调用 strict_json_argv_guard(payload, spec)；spec 由当前脚本核心逻辑实际读取的参数决定，不来自平台字段词表。",
+        "硬性 argv guard 规则：必须在 parse_args 或等价入口解析 sys.argv[1]，然后调用 strict_json_argv_guard(payload, spec)；spec 由当前脚本 run/main 实际读取的参数决定。",
+        "strict_json_argv_guard spec 应优先参考当前脚本职责、local_contract inputs/outputs、SKILL.md command 附近的 argv JSON contract、RequirementGraph/SkillPlan 推荐 inputs/outputs、E2E repair trace 已形成的字段链路；这些都是共同推荐，不是字段白名单。",
+        "script 推荐使用 SKILL.md command 已经映射出来的 argv key；如果脚本内部变量名不同，可以在脚本内部做局部变量转换。",
+        "不要为了使用平台字段名而强行把脚本接口改成 user_request/input/text/payload 等平台 root；平台 root 是来源，不是脚本必需参数名。",
+        "script 可以有 optional/default/config 参数；这些参数不需要来自平台 IO，也不需要出现在 recommended_inputs。required 参数必须能由 SKILL.md command 提供非空值；optional/default 参数应在 guard spec 或 run/main 默认逻辑中自洽。",
         "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
         "硬性 argv guard 规则：run() 只能使用 strict_json_argv_guard 返回的 args；run() 不得重新 json.loads(sys.argv[1])，不得直接使用未校验 payload。",
         "硬性 argv guard 规则：骨架 spec 中的 input_text 只是示例，必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
@@ -931,12 +935,14 @@ def _build_generate_file_prompt(
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role: ...、inputs: ...、outputs: ...。\n"
-            "6b. command JSON argv keys 必须和附近 inputs 声明对齐；不要声明 inputs 后传入无关 argv key。\n"
-            "7. 第一条脚本命令只能引用 external envelope 中确定存在的通用字段：user_request、input、text、input_files、files、fields、options，或显式结构化来源提供的字段。\n"
+            "6b. command JSON argv keys 是当前脚本接口字段，不是平台字段白名单；argv keys 应优先参考当前脚本职责、SkillPlan inputs/outputs、RequirementGraph inputs/outputs、local_contract inputs/outputs 和附近 action schema，以便 SKILL.md 与 script 使用同一套推荐词汇，但第一轮不要求这些字段严格一致。\n"
+            "6c. 允许脚本需要的 optional/default/config 参数、reference/assets 路径、runtime constants、格式控制参数出现在 argv 中；不要要求所有 argv key 都来自平台 IO，也不要要求使用所有平台输入字段。\n"
+            "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。argv key 不必等于这些平台字段名。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
             "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
             "10. JSON argv 必须是标准 JSON：不得在 JSON argv 值里写 {{input_files[0]}}、{{references/...}}、{{assets/...}} 等复杂模板表达式；运行时输入文件使用 __RUNTIME_INPUT_FILE__ / __RUNTIME_INPUT_FILE_0__ 等安全占位符；reference/assets 文件使用普通相对路径字符串；模型名使用 TEXT_MODEL。\n"
-            "10a. 每个核心执行命令附近必须写 **argv JSON contract**，逐项声明 argv.<key> 的 type/source/placeholder 或 path/required；例如 runtime_input_file + __RUNTIME_INPUT_FILE__、reference_file + references/x.md、runtime_model + TEXT_MODEL。\n"
+            "10a. 每个核心执行命令附近必须写 **argv JSON contract**；这是提示词级映射说明，不是硬校验 schema。对每个 argv.<key> 说明 type、source_kind、source、required、default（如有）。source_kind 只能用通用类别：platform_input、previous_stdout、reference_file、asset_file、literal_default、runtime_constant、script_default。\n"
+            "10b. argv key 可以是脚本接口字段；argv value 如果是动态值，应能从平台 input envelope 或前序 stdout 解析；argv value 如果是 literal/default/reference/assets/runtime constant，不需要来自平台字段。SKILL.md 至少要体现平台输入槽位如何映射到脚本 argv key，但脚本 argv key 不必等于平台槽位名。\n"
             "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
             "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
             "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"

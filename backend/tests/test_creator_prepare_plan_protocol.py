@@ -119,6 +119,29 @@ async def test_under_limit_needs_clarification_drops_model_review_summary(monkey
 
 
 @pytest.mark.asyncio
+async def test_direct_ready_first_returns_creation_points_confirmation(monkeypatch):
+    async def fake_generate(_request):
+        return {"status": "ready", "internal_blueprint_text": _ready_blueprint(), "skill_name": "demo-skill"}
+    async def fake_summary(**kwargs):
+        return api.PreparePlanReviewSummary(goal="目标功能", input="运行时输入", output="JSON", risks=["hidden risk"])
+    async def fake_analyze(_request):
+        raise AssertionError("analyze_blueprint should not run before creation points confirmation")
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "_prepare_summarize_confirmed_requirements", fake_summary)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(_request())
+
+    assert resp.status == "needs_clarification"
+    assert resp.prepare_stage == "creation_points_confirmation"
+    assert resp.clarifying_questions == [api._PREPARE_SUPPLEMENT_QUESTION]
+    assert resp.review_summary.goal == "目标功能"
+    assert resp.review_summary.risks == []
+    assert resp.files == []
+
+
+@pytest.mark.asyncio
 async def test_feedback_wants_supplement_blocks_ready(monkeypatch):
     async def fake_generate(_request):
         return {"status": "ready", "internal_blueprint_text": _ready_blueprint()}
@@ -211,7 +234,7 @@ async def test_supplement_content_resummarizes_and_asks_confirmation(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_supplement_limit_generates_blueprint_and_strict_analyze(monkeypatch):
+async def test_supplement_limit_still_requires_creation_points_confirmation(monkeypatch):
     calls = []
     async def fake_generate(_request):
         return {"status": "needs_clarification", "clarifying_questions": ["输入？A. 文本 B. 文件"]}
@@ -228,8 +251,10 @@ async def test_supplement_limit_generates_blueprint_and_strict_analyze(monkeypat
     monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
     history = [{"role": "user", "content": "补充：第一次补充"}]
     resp = await api.prepare_plan(_request(conversation_history=history, human_feedback="补充：第二次补充"))
-    assert resp.status == "ready"
-    assert calls and calls[0].strict is True
+    assert resp.status == "needs_clarification"
+    assert resp.prepare_stage == "creation_points_confirmation"
+    assert "补充" in resp.clarifying_questions[0]
+    assert calls == []
 
 
 @pytest.mark.asyncio

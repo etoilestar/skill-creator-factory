@@ -113,22 +113,31 @@
               />
             </label>
             <div v-if="uploadError" class="error">{{ uploadError }}</div>
-            <div v-if="showAssetDecisionDialog" class="asset-decision-modal">
+            <div v-if="showAssetDecisionDialog" class="asset-decision-modal" role="dialog" aria-modal="true" @click.self="closeAssetDecisionDialog">
               <div class="asset-decision-card">
-                <h3>选择上传文件用途</h3>
-                <p class="muted">只有选择“固定加入 Skill assets”的文件会复制到 assets/**。</p>
-                <div v-for="file in pendingAssetDecisionFiles" :key="file.file_id" class="asset-decision-row">
-                  <strong>{{ file.original_name || file.name }}</strong>
-                  <select v-model="file.asset_decision">
-                    <option value="include_as_asset">固定加入 Skill assets</option>
-                    <option value="reference_only">只作为本次创建参考</option>
-                    <option value="runtime_input">作为 Skill 运行时输入参考</option>
-                    <option value="unknown">暂不决定</option>
-                  </select>
-                  <input v-if="file.asset_decision === 'include_as_asset'" v-model="file.asset_target_path" placeholder="assets/example.ext" />
+                <div class="asset-decision-header">
+                  <div>
+                    <h3>选择上传文件用途</h3>
+                    <p class="muted">只有选择“固定加入 Skill assets”的文件会复制到 assets/**；关闭未选择项会默认作为参考。</p>
+                  </div>
+                  <button class="btn-ghost asset-decision-close" type="button" @click="closeAssetDecisionDialog">✕</button>
                 </div>
-                <div class="actions">
-                  <button class="btn-primary" type="button" @click="confirmAssetDecisions">确认</button>
+                <div class="asset-decision-body">
+                  <div v-for="file in pendingAssetDecisionFiles" :key="file.file_id" class="asset-decision-row">
+                    <strong>{{ file.original_name || file.name }}</strong>
+                    <select v-model="file.asset_decision">
+                      <option value="include_as_asset">固定加入 Skill assets</option>
+                      <option value="reference_only">只作为本次创建参考</option>
+                      <option value="runtime_input">作为 Skill 运行时输入参考</option>
+                      <option value="unknown">暂不决定</option>
+                    </select>
+                    <input v-if="file.asset_decision === 'include_as_asset'" v-model="file.asset_target_path" placeholder="assets/example.ext" />
+                  </div>
+                </div>
+                <div class="asset-decision-actions">
+                  <button class="btn-ghost" type="button" @click="markAllAssetDecisionsAsReference">全部作为参考</button>
+                  <button class="btn-primary" type="button" @click="confirmAssetDecisions">确认选择</button>
+                  <button class="btn-ghost" type="button" @click="closeAssetDecisionDialog">关闭</button>
                 </div>
               </div>
             </div>
@@ -316,11 +325,28 @@ function editAssetDecision(file) {
   showAssetDecisionDialog.value = true
 }
 
-function confirmAssetDecisions() {
+function normalizePendingAssetDecisions({ defaultDecision = 'reference_only' } = {}) {
   pendingAssetDecisionFiles.value.forEach(file => {
-    if (!file.asset_decision) file.asset_decision = 'unknown'
+    if (!file.asset_decision || file.asset_decision === 'unknown') file.asset_decision = defaultDecision
     if (file.asset_decision === 'include_as_asset' && !file.asset_target_path) file.asset_target_path = defaultAssetTargetPath(file)
   })
+}
+
+function markAllAssetDecisionsAsReference() {
+  pendingAssetDecisionFiles.value.forEach(file => {
+    file.asset_decision = 'reference_only'
+  })
+  closeAssetDecisionDialog()
+}
+
+function confirmAssetDecisions() {
+  normalizePendingAssetDecisions({ defaultDecision: 'reference_only' })
+  pendingAssetDecisionFiles.value = []
+  showAssetDecisionDialog.value = false
+}
+
+function closeAssetDecisionDialog() {
+  normalizePendingAssetDecisions({ defaultDecision: 'reference_only' })
   pendingAssetDecisionFiles.value = []
   showAssetDecisionDialog.value = false
 }
@@ -875,6 +901,82 @@ function clearChat() {
   padding: 12px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
+}
+
+.asset-decision-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.56);
+  backdrop-filter: blur(2px);
+}
+
+.asset-decision-card {
+  width: min(720px, 96vw);
+  max-height: min(720px, 86vh);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+  background: var(--surface, #fff);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+}
+
+.asset-decision-header,
+.asset-decision-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-decision-header h3 {
+  margin: 0 0 6px;
+}
+
+.asset-decision-close {
+  align-self: flex-start;
+}
+
+.asset-decision-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.asset-decision-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(180px, 220px) minmax(180px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.asset-decision-row select,
+.asset-decision-row input {
+  width: 100%;
+}
+
+.asset-decision-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 720px) {
+  .asset-decision-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 </style>

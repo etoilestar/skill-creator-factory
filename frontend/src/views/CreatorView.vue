@@ -467,15 +467,6 @@ ${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || 
       return
     }
 
-    if (plan.status === 'ready' && currentPrepareAction !== 'confirm') {
-      console.warn('[Creator] blocked ready prepare-plan response without explicit confirm action', { prepareAction: currentPrepareAction })
-      messages.value.push({
-        role: 'assistant',
-        content: '系统已整理出创建要点，请先确认是否按这些要点继续。',
-      })
-      quickActions.value = buildClarificationQuickActions([question || '以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明'], { prepareStage: plan.prepare_stage || '' })
-      return
-    }
 
     creationPlan.value = plan
     skillName.value = plan.skill_name || currentSkillName

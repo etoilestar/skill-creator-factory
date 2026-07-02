@@ -631,6 +631,10 @@ def _script_local_contract_payload(
         max_snippets=8,
     )
 
+    tool_binding_summary = {}
+    if isinstance(plan_entry.runtime_contract, dict):
+        tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
+
     return {
         "file_path": file_path,
         "runtime": plan_entry.runtime,
@@ -642,6 +646,8 @@ def _script_local_contract_payload(
         "tool_function_cards": tool_function_cards,
         "tool_snippets": tool_snippets,
         "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
+        "current_file_tool_binding": tool_binding_summary,
+        "allowed_helper_imports": tool_binding_summary.get("allowed_helper_imports", []),
         "resource_refs": canonical_contract.resource_refs,
         "output_contract": {
             "stdout_schema": stdout_schema,
@@ -668,7 +674,12 @@ def _script_local_contract_payload(
         "rules": [
             "Use script_composition: combine argv inputs, local logic, standard library, and any useful available_tools to satisfy this single script goal.",
             "available_tools are recalled base capabilities, not an exhaustive list of business solutions; the script may implement composition/adaptation locally instead of waiting for a specialized tool.",
-            "Only import a platform tool using its exact call_template import path; never guess backend imports.",
+            "Only import helpers listed in current_file_tool_binding.allowed_helper_imports; backend.services.runtime_tools is not an open namespace.",
+            "Never guess helper names from file formats; forbidden examples include read_pdf_text, read_xlsx_text, read_txt_text, read_excel_text.",
+            "If importing from backend.services.runtime_tools.custom_tools or any custom import_path, both import_path and function name must appear in current_file_tool_binding.allowed_import_paths / allowed_function_imports.",
+            "Prefer current_file_tool_binding.primary_tool_ids; use secondary_tool_ids as fallback when primary is unavailable or not relevant.",
+            "Do not choose extract_pdf_text just because the user said PDF; follow Current File Tool Binding and scored_tools selection reasons.",
+            "If a capability is missing, return/describe a tool_pool_request instead of inventing a runtime_tools import.",
             "Standard-library imports and already-available runtime libraries may be used for local composition.",
             "References/assets are resource_refs only, not pip/install/import dependencies.",
             "First round fixes only the current script; end-to-end chain repair happens later.",
@@ -756,6 +767,9 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
+    if isinstance(skill_plan_entry, dict) and isinstance(skill_plan_entry.get("tool_binding_summary"), dict):
+        local_contract["current_file_tool_binding"] = skill_plan_entry.get("tool_binding_summary") or {}
+        local_contract["allowed_helper_imports"] = list((skill_plan_entry.get("tool_binding_summary") or {}).get("allowed_helper_imports") or [])
 
     implementation_payload = (
         local_contract.get("implementation_resolution")
@@ -873,6 +887,9 @@ def _build_script_generate_file_prompt_variant(
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
+        "Current Skill Tool Pool / Current File Tool Binding（硬约束）：",
+        json.dumps(local_contract.get("current_file_tool_binding") or {"allowed_helper_imports": local_contract.get("allowed_helper_imports", [])}, ensure_ascii=False, indent=2),
+        "Allowed helper imports 是唯一允许从 backend.services.runtime_tools 顶层导入的业务 helper；allowed_import_paths + allowed_function_imports 是唯一允许的 custom tool import；禁止未列出 helper/custom function，禁止 import *，禁止按格式猜 read_pdf_text/read_xlsx_text/read_txt_text。",
         "动态工具函数卡片（从 registry/manifest 读取，不硬编码工具名）：",
         "\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无",
         "动态工具 Snippet 指南（从 registry/manifest 读取，不硬编码工具名）：",

@@ -784,3 +784,56 @@ def images_to_pdf(image_paths: list[str], output_path: str | os.PathLike[str] | 
     first, rest = images[0], images[1:]
     first.save(str(out_path), save_all=True, append_images=rest)
     return {"pdf_path": str(out_path), "file_paths": [str(out_path)], "file_outputs": [str(out_path)]}
+
+
+def _tabular_rows_to_text(rows: Any, columns: Any = None) -> str:
+    lines: list[str] = []
+    if columns:
+        lines.append("\t".join(str(c) for c in columns))
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                keys = list(columns or row.keys())
+                lines.append("\t".join(str(row.get(k, "")) for k in keys))
+            elif isinstance(row, (list, tuple)):
+                lines.append("\t".join(str(cell) for cell in row))
+            else:
+                lines.append(str(row))
+    return "\n".join(lines)
+
+def read_file_text(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read supported document/table/plain-text files into a uniform dict.
+
+    Always returns text, source_path, file_type, and metadata.  This helper is
+    the preferred Creator-facing API for multi-format text ingestion; callers
+    must treat the result as a dict, not as a raw string.
+    """
+    raw = Path(path).expanduser()
+    suffix = raw.suffix.lower()
+    if suffix == ".pdf":
+        result = extract_pdf_text(path)
+        text = str(result.get("text") or "")
+    elif suffix == ".docx":
+        result = read_docx_text(path)
+        text = str(result.get("text") or "")
+    elif suffix == ".pptx":
+        result = read_pptx_text(path)
+        text = str(result.get("text") or "")
+    elif suffix in {".xlsx", ".xlsm"}:
+        result = read_spreadsheet(path)
+        text = str(result.get("text") or "") or _tabular_rows_to_text(result.get("rows"), result.get("columns"))
+    elif suffix in {".csv", ".tsv"}:
+        result = read_csv(path)
+        text = str(result.get("text") or "") or _tabular_rows_to_text(result.get("rows"), result.get("columns"))
+    elif suffix in {".txt", ".md"}:
+        safe_path = _safe_input_path(path, {".txt", ".md"})
+        result = {"source_path": str(safe_path)}
+        text = safe_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        raise ValueError(f"unsupported file type: {suffix}")
+    return {
+        "text": text,
+        "source_path": str(result.get("source_path") or raw),
+        "file_type": suffix.lstrip("."),
+        "metadata": {k: v for k, v in result.items() if k not in {"text", "source_path"}},
+    }

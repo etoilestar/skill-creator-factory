@@ -568,3 +568,14 @@ python ../kernel/scripts/package_skill.py ./my-skill ./dist
 - **多步骤流程设计**: 见 [references/workflows.md](references/workflows.md)
 - **输出格式模式**: 见 [references/output-patterns.md](references/output-patterns.md)
 - **交互设计指南**: 见 [references/interaction-guide.md](references/interaction-guide.md) - AskUserQuestion 最佳实践
+
+## Creator Tool Pool and Runtime Helper Gate
+
+- Creator maintains a Skill-level tool pool for generated scripts; blueprint planning may declare capabilities/tool slots, but must not declare concrete runtime helper names.
+- Runtime helper names are selected by the backend registry and tool gate, then bound per script file in the current file tool binding.
+- Generated scripts may import only helpers listed in the current file binding's `allowed_helper_imports`; `backend.services.runtime_tools` is not an open namespace.
+- If a script needs a capability outside the current binding, the model must request a tool-pool addition; the request must pass the backend gate before code imports the helper.
+- Gate-denied tools/helpers must be treated as unavailable and must not be reintroduced by generation, repair, or E2E.
+- Do not invent runtime helper names such as `read_pdf_text`, `read_xlsx_text`, `read_txt_text`, or `read_excel_text`.
+- Multi-format text ingestion should prefer the gated `read_file_text` helper when it is present in the current file binding.
+- Reference and asset files are resources only; they must not declare or use runtime tools.

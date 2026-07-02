@@ -16,6 +16,7 @@ from .document_tools import (
     merge_pdfs,
     read_docx_text,
     read_csv,
+    read_file_text,
     read_pptx_text,
     read_spreadsheet,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "query_database_readonly",
     "read_docx_text",
     "read_csv",
+    "read_file_text",
     "read_pptx_text",
     "read_spreadsheet",
     "create_pdf_document",

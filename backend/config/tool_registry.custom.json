@@ -661,6 +661,243 @@
       "usage_policy": "helper_preferred",
       "validator_kind": "generic",
       "version": "1.0.0"
+    },
+    {
+      "accepted_input_extensions": [
+        ".pdf"
+      ],
+      "adapter_path": "backend/services/runtime_tools/custom_tools/pdf_to_md_mineru.py",
+      "allow_creator_use": true,
+      "allow_external_side_effect": false,
+      "allowed_roles": [
+        "generic_script",
+        "document_parser",
+        "pdf_parser",
+        "aggregator"
+      ],
+      "approval_status": "enabled",
+      "capability_aliases": [
+        "pdf_parsing",
+        "pdf_text_extraction",
+        "pdf_to_markdown",
+        "pdf_to_md",
+        "document_parse",
+        "document_layout_parse",
+        "mineru_pdf_parse"
+      ],
+      "category": "document_parsing",
+      "created_by": "user",
+      "dependencies": [
+        {
+          "imports": [
+            "requests"
+          ],
+          "package": "requests"
+        }
+      ],
+      "display_name": "MinerU PDF to Markdown",
+      "domain_terms": [
+        "pdf转md",
+        "pdf转markdown",
+        "pdf转文本",
+        "pdf解析",
+        "提取pdf文本",
+        "mineru",
+        "保留结构",
+        "版面",
+        "表格",
+        "公式"
+      ],
+      "enabled": true,
+      "enabled_by_default": true,
+      "functions": [
+        {
+          "allowed_roles": [
+            "generic_script",
+            "document_parser",
+            "pdf_parser",
+            "aggregator"
+          ],
+          "common_mistakes": [
+            "Do not import this unless current file binding allows its import_path/function_name.",
+            "Do not use for non-PDF files."
+          ],
+          "example_call": "from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\nresult = pdf_to_md_mineru({\"pdf_path\": payload[\"input_path\"]})",
+          "example_stdout": "return result",
+          "function_name": "pdf_to_md_mineru",
+          "import_path": "backend.services.runtime_tools.custom_tools.pdf_to_md_mineru",
+          "input_schema": {
+            "properties": {
+              "input_path": {
+                "type": "string"
+              },
+              "pdf_path": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "output_schema": {
+            "properties": {
+              "artifact_metadata": {
+                "type": "object"
+              },
+              "file_outputs": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "markdown_path": {
+                "type": "string"
+              },
+              "markdown_text": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "markdown_path",
+              "file_outputs"
+            ],
+            "type": "object"
+          },
+          "required_capabilities": [
+            "pdf_to_md_mineru"
+          ],
+          "return_contract": "Returns markdown_path, markdown_text/text, file_outputs, and artifact_metadata.",
+          "short_description": "Convert PDF files to Markdown/text with structure-aware parsing.",
+          "signature": "pdf_to_md_mineru(payload: dict) -> dict",
+          "trial_mode_behavior": "When SKILL_TRIAL_RUN=1, returns deterministic mock Markdown output.",
+          "usage_policy": "helper_preferred",
+          "when_to_use": "Use for PDF to Markdown, PDF to text, layout/structure/table/formula extraction, or high-quality PDF preprocessing."
+        }
+      ],
+      "helper_imports": [],
+      "input_schema": {
+        "properties": {
+          "input_path": {
+            "type": "string"
+          },
+          "pdf_path": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "pdf_to_md_mineru",
+      "negative_tags": [],
+      "output_content_types": [
+        "markdown",
+        "text",
+        "structured_document"
+      ],
+      "output_extensions": [
+        ".md"
+      ],
+      "output_schema": {
+        "properties": {
+          "artifact_metadata": {
+            "type": "object"
+          },
+          "file_outputs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "markdown_path": {
+            "type": "string"
+          },
+          "markdown_text": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "markdown_path",
+          "file_outputs"
+        ],
+        "type": "object"
+      },
+      "preference_score": 0.85,
+      "required_env": [],
+      "required_secrets": [],
+      "roles": [
+        "generic_script",
+        "document_parser",
+        "pdf_parser",
+        "aggregator"
+      ],
+      "semantic_tags": [
+        "pdf",
+        "markdown",
+        "text_extraction",
+        "layout",
+        "document_structure",
+        "table_extraction",
+        "formula_extraction"
+      ],
+      "snippets": [
+        {
+          "anti_patterns": [
+            "Do not invent helper names.",
+            "Do not import this custom tool unless file binding allows it."
+          ],
+          "applies_to": {
+            "capabilities": [
+              "pdf_to_md_mineru"
+            ],
+            "roles": [
+              "generic_script",
+              "document_parser",
+              "pdf_parser",
+              "aggregator"
+            ]
+          },
+          "code": "from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\n\nresult = pdf_to_md_mineru({\"pdf_path\": payload[\"input_path\"]})\nreturn result",
+          "description": "Use the gated custom MinerU adapter for structure-aware PDF to Markdown conversion.",
+          "expected_input_shape": {
+            "input_path": "string PDF path"
+          },
+          "expected_output_shape": {
+            "file_outputs": [
+              "string"
+            ],
+            "markdown_path": "string",
+            "markdown_text": "string"
+          },
+          "id": "pdf_to_md_mineru.minimal_usage",
+          "kind": "minimal_usage",
+          "priority": 150,
+          "requires": [
+            "pdf_to_md_mineru"
+          ],
+          "return_rule": "Return the adapter dict directly.",
+          "title": "Convert PDF to Markdown",
+          "usage_policy": "helper_preferred"
+        }
+      ],
+      "structured_output_score": 0.9,
+      "task_verbs": [
+        "convert",
+        "parse",
+        "extract",
+        "read"
+      ],
+      "test_status": "passed",
+      "tool_quality_score": 0.85,
+      "tool_type": "custom_adapter",
+      "usage_policy": "helper_preferred"
     }
   ]
 }

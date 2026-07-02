@@ -649,6 +649,7 @@ class FileSpecOut(BaseModel):
     required_tool_slots: list[dict[str, Any]] = Field(default_factory=list)
     implementation_strategy: list[dict[str, Any]] = Field(default_factory=list)
     selected_tools: list[str] = Field(default_factory=list)
+    tool_binding_summary: dict[str, Any] = Field(default_factory=dict)
     runtime_contract: dict[str, Any] = Field(default_factory=dict)
     artifact_contract: dict[str, Any] = Field(default_factory=dict)
     required_capabilities: list[str] = Field(default_factory=list)

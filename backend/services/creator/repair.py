@@ -1764,6 +1764,9 @@ async def _repair_generated_file_with_feedback(
     failed_checks_text: str = "",
     repair_mode: str = "minimal_edit",
     skill_plan_entry: dict[str, Any] | None = None,
+    import_guard_result: dict[str, Any] | None = None,
+    current_file_binding: dict[str, Any] | None = None,
+    tool_pool_summary: dict[str, Any] | None = None,
     patch_retry_limit: int = 3,
 ) -> str:
     """First-round single-file repair using local patch.
@@ -1892,6 +1895,12 @@ async def _repair_generated_file_with_feedback(
             f"runtime={repair_runtime}, language={repair_language}\n\n"
             "SkillPlanEntry：\n"
             f"{json.dumps(skill_plan_entry or {}, ensure_ascii=False, default=str)[:6000]}\n\n"
+            "Current File Tool Binding（硬约束）：\n"
+            f"{json.dumps(current_file_binding or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+            "Current Tool Pool Summary（含 scored candidates / primary / fallback / denied / missing）：\n"
+            f"{json.dumps(tool_pool_summary or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
+            "Runtime Import Guard Result（如果存在，必须先修复该硬错误；需要池外工具时只能输出 tool_pool_patch.add_tool_requests）：\n"
+            f"{json.dumps(import_guard_result or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
             "Tool Registry / Snippet 上下文：\n"
             f"{tool_context}\n\n"
             + (
@@ -3851,3 +3860,6 @@ async def _run_script_responsibility_review(
     }
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+TOOL_POOL_REPAIR_RULES = """Repair may only use current_file_binding.allowed_helper_imports. If a pool-external helper is needed, emit tool_pool_patch.add_tool_requests; patches must pass tool_pool_gate before code may import the helper. Repair must not add script files or let references/assets use runtime tools. Import guard errors are hard constraints."""

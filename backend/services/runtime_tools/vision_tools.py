@@ -41,9 +41,12 @@ def _safe_image_path(image_path: str) -> Path:
 
 
 def _vision_endpoint() -> str:
-    base = (os.environ.get("VISION_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").rstrip("/")
-    if not base:
-        raise RuntimeError("VISION_BASE_URL or OPENAI_BASE_URL is not set")
+    base = (
+        os.environ.get("VISION_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or "http://localhost:11434"
+    ).rstrip("/")
     if base.endswith("/v1/chat/completions"):
         return base
     if base.endswith("/v1"):
@@ -66,9 +69,7 @@ def analyze_image_with_vision(image_path: str, prompt: str = "Describe this imag
     model = os.environ.get("VISION_MODEL") or ""
     if not model:
         raise RuntimeError("VISION_MODEL is not set")
-    api_key = os.environ.get("VISION_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
-    if not api_key:
-        raise RuntimeError("VISION_API_KEY or OPENAI_API_KEY is not set")
+    api_key = os.environ.get("VISION_API_KEY") or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "ollama"
     mime = mimetypes.guess_type(str(path))[0] or "image/png"
     data_url = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
     payload = {

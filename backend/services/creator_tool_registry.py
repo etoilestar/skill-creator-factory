@@ -359,7 +359,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "pptx_parsing": _simple_cap("pptx_parsing", "PPT 解析", "parsing", ["pptx_parser"], dependencies=[{"package": "python-pptx", "imports": ["pptx"]}]),
     "spreadsheet_read": _simple_cap("spreadsheet_read", "表格读取", "parsing", ["spreadsheet_reader"], dependencies=[{"package": "openpyxl", "imports": ["openpyxl"]}]),
     "csv_read": _simple_cap("csv_read", "CSV 读取", "parsing", ["spreadsheet_reader"]),
-    "vision_understanding": _simple_cap("vision_understanding", "视觉理解", "ai", ["vision_analyzer"]),
+    "vision_understanding": _simple_cap("vision_understanding", "视觉理解", "ai", ["vision_analyzer", "generic_script", "composite_generator"]),
     "http_request": _simple_cap("http_request", "HTTP/API 请求", "retrieval", ["search_reader", "generic_script"], prompt="Metadata only. Generated scripts implement HTTP themselves when permissions.network=true."),
     "network_read": _simple_cap("network_read", "网络资源读取", "retrieval", ["search_reader", "generic_script"]),
     "web_search": _simple_cap("web_search", "网页搜索", "retrieval", ["search_reader"], required_env=["SEARCHXNG_BASE_URL"]),
@@ -442,6 +442,73 @@ BUILTIN_TOOL_CAPABILITIES["script_argv_guard"] = ToolCapability(
             priority=10000,
         )
     ],
+)
+
+BUILTIN_TOOL_CAPABILITIES["vision_understanding"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["vision_understanding"],
+    helper_imports=["analyze_image_with_vision"],
+    helper_module="backend.services.runtime_tools",
+    required_env=["LLM_BASE_URL", "VISION_MODEL"],
+    input_schema={
+        "type": "object",
+        "required": ["image_path", "prompt"],
+        "properties": {
+            "image_path": {
+                "type": "string",
+                "format": "file-path",
+                "description": "Existing image file path (.png, .jpg, .jpeg, .webp) supplied as runtime input or Creator context.",
+                "accepted_extensions": [".png", ".jpg", ".jpeg", ".webp"],
+            },
+            "prompt": {"type": "string", "description": "Question or instruction for understanding the image."},
+        },
+    },
+    output_schema={
+        "type": "object",
+        "required": ["image_path", "description", "ocr_text", "model"],
+        "properties": {
+            "image_path": {"type": "string"},
+            "description": {"type": "string"},
+            "ocr_text": {"type": "string"},
+            "model": {"type": "string"},
+        },
+    },
+    functions=[
+        ToolFunctionManifest(
+            function_name="analyze_image_with_vision",
+            import_path="backend.services.runtime_tools",
+            short_description="Analyze an existing image with the configured vision-language model.",
+            when_to_use="Use when a script declares vision_understanding and must inspect uploaded or runtime image content.",
+            signature="analyze_image_with_vision(image_path: str, prompt: str = 'Describe this image.') -> dict[str, Any]",
+            input_schema={"type": "object", "required": ["image_path", "prompt"], "properties": {"image_path": {"type": "string", "format": "file-path", "accepted_extensions": [".png", ".jpg", ".jpeg", ".webp"]}, "prompt": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["image_path", "description", "ocr_text", "model"], "properties": {"image_path": {"type": "string"}, "description": {"type": "string"}, "ocr_text": {"type": "string"}, "model": {"type": "string"}}},
+            return_contract="Returns image_path, description, ocr_text, and model; script stdout must preserve needed fields.",
+            example_call="from backend.services.runtime_tools import analyze_image_with_vision\nresult = analyze_image_with_vision(image_path=payload['image_path'], prompt=payload.get('prompt') or 'Describe this image.')",
+            common_mistakes=["Do not use image_generation for image understanding.", "Do not ask the user to manually describe an uploaded image when this helper is selected.", "Do not write uploaded images into assets unless the user explicitly confirmed fixed Skill assets."],
+            usage_policy="helper_preferred",
+            required_env=["LLM_BASE_URL", "VISION_MODEL"],
+            required_capabilities=["vision_understanding"],
+            allowed_roles=["vision_analyzer", "generic_script", "composite_generator"],
+        )
+    ],
+    snippets=[
+        ToolSnippet(
+            id="vision_understanding.analyze_image_with_vision",
+            title="Understand an uploaded/runtime image",
+            kind="minimal_usage",
+            applies_to={"capabilities": ["vision_understanding"]},
+            description="Call analyze_image_with_vision for existing image files. This is not image_generation and must not default uploaded images into assets.",
+            code="from backend.services.runtime_tools import analyze_image_with_vision\n\nimage_path = payload['image_path']\nprompt = payload.get('prompt') or 'Describe this image.'\nresult = analyze_image_with_vision(image_path=image_path, prompt=prompt)\nreturn {'image_path': result['image_path'], 'description': result['description'], 'ocr_text': result.get('ocr_text', ''), 'model': result['model']}",
+            expected_input_shape={"image_path": "path to .png/.jpg/.jpeg/.webp", "prompt": "string"},
+            expected_output_shape={"image_path": "string", "description": "string", "ocr_text": "string", "model": "string"},
+            return_rule="Return the helper result fields needed by downstream scripts.",
+            anti_patterns=["Do not call image_generation.", "Do not require the user to manually describe the image.", "Do not copy Creator context uploads into assets by default."],
+            requires=["vision_understanding"],
+            usage_policy="helper_preferred",
+            priority=150,
+        )
+    ],
+    usage_policy="helper_preferred",
+    prompt_guidance="图片内容理解使用 backend.services.runtime_tools.analyze_image_with_vision；不要混用 image_generation，不要默认写 assets。",
 )
 
 BUILTIN_TOOL_CAPABILITIES["text_generation"] = replace(
@@ -2011,6 +2078,9 @@ def resolve_tools_for_skill_plan_entry(entry: Any) -> ToolResolveResult:
             # Backwards-compatible spelling; generation treats it as local_code.
             continue
     for slot in slots:
+        if isinstance(slot, str):
+            caps.append(slot)
+            continue
         data = slot if isinstance(slot, dict) else getattr(slot, "__dict__", {})
         for value in [data.get("slot_id"), data.get("tool_id"), data.get("capability")]:
             if value:

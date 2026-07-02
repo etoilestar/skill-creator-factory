@@ -88,6 +88,22 @@ export async function prepareCreationPlan(payload) {
   return resp.json()
 }
 
+
+export async function uploadCreatorContextFile({ file, sessionId }) {
+  const form = new FormData()
+  form.append('file', file)
+  form.append('session_id', sessionId)
+  const resp = await fetch('/api/creator/upload-context-file', {
+    method: 'POST',
+    body: form,
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) {
+    throw new Error(data.detail || data.message || '上下文文件上传失败')
+  }
+  return data
+}
+
 /**
  * Analyze the conversation blueprint and extract a file-creation plan.
  * This is a pure rule-based call — no LLM is involved.

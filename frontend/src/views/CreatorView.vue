@@ -100,6 +100,28 @@
         <div class="input-area">
           <div v-if="error" class="error">{{ error }}</div>
           
+          <div class="context-upload-panel">
+            <label class="context-upload-label">
+              上传创建上下文（不会自动加入 assets）
+              <input
+                type="file"
+                multiple
+                accept=".pdf,.docx,.pptx,.xlsx,.csv,.txt,.md,.json,.yaml,.yml,.png,.jpg,.jpeg,.webp"
+                @change="handleContextFileUpload"
+                :disabled="streaming"
+              />
+            </label>
+            <div v-if="uploadError" class="error">{{ uploadError }}</div>
+            <div v-if="uploadedContextFiles.length" class="uploaded-context-list">
+              <div v-for="file in uploadedContextFiles" :key="file.file_id" class="uploaded-context-item">
+                <span class="context-file-name">{{ file.original_name || file.name }}</span>
+                <span class="context-file-kind">{{ file.content_kind }} / {{ file.extension }}</span>
+                <span v-if="file.candidate_tools?.length" class="context-file-tools">tools: {{ file.candidate_tools.join(', ') }}</span>
+                <button class="btn-ghost" type="button" @click="removeUploadedContextFile(file.file_id)" :disabled="streaming">移除</button>
+              </div>
+            </div>
+          </div>
+
           <!-- Quick action buttons -->
           <div v-if="quickActions.length" class="quick-actions">
             <p class="quick-actions-label">选择选项或输入内容：</p>
@@ -152,7 +174,7 @@
 
 <script setup>
 import { ref, computed, nextTick } from 'vue'
-import { prepareCreationPlan, buildClarificationQuickActions } from '../composables/useCreator.js'
+import { prepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
@@ -182,6 +204,9 @@ const streamBuffer = ref('')
 const error = ref('')
 const messagesEl = ref(null)
 const currentStatus = ref(null)
+const uploadedContextFiles = ref([])
+const uploadError = ref('')
+const creatorUploadSessionId = ref(`creator-${Date.now()}-${Math.random().toString(36).slice(2)}`)
 
 // Quick actions state
 const quickActions = ref([])
@@ -223,7 +248,39 @@ function resolveCurrentSkillName() {
 }
 
 function collectUploadedFileMetadata() {
-  return []
+  return uploadedContextFiles.value.map(file => ({
+    file_id: file.file_id,
+    session_id: file.session_id,
+    name: file.name,
+    original_name: file.original_name,
+    path: file.path,
+    size: file.size,
+    mime_type: file.mime_type,
+    extension: file.extension,
+    suggested_role: file.suggested_role,
+    asset_decision: file.asset_decision,
+    candidate_tools: file.candidate_tools || [],
+    content_kind: file.content_kind,
+  }))
+}
+
+async function handleContextFileUpload(event) {
+  const files = Array.from(event.target.files || [])
+  event.target.value = ''
+  if (!files.length || streaming.value) return
+  uploadError.value = ''
+  for (const file of files) {
+    try {
+      const metadata = await uploadCreatorContextFile({ file, sessionId: creatorUploadSessionId.value })
+      uploadedContextFiles.value.push(metadata)
+    } catch (e) {
+      uploadError.value = e.message || '上下文文件上传失败'
+    }
+  }
+}
+
+function removeUploadedContextFile(fileId) {
+  uploadedContextFiles.value = uploadedContextFiles.value.filter(file => file.file_id !== fileId)
 }
 
 function shouldPreparePlanRevise({ skillName, previousBlueprintText, humanFeedback }) {
@@ -406,6 +463,9 @@ function clearChat() {
   showInternalBlueprint.value = false
   skillName.value = ''
   selectedExistingSkillName.value = ''
+  uploadedContextFiles.value = []
+  uploadError.value = ''
+  creatorUploadSessionId.value = `creator-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 </script>
@@ -428,6 +488,12 @@ function clearChat() {
   flex-shrink: 0;
 }
 .header h2 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+.context-upload-panel { margin-bottom: 10px; padding: 10px; border: 1px dashed var(--border); border-radius: 8px; }
+.context-upload-label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.uploaded-context-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.uploaded-context-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }
+.context-file-name { font-weight: 600; }
+.context-file-kind, .context-file-tools { color: var(--muted); }
 
 .toolbar {
   display: flex;

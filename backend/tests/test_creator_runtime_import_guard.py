@@ -34,3 +34,10 @@ def test_import_guard_blocks_unbound_custom_tool_and_wildcard():
     wildcard = guard_runtime_imports('from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import *\n', 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
     assert not wildcard.success
     assert wildcard.error_type == 'generated_custom_tool_wildcard_import'
+
+
+def test_import_guard_blocks_pool_external_custom_tool():
+    src = 'from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\n'
+    result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
+    assert not result.success
+    assert result.error_type == 'generated_pool_forbidden_custom_tool_import'

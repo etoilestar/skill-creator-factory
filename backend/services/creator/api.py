@@ -10,6 +10,8 @@ from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from .upload_context import save_creator_context_upload
+from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
+from .runtime_import_guard import guard_runtime_imports
 
 _VALIDATOR_ONLY_LAYERS = {
     "e2e_requirement_validator_error",
@@ -1371,13 +1373,22 @@ async def prepare_plan(request: PreparePlanRequest):
         if isinstance(item, dict) or hasattr(item, "model_dump")
     ]
     tool_pool = build_tool_pool(skill_name=plan.skill_name, user_request=getattr(request, "user_request", "") or "", blueprint_text=plan.blueprint_text or blueprint_text, file_specs=file_specs_payload, uploaded_files=uploaded_files_payload)
+    skill_dir_for_tool_pool = settings.skills_path / _validate_skill_name(plan.skill_name)
+    skill_dir_for_tool_pool.mkdir(parents=True, exist_ok=True)
+    save_tool_pool(skill_dir_for_tool_pool, tool_pool)
     binding_by_path = {binding.target_file: binding for binding in tool_pool.file_bindings}
     for file_spec in plan.files or []:
         binding = binding_by_path.get(getattr(file_spec, "path", ""))
         if binding is not None and hasattr(file_spec, "tool_binding_summary"):
             file_spec.tool_binding_summary = {
                 "allowed_tool_ids": binding.allowed_tool_ids,
+                "primary_tool_ids": binding.primary_tool_ids,
+                "secondary_tool_ids": binding.secondary_tool_ids,
                 "allowed_helper_imports": binding.allowed_helper_imports,
+                "allowed_import_paths": binding.allowed_import_paths,
+                "allowed_function_imports": binding.allowed_function_imports,
+                "scored_tools": binding.scored_tools,
+                "matched_features_by_tool": binding.matched_features_by_tool,
                 "denied_helper_imports": binding.denied_helper_imports,
             }
     gate_events = [g.model_dump(mode="json") for g in tool_pool.gate_events]
@@ -3085,6 +3096,26 @@ async def generate_file(request: GenerateFileRequest):
                 content = candidate
 
                 if request.file_path.startswith("scripts/"):
+                    try:
+                        tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                        file_binding = get_file_binding(tool_pool, request.file_path)
+                        if file_binding is None and isinstance(effective_skill_plan_entry, dict):
+                            file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
+                        import_guard_result = guard_runtime_imports(content, request.file_path, file_binding)
+                    except Exception as guard_exc:
+                        raise FileGenerationStageError(
+                            source="runtime_import_guard",
+                            layer="runtime_import_guard_error",
+                            detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
+                        ) from guard_exc
+                    if not import_guard_result.success:
+                        raise FileGenerationStageError(
+                            source="runtime_import_guard",
+                            layer=import_guard_result.error_type or "runtime_import_guard_failed",
+                            detail=json.dumps(import_guard_result.model_dump(mode="json"), ensure_ascii=False, default=str),
+                        )
+
+                if request.file_path.startswith("scripts/"):
                     allowed_tools = list(resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
                     boundary_violations = _script_tool_boundary_violations(content, allowed_tools)
                     if boundary_violations:
@@ -3728,6 +3759,28 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                         )
 
+                    repair_tool_pool_summary = {}
+                    repair_current_file_binding = {}
+                    repair_import_guard_result = {}
+                    if request.file_path.startswith("scripts/"):
+                        try:
+                            repair_tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                            repair_tool_pool_summary = repair_tool_pool.model_dump(mode="json")
+                            repair_binding_obj = get_file_binding(repair_tool_pool, request.file_path)
+                            if repair_binding_obj is not None:
+                                repair_current_file_binding = repair_binding_obj.model_dump(mode="json")
+                            elif isinstance(effective_skill_plan_entry, dict):
+                                repair_current_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
+                            try:
+                                parsed_guard = json.loads(str(stage_error.detail or ""))
+                                if isinstance(parsed_guard, dict) and str(parsed_guard.get("error_type") or "").startswith("generated_"):
+                                    repair_import_guard_result = parsed_guard
+                            except Exception:
+                                repair_import_guard_result = {}
+                        except Exception:
+                            repair_tool_pool_summary = {}
+                            repair_current_file_binding = {}
+
                     repaired_candidate = await _repair_generated_file_with_feedback(
                         prompt_messages=prompt_messages,
                         model=route.model,
@@ -3740,6 +3793,9 @@ async def generate_file(request: GenerateFileRequest):
                         failed_checks_text=failed_checks_text,
                         repair_mode=repair_mode,
                         skill_plan_entry=effective_skill_plan_entry,
+                        import_guard_result=repair_import_guard_result,
+                        current_file_binding=repair_current_file_binding,
+                        tool_pool_summary=repair_tool_pool_summary,
                     )
                     repaired_candidate = _canonicalize_generated_candidate(
                         file_path=request.file_path,
@@ -3880,6 +3936,9 @@ async def generate_file(request: GenerateFileRequest):
                         failed_checks_text=failed_checks_text,
                         repair_mode="strict_patch",
                         skill_plan_entry=effective_skill_plan_entry,
+                        import_guard_result=repair_import_guard_result if 'repair_import_guard_result' in locals() else {},
+                        current_file_binding=repair_current_file_binding if 'repair_current_file_binding' in locals() else {},
+                        tool_pool_summary=repair_tool_pool_summary if 'repair_tool_pool_summary' in locals() else {},
                     )
                     repaired_candidate = _canonicalize_generated_candidate(
                         file_path=request.file_path,

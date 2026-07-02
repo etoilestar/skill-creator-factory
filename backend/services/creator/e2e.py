@@ -6,6 +6,8 @@ import uuid
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
+from .tool_pool_store import load_tool_pool, get_file_binding
+from .runtime_import_guard import guard_runtime_imports
 
 
 
@@ -3150,6 +3152,30 @@ def _run_skill_workflow_e2e_once(
                     })
 
                 if entry.runtime == "python":
+                    tool_pool = load_tool_pool(trial_skill_dir)
+                    file_binding = get_file_binding(tool_pool, command.script_path)
+                    import_guard_result = guard_runtime_imports(content, command.script_path, file_binding)
+                    if not import_guard_result.success:
+                        if e2e_session is not None:
+                            e2e_session.events.append({
+                                **e2e_session.to_event_base(),
+                                "event": "runtime_import_guard_failed",
+                                "phase": "e2e_pre_run",
+                                "status": "blocked",
+                                "current_step": command.ordinal,
+                                "total_steps": len(commands),
+                                "target_file": command.script_path,
+                                "import_guard_result": import_guard_result.model_dump(mode="json"),
+                            })
+                        raise ValueError(_e2e_error(
+                            target=command.script_path,
+                            layer="runtime_import_guard",
+                            message=(
+                                f"第 {command.ordinal} 步 {command.script_path} runtime_import_guard 失败，已跳过脚本执行："
+                                f"{json.dumps(import_guard_result.model_dump(mode='json'), ensure_ascii=False, default=str)}"
+                            ),
+                        ))
+
                     if venv_python is None:
                         raise ValueError("python venv 未初始化。")
 

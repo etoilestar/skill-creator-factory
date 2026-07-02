@@ -634,8 +634,6 @@ def _script_local_contract_payload(
     tool_binding_summary = {}
     if isinstance(plan_entry.runtime_contract, dict):
         tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
-    if isinstance(skill_plan_entry, dict):
-        tool_binding_summary = skill_plan_entry.get("tool_binding_summary") or tool_binding_summary
 
     return {
         "file_path": file_path,
@@ -769,6 +767,9 @@ def _build_script_generate_file_prompt_variant(
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
+    if isinstance(skill_plan_entry, dict) and isinstance(skill_plan_entry.get("tool_binding_summary"), dict):
+        local_contract["current_file_tool_binding"] = skill_plan_entry.get("tool_binding_summary") or {}
+        local_contract["allowed_helper_imports"] = list((skill_plan_entry.get("tool_binding_summary") or {}).get("allowed_helper_imports") or [])
 
     implementation_payload = (
         local_contract.get("implementation_resolution")

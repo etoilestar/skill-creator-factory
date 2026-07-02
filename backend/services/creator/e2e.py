@@ -2769,7 +2769,19 @@ async def _repair_existing_file_for_e2e_failure(
             }
         payload = _command_normalizer_blocked_payload(target_file="SKILL.md", issues=normalization.issues)
         if normalization.blocked or normalizer_attempted:
-            raise ValueError("command_normalizer_blocked: " + json.dumps(payload, ensure_ascii=False, default=str))
+            if repair_events is not None:
+                repair_events.append({
+                    "type": "command_normalizer_blocked_fallback_to_model",
+                    "target_file": "SKILL.md",
+                    "payload": payload,
+                })
+            e2e_errors = list(e2e_errors or []) + [
+                _e2e_error(
+                    target="SKILL.md",
+                    layer="command_normalizer_blocked",
+                    message=json.dumps(payload, ensure_ascii=False, default=str),
+                )
+            ]
 
     if target_path == "SKILL.md":
         hard_format_failures = detect_markdown_hard_format_failures(
@@ -2871,6 +2883,8 @@ async def _repair_existing_file_for_e2e_failure(
             "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
             "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
             "如果 script 自身接口自洽而 command argv 不一致，优先只改 SKILL.md 当前失败 command JSON argv。\n"
+            "当 failure layer 是 runtime_command_invalid 或 command_normalizer_blocked 时，必须把失败命令修成：脚本路径 + 一个单引号包住的 JSON argv 参数，例如 python scripts/x.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'。\n"
+            "禁止未加引号 JSON；禁止把 JSON 拆成多个 CLI 参数；禁止 --key value 风格；命令必须通过 exactly one JSON argv object 检查。\n"
             "不得改 YAML frontmatter；不得重写整篇 SKILL.md；不得改其它已通过 command；不得改 script；不得新增脚本路径；不得引入 --argv；不得引入 runtime/entrypoint/argv 伪命令对象。\n"
             "不要重写 SKILL.md 正文。\n"
             "当前 Markdown 格式已经通过；不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行。\n"

@@ -1010,6 +1010,7 @@ class CreatorE2ESession:
     temp_handle: tempfile.TemporaryDirectory | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     resolved_failures: list[dict[str, Any]] = field(default_factory=list)
+    repair_attempt_counts: dict[str, int] = field(default_factory=dict)
 
     def to_event_base(self) -> dict[str, Any]:
         return {
@@ -1088,6 +1089,94 @@ def _create_e2e_session(skill_name: str, *, source_skill_dir: Path | None = None
     )
     session.events.append({**session.to_event_base(), "event": "session_created", "reused_venv": False})
     return session
+
+
+def _e2e_repair_key(*, target_path: str, structured_failure: dict[str, Any], phase: str = "workflow_e2e") -> str:
+    layer = str(
+        structured_failure.get("failure_layer")
+        or structured_failure.get("layer")
+        or structured_failure.get("failure_category")
+        or structured_failure.get("error_code")
+        or "e2e"
+    )
+    return "|".join([target_path, layer, phase])
+
+
+async def _request_full_file_rewrite_for_e2e(
+    *,
+    model: str,
+    target_path: str,
+    current_content: str,
+    previous_content: str,
+    task_context: str,
+    target_rule: str,
+) -> str:
+    """Ask the model for a complete replacement file for repeated E2E failures."""
+    skill_md_extra = ""
+    if target_path == "SKILL.md":
+        skill_md_extra = (
+            "\n如果目标是 SKILL.md：\n"
+            "- 输出完整 SKILL.md。\n"
+            "- 保留合法 YAML frontmatter。\n"
+            "- 保留 name / description。\n"
+            "- 不要新增 runner/script/argv 伪协议对象。\n"
+            "- 不要把 references/assets 写成执行步骤。\n"
+            "- bash block 内只能是一条真实 shell 命令。\n"
+            "- 如果脚本使用 JSON argv，命令必须是：python scripts/x.py '{\"key\":\"value\"}'。\n"
+            "- 不要把 JSON 拆成多个 CLI 参数。\n"
+            "- 不要用 --key value 风格替代 JSON argv。\n"
+        )
+    script_extra = ""
+    if target_path.startswith("scripts/"):
+        script_extra = (
+            "\n如果目标是 scripts/*.py：\n"
+            "- 输出完整 Python 文件。\n"
+            "- 保留 strict_json_argv_guard。\n"
+            "- 保持 SKILL.md command argv key 对齐。\n"
+            "- stdout 必须是 JSON object。\n"
+            "- stdout 字段必须满足 runtime/output/artifact 合同。\n"
+            "- 不得 placeholder / TODO / fake output。\n"
+            "- 不得调用未注册 helper。\n"
+            "- 可以使用本轮重新发现的候选工具。\n"
+            "- 如果没有合适工具，使用本地确定性实现。\n"
+        )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 superskills Creator 的整文件重写代码模型。\n"
+                "你只能输出目标文件的完整内容，不能输出解释、Markdown 包裹、diff、old_lines/new_lines 或 JSON patch。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标文件：{target_path}\n\n"
+                "你正在重写目标文件，不是做局部 patch。\n"
+                "请基于该文件职责、runtime_contract、coverage_requirements、上下游合同、当前内容、之前版本，重新生成完整目标文件。\n"
+                "不要依据具体错误文本逐字修补，也不要围绕某个报错行做小修。\n"
+                "目标是让文件整体重新满足职责和工作流合同。\n"
+                "输出完整文件内容，不要输出解释，不要输出 diff，不要输出 old_lines/new_lines。\n\n"
+                "本轮重写规则：\n"
+                f"{target_rule}\n\n"
+                f"{skill_md_extra}{script_extra}\n"
+                "职责、合同与上下文（包含目标文件职责、SkillPlanEntry/runtime_contract、coverage_requirements、command argv contract、上下游摘要、workflow 相邻步骤输入输出合同）：\n"
+                f"{task_context[-24000:]}\n\n"
+                "当前目标文件内容：\n"
+                "```text\n"
+                f"{current_content}\n"
+                "```\n\n"
+                "previous content / repair 前快照：\n"
+                "```text\n"
+                f"{previous_content}\n"
+                "```\n"
+            ),
+        },
+    ]
+    text = await complete_chat_once(messages, model)
+    text = str(text or "")
+    fence = re.match(r"^\s*```[a-zA-Z0-9_-]*\s*\n(?P<body>.*)\n```\s*$", text, re.S)
+    return fence.group("body") if fence else text
 
 
 def _checkpoint_dir(session: CreatorE2ESession) -> Path:
@@ -2844,6 +2933,7 @@ async def _repair_existing_file_for_e2e_failure(
     repair_state = _e2e_repair_state_from_errors(e2e_errors, resolved_failures=e2e_session.resolved_failures)
     structured_failure = _structured_failure_from_errors(e2e_errors)
     targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
+    repair_key = _e2e_repair_key(target_path=target_path, structured_failure=structured_failure)
 
     scope = CreatorRepairScope(
         phase="workflow_e2e",
@@ -2858,11 +2948,13 @@ async def _repair_existing_file_for_e2e_failure(
     )
 
     e2e_tool_cards = ""
+    e2e_entry_context: Any = None
     if target_path.startswith("scripts/"):
         e2e_entry = _skill_plan_entry_for_file(
             file_path=target_path,
             blueprint_text=skill_md,
         )
+        e2e_entry_context = getattr(e2e_entry, "__dict__", e2e_entry)
         e2e_tool_cards = _creator_tool_context_for_script(
             file_path=target_path,
             skill_plan_entry=e2e_entry,
@@ -2870,6 +2962,15 @@ async def _repair_existing_file_for_e2e_failure(
             failure_layer=_failure_layer_from_error_text(deterministic_error),
             error_text=deterministic_error,
             include_snippets=True,
+            rediscover_for_repair=True,
+            repair_context={
+                "target_file": target_path,
+                "script_content": (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8", errors="replace"),
+                "structured_failure": structured_failure,
+                "repair_state": repair_state,
+                "runtime_contract": getattr(e2e_entry, "runtime_contract", None),
+                "coverage_requirements": getattr(e2e_entry, "coverage_requirements", None),
+            },
         )
 
     if target_path == "SKILL.md":
@@ -2935,6 +3036,9 @@ async def _repair_existing_file_for_e2e_failure(
         "sandbox IO 前置协议：",
         _sandbox_io_contract_text_for_creator(),
         "",
+        "目标文件职责 / SkillPlanEntry / runtime_contract / coverage_requirements / command argv contract：",
+        json.dumps(e2e_entry_context or {}, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "",
         "当前 SKILL.md：",
         skill_md[-12000:],
         "",
@@ -2949,11 +3053,13 @@ async def _repair_existing_file_for_e2e_failure(
     last_failure = ""
     max_candidate_attempts = 10
     working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
+    before_repair_snapshot = working_content
     consecutive_format_regressions = 0
     repair_template_history: dict[str, list[str]] = {}
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
+        use_full_rewrite = e2e_session.repair_attempt_counts.get(repair_key, 0) >= 2
         effective_skill_md = current_content if target_path == "SKILL.md" else skill_md
         effective_task_context = base_task_context
         if target_path == "SKILL.md":
@@ -2970,16 +3076,32 @@ async def _repair_existing_file_for_e2e_failure(
         )
 
         try:
-            _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
-                model=model,
-                file_path=target_path,
-                current_content=current_content,
-                failure_text=repair_feedback,
-                scope=scope,
-                task_context=effective_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
-                target_rule=target_rule,
-                patch_retry_limit=3,
-            )
+            if use_full_rewrite:
+                candidate_content = await _request_full_file_rewrite_for_e2e(
+                    model=model,
+                    target_path=target_path,
+                    current_content=current_content,
+                    previous_content=before_repair_snapshot,
+                    task_context=effective_task_context + ("\n\n上一轮候选失败反馈摘要（辅助信号，不能作为主要定位依据）：\n" + last_failure if last_failure else ""),
+                    target_rule=target_rule,
+                )
+                diff_stats = {
+                    "mode": "full_file_rewrite",
+                    "changed_line_count": abs(len(candidate_content.splitlines()) - len(current_content.splitlines())),
+                    "generated_diff_excerpt": "",
+                    "applied": [{"fallback_type": "full_file_rewrite"}],
+                }
+            else:
+                _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
+                    model=model,
+                    file_path=target_path,
+                    current_content=current_content,
+                    failure_text=repair_feedback,
+                    scope=scope,
+                    task_context=effective_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
+                    target_rule=target_rule,
+                    patch_retry_limit=3,
+                )
 
             from .generation import _sanitize_generated_file_content
 
@@ -3016,6 +3138,8 @@ async def _repair_existing_file_for_e2e_failure(
                     "attempt": candidate_attempt,
                     "target_file": target_path,
                     "patch_status": "static_regression_failed",
+                    "repair_key": repair_key,
+                    "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
                     "status": "patch_failed",
                     "rejection_reason": str(preflight_exc)[:2000],
                     "failed_checks": repair_feedback.split("\n\n")[:8],
@@ -3023,6 +3147,8 @@ async def _repair_existing_file_for_e2e_failure(
                     "rerun_status": "skipped",
                     "writeback_status": "candidate_only",
                 })
+                if not use_full_rewrite:
+                    e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
                 logger.warning(
                     "[Creator][E2E][repair_candidate_static_failed] skill=%s file=%s attempt=%d/%d error=%s",
                     skill_name,
@@ -3078,6 +3204,8 @@ async def _repair_existing_file_for_e2e_failure(
                 "failed_checks": sandbox_gate.get("errors") or [],
                 "resolved_failures": e2e_session.resolved_failures,
                 "patch_mode": "exact_replace",
+                "repair_key": repair_key,
+                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
                 "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
                 "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "same_target_still_failed",
                 "status": "repaired" if sandbox_gate.get("accepted") else "same_target_still_failed",
@@ -3090,6 +3218,8 @@ async def _repair_existing_file_for_e2e_failure(
             })
 
             if not sandbox_gate.get("accepted"):
+                if not use_full_rewrite:
+                    e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
                 gate_errors = sandbox_gate.get("errors") or []
                 failure_signature = _failure_signature_from_error((gate_errors or [""])[0])
                 template_signature = _stable_json_hash([
@@ -3250,6 +3380,8 @@ async def _repair_existing_file_for_e2e_failure(
                 "last_output_excerpt": getattr(candidate_exc, "last_output_excerpt", ""),
                 "parser_error": getattr(candidate_exc, "parser_error", "") or (error_text[:1000] if patch_status == "parse_failed" else ""),
                 "diff_extraction_attempted": bool(getattr(candidate_exc, "diff_extraction_attempted", False)),
+                "repair_key": repair_key,
+                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
                 "old_lines_new_lines_fallback_attempted": bool(getattr(candidate_exc, "lines_fallback_attempted", False)),
                 "failed_checks": repair_feedback.split("\n\n")[:8],
                 "resolved_failures": e2e_session.resolved_failures,
@@ -3272,6 +3404,8 @@ async def _repair_existing_file_for_e2e_failure(
                 )
             )
             repair_feedback = deterministic_error + "\n\n" + last_failure
+            if not use_full_rewrite:
+                e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
 
             if consecutive_format_regressions >= 2:
                 if repair_events is not None:

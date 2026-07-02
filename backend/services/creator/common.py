@@ -1690,13 +1690,15 @@ def _creator_tool_context_for_script(
     failure_layer: str | None = None,
     error_text: str | None = None,
     include_snippets: bool = True,
+    rediscover_for_repair: bool = False,
+    repair_context: dict[str, Any] | None = None,
 ) -> str:
     """Build tool context from explicit SkillPlan contract and registry metadata only."""
     if not file_path.startswith("scripts/"):
         return ""
     entry = skill_plan_entry or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text)
     tool_resolve = resolve_tools_for_skill_plan_entry(entry)
-    parts = [tool_resolve.tool_usage_prompt]
+    parts = ["【Plan selected tools】\n" + tool_resolve.tool_usage_prompt]
     if failure_layer or error_text:
         role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
         required = list(entry.get("required_capabilities", []) if isinstance(entry, dict) else getattr(entry, "required_capabilities", []) or [])
@@ -1725,7 +1727,142 @@ def _creator_tool_context_for_script(
             )
             if snippets:
                 parts.append(tool_snippet_prompt(snippets))
+    if rediscover_for_repair:
+        rediscovered = _rediscover_tool_context_for_repair(
+            entry=entry,
+            file_path=file_path,
+            skill_md=blueprint_text,
+            script_content=str((repair_context or {}).get("script_content") or ""),
+            repair_context=repair_context,
+        )
+        parts.append(
+            "【Rediscovered candidate tools for current repair】\n"
+            + (rediscovered or "无匹配候选工具；请使用本地确定性实现，不要发明未列出的平台 helper。")
+            + "\n\n本轮脚本 repair 工具规则：\n"
+            "- 如果候选工具能补齐当前缺失职责，优先使用候选工具。\n"
+            "- 不得发明未列出的平台 helper。\n"
+            "- 不得调用 disabled / draft / failed custom tool。\n"
+            "- 如果当前脚本用了未知 helper，必须删除该 helper，改用候选工具或本地确定性实现。\n"
+            "- rediscovered tools 只是本次修复候选，不代表自动修改 selected_tools。"
+        )
     return "\n\n".join(part for part in parts if part)
+
+
+def _rediscover_tool_context_for_repair(
+    *,
+    entry,
+    file_path: str,
+    skill_md: str,
+    script_content: str,
+    repair_context: dict | None = None,
+    max_tools: int = 6,
+) -> str:
+    """Return candidate registered tool cards for the current repair only.
+
+    This intentionally does not mutate SkillPlanEntry.selected_tools and does
+    not register tools.  Concrete traceback text is treated as a weak signal;
+    declared responsibilities/contracts and structured missing items dominate.
+    """
+    if not file_path.startswith("scripts/"):
+        return ""
+
+    ctx = repair_context or {}
+    role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
+    selected = set(str(x) for x in (entry.get("selected_tools", []) if isinstance(entry, dict) else getattr(entry, "selected_tools", []) or []) if x)
+    signal_payload = {
+        "target_file": file_path,
+        "role": role,
+        "skill_plan_entry": entry if isinstance(entry, dict) else getattr(entry, "__dict__", {}),
+        "structured_failure": ctx.get("structured_failure"),
+        "repair_state": ctx.get("repair_state"),
+        "runtime_contract": ctx.get("runtime_contract"),
+        "coverage_requirements": ctx.get("coverage_requirements"),
+        "artifact_contract": ctx.get("artifact_contract"),
+        "stdout_schema": ctx.get("stdout_schema"),
+        "command_argv_contract": ctx.get("command_argv_contract"),
+        "skill_md_contract_excerpt": str(skill_md or "")[:6000],
+        "script_source_indicators": {
+            "has_placeholder": bool(re.search(r"TODO|NotImplemented|placeholder|fake output|dummy", script_content or "", re.I)),
+            "mentions_unknown_helper": bool(re.search(r"runtime_tools\.|from\s+backend\.services\.skill_runtime\s+import", script_content or "")),
+        },
+    }
+    text = json.dumps(signal_payload, ensure_ascii=False, default=str).lower()
+
+    scored: list[tuple[int, str]] = []
+    for cap in list_tool_capabilities():
+        if not cap.enabled_by_default or not cap.allow_creator_use:
+            continue
+        if cap.created_by != "system" and (cap.approval_status != "approved" or cap.test_status == "failed"):
+            continue
+        if cap.name in selected:
+            continue
+        haystack = " ".join([
+            cap.name,
+            cap.display_name,
+            cap.category,
+            " ".join(cap.roles or []),
+            " ".join(cap.required_capabilities or []),
+            " ".join(cap.optional_capabilities or []),
+            cap.prompt_guidance,
+            json.dumps(cap.input_schema, ensure_ascii=False, default=str),
+            json.dumps(cap.output_schema, ensure_ascii=False, default=str),
+            json.dumps(cap.artifact_outputs, ensure_ascii=False, default=str),
+            " ".join(
+                fn.function_name
+                + " "
+                + str(getattr(fn, "description", "") or getattr(fn, "short_description", "") or getattr(fn, "when_to_use", "") or "")
+                for fn in (cap.functions or [])
+            ),
+        ]).lower()
+        score = 0
+        for token in set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}|[\u4e00-\u9fff]{2,}", haystack)):
+            if token in text:
+                score += 1
+        if role and role in cap.roles:
+            score += 2
+        # Common missing-responsibility shortcuts used only to rank registered tools.
+        if "pdf" in text and ("pdf" in haystack or "extract_pdf_text" in haystack):
+            score += 20
+        if any(t in text for t in ["docx", "word"]) and any(t in haystack for t in ["docx", "word"]):
+            score += 18
+        if any(t in text for t in ["txt", "text file", "文本"]) and any(t in haystack for t in ["txt", "text", "file"]):
+            score += 8
+        if any(t in text for t in ["artifact", "file output", "file_outputs", "output file", "产物"]) and any(t in haystack for t in ["artifact", "file_output", "file_outputs"]):
+            score += 20
+        if score > 0:
+            scored.append((score, cap.name))
+
+    chosen = [name for _, name in sorted(scored, reverse=True)[:max_tools]]
+    cards: list[str] = []
+    snippets: list[dict[str, Any]] = []
+    for name in chosen:
+        cap = get_tool_capability(name)
+        if not cap:
+            continue
+        cap_cards = function_cards_for_tool(cap)
+        cards.extend(cap_cards)
+        if cap.name == "pdf_parsing" and not cap_cards:
+            cards.append(
+                "Tool: pdf_parsing\n"
+                "Registered helper: from backend.services.runtime_tools import extract_pdf_text\n"
+                "Use extract_pdf_text(path, max_pages=None) for declared PDF text extraction responsibilities; stdout must map the returned text/pages into the script contract."
+            )
+    if chosen:
+        snippets = resolve_tool_snippets_for_context(
+            role=role,
+            capabilities=chosen,
+            tool_names=chosen,
+            file_path=file_path,
+            max_snippets=max_tools,
+        )
+    sections = []
+    if cards:
+        sections.append("Rediscovered registered function cards:\n\n" + "\n\n---\n\n".join(cards))
+    if snippets:
+        sections.append(tool_snippet_prompt(snippets))
+    if chosen:
+        sections.append("Rediscovered tool ids (repair-only, not selected_tools): " + ", ".join(chosen))
+    return "\n\n".join(sections)
 
 
 

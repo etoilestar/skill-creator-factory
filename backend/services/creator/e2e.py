@@ -4633,3 +4633,6 @@ def _targeted_e2e_repair_hint(errors: list[str]) -> str:
     return ""
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+E2E_TOOL_POOL_RULES = """Before running generated scripts, Creator must run runtime_import_guard against the current tool_pool file binding; guard failures skip run_script and enter repair/tool_pool_patch + gate."""

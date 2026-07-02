@@ -359,6 +359,7 @@ BUILTIN_TOOL_CAPABILITIES: dict[str, ToolCapability] = {
     "pptx_parsing": _simple_cap("pptx_parsing", "PPT 解析", "parsing", ["pptx_parser"], dependencies=[{"package": "python-pptx", "imports": ["pptx"]}]),
     "spreadsheet_read": _simple_cap("spreadsheet_read", "表格读取", "parsing", ["spreadsheet_reader"], dependencies=[{"package": "openpyxl", "imports": ["openpyxl"]}]),
     "csv_read": _simple_cap("csv_read", "CSV 读取", "parsing", ["spreadsheet_reader"]),
+    "unified_file_text_read": _simple_cap("unified_file_text_read", "多格式文本读取", "parsing", ["generic_script", "document_parser", "aggregator"], helper_imports=["read_file_text"]),
     "vision_understanding": _simple_cap("vision_understanding", "视觉理解", "ai", ["vision_analyzer", "generic_script", "composite_generator"]),
     "http_request": _simple_cap("http_request", "HTTP/API 请求", "retrieval", ["search_reader", "generic_script"], prompt="Metadata only. Generated scripts implement HTTP themselves when permissions.network=true."),
     "network_read": _simple_cap("network_read", "网络资源读取", "retrieval", ["search_reader", "generic_script"]),
@@ -1021,6 +1022,40 @@ _read_capability("docx_parsing", "read_docx_text", "docx", "python-docx", ["docx
 _read_capability("pptx_parsing", "read_pptx_text", "pptx", "python-pptx", ["pptx"])
 _read_capability("spreadsheet_read", "read_spreadsheet", "xlsx", "openpyxl", ["openpyxl"])
 _read_capability("csv_read", "read_csv", "csv", None, [])
+
+BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"] = replace(
+    BUILTIN_TOOL_CAPABILITIES["unified_file_text_read"],
+    helper_imports=["read_file_text"],
+    input_schema={"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+    output_schema={"type": "object", "required": ["text", "source_path", "file_type", "metadata"], "properties": {"text": {"type": "string"}, "source_path": {"type": "string"}, "file_type": {"type": "string"}, "metadata": {"type": "object"}}},
+    functions=[ToolFunctionManifest(
+        function_name="read_file_text",
+        import_path="backend.services.runtime_tools",
+        short_description="Read PDF/DOCX/PPTX/XLSX/CSV/TXT/MD into a uniform dict with text.",
+        when_to_use="Use for scripts that need multi-format text ingestion; prefer this over guessing per-format helper names.",
+        signature="read_file_text(path: str) -> dict[str, Any]",
+        input_schema={"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}},
+        output_schema={"type": "object", "required": ["text", "source_path", "file_type", "metadata"], "properties": {"text": {"type": "string"}, "source_path": {"type": "string"}, "file_type": {"type": "string"}, "metadata": {"type": "object"}}},
+        return_contract="Returns a dict with text, source_path, file_type, and metadata; never a raw string.",
+        example_call="from backend.services.runtime_tools import read_file_text\nresult = read_file_text(payload['input_path'])\ntext = result['text']",
+        common_mistakes=["Do not use read_pdf_text.", "Do not use read_xlsx_text.", "Do not use read_txt_text.", "Helper returns a dict, not str."],
+        usage_policy="helper_preferred",
+        allowed_roles=["generic_script", "document_parser", "aggregator"],
+        required_capabilities=["unified_file_text_read"],
+    )],
+    snippets=[ToolSnippet(
+        id="unified_file_text_read.read_file_text",
+        title="Read any supported file as text",
+        applies_to={"capabilities": ["unified_file_text_read"]},
+        code="from backend.services.runtime_tools import read_file_text\n\nresult = read_file_text(payload['input_path'])\ntext = result['text']\nreturn {'text': text, 'source_path': result['source_path'], 'file_type': result['file_type']}",
+        return_rule="Use result['text']; preserve source_path/file_type when useful.",
+        anti_patterns=["Do not invent read_pdf_text/read_xlsx_text/read_txt_text.", "Do not join helper result directly; it is a dict."],
+        requires=["unified_file_text_read"],
+        usage_policy="helper_preferred",
+        priority=140,
+    )],
+    usage_policy="helper_preferred",
+)
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()

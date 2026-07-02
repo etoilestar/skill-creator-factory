@@ -3851,3 +3851,6 @@ async def _run_script_responsibility_review(
     }
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+TOOL_POOL_REPAIR_RULES = """Repair may only use current_file_binding.allowed_helper_imports. If a pool-external helper is needed, emit tool_pool_patch.add_tool_requests; patches must pass tool_pool_gate before code may import the helper. Repair must not add script files or let references/assets use runtime tools. Import guard errors are hard constraints."""

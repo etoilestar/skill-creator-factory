@@ -84,6 +84,7 @@ class PreparePlanResponse(BaseModel):
     creation_blockers: list[Any] = Field(default_factory=list)
     requirement_graph: Any = Field(default_factory=dict)
     workflow_allocation_summary: str = ""
+    tool_pool_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 def _read_prepare_existing_skill_context(skill_name: str | None) -> dict[str, Any]:
@@ -1363,6 +1364,23 @@ async def prepare_plan(request: PreparePlanRequest):
         and not re.search(r"运行时|每次上传|用户输入|runtime", str(getattr(asset, "description", "") or ""), re.I)
     ]
     graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
+    file_specs_payload = [f.model_dump(mode="json") if hasattr(f, "model_dump") else dict(f) for f in (plan.files or [])]
+    tool_pool = build_tool_pool(skill_name=plan.skill_name, user_request=getattr(request, "user_request", "") or "", blueprint_text=plan.blueprint_text or blueprint_text, file_specs=file_specs_payload, uploaded_files=[])
+    binding_by_path = {binding.target_file: binding for binding in tool_pool.file_bindings}
+    for file_spec in plan.files or []:
+        binding = binding_by_path.get(getattr(file_spec, "path", ""))
+        if binding is not None and hasattr(file_spec, "tool_binding_summary"):
+            file_spec.tool_binding_summary = {
+                "allowed_tool_ids": binding.allowed_tool_ids,
+                "allowed_helper_imports": binding.allowed_helper_imports,
+                "denied_helper_imports": binding.denied_helper_imports,
+            }
+    tool_pool_summary = {
+        "tools": [{"tool_id": t.tool_id, "status": t.status, "target_files": t.target_files, "allowed_helper_imports": t.allowed_helper_imports} for t in tool_pool.tools],
+        "file_bindings": [{"target_file": b.target_file, "allowed_tool_ids": b.allowed_tool_ids, "allowed_helper_imports": b.allowed_helper_imports} for b in tool_pool.file_bindings],
+        "denied_requests": [d.model_dump(mode="json") for d in tool_pool.denied_requests],
+        "missing_requests": [m.model_dump(mode="json") for m in tool_pool.missing_requests],
+    }
     return PreparePlanResponse(
         status="ready",
         prepare_stage="ready",
@@ -1379,6 +1397,7 @@ async def prepare_plan(request: PreparePlanRequest):
         creation_blockers=plan.creation_blockers,
         requirement_graph=graph_payload,
         workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
+        tool_pool_summary=tool_pool_summary,
     )
 
 

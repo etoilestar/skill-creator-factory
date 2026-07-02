@@ -499,3 +499,56 @@ def test_e2e_missing_placeholder_reports_index_not_integer_and_empty_expr():
     value = e2e._resolve_e2e_payload_expr("   ", payload={}, missing=missing, missing_details=details)
     assert value == ""
     assert details[-1]["reason"] == "empty_expr"
+
+@pytest.mark.asyncio
+async def test_e2e_repair_escalates_to_full_file_rewrite_after_two_localized_failures(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n```bash\npython scripts/one.py '{}'\n```\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text("print({})\n", encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", lambda **kwargs: SimpleNamespace(role="generic_script", runtime="python", runtime_contract={"stdout": ["ok"]}, coverage_requirements=["emit ok"], selected_tools=[]))
+    monkeypatch.setattr(e2e, "_validate_e2e_script_static_preflight", lambda **kwargs: None)
+    monkeypatch.setattr(e2e, "_extract_e2e_workflow_commands", lambda *args, **kwargs: [E2EWorkflowCommand(1, "SKILL.md", "scripts/one.py", "python scripts/one.py '{}'", "python", {})])
+    monkeypatch.setattr(e2e, "_command_plan_signature", lambda commands: "sig")
+    monkeypatch.setattr(e2e, "_earliest_invalid_step", lambda **kwargs: 1)
+    monkeypatch.setattr(e2e, "_invalidate_checkpoints_from", lambda *args, **kwargs: [])
+    monkeypatch.setattr(e2e, "_load_valid_checkpoint", lambda *args, **kwargs: None)
+
+    patch_calls = []
+    async def fake_patch(**kwargs):
+        patch_calls.append(kwargs)
+        return None, "print({})\n", {"changed_line_count": 0, "applied": [{"fallback_type": "none"}]}
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_patch)
+
+    full_calls = []
+    async def fake_full(**kwargs):
+        full_calls.append(kwargs)
+        return "print('{\"ok\": true}')\n"
+    monkeypatch.setattr(e2e, "_request_full_file_rewrite_for_e2e", fake_full)
+
+    gate_calls = []
+    def fake_gate(**kwargs):
+        gate_calls.append(kwargs)
+        if len(gate_calls) < 3:
+            return {"accepted": False, "errors": ["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=stdout_schema\nstill missing ok"]}
+        return {"accepted": True, "errors": []}
+    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", fake_gate)
+
+    events = []
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name="demo",
+        target_path="scripts/one.py",
+        e2e_errors=["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=stdout_schema\nmissing ok"],
+        repair_events=events,
+    )
+
+    assert result["status"] == "repaired"
+    assert len(patch_calls) == 2
+    assert len(full_calls) == 1
+    assert len(gate_calls) == 3
+    assert full_calls[0]["previous_content"] == "print({})\n"
+    assert "runtime_contract" in full_calls[0]["task_context"]
+    assert "coverage_requirements" in full_calls[0]["task_context"]
+    assert any(event.get("repair_mode") == "full_file_rewrite" and event.get("rerun_status") == "passed" for event in events)

@@ -1846,6 +1846,21 @@ async def _repair_generated_file_with_feedback(
                 failure_layer=_failure_layer_from_error_text(validation_error),
                 error_text=validation_error,
                 include_snippets=True,
+                rediscover_for_repair=True,
+                repair_context={
+                    "target_file": file_path,
+                    "script_content": current_content,
+                    "structured_failure": {
+                        "validation_error": validation_error,
+                        "targeted_repair": targeted_repair,
+                        "failed_checks": failed_checks_text,
+                    },
+                    "runtime_contract": getattr(plan_entry, "runtime_contract", None),
+                    "coverage_requirements": getattr(plan_entry, "coverage_requirements", None),
+                    "artifact_contract": getattr(plan_entry, "artifact_contract", None),
+                    "stdout_schema": getattr(getattr(plan_entry, "runtime_contract", None), "stdout_schema", None),
+                    "command_argv_contract": getattr(plan_entry, "command_template", None),
+                },
             )
             if plan_entry is not None
             else ""

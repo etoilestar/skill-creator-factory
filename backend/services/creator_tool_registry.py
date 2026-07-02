@@ -497,7 +497,7 @@ BUILTIN_TOOL_CAPABILITIES["vision_understanding"] = replace(
             kind="minimal_usage",
             applies_to={"capabilities": ["vision_understanding"]},
             description="Call analyze_image_with_vision for existing image files. This is not image_generation and must not default uploaded images into assets.",
-            code="from backend.services.runtime_tools import analyze_image_with_vision\n\nresult = analyze_image_with_vision(image_path=args['image_path'], prompt=args.get('prompt') or 'Describe this image.')\nreturn {'image_path': result['image_path'], 'description': result['description'], 'ocr_text': result.get('ocr_text', ''), 'model': result['model']}",
+            code="from backend.services.runtime_tools import analyze_image_with_vision\n\nimage_path = payload['image_path']\nprompt = payload.get('prompt') or 'Describe this image.'\nresult = analyze_image_with_vision(image_path=image_path, prompt=prompt)\nreturn {'image_path': result['image_path'], 'description': result['description'], 'ocr_text': result.get('ocr_text', ''), 'model': result['model']}",
             expected_input_shape={"image_path": "path to .png/.jpg/.jpeg/.webp", "prompt": "string"},
             expected_output_shape={"image_path": "string", "description": "string", "ocr_text": "string", "model": "string"},
             return_rule="Return the helper result fields needed by downstream scripts.",

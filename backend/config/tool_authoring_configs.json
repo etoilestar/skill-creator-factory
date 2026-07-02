@@ -161,6 +161,108 @@
       "tool_name": "https://google.serper.dev/search",
       "updated_at": "2026-06-13T16:26:22.618207+00:00"
     },
+    "mineru_markdown": {
+      "auth_override": {
+        "mode": "auto",
+        "reason": "",
+        "source": "user",
+        "updated_at": ""
+      },
+      "config": {
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "none",
+        "method": "GET",
+        "query_template": {
+          "api_url": "https://api.mineru.com/parse",
+          "output_md_file": "output/result.md",
+          "pdf_file": "backend/samples/sample.pdf",
+          "task_type": "pdf_to_md",
+          "user_id": "user123"
+        }
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [],
+      "sample_input": {
+        "api_url": "https://api.mineru.com/parse",
+        "output_md_file": "output/result.md",
+        "pdf_file": "backend/samples/sample.pdf",
+        "task_type": "pdf_to_md",
+        "user_id": "user123"
+      },
+      "tool_name": "parse_pdf_with_mineru",
+      "updated_at": "2026-07-01T05:56:30.522030+00:00"
+    },
+    "mineru_pdf": {
+      "auth_override": {
+        "mode": "auto",
+        "reason": "",
+        "source": "user",
+        "updated_at": ""
+      },
+      "config": {
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "none",
+        "method": "GET",
+        "query_template": {
+          "api_url": "https://api.mineru.com/parse",
+          "output_format": "markdown",
+          "pdf_path": "backend/samples/sample.pdf",
+          "task_type": "pdf_extraction",
+          "user_id": "user123"
+        }
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [],
+      "sample_input": {
+        "api_url": "https://api.mineru.com/parse",
+        "output_format": "markdown",
+        "pdf_path": "backend/samples/sample.pdf",
+        "task_type": "pdf_extraction",
+        "user_id": "user123"
+      },
+      "tool_name": "parse_pdf_with_mineru",
+      "updated_at": "2026-07-01T05:22:52.167880+00:00"
+    },
+    "mineru_pdf_md": {
+      "auth_override": {
+        "mode": "auto",
+        "reason": "",
+        "source": "user",
+        "updated_at": ""
+      },
+      "config": {
+        "auth_header_name": "X-API-KEY",
+        "auth_placement": "header",
+        "auth_query_param": "api_key",
+        "auth_type": "none",
+        "method": "GET",
+        "query_template": {
+          "api_url": "https://api.mineru.com/parse",
+          "output_md_path": "output/result.md",
+          "pdf_path": "backend/samples/sample.pdf",
+          "task_type": "pdf_to_md",
+          "user_id": "user123"
+        }
+      },
+      "config_refs": {},
+      "configured_env": [],
+      "configured_secrets": [],
+      "sample_input": {
+        "api_url": "https://api.mineru.com/parse",
+        "output_md_path": "output/result.md",
+        "pdf_path": "backend/samples/sample.pdf",
+        "task_type": "pdf_to_md",
+        "user_id": "user123"
+      },
+      "tool_name": "parse_pdf_with_mineru",
+      "updated_at": "2026-07-01T06:39:16.792910+00:00"
+    },
     "search": {
       "config": {
         "auth": {
@@ -496,6 +598,6 @@
       "updated_at": "2026-06-13T15:39:05.150623+00:00"
     }
   },
-  "updated_at": "2026-06-17T06:27:59.357202+00:00",
+  "updated_at": "2026-07-01T06:39:16.799127+00:00",
   "version": 1
 }

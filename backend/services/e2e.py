@@ -573,277 +573,12 @@ def _collect_e2e_typed_inputs_from_graph(
     return list(specs.values())
 
 
-def _read_e2e_skill_md_for_samples(skill_dir: Path | None) -> str:
-    if skill_dir is None:
-        return ""
-    path = skill_dir / "SKILL.md"
-    if not path.is_file():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
-
-
-def _read_e2e_script_for_samples(skill_dir: Path | None, target_file: str = "") -> str:
-    if skill_dir is None or not target_file:
-        return ""
-    path = skill_dir / target_file
-    if not path.is_file():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
-
-
-def _e2e_file_kind_from_text(text: str) -> list[str]:
-    lowered = str(text or "").lower()
-    kinds: list[str] = []
-
-    # Keep this generic: infer file formats from extensions / common MIME words,
-    # not business-specific skill names.
-    checks = [
-        ("pdf", ("pdf", ".pdf", "application/pdf")),
-        ("docx", ("docx", ".docx", "word document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
-        ("txt", ("txt", ".txt", "plain text", "text/plain")),
-        ("md", ("markdown", ".md", "text/markdown")),
-        ("csv", ("csv", ".csv", "text/csv")),
-        ("json", ("json", ".json", "application/json")),
-        ("html", ("html", ".html", ".htm", "text/html")),
-        ("png", ("png", ".png", "image/png")),
-        ("jpg", ("jpg", ".jpg", ".jpeg", "image/jpeg")),
-    ]
-
-    for kind, needles in checks:
-        if any(needle in lowered for needle in needles):
-            kinds.append(kind)
-
-    return list(dict.fromkeys(kinds))
-
-
-def _infer_e2e_file_sample_kinds(
-    *,
-    name: str = "",
-    shape: str = "",
-    target_file: str = "",
-    skill_md: str = "",
-    script_content: str = "",
-    max_count: int = 3,
-) -> list[str]:
-    """Infer representative sample file kinds for Creator E2E.
-
-    This deliberately uses generic evidence:
-    - argv key / spec name
-    - expected shape
-    - target script path
-    - SKILL.md
-    - script source
-
-    It does not hardcode business skill names.
-    """
-    evidence = "\n".join([
-        str(name or ""),
-        str(shape or ""),
-        str(target_file or ""),
-        str(skill_md or "")[:16000],
-        str(script_content or "")[:16000],
-    ])
-
-    key_kinds = _e2e_file_kind_from_text(" ".join([str(name or ""), str(shape or ""), str(target_file or "")]))
-    context_kinds = _e2e_file_kind_from_text(evidence)
-
-    ordered: list[str] = []
-
-    # If the argv key itself says pdf/docx/csv/etc., obey it first.
-    ordered.extend(key_kinds)
-
-    # Otherwise infer from SKILL.md / script content.
-    ordered.extend(context_kinds)
-
-    # For generic "document/file/path" inputs, prefer document formats when declared.
-    # This helps catch fake txt-only implementations for a skill that claims PDF/DOCX support.
-    priority = ["pdf", "docx", "txt", "md", "csv", "json", "html", "png", "jpg"]
-
-    deduped = [kind for kind in priority if kind in set(ordered)]
-
-    if not deduped:
-        deduped = ["txt"]
-
-    return deduped[: max(1, max_count)]
-
-
-def _pdf_escape_text(text: str) -> str:
-    return (
-        str(text or "")
-        .replace("\\", "\\\\")
-        .replace("(", "\\(")
-        .replace(")", "\\)")
-        .replace("\r", " ")
-        .replace("\n", " ")
-    )
-
-
-def _write_minimal_pdf(path: Path, text: str) -> None:
-    """Write a tiny valid PDF using only stdlib bytes.
-
-    It is enough for most PDF text extractors to open the file and see a page.
-    """
-    stream = f"BT /F1 12 Tf 72 720 Td ({_pdf_escape_text(text)}) Tj ET".encode("latin-1", errors="replace")
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
-    ]
-
-    data = bytearray()
-    data.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = [0]
-    for idx, obj in enumerate(objects, start=1):
-        offsets.append(len(data))
-        data.extend(f"{idx} 0 obj\n".encode("ascii"))
-        data.extend(obj)
-        data.extend(b"\nendobj\n")
-
-    xref_offset = len(data)
-    data.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
-    data.extend(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        data.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
-
-    data.extend(
-        (
-            "trailer\n"
-            f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-            "startxref\n"
-            f"{xref_offset}\n"
-            "%%EOF\n"
-        ).encode("ascii")
-    )
-    path.write_bytes(bytes(data))
-
-
-def _write_minimal_docx(path: Path, text: str) -> None:
-    """Write a minimal valid DOCX using only stdlib zipfile."""
-    import zipfile
-    from xml.sax.saxutils import escape
-
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        "<w:body>"
-        "<w:p><w:r><w:t>"
-        + escape(str(text or "Creator E2E sample DOCX"))
-        + "</w:t></w:r></w:p>"
-        '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>'
-        "</w:body>"
-        "</w:document>"
-    )
-
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-        "</Types>"
-    )
-
-    rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-        "</Relationships>"
-    )
-
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", rels)
-        zf.writestr("word/document.xml", document_xml)
-
-
-def _write_minimal_png(path: Path) -> None:
-    # 1x1 transparent PNG.
-    path.write_bytes(bytes.fromhex(
-        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-        "0000000a49444154789c636000000200015d0b2a0000000049454e44ae426082"
-    ))
-
-
-def _write_minimal_jpg(path: Path) -> None:
-    # 1x1 JPEG.
-    path.write_bytes(bytes.fromhex(
-        "ffd8ffe000104a46494600010101006000600000ffdb00430003020203020203"
-        "030303040304050805050404050a070706080c0a0c0c0b0a0b0b0d0e12100d0e"
-        "110e0b0b1016101113141515150c0f171816141812141514ffc0000b08000100"
-        "0101011100ffc4001400010000000000000000000000000000000000000000ff"
-        "da0008010100003f00d2cf20ffd9"
-    ))
-
-
-def _e2e_sample_suffix_for_kind(kind: str) -> str:
-    return {
-        "pdf": ".pdf",
-        "docx": ".docx",
-        "txt": ".txt",
-        "md": ".md",
-        "csv": ".csv",
-        "json": ".json",
-        "html": ".html",
-        "png": ".png",
-        "jpg": ".jpg",
-        "jpeg": ".jpg",
-    }.get(str(kind or "").lower(), ".txt")
-
-
-def _write_e2e_sample_file_by_kind(path: Path, *, kind: str, name: str, index: int) -> None:
-    kind = str(kind or "txt").lower()
-    sample_text = (
-        f"Creator E2E sample content for {name or 'input'} #{index}.\n"
-        "This file is generated deterministically to validate file input handling, "
-        "script execution, stdout JSON, and final workflow closure.\n"
-    )
-
-    if kind == "pdf":
-        _write_minimal_pdf(path, sample_text)
-    elif kind == "docx":
-        _write_minimal_docx(path, sample_text)
-    elif kind == "md":
-        path.write_text("# Creator E2E Sample\n\n" + sample_text, encoding="utf-8")
-    elif kind == "csv":
-        path.write_text("title,content\nCreator E2E Sample," + sample_text.replace("\n", " ") + "\n", encoding="utf-8")
-    elif kind == "json":
-        path.write_text(json.dumps({"title": "Creator E2E Sample", "content": sample_text}, ensure_ascii=False), encoding="utf-8")
-    elif kind == "html":
-        path.write_text(f"<html><body><h1>Creator E2E Sample</h1><p>{sample_text}</p></body></html>", encoding="utf-8")
-    elif kind == "png":
-        _write_minimal_png(path)
-    elif kind in {"jpg", "jpeg"}:
-        _write_minimal_jpg(path)
-    else:
-        path.write_text(sample_text, encoding="utf-8")
-
-
-def _e2e_sample_file(
-    skill_dir: Path | None,
-    name: str,
-    index: int = 1,
-    *,
-    kind: str | None = None,
-    suffix: str | None = None,
-) -> str:
+def _e2e_sample_file(skill_dir: Path | None, name: str, index: int = 1) -> str:
     base = (skill_dir / ".creator_e2e" / "samples") if skill_dir is not None else Path(tempfile.mkdtemp(prefix="creator-e2e-samples-"))
     base.mkdir(parents=True, exist_ok=True)
-
-    sample_kind = str(kind or "").strip().lower() or "txt"
-    sample_suffix = suffix or _e2e_sample_suffix_for_kind(sample_kind)
-
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "input").strip("._") or "input"
-    path = base / f"{safe}_{index}{sample_suffix}"
-
-    _write_e2e_sample_file_by_kind(path, kind=sample_kind, name=name, index=index)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name or "input")
+    path = base / f"{safe}_{index}.txt"
+    path.write_text(f"Creator E2E sample file for {name} #{index}\n", encoding="utf-8")
     return str(path)
 
 
@@ -853,69 +588,25 @@ def _materialize_e2e_sample_value(
     skill_dir: Path | None,
 ) -> Any:
     shape = _canonical_e2e_shape(spec.shape)
-    skill_md = _read_e2e_skill_md_for_samples(skill_dir)
-    script_content = _read_e2e_script_for_samples(skill_dir, spec.target_file)
-
     if shape in {"number", "integer"}:
         return 1
-
     if shape == "boolean":
         return True
-
     if shape == "object":
-        return {
-            key: _materialize_e2e_sample_value(
-                E2ETypedInputSpec(
-                    name=key,
-                    shape=value,
-                    target_file=spec.target_file,
-                    source=spec.source,
-                    confidence=spec.confidence,
-                ),
-                skill_dir=skill_dir,
-            )
-            for key, value in (spec.properties or {}).items()
-        } or {"value": "sample value"}
-
+        return {key: _materialize_e2e_sample_value(E2ETypedInputSpec(name=key, shape=value), skill_dir=skill_dir) for key, value in (spec.properties or {}).items()} or {"value": "sample value"}
     if shape == "file_path":
-        kinds = _infer_e2e_file_sample_kinds(
-            name=spec.name,
-            shape=shape,
-            target_file=spec.target_file,
-            skill_md=skill_md,
-            script_content=script_content,
-            max_count=1,
-        )
-        return _e2e_sample_file(skill_dir, spec.name, 1, kind=kinds[0])
-
+        return _e2e_sample_file(skill_dir, spec.name, 1)
     if shape.startswith("list"):
         item_shape = _shape_item_shape(shape) or spec.item_shape or "string"
-
         if item_shape == "file_path":
-            kinds = _infer_e2e_file_sample_kinds(
-                name=spec.name,
-                shape=shape,
-                target_file=spec.target_file,
-                skill_md=skill_md,
-                script_content=script_content,
-                max_count=3,
-            )
-            return [
-                _e2e_sample_file(skill_dir, spec.name, index + 1, kind=kind)
-                for index, kind in enumerate(kinds)
-            ]
-
+            return [_e2e_sample_file(skill_dir, spec.name, 1), _e2e_sample_file(skill_dir, spec.name, 2)]
         if item_shape == "object":
             return [{"value": "sample item 1"}, {"value": "sample item 2"}]
-
         if item_shape in {"number", "integer"}:
             return [1, 2]
-
         if item_shape == "boolean":
             return [True, False]
-
         return ["sample item 1", "sample item 2"]
-
     return "sample value"
 
 
@@ -1146,178 +837,6 @@ def _render_e2e_command_payload(
         )
 
     return rendered
-
-
-
-_E2E_RUNTIME_INPUT_LITERAL_TOKENS = {
-    "__RUNTIME_INPUT_FILE__",
-    "__RUNTIME_INPUT_FILES__",
-    "__RUNTIME_INPUT_TEXT__",
-    "__RUNTIME_INPUT__",
-    "__USER_INPUT__",
-}
-
-
-def _is_e2e_runtime_input_literal(value: Any) -> bool:
-    return isinstance(value, str) and value.strip() in _E2E_RUNTIME_INPUT_LITERAL_TOKENS
-
-
-def _e2e_runtime_literal_token(value: Any) -> str:
-    return str(value or "").strip() if isinstance(value, str) else ""
-
-
-def _e2e_text_sample_value() -> str:
-    return (
-        "Creator E2E runtime input sample text. "
-        "这是一段用于验证纯文本输入的中文内容，包含 English words 和标点。"
-        "它用于测试参数传递、脚本消费、stdout JSON 和最终输出闭环。"
-    )
-
-
-def _materialize_e2e_runtime_literal_scalar(
-    *,
-    key: str,
-    value: str,
-    skill_dir: Path | None,
-    target_file: str = "",
-    skill_md: str = "",
-    script_content: str = "",
-    index: int = 1,
-) -> Any:
-    """Materialize Creator runtime sentinel literals for deterministic E2E.
-
-    Real platform execution replaces these sentinels before invoking a Skill.
-    Creator E2E must do the same in the trial workspace; otherwise generated
-    scripts receive strings such as ``__RUNTIME_INPUT_FILE__`` and fail with a
-    misleading FileNotFoundError that gets incorrectly attributed to the script.
-    """
-    token = _e2e_runtime_literal_token(value)
-
-    if token == "__RUNTIME_INPUT_FILES__":
-        kinds = _infer_e2e_file_sample_kinds(
-            name=key,
-            shape="list[file_path]",
-            target_file=target_file,
-            skill_md=skill_md,
-            script_content=script_content,
-            max_count=3,
-        )
-        return [
-            _e2e_sample_file(skill_dir, key or "runtime_input_file", idx + 1, kind=kind)
-            for idx, kind in enumerate(kinds)
-        ]
-
-    if token == "__RUNTIME_INPUT_FILE__":
-        kinds = _infer_e2e_file_sample_kinds(
-            name=key,
-            shape="file_path",
-            target_file=target_file,
-            skill_md=skill_md,
-            script_content=script_content,
-            max_count=1,
-        )
-        return _e2e_sample_file(skill_dir, key or "runtime_input_file", index, kind=kinds[0])
-
-    if token in {"__RUNTIME_INPUT_TEXT__", "__RUNTIME_INPUT__", "__USER_INPUT__"}:
-        return _e2e_text_sample_value()
-
-    return value
-
-
-def _materialize_e2e_runtime_input_literals(
-    value: Any,
-    *,
-    skill_dir: Path | None,
-    key: str = "",
-    target_file: str = "",
-    skill_md: str = "",
-    script_content: str = "",
-) -> tuple[Any, list[dict[str, Any]]]:
-    """Replace runtime sentinel literals in a rendered E2E payload.
-
-    This function is deliberately deterministic and does not write back to
-    SKILL.md or generated scripts. It only prepares realistic sandbox inputs.
-    """
-    events: list[dict[str, Any]] = []
-
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for child_key, child_value in value.items():
-            materialized, child_events = _materialize_e2e_runtime_input_literals(
-                child_value,
-                skill_dir=skill_dir,
-                key=str(child_key),
-                target_file=target_file,
-                skill_md=skill_md,
-                script_content=script_content,
-            )
-            out[str(child_key)] = materialized
-            events.extend(child_events)
-        return out, events
-
-    if isinstance(value, list):
-        out_list: list[Any] = []
-        for item in value:
-            materialized, child_events = _materialize_e2e_runtime_input_literals(
-                item,
-                skill_dir=skill_dir,
-                key=key,
-                target_file=target_file,
-                skill_md=skill_md,
-                script_content=script_content,
-            )
-            out_list.append(materialized)
-            events.extend(child_events)
-        return out_list, events
-
-    if _is_e2e_runtime_input_literal(value):
-        token = _e2e_runtime_literal_token(value)
-        materialized = _materialize_e2e_runtime_literal_scalar(
-            key=key,
-            value=token,
-            skill_dir=skill_dir,
-            target_file=target_file,
-            skill_md=skill_md,
-            script_content=script_content,
-        )
-        events.append({
-            "event": "runtime_input_literal_materialized",
-            "key": key,
-            "token": token,
-            "target_file": target_file,
-            "materialized_shape": _json_shape(materialized),
-            "materialized_value": materialized if isinstance(materialized, str) else str(materialized),
-        })
-        return materialized, events
-
-    return value, events
-
-
-def _materialize_rendered_e2e_payload_runtime_literals(
-    rendered_payload: dict[str, Any],
-    *,
-    skill_dir: Path | None,
-    target_file: str = "",
-    skill_md: str = "",
-    script_content: str = "",
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Materialize literal runtime input sentinels before executing a step."""
-    if not isinstance(rendered_payload, dict):
-        return {}, []
-
-    materialized, events = _materialize_e2e_runtime_input_literals(
-        rendered_payload,
-        skill_dir=skill_dir,
-        key="",
-        target_file=target_file,
-        skill_md=skill_md,
-        script_content=script_content,
-    )
-
-    if not isinstance(materialized, dict):
-        return rendered_payload, events
-
-    return materialized, events
 
 
 def _seed_initial_e2e_payload(
@@ -3102,40 +2621,6 @@ def _run_skill_workflow_e2e_once(
                     traces=traces,
                     typed_input_specs=typed_input_specs,
                 )
-
-                rendered_payload, runtime_literal_events = _materialize_rendered_e2e_payload_runtime_literals(
-                    rendered_payload,
-                    skill_dir=trial_skill_dir,
-                    target_file=command.script_path,
-                    skill_md=trial_skill_md,
-                    script_content=content,
-                )
-
-                if runtime_literal_events:
-                    logger.info("[Creator][E2E][runtime_input_literal_materialized] %s", json.dumps({
-                        "event": "runtime_input_literal_materialized",
-                        "script_path": command.script_path,
-                        "ordinal": command.ordinal,
-                        "events": runtime_literal_events,
-                    }, ensure_ascii=False, default=str))
-
-                    if e2e_session is not None:
-                        e2e_session.events.append({
-                            **e2e_session.to_event_base(),
-                            "event": "runtime_input_literal_materialized",
-                            "phase": "e2e_run",
-                            "status": "materialized",
-                            "current_step": command.ordinal,
-                            "total_steps": len(commands),
-                            "target_file": command.script_path,
-                            "runtime_literal_events": runtime_literal_events,
-                            "rendered_payload_summary": json.dumps(
-                                _json_object_shape(rendered_payload),
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                        })
-
                 if e2e_session is not None:
                     e2e_session.events.append({
                         **e2e_session.to_event_base(),
@@ -3579,11 +3064,7 @@ async def _repair_existing_file_for_e2e_failure(
             "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
             "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
             "如果 script 自身接口自洽而 command argv 不一致，优先只改 SKILL.md 当前失败 command JSON argv。\n"
-            "当 failure layer 是 runtime_command_invalid 或 command_normalizer_blocked 时，必须把失败命令修成：脚本路径 + 一个单引号包住的 JSON argv 参数。\n"
-            "文件输入使用 __RUNTIME_INPUT_FILE__，例如：python scripts/x.py '{\"file_path\":\"__RUNTIME_INPUT_FILE__\"}'。\n"
-            "多文件输入使用 __RUNTIME_INPUT_FILES__，例如：python scripts/x.py '{\"file_paths\":\"__RUNTIME_INPUT_FILES__\"}'。\n"
-            "纯文本输入使用 __RUNTIME_INPUT_TEXT__ 或 {{text}}，例如：python scripts/x.py '{\"text_content\":\"__RUNTIME_INPUT_TEXT__\"}'。\n"
-            "不要把纯文本任务强行改成 file_path；不要把文件任务强行改成 text_content。\n"
+            "当 failure layer 是 runtime_command_invalid 或 command_normalizer_blocked 时，必须把失败命令修成：脚本路径 + 一个单引号包住的 JSON argv 参数，例如 python scripts/x.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'。\n"
             "禁止未加引号 JSON；禁止把 JSON 拆成多个 CLI 参数；禁止 --key value 风格；命令必须通过 exactly one JSON argv object 检查。\n"
             "不得改 YAML frontmatter；不得重写整篇 SKILL.md；不得改其它已通过 command；不得改 script；不得新增脚本路径；不得引入 --argv；不得引入 runtime/entrypoint/argv 伪命令对象。\n"
             "不要重写 SKILL.md 正文。\n"

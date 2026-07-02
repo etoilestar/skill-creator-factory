@@ -661,6 +661,351 @@
       "usage_policy": "helper_preferred",
       "validator_kind": "generic",
       "version": "1.0.0"
+    },
+    {
+      "adapter_path": "backend/services/runtime_tools/custom_tools/pdf_to_md_mineru.py",
+      "allow_creator_use": true,
+      "allow_external_side_effect": false,
+      "allowed_roles": [
+        "generic_script"
+      ],
+      "approval_status": "enabled",
+      "artifact_outputs": [],
+      "category": "custom",
+      "created_at": "2026-07-01T06:46:26.641591+00:00",
+      "created_by": "user",
+      "dependencies": [
+        {
+          "imports": [
+            "requests"
+          ],
+          "package": "requests",
+          "version": "2.31.0"
+        }
+      ],
+      "display_name": "pdf_to_md_mineru",
+      "enabled": true,
+      "forbidden_capabilities": [],
+      "forbidden_direct_imports": [],
+      "functions": [
+        {
+          "allowed_roles": [
+            "generic_script"
+          ],
+          "artifact_outputs": [],
+          "common_mistakes": [],
+          "example_call": "",
+          "example_return": "",
+          "example_stdout": "",
+          "forbidden_imports": [],
+          "forbidden_side_effects": [],
+          "function_name": "pdf_to_md_mineru",
+          "import_path": "backend.services.runtime_tools.custom_tools.pdf_to_md_mineru",
+          "input_schema": {
+            "properties": {
+              "api_url": {
+                "description": "URL of the Mineru API endpoint.",
+                "format": "uri",
+                "type": "string"
+              },
+              "output_md_path": {
+                "description": "Path where the generated Markdown file will be saved.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "pdf_path": {
+                "contentMediaType": "application/pdf",
+                "description": "Path to the input PDF file.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "task_type": {
+                "description": "Type of task being performed.",
+                "type": "string"
+              },
+              "user_id": {
+                "description": "User identifier for the API request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pdf_path",
+              "output_md_path",
+              "api_url",
+              "user_id",
+              "task_type"
+            ],
+            "type": "object"
+          },
+          "output_schema": {
+            "properties": {
+              "message": {
+                "description": "Additional information or error message.",
+                "type": "string"
+              },
+              "output_md_path": {
+                "description": "Path to the generated Markdown file.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "status": {
+                "description": "Result status of the conversion.",
+                "enum": [
+                  "success",
+                  "failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "output_md_path"
+            ],
+            "type": "object"
+          },
+          "required_capabilities": [
+            "deterministic_execution"
+          ],
+          "required_env": [],
+          "required_secrets": [],
+          "return_contract": "Returns the dict produced by generated python_script run(payload, config=None).",
+          "safety_notes": [],
+          "short_description": "Converts a PDF file to Markdown format using the Mineru API.",
+          "side_effects": [],
+          "signature": "pdf_to_md_mineru(payload: dict) -> dict",
+          "trial_mode_behavior": "",
+          "usage_policy": "self_implementation_allowed",
+          "when_to_use": "Use when a Creator script needs pdf_to_md_mineru."
+        }
+      ],
+      "helper_imports": [],
+      "helper_module": "backend.services.skill_runtime",
+      "input_schema": {
+        "properties": {
+          "api_url": {
+            "description": "URL of the Mineru API endpoint.",
+            "format": "uri",
+            "type": "string"
+          },
+          "output_md_path": {
+            "description": "Path where the generated Markdown file will be saved.",
+            "format": "file-path",
+            "type": "string"
+          },
+          "pdf_path": {
+            "contentMediaType": "application/pdf",
+            "description": "Path to the input PDF file.",
+            "format": "file-path",
+            "type": "string"
+          },
+          "task_type": {
+            "description": "Type of task being performed.",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "User identifier for the API request.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pdf_path",
+          "output_md_path",
+          "api_url",
+          "user_id",
+          "task_type"
+        ],
+        "type": "object"
+      },
+      "last_validation_result": {
+        "auth_gate": {
+          "auth": {
+            "reason": "No API key, token, or secret is required; authentication is handled via user_id and task_type in the request data.",
+            "required": "no",
+            "secrets": []
+          },
+          "block_registration": false,
+          "can_register": true,
+          "can_run_trial": true,
+          "configured_env": [],
+          "configured_secrets": [],
+          "declared_env": [],
+          "missing_env": [],
+          "missing_optional_env": [],
+          "missing_secrets": [],
+          "optional_env": [],
+          "reason": "No API key, token, or secret is required; authentication is handled via user_id and task_type in the request data.",
+          "required": false,
+          "required_env": [],
+          "required_secrets": [],
+          "status": "not_required"
+        },
+        "auth_review": {
+          "declared_env": [],
+          "planner_declared_auth": false,
+          "script_uses_auth": false,
+          "undeclared_env": [],
+          "used_env": []
+        },
+        "block_registration": false,
+        "call_chain": null,
+        "can_register": true,
+        "collapsible_blocks": null,
+        "debug_sections": null,
+        "dependency_environment": null,
+        "dynamic_trial": {
+          "skipped": true
+        },
+        "errors": [],
+        "real_run": {
+          "skipped": true
+        },
+        "sample_input": {
+          "api_url": "https://api.mineru.com/parse",
+          "output_md_path": "output/result.md",
+          "pdf_path": "backend/samples/sample.pdf",
+          "task_type": "pdf_to_md",
+          "user_id": "user123"
+        },
+        "sample_notes": [],
+        "snippet_preview": [],
+        "snippet_validations": [],
+        "status": "validated",
+        "success": true,
+        "temporary_environment": null,
+        "tool_card_preview": [],
+        "warnings": []
+      },
+      "name": "pdf_to_md_mineru",
+      "optional_capabilities": [],
+      "output_schema": {
+        "properties": {
+          "message": {
+            "description": "Additional information or error message.",
+            "type": "string"
+          },
+          "output_md_path": {
+            "description": "Path to the generated Markdown file.",
+            "format": "file-path",
+            "type": "string"
+          },
+          "status": {
+            "description": "Result status of the conversion.",
+            "enum": [
+              "success",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "output_md_path"
+        ],
+        "type": "object"
+      },
+      "prompt_guidance": "",
+      "required_capabilities": [
+        "deterministic_execution",
+        "file_output"
+      ],
+      "required_env": [],
+      "required_secrets": [],
+      "roles": [
+        "generic_script"
+      ],
+      "runtime_type": "python_script",
+      "safety_level": "standard",
+      "side_effects": [],
+      "snippets": [
+        {
+          "anti_patterns": [
+            "Do not pass secrets in payload.",
+            "Do not invent input/output fields outside the tool contract.",
+            "Do not write files outside TOOL_OUTPUT_DIR unless the artifact policy allows it."
+          ],
+          "applies_to": {},
+          "code": "payload = {\n  \"pdf_path\": \"backend/samples/sample.pdf\",\n  \"output_md_path\": \"output/result.md\",\n  \"api_url\": \"https://api.mineru.com/parse\",\n  \"user_id\": \"user123\",\n  \"task_type\": \"pdf_to_md\"\n}\nresult = run_tool(payload)\nreturn result",
+          "description": "Converts a PDF file to Markdown format using the Mineru API.",
+          "expected_input_shape": {
+            "properties": {
+              "api_url": {
+                "description": "URL of the Mineru API endpoint.",
+                "format": "uri",
+                "type": "string"
+              },
+              "output_md_path": {
+                "description": "Path where the generated Markdown file will be saved.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "pdf_path": {
+                "contentMediaType": "application/pdf",
+                "description": "Path to the input PDF file.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "task_type": {
+                "description": "Type of task being performed.",
+                "type": "string"
+              },
+              "user_id": {
+                "description": "User identifier for the API request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pdf_path",
+              "output_md_path",
+              "api_url",
+              "user_id",
+              "task_type"
+            ],
+            "type": "object"
+          },
+          "expected_output_shape": {
+            "properties": {
+              "message": {
+                "description": "Additional information or error message.",
+                "type": "string"
+              },
+              "output_md_path": {
+                "description": "Path to the generated Markdown file.",
+                "format": "file-path",
+                "type": "string"
+              },
+              "status": {
+                "description": "Result status of the conversion.",
+                "enum": [
+                  "success",
+                  "failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "output_md_path"
+            ],
+            "type": "object"
+          },
+          "id": "pdf_to_md_mineru.generic_usage",
+          "kind": "minimal_usage",
+          "priority": 80,
+          "requires": [
+            "deterministic_execution"
+          ],
+          "return_rule": "Return the generated tool result directly; downstream modules should rely on output_io.schema.",
+          "title": "Use pdf_to_md_mineru",
+          "usage_policy": "self_implementation_allowed"
+        }
+      ],
+      "test_status": "passed",
+      "tool_type": "python_script",
+      "trial_mode": "mock",
+      "updated_at": "2026-07-01T06:46:26.641591+00:00",
+      "usage_policy": "self_implementation_allowed",
+      "validator_kind": "generic_python_script",
+      "version": "0.1.0"
     }
   ]
 }

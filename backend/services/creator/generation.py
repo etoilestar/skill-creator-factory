@@ -545,6 +545,33 @@ def _creator_kernel_reference_context() -> str:
     return "\n\n".join(chunks)
 
 
+
+
+def _command_argv_contract_for_script(file_path: str, blueprint_text: str, plan_entry: SkillPlanEntry) -> dict[str, Any]:
+    """Best-effort command argv contract for first-round script generation."""
+    command_template = _script_command_template(file_path, blueprint_text, plan_entry)
+    argv: dict[str, Any] = {}
+    try:
+        parts = shlex.split(command_template)
+    except Exception:
+        parts = []
+    for part in reversed(parts):
+        text = str(part or "").strip()
+        if not (text.startswith("{") and text.endswith("}")):
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            argv = parsed
+            break
+    return {
+        "command_template": command_template,
+        "argv_template": argv,
+        "argv_keys": sorted(str(key) for key in argv.keys()),
+    }
+
 def _script_local_contract_payload(
     *,
     file_path: str,
@@ -561,6 +588,7 @@ def _script_local_contract_payload(
     """
     canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
+    command_argv_contract = _command_argv_contract_for_script(file_path, "", plan_entry)
 
     available_tools: list[dict[str, Any]] = []
     tool_function_cards: list[str] = []
@@ -623,6 +651,7 @@ def _script_local_contract_payload(
         "platform_io_rules": platform_io_contract_prompt_text(),
         "coverage_requirements": (plan_entry.runtime_contract or {}).get("coverage_requirements", {}),
         "runtime_contract": plan_entry.runtime_contract or {},
+        "command_argv_contract": command_argv_contract,
         "runtime_envelope": {
             "description": (
                 "Creator/Skill runtime may provide a generic JSON argv envelope. "
@@ -827,6 +856,8 @@ def _build_script_generate_file_prompt_variant(
         "覆盖要求硬规则：如果声明 JSON + Markdown 等多种输出，stdout 必须包含对应非空字段，并至少包含 text/markdown/file_paths/file_outputs 等最终平台可消费字段之一。",
         "覆盖要求硬规则：SKILL.md command argv key 与 strict_json_argv_guard required keys 必须一致；不要把 input_file 自行改成 input_path，除非 command 同步传 input_path。",
         "覆盖要求硬规则：如果声明 reference_path 或 required reference read，脚本要么读取并消费它，要么把它作为 optional 并在 stdout/metadata 中说明其缺省不影响核心逻辑；不要 required 但不用。",
+        "覆盖要求边界：coverage_requirements 是职责约束，不是 argv/stdout 字段；禁止生成 coverage:*、covered:*、declared_requirement_terms 等伪运行时字段，禁止把 coverage terms 当成 strict_json_argv_guard required keys。",
+        "argv key 一致性硬规则：local_contract.command_argv_contract.argv_keys 是 SKILL.md command 已传入的脚本接口字段；strict_json_argv_guard required keys 必须优先采用这些 key。若内部变量名不同，在 run 内做转换，例如 input_path = args[\"input_file\"]；不得把 command 中的 input_file 自行改成 input_path，除非 SKILL.md command 同步传 input_path。",
         "raw role/capability 只能作为 hint，不能当硬合同。",
         "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑、标准库和 available_tools。",
         "available_tools 是基础能力候选，不是完整业务方案枚举；不要因为缺少某个专用工具就放弃实现当前脚本职责。",

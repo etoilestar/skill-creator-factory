@@ -644,10 +644,10 @@ async def _extract_requirement_graph_with_validator(
         text = await complete_chat_once(messages, route.model)
         data = parse_requirement_graph_result(text)
         if isinstance(data, dict) and "patches" not in data and "requirements" in data:
-            raise RequirementGraphValidationError(
-                "Requirement graph patch JSON must use patches format.",
-                code="validator_incomplete",
-            )
+            graph_from_validator = normalize_requirement_graph(data)
+            graph_from_validator.requirement_graph_source = "validator"
+            graph_from_validator.requirement_graph_quality = "full"
+            return validate_requirement_graph_schema(graph_from_validator, files_out)
         patches = data.get("patches", []) if isinstance(data, dict) else []
         if not isinstance(patches, list):
             raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
@@ -776,13 +776,11 @@ def _normalize_file_plan_for_requirement_coverage(
     final_outputs: list[Any] | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Ensure executable file plans carry declared requirement coverage.
+    """Attach declared requirement coverage as script responsibility metadata.
 
-    The pass may add scripts before workflow allocation. It does not know about
-    specific business fields; it compares declared terms from the confirmed
-    blueprint/review/final outputs to the scripts' purpose/input/output/runtime
-    contracts. A single script remains valid only if its contract explicitly
-    carries the full coverage requirements.
+    Coverage is a planning/generation constraint only. It must never be
+    converted into runtime argv/stdout fields, and this pass must not create
+    generic bridge scripts that hide real planning gaps.
     """
     warnings = warnings if warnings is not None else []
     review_text = ""
@@ -794,11 +792,13 @@ def _normalize_file_plan_for_requirement_coverage(
     scripts = [item for item in files_out if item.path.startswith("scripts/") and item.required]
     if not scripts:
         return
+
     covered_terms: set[str] = set()
     for item in scripts:
         text = _script_contract_text(item)
         covered_terms.update(term for term in declared_terms if term in text)
     missing_terms = [term for term in declared_terms if term not in covered_terms]
+
     coverage_requirements = {
         "declared_requirement_terms": declared_terms,
         "declared_input_sources": _coverage_terms_from_text(str(getattr(review_summary, "input", "") if review_summary else "")),
@@ -808,49 +808,36 @@ def _normalize_file_plan_for_requirement_coverage(
         "required_reference_reads": [item.path for item in files_out if item.path.startswith("references/")],
         "final_platform_output_obligations": [str(x) for x in (final_outputs or []) if str(x).strip()],
     }
-    if len(scripts) == 1:
-        script = scripts[0]
-        runtime_contract = dict(script.runtime_contract or {})
-        runtime_contract["coverage_requirements"] = coverage_requirements
-        if missing_terms:
-            runtime_contract["coverage_requirements"]["single_script_full_coverage_contract"] = True
-            script.runtime_contract = runtime_contract
-            additions = [f"coverage:{term}" for term in missing_terms if f"coverage:{term}" not in script.inputs and f"coverage:{term}" not in script.outputs]
-            script.inputs = list(dict.fromkeys(list(script.inputs or []) + additions[:20]))
-            script.outputs = list(dict.fromkeys(list(script.outputs or []) + [f"covered:{term}" for term in missing_terms[:20]]))
-            script.purpose = (script.purpose or "") + "\n覆盖合同：当前单脚本必须承担全部声明的输入来源、输入变体、核心处理动作、参考读取和输出义务；不得只实现其中一个窄分支。"
-            warnings.append({"severity": "info", "code": "single_script_full_coverage_contract", "source": "analyze_blueprint", "path": script.path, "field": "runtime_contract.coverage_requirements", "message": "Single required script was expanded with an explicit full-coverage contract.", "missing_terms": missing_terms[:20]})
-        else:
-            runtime_contract.setdefault("coverage_requirements", coverage_requirements)
-            script.runtime_contract = runtime_contract
-        return
+
+    single_script = len(scripts) == 1
+    if single_script:
+        coverage_requirements["single_script_full_coverage_contract"] = True
+
     for script in scripts:
         runtime_contract = dict(script.runtime_contract or {})
-        runtime_contract.setdefault("coverage_requirements", coverage_requirements)
+        runtime_contract["coverage_requirements"] = dict(coverage_requirements)
         script.runtime_contract = runtime_contract
+
+    if single_script:
+        warnings.append({
+            "severity": "info",
+            "code": "single_script_full_coverage_contract",
+            "source": "analyze_blueprint",
+            "path": scripts[0].path,
+            "field": "runtime_contract.coverage_requirements",
+            "message": "Single required script must satisfy the declared full-coverage responsibility contract; coverage is not an argv/stdout field.",
+            "missing_terms": missing_terms[:20],
+        })
     if missing_terms:
-        new_path = "scripts/cover_declared_requirements.py"
-        if not any(item.path == new_path for item in files_out):
-            files_out.append(FileSpecOut(
-                path=new_path,
-                generation_order=_generation_order_for_file(new_path, ""),
-                purpose="Coverage normalization script: bridge declared input/source/format/action/output obligations that were not explicitly owned by the existing executable plan.",
-                required=True,
-                can_skip=False,
-                file_type="script",
-                file_kind="script",
-                role="coverage_bridge",
-                component_hint="coverage_bridge",
-                inputs=[f"coverage:{term}" for term in missing_terms[:30]],
-                outputs=[f"covered:{term}" for term in missing_terms[:30]],
-                runtime_contract={"coverage_requirements": coverage_requirements, "decomposition_reason": "existing required scripts did not explicitly cover all declared requirement terms"},
-                language="python",
-                runtime="python",
-                entrypoint=new_path,
-                reason="deterministic coverage normalization before workflow allocation",
-                heuristic_signals=["requirement_coverage_normalization"],
-            ))
-            warnings.append({"severity": "info", "code": "coverage_decomposition_added_script", "source": "analyze_blueprint", "path": new_path, "field": "files", "message": "Added a generic coverage bridge script before workflow allocation.", "missing_terms": missing_terms[:20]})
+        warnings.append({
+            "severity": "planning_warning",
+            "code": "requirement_coverage_incomplete",
+            "source": "analyze_blueprint",
+            "path": "",
+            "field": "runtime_contract.coverage_requirements",
+            "missing_terms": missing_terms[:30],
+            "message": "File plan does not explicitly cover all declared requirement terms; planner should expand real script responsibilities or decompose into real workflow scripts.",
+        })
 
 async def _allocate_workflow_script_responsibilities(
     *,
@@ -909,6 +896,7 @@ async def _allocate_workflow_script_responsibilities(
             "如果下游脚本需要消费上游集合元素中的子字段（例如从某个 structured collection item 中读取 description/text/scene/metadata），这不是自动存在的 workflow 顶层变量。除非上游脚本明确把该字段作为 stdout 顶层输出，否则下游不能直接把它作为 input；若平台没有显式 loop/map/foreach 节点，遍历集合并提取子字段的责任必须落到某个脚本内部。\n"
             "workflow_allocation_summary、patch purpose、patch inputs、patch outputs 必须描述同一个全局责任合同；summary 不得继续描述被替换掉的旧脚本级 inputs/outputs。purpose 的来源必须与 patch inputs 字段名和粒度一致，purpose 的交付必须与 patch outputs 字段名和粒度一致，不得出现 outputs 与 purpose 中单复数/类型/字段名模糊或冲突。\n"
             "patch 默认只改当前脚本 purpose/final inputs/final outputs；如果当前职责调整影响直接上游或直接下游，可以同步 patch 相邻 required scripts 的 purpose/inputs/outputs，做最小联动。不要新增文件，不硬编码业务字段，不按字段名、文件名、role、单复数机械判断。\n"
+            "coverage_requirements 是职责约束，不是运行时 argv/stdout 字段；不得把 coverage:* 或 covered:* 写进 inputs/outputs，不得把 coverage bridge 当成真实 workflow step。coverage 不足时只能扩展真实脚本 purpose/contract，不能制造伪字段。\n"
             "workflow allocation patch 中的 inputs/outputs 表示 final inputs/final outputs；如果 patch 提供 inputs/outputs，默认替换原始 inputs/outputs，不再默认 append。只有明确设置 replace_inputs=false 或 replace_outputs=false 时才按 legacy append 兼容。需要把旧单项接口升级为整体/集合接口时，应提供 inputs/outputs 并保持默认替换，避免错误旧字段残留。\n"
             "只输出 compact patches；不要新增复杂结构。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
             "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[],\"replace_inputs\":true,\"replace_outputs\":true}]}"

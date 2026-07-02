@@ -2103,6 +2103,50 @@ def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill
         )
 
 
+
+
+def _e2e_argv_key_consistency_error(
+    *,
+    command: E2EWorkflowCommand,
+    content: str,
+    entry: SkillPlanEntry,
+) -> str | None:
+    """Deterministic argv contract smoke for obvious command/guard mismatches."""
+    if entry.runtime != "python":
+        return None
+    if not command.argv_template:
+        return None
+    try:
+        schema = extract_python_strict_argv_schema(content)
+    except Exception:
+        return None
+    required = {str(key) for key in (schema.get("required_keys") or []) if str(key or "").strip()}
+    allowed_raw = schema.get("allowed_keys")
+    allowed = {str(key) for key in (allowed_raw or []) if str(key or "").strip()} if allowed_raw is not None else set()
+    command_keys = {str(key) for key in (command.argv_template or {}).keys() if str(key or "").strip()}
+    if not required or not command_keys:
+        return None
+    generic_keys = {"payload", "input", "user_request", "fields", "options", "files", "input_files", "resources"}
+    missing_required = sorted(required - command_keys)
+    # If the command intentionally passes a generic envelope, the script can
+    # derive local fields internally; only block the clear renamed-key case.
+    if not missing_required or command_keys & generic_keys:
+        return None
+    unknown_command = sorted(command_keys - allowed) if allowed else []
+    return _e2e_error(
+        target=command.script_path,
+        layer="argv_schema_error",
+        message=(
+            f"第 {command.ordinal} 步 {command.script_path} 的 SKILL.md command argv keys 与脚本 strict_json_argv_guard required keys 明显不一致。\n"
+            f"command_argv_keys={sorted(command_keys)}\n"
+            f"script_required_keys={sorted(required)}\n"
+            f"script_allowed_keys={sorted(allowed) if allowed else '(unbounded)'}\n"
+            f"missing_required_from_command={missing_required}\n"
+            f"unknown_command_keys={unknown_command}\n"
+            "如果 command 传 input_file，脚本 guard/run 不得自行要求 input_path；应使用 command 已传 key，或同步修 SKILL.md command。"
+        ),
+    )
+
 def _validate_e2e_command_static(
     *,
     command: E2EWorkflowCommand,
@@ -2150,6 +2194,14 @@ def _validate_e2e_command_static(
                 message=f"第 {command.ordinal} 步 {command.script_path} 静态合同失败：{exc}",
             )
         ) from exc
+
+    argv_consistency_error = _e2e_argv_key_consistency_error(
+        command=command,
+        content=content,
+        entry=entry,
+    )
+    if argv_consistency_error:
+        raise ValueError(argv_consistency_error)
 
     return entry
 

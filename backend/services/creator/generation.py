@@ -621,6 +621,8 @@ def _script_local_contract_payload(
         },
         "platform_io_contract": build_platform_io_contract(),
         "platform_io_rules": platform_io_contract_prompt_text(),
+        "coverage_requirements": (plan_entry.runtime_contract or {}).get("coverage_requirements", {}),
+        "runtime_contract": plan_entry.runtime_contract or {},
         "runtime_envelope": {
             "description": (
                 "Creator/Skill runtime may provide a generic JSON argv envelope. "
@@ -819,7 +821,12 @@ def _build_script_generate_file_prompt_variant(
         "硬性 argv guard 规则：骨架 spec 中的 input_text 只是示例，必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
-        "只根据轻量上下文实现：script_goal、inputs、outputs、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
+        "只根据轻量上下文实现：script_goal、inputs、outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
+        "覆盖要求硬规则：如果 local_contract.coverage_requirements 声明了输入来源、输入格式、核心动作、输出变体、参考读取或最终平台输出义务，当前脚本必须在自己的职责范围内实际读取/处理/产出这些义务；单脚本 full-coverage contract 必须覆盖全部声明能力。",
+        "覆盖要求硬规则：声明支持多个输入变体时，不要只实现其中一个窄分支；应使用通用分发/解析逻辑，或在当前脚本职责中清楚交付可执行覆盖。",
+        "覆盖要求硬规则：如果声明 JSON + Markdown 等多种输出，stdout 必须包含对应非空字段，并至少包含 text/markdown/file_paths/file_outputs 等最终平台可消费字段之一。",
+        "覆盖要求硬规则：SKILL.md command argv key 与 strict_json_argv_guard required keys 必须一致；不要把 input_file 自行改成 input_path，除非 command 同步传 input_path。",
+        "覆盖要求硬规则：如果声明 reference_path 或 required reference read，脚本要么读取并消费它，要么把它作为 optional 并在 stdout/metadata 中说明其缺省不影响核心逻辑；不要 required 但不用。",
         "raw role/capability 只能作为 hint，不能当硬合同。",
         "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑、标准库和 available_tools。",
         "available_tools 是基础能力候选，不是完整业务方案枚举；不要因为缺少某个专用工具就放弃实现当前脚本职责。",

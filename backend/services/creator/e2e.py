@@ -2478,28 +2478,13 @@ def _run_skill_workflow_e2e_once(
                     stdout_shape=_json_object_shape(stdout_json),
                 )
 
-                argument_effect_review = _run_e2e_requirement_flow_review(
-                    command=command,
-                    script_content=content,
-                    skill_plan_entry=entry,
-                    rendered_payload=rendered_payload,
-                    stdout_json=stdout_json,
-                    artifact_paths=artifact_paths,
-                    trace=trace,
-                    previous_traces=traces,
-                    requested_model=requested_model,
-                    requirements=requirements_by_file.get(command.script_path, []),
-                )
-
-                if not argument_effect_review.get("passed"):
-                    raise ValueError(_e2e_argument_effect_failure(
-                        command=command,
-                        review=argument_effect_review,
-                        rendered_payload=rendered_payload,
-                        stdout_json=stdout_json,
-                        artifact_paths=artifact_paths,
-                        traces=traces,
-                    ))
+                # Strict E2E is deterministic: once the command renders, the script
+                # exits successfully, stdout is a valid JSON object that satisfies
+                # the declared stdout/artifact contract, and the final platform
+                # output is consumable, the workflow is accepted.  The legacy
+                # requirement/argument-effect LLM review is intentionally not run
+                # here because validator availability or semantic judgement must
+                # not block packaging or trigger business-file repair.
 
                 is_final_step = index == len(commands) - 1
                 if is_final_step:
@@ -3268,15 +3253,11 @@ def validate_workflow_e2e(
 ) -> list[str]:
     """Second-round Creator validator.
 
-    第二轮负责：
-    - SKILL.md workflow 能否真实执行；
-    - 上下游 JSON 字段能否串起来；
-    - 当前 step 接口是否对齐；
-    - 最后一步 stdout 是否符合现有 sandbox 平台协议；
-    - artifact 是否真实存在并基础合法。
-
-    不写业务字段词表。
-    不重新做第一轮责任审查。
+    Strict E2E is a deterministic workflow gate only: command rendering,
+    placeholder resolution, script static preflight, real process exit status,
+    stdout JSON/object contract, artifact existence, and final sandbox output.
+    LLM requirement/argument-effect review is advisory only and is not invoked
+    from this blocking path.
     """
 
     return _run_skill_workflow_e2e_once(

@@ -1,4 +1,7 @@
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import pytest
 
 from backend.services.creator.command_normalizer import (
     canonicalize_skill_md_runtime_commands,
@@ -248,3 +251,91 @@ After
     assert not second.changed
     assert not second.blocked
     assert second.content == first.content
+
+
+@pytest.mark.asyncio
+async def test_e2e_command_normalizer_blocked_falls_back_to_model_repair(tmp_path, monkeypatch):
+    from backend.services.creator import e2e
+    from backend.services.creator.command_normalizer import CommandFormatIssue, CommandNormalizationResult
+
+    skill_name = "blocked-fallback-skill"
+    skill_dir = tmp_path / skill_name
+    (skill_dir / "scripts").mkdir(parents=True)
+    bad_skill_md = """---
+name: Test Skill
+description: Test.
+---
+# Test Skill
+
+```bash
+python scripts/run.py --input __RUNTIME_INPUT_FILE__
+```
+"""
+    fixed_skill_md = """---
+name: Test Skill
+description: Test.
+---
+# Test Skill
+
+```bash
+python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
+```
+"""
+    (skill_dir / "SKILL.md").write_text(bad_skill_md, encoding="utf-8")
+    (skill_dir / "scripts" / "run.py").write_text("print('{}')\n", encoding="utf-8")
+
+    monkeypatch.setattr(e2e.settings, "skills_path", tmp_path)
+    issue = CommandFormatIssue(
+        "missing_command_arg_binding",
+        "required argv keys have no explicit binding",
+        "scripts/run.py",
+        {"missing_keys": ["input_file"], "available_contract_sources": ["runtime_spec.script_argv_schema"]},
+    )
+    monkeypatch.setattr(
+        e2e,
+        "_normalize_skill_md_runtime_commands_for_e2e",
+        lambda **kwargs: CommandNormalizationResult(False, kwargs["skill_md"], [issue], True),
+    )
+    monkeypatch.setattr(e2e, "route_creator_file_model", lambda **kwargs: SimpleNamespace(model="test-model"))
+    monkeypatch.setattr(e2e, "_log_creator_model_usage", lambda **kwargs: None)
+
+    captured = {}
+
+    async def fake_request_and_apply_repair_patch(**kwargs):
+        captured.update(kwargs)
+        return None, fixed_skill_md, {
+            "changed_line_count": 1,
+            "generated_diff_excerpt": "python scripts/run.py '{...}'",
+            "applied": [{"fallback_type": "none"}],
+        }
+
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_request_and_apply_repair_patch)
+    monkeypatch.setattr(
+        e2e,
+        "_run_e2e_sandbox_acceptance_gate",
+        lambda **kwargs: {"accepted": True, "errors": [], "phase": "e2e_sandbox"},
+    )
+
+    repair_events = []
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name=skill_name,
+        target_path="SKILL.md",
+        e2e_errors=[
+            "E2E_REPAIR_TARGET=SKILL.md\nE2E_LAYER=runtime_command_invalid\ncommand must pass exactly one JSON argv object"
+        ],
+        repair_events=repair_events,
+    )
+
+    assert result["status"] == "repaired"
+    assert any(event.get("type") == "command_normalizer_blocked_fallback_to_model" for event in repair_events)
+    assert "command_normalizer_blocked" in captured["failure_text"]
+    assert "missing_command_arg_binding" in captured["task_context"]
+    assert "command_normalizer_blocked" in captured["task_context"]
+    assert "一个单引号包住的 JSON argv 参数" in captured["target_rule"]
+    assert "禁止未加引号 JSON" in captured["target_rule"]
+    assert "禁止 --key value 风格" in captured["target_rule"]
+
+    repaired = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    block = parse_skill_md_bash_command_blocks(repaired)[0]
+    assert validate_runtime_command_format(block.content) == []
+    assert block.content == "python scripts/run.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'"

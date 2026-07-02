@@ -9,6 +9,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
+from .upload_context import save_creator_context_upload
 
 _VALIDATOR_ONLY_LAYERS = {
     "e2e_requirement_validator_error",
@@ -419,8 +420,17 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 - 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充；如果用户选择“没有，按上面的选择继续”，且其他阻塞点已解决，才可以 ready。
 - 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
 - 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
+- 文件数量只在 prepare-plan 蓝图阶段决定；蓝图通过后不得新增、删除、拆分或合并脚本文件。
+- 不默认单脚本，也不按自然语言步骤机械增加脚本；脚本数量必须来自任务复杂度、工具边界、输入输出合同、可验证中间产物。
+- 原子任务或高度耦合任务可用 1 个脚本；存在清晰阶段边界、不同工具族、不同产物类型、解析-生成-构建链路、fanout/aggregate 边界时应拆为多个脚本。
+- 当前平台没有显式 loop/map/foreach 节点；批量、逐项、顺序映射和聚合交付必须由某个脚本内部承担。
+- uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets；先判断 reference_only/runtime_input/asset_candidate。没有用户明确确认“固定加入 Skill assets”不得写入 assets/**。
+- 如果上传文件用途不明确，必须追问并区分：只作为本次创建参考、作为未来运行 Skill 的输入、固定加入 Skill assets。
 - assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
 - 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path；目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。
+- 需要使用已有工具时，脚本必须写 required_tool_slots 或 selected_tools；不要只依赖 required_capabilities。reference 文件和 asset 文件不得声明运行时工具能力。
+- 当 uploaded_files 的 candidate_tools 包含 vision_understanding 且需求需要理解图片内容时，应在脚本中声明 required_tool_slots: [vision_understanding] 或 selected_tools: [vision_understanding]；不要只写 required_capabilities。
+- 上传图片需要理解内容时使用 vision_understanding，不要要求用户手动描述图片，不要把图像理解误当 image_generation，不要把上传图片默认加入 assets。
 """
     payload = {
         "mode": request.mode,
@@ -1746,6 +1756,23 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         blueprint_refined=False,
     )
 
+
+
+@router.post("/upload-context-file")
+async def upload_context_file(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Persist a Creator planning context upload without touching Skill assets."""
+    try:
+        return save_creator_context_upload(
+            fileobj=file.file,
+            filename=file.filename or "upload",
+            session_id=session_id,
+            mime_type=file.content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/init-skill", response_model=InitSkillResponse)
 async def init_skill(request: InitSkillRequest):

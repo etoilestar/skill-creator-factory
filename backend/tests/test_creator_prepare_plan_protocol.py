@@ -352,3 +352,86 @@ def test_legacy_choice_line_prevents_question_option_b_from_overriding_a():
     request = _request(human_feedback=feedback)
     assert api._prepare_user_confirmed_no_more_supplement(request)
     assert not api._prepare_feedback_wants_supplement(request)
+
+
+def _file(path, *, asset_source=""):
+    return FileSpecOut(path=path, purpose="test", required=True, can_skip=False, asset_source=asset_source)
+
+
+@pytest.mark.asyncio
+async def test_ready_syncs_review_summary_files_from_skill_plan_references(monkeypatch):
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": _ready_blueprint(),
+            "review_summary": {"files_to_create_or_update": ["SKILL.md", "scripts/process.py"]},
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[_file("SKILL.md"), _file("scripts/process.py"), _file("references/output-patterns.md")],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=_ready_blueprint(),
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(_request(human_feedback="A. 没有，按上面的选择继续"))
+
+    assert resp.status == "ready"
+    assert resp.review_summary.files_to_create_or_update == ["SKILL.md", "scripts/process.py", "references/output-patterns.md"]
+    assert [f.path for f in resp.files] == ["SKILL.md", "scripts/process.py", "references/output-patterns.md"]
+
+
+@pytest.mark.asyncio
+async def test_ready_does_not_add_summary_hallucinated_file_to_execution_plan(monkeypatch):
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": _ready_blueprint(),
+            "review_summary": {"files_to_create_or_update": ["SKILL.md", "scripts/extra.py"]},
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[_file("SKILL.md")],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=_ready_blueprint(),
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(_request(human_feedback="A. 没有，按上面的选择继续"))
+
+    assert resp.status == "ready"
+    assert resp.review_summary.files_to_create_or_update == ["SKILL.md"]
+    assert [f.path for f in resp.files] == ["SKILL.md"]
+    assert any(w.get("code") == "summary_files_not_in_skill_plan" and "scripts/extra.py" in w.get("files", []) for w in resp.warnings)
+
+
+def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
+    summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
+    warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [
+        _file("SKILL.md"),
+        _file("scripts/"),
+        _file("references/"),
+        _file("assets/"),
+        _file("scripts/${name}.py"),
+        _file("references/[file].md"),
+        _file("assets/logo.png"),
+        _file("assets/bundled.png", asset_source="bundled"),
+        _file("references/output-patterns.md"),
+    ])
+
+    assert warnings == []
+    assert summary.files_to_create_or_update == ["SKILL.md", "assets/bundled.png", "references/output-patterns.md"]
+    assert "scripts/" not in summary.files_to_create_or_update
+    assert "references/" not in summary.files_to_create_or_update
+    assert "assets/" not in summary.files_to_create_or_update
+    assert not any("${" in path or "[" in path for path in summary.files_to_create_or_update)

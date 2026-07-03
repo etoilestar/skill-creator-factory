@@ -16,6 +16,7 @@ from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_s
 from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
 from .tool_pool_builder import build_tool_pool
 from .runtime_import_guard import guard_runtime_imports
+from .basic_format import check_patch_candidate_basic_format
 
 _NOT_SUPPORTED_MARKERS = (
     "not supported in current implementation",
@@ -26,6 +27,29 @@ _DECLARED_FORMAT_TOKENS = {
     "docx": ("docx", ".docx", "word document"),
     "txt": ("txt", ".txt", "plain text"),
 }
+
+
+def _post_patch_basic_format_stage_error(file_path: str, content: str) -> FileGenerationStageError | None:
+    """Coarse post-patch candidate check; intentionally excludes tools/argv/stdout/E2E/business semantics."""
+    failure = check_patch_candidate_basic_format(file_path, content)
+    if failure is None:
+        return None
+    return FileGenerationStageError(
+        source="basic_format",
+        layer=failure.coarse_failure_kind,
+        detail=failure.to_failure_text(),
+    )
+
+
+def _basic_format_repair_feedback(stage_error: FileGenerationStageError) -> str:
+    detail = str(getattr(stage_error, "detail", "") or "")
+    return (
+        "BASIC_FORMAT_PATCH_STAGE\n"
+        "当前失败只表示 patch 后文件基础格式不合法。\n"
+        f"{detail}\n"
+        "不要修改工具选择。不要修改 argv schema。不要修改 stdout 字段。不要修改业务职责。"
+        "只把当前候选修成合法源码/合法 Markdown。"
+    )
 
 
 def _entry_text_for_declared_support(skill_plan_entry: Any) -> str:
@@ -4085,7 +4109,13 @@ async def generate_file(request: GenerateFileRequest):
                         attempt=attempt,
                     )
 
-                    if (
+                    if error_source == "basic_format" or stage_error.layer in {"python_compile_error", "markdown_basic_format_error"}:
+                        feedback = _basic_format_repair_feedback(stage_error)
+                        passed_checks_text = ""
+                        failed_checks_text = feedback
+                        contract_text = ""
+                        targeted_repair = "只修复当前候选的基础源码/Markdown 格式，不处理工具、argv、stdout、E2E 或业务职责。"
+                    elif (
                         error_source in {"script_requirement_failed", "script_functional", "script_responsibility"}
                         and request.file_path.startswith("scripts/")
                     ):
@@ -4169,6 +4199,12 @@ async def generate_file(request: GenerateFileRequest):
                         skill_name=skill_name,
                         purpose=request.purpose,
                     )
+                    basic_format_stage_error = _post_patch_basic_format_stage_error(request.file_path, repaired_candidate)
+                    if basic_format_stage_error is not None:
+                        candidate = repaired_candidate
+                        stage_error = basic_format_stage_error
+                        deterministic_error = _basic_format_repair_feedback(basic_format_stage_error)
+                        continue
 
                 except Exception as repair_exc:
                     if (
@@ -4312,6 +4348,12 @@ async def generate_file(request: GenerateFileRequest):
                         skill_name=skill_name,
                         purpose=request.purpose,
                     )
+                    basic_format_stage_error = _post_patch_basic_format_stage_error(request.file_path, repaired_candidate)
+                    if basic_format_stage_error is not None:
+                        candidate = repaired_candidate
+                        stage_error = basic_format_stage_error
+                        deterministic_error = _basic_format_repair_feedback(basic_format_stage_error)
+                        continue
 
                 candidate = repaired_candidate
 

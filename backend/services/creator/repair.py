@@ -1448,6 +1448,9 @@ async def _request_repair_diff_proposal(
                 "本轮只允许修复 target_file。\n"
                 "不要新增文件、删除文件、修改其它文件。\n"
                 "不要在 Creator repair 层重新定义平台 IO。"
+                "收到 basic_format/python_compile_error/markdown_basic_format_error 时，只修格式；"
+                "不要修改工具选择、argv schema、stdout 字段或业务职责。"
+                "只有 sandbox/E2E 错误才修 workflow/argv/stdout/artifact 链路。"
                 "平台兼容性会由后续 sandbox / smoke / E2E 真实试运行判断。\n"
             ),
         },
@@ -1849,7 +1852,7 @@ async def _repair_generated_file_with_feedback(
                 failure_layer=_failure_layer_from_error_text(validation_error),
                 error_text=validation_error,
                 include_snippets=True,
-                rediscover_for_repair=True,
+                rediscover_for_repair=False,
                 repair_context={
                     "target_file": file_path,
                     "script_content": current_content,
@@ -1884,6 +1887,8 @@ async def _repair_generated_file_with_feedback(
 
         target_rule = (
             "第一轮单文件修复。\n"
+            "如果 failure_text/coarse_failure_kind 是 basic_format/python_compile_error/markdown_basic_format_error，"
+            "只修当前候选基础格式；不要修改工具选择、argv schema、stdout 字段或业务职责。\n"
             "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
             "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
             "优先使用 Current File Tool Binding 绑定的 helper；没有可用 helper 时用当前脚本本地逻辑、Python 标准库或已允许/已安装的安全依赖实现职责，不要猜 runtime_tools 函数。\n"

@@ -3563,6 +3563,9 @@ async def _repair_existing_file_for_e2e_failure(
         target_file=target_path,
         max_changed_lines=220,
         notes=(
+            "第二轮最多 10 轮，始终使用 localized_patch，不会因普通 E2E 失败切 full_file_rewrite。",
+            "patch 后会先做 basic format/compile check；通过只代表文件合法，不代表 E2E 通过。",
+            "basic format 错误只修格式；sandbox E2E 错误才修 workflow / argv / stdout / artifact 链路。",
             "第二轮只修 workflow / cross-step IO / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
@@ -3584,7 +3587,7 @@ async def _repair_existing_file_for_e2e_failure(
             failure_layer=_failure_layer_from_error_text(deterministic_error),
             error_text=deterministic_error,
             include_snippets=True,
-            rediscover_for_repair=True,
+            rediscover_for_repair=False,
             repair_context={
                 "target_file": target_path,
                 "script_content": (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8", errors="replace"),
@@ -3718,7 +3721,7 @@ async def _repair_existing_file_for_e2e_failure(
                             failure_layer=None,
                             error_text=None,
                             include_snippets=True,
-                            rediscover_for_repair=True,
+                            rediscover_for_repair=False,
                             repair_context={
                                 "target_file": target_path,
                                 "script_content": current_content,
@@ -3799,7 +3802,17 @@ async def _repair_existing_file_for_e2e_failure(
                 e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
                 consecutive_format_regressions += 1
                 if consecutive_format_regressions >= 3:
-                    return E2EValidationResult(success=False, errors=[last_failure], warnings=[], artifacts={}, debug={"stop_reason": "basic_format_failed"})
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {
+                        "status": "still_failed_same_target",
+                        "repaired_target": target_path,
+                        "next_target": None,
+                        "next_failure": [last_failure],
+                        "last_failure": last_failure,
+                        "attempt": candidate_attempt,
+                        "error_type": "basic_format_failed",
+                    }
                 continue
             consecutive_format_regressions = 0
 
@@ -3851,7 +3864,7 @@ async def _repair_existing_file_for_e2e_failure(
                 "repair_key": repair_key,
                 "repair_mode": "localized_patch",
                 "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
-                "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "same_target_still_failed",
+                "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "e2e_still_failed",
                 "status": "repaired" if sandbox_gate.get("accepted") else "same_target_still_failed",
                 "changed_line_count": diff_stats.get("changed_line_count"),
                 "diff_excerpt": diff_stats.get("generated_diff_excerpt"),

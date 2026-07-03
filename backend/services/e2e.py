@@ -1970,18 +1970,76 @@ def _argv_value_shape(value: Any) -> str:
 
 
 
-def _python_run_main_read_keys(content: str) -> set[str]:
-    """Best-effort keys actually read from parsed argv in run/main code.
+def _python_run_args_analysis(content: str) -> dict[str, Any]:
+    """Best-effort AST analysis for the script's run(args) body only.
 
-    This is intentionally generic and business-word agnostic: it only detects
-    literal string keys used with common argv/payload variables.
+    Required interface mismatches should be inferred from required reads like
+    args["key"], not optional reads such as args.get("key"). parse_args/main
+    may read sys.argv to parse the initial JSON; sys.argv reads inside run(args)
+    are a script interface error.
     """
-    keys: set[str] = set()
-    for match in re.finditer(r"(?:argv|args|payload|data|params|input_data)\s*\.\s*get\(\s*['\"]([^'\"]+)['\"]", content or ""):
-        keys.add(match.group(1))
-    for match in re.finditer(r"(?:argv|args|payload|data|params|input_data)\s*\[\s*['\"]([^'\"]+)['\"]\s*\]", content or ""):
-        keys.add(match.group(1))
-    return keys
+    result: dict[str, Any] = {
+        "required_read_keys": [],
+        "optional_read_keys": [],
+        "reads_sys_argv": False,
+    }
+    try:
+        tree = ast.parse(content or "")
+    except SyntaxError:
+        return result
+
+    run_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            run_node = node
+            break
+    if run_node is None or not run_node.args.args:
+        return result
+
+    arg_names = {run_node.args.args[0].arg}
+    # Common aliases inside run(args): payload = args
+    for node in ast.walk(run_node):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    arg_names.add(target.id)
+
+    required: set[str] = set()
+    optional: set[str] = set()
+    reads_sys_argv = False
+    for node in ast.walk(run_node):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "argv"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            reads_sys_argv = True
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            key_node = node.slice
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                required.add(key_node.value)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in arg_names
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            optional.add(node.args[0].value)
+
+    result["required_read_keys"] = sorted(required)
+    result["optional_read_keys"] = sorted(optional)
+    result["reads_sys_argv"] = reads_sys_argv
+    return result
+
+
+def _python_run_main_read_keys(content: str) -> set[str]:
+    """Compatibility wrapper returning required run(args) reads only."""
+    return set(_python_run_args_analysis(content).get("required_read_keys") or [])
 
 def _classify_argv_schema_failure(
     *,
@@ -2001,63 +2059,51 @@ def _classify_argv_schema_failure(
     optional = schema.get("optional_keys")
     defaulted = schema.get("defaulted_keys")
     expected_types = schema.get("expected_types") or {}
+    has_guard = "strict_json_argv_guard" in (content or "") or allowed is not None or required is not None
     failed_keys = _extract_failed_argv_keys(f"{stderr}\n{stdout}")
     received_keys = sorted(str(key) for key in (rendered_payload or {}).keys())
     command_argv_keys = sorted(str(key) for key in (command.argv_template or {}).keys())
     semantic_inputs = sorted(str(key) for key in (getattr(entry, "inputs", []) or []) if str(key or "").strip())
-    semantic_set = set(semantic_inputs)
-    run_read_keys = sorted(_python_run_main_read_keys(content)) if entry.runtime == "python" else []
+    run_analysis = _python_run_args_analysis(content) if entry.runtime == "python" else {"required_read_keys": [], "optional_read_keys": [], "reads_sys_argv": False}
+    run_required_keys = sorted(str(key) for key in (run_analysis.get("required_read_keys") or []))
+    run_optional_keys = sorted(str(key) for key in (run_analysis.get("optional_read_keys") or []))
+    run_read_keys = sorted(set(run_required_keys) | set(run_optional_keys))
+    run_reads_sys_argv = bool(run_analysis.get("reads_sys_argv"))
+    allowed_set = set(str(key) for key in (allowed or []) if str(key or "").strip()) if allowed is not None else set()
     required_set = set(str(key) for key in (required or []) if str(key or "").strip())
-    guard_run_mismatch = bool(required_set and run_read_keys and not required_set.issubset(set(run_read_keys)))
+    run_required_set = set(run_required_keys)
+    run_reads_guard_undeclared = bool(allowed is not None and run_required_set - allowed_set)
+    guard_required_unconsumed = bool(required_set and not required_set.issubset(run_required_set | set(run_optional_keys)))
+    guard_run_mismatch = run_reads_guard_undeclared or guard_required_unconsumed or run_reads_sys_argv or not has_guard
 
-    primary_target = ""
-    target_reason = ""
+    script_reasons: list[str] = []
+    if not has_guard:
+        script_reasons.append("script has no strict_json_argv_guard call")
+    if run_reads_sys_argv:
+        script_reasons.append("run(args) reads sys.argv/json argv internally")
+    if run_reads_guard_undeclared:
+        script_reasons.append("run(args) reads keys that strict_json_argv_guard did not declare")
+    if guard_required_unconsumed:
+        script_reasons.append("strict_json_argv_guard required keys are not consumed by run(args)")
+
+    default_skill_md_kinds = {"unknown_key", "missing_required", "invalid_type", "empty_required", "non_object_argv", "missing_json_argv"}
+    primary_target = "SKILL.md" if kind in default_skill_md_kinds else "SKILL.md"
+    target_reason = "SKILL.md command JSON argv does not match the current script entry strict_json_argv_guard spec."
     if kind in {"non_object_argv", "missing_json_argv"}:
-        primary_target = "SKILL.md"
-        target_reason = "SKILL.md command did not provide a JSON object argv."
-    elif kind == "empty_required":
-        if guard_run_mismatch:
-            primary_target = command.script_path
-            target_reason = "Script marked an optional/default/config-style parameter as required, but run/main does not read all required guard keys."
-        else:
-            primary_target = "SKILL.md"
-            target_reason = "SKILL.md command rendered an empty required argv value from an unresolved placeholder or missing upstream/platform input."
+        target_reason = "SKILL.md command did not provide exactly one JSON object argv."
     elif kind == "unknown_key":
-        if failed_keys and run_read_keys and any(key in set(run_read_keys) for key in failed_keys):
-            primary_target = command.script_path
-            target_reason = "run/main reads keys that strict_json_argv_guard omitted from allowed schema."
-        elif failed_keys and allowed is not None and all(key not in (allowed or []) for key in failed_keys):
-            primary_target = "SKILL.md"
-            target_reason = "SKILL.md command passed keys outside the script allowed schema."
-        else:
-            target_reason = "Unable to determine whether SKILL.md over-sent argv keys or the script schema under-declared semantic parameters."
+        target_reason = "SKILL.md command passed argv keys outside the script strict_json_argv_guard spec."
     elif kind == "missing_required":
-        if guard_run_mismatch:
-            primary_target = command.script_path
-            target_reason = "Script strict_json_argv_guard required keys do not match keys actually read by run/main; script interface is not self-consistent."
-        elif failed_keys and all(key not in rendered_payload for key in failed_keys):
-            primary_target = "SKILL.md"
-            target_reason = (
-                "Script interface appears self-consistent, and missing required argv key is absent from the rendered SKILL.md command payload; "
-                "prefer repairing the current SKILL.md command JSON argv to align with the generated script."
-            )
-        else:
-            target_reason = "Unable to determine whether SKILL.md omitted a required semantic input or the script required schema is too broad."
+        target_reason = "SKILL.md command omitted required keys declared by the script strict_json_argv_guard spec."
     elif kind == "invalid_type":
-        if failed_keys and any(key in rendered_payload for key in failed_keys):
-            primary_target = "SKILL.md"
-            target_reason = "SKILL.md command rendered values whose JSON types do not match the script schema."
-        else:
-            target_reason = "Unable to determine whether SKILL.md sent the wrong JSON type or the script EXPECTED_TYPES is wrong."
+        target_reason = "SKILL.md command rendered argv values whose JSON types do not match the script strict_json_argv_guard spec."
+    elif kind == "empty_required":
+        target_reason = "SKILL.md command rendered an empty value for a key required by the script strict_json_argv_guard spec."
 
-    uncertain = "Unable to determine" in target_reason
-    if not primary_target:
-        primary_target = "SKILL.md"
-        if not target_reason:
-            target_reason = "Uncertain argv schema attribution; prefer repairing SKILL.md command JSON argv unless script self-inconsistency is proven."
-        elif uncertain:
-            target_reason += " Prefer repairing SKILL.md command JSON argv first; do not blindly modify the generated script."
-    cross_alignment_probe = kind == "missing_required" and primary_target == "SKILL.md"
+    if script_reasons:
+        primary_target = command.script_path
+        target_reason = "; ".join(script_reasons) + "."
+
     return {
         "argv_schema_error_kind": kind,
         "received_keys": received_keys,
@@ -2068,12 +2114,16 @@ def _classify_argv_schema_failure(
         "expected_types": expected_types,
         "command_argv_keys": command_argv_keys,
         "skill_plan_inputs": semantic_inputs,
-        "advisory_notes": ["SkillPlan/RequirementGraph recommended inputs are advisory evidence only and did not determine primary_target."],
+        "advisory_notes": ["Field differences are diagnostics only; strict_json_argv_guard(payload, spec) is the script entry interface fact."],
         "script_run_read_keys": run_read_keys,
+        "script_run_required_read_keys": run_required_keys,
+        "script_run_optional_read_keys": run_optional_keys,
+        "script_run_reads_sys_argv": run_reads_sys_argv,
+        "script_has_strict_json_argv_guard": has_guard,
         "script_guard_run_mismatch": guard_run_mismatch,
         "failed_keys": failed_keys,
         "primary_target": primary_target,
-        "candidate_targets": ["SKILL.md", command.script_path] if (uncertain or cross_alignment_probe) else [primary_target],
+        "candidate_targets": [primary_target],
         "target_reason": target_reason,
         "rendered_payload_shape": {str(key): _argv_value_shape(value) for key, value in (rendered_payload or {}).items()},
         "previous_trace_summary": [],
@@ -2082,25 +2132,33 @@ def _classify_argv_schema_failure(
 
 def _argv_schema_repair_instruction(script_path: str, details: dict[str, Any]) -> str:
     primary = str(details.get("primary_target") or "")
-    candidate_targets = details.get("candidate_targets") or ["SKILL.md", script_path]
     target_reason = str(details.get("target_reason") or "")
+    diagnostics = {
+        "argv_schema_error_kind": details.get("argv_schema_error_kind"),
+        "failed_keys": details.get("failed_keys"),
+        "received_keys": details.get("received_keys"),
+        "allowed_keys": details.get("allowed_keys"),
+        "required_keys": details.get("required_keys"),
+        "optional_keys": details.get("optional_keys"),
+        "expected_types": details.get("expected_types"),
+        "command_argv_keys": details.get("command_argv_keys"),
+        "script_run_required_read_keys": details.get("script_run_required_read_keys"),
+        "script_run_optional_read_keys": details.get("script_run_optional_read_keys"),
+        "script_run_reads_sys_argv": details.get("script_run_reads_sys_argv"),
+        "script_has_strict_json_argv_guard": details.get("script_has_strict_json_argv_guard"),
+    }
     common = (
         f"argv_schema_error 归因：{target_reason}\n"
-        f"candidate_targets={candidate_targets}。strict_json_argv_guard 是接口不对齐探针，不是默认修复目标；"
-        "E2E 阶段以已经生成的 script 为主要接口事实，SKILL.md command block 是 orchestration 描述；"
-        "如果 script 自身接口自洽而 SKILL.md command argv 不一致，优先修 SKILL.md 当前失败 command JSON argv。"
-        "missing_required keys 时优先修 SKILL.md command JSON argv 或 graph/command binding，传齐脚本 required keys；不要让脚本为了适配错误 SKILL.md 把 required schema 改成泛化 payload。"
-        "如果 command argv 对图谱标记为 dynamic 的输入使用 literal runtime data，target_file=SKILL.md 或 graph/command binding，改为图谱边派生的占位符。"
-        "只有 script 语法/导入/入口/JSON argv 读取、guard 与 run/main 读取字段不一致、未消费正确字段、stdout/artifact 输出错误时才改 script。"
-        "禁止只改 guard schema 或只 patch guard spec；不得为了适配错误 SKILL.md command 而重命名脚本接口。"
-        "不能通过删除参数、删除业务参数或删除功能分支降低功能覆盖面；不强制固定字段常量名；"
-        "required 参数不能靠默认值兜底，optional/defaulted 参数必须由脚本 schema 明确声明。"
+        "strict_json_argv_guard(payload, spec) 是当前脚本入口接口事实；"
+        "command_argv_keys/script_required_keys 仅作 diagnostics，不作为主提示或新合同。\n"
+        f"diagnostics={json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str)}\n"
+        "不得新增独立 canonical argv contract；不得因为 SKILL.md block 写错字段而让 script guard 迁就 block；禁止只改 guard schema；不要只修 guard。"
     )
     if primary == "SKILL.md":
-        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；传齐脚本入口校验和核心逻辑实际需要的参数，第一步输入只能从 platform_input_node 边界字段派生，后续步骤只能从前序 stdout 边派生；移除确属职责外的 unknown keys；不得写 dynamic literal runtime data；不得改 YAML frontmatter，不得重写整篇 SKILL.md，不得改其它已通过 command，不得改 script，不得新增脚本路径，不得引入 --argv/runtime/entrypoint/argv 伪命令对象。"
+        return common + "\nprimary_target=SKILL.md：只修当前失败 command block 的 JSON argv；让 block argv keys 与脚本 strict_json_argv_guard spec 逐字对齐；移除 guard 不接受的 unknown keys，补齐 guard required keys，并修正类型/空值；不得改脚本，不得改 guard，不得改 parse_args/run/main/stdout，不得重写整篇 SKILL.md，不得改其它已通过 command。"
     if primary == script_path:
-        return common + f"\nprimary_target={script_path}：只修改当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout 输出逻辑；确保入口校验与 run/main 实际使用参数对齐；不要只修 guard；不得改 SKILL.md，不得为了适配错误 SKILL.md 而重命名脚本接口，不得删除 guard、核心功能或用默认值绕过必需输入。"
-    return common + "\nprimary_target 不确定：不要乱修或全量重写；先根据真实 trace 判断应修 SKILL.md 当前失败 command JSON argv，还是当前脚本入口接口与核心逻辑一致性。"
+        return common + f"\nprimary_target={script_path}：只修当前脚本中与失败相关的 parse_args/strict_json_argv_guard/run/main/stdout；确保 guard、run(args)、main() 自洽；run(args) 不得读取 guard 未声明 key，不得重新读取 sys.argv/json argv，guard required key 必须被 run(args) 消费；不得改 SKILL.md。"
+    return common + "\nprimary_target 不确定：停止扩大修改；先依据 strict_json_argv_guard spec 与 run(args) AST diagnostics 判断目标，默认只修当前失败 SKILL.md command block。"
 
 
 def _parse_e2e_stdout_json(
@@ -3140,6 +3198,7 @@ async def _repair_existing_file_for_e2e_failure(
     before_repair_snapshot = working_content
     consecutive_format_regressions = 0
     repair_template_history: dict[str, list[str]] = {}
+    consecutive_argv_schema_noops = 0
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
@@ -3500,6 +3559,43 @@ async def _repair_existing_file_for_e2e_failure(
                 "rerun_status": "skipped",
                 "writeback_status": "candidate_only",
             })
+            if patch_status == "noop" and "argv_schema_error" in deterministic_error:
+                consecutive_argv_schema_noops += 1
+                argv_kind = str(structured_failure.get("details", {}).get("argv_schema_error_kind") or "")
+                if (
+                    target_path.startswith("scripts/")
+                    and argv_kind in {"unknown_key", "missing_required", "invalid_type", "empty_required"}
+                ):
+                    switch_message = (
+                        "argv_schema_error no-op on script target; for unknown_key/missing_required/"
+                        "invalid_type/empty_required the repair target is SKILL.md unless script self-inconsistency is proven."
+                    )
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {
+                        "status": "target_changed",
+                        "repaired_target": target_path,
+                        "next_target": "SKILL.md",
+                        "next_failure": [switch_message, deterministic_error],
+                        "attempt": candidate_attempt,
+                    }
+                if consecutive_argv_schema_noops >= 2:
+                    blocked_message = (
+                        "argv_schema_error repair produced two consecutive no-op patches for the current target; "
+                        "stop this target to avoid burning the full retry budget."
+                    )
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {
+                        "status": "blocked",
+                        "repaired_target": target_path,
+                        "next_target": None,
+                        "next_failure": [blocked_message, deterministic_error],
+                        "attempt": candidate_attempt,
+                        "error_type": "argv_schema_noop_blocked",
+                    }
+            elif patch_status != "noop":
+                consecutive_argv_schema_noops = 0
             if repair_events is not None and patch_status in {"noop", "parse_failed"}:
                 repair_events.extend(e2e_session.events)
             last_failure = (

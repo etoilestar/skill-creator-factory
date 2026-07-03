@@ -159,15 +159,14 @@ def _argv_details(stderr, *, inputs, rendered, allowed='ALLOWED_KEYS = {"text"}'
 
 def test_argv_schema_attribution_targets():
     assert _argv_details("ValueError: unknown argv keys: ['extra']", inputs=["text"], rendered={"text": "ok", "extra": "x"})["primary_target"] == "SKILL.md"
-    assert _argv_details("ValueError: unknown argv keys: ['text']", inputs=["text"], rendered={"text": "ok"}, allowed='ALLOWED_KEYS = set()')["primary_target"] == "scripts/main.py"
+    assert _argv_details("ValueError: unknown argv keys: ['text']", inputs=["text"], rendered={"text": "ok"}, allowed='ALLOWED_KEYS = set()')["primary_target"] == "SKILL.md"
     missing = _argv_details("ValueError: missing required argv keys: ['extra']", inputs=["text"], rendered={"text": "ok"}, required='REQUIRED_KEYS = {"text", "extra"}')
     assert missing["primary_target"] == "scripts/main.py"
     assert missing["candidate_targets"] == ["scripts/main.py"]
-    assert "not self-consistent" in missing["target_reason"]
+    assert "required keys are not consumed" in missing["target_reason"]
     uncertain = _argv_details("ValueError: unknown argv schema error", inputs=[], rendered={"mystery": "ok"}, allowed='ALLOWED_KEYS = {"other"}')
     assert uncertain["primary_target"] == "SKILL.md"
-    assert uncertain["candidate_targets"] == ["SKILL.md", "scripts/main.py"]
-    assert "do not blindly modify" in uncertain["target_reason"]
+    assert uncertain["candidate_targets"] == ["SKILL.md"]
 
 
 def test_argv_schema_prefers_skill_md_when_script_interface_self_consistent():
@@ -182,7 +181,7 @@ def test_argv_schema_prefers_skill_md_when_script_interface_self_consistent():
 
 
 def test_argv_schema_targets_script_when_guard_and_run_keys_disagree():
-    content = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv.get("title")}\n'
+    content = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv["title"]}\n'
     details = _argv_details(
         "ValueError: missing required argv keys: ['input_text']",
         inputs=["input_text"],
@@ -191,6 +190,26 @@ def test_argv_schema_targets_script_when_guard_and_run_keys_disagree():
     )
     assert details["primary_target"] == "scripts/main.py"
     assert details["script_guard_run_mismatch"] is True
+
+
+def test_argv_schema_requested_regressions_for_guard_as_interface_fact():
+    content = 'ALLOWED_KEYS = {"input_files"}\nREQUIRED_KEYS = {"input_files"}\ndef run(args):\n    return {"count": len(args["input_files"])}\n'
+    assert _argv_details("ValueError: unknown argv keys: ['file_path']", inputs=["input_files"], rendered={"file_path": "x"}, content=content)["primary_target"] == "SKILL.md"
+    assert _argv_details("ValueError: unknown argv keys: ['model']", inputs=["input_files"], rendered={"input_files": ["x"], "model": "y"}, content=content)["primary_target"] == "SKILL.md"
+    assert _argv_details("ValueError: missing required argv keys: ['input_files']", inputs=["input_files"], rendered={}, content=content)["primary_target"] == "SKILL.md"
+
+
+def test_argv_schema_run_args_ast_detection():
+    undeclared = 'ALLOWED_KEYS = {"input_files"}\nREQUIRED_KEYS = {"input_files"}\ndef run(args):\n    return {"x": args["file_path"]}\n'
+    assert _argv_details("ValueError: missing required argv keys: ['input_files']", inputs=["input_files"], rendered={}, content=undeclared)["primary_target"] == "scripts/main.py"
+    parse_main_sys_argv = 'import sys\nALLOWED_KEYS = {"input_files"}\nREQUIRED_KEYS = {"input_files"}\ndef parse_args():\n    return sys.argv[1]\ndef main():\n    print(sys.argv[0])\ndef run(args):\n    return {"x": args["input_files"]}\n'
+    assert _argv_details("ValueError: missing required argv keys: ['input_files']", inputs=["input_files"], rendered={}, content=parse_main_sys_argv)["primary_target"] == "SKILL.md"
+    run_sys_argv = 'import sys\nALLOWED_KEYS = {"input_files"}\nREQUIRED_KEYS = {"input_files"}\ndef run(args):\n    return {"x": sys.argv[1]}\n'
+    assert _argv_details("ValueError: missing required argv keys: ['input_files']", inputs=["input_files"], rendered={}, content=run_sys_argv)["primary_target"] == "scripts/main.py"
+    optional_get = 'ALLOWED_KEYS = {"input_files", "style"}\nREQUIRED_KEYS = {"input_files"}\ndef run(args):\n    return {"x": args["input_files"], "style": args.get("style")}\n'
+    details = _argv_details("ValueError: missing required argv keys: ['input_files']", inputs=["input_files"], rendered={}, content=optional_get)
+    assert details["primary_target"] == "SKILL.md"
+    assert details["script_run_optional_read_keys"] == ["style"]
 
 from backend.services.creator.generation import _script_generation_skeleton
 
@@ -207,7 +226,7 @@ def test_argv_schema_repair_instruction_treats_guard_as_probe():
         "scripts/main.py",
         {"primary_target": "scripts/main.py", "candidate_targets": ["SKILL.md", "scripts/main.py"], "target_reason": "x"},
     )
-    assert "strict_json_argv_guard 是接口不对齐探针" in instruction
+    assert "strict_json_argv_guard(payload, spec) 是当前脚本入口接口事实" in instruction
     assert "禁止只改 guard schema" in instruction
     assert "不要只修 guard" in instruction
     assert "只修当前脚本 mandatory argv guard import/call 或 guard spec" not in instruction
@@ -218,3 +237,10 @@ def test_e2e_script_target_rule_contains_coverage_guardrail():
     joined = "\n".join(str(item) for item in source if isinstance(item, str))
     assert "strict_json_argv_guard 是接口不对齐探针" in joined
     assert "不能通过删除参数降低功能覆盖面" in joined
+
+
+def test_argv_schema_noop_guardrail_source_contains_two_noop_block():
+    source = e2e._repair_existing_file_for_e2e_failure.__code__.co_consts
+    joined = "\n".join(str(item) for item in source if isinstance(item, str))
+    assert "two consecutive no-op patches" in joined
+    assert "next_target" in joined and "SKILL.md" in joined

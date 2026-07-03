@@ -210,6 +210,39 @@ _VALIDATOR_ONLY_LAYERS = {
     "validator_invalid_json",
 }
 
+_MISSING_CAPABILITY_KEYWORDS = {"tool", "helper", "capability", "dependency", "runtime"}
+
+
+def _has_responsibility_missing_capability_issue(issues: list[Any]) -> bool:
+    """Return True if any responsibility issue signals missing tools/capabilities/dependencies.
+
+    Triggers secondary tool-pool exploration when passed=False is caused by the lack
+    of an available tool, helper, or dependency — not just by stub implementations.
+    """
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        # Explicit issue IDs for tool-binding responsibility failures
+        issue_id = str(issue.get("id") or "")
+        if issue_id in {
+            "responsibility_tool_binding_failed",
+            "missing_tool_binding",
+            "missing_required_tool",
+        }:
+            return True
+        # missing_evidence list mentioning tool/helper/capability/dependency
+        missing_ev = issue.get("missing_evidence")
+        if isinstance(missing_ev, list):
+            for ev in missing_ev:
+                ev_str = str(ev).lower()
+                if any(kw in ev_str for kw in _MISSING_CAPABILITY_KEYWORDS):
+                    return True
+        # semantic_failure text mentioning missing tool/helper/capability
+        semantic = str(issue.get("semantic_failure") or "").lower()
+        if any(kw in semantic for kw in _MISSING_CAPABILITY_KEYWORDS):
+            return True
+    return False
+
 def _split_e2e_blocking_errors(errors: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
     """Separate deterministic workflow failures from advisory validator issues."""
     blocking: list[str] = []
@@ -4297,23 +4330,30 @@ async def generate_file(request: GenerateFileRequest):
                         original_exc = stage_error.original
                         if isinstance(original_exc, ScriptFunctionalValidationError):
                             responsibility_issues = original_exc.issues
-                        # If stub/empty-shell implementations are detected and we haven't
-                        # yet re-explored the tool library for this file, do so now.
+                        # Trigger re-exploration of the tool library for this file when:
+                        # 1. Stub/empty-shell implementations are detected, OR
+                        # 2. passed=false and issues indicate missing tool/capability/dependency
+                        #    caused the responsibility failure.
                         # The result is a proposal only — it still passes through the gate
                         # before any tool is added to the allowed pool.
                         has_stubs = any(
                             str(issue.get("id") or "") in {"stub_implementation", "stub_branch"}
                             for issue in (responsibility_issues or [])
                         )
-                        if has_stubs and tool_re_explore_count < 1 and request.file_path.startswith("scripts/"):
+                        has_missing_capability = _has_responsibility_missing_capability_issue(responsibility_issues)
+                        if (has_stubs or has_missing_capability) and tool_re_explore_count < 1 and request.file_path.startswith("scripts/"):
                             try:
-                                file_specs_for_explore = [
-                                    f.model_dump(mode="json") if hasattr(f, "model_dump") else dict(f)
-                                    for f in (
-                                        [s for s in (getattr(request, "skill_plan_entry", None) and [] or [])]
-                                        or []
-                                    )
-                                ] or [{"path": request.file_path, "role": request.role or "generic_script"}]
+                                # Build a full file spec from the canonical entry so the
+                                # explorer has enough context (path/role/purpose/inputs/outputs/
+                                # selected_tools/required_tool_slots/runtime_contract/
+                                # tool_binding_summary).
+                                if effective_skill_plan_entry and isinstance(effective_skill_plan_entry, dict):
+                                    _explore_spec = dict(effective_skill_plan_entry)
+                                    _explore_spec.setdefault("path", request.file_path)
+                                    _explore_spec.setdefault("role", request.role or "generic_script")
+                                    file_specs_for_explore = [_explore_spec]
+                                else:
+                                    file_specs_for_explore = [{"path": request.file_path, "role": request.role or "generic_script"}]
                                 re_explored = explore_tool_pool(
                                     user_request=getattr(request, "user_request", "") or request.purpose or "",
                                     blueprint_text=request.blueprint_text or "",
@@ -4815,7 +4855,7 @@ async def validate_skill(request: SkillActionRequest):
             ]
         blocking_errors, advisory_warnings = _split_e2e_blocking_errors(e2e_errors)
         # Point 5: extract missing stdlib package requests from E2E errors.
-        missing_stdlib_reqs = _extract_missing_stdlib_from_e2e_errors(blocking_errors)
+        missing_stdlib_reqs = extract_missing_stdlib_from_e2e_errors(blocking_errors)
         if not blocking_errors:
             suffix = ""
             if repair_logs:

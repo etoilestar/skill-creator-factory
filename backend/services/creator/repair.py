@@ -37,6 +37,7 @@ class CreatorRepairScope:
     target_file: str
     max_changed_lines: int = 160
     allow_format_repair: bool = False
+    allow_tool_explore: bool = True
     notes: tuple[str, ...] = ()
 
     def to_prompt_dict(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class CreatorRepairScope:
             "target_file": self.target_file,
             "max_changed_lines": self.max_changed_lines,
             "allow_format_repair": self.allow_format_repair,
+            "allow_tool_explore": self.allow_tool_explore,
             "notes": list(self.notes),
         }
 
@@ -228,8 +230,22 @@ def _extract_diff_payload_from_malformed_patch_text(text: str) -> str | None:
     return candidate if _looks_like_unified_diff(candidate) else None
 
 
-def _coerce_patch_schema_fields(parsed: dict[str, Any], *, expected_target_file: str) -> CreatorDiffProposal:
+def _reject_tool_pool_patch_if_frozen(parsed: dict[str, Any], *, allow_tool_explore: bool) -> None:
+    """Raise if the model response includes tool_pool_patch.add_tool_requests and exploration is frozen."""
+    if allow_tool_explore:
+        return
+    patch = parsed.get("tool_pool_patch")
+    if isinstance(patch, dict) and patch.get("add_tool_requests"):
+        raise ValueError(
+            "E2E repair scope: allow_tool_explore=False; "
+            "tool_pool_patch.add_tool_requests is strictly forbidden in this phase. "
+            "Fix cross-step IO issues only; do not request new tools."
+        )
+
+
+def _coerce_patch_schema_fields(parsed: dict[str, Any], *, expected_target_file: str, allow_tool_explore: bool = True) -> CreatorDiffProposal:
     """Coerce and validate only CreatorDiffProposal schema fields."""
+    _reject_tool_pool_patch_if_frozen(parsed, allow_tool_explore=allow_tool_explore)
     allowed = {key: parsed.get(key) for key in _PATCH_SCHEMA_KEYS if key in parsed}
     target_file = _strip_diff_path_prefix(allowed.get("target_file") or expected_target_file)
     if target_file != expected_target_file:
@@ -275,6 +291,7 @@ def _extract_json_or_diff_proposal(
     text: str,
     *,
     expected_target_file: str,
+    allow_tool_explore: bool = True,
 ) -> CreatorDiffProposal:
     """Parse model repair proposal.
 
@@ -320,7 +337,7 @@ def _extract_json_or_diff_proposal(
 
     if isinstance(parsed, dict):
         lines_fallback_attempted = True
-        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file)
+        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file, allow_tool_explore=allow_tool_explore)
 
     diff_extraction_attempted = True
     recovered_diff = _extract_diff_payload_from_malformed_patch_text(raw_text)
@@ -1511,6 +1528,7 @@ async def _request_repair_diff_proposal(
             return _extract_json_or_diff_proposal(
                 text,
                 expected_target_file=file_path,
+                allow_tool_explore=scope.allow_tool_explore,
             )
 
         except Exception as exc:

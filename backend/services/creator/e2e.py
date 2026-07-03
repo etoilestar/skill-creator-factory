@@ -54,7 +54,7 @@ def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) 
     }
 
 
-def _extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, str]]:
+def extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, str]]:
     """Extract missing standard-library/package requests from E2E execution errors.
 
     Parses ``ModuleNotFoundError`` and ``ImportError`` lines in stderr/stdout
@@ -3648,6 +3648,7 @@ async def _repair_existing_file_for_e2e_failure(
         repair_type="cross_step_io_alignment",
         target_file=target_path,
         max_changed_lines=220,
+        allow_tool_explore=False,
         notes=(
             "第二轮最多 10 轮，始终使用 localized_patch，不会因普通 E2E 失败切 full_file_rewrite。",
             "patch 后会先做 basic format/compile check；通过只代表文件合法，不代表 E2E 通过。",

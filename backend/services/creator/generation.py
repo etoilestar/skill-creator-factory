@@ -898,8 +898,9 @@ def _build_script_generate_file_prompt_variant(
         else []
     )
 
+    current_binding = local_contract.get("current_file_tool_binding") or {}
     logger.info(
-        "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s",
+        "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s current_file_binding.allowed_helper_imports=%s allowed_import_paths=%s allowed_function_imports=%s runtime_import_guard_result.success=%s runtime_import_guard_result.error_type=%s",
         file_path,
         json.dumps(local_contract.get("inputs") or [], ensure_ascii=False),
         json.dumps(local_contract.get("outputs") or [], ensure_ascii=False),
@@ -916,6 +917,11 @@ def _build_script_generate_file_prompt_variant(
         json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
         json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
         str(resolution_payload.get("reason") or ""),
+        json.dumps(current_binding.get("allowed_helper_imports") or local_contract.get("allowed_helper_imports") or [], ensure_ascii=False),
+        json.dumps(current_binding.get("allowed_import_paths") or [], ensure_ascii=False),
+        json.dumps(current_binding.get("allowed_function_imports") or [], ensure_ascii=False),
+        None,
+        None,
     )
 
     instruction = [

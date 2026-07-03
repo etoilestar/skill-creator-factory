@@ -47,3 +47,20 @@ def test_first_round_basic_format_stage_error_is_coarse():
     assert err.source == 'basic_format'
     assert err.layer == 'python_compile_error'
     assert 'argv' in err.detail
+
+
+def test_post_patch_python_compile_stage_error_is_compile_only():
+    from backend.services.creator.api import _post_patch_python_compile_stage_error
+
+    err = _post_patch_python_compile_stage_error('scripts/a.py', 'def broken(:\n    pass\n')
+    assert err is not None
+    assert err.source == 'python_compile'
+    assert err.layer == 'python_compile_error'
+    assert 'SyntaxError' in err.detail
+    assert 'lineno' in err.detail
+
+
+def test_post_patch_python_compile_stage_ignores_non_scripts():
+    from backend.services.creator.api import _post_patch_python_compile_stage_error
+
+    assert _post_patch_python_compile_stage_error('references/a.md', 'def broken(:\n') is None

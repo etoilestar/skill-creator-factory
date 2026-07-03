@@ -3,6 +3,7 @@
 import hashlib
 import json
 import shutil
+import traceback
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,6 +42,40 @@ def _post_patch_basic_format_stage_error(file_path: str, content: str) -> FileGe
     )
 
 
+def _post_patch_python_compile_stage_error(file_path: str, content: str) -> FileGenerationStageError | None:
+    """Compile-only gate for patched scripts; never executes generated code."""
+    if not (file_path.startswith("scripts/") and file_path.endswith(".py")):
+        return None
+    try:
+        compile(content or "", file_path, "exec")
+        return None
+    except SyntaxError as exc:
+        detail = {
+            "error_type": type(exc).__name__,
+            "lineno": exc.lineno,
+            "offset": exc.offset,
+            "end_lineno": getattr(exc, "end_lineno", None),
+            "end_offset": getattr(exc, "end_offset", None),
+            "msg": exc.msg,
+            "text": (exc.text or "").strip(),
+            "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        }
+    except Exception as exc:
+        detail = {
+            "error_type": type(exc).__name__,
+            "lineno": None,
+            "offset": None,
+            "msg": str(exc),
+            "text": "",
+            "traceback": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+        }
+    return FileGenerationStageError(
+        source="python_compile",
+        layer="python_compile_error",
+        detail=json.dumps(detail, ensure_ascii=False, default=str),
+    )
+
+
 def _basic_format_repair_feedback(stage_error: FileGenerationStageError) -> str:
     detail = str(getattr(stage_error, "detail", "") or "")
     return (
@@ -50,6 +85,49 @@ def _basic_format_repair_feedback(stage_error: FileGenerationStageError) -> str:
         "不要修改工具选择。不要修改 argv schema。不要修改 stdout 字段。不要修改业务职责。"
         "只把当前候选修成合法源码/合法 Markdown。"
     )
+
+
+def _build_strict_compile_rewrite_prompt(
+    *,
+    file_path: str,
+    skill_name: str,
+    purpose: str | None,
+    blueprint_text: str,
+    role: str | None,
+    skill_plan_entry: Any,
+    deterministic_error: str,
+    previous_content: str,
+    current_file_binding: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator strict_compile_rewrite 修复器。只输出完整 Python 源码。"
+                "不要 Markdown fence。不要解释。不要 JSON patch。不要 diff。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Skill: {skill_name}\n文件路径: {file_path}\nrole: {role or ''}\npurpose: {purpose or ''}\n\n"
+                "目标：只让当前脚本成为合法可编译源码。保留 strict_json_argv_guard。"
+                "不要改工具选择、argv schema、stdout 字段、业务职责，除非这些内容本身造成语法错误。"
+                "不要新增未绑定 runtime_tools helper。\n\n"
+                "当前 SkillPlanEntry / 轻量职责：\n"
+                f"{json.dumps(skill_plan_entry or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
+                "当前 tool binding 摘要：\n"
+                f"{json.dumps(current_file_binding or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
+                "当前 strict_json_argv_guard 要求：如果源码已经导入或调用 strict_json_argv_guard，必须保留；"
+                "不要删除已有 guard；不要内联替代；不要把合法 helper 调用改成本地占位逻辑。\n\n"
+                "编译错误完整信息：\n"
+                f"{deterministic_error}\n\n"
+                "当前失败源码完整内容：\n"
+                f"{previous_content or ''}\n\n"
+                "输出要求：只输出完整 Python 源码；不要 Markdown fence；不要解释；不要 JSON patch；不要 diff。"
+            ),
+        },
+    ]
 
 
 def _entry_text_for_declared_support(skill_plan_entry: Any) -> str:
@@ -3474,25 +3552,8 @@ async def generate_file(request: GenerateFileRequest):
 
                 content = candidate
 
-                if request.file_path.startswith("scripts/"):
-                    try:
-                        tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                        file_binding = get_file_binding(tool_pool, request.file_path)
-                        if file_binding is None and isinstance(effective_skill_plan_entry, dict):
-                            file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
-                        import_guard_result = guard_runtime_imports(content, request.file_path, file_binding)
-                    except Exception as guard_exc:
-                        raise FileGenerationStageError(
-                            source="runtime_import_guard",
-                            layer="runtime_import_guard_error",
-                            detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
-                        ) from guard_exc
-                    if not import_guard_result.success:
-                        raise FileGenerationStageError(
-                            source="runtime_import_guard",
-                            layer=import_guard_result.error_type or "runtime_import_guard_failed",
-                            detail=json.dumps(import_guard_result.model_dump(mode="json"), ensure_ascii=False, default=str),
-                        )
+                last_import_guard_result: Any = None
+                last_file_binding: Any = None
 
                 if request.file_path.startswith("scripts/"):
                     unsupported_issue = _not_supported_declared_input_issue(
@@ -3550,6 +3611,31 @@ async def generate_file(request: GenerateFileRequest):
                 )
                 if format_stage_error is not None:
                     raise format_stage_error
+                compile_stage_error = _post_patch_python_compile_stage_error(request.file_path, content)
+                if compile_stage_error is not None:
+                    raise compile_stage_error
+
+                if request.file_path.startswith("scripts/"):
+                    try:
+                        tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                        file_binding = get_file_binding(tool_pool, request.file_path)
+                        if file_binding is None and isinstance(effective_skill_plan_entry, dict):
+                            file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
+                        last_file_binding = file_binding
+                        import_guard_result = guard_runtime_imports(content, request.file_path, file_binding)
+                        last_import_guard_result = import_guard_result
+                    except Exception as guard_exc:
+                        raise FileGenerationStageError(
+                            source="runtime_import_guard",
+                            layer="runtime_import_guard_error",
+                            detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
+                        ) from guard_exc
+                    if not import_guard_result.success:
+                        raise FileGenerationStageError(
+                            source="runtime_import_guard",
+                            layer=import_guard_result.error_type or "runtime_import_guard_failed",
+                            detail=json.dumps(import_guard_result.model_dump(mode="json"), ensure_ascii=False, default=str),
+                        )
 
                 try:
 
@@ -3645,8 +3731,36 @@ async def generate_file(request: GenerateFileRequest):
                                 "workflow_allocation_summary": workflow_allocation_summary,
                                 "trial_stdout": "第一轮责任审查在局部 patch 前可能尚未执行试运行；如为空，不得把缺 stdout 当接口失败。",
                                 "artifact_info": "第一轮责任审查只用 artifact 信息辅助判断语义交付；真实存在性由运行/E2E 检查。",
+                                "runtime_import_guard_result": (
+                                    last_import_guard_result.model_dump(mode="json")
+                                    if hasattr(last_import_guard_result, "model_dump")
+                                    else last_import_guard_result
+                                ),
+                                "current_file_tool_binding": (
+                                    last_file_binding.model_dump(mode="json")
+                                    if hasattr(last_file_binding, "model_dump")
+                                    else last_file_binding
+                                ),
                             },
                         )
+                        original_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
+                        responsibility_review = _filter_responsibility_tool_binding_false_positives(
+                            responsibility_review,
+                            (
+                                last_import_guard_result.model_dump(mode="json")
+                                if hasattr(last_import_guard_result, "model_dump")
+                                else last_import_guard_result
+                            ),
+                        )
+                        remaining_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
+                        logger.info("[Creator][script_responsibility][tool_binding_filter] %s", json.dumps({
+                            "event": "script_responsibility_tool_binding_filter",
+                            "file_path": request.file_path,
+                            "import_guard_success": bool(getattr(last_import_guard_result, "success", False)),
+                            "original_responsibility_issue_count": original_issue_count,
+                            "filtered_tool_binding_false_positive_count": max(original_issue_count - remaining_issue_count, 0),
+                            "remaining_issue_count": remaining_issue_count,
+                        }, ensure_ascii=False, default=str))
 
                         if not responsibility_review.get("passed"):
                             failure_type = str(responsibility_review.get("failure_type") or "script_requirement_failed")
@@ -3741,7 +3855,11 @@ async def generate_file(request: GenerateFileRequest):
                     return
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
-                if is_generation_format_error(stage_error) and request.file_path.startswith("scripts/"):
+                if (
+                    is_generation_format_error(stage_error)
+                    or stage_error.source == "python_compile"
+                    or stage_error.layer in {"python_compile_error", "post_patch_python_compile_error"}
+                ) and request.file_path.startswith("scripts/"):
                     format_retry_count += 1
                 elif is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
                     markdown_format_retry_count += 1
@@ -3756,7 +3874,15 @@ async def generate_file(request: GenerateFileRequest):
                 repeated_same_candidate = previous_digest == candidate_digest
                 repair_failure_signatures[signature_key] = (previous_repeat_count + 1, candidate_digest)
 
-                if is_script_raw_source_format_error(stage_error) and request.file_path.startswith("scripts/"):
+                is_compile_rewrite_error = (
+                    request.file_path.startswith("scripts/")
+                    and (
+                        stage_error.source == "python_compile"
+                        or stage_error.layer in {"python_compile_error", "post_patch_python_compile_error"}
+                        or "script candidate after patch cannot compile" in deterministic_error
+                    )
+                )
+                if (is_script_raw_source_format_error(stage_error) or is_compile_rewrite_error) and request.file_path.startswith("scripts/"):
                     layer_limit = _first_round_repair_limit("content_review")
                     if format_retry_count > layer_limit:
                         yield _file_done_error_sse(
@@ -3789,26 +3915,67 @@ async def generate_file(request: GenerateFileRequest):
                         },
                     })
 
-                    next_messages = _build_strict_script_source_only_regeneration_prompt(
-                        file_path=request.file_path,
-                        skill_name=skill_name,
-                        purpose=request.purpose,
-                        blueprint_text=request.blueprint_text,
-                        role=request.role,
-                        skill_plan_entry=effective_skill_plan_entry,
-                        deterministic_error=deterministic_error,
-                        previous_content=candidate or "",
-                    )
+                    rewrite_prompt_variant = "strict_compile_rewrite" if is_compile_rewrite_error else "strict_source_only_regeneration"
+                    if is_compile_rewrite_error:
+                        try:
+                            rewrite_tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                            rewrite_binding_obj = get_file_binding(rewrite_tool_pool, request.file_path)
+                            rewrite_current_file_binding = (
+                                rewrite_binding_obj.model_dump(mode="json")
+                                if hasattr(rewrite_binding_obj, "model_dump")
+                                else (rewrite_binding_obj or {})
+                            )
+                            if not rewrite_current_file_binding and isinstance(effective_skill_plan_entry, dict):
+                                rewrite_current_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
+                        except Exception:
+                            rewrite_current_file_binding = (
+                                effective_skill_plan_entry.get("tool_binding_summary") if isinstance(effective_skill_plan_entry, dict) else {}
+                            ) or {}
+                        try:
+                            compile_detail = json.loads(str(stage_error.detail or "{}"))
+                        except Exception:
+                            compile_detail = {}
+                        logger.info("[Creator][compile_rewrite] %s", json.dumps({
+                            "event": "compile_rewrite",
+                            "file_path": request.file_path,
+                            "compile_error_type": compile_detail.get("error_type"),
+                            "compile_error_lineno": compile_detail.get("lineno"),
+                            "compile_error_msg": compile_detail.get("msg"),
+                            "rewrite_attempt": format_retry_count,
+                            "rewrite_prompt_variant": "strict_compile_rewrite",
+                        }, ensure_ascii=False, default=str))
+                        next_messages = _build_strict_compile_rewrite_prompt(
+                            file_path=request.file_path,
+                            skill_name=skill_name,
+                            purpose=request.purpose,
+                            blueprint_text=request.blueprint_text,
+                            role=request.role,
+                            skill_plan_entry=effective_skill_plan_entry,
+                            deterministic_error=deterministic_error,
+                            previous_content=candidate or "",
+                            current_file_binding=rewrite_current_file_binding,
+                        )
+                    else:
+                        next_messages = _build_strict_script_source_only_regeneration_prompt(
+                            file_path=request.file_path,
+                            skill_name=skill_name,
+                            purpose=request.purpose,
+                            blueprint_text=request.blueprint_text,
+                            role=request.role,
+                            skill_plan_entry=effective_skill_plan_entry,
+                            deterministic_error=deterministic_error,
+                            previous_content=candidate or "",
+                        )
                     candidate = await _complete_creator_file_generation(
                         messages=next_messages,
                         model=route.model,
                         skill_name=skill_name,
                         file_path=request.file_path,
-                        prompt_variant="strict_source_only_regeneration",
+                        prompt_variant=rewrite_prompt_variant,
                         retry_index=format_retry_count - 1,
                     )
                     prompt_messages = next_messages
-                    prompt_variant = "strict_source_only_regeneration"
+                    prompt_variant = rewrite_prompt_variant
                     continue
 
                 if error_source == "model_empty_content":
@@ -4171,6 +4338,12 @@ async def generate_file(request: GenerateFileRequest):
                                     repair_import_guard_result = parsed_guard
                             except Exception:
                                 repair_import_guard_result = {}
+                            if not repair_import_guard_result:
+                                try:
+                                    repair_guard_obj = guard_runtime_imports(candidate or "", request.file_path, repair_current_file_binding)
+                                    repair_import_guard_result = repair_guard_obj.model_dump(mode="json")
+                                except Exception:
+                                    repair_import_guard_result = {}
                         except Exception:
                             repair_tool_pool_summary = {}
                             repair_current_file_binding = {}
@@ -4204,6 +4377,12 @@ async def generate_file(request: GenerateFileRequest):
                         candidate = repaired_candidate
                         stage_error = basic_format_stage_error
                         deterministic_error = _basic_format_repair_feedback(basic_format_stage_error)
+                        continue
+                    compile_stage_error = _post_patch_python_compile_stage_error(request.file_path, repaired_candidate)
+                    if compile_stage_error is not None:
+                        candidate = repaired_candidate
+                        stage_error = compile_stage_error
+                        deterministic_error = str(compile_stage_error)
                         continue
 
                 except Exception as repair_exc:
@@ -4353,6 +4532,12 @@ async def generate_file(request: GenerateFileRequest):
                         candidate = repaired_candidate
                         stage_error = basic_format_stage_error
                         deterministic_error = _basic_format_repair_feedback(basic_format_stage_error)
+                        continue
+                    compile_stage_error = _post_patch_python_compile_stage_error(request.file_path, repaired_candidate)
+                    if compile_stage_error is not None:
+                        candidate = repaired_candidate
+                        stage_error = compile_stage_error
+                        deterministic_error = str(compile_stage_error)
                         continue
 
                 candidate = repaired_candidate

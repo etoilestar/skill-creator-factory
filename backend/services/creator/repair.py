@@ -1885,15 +1885,24 @@ async def _repair_generated_file_with_feedback(
             )
             repair_snippet_text = tool_snippet_prompt(snippets)
 
+        guard_success = bool((import_guard_result or {}).get("success")) if isinstance(import_guard_result, dict) else False
+        failure_layer = _failure_layer_from_error_text(validation_error)
+        should_repair_tools = "runtime_import_guard" in str(failure_layer or "") or "runtime_import_guard" in str(validation_error or "")
         target_rule = (
             "第一轮单文件修复。\n"
             "如果 failure_text/coarse_failure_kind 是 basic_format/python_compile_error/markdown_basic_format_error，"
             "只修当前候选基础格式；不要修改工具选择、argv schema、stdout 字段或业务职责。\n"
             "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
-            "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
+            "只有 failure source/layer 是 runtime_import_guard 时，才优先修不可用工具或 helper。\n"
+            "如果 runtime_import_guard 已通过，不要删除 helper import，不要把合法 helper 调用改成本地占位逻辑，不要替换成另一个未绑定 helper。\n"
             "优先使用 Current File Tool Binding 绑定的 helper；没有可用 helper 时用当前脚本本地逻辑、Python 标准库或已允许/已安装的安全依赖实现职责，不要猜 runtime_tools 函数。\n"
             "不要只改字段名；不要为了通过校验返回空结果或伪造成功。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
+            + (
+                "\n工具导入已通过后端确定性检查，本轮不要修改工具导入。"
+                if guard_success and not should_repair_tools
+                else "\n本轮 runtime_import_guard 未通过或失败来源为 runtime_import_guard；允许按 Current File Tool Binding 修复 import/helper。"
+            )
         )
 
         extra_context = (
@@ -2911,6 +2920,62 @@ def _normalize_responsibility_review_issues(
     return normalized
 
 
+def _filter_responsibility_tool_binding_false_positives(
+    review: dict[str, Any],
+    import_guard_result: Any,
+) -> dict[str, Any]:
+    """Drop responsibility-review tool-binding blockers when deterministic import guard passed."""
+    if not isinstance(review, dict):
+        return review
+    guard = import_guard_result.model_dump(mode="json") if hasattr(import_guard_result, "model_dump") else import_guard_result
+    if not (isinstance(guard, dict) and guard.get("success") is True):
+        return review
+
+    issues = review.get("issues") if isinstance(review.get("issues"), list) else []
+    patterns = (
+        "forbidden helper",
+        "未绑定 helper",
+        "unbound helper",
+        "runtime_tools import",
+        "runtime_tools",
+        "删除 read_docx_text",
+        "delete read_docx_text",
+        "read_docx_text forbidden",
+        "forbidden import",
+        "后端确定性检查判定禁止",
+    )
+    kept: list[Any] = []
+    filtered: list[Any] = []
+    for issue in issues:
+        text = json.dumps(issue, ensure_ascii=False, default=str).lower() if isinstance(issue, dict) else str(issue).lower()
+        if any(pattern.lower() in text for pattern in patterns):
+            filtered.append(issue)
+        else:
+            kept.append(issue)
+    if not filtered:
+        return review
+    updated = dict(review)
+    updated["issues"] = kept
+    notes = updated.get("advisory_notes") if isinstance(updated.get("advisory_notes"), list) else []
+    updated["advisory_notes"] = [
+        *notes,
+        *[
+            {
+                "id": "responsibility_tool_binding_false_positive_filtered",
+                "severity": "warning",
+                "reason": "runtime_import_guard passed; responsibility validator may not block on helper/tool binding.",
+                "original_issue": issue,
+            }
+            for issue in filtered
+        ],
+    ]
+    updated["filtered_tool_binding_false_positive_count"] = len(filtered)
+    if not kept:
+        updated["passed"] = True
+        updated["repair_instructions"] = ""
+    return updated
+
+
 _CURRENT_FILE_SCOPE_VALUES = {"current_file", "current_file_only", "current file", "current-file"}
 _RESPONSIBILITY_LAYER_VALUES = {"responsibility", "semantic_responsibility"}
 
@@ -3607,6 +3672,9 @@ async def _run_script_responsibility_review(
                 "- 如果脚本局部完成‘单个输入 -> 单个输出’，但全局需要完整集合、完整聚合结果、顺序映射或下游可直接消费的完整中间产物，应 passed=false。\n"
                 "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
                 "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件在可观察边界内缺失的职责和最小实现边界。\n\n"
+                "工具绑定边界：工具/helper/custom_tools 是否允许，已经由 runtime_import_guard 和 Current File Tool Binding 负责。"
+                "你不得因为 runtime_tools/helper 导入判 failed；如怀疑工具绑定问题，只能设置 delegate_to_backend_contract=true 并放入 advisory_notes。"
+                "没有 deterministic runtime_import_guard failure 时，不得声称“后端确定性检查判定禁止”。\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -3670,6 +3738,7 @@ async def _run_script_responsibility_review(
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息；上游已建立的关系当前脚本只需保留。\n"
                 "5. 只有丢失已有结构、打乱顺序、丢弃必要输入、漏交付输出、静默错位、压扁集合导致下游不可恢复时，才判责任失败。\n"
                 "6. 当失败涉及集合边界丢失、隐式循环、隐式聚合或责任被压窄时，repair_instructions 必须要求恢复当前脚本应承担的完整输入、完整处理、完整输出；如果当前脚本负责逐项处理，则在当前脚本内部循环并输出完整结果。不要建议只处理单个元素、只取首项、join 压扁、删除参数、放宽参数校验或让下游猜测补齐。\n"
+                "7. 工具/helper/custom_tools 绑定问题不属于职责审查阻断项；runtime_import_guard 已通过时，不得要求删除 runtime_tools helper（例如 read_docx_text）或声称 helper forbidden。\n"
             ),
         },
     ]

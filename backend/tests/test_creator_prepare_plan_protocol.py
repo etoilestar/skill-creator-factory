@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from fastapi import HTTPException
 
@@ -352,3 +354,146 @@ def test_legacy_choice_line_prevents_question_option_b_from_overriding_a():
     request = _request(human_feedback=feedback)
     assert api._prepare_user_confirmed_no_more_supplement(request)
     assert not api._prepare_feedback_wants_supplement(request)
+
+
+def _file(path, *, asset_source=""):
+    return FileSpecOut(path=path, purpose="test", required=True, can_skip=False, asset_source=asset_source)
+
+
+@pytest.mark.asyncio
+async def test_ready_syncs_review_summary_files_from_skill_plan_references(monkeypatch):
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": _ready_blueprint(),
+            "review_summary": {"files_to_create_or_update": ["SKILL.md", "scripts/process.py"]},
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[_file("SKILL.md"), _file("scripts/process.py"), _file("references/output-patterns.md")],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=_ready_blueprint(),
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(_request(human_feedback="A. 没有，按上面的选择继续"))
+
+    assert resp.status == "ready"
+    assert resp.review_summary.files_to_create_or_update == ["SKILL.md", "scripts/process.py", "references/output-patterns.md"]
+    assert [f.path for f in resp.files] == ["SKILL.md", "scripts/process.py", "references/output-patterns.md"]
+
+
+@pytest.mark.asyncio
+async def test_ready_does_not_add_summary_hallucinated_file_to_execution_plan(monkeypatch):
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": _ready_blueprint(),
+            "review_summary": {"files_to_create_or_update": ["SKILL.md", "scripts/extra.py"]},
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[_file("SKILL.md")],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=_ready_blueprint(),
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(_request(human_feedback="A. 没有，按上面的选择继续"))
+
+    assert resp.status == "ready"
+    assert resp.review_summary.files_to_create_or_update == ["SKILL.md"]
+    assert [f.path for f in resp.files] == ["SKILL.md"]
+    assert any(w.get("code") == "summary_files_not_in_skill_plan" and "scripts/extra.py" in w.get("files", []) for w in resp.warnings)
+
+
+def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
+    summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
+    warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [
+        _file("SKILL.md"),
+        _file("scripts/"),
+        _file("references/"),
+        _file("assets/"),
+        _file("scripts/${name}.py"),
+        _file("references/[file].md"),
+        _file("assets/logo.png"),
+        _file("assets/bundled.png", asset_source="bundled"),
+        _file("references/output-patterns.md"),
+    ])
+
+    assert warnings == []
+    assert summary.files_to_create_or_update == ["SKILL.md", "assets/bundled.png", "references/output-patterns.md"]
+    assert "scripts/" not in summary.files_to_create_or_update
+    assert "references/" not in summary.files_to_create_or_update
+    assert "assets/" not in summary.files_to_create_or_update
+    assert not any("${" in path or "[" in path for path in summary.files_to_create_or_update)
+
+
+def _blueprint_with_reference_mention(reference_line: str) -> str:
+    return _ready_blueprint() + f"\n{reference_line}\n"
+
+
+def _assert_normalized_reference_block(text: str, path: str):
+    normalized = api._normalize_prepare_blueprint_references(text)
+    assert f"- path: `{path}`" in normalized
+    assert normalized.index(f"- path: `{path}`") < normalized.index("### 宿主执行方式")
+    block_match = re.search(rf"(?ms)^- path: `{re.escape(path)}`\n(?P<block>.*?)(?=^- path:|^### |\Z)", normalized)
+    assert block_match, normalized
+    block = block_match.group("block")
+    for field in [
+        "role: reference",
+        "inputs: []",
+        "outputs: []",
+        "dependencies: []",
+        "required_capabilities: []",
+        "forbidden_capabilities: []",
+        "references: []",
+    ]:
+        assert field in block
+    assert not any(i["code"] == "directory_or_text_path_missing_from_skill_plan" and i["path"] == path for i in api._preflight_prepare_blueprint_text(normalized))
+
+
+def test_normalize_prepare_references_adds_dependency_reference_to_skill_plan():
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/workflows.md]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
+    _assert_normalized_reference_block(text, "references/workflows.md")
+
+
+def test_normalize_prepare_references_adds_references_field_reference_to_skill_plan():
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: [references/output-patterns.md]")
+    _assert_normalized_reference_block(text, "references/output-patterns.md")
+
+
+def test_normalize_prepare_references_adds_resource_list_reference_to_skill_plan():
+    text = _blueprint_with_reference_mention("- [ ] references/best-practices.md")
+    _assert_normalized_reference_block(text, "references/best-practices.md")
+
+
+def test_normalize_prepare_references_adds_body_backtick_reference_to_skill_plan():
+    text = _blueprint_with_reference_mention("正文需要读取 `references/interaction-guide.md` 作为交互规范。")
+    _assert_normalized_reference_block(text, "references/interaction-guide.md")
+
+
+def test_normalize_prepare_references_ignores_wildcards_and_placeholders():
+    text = _blueprint_with_reference_mention("不要补 `references/*.md`、references/<name>.md、references/[file].md 或 references/ 目录。")
+    normalized = api._normalize_prepare_blueprint_references(text)
+    assert "- path: `references/*.md`" not in normalized
+    assert "- path: `references/<name>.md`" not in normalized
+    assert "- path: `references/[file].md`" not in normalized
+    assert normalized == text
+
+
+def test_preflight_missing_skill_plan_message_includes_path():
+    issues = api._preflight_prepare_blueprint_text(_blueprint_with_reference_mention("- [ ] references/workflows.md"))
+    issue = next(i for i in issues if i["code"] == "directory_or_text_path_missing_from_skill_plan")
+    assert issue["path"] == "references/workflows.md"
+    assert "references/workflows.md" in issue["message"]

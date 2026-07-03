@@ -54,6 +54,7 @@ from ..markdown_metadata import (
 from ..creator_contracts import (
     compile_canonical_file_contract,
     contract_payload,
+    ImplementationResolution,
     refine_contract_with_resolution,
     resolve_implementation,
     call_template_for_tool,

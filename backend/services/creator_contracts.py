@@ -291,7 +291,12 @@ def resolve_implementation(entry: SkillPlanEntry, contract: CanonicalFileContrac
     if local_ok or available_manifests:
         available_manifests = _filter_available_tools(available_manifests, contract)
         deps = sorted({d for m in available_manifests for d in m.dependencies if _is_declared_dependency(d)})
-        import_paths = sorted({m.import_path for m in available_manifests if m.import_path})
+        import_paths = sorted({
+            path
+            for m in available_manifests
+            for path in (m.import_path, f"{m.import_path}.{m.function_name}" if m.import_path and m.function_name else "")
+            if path
+        })
         required_evidence = ["input_dependency", "nontrivial_transform", "stdout_contract", "declared_dependency_only", "no_shell_template"]
         if _contract_declares_artifact(contract) or any(m.artifact_outputs for m in available_manifests):
             required_evidence.append("artifact_created")
@@ -503,6 +508,7 @@ class _EvidenceVisitor(ast.NodeVisitor):
         self.resolution = resolution
         self.import_roots: set[str] = set()
         self.import_modules: set[str] = set()
+        self.import_paths: set[str] = set()
         self.calls: set[str] = set()
         self.has_file_write = False
         self.has_transform_call = False
@@ -528,11 +534,15 @@ class _EvidenceVisitor(ast.NodeVisitor):
             if alias.name:
                 self.import_roots.add(alias.name.split(".")[0])
                 self.import_modules.add(alias.name)
+                self.import_paths.add(alias.name)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> Any:
         if node.module:
             self.import_roots.add(node.module.split(".")[0])
             self.import_modules.add(node.module)
+            for alias in node.names:
+                if alias.name and alias.name != "*":
+                    self.import_paths.add(f"{node.module}.{alias.name}")
 
     def visit_Call(self, node: ast.Call) -> Any:
         name = _call_name(node.func)
@@ -602,6 +612,8 @@ def validate_python_evidence(content: str, contract: CanonicalFileContract, reso
     for module in visitor.import_modules:
         root = module.split(".")[0]
         if root in stdlib or root in allowed_dependency_roots or module in allowed_exact:
+            continue
+        if any(path.startswith(module + ".") for path in visitor.import_paths & allowed_exact):
             continue
         undeclared.append(module)
     undeclared = sorted(set(undeclared))

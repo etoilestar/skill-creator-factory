@@ -927,8 +927,11 @@ def _build_script_generate_file_prompt_variant(
         "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
         "系统提供 mandatory script core tool: strict_json_argv_guard；它不是可选 selected business tool，所有 Python scripts/*.py 必须 import 并调用它。",
         "硬性 argv guard 规则：必须在 parse_args 或等价入口解析 sys.argv[1]，然后调用 strict_json_argv_guard(payload, spec)；spec 由当前脚本 run/main 实际读取的参数决定。",
-        "strict_json_argv_guard spec 应优先参考当前脚本职责、local_contract inputs/outputs、SKILL.md command 附近的 argv JSON contract、RequirementGraph/SkillPlan 推荐 inputs/outputs、E2E repair trace 已形成的字段链路；这些都是共同推荐，不是字段白名单。",
+        "strict_json_argv_guard spec 是当前脚本入口接口事实；不要生成额外的 canonical argv contract。",
+        "strict_json_argv_guard spec 应优先参考当前脚本职责、脚本计划、脚本骨架、command_argv_contract、local_contract inputs/outputs、SKILL.md command 附近的 argv JSON contract、RequirementGraph/SkillPlan 推荐 inputs/outputs、E2E repair trace 已形成的字段链路；这些都是共同推荐，不是字段白名单。",
         "script 推荐使用 SKILL.md command 已经映射出来的 argv key；如果脚本内部变量名不同，可以在脚本内部做局部变量转换。",
+        "不要因为 SKILL.md block 写错字段，就让 strict_json_argv_guard 迁就 block；如果 E2E 发现 block 与 guard 不一致，应修 SKILL.md block。",
+        "脚本只需保证 strict_json_argv_guard spec、run(args)、main() 自洽：run(args) 只读取 guard 声明并返回的 args key，guard required key 应被 run(args) 消费。",
         "不要为了使用平台字段名而强行把脚本接口改成 user_request/input/text/payload 等平台 root；平台 root 是来源，不是脚本必需参数名。",
         "script 可以有 optional/default/config 参数；这些参数不需要来自平台 IO，也不需要出现在 recommended_inputs。required 参数必须能由 SKILL.md command 提供非空值；optional/default 参数应在 guard spec 或 run/main 默认逻辑中自洽。",
         "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
@@ -940,10 +943,10 @@ def _build_script_generate_file_prompt_variant(
         "覆盖要求硬规则：如果 local_contract.coverage_requirements 声明了输入来源、输入格式、核心动作、输出变体、参考读取或最终平台输出义务，当前脚本必须在自己的职责范围内实际读取/处理/产出这些义务；单脚本 full-coverage contract 必须覆盖全部声明能力。",
         "覆盖要求硬规则：声明支持多个输入变体时，不要只实现其中一个窄分支；应使用通用分发/解析逻辑，或在当前脚本职责中清楚交付可执行覆盖。",
         "覆盖要求硬规则：如果声明 JSON + Markdown 等多种输出，stdout 必须包含对应非空字段，并至少包含 text/markdown/file_paths/file_outputs 等最终平台可消费字段之一。",
-        "覆盖要求硬规则：SKILL.md command argv key 与 strict_json_argv_guard required keys 必须一致；不要把 input_file 自行改成 input_path，除非 command 同步传 input_path。",
+        "覆盖要求硬规则：strict_json_argv_guard required keys 是脚本入口事实；SKILL.md command argv key 必须与这些 key 一致。脚本不得为了适配错误 command block 把 input_files/file_path/input_path/model 等同义字段来回迁就。",
         "覆盖要求硬规则：如果声明 reference_path 或 required reference read，脚本要么读取并消费它，要么把它作为 optional 并在 stdout/metadata 中说明其缺省不影响核心逻辑；不要 required 但不用。",
         "覆盖要求边界：coverage_requirements 是职责约束，不是 argv/stdout 字段；禁止生成 coverage:*、covered:*、declared_requirement_terms 等伪运行时字段，禁止把 coverage terms 当成 strict_json_argv_guard required keys。",
-        "argv key 一致性硬规则：local_contract.command_argv_contract.argv_keys 是 SKILL.md command 已传入的脚本接口字段；strict_json_argv_guard required keys 必须优先采用这些 key。若内部变量名不同，在 run 内做转换，例如 input_path = args[\"input_file\"]；不得把 command 中的 input_file 自行改成 input_path，除非 SKILL.md command 同步传 input_path。",
+        "argv key 一致性硬规则：如果 local_contract.command_argv_contract.argv_keys 已声明字段，strict_json_argv_guard spec 与 run(args) 应优先逐字采用这些 key；若后续 E2E 发现 SKILL.md block 与 guard 不一致，默认修 SKILL.md block，不改脚本 guard。",
         "raw role/capability 只能作为 hint，不能当硬合同。",
         "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑、标准库和 available_tools。",
         "available_tools 是基础能力候选，不是完整业务方案枚举；不要因为缺少某个专用工具就放弃实现当前脚本职责。",
@@ -1064,7 +1067,9 @@ def _build_generate_file_prompt(
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role: ...、inputs: ...、outputs: ...。\n"
-            "6b. command JSON argv keys 是当前脚本接口字段，不是平台字段白名单；argv keys 应优先参考当前脚本职责、SkillPlan inputs/outputs、RequirementGraph inputs/outputs、local_contract inputs/outputs 和附近 action schema，以便 SKILL.md 与 script 使用同一套推荐词汇，但第一轮不要求这些字段严格一致。\n"
+            "6b. command JSON argv keys 是当前脚本入口接口字段，不是平台字段白名单；argv keys 必须优先使用脚本入口参数提示字段。\n"
+            "6b-1. 如果脚本计划、脚本骨架、command_argv_contract 或 strict_json_argv_guard spec 已声明字段，command block 必须逐字使用这些 key；不得自行发明 input_file/input_path/input_files/file_path/model 等同义字段。\n"
+            "6b-2. 第一轮必须尽量让 SKILL.md command JSON argv 与脚本入口字段对齐；stdout/final artifact 闭环仍保留到第二轮 E2E 真实执行验证。\n"
             "6c. 允许脚本需要的 optional/default/config 参数、reference/assets 路径、runtime constants、格式控制参数出现在 argv 中；不要要求所有 argv key 都来自平台 IO，也不要要求使用所有平台输入字段。\n"
             "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。argv key 不必等于这些平台字段名。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"

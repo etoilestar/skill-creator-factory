@@ -15,7 +15,7 @@ def _binding_values(binding: ToolPoolFileBinding | dict[str, Any] | None, key: s
     return [str(x) for x in binding.get(key) or []]
 
 def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolFileBinding | dict[str, Any] | None = None) -> RuntimeImportGuardResult:
-    allowed_helpers = set(_binding_values(file_binding, 'allowed_helper_imports', list(RUNTIME_TOOLS_ALL)))
+    allowed_helpers = set(_binding_values(file_binding, 'allowed_helper_imports', []))
     allowed_paths = set(_binding_values(file_binding, 'allowed_import_paths', []))
     allowed_functions = set(_binding_values(file_binding, 'allowed_function_imports', []))
     runtime_all = set(RUNTIME_TOOLS_ALL)

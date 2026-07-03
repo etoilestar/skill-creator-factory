@@ -54,6 +54,51 @@ def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) 
     }
 
 
+def _is_python_stdlib_module(name: str) -> bool:
+    """Return True if *name* is a Python standard-library module.
+
+    Uses ``sys.stdlib_module_names`` (Python 3.10+) and ``sys.builtin_module_names``
+    (all versions).  Standard-library modules ship with the interpreter and cannot
+    be installed via pip; surfacing them as install requests would always fail.
+    """
+    import sys as _sys
+    stdlib_names: frozenset[str] = getattr(_sys, "stdlib_module_names", frozenset())
+    builtin_names: frozenset[str] = frozenset(getattr(_sys, "builtin_module_names", ()))
+    return name in stdlib_names or name in builtin_names
+
+
+def extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, str]]:
+    """Extract missing third-party package requests from E2E execution errors.
+
+    Parses ``ModuleNotFoundError`` and ``ImportError`` lines in stderr/stdout
+    sections of E2E error messages and returns structured install requests.
+    These are surfaced to the caller so the backend can add the packages to the
+    environment rather than treating them as code bugs.
+
+    Python standard-library modules are automatically excluded: they ship with
+    the interpreter and cannot be installed via pip, so attempting to install
+    them would always fail.
+    """
+    import re as _re
+    requests: list[dict[str, str]] = []
+    seen: set[str] = set()
+    # Patterns: "No module named 'X'" or "No module named X"
+    module_pattern = _re.compile(
+        r"(?:ModuleNotFoundError|ImportError)[^\n]*No module named ['\"]?([A-Za-z0-9_.\-]+)['\"]?",
+        _re.IGNORECASE,
+    )
+    for error in errors or []:
+        for match in module_pattern.finditer(error):
+            pkg = match.group(1).split(".")[0]  # top-level package name
+            if pkg and pkg not in seen and not _is_python_stdlib_module(pkg):
+                seen.add(pkg)
+                requests.append({
+                    "package": pkg,
+                    "reason": "E2E execution failed with ModuleNotFoundError; package must be added to the environment library.",
+                    "source": "e2e_missing_stdlib",
+                })
+    return requests
+
 
 def _skill_md_command_normalizer_context(
     *,
@@ -3620,6 +3665,7 @@ async def _repair_existing_file_for_e2e_failure(
         repair_type="cross_step_io_alignment",
         target_file=target_path,
         max_changed_lines=220,
+        allow_tool_explore=False,
         notes=(
             "第二轮最多 10 轮，始终使用 localized_patch，不会因普通 E2E 失败切 full_file_rewrite。",
             "patch 后会先做 basic format/compile check；通过只代表文件合法，不代表 E2E 通过。",
@@ -3627,6 +3673,9 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮只修 workflow / cross-step IO / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
+            # Point 4: Explicitly prohibit tool exploration during E2E repair.
+            "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，不得探索或扩展工具池。"
+            "若 E2E 发现缺少标准库，在响应中声明 missing_stdlib_request 而非探索工具库。",
         ),
     )
 

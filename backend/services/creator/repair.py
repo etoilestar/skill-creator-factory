@@ -37,6 +37,7 @@ class CreatorRepairScope:
     target_file: str
     max_changed_lines: int = 160
     allow_format_repair: bool = False
+    allow_tool_explore: bool = True
     notes: tuple[str, ...] = ()
 
     def to_prompt_dict(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class CreatorRepairScope:
             "target_file": self.target_file,
             "max_changed_lines": self.max_changed_lines,
             "allow_format_repair": self.allow_format_repair,
+            "allow_tool_explore": self.allow_tool_explore,
             "notes": list(self.notes),
         }
 
@@ -228,8 +230,22 @@ def _extract_diff_payload_from_malformed_patch_text(text: str) -> str | None:
     return candidate if _looks_like_unified_diff(candidate) else None
 
 
-def _coerce_patch_schema_fields(parsed: dict[str, Any], *, expected_target_file: str) -> CreatorDiffProposal:
+def _reject_tool_pool_patch_if_frozen(parsed: dict[str, Any], *, allow_tool_explore: bool) -> None:
+    """Raise if the model response includes tool_pool_patch.add_tool_requests and exploration is frozen."""
+    if allow_tool_explore:
+        return
+    patch = parsed.get("tool_pool_patch")
+    if isinstance(patch, dict) and patch.get("add_tool_requests"):
+        raise ValueError(
+            "E2E repair scope: allow_tool_explore=False; "
+            "tool_pool_patch.add_tool_requests is strictly forbidden in this phase. "
+            "Fix cross-step IO issues only; do not request new tools."
+        )
+
+
+def _coerce_patch_schema_fields(parsed: dict[str, Any], *, expected_target_file: str, allow_tool_explore: bool = True) -> CreatorDiffProposal:
     """Coerce and validate only CreatorDiffProposal schema fields."""
+    _reject_tool_pool_patch_if_frozen(parsed, allow_tool_explore=allow_tool_explore)
     allowed = {key: parsed.get(key) for key in _PATCH_SCHEMA_KEYS if key in parsed}
     target_file = _strip_diff_path_prefix(allowed.get("target_file") or expected_target_file)
     if target_file != expected_target_file:
@@ -275,6 +291,7 @@ def _extract_json_or_diff_proposal(
     text: str,
     *,
     expected_target_file: str,
+    allow_tool_explore: bool = True,
 ) -> CreatorDiffProposal:
     """Parse model repair proposal.
 
@@ -320,7 +337,7 @@ def _extract_json_or_diff_proposal(
 
     if isinstance(parsed, dict):
         lines_fallback_attempted = True
-        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file)
+        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file, allow_tool_explore=allow_tool_explore)
 
     diff_extraction_attempted = True
     recovered_diff = _extract_diff_payload_from_malformed_patch_text(raw_text)
@@ -1511,6 +1528,7 @@ async def _request_repair_diff_proposal(
             return _extract_json_or_diff_proposal(
                 text,
                 expected_target_file=file_path,
+                allow_tool_explore=scope.allow_tool_explore,
             )
 
         except Exception as exc:
@@ -3287,6 +3305,113 @@ def _detect_script_responsibility_static_blockers(
     }]
 
 
+def _detect_stub_implementations(
+    script_content: str,
+    skill_plan_entry: Any,
+) -> list[dict[str, Any]]:
+    """Detect empty-shell functions and empty conditional branches.
+
+    Checks for:
+    - Functions/methods whose body consists only of ``pass``, ``...``, a bare
+      ``raise NotImplementedError``, or a docstring with no real logic.
+    - ``if``/``elif``/``else`` branches that consist only of ``pass`` or ``...``.
+
+    These are treated as unfulfilled responsibilities and trigger re-exploration
+    of the tool library rather than direct repair so the judgment model can
+    evaluate them with an updated tool pool.
+    """
+    issues: list[dict[str, Any]] = []
+    try:
+        tree = ast.parse(script_content or "")
+    except SyntaxError:
+        return issues
+
+    file_path = getattr(skill_plan_entry, 'path', '') or (
+        skill_plan_entry.get('path', '') if isinstance(skill_plan_entry, dict) else ''
+    )
+
+    def _real_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
+        """Strip leading docstring constants; return remaining real statements."""
+        result = list(stmts)
+        if result and isinstance(result[0], ast.Expr) and isinstance(result[0].value, ast.Constant) and isinstance(result[0].value.value, str):
+            result = result[1:]
+        return result
+
+    def _is_stub_body(stmts: list[ast.stmt]) -> bool:
+        real = _real_stmts(stmts)
+        if not real:
+            return True  # empty or docstring-only
+        if len(real) == 1:
+            s = real[0]
+            if isinstance(s, ast.Pass):
+                return True
+            # bare Ellipsis: ...
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and s.value.value is ...:
+                return True
+            if isinstance(s, ast.Raise):
+                exc = s.exc
+                if exc is not None:
+                    name = ''
+                    if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+                        name = exc.func.id
+                    elif isinstance(exc, ast.Name):
+                        name = exc.id
+                    if 'NotImplemented' in name or 'TODO' in name:
+                        return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Skip dunder methods and private helpers
+            if node.name.startswith('__') and node.name.endswith('__'):
+                continue
+            if _is_stub_body(node.body):
+                issues.append({
+                    'id': 'stub_implementation',
+                    'requirement_id': '',
+                    'failed_file': file_path,
+                    'failed_function': node.name,
+                    'code_region': f'def {node.name}() line {node.lineno}',
+                    'reason': (
+                        f"Function '{node.name}' has an empty-shell implementation "
+                        '(only pass/ellipsis/raise NotImplementedError). '
+                        'This indicates unfulfilled responsibility; consider re-exploring '
+                        'the tool library for a suitable helper.'
+                    ),
+                    'missing_evidence': ['real implementation of function body'],
+                    'minimal_edit': (
+                        f"Implement the actual business logic inside '{node.name}'; "
+                        'if a platform helper is needed, request it via the tool pool '
+                        'rather than leaving an empty shell.'
+                    ),
+                })
+            else:
+                # Check for empty conditional branches inside the function
+                for child in ast.walk(node):
+                    if isinstance(child, ast.If):
+                        for branch_stmts, branch_label in [
+                            (child.body, 'if branch'),
+                            (child.orelse, 'else/elif branch'),
+                        ]:
+                            if branch_stmts and _is_stub_body(branch_stmts):
+                                issues.append({
+                                    'id': 'stub_branch',
+                                    'requirement_id': '',
+                                    'failed_file': file_path,
+                                    'failed_function': node.name,
+                                    'code_region': f'{branch_label} inside {node.name} near line {child.lineno}',
+                                    'reason': (
+                                        f"A {branch_label} inside '{node.name}' is an empty shell "
+                                        '(only pass/ellipsis). This may leave a responsibility unmet.'
+                                    ),
+                                    'missing_evidence': [f'real logic in {branch_label}'],
+                                    'minimal_edit': (
+                                        f"Fill the {branch_label} inside '{node.name}' with the required logic."
+                                    ),
+                                })
+    return issues
+
+
 def _runtime_tool_contract_static_blockers(
     script_content: str,
     skill_plan_entry: SkillPlanEntry,
@@ -3608,6 +3733,11 @@ async def _run_script_responsibility_review(
     deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
     deterministic_issues += detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
     deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
+    # Detect empty-shell functions and branches; stub implementations are a hard
+    # responsibility failure regardless of other checks.
+    stub_issues = _detect_stub_implementations(script_content, skill_plan_entry)
+    if stub_issues:
+        deterministic_issues += stub_issues
     review_context = review_context if isinstance(review_context, dict) else {}
 
     if deterministic_issues:
@@ -3672,9 +3802,13 @@ async def _run_script_responsibility_review(
                 "- 如果脚本局部完成‘单个输入 -> 单个输出’，但全局需要完整集合、完整聚合结果、顺序映射或下游可直接消费的完整中间产物，应 passed=false。\n"
                 "- 默认内容、空内容、纯占位内容、明显模板化内容只能作为兜底健壮性，不能替代核心职责实现。\n"
                 "- 不做质量、审美、风格、充分性细评；blocking_issues 只能描述当前文件在可观察边界内缺失的职责和最小实现边界。\n\n"
+                "空壳检查（重点）：\n"
+                "- 必须重点检查空壳函数（函数体仅含 pass / ... / raise NotImplementedError）和空壳分支（if/elif/else 仅含 pass / ...）。\n"
+                "- 空壳函数/空壳分支是责任未完成的直接证据；必须在 blocking_issues 中明确指出每一个空壳位置，指明函数名、行号区域和应实现的职责。\n"
+                "- 不得以'结构完整'或'有导入语句'为由跳过空壳检查。\n\n"
                 "工具绑定边界：工具/helper/custom_tools 是否允许，已经由 runtime_import_guard 和 Current File Tool Binding 负责。"
                 "你不得因为 runtime_tools/helper 导入判 failed；如怀疑工具绑定问题，只能设置 delegate_to_backend_contract=true 并放入 advisory_notes。"
-                "没有 deterministic runtime_import_guard failure 时，不得声称“后端确定性检查判定禁止”。\n\n"
+                "没有 deterministic runtime_import_guard failure 时，不得声称\"后端确定性检查判定禁止\"。\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -3947,3 +4081,5 @@ __all__ = [name for name in globals() if not name.startswith("__")]
 
 
 TOOL_POOL_REPAIR_RULES = """Repair may only import backend.services.runtime_tools helpers listed in current_file_binding.allowed_helper_imports. Do not replace a forbidden helper with another unbound helper. If a pool-external platform helper is needed, emit tool_pool_patch.add_tool_requests; patches must pass tool_pool_gate before code may import the helper. If the task can be implemented with Python standard library or allowed third-party dependencies, do that without importing runtime_tools. Repair must not add script files or let references/assets use runtime tools. Import guard errors are hard constraints."""
+
+E2E_REPAIR_NO_TOOL_EXPLORE_RULE = """E2E repair phase: tool library exploration is strictly prohibited. Do NOT emit tool_pool_patch.add_tool_requests or request any new tool. E2E repair must only fix cross-module interface issues (command payloads, argv/stdout alignment, workflow dataflow) using the existing allowed tool pool. If a missing standard library package is discovered during E2E execution, surface it as a missing_stdlib_request in the response instead of requesting tool exploration."""

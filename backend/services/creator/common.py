@@ -815,6 +815,9 @@ class SkillActionResponse(BaseModel):
     editable: bool = True
     disabled: bool = False
     recoverable: bool = True
+    # Point 5: structured list of stdlib/package install requests discovered during E2E.
+    # Each entry: {"package": str, "reason": str, "source": "e2e_missing_stdlib"}
+    missing_stdlib_requests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ListFilesRequest(BaseModel):

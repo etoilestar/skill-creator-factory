@@ -16,6 +16,10 @@ from ..kernel_loader import load_kernel_creator_for_phase
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
 from .tool_pool_builder import build_tool_pool
+from .tool_pool_explorer import explore_tool_pool
+from .tool_pool_gate import gate_tool_request
+from .tool_pool_models import ToolPoolTool
+from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
 
@@ -205,6 +209,39 @@ _VALIDATOR_ONLY_LAYERS = {
     "validator_timeout",
     "validator_invalid_json",
 }
+
+_MISSING_CAPABILITY_KEYWORDS = {"tool", "helper", "capability", "dependency", "runtime"}
+
+
+def _has_responsibility_missing_capability_issue(issues: list[Any]) -> bool:
+    """Return True if any responsibility issue signals missing tools/capabilities/dependencies.
+
+    Triggers secondary tool-pool exploration when passed=False is caused by the lack
+    of an available tool, helper, or dependency — not just by stub implementations.
+    """
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        # Explicit issue IDs for tool-binding responsibility failures
+        issue_id = str(issue.get("id") or "")
+        if issue_id in {
+            "responsibility_tool_binding_failed",
+            "missing_tool_binding",
+            "missing_required_tool",
+        }:
+            return True
+        # missing_evidence list mentioning tool/helper/capability/dependency
+        missing_ev = issue.get("missing_evidence")
+        if isinstance(missing_ev, list):
+            for ev in missing_ev:
+                ev_str = str(ev).lower()
+                if any(kw in ev_str for kw in _MISSING_CAPABILITY_KEYWORDS):
+                    return True
+        # semantic_failure text mentioning missing tool/helper/capability
+        semantic = str(issue.get("semantic_failure") or "").lower()
+        if any(kw in semantic for kw in _MISSING_CAPABILITY_KEYWORDS):
+            return True
+    return False
 
 def _split_e2e_blocking_errors(errors: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
     """Separate deterministic workflow failures from advisory validator issues."""
@@ -3500,6 +3537,9 @@ async def generate_file(request: GenerateFileRequest):
         markdown_format_retry_count = 0
         business_repair_count = 0
         repair_failure_signatures: dict[str, tuple[int, str]] = {}
+        # Track how many tool re-explorations have been triggered for this file
+        # (at most once per generation session to avoid unbounded exploration).
+        tool_re_explore_count = 0
 
         try:
             if request.file_path.startswith("references/") or (Path(request.file_path).suffix.lower() in {".md", ".markdown"} and request.file_path != "SKILL.md"):
@@ -4290,6 +4330,92 @@ async def generate_file(request: GenerateFileRequest):
                         original_exc = stage_error.original
                         if isinstance(original_exc, ScriptFunctionalValidationError):
                             responsibility_issues = original_exc.issues
+                        # Trigger re-exploration of the tool library for this file when:
+                        # 1. Stub/empty-shell implementations are detected, OR
+                        # 2. passed=false and issues indicate missing tool/capability/dependency
+                        #    caused the responsibility failure.
+                        # The result is a proposal only — it still passes through the gate
+                        # before any tool is added to the allowed pool.
+                        has_stubs = any(
+                            str(issue.get("id") or "") in {"stub_implementation", "stub_branch"}
+                            for issue in (responsibility_issues or [])
+                        )
+                        has_missing_capability = _has_responsibility_missing_capability_issue(responsibility_issues)
+                        if (has_stubs or has_missing_capability) and tool_re_explore_count < 1 and request.file_path.startswith("scripts/"):
+                            try:
+                                # Build a full file spec from the canonical entry so the
+                                # explorer has enough context (path/role/purpose/inputs/outputs/
+                                # selected_tools/required_tool_slots/runtime_contract/
+                                # tool_binding_summary).
+                                if effective_skill_plan_entry and isinstance(effective_skill_plan_entry, dict):
+                                    _explore_spec = dict(effective_skill_plan_entry)
+                                    _explore_spec.setdefault("path", request.file_path)
+                                    _explore_spec.setdefault("role", request.role or "generic_script")
+                                    file_specs_for_explore = [_explore_spec]
+                                else:
+                                    file_specs_for_explore = [{"path": request.file_path, "role": request.role or "generic_script"}]
+                                re_explored = explore_tool_pool(
+                                    user_request=getattr(request, "user_request", "") or request.purpose or "",
+                                    blueprint_text=request.blueprint_text or "",
+                                    file_specs=file_specs_for_explore,
+                                )
+                                if re_explored.candidate_tool_requests:
+                                    existing_pool = load_tool_pool(settings.skills_path / skill_name)
+                                    existing_allowed = {t.tool_id for t in existing_pool.tools}
+                                    new_requests = [
+                                        r for r in re_explored.candidate_tool_requests
+                                        if r.candidate_tool_id not in existing_allowed
+                                    ]
+                                    if new_requests:
+                                        for req_item in new_requests:
+                                            spec_dict = {"path": request.file_path, "role": request.role or "generic_script"}
+                                            gate_evt = gate_tool_request(req_item, file_role=str(spec_dict.get("role") or "generic_script"), file_spec=spec_dict)
+                                            existing_pool.gate_events.append(gate_evt)
+                                            if gate_evt.decision == "allow":
+                                                cap = get_tool_capability(gate_evt.tool_id)
+                                                existing_pool.tools.append(ToolPoolTool(
+                                                    tool_id=gate_evt.tool_id,
+                                                    status="allowed",
+                                                    source="repair_request",
+                                                    source_phase="responsibility_repair",
+                                                    target_files=[request.file_path],
+                                                    allowed_helper_imports=gate_evt.allowed_helper_imports,
+                                                    allowed_import_paths=gate_evt.allowed_import_paths,
+                                                    allowed_function_imports=gate_evt.allowed_function_imports,
+                                                    score=req_item.score,
+                                                    matched_features=req_item.matched_features,
+                                                    matched_terms=req_item.matched_terms,
+                                                    allowed_roles=list((cap.roles if cap else []) or []),
+                                                    input_schema=(cap.input_schema if cap else {}) or {},
+                                                    output_schema=(cap.output_schema if cap else {}) or {},
+                                                    required_env=gate_evt.required_env,
+                                                    dependencies=gate_evt.dependencies,
+                                                    reason=req_item.reason,
+                                                    gate_result=gate_evt.decision,
+                                                    gate_messages=gate_evt.messages,
+                                                ))
+                                                binding = next((b for b in existing_pool.file_bindings if b.target_file == request.file_path), None)
+                                                if binding is None:
+                                                    from .tool_pool_models import ToolPoolFileBinding
+                                                    binding = ToolPoolFileBinding(target_file=request.file_path)
+                                                    existing_pool.file_bindings.append(binding)
+                                                if gate_evt.tool_id not in binding.allowed_tool_ids:
+                                                    binding.allowed_tool_ids.append(gate_evt.tool_id)
+                                                binding.allowed_helper_imports = list(dict.fromkeys(binding.allowed_helper_imports + gate_evt.allowed_helper_imports))
+                                                binding.allowed_import_paths = list(dict.fromkeys(binding.allowed_import_paths + gate_evt.allowed_import_paths))
+                                                binding.allowed_function_imports = list(dict.fromkeys(binding.allowed_function_imports + gate_evt.allowed_function_imports))
+                                        save_tool_pool(settings.skills_path / skill_name, existing_pool)
+                                        logger.info(
+                                            "[Creator][tool_re_explore] skill=%s file=%s new_candidates=%d allowed_new=%d",
+                                            skill_name, request.file_path, len(new_requests),
+                                            sum(1 for e in existing_pool.gate_events[-len(new_requests):] if e.decision == "allow"),
+                                        )
+                                tool_re_explore_count += 1
+                            except Exception as re_explore_exc:
+                                logger.warning(
+                                    "[Creator][tool_re_explore] re-exploration failed skill=%s file=%s error=%s",
+                                    skill_name, request.file_path, re_explore_exc,
+                                )
                         feedback = (
                             "RESPONSIBILITY_PATCH_STAGE\n"
                             "只根据 RESPONSIBILITY_STAGE 明确给出的当前文件职责缺失做最小修改。\n\n"
@@ -4728,6 +4854,8 @@ async def validate_skill(request: SkillActionRequest):
                 )
             ]
         blocking_errors, advisory_warnings = _split_e2e_blocking_errors(e2e_errors)
+        # Point 5: extract missing stdlib package requests from E2E errors.
+        missing_stdlib_reqs = extract_missing_stdlib_from_e2e_errors(blocking_errors)
         if not blocking_errors:
             suffix = ""
             if repair_logs:
@@ -4765,6 +4893,7 @@ async def validate_skill(request: SkillActionRequest):
                 advisory_validator_status=_e2e_advisory_status_from_warnings(advisory_warnings),
                 blocking_errors=blocking_errors,
                 warnings=advisory_warnings,
+                missing_stdlib_requests=missing_stdlib_reqs,
             )
 
         target_path = _e2e_repair_target_from_errors(blocking_errors)
@@ -4810,6 +4939,7 @@ async def validate_skill(request: SkillActionRequest):
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                missing_stdlib_requests=missing_stdlib_reqs,
             )
         try:
             attempts_by_target[target_path] = attempts_by_target.get(target_path, 0) + 1
@@ -4861,6 +4991,7 @@ async def validate_skill(request: SkillActionRequest):
                     editable=True,
                     disabled=False,
                     recoverable=True,
+                    missing_stdlib_requests=missing_stdlib_reqs,
                 )
             raise ValueError(json.dumps(repair_result, ensure_ascii=False, default=str))
         except Exception as exc:
@@ -4883,6 +5014,7 @@ async def validate_skill(request: SkillActionRequest):
                     )
                 ),
                 repair_events=repair_events or e2e_session.events,
+                missing_stdlib_requests=missing_stdlib_reqs,
             )
 
 

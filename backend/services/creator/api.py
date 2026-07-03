@@ -206,6 +206,63 @@ def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
     )
 
 
+def _is_concrete_prepare_summary_file_path(path: str, *, asset_source: str = "") -> bool:
+    normalized = _normalize_skill_path(str(path or ""))
+    if not normalized:
+        return False
+    if normalized in {"assets", "assets/", "references", "references/", "scripts", "scripts/"}:
+        return False
+    if normalized.endswith("/") or _is_directory_like_skill_path(normalized):
+        return False
+    if re.search(r"[<>{}*]|\$\{|\[[^\]]*(?:name|path|file|ext|文件|名称)[^\]]*\]", normalized, re.I):
+        return False
+    if re.match(r"^(?:outputs?|OUTPUT_DIR|generated|build|dist|tmp)(?:/|$)", normalized, re.I):
+        return False
+    if normalized.startswith("assets/") and asset_source not in {"user_upload", "bundled"}:
+        return False
+    return True
+
+
+def _sync_prepare_summary_files_from_skill_plan(
+    summary: PreparePlanReviewSummary,
+    plan_files: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """Make prepare review file display follow the analyzed SkillPlan files.
+
+    The analyzed SkillPlan is authoritative. This helper only updates the
+    front-end review/double-check field from the final plan; it never mutates
+    or expands the execution plan from model-authored summary text.
+    """
+    original_summary_files = [
+        _normalize_skill_path(str(path or ""))
+        for path in (summary.files_to_create_or_update or [])
+        if str(path or "").strip()
+    ]
+    authoritative: list[str] = []
+    for file_spec in plan_files or []:
+        path = _normalize_skill_path(str(getattr(file_spec, "path", "") or ""))
+        asset_source = str(getattr(file_spec, "asset_source", "") or "").strip()
+        if _is_concrete_prepare_summary_file_path(path, asset_source=asset_source) and path not in authoritative:
+            authoritative.append(path)
+    summary.files_to_create_or_update = authoritative
+    extra_summary_files = [
+        path
+        for path in original_summary_files
+        if path and path not in set(authoritative) and _is_concrete_prepare_summary_file_path(path, asset_source="bundled" if path.startswith("assets/") else "")
+    ]
+    if not extra_summary_files:
+        return []
+    return [{
+        "severity": "planning_warning",
+        "code": "summary_files_not_in_skill_plan",
+        "source": "prepare_plan",
+        "path": "",
+        "field": "review_summary.files_to_create_or_update",
+        "files": extra_summary_files,
+        "message": "review_summary listed files not present in analyzed SkillPlan; ignored because SkillPlan is authoritative.",
+    }]
+
+
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
 MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
 MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 3
@@ -1552,13 +1609,7 @@ async def prepare_plan(request: PreparePlanRequest):
         or str(getattr(asset, "path", "") or "") in confirmed_asset_paths
     ]
 
-    summary.files_to_create_or_update = [
-        file_spec.path
-        for file_spec in (plan.files or [])
-        if getattr(file_spec, "path", "")
-        and not _is_directory_like_skill_path(getattr(file_spec, "path", ""))
-        and not re.search(r"[<>{}\*]", getattr(file_spec, "path", ""))
-    ]
+    summary_sync_warnings = _sync_prepare_summary_files_from_skill_plan(summary, plan.files)
     summary.assets_to_upload = [
         str(getattr(asset, "path", "") or "").strip()
         for asset in (plan.asset_requirements or [])
@@ -1615,7 +1666,7 @@ async def prepare_plan(request: PreparePlanRequest):
         blueprint_text=plan.blueprint_text or blueprint_text,
         skill_name=plan.skill_name,
         files=plan.files,
-        warnings=plan.warnings,
+        warnings=[*(plan.warnings or []), *summary_sync_warnings],
         asset_requirements=plan.asset_requirements,
         final_outputs=plan.final_outputs,
         available_tools=plan.available_tools,

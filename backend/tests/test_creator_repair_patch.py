@@ -500,3 +500,25 @@ def test_generated_pool_forbidden_import_repair_prompt_mentions_stdlib_fallback(
     assert 'open()' in prompt
     assert 'zipfile' in prompt
     assert 'PDF' in prompt
+
+
+def test_responsibility_tool_binding_false_positive_filter_passed_guard():
+    review = {
+        "passed": False,
+        "issues": [{"reason": "read_docx_text forbidden helper should be deleted"}],
+        "repair_instructions": "delete read_docx_text",
+    }
+    filtered = repair._filter_responsibility_tool_binding_false_positives(review, {"success": True})
+    assert filtered["passed"] is True
+    assert filtered["issues"] == []
+    assert filtered["filtered_tool_binding_false_positive_count"] == 1
+
+
+def test_responsibility_tool_binding_false_positive_filter_failed_guard_keeps_blocker():
+    review = {
+        "passed": False,
+        "issues": [{"reason": "runtime_tools import forbidden"}],
+    }
+    filtered = repair._filter_responsibility_tool_binding_false_positives(review, {"success": False})
+    assert filtered["passed"] is False
+    assert len(filtered["issues"]) == 1

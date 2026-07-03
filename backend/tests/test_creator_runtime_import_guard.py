@@ -20,10 +20,46 @@ def test_import_guard_allows_bound_helper():
     assert result.success
 
 
+def test_import_guard_blocks_mixed_bound_and_unbound_runtime_helpers():
+    result = guard_runtime_imports(
+        'from backend.services.runtime_tools import read_file_text, read_pdf_text\n',
+        'scripts/a.py',
+        {'allowed_helper_imports': ['read_file_text']},
+    )
+    assert not result.success
+    assert result.error_type == 'generated_unknown_runtime_tool_import'
+    assert 'read_pdf_text' in result.missing_imports
+
+
 def test_import_guard_allows_bound_custom_tool():
     src = 'from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\n'
     result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
     assert result.success
+
+
+def test_import_guard_allows_custom_tool_full_function_path_but_blocks_same_module_unbound_function():
+    allowed = 'backend.services.runtime_tools.custom_tools.lookup.lookup_value'
+    ok = guard_runtime_imports(
+        'from backend.services.runtime_tools.custom_tools.lookup import lookup_value\n',
+        'scripts/a.py',
+        {
+            'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.lookup'],
+            'allowed_function_imports': [allowed],
+        },
+    )
+    assert ok.success
+
+    bad = guard_runtime_imports(
+        'from backend.services.runtime_tools.custom_tools.lookup import lookup_value, other_value\n',
+        'scripts/a.py',
+        {
+            'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.lookup'],
+            'allowed_function_imports': [allowed],
+        },
+    )
+    assert not bad.success
+    assert bad.error_type == 'generated_pool_forbidden_custom_tool_import'
+    assert 'backend.services.runtime_tools.custom_tools.lookup.other_value' in bad.forbidden_imports
 
 
 def test_import_guard_blocks_unbound_custom_tool_and_wildcard():

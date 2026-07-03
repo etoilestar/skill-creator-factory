@@ -43,7 +43,7 @@ def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolF
                     custom_forbidden.append(module)
                 for alias in node.names:
                     if alias.name == '*': custom_wildcard.append(module)
-                    elif alias.name not in allowed_functions or module not in allowed_paths:
+                    elif (alias.name not in allowed_functions and f'{module}.{alias.name}' not in allowed_functions) or module not in allowed_paths:
                         custom_forbidden.append(f'{module}.{alias.name}')
         elif isinstance(node, ast.Import):
             for alias in node.names:

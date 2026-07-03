@@ -628,6 +628,15 @@ def _merge_tool_binding_summary(explicit: dict[str, Any] | None, derived: dict[s
     return merged
 
 
+def _ensure_python_script_core_binding(binding: dict[str, Any], plan_entry: SkillPlanEntry) -> dict[str, Any]:
+    if str(getattr(plan_entry, "runtime", "") or "").lower() != "python":
+        return binding
+    merged = dict(binding)
+    merged["primary_tool_ids"] = _stable_unique([*(merged.get("primary_tool_ids") or []), "script_argv_guard"])
+    merged["allowed_helper_imports"] = _stable_unique([*(merged.get("allowed_helper_imports") or []), "strict_json_argv_guard"])
+    return merged
+
+
 def _script_local_contract_payload(
     *,
     file_path: str,
@@ -692,6 +701,7 @@ def _script_local_contract_payload(
         tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
     derived_tool_binding = _tool_binding_from_resolution(implementation_resolution)
     tool_binding_summary = _merge_tool_binding_summary(tool_binding_summary, derived_tool_binding)
+    tool_binding_summary = _ensure_python_script_core_binding(tool_binding_summary, plan_entry)
 
     return {
         "file_path": file_path,

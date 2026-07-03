@@ -126,3 +126,23 @@ def run(args):
     error = _e2e_argv_key_consistency_error(command=command, content=content, entry=entry)
     assert error is not None
     assert "E2E_LAYER=argv_schema_error" in error
+
+
+def test_declared_pdf_support_not_supported_branch_is_blocking():
+    from backend.services.creator.api import _not_supported_declared_input_issue
+
+    source = """
+def parse(path):
+    if path.lower().endswith('.pdf'):
+        raise ValueError('PDF parsing not supported in current implementation')
+    return 'ok'
+"""
+    issue = _not_supported_declared_input_issue(
+        source=source,
+        blueprint_text='支持 PDF/DOCX/TXT 上传并解析',
+        skill_plan_entry={'purpose': 'parse PDF DOCX TXT inputs'},
+        file_path='scripts/parse.py',
+    )
+    assert issue is not None
+    assert issue['id'] == 'script_declared_input_not_supported'
+    assert 'standard library' in issue['minimal_edit']

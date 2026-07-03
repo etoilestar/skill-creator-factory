@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from fastapi import HTTPException
 
@@ -435,3 +437,63 @@ def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
     assert "references/" not in summary.files_to_create_or_update
     assert "assets/" not in summary.files_to_create_or_update
     assert not any("${" in path or "[" in path for path in summary.files_to_create_or_update)
+
+
+def _blueprint_with_reference_mention(reference_line: str) -> str:
+    return _ready_blueprint() + f"\n{reference_line}\n"
+
+
+def _assert_normalized_reference_block(text: str, path: str):
+    normalized = api._normalize_prepare_blueprint_references(text)
+    assert f"- path: `{path}`" in normalized
+    assert normalized.index(f"- path: `{path}`") < normalized.index("### 宿主执行方式")
+    block_match = re.search(rf"(?ms)^- path: `{re.escape(path)}`\n(?P<block>.*?)(?=^- path:|^### |\Z)", normalized)
+    assert block_match, normalized
+    block = block_match.group("block")
+    for field in [
+        "role: reference",
+        "inputs: []",
+        "outputs: []",
+        "dependencies: []",
+        "required_capabilities: []",
+        "forbidden_capabilities: []",
+        "references: []",
+    ]:
+        assert field in block
+    assert not any(i["code"] == "directory_or_text_path_missing_from_skill_plan" and i["path"] == path for i in api._preflight_prepare_blueprint_text(normalized))
+
+
+def test_normalize_prepare_references_adds_dependency_reference_to_skill_plan():
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/workflows.md]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
+    _assert_normalized_reference_block(text, "references/workflows.md")
+
+
+def test_normalize_prepare_references_adds_references_field_reference_to_skill_plan():
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: [references/output-patterns.md]")
+    _assert_normalized_reference_block(text, "references/output-patterns.md")
+
+
+def test_normalize_prepare_references_adds_resource_list_reference_to_skill_plan():
+    text = _blueprint_with_reference_mention("- [ ] references/best-practices.md")
+    _assert_normalized_reference_block(text, "references/best-practices.md")
+
+
+def test_normalize_prepare_references_adds_body_backtick_reference_to_skill_plan():
+    text = _blueprint_with_reference_mention("正文需要读取 `references/interaction-guide.md` 作为交互规范。")
+    _assert_normalized_reference_block(text, "references/interaction-guide.md")
+
+
+def test_normalize_prepare_references_ignores_wildcards_and_placeholders():
+    text = _blueprint_with_reference_mention("不要补 `references/*.md`、references/<name>.md、references/[file].md 或 references/ 目录。")
+    normalized = api._normalize_prepare_blueprint_references(text)
+    assert "- path: `references/*.md`" not in normalized
+    assert "- path: `references/<name>.md`" not in normalized
+    assert "- path: `references/[file].md`" not in normalized
+    assert normalized == text
+
+
+def test_preflight_missing_skill_plan_message_includes_path():
+    issues = api._preflight_prepare_blueprint_text(_blueprint_with_reference_mention("- [ ] references/workflows.md"))
+    issue = next(i for i in issues if i["code"] == "directory_or_text_path_missing_from_skill_plan")
+    assert issue["path"] == "references/workflows.md"
+    assert "references/workflows.md" in issue["message"]

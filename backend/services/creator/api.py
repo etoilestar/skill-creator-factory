@@ -440,7 +440,7 @@ def _preflight_prepare_blueprint_text(blueprint_text: str) -> list[dict[str, Any
         if p.startswith(("scripts/", "references/", "assets/")) and _has_file_extension(p)
     }
     for path in sorted(concrete_declared - plan_path_set):
-        issues.append(_prepare_protocol_issue("directory_or_text_path_missing_from_skill_plan", "蓝图中出现的具体文件必须在 SkillPlan path 中声明。", path=path))
+        issues.append(_prepare_protocol_issue("directory_or_text_path_missing_from_skill_plan", f"蓝图中出现的具体文件 {path} 必须在 SkillPlan path 中声明。", path=path))
     return issues
 
 
@@ -467,56 +467,71 @@ def _prepare_repair_candidate_is_valid(candidate: str) -> bool:
     )
 
 
-def _prepare_reference_dependency_paths(blueprint_text: str) -> set[str]:
+def _is_valid_prepare_reference_path(path: str) -> bool:
+    normalized = _normalize_skill_path(str(path or ""))
+    if not normalized.startswith("references/") or normalized in {"references", "references/"}:
+        return False
+    if not normalized.endswith(".md") or not _has_file_extension(normalized):
+        return False
+    if re.search(r"[<>{}*\[\]]|\$\{", normalized):
+        return False
+    return True
+
+
+def _extract_prepare_reference_paths(blueprint_text: str) -> set[str]:
+    """Extract concrete references/*.md mentions from the whole prepare blueprint."""
     paths: set[str] = set()
-    for dep_match in re.finditer(r"(?im)^\s*dependencies\s*:\s*\[?([^\]\n]*)\]?", str(blueprint_text or "")):
-        for ref in re.findall(r"references/[A-Za-z0-9._/-]+\.md\b", dep_match.group(1)):
-            normalized = _normalize_skill_path(ref)
-            if normalized:
-                paths.add(normalized)
+    pattern = re.compile(r"(?<![\w./-])(references/[^\s`'\"，,。；;:)）]+\.md)(?![\w./-])", re.I)
+    for match in pattern.finditer(str(blueprint_text or "")):
+        path = _normalize_skill_path(match.group(1).strip())
+        if _is_valid_prepare_reference_path(path):
+            paths.add(path)
     return paths
 
 
 def _prepare_reference_plan_block(path: str) -> str:
     return (
-        f"- path: {path}\n"
+        f"- path: `{path}`\n"
         "  file_type: reference\n"
         "  role: reference\n"
         "  purpose: 运行前静态参考资料，供相关脚本按 dependencies/reference_files 读取。\n"
         "  required: true\n"
-        "  dependencies: []"
+        "  can_skip: false\n"
+        "  inputs: []\n"
+        "  outputs: []\n"
+        "  dependencies: []\n"
+        "  required_capabilities: []\n"
+        "  forbidden_capabilities: []\n"
+        "  references: []"
     )
 
 
-def _normalize_prepare_blueprint_references(blueprint_text: str) -> str:
-    """Deterministically reconcile references/*.md mentions with SkillPlan paths.
+def _insert_prepare_reference_plan_blocks(blueprint_text: str, blocks: list[str]) -> str:
+    if not blocks:
+        return str(blueprint_text or "").strip()
+    text = str(blueprint_text or "").rstrip()
+    addition = "\n" + "\n".join(blocks) + "\n"
+    heading_match = re.search(r"(?im)^\s*#{1,6}\s*(?:SkillPlan|.*文件职责计划).*$", text)
+    if not heading_match:
+        return (text + "\n\n## SkillPlan / 文件职责计划" + addition).strip()
+    next_heading = re.search(r"(?m)^\s*#{1,6}\s+", text[heading_match.end():])
+    if not next_heading:
+        return (text + addition).strip()
+    insert_at = heading_match.end() + next_heading.start()
+    before = text[:insert_at].rstrip()
+    after = text[insert_at:].lstrip("\n")
+    return (before + addition + "\n" + after).strip()
 
-    Missing reference paths that are explicitly used in dependencies are added
-    as reference file plans. Incidental resource-list mentions are removed
-    rather than escalating back to user clarification.
-    """
+
+def _normalize_prepare_blueprint_references(blueprint_text: str) -> str:
+    """Deterministically add SkillPlan entries for concrete references/*.md mentions."""
     text = str(blueprint_text or "")
     plan_paths = set(_extract_prepare_skill_plan_paths(text))
-    declared_refs = {
-        p for p in _extract_declared_skill_paths(text)
-        if p.startswith("references/") and _has_file_extension(p)
-    }
-    missing_refs = sorted(declared_refs - plan_paths)
+    missing_refs = sorted(path for path in _extract_prepare_reference_paths(text) if path not in plan_paths)
     if not missing_refs:
         return text
-    dependency_refs = _prepare_reference_dependency_paths(text)
-    refs_to_add = [p for p in missing_refs if p in dependency_refs]
-    refs_to_remove = [p for p in missing_refs if p not in dependency_refs]
-    normalized = text
-    for path in refs_to_remove:
-        normalized = re.sub(rf"(?m)^\s*[-*]?\s*`?{re.escape(path)}`?.*$\n?", "", normalized)
-    if refs_to_add:
-        addition = "\n".join(_prepare_reference_plan_block(path) for path in refs_to_add)
-        if re.search(r"(?im)SkillPlan|文件职责计划", normalized):
-            normalized = normalized.rstrip() + "\n" + addition + "\n"
-        else:
-            normalized = normalized.rstrip() + "\n\n## SkillPlan / 文件职责计划\n" + addition + "\n"
-    return normalized.strip()
+    blocks = [_prepare_reference_plan_block(path) for path in missing_refs]
+    return _insert_prepare_reference_plan_blocks(text, blocks)
 
 
 async def _repair_prepare_blueprint_protocol(
@@ -620,6 +635,9 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
 - 如果上传文件用途不明确，必须追问并区分：只作为本次创建参考、作为未来运行 Skill 的输入、固定加入 Skill assets。
 - assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
 - 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path；目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。
+- 资源清单只能列 SkillPlan path 中已声明的 references/assets；dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
+- 不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图；不确定是否需要 reference 时，默认不创建 reference 文件，也不要写入资源清单。
+- 如确需 reference，必须在 SkillPlan 中声明完整 reference block：path/role/inputs/outputs/dependencies/required_capabilities/forbidden_capabilities/references。
 - 需要使用已有工具时，脚本必须写 required_tool_slots 或 selected_tools；不要只依赖 required_capabilities。reference 文件和 asset 文件不得声明运行时工具能力。
 - 当 uploaded_files 的 candidate_tools 包含 vision_understanding 且需求需要理解图片内容时，应在脚本中声明 required_tool_slots: [vision_understanding] 或 selected_tools: [vision_understanding]；不要只写 required_capabilities。
 - 上传图片需要理解内容时使用 vision_understanding，不要要求用户手动描述图片，不要把图像理解误当 image_generation，不要把上传图片默认加入 assets。
@@ -707,6 +725,7 @@ async def _generate_internal_blueprint_from_confirmed_summary(
     prompt = load_kernel_creator_for_phase("prepare_plan") + """
 基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text。只输出严格 JSON object：{"status":"ready","internal_blueprint_text":"...","review_summary":{...},"skill_name":"..."}。
 不得继续返回 needs_clarification，不得询问问题。未明确的非关键偏好使用默认推荐项。运行时输入默认不作为 Creator assets。输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
+资源清单只能列 SkillPlan path 中已声明的 references/assets；dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图；不确定是否需要 reference 时默认不创建 reference 文件，也不要写入资源清单。如确需 reference，必须在 SkillPlan 中声明完整 reference block：path/role/inputs/outputs/dependencies/required_capabilities/forbidden_capabilities/references。
 """
     confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
     payload = {

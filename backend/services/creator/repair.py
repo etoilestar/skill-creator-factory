@@ -1886,7 +1886,7 @@ async def _repair_generated_file_with_feedback(
             "第一轮单文件修复。\n"
             "只修当前脚本文件，不改 SKILL.md，不改其它脚本，不改 references/assets。\n"
             "优先修不可用工具或 helper；然后确保当前脚本语义功能完整、核心产物真实构造、declared artifact 来自真实结果。\n"
-            "只使用 selected Tool Registry function cards 中真实存在的 helper；没有可用 helper 时用当前脚本本地逻辑实现职责，不要猜 runtime_tools 函数。\n"
+            "优先使用 Current File Tool Binding 绑定的 helper；没有可用 helper 时用当前脚本本地逻辑、Python 标准库或已允许/已安装的安全依赖实现职责，不要猜 runtime_tools 函数。\n"
             "不要只改字段名；不要为了通过校验返回空结果或伪造成功。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
         )
@@ -1899,7 +1899,7 @@ async def _repair_generated_file_with_feedback(
             f"{json.dumps(current_file_binding or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
             "Current Tool Pool Summary（含 scored candidates / primary / fallback / denied / missing）：\n"
             f"{json.dumps(tool_pool_summary or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
-            "Runtime Import Guard Result（如果存在，必须先修复该硬错误；需要池外工具时只能输出 tool_pool_patch.add_tool_requests）：\n"
+            "Runtime Import Guard Result（如果存在，必须先修复该硬错误；不要把 forbidden helper 替换成另一个未绑定 helper；需要平台 helper 时请求 tool_pool_patch.add_tool_requests；若任务可由标准库/允许依赖完成，则改为本地实现，不导入 runtime_tools）：\n"
             f"{json.dumps(import_guard_result or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
             "Tool Registry / Snippet 上下文：\n"
             f"{tool_context}\n\n"
@@ -2101,6 +2101,16 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
                 "这不是可保存状态，必须让模型返修为非空静态资源内容；"
                 "如果该 asset 是用户上传素材，则不应走模型生成链路。"
             )
+
+    if "generated_pool_forbidden_import" in error_text or "generated_unknown_runtime_tool_import" in error_text:
+        return (
+            "当前脚本导入了未绑定或不存在的 backend.services.runtime_tools helper，这是硬错误。"
+            "不要把 forbidden helper 替换成另一个未绑定 helper，不要伪造 helper 名称。"
+            "如果确实需要平台 helper，应请求 tool_pool_patch.add_tool_requests 并等待工具池绑定后再 import。"
+            "如果没有平台 helper，但任务可由 Python 标准库或允许的第三方依赖完成，请改为本地实现，不要 import runtime_tools。"
+            "TXT 读取使用 open()。DOCX 可用 zipfile + xml.etree.ElementTree 读取 word/document.xml 作为 fallback。"
+            "PDF 若没有 extract_pdf_text/pypdf/pdfplumber 等已绑定 helper或可用依赖，则返回明确 blocker，不要假装支持。"
+        )
 
     if "stdout_required_outputs_missing" in error_text:
         return (
@@ -3862,4 +3872,4 @@ async def _run_script_responsibility_review(
 __all__ = [name for name in globals() if not name.startswith("__")]
 
 
-TOOL_POOL_REPAIR_RULES = """Repair may only use current_file_binding.allowed_helper_imports. If a pool-external helper is needed, emit tool_pool_patch.add_tool_requests; patches must pass tool_pool_gate before code may import the helper. Repair must not add script files or let references/assets use runtime tools. Import guard errors are hard constraints."""
+TOOL_POOL_REPAIR_RULES = """Repair may only import backend.services.runtime_tools helpers listed in current_file_binding.allowed_helper_imports. Do not replace a forbidden helper with another unbound helper. If a pool-external platform helper is needed, emit tool_pool_patch.add_tool_requests; patches must pass tool_pool_gate before code may import the helper. If the task can be implemented with Python standard library or allowed third-party dependencies, do that without importing runtime_tools. Repair must not add script files or let references/assets use runtime tools. Import guard errors are hard constraints."""

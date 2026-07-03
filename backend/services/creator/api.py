@@ -1,9 +1,10 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import hashlib
+import json
 import shutil
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
@@ -15,6 +16,85 @@ from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_s
 from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
 from .tool_pool_builder import build_tool_pool
 from .runtime_import_guard import guard_runtime_imports
+
+_NOT_SUPPORTED_MARKERS = (
+    "not supported in current implementation",
+    "not supported",
+)
+_DECLARED_FORMAT_TOKENS = {
+    "pdf": ("pdf", ".pdf"),
+    "docx": ("docx", ".docx", "word document"),
+    "txt": ("txt", ".txt", "plain text"),
+}
+
+
+def _entry_text_for_declared_support(skill_plan_entry: Any) -> str:
+    if isinstance(skill_plan_entry, dict):
+        parts = [
+            skill_plan_entry.get("purpose"),
+            skill_plan_entry.get("inputs"),
+            skill_plan_entry.get("outputs"),
+            skill_plan_entry.get("runtime_contract"),
+            skill_plan_entry.get("coverage_requirements"),
+        ]
+    else:
+        parts = [
+            getattr(skill_plan_entry, "purpose", None),
+            getattr(skill_plan_entry, "inputs", None),
+            getattr(skill_plan_entry, "outputs", None),
+            getattr(skill_plan_entry, "runtime_contract", None),
+            getattr(skill_plan_entry, "coverage_requirements", None),
+        ]
+    return json.dumps(parts, ensure_ascii=False, default=str).lower()
+
+
+def _declared_supported_input_formats(*, blueprint_text: str, skill_plan_entry: Any) -> set[str]:
+    declared = f"{blueprint_text or ''}\n{_entry_text_for_declared_support(skill_plan_entry)}".lower()
+    return {
+        fmt
+        for fmt, tokens in _DECLARED_FORMAT_TOKENS.items()
+        if any(token in declared for token in tokens)
+    }
+
+
+def _not_supported_declared_input_issue(
+    *,
+    source: str,
+    blueprint_text: str,
+    skill_plan_entry: Any,
+    file_path: str,
+) -> dict[str, Any] | None:
+    lowered = (source or "").lower()
+    if not any(marker in lowered for marker in _NOT_SUPPORTED_MARKERS):
+        return None
+    declared_formats = _declared_supported_input_formats(
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+    )
+    unsupported_declared = sorted(
+        fmt
+        for fmt in declared_formats
+        if fmt in lowered or f".{fmt}" in lowered
+    )
+    if not unsupported_declared:
+        return None
+    return {
+        "id": "script_declared_input_not_supported",
+        "failed_file": file_path,
+        "failed_function": "declared input parser/dispatcher",
+        "code_region": "branch raising not supported for a declared input type",
+        "reason": (
+            "Script source contains a not-supported branch for input formats "
+            f"{', '.join(unsupported_declared)} while the blueprint/SkillPlan declares support for them."
+        ),
+        "minimal_edit": (
+            "Either use a bound helper, implement the format with Python standard library / allowed dependencies, "
+            "or adjust SkillPlan/SKILL.md to remove that support scope; do not simultaneously claim support and raise not supported."
+        ),
+        "allowed_scope": "current script implementation or declared support scope",
+        "repair_boundary": "declared input format handling",
+        "details": {"declared_formats": unsupported_declared},
+    }
 
 _VALIDATOR_ONLY_LAYERS = {
     "e2e_requirement_validator_error",
@@ -3391,6 +3471,15 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                 if request.file_path.startswith("scripts/"):
+                    unsupported_issue = _not_supported_declared_input_issue(
+                        source=content,
+                        blueprint_text=request.blueprint_text,
+                        skill_plan_entry=effective_skill_plan_entry,
+                        file_path=request.file_path,
+                    )
+                    if unsupported_issue:
+                        raise ScriptFunctionalValidationError([unsupported_issue], layer="script_declared_input_not_supported")
+
                     allowed_tools = list(resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
                     boundary_violations = _script_tool_boundary_violations(content, allowed_tools)
                     if boundary_violations:

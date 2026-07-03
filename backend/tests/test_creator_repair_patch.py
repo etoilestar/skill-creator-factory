@@ -486,3 +486,17 @@ async def test_workflow_e2e_argv_schema_context_treats_guard_as_probe(monkeypatc
     assert "禁止只 patch guard schema" in combined
     assert "SKILL.md block 调用、script entry、script core" in combined
     assert "不能删除业务参数/功能覆盖面" in combined
+
+
+def test_generated_pool_forbidden_import_repair_prompt_mentions_stdlib_fallback():
+    from backend.services.creator.repair import _targeted_generated_file_repair_instructions
+
+    prompt = _targeted_generated_file_repair_instructions(
+        file_path='scripts/parse.py',
+        deterministic_error='generated_pool_forbidden_import: read_file_text is not bound',
+    )
+    assert '不要把 forbidden helper 替换成另一个未绑定 helper' in prompt
+    assert 'tool_pool_patch' in prompt
+    assert 'open()' in prompt
+    assert 'zipfile' in prompt
+    assert 'PDF' in prompt

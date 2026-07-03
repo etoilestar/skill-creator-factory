@@ -54,13 +54,30 @@ def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) 
     }
 
 
+def _is_python_stdlib_module(name: str) -> bool:
+    """Return True if *name* is a Python standard-library module.
+
+    Uses ``sys.stdlib_module_names`` (Python 3.10+) and ``sys.builtin_module_names``
+    (all versions).  Standard-library modules ship with the interpreter and cannot
+    be installed via pip; surfacing them as install requests would always fail.
+    """
+    import sys as _sys
+    stdlib_names: frozenset[str] = getattr(_sys, "stdlib_module_names", frozenset())
+    builtin_names: frozenset[str] = frozenset(getattr(_sys, "builtin_module_names", ()))
+    return name in stdlib_names or name in builtin_names
+
+
 def extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, str]]:
-    """Extract missing standard-library/package requests from E2E execution errors.
+    """Extract missing third-party package requests from E2E execution errors.
 
     Parses ``ModuleNotFoundError`` and ``ImportError`` lines in stderr/stdout
     sections of E2E error messages and returns structured install requests.
     These are surfaced to the caller so the backend can add the packages to the
     environment rather than treating them as code bugs.
+
+    Python standard-library modules are automatically excluded: they ship with
+    the interpreter and cannot be installed via pip, so attempting to install
+    them would always fail.
     """
     import re as _re
     requests: list[dict[str, str]] = []
@@ -73,7 +90,7 @@ def extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, 
     for error in errors or []:
         for match in module_pattern.finditer(error):
             pkg = match.group(1).split(".")[0]  # top-level package name
-            if pkg and pkg not in seen:
+            if pkg and pkg not in seen and not _is_python_stdlib_module(pkg):
                 seen.add(pkg)
                 requests.append({
                     "package": pkg,

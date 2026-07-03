@@ -53,6 +53,42 @@ def test_extract_missing_stdlib_empty_input():
     assert extract_missing_stdlib_from_e2e_errors(["no error here"]) == []
 
 
+def test_extract_missing_stdlib_filters_out_python_stdlib_modules():
+    """Python stdlib modules (os, sys, json, re …) must NOT be surfaced as pip requests."""
+    from backend.services.creator.e2e import extract_missing_stdlib_from_e2e_errors
+
+    # These are all Python standard-library modules that cannot be pip-installed.
+    stdlib_errors = [
+        "ModuleNotFoundError: No module named 'os'",
+        "ModuleNotFoundError: No module named 'sys'",
+        "ModuleNotFoundError: No module named 'json'",
+        "ImportError: No module named re",
+        "ModuleNotFoundError: No module named 'pathlib'",
+    ]
+    reqs = extract_missing_stdlib_from_e2e_errors(stdlib_errors)
+    stdlib_pkgs = {r["package"] for r in reqs}
+    for stdlib_mod in ("os", "sys", "json", "re", "pathlib"):
+        assert stdlib_mod not in stdlib_pkgs, (
+            f"stdlib module '{stdlib_mod}' must not be surfaced as a pip install request"
+        )
+
+
+def test_extract_missing_stdlib_third_party_still_surfaced():
+    """Third-party packages must still be surfaced even when mixed with stdlib modules."""
+    from backend.services.creator.e2e import extract_missing_stdlib_from_e2e_errors
+
+    errors = [
+        "ModuleNotFoundError: No module named 'requests'",
+        "ModuleNotFoundError: No module named 'os'",   # stdlib – must be filtered
+        "ModuleNotFoundError: No module named 'pandas'",
+    ]
+    reqs = extract_missing_stdlib_from_e2e_errors(errors)
+    pkgs = {r["package"] for r in reqs}
+    assert "requests" in pkgs
+    assert "pandas" in pkgs
+    assert "os" not in pkgs
+
+
 # ---------------------------------------------------------------------------
 # Fix 5: runtime_import_guard fail-closed (no binding → deny runtime helpers)
 # ---------------------------------------------------------------------------

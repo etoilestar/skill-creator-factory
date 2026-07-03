@@ -13,6 +13,7 @@ from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
+from .tool_pool_builder import build_tool_pool
 from .runtime_import_guard import guard_runtime_imports
 
 _VALIDATOR_ONLY_LAYERS = {
@@ -73,7 +74,7 @@ class PreparePlanReviewSummary(BaseModel):
 
 class PreparePlanResponse(BaseModel):
     status: Literal["ready", "needs_clarification", "blocked"]
-    prepare_stage: Literal["business_clarification", "creation_points_confirmation", "supplement_confirmation", "ready"] = "business_clarification"
+    prepare_stage: Literal["business_clarification", "creation_points_confirmation", "supplement_confirmation", "ready", "blueprint_protocol_failed", "blueprint_analyze_failed"] = "business_clarification"
     clarifying_questions: list[str] = Field(default_factory=list)
     review_summary: PreparePlanReviewSummary = Field(default_factory=PreparePlanReviewSummary)
     blueprint_text: str = ""
@@ -207,6 +208,7 @@ def _coerce_prepare_summary(data: Any) -> PreparePlanReviewSummary:
 
 MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS = 2
 MAX_PREPARE_SUPPLEMENT_ROUNDS = 1
+MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS = 3
 
 _PREPARE_SUPPLEMENT_QUESTION = "以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明"
 
@@ -385,6 +387,81 @@ def _preflight_prepare_blueprint_text(blueprint_text: str) -> list[dict[str, Any
     return issues
 
 
+def _prepare_blueprint_has_required_protocol_shape(blueprint_text: str) -> bool:
+    text = str(blueprint_text or "")
+    return bool(
+        text.strip()
+        and re.search(r"Skill\s*架构蓝图|技能架构蓝图|架构蓝图|internal_blueprint", text, re.I)
+        and re.search(r"SkillPlan|文件职责计划", text, re.I)
+        and _extract_prepare_skill_plan_paths(text)
+    )
+
+
+def _prepare_blueprint_contains_clarification_text(blueprint_text: str) -> bool:
+    text = str(blueprint_text or "")
+    return bool(re.search(r"\bneeds_clarification\b|clarifying_questions|还需要.*确认|请.*补充", text, re.I))
+
+
+def _prepare_repair_candidate_is_valid(candidate: str) -> bool:
+    return (
+        bool(str(candidate or "").strip())
+        and _prepare_blueprint_has_required_protocol_shape(candidate)
+        and not _prepare_blueprint_contains_clarification_text(candidate)
+    )
+
+
+def _prepare_reference_dependency_paths(blueprint_text: str) -> set[str]:
+    paths: set[str] = set()
+    for dep_match in re.finditer(r"(?im)^\s*dependencies\s*:\s*\[?([^\]\n]*)\]?", str(blueprint_text or "")):
+        for ref in re.findall(r"references/[A-Za-z0-9._/-]+\.md\b", dep_match.group(1)):
+            normalized = _normalize_skill_path(ref)
+            if normalized:
+                paths.add(normalized)
+    return paths
+
+
+def _prepare_reference_plan_block(path: str) -> str:
+    return (
+        f"- path: {path}\n"
+        "  file_type: reference\n"
+        "  role: reference\n"
+        "  purpose: 运行前静态参考资料，供相关脚本按 dependencies/reference_files 读取。\n"
+        "  required: true\n"
+        "  dependencies: []"
+    )
+
+
+def _normalize_prepare_blueprint_references(blueprint_text: str) -> str:
+    """Deterministically reconcile references/*.md mentions with SkillPlan paths.
+
+    Missing reference paths that are explicitly used in dependencies are added
+    as reference file plans. Incidental resource-list mentions are removed
+    rather than escalating back to user clarification.
+    """
+    text = str(blueprint_text or "")
+    plan_paths = set(_extract_prepare_skill_plan_paths(text))
+    declared_refs = {
+        p for p in _extract_declared_skill_paths(text)
+        if p.startswith("references/") and _has_file_extension(p)
+    }
+    missing_refs = sorted(declared_refs - plan_paths)
+    if not missing_refs:
+        return text
+    dependency_refs = _prepare_reference_dependency_paths(text)
+    refs_to_add = [p for p in missing_refs if p in dependency_refs]
+    refs_to_remove = [p for p in missing_refs if p not in dependency_refs]
+    normalized = text
+    for path in refs_to_remove:
+        normalized = re.sub(rf"(?m)^\s*[-*]?\s*`?{re.escape(path)}`?.*$\n?", "", normalized)
+    if refs_to_add:
+        addition = "\n".join(_prepare_reference_plan_block(path) for path in refs_to_add)
+        if re.search(r"(?im)SkillPlan|文件职责计划", normalized):
+            normalized = normalized.rstrip() + "\n" + addition + "\n"
+        else:
+            normalized = normalized.rstrip() + "\n\n## SkillPlan / 文件职责计划\n" + addition + "\n"
+    return normalized.strip()
+
+
 async def _repair_prepare_blueprint_protocol(
     *,
     request: PreparePlanRequest,
@@ -393,7 +470,7 @@ async def _repair_prepare_blueprint_protocol(
 ) -> str:
     repaired = str(blueprint_text or "")
     seen = {repaired}
-    for _ in range(2):
+    for _ in range(MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS):
         prompt = load_kernel_creator_for_phase("prepare_plan") + """
 你只修复 internal_blueprint_text 的 Creator 硬协议问题。只输出修复后的蓝图正文，不要 JSON，不要 Markdown 解释。
 修复要求：
@@ -414,10 +491,13 @@ async def _repair_prepare_blueprint_protocol(
         if candidate.startswith("```"):
             candidate = re.sub(r"^```(?:markdown|md)?\s*", "", candidate, flags=re.IGNORECASE).strip()
             candidate = re.sub(r"\s*```$", "", candidate).strip()
-        if not candidate or candidate in seen:
+        if not _prepare_repair_candidate_is_valid(candidate):
+            continue
+        if candidate in seen:
             break
         repaired = candidate
         seen.add(repaired)
+        repaired = _normalize_prepare_blueprint_references(repaired)
         protocol_errors = _preflight_prepare_blueprint_text(repaired)
         if not protocol_errors:
             break
@@ -1270,6 +1350,7 @@ async def _normalize_script_purpose_short_contracts(
 @router.post("/prepare-plan", response_model=PreparePlanResponse)
 async def prepare_plan(request: PreparePlanRequest):
     prepare_action = str(request.prepare_action or "none")
+    confirmed_prepare = prepare_action == "confirm" or _prepare_user_confirmed_no_more_supplement(request)
 
     if prepare_action == "request_supplement":
         return PreparePlanResponse(
@@ -1304,12 +1385,7 @@ async def prepare_plan(request: PreparePlanRequest):
         confirmed = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=[question], review_summary=_strip_prepare_summary_risks(confirmed), skill_name=skill_name)
 
-    if prepare_action == "confirm" and status != "ready":
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
-        status = "ready"
-        skill_name = str(prepared.get("skill_name") or skill_name)
-    elif prepare_action == "none" and _prepare_user_confirmed_no_more_supplement(request) and status != "ready":
+    if confirmed_prepare and status != "ready":
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
         status = "ready"
@@ -1340,7 +1416,12 @@ async def prepare_plan(request: PreparePlanRequest):
         )
 
     if status == "needs_clarification":
-        if not _prepare_business_clarification_limit_reached(request):
+        if confirmed_prepare:
+            summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
+            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
+            status = "ready"
+            skill_name = str(prepared.get("skill_name") or skill_name)
+        elif not _prepare_business_clarification_limit_reached(request):
             return PreparePlanResponse(
                 status="needs_clarification",
                 prepare_stage="business_clarification",
@@ -1348,12 +1429,23 @@ async def prepare_plan(request: PreparePlanRequest):
                 review_summary=PreparePlanReviewSummary(),
                 skill_name=skill_name,
             )
-        return await summarize_and_confirm(_PREPARE_SUPPLEMENT_QUESTION)
+        else:
+            return await summarize_and_confirm(_PREPARE_SUPPLEMENT_QUESTION)
 
-    if status == "blocked":
+    if status == "blocked" and not confirmed_prepare:
         return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
+    if status == "blocked" and confirmed_prepare:
+        blockers = prepared.get("blockers") or ["用户确认后仍无法生成可执行蓝图。"]
+        return PreparePlanResponse(
+            status="blocked",
+            prepare_stage="blueprint_protocol_failed",
+            clarifying_questions=[],
+            review_summary=_strip_prepare_summary_risks(summary),
+            skill_name=skill_name,
+            creation_blockers=blockers if isinstance(blockers, list) else [str(blockers)],
+        )
 
-    if status == "ready" and prepare_action != "confirm" and not _prepare_user_confirmed_no_more_supplement(request):
+    if status == "ready" and not confirmed_prepare:
         summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
         return PreparePlanResponse(
             status="needs_clarification",
@@ -1365,12 +1457,23 @@ async def prepare_plan(request: PreparePlanRequest):
 
     blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
     if not blueprint_text:
+        if confirmed_prepare:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=_strip_prepare_summary_risks(summary),
+                skill_name=skill_name,
+                creation_blockers=[_prepare_protocol_issue("empty_blueprint", "用户确认后内部蓝图为空，无法进入创建计划。")],
+            )
         return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
 
+    blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
     protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
     if protocol_errors:
         try:
             blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=protocol_errors)
+            blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
             protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
         except Exception:
             pass
@@ -1379,10 +1482,20 @@ async def prepare_plan(request: PreparePlanRequest):
         try:
             prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
             blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
+            blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
             protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
         except Exception:
             pass
     if protocol_errors:
+        if confirmed_prepare:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=_strip_prepare_summary_risks(summary),
+                skill_name=skill_name,
+                creation_blockers=protocol_errors,
+            )
         return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
     plan = None
@@ -1403,6 +1516,7 @@ async def prepare_plan(request: PreparePlanRequest):
                 break
             try:
                 blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=[{**analyze_errors[0], "detail": str(exc.detail)}])
+                blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
             except Exception:
                 break
             protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
@@ -1410,6 +1524,16 @@ async def prepare_plan(request: PreparePlanRequest):
                 analyze_errors = protocol_errors
                 break
     if plan is None:
+        if confirmed_prepare:
+            blockers = analyze_errors or [_prepare_protocol_issue("strict_analyze_failed", "用户确认后内部蓝图无法解析为创建计划。", field="analyze_blueprint")]
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_analyze_failed",
+                clarifying_questions=[],
+                review_summary=_strip_prepare_summary_risks(summary),
+                skill_name=skill_name,
+                creation_blockers=blockers,
+            )
         return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
     confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)

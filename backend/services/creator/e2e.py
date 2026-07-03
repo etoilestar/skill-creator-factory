@@ -54,6 +54,34 @@ def _command_normalizer_blocked_payload(*, target_file: str, issues: list[Any]) 
     }
 
 
+def _extract_missing_stdlib_from_e2e_errors(errors: list[str]) -> list[dict[str, str]]:
+    """Extract missing standard-library/package requests from E2E execution errors.
+
+    Parses ``ModuleNotFoundError`` and ``ImportError`` lines in stderr/stdout
+    sections of E2E error messages and returns structured install requests.
+    These are surfaced to the caller so the backend can add the packages to the
+    environment rather than treating them as code bugs.
+    """
+    import re as _re
+    requests: list[dict[str, str]] = []
+    seen: set[str] = set()
+    # Patterns: "No module named 'X'" or "No module named X"
+    module_pattern = _re.compile(
+        r"(?:ModuleNotFoundError|ImportError)[^\n]*No module named ['\"]?([A-Za-z0-9_.\-]+)['\"]?",
+        _re.IGNORECASE,
+    )
+    for error in errors or []:
+        for match in module_pattern.finditer(error):
+            pkg = match.group(1).split(".")[0]  # top-level package name
+            if pkg and pkg not in seen:
+                seen.add(pkg)
+                requests.append({
+                    "package": pkg,
+                    "reason": "E2E execution failed with ModuleNotFoundError; package must be added to the environment library.",
+                    "source": "e2e_missing_stdlib",
+                })
+    return requests
+
 
 def _skill_md_command_normalizer_context(
     *,
@@ -3627,6 +3655,9 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮只修 workflow / cross-step IO / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
+            # Point 4: Explicitly prohibit tool exploration during E2E repair.
+            "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，不得探索或扩展工具池。"
+            "若 E2E 发现缺少标准库，在响应中声明 missing_stdlib_request 而非探索工具库。",
         ),
     )
 

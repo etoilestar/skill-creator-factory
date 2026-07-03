@@ -1,19 +1,45 @@
 from __future__ import annotations
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from pydantic import BaseModel, Field
 from backend.services.creator_tool_registry import ToolCapability, list_tool_capabilities
 from .tool_pool_models import ToolPoolAddToolRequest
 
-SYNONYMS = {
-    'pdf': ['pdf', '文档', '论文', '报告文件'],
-    'text_extraction': ['文本', '提取文本', '读取文本', '转文本', '抽取内容', '解析内容', '内容提取'],
-    'markdown': ['markdown', 'md', '转md', '转 markdown', '转markdown', 'markdown格式'],
-    'parse': ['解析', '提取', '读取', '转换', 'convert', 'parse', 'extract', 'read'],
-    'structure': ['结构', '版面', '表格', '公式', '标题', '层级', 'layout', 'structure', 'table', 'formula'],
-    'image': ['图片', '图像', '照片', '视觉', 'image', 'vision'],
-    'spreadsheet': ['表格', 'excel', 'xlsx', 'csv', 'sheet'],
-}
+# Generic baseline action tokens that apply across any domain.
+_BASELINE_TOKENS = [
+    'convert', 'parse', 'extract', 'read', 'write', 'generate', 'analyze',
+    'process', 'transform', 'search', 'summarize', 'classify', 'detect',
+    'export', 'import', 'merge', 'split', 'validate', 'format',
+]
+
+@lru_cache(maxsize=1)
+def _build_registry_synonym_map() -> dict[str, list[str]]:
+    """Build a token-expansion map from tool registry metadata (domain-agnostic).
+
+    Groups capability_aliases and semantic_tags from every registered tool so
+    that matching is driven by what the registry actually declares rather than
+    hard-coded domain keywords.  The result is cached for the process lifetime.
+    """
+    synonym_map: dict[str, list[str]] = {}
+    for cap in list_tool_capabilities():
+        all_terms: list[str] = []
+        for field in ('capability_aliases', 'semantic_tags', 'domain_terms', 'task_verbs'):
+            for item in (getattr(cap, field, None) or []):
+                t = str(item).strip()
+                if t:
+                    all_terms.append(t)
+        for term in all_terms:
+            key = term.lower().replace(' ', '')
+            if not key:
+                continue
+            group = synonym_map.setdefault(key, [])
+            for sibling in all_terms:
+                s = sibling.lower().replace(' ', '')
+                if s and s not in group:
+                    group.append(s)
+    return synonym_map
 
 class ToolPoolExplorationResult(BaseModel):
     candidate_tool_requests: list[ToolPoolAddToolRequest] = Field(default_factory=list)
@@ -57,13 +83,23 @@ def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tupl
     return tools, triggers
 
 def _normalize_tokens(text: str) -> set[str]:
-    raw=(text or '').lower().replace(' ', '')
-    tokens={raw} if raw else set()
-    for key, terms in SYNONYMS.items():
-        if any(term.lower().replace(' ', '') in raw for term in terms):
-            tokens.add(key)
-    for chunk in ['pdf','markdown','md','text','convert','parse','extract','read','summary','摘要','纯文本']:
-        if chunk in raw: tokens.add(chunk)
+    raw = (text or '').lower()
+    raw_nospace = raw.replace(' ', '')
+    # Extract individual words/CJK substrings as tokens
+    word_tokens = set(re.findall(r'[a-z0-9_\u4e00-\u9fff]+', raw))
+    tokens = word_tokens | ({raw_nospace} if raw_nospace else set())
+    # Expand via registry-derived synonym map (domain-agnostic)
+    synonym_map = _build_registry_synonym_map()
+    expanded: set[str] = set()
+    for key, siblings in synonym_map.items():
+        if key in raw_nospace or any(s in raw_nospace for s in siblings):
+            expanded.add(key)
+            expanded.update(siblings)
+    tokens |= expanded
+    # Baseline action tokens as a fallback floor
+    for chunk in _BASELINE_TOKENS:
+        if chunk in raw:
+            tokens.add(chunk)
     return tokens
 
 def _cap_meta(cap: ToolCapability, key: str) -> list[str]:
@@ -153,8 +189,16 @@ def explore_tool_pool(*, user_request: str = '', blueprint_text: str = '', file_
         for row in candidates:
             if len(keep) < 3 or row['tool_id'] in selected or row['tool_id'] in uploaded_candidate_tools:
                 keep.append(row)
+        # Derive a single capability_group for all tools discovered for this file spec.
+        # All top-ranked tools for the same file compete for the same "slot", so they share
+        # one group — the highest-scoring tool becomes primary, the rest become secondary.
+        # This is derived from the top matched terms of the best candidate (generic, not hardcoded).
+        if keep:
+            top_terms = [t for t in (keep[0].get('matched_terms') or []) if t]
+            file_capability_group = '_'.join(top_terms[:2]) if top_terms else (keep[0]['tool_id'] if keep else target.replace('/', '_'))
+        else:
+            file_capability_group = target.replace('/', '_')
         for rank,row in enumerate(keep,1):
             row['rank']=rank; scored.append(row)
-            capability_group = 'pdf_text_extraction' if '.pdf' in exts and (tokens & {'pdf','text_extraction','markdown','parse','structure'} or any('pdf' in o.lower() for o in outputs)) else row['tool_id']
-            requests.append(ToolPoolAddToolRequest(target_file=target, requested_capability=capability_group, candidate_tool_id=row['tool_id'], source='registry_exploration', reason=row['semantic_reason'], confidence=min(1.0, row['score']/100.0), score=row['score'], matched_features=row['matched_features'], matched_terms=row['matched_terms'], rank=rank, candidate_source=row['candidate_source'], semantic_reason=row['semantic_reason']))
+            requests.append(ToolPoolAddToolRequest(target_file=target, requested_capability=file_capability_group, candidate_tool_id=row['tool_id'], source='registry_exploration', reason=row['semantic_reason'], confidence=min(1.0, row['score']/100.0), score=row['score'], matched_features=row['matched_features'], matched_terms=row['matched_terms'], rank=rank, candidate_source=row['candidate_source'], semantic_reason=row['semantic_reason']))
     return ToolPoolExplorationResult(candidate_tool_requests=requests, scored_candidates=scored, uploaded_file_triggers=triggers, confidence=0.85, reason='semantic registry recall and scoring')

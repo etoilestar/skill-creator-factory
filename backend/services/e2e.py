@@ -6,6 +6,7 @@ import uuid
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
+from .creator.basic_format import check_patch_candidate_basic_format
 
 
 
@@ -3139,7 +3140,7 @@ async def _repair_existing_file_for_e2e_failure(
 
     for candidate_attempt in range(1, max_candidate_attempts + 1):
         current_content = working_content
-        use_full_rewrite = e2e_session.repair_attempt_counts.get(repair_key, 0) >= 2
+        use_full_rewrite = False
         effective_skill_md = current_content if target_path == "SKILL.md" else skill_md
         effective_task_context = base_task_context
         if target_path == "SKILL.md":
@@ -3226,57 +3227,36 @@ async def _repair_existing_file_for_e2e_failure(
 
             sanitized = _sanitize_generated_file_content(target_path, candidate_content)
 
-            try:
-                if target_path == "SKILL.md":
-                    _validate_skill_md_against_existing_files(skill_name, sanitized)
-
-                elif target_path.startswith("references/"):
-                    _validate_reference_file_contract(target_path, sanitized, skill_md)
-
-                elif target_path.startswith("assets/"):
-                    _validate_asset_file_contract(target_path, sanitized)
-
-                elif target_path.startswith("scripts/"):
-                    _validate_e2e_script_static_preflight(
-                        file_path=target_path,
-                        content=sanitized,
-                        skill_md=effective_skill_md,
-                    )
-
-            except Exception as preflight_exc:
+            basic_format_failure = check_patch_candidate_basic_format(target_path, sanitized)
+            if basic_format_failure is not None:
                 last_failure = (
-                    "STATIC_PREFLIGHT_FAILED：候选 patch 已应用，但静态预检失败。\n"
+                    "当前失败只表示 patch 后文件基础格式不合法。\n"
                     f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
-                    f"error_type={type(preflight_exc).__name__}\n"
-                    f"error={preflight_exc}\n"
-                    "请基于这个静态错误继续输出新的 exact_replace patch。"
+                    f"{basic_format_failure.to_failure_text()}\n"
+                    "不要修改工具选择。不要修改 argv schema。不要修改 stdout 字段。不要修改业务职责。只把当前候选修成合法源码/合法 Markdown。"
                 )
                 repair_feedback = deterministic_error + "\n\n" + last_failure
                 e2e_session.events.append({
                     **e2e_session.to_event_base(),
                     "attempt": candidate_attempt,
                     "target_file": target_path,
-                    "patch_status": "static_regression_failed",
+                    "patch_status": "basic_format_failed",
                     "repair_key": repair_key,
-                    "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
+                    "repair_mode": "localized_patch",
                     "status": "patch_failed",
-                    "rejection_reason": str(preflight_exc)[:2000],
+                    "coarse_failure_kind": basic_format_failure.coarse_failure_kind,
+                    "rejection_reason": basic_format_failure.message,
                     "failed_checks": repair_feedback.split("\n\n")[:8],
                     "resolved_failures": e2e_session.resolved_failures,
                     "rerun_status": "skipped",
                     "writeback_status": "candidate_only",
                 })
-                if not use_full_rewrite:
-                    e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
-                logger.warning(
-                    "[Creator][E2E][repair_candidate_static_failed] skill=%s file=%s attempt=%d/%d error=%s",
-                    skill_name,
-                    target_path,
-                    candidate_attempt,
-                    max_candidate_attempts,
-                    preflight_exc,
-                )
+                e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
+                consecutive_format_regressions += 1
+                if consecutive_format_regressions >= 3:
+                    return E2EValidationResult(success=False, errors=[last_failure], warnings=[], artifacts={}, debug={"stop_reason": "basic_format_failed"})
                 continue
+            consecutive_format_regressions = 0
 
             old_command_signature = e2e_session.command_plan_signature
             session_target = e2e_session.workspace_dir / target_path
@@ -3324,7 +3304,7 @@ async def _repair_existing_file_for_e2e_failure(
                 "resolved_failures": e2e_session.resolved_failures,
                 "patch_mode": "exact_replace",
                 "repair_key": repair_key,
-                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
+                "repair_mode": "localized_patch",
                 "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
                 "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "same_target_still_failed",
                 "status": "repaired" if sandbox_gate.get("accepted") else "same_target_still_failed",
@@ -3500,7 +3480,7 @@ async def _repair_existing_file_for_e2e_failure(
                 "parser_error": getattr(candidate_exc, "parser_error", "") or (error_text[:1000] if patch_status == "parse_failed" else ""),
                 "diff_extraction_attempted": bool(getattr(candidate_exc, "diff_extraction_attempted", False)),
                 "repair_key": repair_key,
-                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
+                "repair_mode": "localized_patch",
                 "old_lines_new_lines_fallback_attempted": bool(getattr(candidate_exc, "lines_fallback_attempted", False)),
                 "failed_checks": repair_feedback.split("\n\n")[:8],
                 "resolved_failures": e2e_session.resolved_failures,

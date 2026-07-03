@@ -572,6 +572,62 @@ def _command_argv_contract_for_script(file_path: str, blueprint_text: str, plan_
         "argv_keys": sorted(str(key) for key in argv.keys()),
     }
 
+
+def _stable_unique(values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _tool_binding_from_resolution(implementation_resolution: ImplementationResolution) -> dict[str, Any]:
+    tools = list(implementation_resolution.available_tools or []) + list(implementation_resolution.selected_tools or [])
+    primary_tool_ids: list[str] = []
+    allowed_helper_imports: list[str] = []
+    allowed_import_paths: list[str] = []
+    allowed_function_imports: list[str] = []
+    dependencies: list[str] = []
+    for tool in tools:
+        if getattr(tool, "tool_id", ""):
+            primary_tool_ids.append(str(tool.tool_id))
+        import_path = str(getattr(tool, "import_path", "") or "").strip()
+        function_name = str(getattr(tool, "function_name", "") or "").strip()
+        if import_path:
+            allowed_import_paths.append(import_path)
+        if import_path and function_name:
+            allowed_function_imports.append(function_name)
+            allowed_function_imports.append(f"{import_path}.{function_name}")
+            if import_path == "backend.services.runtime_tools":
+                allowed_helper_imports.append(function_name)
+        dependencies.extend(str(dep) for dep in (getattr(tool, "dependencies", []) or []))
+    dependencies.extend(str(dep) for dep in (implementation_resolution.declared_dependencies or []))
+    return {
+        "primary_tool_ids": _stable_unique(primary_tool_ids),
+        "allowed_helper_imports": _stable_unique(allowed_helper_imports),
+        "allowed_import_paths": _stable_unique(allowed_import_paths),
+        "allowed_function_imports": _stable_unique(allowed_function_imports),
+        "dependencies": _stable_unique(dependencies),
+    }
+
+
+def _merge_tool_binding_summary(explicit: dict[str, Any] | None, derived: dict[str, Any]) -> dict[str, Any]:
+    explicit = explicit if isinstance(explicit, dict) else {}
+    merged = dict(explicit)
+    for key, derived_values in derived.items():
+        existing = explicit.get(key)
+        if isinstance(existing, list):
+            merged[key] = _stable_unique([*existing, *derived_values])
+        elif existing not in (None, "", []):
+            merged[key] = existing
+        else:
+            merged[key] = _stable_unique(derived_values)
+    return merged
+
+
 def _script_local_contract_payload(
     *,
     file_path: str,
@@ -634,6 +690,8 @@ def _script_local_contract_payload(
     tool_binding_summary = {}
     if isinstance(plan_entry.runtime_contract, dict):
         tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
+    derived_tool_binding = _tool_binding_from_resolution(implementation_resolution)
+    tool_binding_summary = _merge_tool_binding_summary(tool_binding_summary, derived_tool_binding)
 
     return {
         "file_path": file_path,

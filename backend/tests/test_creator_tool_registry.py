@@ -172,6 +172,51 @@ def test_registered_tool_resolve_uses_registered_helper_and_trial_dispatch(monke
         clear_registered_tool_capabilities()
 
 
+def test_registered_function_manifest_fields_resolve_consistently():
+    from backend.services.creator_contracts import callable_manifest_from_capability
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        ToolFunctionManifest,
+        clear_registered_tool_capabilities,
+        register_tool_capability,
+        resolve_tools_for_skill_plan_entry,
+    )
+
+    clear_registered_tool_capabilities()
+    try:
+        cap = ToolCapability(
+            name="structured_lookup",
+            display_name="Structured Lookup",
+            category="registered",
+            roles=["generic_script"],
+            dependencies=[{"package": "rich", "imports": ["rich"]}],
+            functions=[ToolFunctionManifest(
+                function_name="lookup_value",
+                import_path="backend.services.runtime_tools.custom_tools.lookup",
+                short_description="Lookup one value.",
+                when_to_use="Use for structured lookup.",
+                signature="lookup_value(query: str) -> dict",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                required_capabilities=["structured_lookup"],
+            )],
+        )
+        register_tool_capability(cap)
+
+        resolved = resolve_tools_for_skill_plan_entry({"role": "generic_script", "required_capabilities": ["structured_lookup"]})
+        manifests = callable_manifest_from_capability(cap)
+
+        assert resolved.allowed_tools == ["structured_lookup"]
+        assert resolved.allowed_helper_imports == ["lookup_value"]
+        assert resolved.required_dependencies == ["rich"]
+        assert "lookup_value" in resolved.tool_usage_prompt
+        assert manifests[0].import_path == "backend.services.runtime_tools.custom_tools.lookup"
+        assert manifests[0].function_name == "lookup_value"
+        assert manifests[0].dependencies == ["rich"]
+    finally:
+        clear_registered_tool_capabilities()
+
+
 def test_resolve_tool_snippets_prioritizes_error_repair_context():
     from backend.services.creator_tool_registry import resolve_tool_snippets_for_context, tool_snippet_prompt
 

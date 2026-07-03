@@ -232,7 +232,60 @@ def test_partial_tool_schema_becomes_available_tool_candidate():
         assert resolution.tool_slots[0]["tool_id"] == "lookup_helper.lookup_value"
         assert "tool_result_used" not in resolution.required_evidence
         assert resolution.selected_tools == []
-        assert resolution.allowed_imports == ["backend.services.runtime_tools"]
+        assert resolution.allowed_imports == ["backend.services.runtime_tools", "backend.services.runtime_tools.lookup_value"]
+    finally:
+        clear_registered_tool_capabilities()
+
+
+def test_function_level_tool_imports_share_dependency_validation():
+    from backend.services.creator_tool_registry import ToolCapability, ToolFunctionManifest, clear_registered_tool_capabilities, register_tool_capability
+
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="custom_lookup",
+        display_name="Custom Lookup",
+        category="retrieval",
+        roles=["generic_script"],
+        dependencies=[{"package": "rich", "imports": ["rich"]}, "assets/not_a_dependency.txt", "references/guide.md"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools.custom_tools.lookup",
+            short_description="Lookup a value.",
+            when_to_use="Use for lookup.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object", "required": ["source_value"], "properties": {"source_value": {"type": "string"}}},
+            required_capabilities=["custom_lookup"],
+        )],
+    ))
+    try:
+        entry = _entry(raw_capability_hints=["custom_lookup"])
+        contract = compile_canonical_file_contract(entry, _schema())
+        resolution = resolve_implementation(entry, contract)
+
+        assert "backend.services.runtime_tools.custom_tools.lookup" in resolution.allowed_imports
+        assert "backend.services.runtime_tools.custom_tools.lookup.lookup_value" in resolution.allowed_imports
+        assert "rich" in resolution.declared_dependencies
+        assert "assets/not_a_dependency.txt" not in resolution.declared_dependencies
+        assert "references/guide.md" not in resolution.declared_dependencies
+
+        ok_code = """
+from backend.services.runtime_tools.custom_tools.lookup import lookup_value
+
+def run(payload):
+    value = lookup_value(str(payload.get("payload", "")))
+    return {"result": value.get("source_value", "")}
+"""
+        assert not any(issue.startswith("declared_dependency_only") for issue in validate_python_evidence(ok_code, contract, resolution))
+
+        bad_code = """
+from backend.services.runtime_tools.custom_tools.other import missing_lookup
+
+def run(payload):
+    value = str(payload.get("payload", "")).strip()
+    return {"result": value}
+"""
+        assert any(issue.startswith("declared_dependency_only") for issue in validate_python_evidence(bad_code, contract, resolution))
     finally:
         clear_registered_tool_capabilities()
 

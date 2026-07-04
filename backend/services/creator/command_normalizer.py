@@ -13,7 +13,11 @@ import re
 import shlex
 from pathlib import Path
 from typing import Any
-
+from ..skill_dataflow import (
+    normalize_bare_json_placeholders,
+    placeholder_pattern,
+)
+_PLATFORM_PLACEHOLDER_RE = placeholder_pattern()
 
 @dataclass
 class SkillMdCommandBlock:
@@ -41,7 +45,6 @@ class CommandNormalizationResult:
 
 
 _SHELL_LANGS = {"bash", "sh", "shell"}
-_SIMPLE_PLACEHOLDER_RE = re.compile(r"^\{\{\s*[A-Za-z_][\w.-]*\s*\}\}$")
 _ANY_PLACEHOLDER_RE = re.compile(r"\{\{\s*(.*?)\s*\}\}", re.S)
 
 
@@ -167,27 +170,90 @@ def _sanitize_json_obj_templates(obj: Any, path: str = "") -> tuple[Any, dict[st
     return obj, bindings, False
 
 
-def _sanitize_json_argv_template_values(raw_json_arg: str) -> tuple[str, dict[str, Any]]:
-    """Normalize allowed legacy JSON argv template strings before validation."""
-    parsed = json.loads(str(raw_json_arg or ""))
-    sanitized, bindings, changed = _sanitize_json_obj_templates(parsed)
-    if not changed:
-        return str(raw_json_arg or ""), bindings
-    return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")), bindings
+def _sanitize_json_argv_template_values(
+    raw_json_arg: str,
+) -> tuple[str, dict[str, Any]]:
+    """Normalize platform placeholders and static argv template values.
 
-def _complex_template_paths(value: Any, path: str = "") -> list[str]:
+    ``{{path}}`` is a platform dataflow token.  When a whole placeholder is
+    written as a bare JSON value, normalize it to a JSON string template before
+    parsing.  Runtime placeholder resolution later restores the original JSON
+    value and type.
+
+    This function only normalizes platform template syntax and known static
+    runtime bindings.  It does not infer business fields or dataflow semantics.
+    """
+    raw = str(raw_json_arg or "")
+
+    placeholder_normalized = (
+        normalize_bare_json_placeholders(raw)
+    )
+
+    parsed = json.loads(placeholder_normalized)
+
+    sanitized, bindings, binding_changed = (
+        _sanitize_json_obj_templates(parsed)
+    )
+
+    placeholder_changed = (
+        placeholder_normalized != raw
+    )
+
+    if not placeholder_changed and not binding_changed:
+        return raw, bindings
+
+    return (
+        json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        bindings,
+    )
+
+def _complex_template_paths(
+    value: Any,
+    path: str = "",
+) -> list[str]:
+    """Return JSON paths containing non-platform placeholder expressions."""
     found: list[str] = []
+
     if isinstance(value, dict):
         for key, item in value.items():
-            found.extend(_complex_template_paths(item, f"{path}.{key}" if path else str(key)))
+            child_path = (
+                f"{path}.{key}"
+                if path
+                else str(key)
+            )
+            found.extend(
+                _complex_template_paths(
+                    item,
+                    child_path,
+                )
+            )
+
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            found.extend(_complex_template_paths(item, f"{path}[{index}]"))
+            found.extend(
+                _complex_template_paths(
+                    item,
+                    f"{path}[{index}]",
+                )
+            )
+
     elif isinstance(value, str):
         for match in _ANY_PLACEHOLDER_RE.finditer(value):
-            token = "{{" + match.group(1).strip() + "}}"
-            if not _SIMPLE_PLACEHOLDER_RE.fullmatch(token):
+            token = (
+                "{{"
+                + match.group(1).strip()
+                + "}}"
+            )
+
+            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(
+                token
+            ):
                 found.append(path or "$")
+
     return found
 
 

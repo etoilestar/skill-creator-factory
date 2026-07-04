@@ -2738,19 +2738,21 @@ def _parse_e2e_stdout_json(
     rendered_payload: dict[str, Any],
     trial_skill_md: str | None = None,
 ) -> dict[str, Any]:
-    """Parse and validate one E2E step stdout.
+    """Parse one real E2E subprocess result.
 
-    This function must not depend on an outer-scope ``trial_skill_md`` variable.
-    Older callers may not pass trial_skill_md, so we recover it from the copied
-    trial Skill directory when missing.
+    Second-round E2E only validates actual process execution, argv failures,
+    stdout JSON/object shape, declared file outputs, and real workflow closure.
+
+    SkillPlan/RequirementGraph/canonical stdout requirements are first-round
+    planning or responsibility facts and must not be re-applied as hard stdout
+    field contracts here.
     """
-    if trial_skill_md is None:
-        skill_md_path = trial_skill_dir / "SKILL.md"
-        trial_skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    _ = trial_skill_md
 
     if proc.returncode != 0:
         stderr_tail = (proc.stderr or "")[-4000:]
         stdout_tail = (proc.stdout or "")[-4000:]
+
         argv_details = _classify_argv_schema_failure(
             command=command,
             content=content,
@@ -2760,78 +2762,144 @@ def _parse_e2e_stdout_json(
             stderr=stderr_tail,
         )
         is_argv_schema_error = bool(argv_details)
-        failure_layer = "argv_schema_error" if is_argv_schema_error else "script_exit"
-        target_file = str(argv_details.get("primary_target") or command.script_path) if is_argv_schema_error else command.script_path
-        target_reason = str(argv_details.get("target_reason") or "")
-        repair_instruction = _argv_schema_repair_instruction(command.script_path, argv_details) if is_argv_schema_error else f"只修改 {command.script_path} 中 run()/main 执行失败相关区域，不修改其它文件或已通过步骤。\n" + _platform_io_repair_summary()
-        raise ValueError(_format_e2e_failure(E2EFailure(
-            failed_step_index=command.ordinal,
-            target_file=target_file,
-            target_region="command JSON argv" if is_argv_schema_error else "run()",
-            failed_command=command.raw_command,
-            input_payload=rendered_payload,
-            rendered_payload=rendered_payload,
-            stdout=stdout_tail,
-            stderr=stderr_tail,
-            return_code=proc.returncode,
-            expected=(
-                "SKILL.md command JSON 必须只传当前脚本入口 argv guard 接受的参数、传齐核心逻辑必需参数，且必需值非空且类型正确。"
-                if is_argv_schema_error
-                else "脚本必须成功退出、stdout 输出合法 JSON object，并真实完成该步骤职责。"
-            ),
-            actual=f"return_code={proc.returncode}" + (f"; target_reason={target_reason}" if target_reason else ""),
-            repair_instruction=repair_instruction,
-            layer=failure_layer,
-            details=argv_details if is_argv_schema_error else {},
-        )))
+
+        failure_layer = (
+            "argv_schema_error"
+            if is_argv_schema_error
+            else "script_exit"
+        )
+
+        target_file = (
+            str(
+                argv_details.get("primary_target")
+                or command.script_path
+            )
+            if is_argv_schema_error
+            else command.script_path
+        )
+
+        target_reason = str(
+            argv_details.get("target_reason")
+            or ""
+        )
+
+        if is_argv_schema_error:
+            repair_instruction = _argv_schema_repair_instruction(
+                command.script_path,
+                argv_details,
+            )
+            target_region = "command JSON argv"
+            expected = (
+                "真实 command argv 必须通过当前脚本 strict_json_argv_guard，"
+                "并保持 strict_json_argv_guard 与 run(args) 入口接口自洽。"
+            )
+        else:
+            repair_instruction = (
+                f"根据 {command.script_path} 本次真实 subprocess "
+                "stderr traceback、return_code 和实际报错源码行进行最小修复。"
+                "只修改异常直接涉及的代码。"
+                "ImportError/ModuleNotFoundError 只修 traceback 直接相关 import；"
+                "其它运行异常只修改 traceback 直接涉及的执行区域。"
+                "不要检查 ToolPool、allowed_helper_imports、tool binding、"
+                "required_capabilities、coverage_requirements 或工具权限。"
+                "不要重新判断脚本职责。"
+                "不要修改其它文件或已通过步骤。"
+            )
+            target_region = "runtime traceback"
+            expected = (
+                "脚本必须在当前真实 E2E runtime 中成功退出，"
+                "并向 stdout 输出可解析的 JSON object。"
+            )
+
+        raise ValueError(
+            _format_e2e_failure(
+                E2EFailure(
+                    failed_step_index=command.ordinal,
+                    target_file=target_file,
+                    target_region=target_region,
+                    failed_command=command.raw_command,
+                    input_payload=rendered_payload,
+                    rendered_payload=rendered_payload,
+                    stdout=stdout_tail,
+                    stderr=stderr_tail,
+                    return_code=proc.returncode,
+                    expected=expected,
+                    actual=(
+                        f"return_code={proc.returncode}"
+                        + (
+                            f"; target_reason={target_reason}"
+                            if target_reason
+                            else ""
+                        )
+                    ),
+                    repair_instruction=repair_instruction,
+                    layer=failure_layer,
+                    details=(
+                        argv_details
+                        if is_argv_schema_error
+                        else {}
+                    ),
+                )
+            )
+        )
 
     try:
-        refined_contract, _resolution = _contract_resolution_for_trial(
-            command.script_path,
-            trial_skill_md,
-            entry.role,
-            entry.__dict__,
-        )
         _validate_trial_stdout_json(
             stdout=proc.stdout,
             content=content,
-            args=[json.dumps(rendered_payload, ensure_ascii=False)],
+            args=[
+                json.dumps(
+                    rendered_payload,
+                    ensure_ascii=False,
+                )
+            ],
             role=entry.role,
             skill_dir=trial_skill_dir,
-            skill_plan_entry=entry.__dict__,
-            canonical_contract=refined_contract,
+            skill_plan_entry=None,
+            canonical_contract=None,
         )
     except ValueError as exc:
-        raise ValueError(_format_e2e_failure(E2EFailure(
-            failed_step_index=command.ordinal,
-            target_file=command.script_path,
-            target_region="stdout output logic",
-            failed_command=command.raw_command,
-            input_payload=rendered_payload,
-            rendered_payload=rendered_payload,
-            stdout=(proc.stdout or "")[-4000:],
-            stderr=(proc.stderr or "")[-4000:],
-            return_code=proc.returncode,
-            expected="stdout 必须是合法 JSON object，required outputs 存在；只有真正 artifact/path/file 语义字段才检查文件产物真实存在。",
-            actual=f"stdout_contract_error={exc}",
-            repair_instruction=(
-                f"只修改 {command.script_path} 的 stdout/artifact 输出逻辑，不修改其它文件。"
-                "如果失败字段是普通业务 stdout 字段，不要把它改成文件路径；"
-                "如果失败字段是 pdf_path/image_path/file_outputs 等产物字段，则确保真实写入文件并返回正确路径。\n"
-                + _platform_io_repair_summary()
-            ),
-            layer="stdout_contract",
-        ))) from exc
+        raise ValueError(
+            _format_e2e_failure(
+                E2EFailure(
+                    failed_step_index=command.ordinal,
+                    target_file=command.script_path,
+                    target_region="stdout output logic",
+                    failed_command=command.raw_command,
+                    input_payload=rendered_payload,
+                    rendered_payload=rendered_payload,
+                    stdout=(proc.stdout or "")[-4000:],
+                    stderr=(proc.stderr or "")[-4000:],
+                    return_code=proc.returncode,
+                    expected=(
+                        "stdout 必须是非空 JSON object，不得包含 error 字段；"
+                        "stdout 中实际声明的文件产物路径必须指向真实文件。"
+                    ),
+                    actual=f"stdout_runtime_error={exc}",
+                    repair_instruction=(
+                        f"根据当前真实 stdout 校验错误，只修改 "
+                        f"{command.script_path} 的 stdout 或实际文件产物返回逻辑。"
+                        "不要依据 SkillPlan outputs、canonical output contract、"
+                        "RequirementGraph、required_capabilities、ToolPool "
+                        "或职责规划重新设计脚本。"
+                    ),
+                    layer="stdout_contract",
+                )
+            )
+        ) from exc
 
     try:
-        parsed = json.loads((proc.stdout or "").strip())
+        parsed = json.loads(
+            (proc.stdout or "").strip()
+        )
     except json.JSONDecodeError as exc:
         raise ValueError(
             _e2e_error(
                 target=command.script_path,
                 layer="stdout_json_parse",
                 message=(
-                    f"第 {command.ordinal} 步 {command.script_path} stdout 不是合法 JSON。\n"
+                    f"第 {command.ordinal} 步 "
+                    f"{command.script_path} stdout 不是合法 JSON。\n"
                     f"stdout={(proc.stdout or '')[-4000:]}"
                 ),
             )
@@ -2842,105 +2910,94 @@ def _parse_e2e_stdout_json(
             _e2e_error(
                 target=command.script_path,
                 layer="stdout_json_type",
-                message=f"第 {command.ordinal} 步 {command.script_path} stdout 必须是 JSON object。",
+                message=(
+                    f"第 {command.ordinal} 步 "
+                    f"{command.script_path} stdout 必须是 JSON object。"
+                ),
             )
         )
 
     return parsed
 
 
-def _validate_e2e_script_static_preflight(*, file_path: str, content: str, skill_md: str) -> None:
-    """E2E preflight for local safety/entry/JSON argv only.
+def _validate_e2e_script_static_preflight(
+    *,
+    file_path: str,
+    content: str,
+    skill_md: str,
+) -> None:
+    """E2E static preflight for executable workflow boundaries only.
 
-    This intentionally does not enforce helper_preferred implementation choices
-    or SkillPlan input key exactness. The real workflow run validates rendered
-    argv, stdout context propagation, and final artifacts.
+    Second-round E2E validates source syntax, runtime entry shape, JSON argv
+    ingestion, and the mandatory argv guard protocol before real execution.
+
+    Tool selection, helper preference, capability fulfillment, and business
+    responsibility were handled by first-round Creator validation.
     """
-    entry = _skill_plan_entry_for_file(file_path=file_path, blueprint_text=skill_md)
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        blueprint_text=skill_md,
+    )
 
     if entry.language == "python":
         try:
             ast.parse(content)
         except SyntaxError as exc:
-            raise ValueError(f"{file_path} 不是合法 Python 源码: {exc.msg}") from exc
+            raise ValueError(
+                f"{file_path} 不是合法 Python 源码: {exc.msg}"
+            ) from exc
 
-    if not _script_has_main_entry(content, entry.runtime):
-        raise ValueError(f"{file_path} 缺少 runtime={entry.runtime} 的入口或 stdout 输出。")
-
-    commands = _extract_script_command_templates(skill_md, file_path)
-    json_argv_commands = [command for command in commands if _command_uses_json_argv(command)]
-    if json_argv_commands and not _script_reads_json_argv(content, entry.runtime):
+    if not _script_has_main_entry(
+        content,
+        entry.runtime,
+    ):
         raise ValueError(
-            f"{file_path} SKILL.md 命令传入 JSON argv，但脚本未按 runtime 读取 JSON argv（例如 Python json.loads(sys.argv[1])）。"
+            f"{file_path} 缺少 runtime={entry.runtime} "
+            "的入口或 stdout 输出。"
         )
+
+    commands = _extract_script_command_templates(
+        skill_md,
+        file_path,
+    )
+    json_argv_commands = [
+        command
+        for command in commands
+        if _command_uses_json_argv(command)
+    ]
+
+    if (
+        json_argv_commands
+        and not _script_reads_json_argv(
+            content,
+            entry.runtime,
+        )
+    ):
+        raise ValueError(
+            f"{file_path} SKILL.md 命令传入 JSON argv，"
+            "但脚本未按 runtime 读取 JSON argv。"
+        )
+
     if entry.runtime == "python":
         try:
-            from backend.services.runtime_tools import strict_json_argv_guard as _strict_json_argv_guard  # noqa: F401
+            from backend.services.runtime_tools import (
+                strict_json_argv_guard as _strict_json_argv_guard,
+            )
         except Exception as exc:
             raise ValueError(
-                "mandatory_guard_import_error: runtime_tools 无法导入 strict_json_argv_guard；"
-                "请检查 runtime_tools 导出、tool registry 注册和打包环境。"
+                "mandatory_guard_import_error: "
+                "runtime_tools 无法导入 strict_json_argv_guard；"
+                "当前 E2E 环境无法执行标准 JSON argv 入口。"
             ) from exc
-    guard_failure = _strict_argv_guard_failure_message(file_path, content, entry.runtime)
+
+    guard_failure = _strict_argv_guard_failure_message(
+        file_path,
+        content,
+        entry.runtime,
+    )
+
     if json_argv_commands and guard_failure:
         raise ValueError(guard_failure)
-
-    helper_required_capabilities = [
-        capability
-        for capability in _effective_required_capabilities_for_script(entry)
-        if (get_tool_capability(capability) and get_tool_capability(capability).usage_policy == "helper_required")
-    ]
-    missing_required_helpers = _script_required_capability_failures(content, helper_required_capabilities)
-    if missing_required_helpers:
-        raise ValueError(
-            "脚本没有调用这些 helper_required 能力对应接口："
-            + ", ".join(missing_required_helpers)
-        )
-
-
-
-
-def _e2e_argv_key_consistency_error(
-    *,
-    command: E2EWorkflowCommand,
-    content: str,
-    entry: SkillPlanEntry,
-) -> str | None:
-    """Deterministic argv contract smoke for obvious command/guard mismatches."""
-    if entry.runtime != "python":
-        return None
-    if not command.argv_template:
-        return None
-    try:
-        schema = extract_python_strict_argv_schema(content)
-    except Exception:
-        return None
-    required = {str(key) for key in (schema.get("required_keys") or []) if str(key or "").strip()}
-    allowed_raw = schema.get("allowed_keys")
-    allowed = {str(key) for key in (allowed_raw or []) if str(key or "").strip()} if allowed_raw is not None else set()
-    command_keys = {str(key) for key in (command.argv_template or {}).keys() if str(key or "").strip()}
-    if not required or not command_keys:
-        return None
-    generic_keys = {"payload", "input", "user_request", "fields", "options", "files", "input_files", "resources"}
-    missing_required = sorted(required - command_keys)
-    # If the command intentionally passes a generic envelope, the script can
-    # derive local fields internally; only block the clear renamed-key case.
-    if not missing_required or command_keys & generic_keys:
-        return None
-    unknown_command = sorted(command_keys - allowed) if allowed else []
-    return _e2e_error(
-        target=command.script_path,
-        layer="argv_schema_error",
-        message=(
-            f"第 {command.ordinal} 步 {command.script_path} 的 SKILL.md command argv keys 与脚本 strict_json_argv_guard required keys 明显不一致。\n"
-            f"command_argv_keys={sorted(command_keys)}\n"
-            f"script_required_keys={sorted(required)}\n"
-            f"script_allowed_keys={sorted(allowed) if allowed else '(unbounded)'}\n"
-            f"missing_required_from_command={missing_required}\n"
-            f"unknown_command_keys={unknown_command}\n"
-            "如果 command 传 input_file，脚本 guard/run 不得自行要求 input_path；应使用 command 已传 key，或同步修 SKILL.md command。"
-        ),
-    )
 
 def _validate_e2e_command_static(
     *,
@@ -2949,32 +3006,60 @@ def _validate_e2e_command_static(
     skill_md: str,
     available_payload_keys: set[str] | None = None,
 ) -> SkillPlanEntry:
-    source_path = trial_skill_dir / command.script_path
+    """Validate only static prerequisites required to launch one E2E step.
+
+    This preflight intentionally does not compare SKILL.md argv field names with
+    strict_json_argv_guard keys. The real subprocess must run first; actual guard
+    failures are then classified by _classify_argv_schema_failure.
+    """
+    _ = available_payload_keys
+
+    source_path = (
+        trial_skill_dir
+        / command.script_path
+    )
+
     if not source_path.is_file():
         raise ValueError(
             _e2e_error(
                 target=command.source_path,
                 layer="script_missing",
-                message=f"第 {command.ordinal} 步引用的脚本不存在：{command.script_path}",
+                message=(
+                    f"第 {command.ordinal} 步"
+                    f"引用的脚本不存在："
+                    f"{command.script_path}"
+                ),
             )
         )
 
-    entry = _skill_plan_entry_for_file(file_path=command.script_path, blueprint_text=skill_md)
-    if not _runner_matches_command_runtime(command, entry):
+    entry = _skill_plan_entry_for_file(
+        file_path=command.script_path,
+        blueprint_text=skill_md,
+    )
+
+    if not _runner_matches_command_runtime(
+        command,
+        entry,
+    ):
         raise ValueError(
             _e2e_error(
                 target=command.source_path,
                 layer="runtime_mismatch",
                 message=(
-                    f"第 {command.ordinal} 步 {command.script_path} 的命令 runner={command.runner!r} "
-                    f"与 SkillPlan.runtime={entry.runtime!r} 不一致。\n"
+                    f"第 {command.ordinal} 步 "
+                    f"{command.script_path} 的命令 "
+                    f"runner={command.runner!r} "
+                    f"与 SkillPlan.runtime={entry.runtime!r} "
+                    "不一致。\n"
                     f"原始命令：{command.raw_command}"
                 ),
             )
         )
 
+    content = source_path.read_text(
+        encoding="utf-8"
+    )
 
-    content = source_path.read_text(encoding="utf-8")
     try:
         _validate_e2e_script_static_preflight(
             file_path=command.script_path,
@@ -2986,17 +3071,13 @@ def _validate_e2e_command_static(
             _e2e_error(
                 target=command.script_path,
                 layer="script_static_contract",
-                message=f"第 {command.ordinal} 步 {command.script_path} 静态合同失败：{exc}",
+                message=(
+                    f"第 {command.ordinal} 步 "
+                    f"{command.script_path} "
+                    f"无法进入真实 E2E 执行：{exc}"
+                ),
             )
         ) from exc
-
-    argv_consistency_error = _e2e_argv_key_consistency_error(
-        command=command,
-        content=content,
-        entry=entry,
-    )
-    if argv_consistency_error:
-        raise ValueError(argv_consistency_error)
 
     return entry
 
@@ -3295,30 +3376,6 @@ def _run_skill_workflow_e2e_once(
                     })
 
                 if entry.runtime == "python":
-                    tool_pool = load_tool_pool(trial_skill_dir)
-                    file_binding = get_file_binding(tool_pool, command.script_path)
-                    import_guard_result = guard_runtime_imports(content, command.script_path, file_binding)
-                    if not import_guard_result.success:
-                        if e2e_session is not None:
-                            e2e_session.events.append({
-                                **e2e_session.to_event_base(),
-                                "event": "runtime_import_guard_failed",
-                                "phase": "e2e_pre_run",
-                                "status": "blocked",
-                                "current_step": command.ordinal,
-                                "total_steps": len(commands),
-                                "target_file": command.script_path,
-                                "import_guard_result": import_guard_result.model_dump(mode="json"),
-                            })
-                        raise ValueError(_e2e_error(
-                            target=command.script_path,
-                            layer="runtime_import_guard",
-                            message=(
-                                f"第 {command.ordinal} 步 {command.script_path} runtime_import_guard 失败，已跳过脚本执行："
-                                f"{json.dumps(import_guard_result.model_dump(mode='json'), ensure_ascii=False, default=str)}"
-                            ),
-                        ))
-
                     if venv_python is None:
                         raise ValueError("python venv 未初始化。")
 
@@ -3545,31 +3602,18 @@ async def _repair_existing_file_for_e2e_failure(
     repair_events: list[dict[str, Any]] | None = None,
     e2e_session: CreatorE2ESession | None = None,
 ) -> dict[str, Any]:
-    """Repair existing SKILL.md/script file using local patch + sandbox E2E.
+    """Repair one real second-round E2E workflow failure.
 
-    第二轮原则：
+    第二轮只根据真实 workflow 执行证据做局部修复：
+    - failed command / rendered payload；
+    - placeholder resolution；
+    - subprocess return code / stdout / stderr；
+    - strict_json_argv_guard 与 run(args) 的真实入口关系；
+    - artifact existence / final platform output；
+    - 已成功前序 step trace。
 
-    1. 只修跨模块接口串接：
-       - SKILL.md workflow command；
-       - 上下游 JSON 字段；
-       - 当前脚本 argv/stdout 对齐；
-       - 最终平台输出是否能被 sandbox 消费。
-
-    2. 不在这里修单模块功能细节：
-       - PDF 字体、字号、行距；
-       - 图片分辨率、风格；
-       - 表格样式；
-       - 内容质量。
-       这些属于第一轮 module functional smoke。
-
-    3. 不写平台 IO 词表。
-       平台 IO 直接复用现有 sandbox / E2E 试运行协议。
-
-    4. 模型只输出局部 patch。
-       E2E 是否通过由临时 skill 沙盒真实试运行决定。
-
-    5. 如果 patch apply / static preflight / sandbox E2E 失败，
-       在本函数内部继续把失败反馈给写代码模型重试，直到通过或达到最大轮次。
+    第一轮已经完成的职责审查、ToolPool、helper 权限、required_capabilities、
+    coverage requirements 和工具选择，不在这里重新判断。
     """
 
     _validate_file_path(target_path)
@@ -3582,107 +3626,218 @@ async def _repair_existing_file_for_e2e_failure(
         target_path = "SKILL.md"
 
     skill_dir = settings.skills_path / skill_name
+
     if e2e_session is None:
-        e2e_session = _create_e2e_session(skill_name, source_skill_dir=skill_dir)
+        e2e_session = _create_e2e_session(
+            skill_name,
+            source_skill_dir=skill_dir,
+        )
+
     target_file = skill_dir / target_path
 
     if not target_file.is_file():
-        raise ValueError(f"端到端修复目标不存在：{target_path}")
+        raise ValueError(
+            f"端到端修复目标不存在：{target_path}"
+        )
 
     skill_md_path = skill_dir / "SKILL.md"
-    skill_md = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    skill_md = (
+        skill_md_path.read_text(
+            encoding="utf-8"
+        )
+        if skill_md_path.is_file()
+        else ""
+    )
 
-    if target_path == "SKILL.md" and _is_skill_md_command_format_error(e2e_errors):
+    if (
+        target_path == "SKILL.md"
+        and _is_skill_md_command_format_error(
+            e2e_errors
+        )
+    ):
         normalizer_attempted = any(
-            event.get("type") == "command_normalizer_attempt"
-            and event.get("target_file") == "SKILL.md"
-            for event in (repair_events or [])
+            event.get("type")
+            == "command_normalizer_attempt"
+            and event.get("target_file")
+            == "SKILL.md"
+            for event in (
+                repair_events or []
+            )
         )
-        normalization = _normalize_skill_md_runtime_commands_for_e2e(
-            skill_name=skill_name,
-            skill_dir=skill_dir,
-            skill_md=skill_md,
+
+        normalization = (
+            _normalize_skill_md_runtime_commands_for_e2e(
+                skill_name=skill_name,
+                skill_dir=skill_dir,
+                skill_md=skill_md,
+            )
         )
+
         if repair_events is not None:
             repair_events.append({
                 "type": "command_normalizer_attempt",
                 "target_file": "SKILL.md",
                 "changed": normalization.changed,
                 "blocked": normalization.blocked,
-                "issues": [getattr(issue, "__dict__", {}) for issue in normalization.issues],
+                "issues": [
+                    getattr(
+                        issue,
+                        "__dict__",
+                        {},
+                    )
+                    for issue in normalization.issues
+                ],
             })
+
         if normalization.changed:
-            skill_md_path.write_text(normalization.content, encoding="utf-8")
-            (e2e_session.workspace_dir / "SKILL.md").write_text(normalization.content, encoding="utf-8")
+            skill_md_path.write_text(
+                normalization.content,
+                encoding="utf-8",
+            )
+
+            (
+                e2e_session.workspace_dir
+                / "SKILL.md"
+            ).write_text(
+                normalization.content,
+                encoding="utf-8",
+            )
+
             return {
                 "status": "repaired",
                 "repaired_target": "SKILL.md",
-                "patch_status": "deterministic_command_normalized",
-                "diff_stats": {"mode": "command_normalizer"},
+                "patch_status": (
+                    "deterministic_command_normalized"
+                ),
+                "diff_stats": {
+                    "mode": "command_normalizer"
+                },
             }
-        payload = _command_normalizer_blocked_payload(target_file="SKILL.md", issues=normalization.issues)
-        if normalization.blocked or normalizer_attempted:
+
+        payload = (
+            _command_normalizer_blocked_payload(
+                target_file="SKILL.md",
+                issues=normalization.issues,
+            )
+        )
+
+        if (
+            normalization.blocked
+            or normalizer_attempted
+        ):
             if repair_events is not None:
                 repair_events.append({
-                    "type": "command_normalizer_blocked_fallback_to_model",
+                    "type": (
+                        "command_normalizer_blocked_"
+                        "fallback_to_model"
+                    ),
                     "target_file": "SKILL.md",
                     "payload": payload,
                 })
-            e2e_errors = list(e2e_errors or []) + [
+
+            e2e_errors = list(
+                e2e_errors or []
+            ) + [
                 _e2e_error(
                     target="SKILL.md",
-                    layer="command_normalizer_blocked",
-                    message=json.dumps(payload, ensure_ascii=False, default=str),
+                    layer=(
+                        "command_normalizer_blocked"
+                    ),
+                    message=json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                 )
             ]
 
     if target_path == "SKILL.md":
-        hard_format_failures = detect_markdown_hard_format_failures(
-            "SKILL.md",
-            skill_md,
-            require_frontmatter=True,
+        hard_format_failures = (
+            detect_markdown_hard_format_failures(
+                "SKILL.md",
+                skill_md,
+                require_frontmatter=True,
+            )
         )
+
         if hard_format_failures:
             if repair_events is not None:
                 repair_events.append({
-                    "type": "hard_format_requires_full_rewrite",
+                    "type": (
+                        "hard_format_requires_full_rewrite"
+                    ),
                     "target_file": "SKILL.md",
                     "failures": hard_format_failures,
                 })
+
             raise ValueError(
-                "hard_format_requires_full_rewrite: E2E localized patch cannot repair SKILL.md hard Markdown format; "
-                + json.dumps(hard_format_failures, ensure_ascii=False, default=str)
+                "hard_format_requires_full_rewrite: "
+                "E2E localized patch cannot repair "
+                "SKILL.md hard Markdown format; "
+                + json.dumps(
+                    hard_format_failures,
+                    ensure_ascii=False,
+                    default=str,
+                )
             )
 
     all_file_summaries: list[str] = []
-    for path in sorted(skill_dir.rglob("*")):
-        if not path.is_file():
-            continue
+    scripts_dir = skill_dir / "scripts"
 
-        rel = path.relative_to(skill_dir).as_posix()
-        if rel.startswith(".venv/") or "__pycache__" in rel:
-            continue
-        if rel == target_path:
-            continue
+    if scripts_dir.is_dir():
+        for path in sorted(
+            scripts_dir.rglob("*")
+        ):
+            if not path.is_file():
+                continue
 
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            continue
+            if (
+                "__pycache__" in path.parts
+                or path.suffix == ".pyc"
+            ):
+                continue
 
-        all_file_summaries.append(f"\n--- FILE {rel} ---\n{text[-6000:]}")
+            if path.suffix.lower() not in {
+                ".py",
+                ".js",
+                ".ts",
+                ".sh",
+                ".bash",
+            }:
+                continue
+
+            rel = path.relative_to(
+                skill_dir
+            ).as_posix()
+
+            if rel == target_path:
+                continue
+
+            try:
+                text = path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except Exception:
+                continue
+
+            all_file_summaries.append(
+                f"\n--- RUNTIME FILE {rel} ---\n"
+                f"{text[-6000:]}"
+            )
 
     route = route_creator_file_model(
         file_path=target_path,
         purpose=(
-            "第二轮 workflow E2E 局部修复："
-            "只修 SKILL.md workflow、跨模块 JSON 字段串接、最终平台输出字段映射；"
-            "不修单文件业务功能细节；"
-            "平台 IO 由 sandbox/E2E 试运行判断；"
-            "输出 single-file local patch proposal。"
+            "第二轮 workflow E2E 真实试运行局部修复："
+            "只根据 failed command、rendered payload、placeholder、"
+            "subprocess return_code、stderr、stdout、artifact 和 final output "
+            "真实失败做 single-file local patch；"
+            "不重新审查职责、ToolPool、工具权限或工具选择。"
         ),
         requested_model=requested_model,
     )
+
     model = route.model
 
     _log_creator_model_usage(
@@ -3690,18 +3845,45 @@ async def _repair_existing_file_for_e2e_failure(
         skill_name=skill_name,
         file_path=target_path,
         route=route,
-        extra=f"errors={len(e2e_errors)} mode=exact_replace_patch_sandbox_e2e",
+        extra=(
+            f"errors={len(e2e_errors)} "
+            "mode=exact_replace_patch_sandbox_e2e"
+        ),
     )
 
-    deterministic_error = "\n\n".join(e2e_errors)[-12000:]
-    repair_state = _e2e_repair_state_from_errors(e2e_errors, resolved_failures=e2e_session.resolved_failures)
-    structured_failure = _structured_failure_from_errors(e2e_errors)
-    targeted_e2e_hint = _targeted_e2e_repair_hint(e2e_errors)
-    repair_key = _e2e_repair_key(target_path=target_path, structured_failure=structured_failure)
+    deterministic_error = "\n\n".join(
+        e2e_errors
+    )[-12000:]
+
+    repair_state = (
+        _e2e_repair_state_from_errors(
+            e2e_errors,
+            resolved_failures=(
+                e2e_session.resolved_failures
+            ),
+        )
+    )
+
+    structured_failure = (
+        _structured_failure_from_errors(
+            e2e_errors
+        )
+    )
+
+    targeted_e2e_hint = (
+        _targeted_e2e_repair_hint(
+            e2e_errors
+        )
+    )
+
+    repair_key = _e2e_repair_key(
+        target_path=target_path,
+        structured_failure=structured_failure,
+    )
 
     scope = CreatorRepairScope(
         phase="workflow_e2e",
-        repair_type="cross_step_io_alignment",
+        repair_type="runtime_trial_failure",
         target_file=target_path,
         max_changed_lines=220,
         allow_tool_explore=False,
@@ -3709,146 +3891,279 @@ async def _repair_existing_file_for_e2e_failure(
             "第二轮最多 10 轮，始终使用 localized_patch，不会因普通 E2E 失败切 full_file_rewrite。",
             "patch 后会先做 basic format/compile check；通过只代表文件合法，不代表 E2E 通过。",
             "basic format 错误只修格式；sandbox E2E 错误才修 workflow / argv / stdout / artifact 链路。",
-            "第二轮只修 workflow / cross-step IO / final sandbox output。",
+            "第二轮只修 workflow / argv / placeholder / stdout / artifact / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
+            "不得重新检查脚本职责、RequirementGraph coverage、required_capabilities、"
+            "ToolPool、allowed_helper_imports、tool binding 或 helper permission。",
+            "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，"
+            "不得探索或扩展工具池。",
+            "ImportError/ModuleNotFoundError 只依据真实 stderr traceback 修直接相关 import；"
+            "不得根据 ToolPool 或 allowed_helper_imports 判断导入是否合法。",
+            "若 E2E 发现缺少第三方依赖，交给 dependency/environment 链路处理，"
+            "不得通过重新选工具或改业务职责绕过。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
-            # Point 4: Explicitly prohibit tool exploration during E2E repair.
-            "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，不得探索或扩展工具池。"
-            "若 E2E 发现缺少标准库，在响应中声明 missing_stdlib_request 而非探索工具库。",
         ),
     )
 
-    e2e_tool_cards = ""
-    e2e_entry_context: Any = None
+    e2e_entry_context: dict[str, Any] = {}
+
     if target_path.startswith("scripts/"):
-        e2e_entry = _skill_plan_entry_for_file(
-            file_path=target_path,
-            blueprint_text=skill_md,
-        )
-        e2e_entry_context = getattr(e2e_entry, "__dict__", e2e_entry)
-        e2e_tool_cards = _creator_tool_context_for_script(
-            file_path=target_path,
-            skill_plan_entry=e2e_entry,
-            blueprint_text=skill_md,
-            failure_layer=_failure_layer_from_error_text(deterministic_error),
-            error_text=deterministic_error,
-            include_snippets=True,
-            rediscover_for_repair=False,
-            repair_context={
-                "target_file": target_path,
-                "script_content": (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8", errors="replace"),
-                "structured_failure": structured_failure,
-                "repair_state": repair_state,
-                "runtime_contract": getattr(e2e_entry, "runtime_contract", None),
-                "coverage_requirements": getattr(e2e_entry, "coverage_requirements", None),
-            },
-        )
+        try:
+            e2e_entry = (
+                _skill_plan_entry_for_file(
+                    file_path=target_path,
+                    blueprint_text=skill_md,
+                )
+            )
+
+            script_content = (
+                e2e_session.workspace_dir
+                / target_path
+            ).read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            argv_schema: dict[str, Any] = {}
+            run_args_analysis: dict[str, Any] = {}
+
+            if target_path.endswith(".py"):
+                try:
+                    argv_schema = (
+                        extract_python_strict_argv_schema(
+                            script_content
+                        )
+                    )
+                except Exception:
+                    argv_schema = {}
+
+                try:
+                    run_args_analysis = (
+                        _python_run_args_analysis(
+                            script_content
+                        )
+                    )
+                except Exception:
+                    run_args_analysis = {}
+
+            e2e_entry_context = {
+                "path": target_path,
+                "runtime": getattr(
+                    e2e_entry,
+                    "runtime",
+                    "",
+                ),
+                "script_argv_schema": argv_schema,
+                "run_args_analysis": run_args_analysis,
+            }
+
+        except Exception:
+            e2e_entry_context = {}
 
     if target_path == "SKILL.md":
         target_rule = (
             "你正在修复 SKILL.md 的 workflow 执行块。\n"
             "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
-            "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，references/*.md 不是执行步骤。\n"
-            "只修 workflow/cross-step IO/final output/artifact 相关问题，不修 Markdown 全局格式。\n"
-            "修复 command_json_parse/missing_placeholder/argv_schema_error 时，必须参考结构化失败对象中的当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
-            "字段类型以 RequirementGraph / SkillPlanEntry / strict_json_argv_guard argv schema 为准；不要把 list 输入改成 scalar，不要把 scalar 改成 list；"
-            "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
-            "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
-            "如果 script 自身接口自洽而 command argv 不一致，优先只改 SKILL.md 当前失败 command JSON argv。\n"
-            "当 failure layer 是 runtime_command_invalid 或 command_normalizer_blocked 时，必须把失败命令修成：脚本路径 + 一个单引号包住的 JSON argv 参数。\n"
-            "文件输入使用 __RUNTIME_INPUT_FILE__，例如：python scripts/x.py '{\"file_path\":\"__RUNTIME_INPUT_FILE__\"}'。\n"
-            "多文件输入使用 __RUNTIME_INPUT_FILES__，例如：python scripts/x.py '{\"file_paths\":\"__RUNTIME_INPUT_FILES__\"}'。\n"
-            "纯文本输入使用 __RUNTIME_INPUT_TEXT__ 或 {{text}}，例如：python scripts/x.py '{\"text_content\":\"__RUNTIME_INPUT_TEXT__\"}'。\n"
-            "不要把纯文本任务强行改成 file_path；不要把文件任务强行改成 text_content。\n"
-            "禁止未加引号 JSON；禁止把 JSON 拆成多个 CLI 参数；禁止 --key value 风格；命令必须通过 exactly one JSON argv object 检查。\n"
-            "不得改 YAML frontmatter；不得重写整篇 SKILL.md；不得改其它已通过 command；不得改 script；不得新增脚本路径；不得引入 --argv；不得引入 runtime/entrypoint/argv 伪命令对象。\n"
+            "E2E 只执行 SKILL.md 中的 bash/sh/shell fenced command block，"
+            "references/*.md 不是执行步骤。\n"
+            "只修 workflow/cross-step IO/final output/artifact 相关问题，"
+            "不修 Markdown 全局格式。\n"
+            "修复 command_json_parse/missing_placeholder/argv_schema_error 时，"
+            "只依据本轮真实结构化失败中的 failed_command、rendered_payload、"
+            "当前 payload keys、placeholder 来源、前序 stdout trace、"
+            "当前脚本 strict_json_argv_guard schema 和 run(args) 实际读取关系判断。\n"
+            "RequirementGraph / SkillPlanEntry 的 inputs/outputs 只是第一轮语义规划信息，"
+            "不得在第二轮作为字段名或字段类型 hard contract。\n"
+            "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；"
+            "先根据真实 payload/trace 判断 placeholder 来源，"
+            "再根据当前脚本 guard/run 接口判断 argv key。\n"
+            "如果 guard expected type 明确要求 list，应传整个 collection；"
+            "只有当前脚本实际接口要求 scalar/file_path 时才允许从 collection 取单项。\n"
+            "如果 script 自身接口自洽而 command argv 不一致，"
+            "优先只改 SKILL.md 当前失败 command JSON argv。\n"
+            "当 failure layer 是 runtime_command_invalid 或 "
+            "command_normalizer_blocked 时，必须把失败命令修成："
+            "脚本路径 + 一个单引号包住的 JSON argv 参数。\n"
+            "文件输入使用 __RUNTIME_INPUT_FILE__，例如："
+            "python scripts/x.py '{\"file_path\":\"__RUNTIME_INPUT_FILE__\"}'。\n"
+            "多文件输入使用 __RUNTIME_INPUT_FILES__，例如："
+            "python scripts/x.py '{\"file_paths\":\"__RUNTIME_INPUT_FILES__\"}'。\n"
+            "纯文本输入使用 __RUNTIME_INPUT_TEXT__ 或 {{text}}，例如："
+            "python scripts/x.py '{\"text_content\":\"__RUNTIME_INPUT_TEXT__\"}'。\n"
+            "不要把纯文本任务强行改成 file_path；"
+            "不要把文件任务强行改成 text_content。\n"
+            "禁止未加引号 JSON；禁止把 JSON 拆成多个 CLI 参数；"
+            "禁止 --key value 风格；"
+            "命令必须通过 exactly one JSON argv object 检查。\n"
+            "不得改 YAML frontmatter；不得重写整篇 SKILL.md；"
+            "不得改其它已通过 command；不得改 script；"
+            "不得新增脚本路径；不得引入 --argv；"
+            "不得引入 runtime/entrypoint/argv 伪命令对象。\n"
             "不要重写 SKILL.md 正文。\n"
-            "当前 Markdown 格式已经通过；不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行。\n"
-            "只修改失败命令那一行；old_lines 必须包含完整、真实、当前文件中的命令行。\n"
-            "不要把 ```bash 和 ``` 纳入 old_lines，除非同时完整包含闭合 fence。\n"
-            "不要修改 frontmatter 边界；不要修改 fenced block 开闭结构。\n"
-            "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
-            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整 SKILL.md。"
+            "当前 Markdown 格式已经通过；不要修 frontmatter；"
+            "不要修 code fence；不要新增/删除 ``` 行。\n"
+            "只修改失败命令那一行；old_lines 必须包含完整、真实、"
+            "当前文件中的命令行。\n"
+            "不要把 ```bash 和 ``` 纳入 old_lines，"
+            "除非同时完整包含闭合 fence。\n"
+            "不要修改 frontmatter 边界；"
+            "不要修改 fenced block 开闭结构。\n"
+            "不要在 repair 层重新定义平台 IO；"
+            "平台 IO 由 sandbox/E2E 试运行判断。\n"
+            "不得检查 ToolPool、allowed_helper_imports、tool binding、"
+            "required_capabilities、coverage_requirements 或工具权限。\n"
+            "优先输出 edits old_lines/new_lines exact_replace patch。"
+            "不要输出完整 SKILL.md。"
         )
 
     elif target_path.startswith("scripts/"):
         target_rule = (
-            "你正在修复脚本源码的 E2E 接口串接问题。\n"
-            "第二轮 E2E 的目标是让 workflow 在简单沙盒中真实跑通。\n"
-            "只修当前脚本与 SKILL.md 命令块、上游 stdout、下游输入之间的接口对齐问题。\n"
-            "修复前核对当前脚本真实 argv schema、可用 payload keys、placeholder 来源；"
-            "字段类型以 RequirementGraph / SkillPlanEntry / strict_json_argv_guard argv schema 为准；不要把 list 输入改成 scalar，不要把 scalar 改成 list；"
-            "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；如果 typed seed 缺失，应报告 infrastructure blocker，不要修改业务文件；"
-            "如果 argv key 期望 list，应传整个 collection（推荐 {{root}}），不要改成 {{root.0}}/{{root[0]}}；只有 scalar/file_path key 才允许索引 collection。\n"
-            "strict_json_argv_guard 是接口不对齐探针；不要只改 guard。\n"
-            "只允许修改当前脚本中与失败相关的 parse_args / strict_json_argv_guard / run / main / stdout 输出逻辑。\n"
-            "不得改 SKILL.md；不得为了适配错误的 SKILL.md 而重命名脚本接口；不得删除 guard；不得删除核心功能；不能通过删除参数降低功能覆盖面；不得通过默认值绕过必需输入。\n"
-            "如果 command 没传核心逻辑需要的参数且脚本自身自洽，应修 SKILL.md 而不是污染 script。\n"
-            "不要重新设计业务功能；PDF 样式、图片风格、表格样式、内容质量属于第一轮功能 smoke。\n"
-            "不要在 repair 层重新定义平台 IO；平台 IO 由 sandbox/E2E 试运行判断。\n"
-            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整源码。"
+            "你正在修复一次真实 workflow E2E 试运行失败。\n"
+            "只依据本轮结构化失败中的 failed_command、rendered_payload、"
+            "stdout、stderr、return_code、失败层和已成功前序 trace 定位问题。\n"
+            "修复范围必须直接对应真实失败证据。\n"
+            "如果是 argv_schema_error，只核对当前 command JSON argv、"
+            "strict_json_argv_guard schema 和 run(args) 实际读取关系。\n"
+            "如果是 script_exit，以 raw stderr traceback、异常类型和报错源码行为主；"
+            "ImportError 或 ModuleNotFoundError 可以修改直接相关 import，"
+            "其它异常只修改 traceback 直接涉及的执行区域。\n"
+            "如果是 stdout_contract/stdout_json_parse，"
+            "只修改当前 stdout 组织与返回逻辑。\n"
+            "如果是 artifact/final output 失败，"
+            "只修改当前产物创建、路径返回或最终 stdout 映射。\n"
+            "不得重新判断当前脚本职责是否完整，"
+            "不得检查 required_capabilities、coverage_requirements、"
+            "ToolPool、allowed_helper_imports、tool binding 或 helper permission。\n"
+            "不得改其它文件或已通过步骤。\n"
+            "优先输出 edits old_lines/new_lines exact_replace patch。"
+            "不要输出完整源码。"
         )
 
     else:
         target_rule = (
             "只修复 E2E_REPAIR_TARGET 指向的文件。\n"
-            "只修当前 E2E 失败对应的最小接口串接问题。\n"
-            "优先输出 edits old_lines/new_lines exact_replace patch。不要输出完整文件。"
+            "只修当前真实 E2E 失败对应的最小接口或运行问题。\n"
+            "不得重新审查职责、ToolPool、工具权限或工具选择。\n"
+            "优先输出 edits old_lines/new_lines exact_replace patch。"
+            "不要输出完整文件。"
         )
 
     base_task_context = "\n".join([
         f"Skill 名称：{skill_name}",
         "",
-        "E2E repair 状态机（只能修 remaining_failed_checks；resolved_failures 禁止重复修复）：",
-        json.dumps(repair_state, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "E2E repair 状态机：",
+        json.dumps(
+            repair_state,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ),
         "",
-        "结构化失败对象：",
-        json.dumps(structured_failure, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "本轮真实 E2E 失败：",
+        json.dumps(
+            structured_failure,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ),
         "",
         "定向 E2E 修复提示：",
         targeted_e2e_hint or "无",
         "",
-        "sandbox IO 前置协议：",
-        _sandbox_io_contract_text_for_creator(),
-        "",
-        "目标文件职责 / SkillPlanEntry / runtime_contract / coverage_requirements / command argv contract：",
-        json.dumps(e2e_entry_context or {}, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+        "当前脚本实际运行接口事实：",
+        json.dumps(
+            e2e_entry_context,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ),
         "",
         "当前 SKILL.md：",
         skill_md[-12000:],
         "",
-        "其它相关文件摘要：",
+        "相关上下游 runtime script 摘要：",
         "".join(all_file_summaries)[-20000:],
         "",
-        "Tool Registry / Snippet 上下文：",
-        e2e_tool_cards,
+        "第二轮硬性边界：",
+        "只根据真实 E2E 运行失败申错改错。",
+        "不得重新判断脚本职责、ToolPool、allowed_helper_imports、tool binding、"
+        "required_capabilities、coverage_requirements、工具选择或 helper permission。",
     ])
 
-    repair_feedback = "\n\n".join(repair_state.get("remaining_failed_checks") or e2e_errors)[-12000:]
+    repair_feedback = "\n\n".join(
+        repair_state.get(
+            "remaining_failed_checks"
+        )
+        or e2e_errors
+    )[-12000:]
+
     last_failure = ""
     max_candidate_attempts = 10
-    working_content = (e2e_session.workspace_dir / target_path).read_text(encoding="utf-8")
+
+    working_content = (
+        e2e_session.workspace_dir
+        / target_path
+    ).read_text(
+        encoding="utf-8"
+    )
+
     before_repair_snapshot = working_content
     consecutive_format_regressions = 0
-    repair_template_history: dict[str, list[str]] = {}
+
+    repair_template_history: dict[
+        str,
+        list[str],
+    ] = {}
+
     consecutive_argv_schema_noops = 0
 
-    for candidate_attempt in range(1, max_candidate_attempts + 1):
+    for candidate_attempt in range(
+        1,
+        max_candidate_attempts + 1,
+    ):
         current_content = working_content
         use_full_rewrite = False
-        effective_skill_md = current_content if target_path == "SKILL.md" else skill_md
-        effective_task_context = base_task_context
-        if target_path == "SKILL.md":
-            effective_task_context = base_task_context.replace(skill_md[-12000:], effective_skill_md[-12000:], 1)
 
-        current_repair_state = _e2e_repair_state_from_errors(
-            repair_feedback.split("\n\n"),
-            resolved_failures=e2e_session.resolved_failures,
+        effective_skill_md = (
+            current_content
+            if target_path == "SKILL.md"
+            else skill_md
         )
+
+        effective_task_context = base_task_context
+
+        if target_path == "SKILL.md":
+            effective_task_context = (
+                base_task_context.replace(
+                    skill_md[-12000:],
+                    effective_skill_md[-12000:],
+                    1,
+                )
+            )
+
+        current_repair_state = (
+            _e2e_repair_state_from_errors(
+                repair_feedback.split("\n\n"),
+                resolved_failures=(
+                    e2e_session.resolved_failures
+                ),
+            )
+        )
+
         effective_task_context += (
             "\n\n当前 E2E repair 状态机：\n"
-            + json.dumps(current_repair_state, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-            + "\n\n硬性要求：只能修 remaining_failed_checks；不得再次修改 resolved_failures 对应问题。"
+            + json.dumps(
+                current_repair_state,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n\n硬性要求：只能修 remaining_failed_checks；"
+            "不得再次修改 resolved_failures 对应问题。"
         )
 
         try:
@@ -3857,241 +4172,657 @@ async def _repair_existing_file_for_e2e_failure(
 
                 if target_path.startswith("scripts/"):
                     try:
-                        clean_rewrite_entry = _skill_plan_entry_for_file(
-                            file_path=target_path,
-                            blueprint_text=skill_md,
+                        clean_rewrite_entry = (
+                            _skill_plan_entry_for_file(
+                                file_path=target_path,
+                                blueprint_text=skill_md,
+                            )
                         )
-                        clean_rewrite_tool_context = _creator_tool_context_for_script(
-                            file_path=target_path,
-                            skill_plan_entry=clean_rewrite_entry,
-                            blueprint_text=skill_md,
-                            failure_layer=None,
-                            error_text=None,
-                            include_snippets=True,
-                            rediscover_for_repair=False,
-                            repair_context={
-                                "target_file": target_path,
-                                "script_content": current_content,
-                                "runtime_contract": getattr(clean_rewrite_entry, "runtime_contract", None),
-                                "coverage_requirements": getattr(clean_rewrite_entry, "coverage_requirements", None),
-                                "artifact_contract": getattr(clean_rewrite_entry, "artifact_contract", None),
-                                "command_argv_contract": getattr(clean_rewrite_entry, "command_template", None),
-                            },
+
+                        clean_rewrite_tool_context = (
+                            _creator_tool_context_for_script(
+                                file_path=target_path,
+                                skill_plan_entry=(
+                                    clean_rewrite_entry
+                                ),
+                                blueprint_text=skill_md,
+                                failure_layer=None,
+                                error_text=None,
+                                include_snippets=True,
+                                rediscover_for_repair=False,
+                                repair_context={
+                                    "target_file": target_path,
+                                    "script_content": (
+                                        current_content
+                                    ),
+                                    "runtime_contract": getattr(
+                                        clean_rewrite_entry,
+                                        "runtime_contract",
+                                        None,
+                                    ),
+                                    "coverage_requirements": getattr(
+                                        clean_rewrite_entry,
+                                        "coverage_requirements",
+                                        None,
+                                    ),
+                                    "artifact_contract": getattr(
+                                        clean_rewrite_entry,
+                                        "artifact_contract",
+                                        None,
+                                    ),
+                                    "command_argv_contract": getattr(
+                                        clean_rewrite_entry,
+                                        "command_template",
+                                        None,
+                                    ),
+                                },
+                            )
                         )
                     except Exception:
                         clean_rewrite_tool_context = ""
 
-                rewrite_context = _full_file_rewrite_context_for_e2e(
-                    skill_name=skill_name,
-                    target_path=target_path,
-                    skill_md=effective_skill_md,
-                    current_content=current_content,
-                    previous_content=before_repair_snapshot,
-                    all_file_summaries=all_file_summaries,
-                    e2e_entry_context=e2e_entry_context,
-                    clean_tool_context=clean_rewrite_tool_context,
+                rewrite_context = (
+                    _full_file_rewrite_context_for_e2e(
+                        skill_name=skill_name,
+                        target_path=target_path,
+                        skill_md=effective_skill_md,
+                        current_content=current_content,
+                        previous_content=(
+                            before_repair_snapshot
+                        ),
+                        all_file_summaries=(
+                            all_file_summaries
+                        ),
+                        e2e_entry_context=(
+                            e2e_entry_context
+                        ),
+                        clean_tool_context=(
+                            clean_rewrite_tool_context
+                        ),
+                    )
                 )
 
-                candidate_content = await _request_full_file_rewrite_for_e2e(
-                    model=model,
-                    target_path=target_path,
-                    current_content=current_content,
-                    previous_content=before_repair_snapshot,
-                    rewrite_context=rewrite_context,
-                    rewrite_target_rule=_full_file_rewrite_target_rule_for_e2e(target_path),
+                candidate_content = await (
+                    _request_full_file_rewrite_for_e2e(
+                        model=model,
+                        target_path=target_path,
+                        current_content=current_content,
+                        previous_content=(
+                            before_repair_snapshot
+                        ),
+                        rewrite_context=rewrite_context,
+                        rewrite_target_rule=(
+                            _full_file_rewrite_target_rule_for_e2e(
+                                target_path
+                            )
+                        ),
+                    )
                 )
+
                 diff_stats = {
                     "mode": "full_file_rewrite",
-                    "changed_line_count": abs(len(candidate_content.splitlines()) - len(current_content.splitlines())),
+                    "changed_line_count": abs(
+                        len(
+                            candidate_content.splitlines()
+                        )
+                        - len(
+                            current_content.splitlines()
+                        )
+                    ),
                     "generated_diff_excerpt": "",
-                    "applied": [{"fallback_type": "full_file_rewrite"}],
+                    "applied": [{
+                        "fallback_type": (
+                            "full_file_rewrite"
+                        )
+                    }],
                 }
+
             else:
-                _proposal, candidate_content, diff_stats = await _request_and_apply_repair_patch(
+                (
+                    _proposal,
+                    candidate_content,
+                    diff_stats,
+                ) = await _request_and_apply_repair_patch(
                     model=model,
                     file_path=target_path,
                     current_content=current_content,
                     failure_text=repair_feedback,
                     scope=scope,
-                    task_context=effective_task_context + ("\n\n上一轮候选失败反馈：\n" + last_failure if last_failure else ""),
+                    task_context=(
+                        effective_task_context
+                        + (
+                            "\n\n上一轮候选失败反馈：\n"
+                            + last_failure
+                            if last_failure
+                            else ""
+                        )
+                    ),
                     target_rule=target_rule,
                     patch_retry_limit=3,
                 )
 
-            from .generation import _sanitize_generated_file_content
+            from .generation import (
+                _sanitize_generated_file_content,
+            )
 
-            sanitized = _sanitize_generated_file_content(target_path, candidate_content)
+            sanitized = (
+                _sanitize_generated_file_content(
+                    target_path,
+                    candidate_content,
+                )
+            )
 
-            basic_format_failure = check_patch_candidate_basic_format(target_path, sanitized)
+            basic_format_failure = (
+                check_patch_candidate_basic_format(
+                    target_path,
+                    sanitized,
+                )
+            )
+
             if basic_format_failure is not None:
                 last_failure = (
                     "当前失败只表示 patch 后文件基础格式不合法。\n"
-                    f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
+                    f"attempt={candidate_attempt}/"
+                    f"{max_candidate_attempts}\n"
                     f"{basic_format_failure.to_failure_text()}\n"
-                    "不要修改工具选择。不要修改 argv schema。不要修改 stdout 字段。不要修改业务职责。只把当前候选修成合法源码/合法 Markdown。"
+                    "不要修改工具选择。不要修改 argv schema。"
+                    "不要修改 stdout 字段。不要修改业务职责。"
+                    "只把当前候选修成合法源码/合法 Markdown。"
                 )
-                repair_feedback = deterministic_error + "\n\n" + last_failure
+
+                repair_feedback = (
+                    deterministic_error
+                    + "\n\n"
+                    + last_failure
+                )
+
                 e2e_session.events.append({
                     **e2e_session.to_event_base(),
                     "attempt": candidate_attempt,
                     "target_file": target_path,
-                    "patch_status": "basic_format_failed",
+                    "patch_status": (
+                        "basic_format_failed"
+                    ),
                     "repair_key": repair_key,
-                    "repair_mode": "localized_patch",
+                    "repair_mode": (
+                        "localized_patch"
+                    ),
                     "status": "patch_failed",
-                    "coarse_failure_kind": basic_format_failure.coarse_failure_kind,
-                    "rejection_reason": basic_format_failure.message,
-                    "failed_checks": repair_feedback.split("\n\n")[:8],
-                    "resolved_failures": e2e_session.resolved_failures,
+                    "coarse_failure_kind": (
+                        basic_format_failure
+                        .coarse_failure_kind
+                    ),
+                    "rejection_reason": (
+                        basic_format_failure.message
+                    ),
+                    "failed_checks": (
+                        repair_feedback.split(
+                            "\n\n"
+                        )[:8]
+                    ),
+                    "resolved_failures": (
+                        e2e_session.resolved_failures
+                    ),
                     "rerun_status": "skipped",
-                    "writeback_status": "candidate_only",
+                    "writeback_status": (
+                        "candidate_only"
+                    ),
                 })
-                e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
+
+                e2e_session.repair_attempt_counts[
+                    repair_key
+                ] = (
+                    e2e_session
+                    .repair_attempt_counts
+                    .get(
+                        repair_key,
+                        0,
+                    )
+                    + 1
+                )
+
                 consecutive_format_regressions += 1
-                if consecutive_format_regressions >= 3:
+
+                if (
+                    consecutive_format_regressions
+                    >= 3
+                ):
                     if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
+                        repair_events.extend(
+                            e2e_session.events
+                        )
+
                     return {
-                        "status": "still_failed_same_target",
-                        "repaired_target": target_path,
+                        "status": (
+                            "still_failed_same_target"
+                        ),
+                        "repaired_target": (
+                            target_path
+                        ),
                         "next_target": None,
-                        "next_failure": [last_failure],
-                        "last_failure": last_failure,
-                        "attempt": candidate_attempt,
-                        "error_type": "basic_format_failed",
+                        "next_failure": [
+                            last_failure
+                        ],
+                        "last_failure": (
+                            last_failure
+                        ),
+                        "attempt": (
+                            candidate_attempt
+                        ),
+                        "error_type": (
+                            "basic_format_failed"
+                        ),
                     }
+
                 continue
+
             consecutive_format_regressions = 0
 
-            old_command_signature = e2e_session.command_plan_signature
-            session_target = e2e_session.workspace_dir / target_path
-            session_target.parent.mkdir(parents=True, exist_ok=True)
-            session_target.write_text(sanitized, encoding="utf-8")
+            old_command_signature = (
+                e2e_session.command_plan_signature
+            )
+
+            session_target = (
+                e2e_session.workspace_dir
+                / target_path
+            )
+
+            session_target.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            session_target.write_text(
+                sanitized,
+                encoding="utf-8",
+            )
+
             e2e_session.current_revision += 1
 
-            session_skill_md = (e2e_session.workspace_dir / "SKILL.md").read_text(encoding="utf-8")
+            session_skill_md = (
+                e2e_session.workspace_dir
+                / "SKILL.md"
+            ).read_text(
+                encoding="utf-8"
+            )
+
             try:
-                session_commands = _extract_e2e_workflow_commands(e2e_session.workspace_dir, session_skill_md)
-                new_command_signature = _command_plan_signature(session_commands)
+                session_commands = (
+                    _extract_e2e_workflow_commands(
+                        e2e_session.workspace_dir,
+                        session_skill_md,
+                    )
+                )
+
+                new_command_signature = (
+                    _command_plan_signature(
+                        session_commands
+                    )
+                )
+
             except Exception:
                 session_commands = []
                 new_command_signature = ""
+
             earliest_step = _earliest_invalid_step(
                 changed_file=target_path,
                 commands=session_commands,
-                old_command_plan_signature=old_command_signature,
-                new_command_plan_signature=new_command_signature,
+                old_command_plan_signature=(
+                    old_command_signature
+                ),
+                new_command_plan_signature=(
+                    new_command_signature
+                ),
             )
-            resume_from_step = earliest_step or (len(session_commands) + 1 if session_commands else 1)
-            invalidated = _invalidate_checkpoints_from(e2e_session, earliest_step) if earliest_step else []
-            reused = [idx for idx in range(1, max(1, resume_from_step)) if _load_valid_checkpoint(e2e_session, idx)]
 
-            sandbox_gate = _run_e2e_sandbox_acceptance_gate(
-                skill_name=skill_name,
-                candidate_skill_dir=e2e_session.workspace_dir,
-                patched_file=target_path,
-                original_errors=e2e_errors,
-                external_context=external_context,
-                requested_model=requested_model,
-                e2e_session=e2e_session,
-                resume_from_step=resume_from_step,
+            resume_from_step = (
+                earliest_step
+                or (
+                    len(session_commands) + 1
+                    if session_commands
+                    else 1
+                )
+            )
+
+            invalidated = (
+                _invalidate_checkpoints_from(
+                    e2e_session,
+                    earliest_step,
+                )
+                if earliest_step
+                else []
+            )
+
+            reused = [
+                idx
+                for idx in range(
+                    1,
+                    max(
+                        1,
+                        resume_from_step,
+                    ),
+                )
+                if _load_valid_checkpoint(
+                    e2e_session,
+                    idx,
+                )
+            ]
+
+            sandbox_gate = (
+                _run_e2e_sandbox_acceptance_gate(
+                    skill_name=skill_name,
+                    candidate_skill_dir=(
+                        e2e_session.workspace_dir
+                    ),
+                    patched_file=target_path,
+                    original_errors=e2e_errors,
+                    external_context=external_context,
+                    requested_model=requested_model,
+                    e2e_session=e2e_session,
+                    resume_from_step=(
+                        resume_from_step
+                    ),
+                )
             )
 
             e2e_session.events.append({
                 **e2e_session.to_event_base(),
                 "attempt": candidate_attempt,
                 "target_file": target_path,
-                "resume_from_step": resume_from_step,
+                "resume_from_step": (
+                    resume_from_step
+                ),
                 "reused_venv": True,
                 "reused_checkpoints": reused,
-                "invalidated_checkpoints": invalidated,
-                "failed_checks": sandbox_gate.get("errors") or [],
-                "resolved_failures": e2e_session.resolved_failures,
+                "invalidated_checkpoints": (
+                    invalidated
+                ),
+                "failed_checks": (
+                    sandbox_gate.get("errors")
+                    or []
+                ),
+                "resolved_failures": (
+                    e2e_session.resolved_failures
+                ),
                 "patch_mode": "exact_replace",
                 "repair_key": repair_key,
                 "repair_mode": "localized_patch",
-                "fallback_type": (diff_stats.get("applied") or [{}])[0].get("fallback_type", "none"),
-                "patch_status": "e2e_fully_passed" if sandbox_gate.get("accepted") else "e2e_still_failed",
-                "status": "repaired" if sandbox_gate.get("accepted") else "same_target_still_failed",
-                "changed_line_count": diff_stats.get("changed_line_count"),
-                "diff_excerpt": diff_stats.get("generated_diff_excerpt"),
-                "matched_excerpt": (diff_stats.get("applied") or [{}])[0].get("matched_excerpt"),
-                "original_model_old_excerpt": (diff_stats.get("applied") or [{}])[0].get("original_model_old_excerpt"),
-                "rerun_status": "passed" if sandbox_gate.get("accepted") else "failed",
-                "writeback_status": "candidate_only",
+                "fallback_type": (
+                    diff_stats.get(
+                        "applied"
+                    )
+                    or [{}]
+                )[0].get(
+                    "fallback_type",
+                    "none",
+                ),
+                "patch_status": (
+                    "e2e_fully_passed"
+                    if sandbox_gate.get(
+                        "accepted"
+                    )
+                    else "e2e_still_failed"
+                ),
+                "status": (
+                    "repaired"
+                    if sandbox_gate.get(
+                        "accepted"
+                    )
+                    else "same_target_still_failed"
+                ),
+                "changed_line_count": (
+                    diff_stats.get(
+                        "changed_line_count"
+                    )
+                ),
+                "diff_excerpt": (
+                    diff_stats.get(
+                        "generated_diff_excerpt"
+                    )
+                ),
+                "matched_excerpt": (
+                    (
+                        diff_stats.get(
+                            "applied"
+                        )
+                        or [{}]
+                    )[0].get(
+                        "matched_excerpt"
+                    )
+                ),
+                "original_model_old_excerpt": (
+                    (
+                        diff_stats.get(
+                            "applied"
+                        )
+                        or [{}]
+                    )[0].get(
+                        "original_model_old_excerpt"
+                    )
+                ),
+                "rerun_status": (
+                    "passed"
+                    if sandbox_gate.get(
+                        "accepted"
+                    )
+                    else "failed"
+                ),
+                "writeback_status": (
+                    "candidate_only"
+                ),
             })
 
-            if not sandbox_gate.get("accepted"):
+            if not sandbox_gate.get(
+                "accepted"
+            ):
                 if not use_full_rewrite:
-                    e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
-                gate_errors = sandbox_gate.get("errors") or []
-                failure_signature = _failure_signature_from_error((gate_errors or [""])[0])
-                template_signature = _stable_json_hash([
-                    {"ordinal": c.ordinal, "script_path": c.script_path, "argv_template": c.argv_template}
-                    for c in (session_commands or [])
-                ])
-                history = repair_template_history.setdefault(failure_signature, [])
-                history.append(template_signature)
-                if len(history) >= 3 and history[-1] == history[-3]:
-                    oscillation_message = (
-                        "Detected oscillating E2E repair. This indicates missing/ambiguous typed sample seeding "
-                        "or placeholder diagnostics. Do not continue patching business files."
+                    e2e_session.repair_attempt_counts[
+                        repair_key
+                    ] = (
+                        e2e_session
+                        .repair_attempt_counts
+                        .get(
+                            repair_key,
+                            0,
+                        )
+                        + 1
                     )
+
+                gate_errors = (
+                    sandbox_gate.get("errors")
+                    or []
+                )
+
+                failure_signature = (
+                    _failure_signature_from_error(
+                        (
+                            gate_errors
+                            or [""]
+                        )[0]
+                    )
+                )
+
+                template_signature = (
+                    _stable_json_hash([
+                        {
+                            "ordinal": c.ordinal,
+                            "script_path": (
+                                c.script_path
+                            ),
+                            "argv_template": (
+                                c.argv_template
+                            ),
+                        }
+                        for c
+                        in (
+                            session_commands
+                            or []
+                        )
+                    ])
+                )
+
+                history = (
+                    repair_template_history
+                    .setdefault(
+                        failure_signature,
+                        [],
+                    )
+                )
+
+                history.append(
+                    template_signature
+                )
+
+                if (
+                    len(history) >= 3
+                    and history[-1]
+                    == history[-3]
+                ):
+                    oscillation_message = (
+                        "Detected oscillating E2E repair. "
+                        "This indicates missing/ambiguous "
+                        "typed sample seeding or placeholder diagnostics. "
+                        "Do not continue patching business files."
+                    )
+
                     e2e_session.events.append({
                         **e2e_session.to_event_base(),
                         "attempt": candidate_attempt,
                         "target_file": target_path,
-                        "patch_status": "oscillating_repair_blocked",
+                        "patch_status": (
+                            "oscillating_repair_blocked"
+                        ),
                         "status": "blocked",
-                        "failure_signature": failure_signature,
-                        "argv_template_history": history[-4:],
-                        "rejection_reason": oscillation_message,
+                        "failure_signature": (
+                            failure_signature
+                        ),
+                        "argv_template_history": (
+                            history[-4:]
+                        ),
+                        "rejection_reason": (
+                            oscillation_message
+                        ),
                         "failed_checks": gate_errors,
                         "rerun_status": "failed",
-                        "writeback_status": "candidate_only",
+                        "writeback_status": (
+                            "candidate_only"
+                        ),
                     })
+
                     if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
+                        repair_events.extend(
+                            e2e_session.events
+                        )
+
                     return {
                         "status": "blocked",
-                        "repaired_target": target_path,
+                        "repaired_target": (
+                            target_path
+                        ),
                         "next_target": None,
-                        "next_failure": [oscillation_message],
-                        "attempt": candidate_attempt,
+                        "next_failure": [
+                            oscillation_message
+                        ],
+                        "attempt": (
+                            candidate_attempt
+                        ),
                     }
-                next_target = _e2e_repair_target_from_errors(gate_errors)
-                has_explicit_next_target = any("E2E_REPAIR_TARGET=" in str(error or "") for error in gate_errors)
-                if has_explicit_next_target and next_target and next_target != target_path:
+
+                next_target = (
+                    _e2e_repair_target_from_errors(
+                        gate_errors
+                    )
+                )
+
+                has_explicit_next_target = any(
+                    "E2E_REPAIR_TARGET="
+                    in str(error or "")
+                    for error in gate_errors
+                )
+
+                if (
+                    has_explicit_next_target
+                    and next_target
+                    and next_target
+                    != target_path
+                ):
                     for error in e2e_errors:
-                        e2e_session.resolved_failures.append({
-                            "failure_signature": _failure_signature_from_error(error),
-                            "target_file": target_path,
-                            "failure_kind": _failure_layer_from_error_text(error) or "e2e",
-                            "step_index": structured_failure.get("failed_step_index"),
-                            "resolved_by_revision": e2e_session.current_revision,
-                            "verified_by_e2e": True,
-                            "handoff_to_target": next_target,
-                        })
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
-                    target_file.write_text(sanitized, encoding="utf-8")
+                        (
+                            e2e_session
+                            .resolved_failures
+                            .append({
+                                "failure_signature": (
+                                    _failure_signature_from_error(
+                                        error
+                                    )
+                                ),
+                                "target_file": target_path,
+                                "failure_kind": (
+                                    _failure_layer_from_error_text(
+                                        error
+                                    )
+                                    or "e2e"
+                                ),
+                                "step_index": (
+                                    structured_failure.get(
+                                        "failed_step_index"
+                                    )
+                                ),
+                                "resolved_by_revision": (
+                                    e2e_session
+                                    .current_revision
+                                ),
+                                "verified_by_e2e": True,
+                                "handoff_to_target": (
+                                    next_target
+                                ),
+                            })
+                        )
+
+                    target_file.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+
+                    target_file.write_text(
+                        sanitized,
+                        encoding="utf-8",
+                    )
+
                     handoff_event = {
                         **e2e_session.to_event_base(),
                         "attempt": candidate_attempt,
                         "target_file": target_path,
-                        "patch_status": "partial_success_target_changed",
+                        "patch_status": (
+                            "partial_success_target_changed"
+                        ),
                         "status": "target_changed",
-                        "rejection_reason": "current target failure disappeared; remaining failure moved to a different file",
+                        "rejection_reason": (
+                            "current target failure disappeared; "
+                            "remaining failure moved to a different file"
+                        ),
                         "next_target": next_target,
                         "next_failure": gate_errors,
-                        "remaining_target_file": next_target,
+                        "remaining_target_file": (
+                            next_target
+                        ),
                         "failed_checks": gate_errors,
-                        "resolved_failures": e2e_session.resolved_failures,
+                        "resolved_failures": (
+                            e2e_session.resolved_failures
+                        ),
                         "rerun_status": "target_handoff",
                         "writeback_status": "written",
                     }
-                    e2e_session.events.append(handoff_event)
+
+                    e2e_session.events.append(
+                        handoff_event
+                    )
+
                     if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
+                        repair_events.extend(
+                            e2e_session.events
+                        )
+
                     return {
                         "status": "target_changed",
                         "repaired_target": target_path,
@@ -4099,47 +4830,106 @@ async def _repair_existing_file_for_e2e_failure(
                         "next_failure": gate_errors,
                         "attempt": candidate_attempt,
                     }
+
                 working_content = sanitized
+
                 last_failure = (
-                    "SANDBOX_E2E_FAILED：候选 patch 已应用，但简单沙盒 E2E 仍失败。\n"
-                    f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
-                    f"diff_stats={json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
-                    f"sandbox_gate={json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
-                    "请基于 sandbox_gate.errors 继续输出新的 exact_replace patch。"
+                    "SANDBOX_E2E_FAILED：候选 patch 已应用，"
+                    "但简单沙盒 E2E 仍失败。\n"
+                    f"attempt={candidate_attempt}/"
+                    f"{max_candidate_attempts}\n"
+                    f"diff_stats="
+                    f"{json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000]}\n"
+                    f"sandbox_gate="
+                    f"{json.dumps(sandbox_gate, ensure_ascii=False, default=str)[:12000]}\n"
+                    "请只依据 sandbox_gate.errors 中新的真实运行失败"
+                    "继续输出新的 exact_replace patch。"
                 )
-                repair_feedback = "\n\n".join(sandbox_gate.get("errors") or e2e_errors)[-12000:] + "\n\n" + last_failure
+
+                repair_feedback = (
+                    "\n\n".join(
+                        sandbox_gate.get(
+                            "errors"
+                        )
+                        or e2e_errors
+                    )[-12000:]
+                    + "\n\n"
+                    + last_failure
+                )
+
                 logger.warning(
-                    "[Creator][E2E][repair_candidate_e2e_failed] skill=%s file=%s attempt=%d/%d",
+                    "[Creator][E2E]"
+                    "[repair_candidate_e2e_failed] "
+                    "skill=%s file=%s attempt=%d/%d",
                     skill_name,
                     target_path,
                     candidate_attempt,
                     max_candidate_attempts,
                 )
+
                 continue
 
             for error in e2e_errors:
-                e2e_session.resolved_failures.append({
-                    "failure_signature": _failure_signature_from_error(error),
-                    "target_file": target_path,
-                    "failure_kind": _failure_layer_from_error_text(error) or "e2e",
-                    "step_index": structured_failure.get("failed_step_index"),
-                    "resolved_by_revision": e2e_session.current_revision,
-                    "verified_by_e2e": True,
-                })
+                (
+                    e2e_session
+                    .resolved_failures
+                    .append({
+                        "failure_signature": (
+                            _failure_signature_from_error(
+                                error
+                            )
+                        ),
+                        "target_file": target_path,
+                        "failure_kind": (
+                            _failure_layer_from_error_text(
+                                error
+                            )
+                            or "e2e"
+                        ),
+                        "step_index": (
+                            structured_failure.get(
+                                "failed_step_index"
+                            )
+                        ),
+                        "resolved_by_revision": (
+                            e2e_session.current_revision
+                        ),
+                        "verified_by_e2e": True,
+                    })
+                )
 
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-            target_file.write_text(sanitized, encoding="utf-8")
+            target_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            target_file.write_text(
+                sanitized,
+                encoding="utf-8",
+            )
+
             if e2e_session.events:
-                e2e_session.events[-1]["writeback_status"] = "written"
+                e2e_session.events[-1][
+                    "writeback_status"
+                ] = "written"
+
             if repair_events is not None:
-                repair_events.extend(e2e_session.events)
+                repair_events.extend(
+                    e2e_session.events
+                )
 
             logger.info(
-                "[Creator][E2E][repair_accept] skill=%s file=%s attempt=%d diff_stats=%s sandbox=passed",
+                "[Creator][E2E][repair_accept] "
+                "skill=%s file=%s attempt=%d "
+                "diff_stats=%s sandbox=passed",
                 skill_name,
                 target_path,
                 candidate_attempt,
-                json.dumps(diff_stats, ensure_ascii=False, default=str)[:3000],
+                json.dumps(
+                    diff_stats,
+                    ensure_ascii=False,
+                    default=str,
+                )[:3000],
             )
 
             return {
@@ -4151,118 +4941,285 @@ async def _repair_existing_file_for_e2e_failure(
             }
 
         except Exception as candidate_exc:
-            error_text = str(candidate_exc)
+            error_text = str(
+                candidate_exc
+            )
+
             is_format_regression_rejection = (
                 target_path == "SKILL.md"
                 and (
-                    "hard_format_regression" in error_text
-                    or "PATCH_CANDIDATE_FORMAT_REGRESSED" in error_text
-                    or "markdown.fences.unclosed" in error_text
-                    or "markdown.fences.bash_unclosed" in error_text
-                    or "markdown.frontmatter.unclosed" in error_text
+                    "hard_format_regression"
+                    in error_text
+                    or "PATCH_CANDIDATE_FORMAT_REGRESSED"
+                    in error_text
+                    or "markdown.fences.unclosed"
+                    in error_text
+                    or "markdown.fences.bash_unclosed"
+                    in error_text
+                    or "markdown.frontmatter.unclosed"
+                    in error_text
                 )
             )
+
             if is_format_regression_rejection:
                 consecutive_format_regressions += 1
             else:
                 consecutive_format_regressions = 0
-            if "proposal_noop" in error_text or "no-op" in error_text:
+
+            if (
+                "proposal_noop" in error_text
+                or "no-op" in error_text
+            ):
                 patch_status = "noop"
+
             elif is_format_regression_rejection:
-                patch_status = "hard_format_regression_rejected"
-            elif "FORMAT_VIOLATION" in error_text or "JSON" in error_text or "parse" in error_text:
+                patch_status = (
+                    "hard_format_regression_rejected"
+                )
+
+            elif (
+                "FORMAT_VIOLATION" in error_text
+                or "JSON" in error_text
+                or "parse" in error_text
+            ):
                 patch_status = "parse_failed"
+
             else:
                 patch_status = "rejected"
+
             e2e_session.events.append({
                 **e2e_session.to_event_base(),
                 "attempt": candidate_attempt,
                 "target_file": target_path,
-                "patch_status": "patch_apply_failed" if patch_status == "rejected" else patch_status,
+                "patch_status": (
+                    "patch_apply_failed"
+                    if patch_status == "rejected"
+                    else patch_status
+                ),
                 "status": "patch_failed",
-                "rejection_reason": error_text[:2000],
-                "last_output_excerpt": getattr(candidate_exc, "last_output_excerpt", ""),
-                "parser_error": getattr(candidate_exc, "parser_error", "") or (error_text[:1000] if patch_status == "parse_failed" else ""),
-                "diff_extraction_attempted": bool(getattr(candidate_exc, "diff_extraction_attempted", False)),
+                "rejection_reason": (
+                    error_text[:2000]
+                ),
+                "last_output_excerpt": getattr(
+                    candidate_exc,
+                    "last_output_excerpt",
+                    "",
+                ),
+                "parser_error": (
+                    getattr(
+                        candidate_exc,
+                        "parser_error",
+                        "",
+                    )
+                    or (
+                        error_text[:1000]
+                        if patch_status
+                        == "parse_failed"
+                        else ""
+                    )
+                ),
+                "diff_extraction_attempted": bool(
+                    getattr(
+                        candidate_exc,
+                        "diff_extraction_attempted",
+                        False,
+                    )
+                ),
                 "repair_key": repair_key,
                 "repair_mode": "localized_patch",
-                "old_lines_new_lines_fallback_attempted": bool(getattr(candidate_exc, "lines_fallback_attempted", False)),
-                "failed_checks": repair_feedback.split("\n\n")[:8],
-                "resolved_failures": e2e_session.resolved_failures,
+                "old_lines_new_lines_fallback_attempted": bool(
+                    getattr(
+                        candidate_exc,
+                        "lines_fallback_attempted",
+                        False,
+                    )
+                ),
+                "failed_checks": (
+                    repair_feedback.split(
+                        "\n\n"
+                    )[:8]
+                ),
+                "resolved_failures": (
+                    e2e_session.resolved_failures
+                ),
                 "rerun_status": "skipped",
-                "writeback_status": "candidate_only",
+                "writeback_status": (
+                    "candidate_only"
+                ),
             })
-            if patch_status == "noop" and "argv_schema_error" in deterministic_error:
+
+            if (
+                patch_status == "noop"
+                and "argv_schema_error"
+                in deterministic_error
+            ):
                 consecutive_argv_schema_noops += 1
-                argv_kind = str(structured_failure.get("details", {}).get("argv_schema_error_kind") or "")
+
+                argv_kind = str(
+                    structured_failure.get(
+                        "details",
+                        {},
+                    ).get(
+                        "argv_schema_error_kind"
+                    )
+                    or ""
+                )
+
                 if (
-                    target_path.startswith("scripts/")
-                    and argv_kind in {"unknown_key", "missing_required", "invalid_type", "empty_required"}
+                    target_path.startswith(
+                        "scripts/"
+                    )
+                    and argv_kind
+                    in {
+                        "unknown_key",
+                        "missing_required",
+                        "invalid_type",
+                        "empty_required",
+                    }
                 ):
                     switch_message = (
-                        "argv_schema_error no-op on script target; for unknown_key/missing_required/"
-                        "invalid_type/empty_required the repair target is SKILL.md unless script self-inconsistency is proven."
+                        "argv_schema_error no-op on script target; "
+                        "for unknown_key/missing_required/"
+                        "invalid_type/empty_required the repair target "
+                        "is SKILL.md unless script self-inconsistency is proven."
                     )
+
                     if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
+                        repair_events.extend(
+                            e2e_session.events
+                        )
+
                     return {
                         "status": "target_changed",
                         "repaired_target": target_path,
                         "next_target": "SKILL.md",
-                        "next_failure": [switch_message, deterministic_error],
+                        "next_failure": [
+                            switch_message,
+                            deterministic_error,
+                        ],
                         "attempt": candidate_attempt,
                     }
-                if consecutive_argv_schema_noops >= 2:
+
+                if (
+                    consecutive_argv_schema_noops
+                    >= 2
+                ):
                     blocked_message = (
-                        "argv_schema_error repair produced two consecutive no-op patches for the current target; "
+                        "argv_schema_error repair produced "
+                        "two consecutive no-op patches for the current target; "
                         "stop this target to avoid burning the full retry budget."
                     )
+
                     if repair_events is not None:
-                        repair_events.extend(e2e_session.events)
+                        repair_events.extend(
+                            e2e_session.events
+                        )
+
                     return {
                         "status": "blocked",
                         "repaired_target": target_path,
                         "next_target": None,
-                        "next_failure": [blocked_message, deterministic_error],
+                        "next_failure": [
+                            blocked_message,
+                            deterministic_error,
+                        ],
                         "attempt": candidate_attempt,
-                        "error_type": "argv_schema_noop_blocked",
+                        "error_type": (
+                            "argv_schema_noop_blocked"
+                        ),
                     }
+
             elif patch_status != "noop":
                 consecutive_argv_schema_noops = 0
-            if repair_events is not None and patch_status in {"noop", "parse_failed"}:
-                repair_events.extend(e2e_session.events)
+
+            if (
+                repair_events is not None
+                and patch_status
+                in {
+                    "noop",
+                    "parse_failed",
+                }
+            ):
+                repair_events.extend(
+                    e2e_session.events
+                )
+
             last_failure = (
-                "REPAIR_CANDIDATE_FAILED：候选 patch 生成、解析或应用失败。\n"
-                f"attempt={candidate_attempt}/{max_candidate_attempts}\n"
-                f"error_type={type(candidate_exc).__name__}\n"
+                "REPAIR_CANDIDATE_FAILED："
+                "候选 patch 生成、解析或应用失败。\n"
+                f"attempt={candidate_attempt}/"
+                f"{max_candidate_attempts}\n"
+                f"error_type="
+                f"{type(candidate_exc).__name__}\n"
                 f"error={candidate_exc}\n"
                 + (
-                    "\n原始 Markdown 格式已经通过；候选 patch 造成格式回归并已拒绝。"
-                    "继续只修 E2E 内容问题：不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行；"
-                    "只修改失败命令那一行；old_lines 必须包含当前文件中的完整真实命令行。"
+                    "\n原始 Markdown 格式已经通过；"
+                    "候选 patch 造成格式回归并已拒绝。"
+                    "继续只修 E2E 内容问题："
+                    "不要修 frontmatter；不要修 code fence；"
+                    "不要新增/删除 ``` 行；"
+                    "只修改失败命令那一行；"
+                    "old_lines 必须包含当前文件中的完整真实命令行。"
                     if is_format_regression_rejection
-                    else "\n请继续输出新的 exact_replace patch。"
+                    else (
+                        "\n请继续输出新的 exact_replace patch；"
+                        "不要重新分析职责、ToolPool 或工具权限。"
+                    )
                 )
             )
-            repair_feedback = deterministic_error + "\n\n" + last_failure
-            if not use_full_rewrite:
-                e2e_session.repair_attempt_counts[repair_key] = e2e_session.repair_attempt_counts.get(repair_key, 0) + 1
 
-            if consecutive_format_regressions >= 2:
+            repair_feedback = (
+                deterministic_error
+                + "\n\n"
+                + last_failure
+            )
+
+            if not use_full_rewrite:
+                e2e_session.repair_attempt_counts[
+                    repair_key
+                ] = (
+                    e2e_session
+                    .repair_attempt_counts
+                    .get(
+                        repair_key,
+                        0,
+                    )
+                    + 1
+                )
+
+            if (
+                consecutive_format_regressions
+                >= 2
+            ):
                 if repair_events is not None:
-                    repair_events.extend(e2e_session.events)
+                    repair_events.extend(
+                        e2e_session.events
+                    )
+
                 return {
-                    "status": "still_failed_same_target",
+                    "status": (
+                        "still_failed_same_target"
+                    ),
                     "repaired_target": target_path,
                     "next_target": None,
-                    "next_failure": repair_feedback.split("\n\n")[:8],
-                    "last_failure": last_failure[:12000],
+                    "next_failure": (
+                        repair_feedback.split(
+                            "\n\n"
+                        )[:8]
+                    ),
+                    "last_failure": (
+                        last_failure[:12000]
+                    ),
                     "attempt": candidate_attempt,
-                    "error_type": "e2e_content_repair_warning",
+                    "error_type": (
+                        "e2e_content_repair_warning"
+                    ),
                 }
 
             logger.warning(
-                "[Creator][E2E][repair_candidate_failed] skill=%s file=%s attempt=%d/%d error=%s",
+                "[Creator][E2E]"
+                "[repair_candidate_failed] "
+                "skill=%s file=%s attempt=%d/%d error=%s",
                 skill_name,
                 target_path,
                 candidate_attempt,
@@ -4273,12 +5230,19 @@ async def _repair_existing_file_for_e2e_failure(
             continue
 
     if repair_events is not None:
-        repair_events.extend(e2e_session.events)
+        repair_events.extend(
+            e2e_session.events
+        )
+
     return {
         "status": "still_failed_same_target",
         "repaired_target": target_path,
         "next_target": None,
-        "next_failure": repair_feedback.split("\n\n")[:8],
+        "next_failure": (
+            repair_feedback.split(
+                "\n\n"
+            )[:8]
+        ),
         "last_failure": last_failure[:12000],
         "attempt": max_candidate_attempts,
     }

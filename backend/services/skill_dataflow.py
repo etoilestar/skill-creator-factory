@@ -57,6 +57,114 @@ class LoopExpansionError(DataflowError):
 def placeholder_pattern() -> re.Pattern[str]:
     return _PLACEHOLDER_RE
 
+def normalize_bare_json_placeholders(raw_json: str) -> str:
+    """Quote bare platform placeholders used as whole JSON values.
+
+    SKILL.md command templates may use the platform ``{{path}}`` syntax to
+    reference workflow context values.  A whole placeholder is represented as a
+    JSON string in the static command template and is restored to its original
+    runtime type by ``replace_placeholders_in_value``.
+
+    Examples:
+
+        {"value": {{result}}}
+        ->
+        {"value": "{{result}}"}
+
+        {"items": {{step.items}}}
+        ->
+        {"items": "{{step.items}}"}
+
+    Placeholders already inside JSON strings are left unchanged.  Expressions
+    that are not valid platform placeholders are also left unchanged so normal
+    JSON validation can reject them.
+    """
+    text = str(raw_json or "")
+
+    if "{{" not in text:
+        return text
+
+    out: list[str] = []
+    index = 0
+    in_string = False
+    escaped = False
+
+    while index < len(text):
+        ch = text[index]
+
+        if in_string:
+            out.append(ch)
+
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+
+            index += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            index += 1
+            continue
+
+        if text.startswith("{{", index):
+            match = _PLACEHOLDER_RE.match(text, index)
+
+            if match is not None:
+                start = match.start()
+                end = match.end()
+
+                previous_index = start - 1
+                while (
+                    previous_index >= 0
+                    and text[previous_index].isspace()
+                ):
+                    previous_index -= 1
+
+                next_index = end
+                while (
+                    next_index < len(text)
+                    and text[next_index].isspace()
+                ):
+                    next_index += 1
+
+                previous_char = (
+                    text[previous_index]
+                    if previous_index >= 0
+                    else ""
+                )
+                next_char = (
+                    text[next_index]
+                    if next_index < len(text)
+                    else ""
+                )
+
+                is_json_value_position = (
+                    previous_char in {":", "[", ","}
+                    and next_char in {",", "}", "]"}
+                )
+
+                if is_json_value_position:
+                    placeholder = match.group(0)
+
+                    out.append(
+                        json.dumps(
+                            placeholder,
+                            ensure_ascii=False,
+                        )
+                    )
+
+                    index = end
+                    continue
+
+        out.append(ch)
+        index += 1
+
+    return "".join(out)
 
 def extract_placeholders(value: Any) -> set[str]:
     """Return all placeholder paths referenced by a nested value."""

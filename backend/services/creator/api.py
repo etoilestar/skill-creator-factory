@@ -1029,26 +1029,198 @@ def _creator_tool_readiness_blockers(entry: Any) -> tuple[list[dict[str, Any]], 
     return requirements, blockers
 
 
-def _extract_script_tool_calls(content: str) -> list[str]:
+def _extract_script_tool_calls(content: str) -> list[dict[str, str]]:
+    """Extract explicit generated tool calls/imports.
+
+    This is only a boundary guard. It must not perform semantic recall.
+    Custom-tool imports are represented with module/function information so the
+    guard can compare them against Current File Tool Binding allowed_import_paths
+    and allowed_function_imports.
+    """
     text = str(content or "")
-    names: list[str] = []
-    call_pattern = r"\b(?:run_registered_tool|run_tool|call_tool)\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"
-    names.extend(re.findall(call_pattern, text))
-    import_pattern = r"^\s*from\s+backend\.services\.runtime_tools\.custom_tools\.([A-Za-z_][A-Za-z0-9_]*)\s+import\b"
-    names.extend(re.findall(import_pattern, text, flags=re.MULTILINE))
-    return list(dict.fromkeys(names))
+    calls: list[dict[str, str]] = []
+
+    for match in re.finditer(
+        r"\b(?:run_registered_tool|run_tool|call_tool)\(\s*['\"]([A-Za-z_][A-Za-z0-9_.-]*)['\"]",
+        text,
+    ):
+        tool_id = match.group(1).strip()
+        if tool_id:
+            calls.append({
+                "kind": "registry_call",
+                "tool_id": tool_id,
+                "module": "",
+                "function": "",
+                "display": tool_id,
+            })
+
+    import_from_re = re.compile(
+        r"^\s*from\s+(backend\.services\.runtime_tools\.custom_tools\.([A-Za-z_][A-Za-z0-9_]*))\s+import\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        re.MULTILINE,
+    )
+    for match in import_from_re.finditer(text):
+        module = match.group(1).strip()
+        tool_id = match.group(2).strip()
+        function_name = match.group(3).strip()
+        calls.append({
+            "kind": "custom_import_from",
+            "tool_id": tool_id,
+            "module": module,
+            "function": function_name,
+            "display": f"{module}.{function_name}",
+        })
+
+    import_re = re.compile(
+        r"^\s*import\s+(backend\.services\.runtime_tools\.custom_tools\.([A-Za-z_][A-Za-z0-9_]*))\b",
+        re.MULTILINE,
+    )
+    for match in import_re.finditer(text):
+        module = match.group(1).strip()
+        tool_id = match.group(2).strip()
+        calls.append({
+            "kind": "custom_import",
+            "tool_id": tool_id,
+            "module": module,
+            "function": "",
+            "display": module,
+        })
+
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in calls:
+        key = (
+            item.get("kind", ""),
+            item.get("tool_id", ""),
+            item.get("module", ""),
+            item.get("function", ""),
+        )
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
 
 
-def _script_tool_boundary_violations(content: str, allowed_tools: list[str]) -> list[dict[str, Any]]:
-    allowed = {str(name) for name in allowed_tools or []}
-    unexpected = [name for name in _extract_script_tool_calls(content) if name not in allowed]
+def _script_tool_boundary_violations(
+    content: str,
+    allowed_tools: list[str],
+    *,
+    file_binding: Any = None,
+    skill_plan_entry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate generated explicit tool calls against the real file binding.
+
+    Important:
+    - This is not semantic matching.
+    - It must not second-guess ToolPool recall.
+    - If Current File Tool Binding allows a custom import path/function, this
+      boundary guard must accept it exactly like runtime_import_guard does.
+    """
+    allowed_tool_ids: set[str] = {str(name).strip() for name in allowed_tools or [] if str(name or "").strip()}
+    allowed_import_paths: set[str] = set()
+    allowed_function_imports: set[str] = set()
+    allowed_helper_imports: set[str] = set()
+
+    def _as_dict(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump(mode="json")
+                return dumped if isinstance(dumped, dict) else {}
+            except Exception:
+                return {}
+        if isinstance(value, dict):
+            return value
+        return {}
+
+    def _list(value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        raw = value if isinstance(value, list) else [value]
+        out: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    binding = _as_dict(file_binding)
+
+    if not binding and isinstance(skill_plan_entry, dict):
+        runtime_contract = skill_plan_entry.get("runtime_contract")
+        if isinstance(runtime_contract, dict):
+            maybe_binding = runtime_contract.get("tool_binding_summary")
+            if isinstance(maybe_binding, dict):
+                binding = maybe_binding
+
+    allowed_tool_ids.update(_list(binding.get("allowed_tool_ids")))
+    allowed_tool_ids.update(_list(binding.get("primary_tool_ids")))
+    allowed_tool_ids.update(_list(binding.get("secondary_tool_ids")))
+    allowed_import_paths.update(_list(binding.get("allowed_import_paths")))
+    allowed_function_imports.update(_list(binding.get("allowed_function_imports")))
+    allowed_helper_imports.update(_list(binding.get("allowed_helper_imports")))
+
+    if isinstance(skill_plan_entry, dict):
+        runtime_contract = skill_plan_entry.get("runtime_contract")
+        if isinstance(runtime_contract, dict):
+            allowed_tool_ids.update(_list(runtime_contract.get("selected_tools")))
+            allowed_tool_ids.update(_list(runtime_contract.get("allowed_tools")))
+            allowed_tool_ids.update(_list(runtime_contract.get("tool_names")))
+            allowed_import_paths.update(_list(runtime_contract.get("allowed_imports")))
+            allowed_function_imports.update(_list(runtime_contract.get("allowed_function_imports")))
+            allowed_helper_imports.update(_list(runtime_contract.get("allowed_helper_imports")))
+
+    unexpected: list[dict[str, str]] = []
+
+    for call in _extract_script_tool_calls(content):
+        kind = call.get("kind", "")
+        tool_id = call.get("tool_id", "")
+        module = call.get("module", "")
+        function_name = call.get("function", "")
+
+        allowed = False
+
+        if tool_id and tool_id in allowed_tool_ids:
+            allowed = True
+
+        if function_name and function_name in allowed_function_imports:
+            allowed = True
+
+        if module and module in allowed_import_paths:
+            allowed = True
+
+        if module and function_name and f"{module}.{function_name}" in allowed_function_imports:
+            allowed = True
+
+        if function_name and function_name in allowed_helper_imports:
+            allowed = True
+
+        # Non-custom registry call fallback: exact capability/tool id only.
+        if kind == "registry_call" and tool_id in allowed_tool_ids:
+            allowed = True
+
+        if not allowed:
+            unexpected.append(call)
+
     if not unexpected:
         return []
+
+    displays = [item.get("display") or item.get("tool_id") or "" for item in unexpected]
     return [{
         "id": "script.hallucinated_tool_call",
         "layer": "script_tool_boundary",
-        "message": "脚本调用了未注册/未允许的工具：" + ", ".join(unexpected),
-        "expected": "只能调用 selected_tools/allowed_tools 中的工具；缺工具时返回 creation_blocker，不能编造工具。",
+        "message": "脚本调用了未注册/未允许的工具：" + ", ".join(x for x in displays if x),
+        "expected": (
+            "只能调用 Current File Tool Binding 中允许的工具、helper、custom import path 或 function；"
+            "缺工具时返回 creation_blocker，不能编造工具。"
+        ),
+        "details": {
+            "unexpected": unexpected,
+            "allowed_tool_ids": sorted(allowed_tool_ids),
+            "allowed_import_paths": sorted(allowed_import_paths),
+            "allowed_function_imports": sorted(allowed_function_imports),
+            "allowed_helper_imports": sorted(allowed_helper_imports),
+        },
     }]
 
 
@@ -3605,14 +3777,35 @@ async def generate_file(request: GenerateFileRequest):
                     if unsupported_issue:
                         raise ScriptFunctionalValidationError([unsupported_issue], layer="script_declared_input_not_supported")
 
-                    allowed_tools = list(resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
-                    boundary_violations = _script_tool_boundary_violations(content, allowed_tools)
+                    boundary_file_binding: Any = None
+                    try:
+                        boundary_tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                        boundary_file_binding = get_file_binding(boundary_tool_pool, request.file_path)
+                    except Exception:
+                        boundary_file_binding = None
+
+                    if boundary_file_binding is None and isinstance(effective_skill_plan_entry, dict):
+                        runtime_contract = effective_skill_plan_entry.get("runtime_contract")
+                        if isinstance(runtime_contract, dict):
+                            boundary_file_binding = runtime_contract.get("tool_binding_summary") or {}
+                        if not boundary_file_binding:
+                            boundary_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
+
+                    allowed_tools = list(
+                        resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
+                    boundary_violations = _script_tool_boundary_violations(
+                        content,
+                        allowed_tools,
+                        file_binding=boundary_file_binding,
+                        skill_plan_entry=effective_skill_plan_entry if isinstance(effective_skill_plan_entry,
+                                                                                  dict) else None,
+                    )
                     if boundary_violations:
                         first_violation = boundary_violations[0]
                         raise FileGenerationStageError(
                             source=first_violation["id"],
                             layer=first_violation["layer"],
-                            detail=first_violation["message"],
+                            detail=json.dumps(first_violation, ensure_ascii=False, default=str),
                         )
 
                 if request.file_path == "SKILL.md":

@@ -83,15 +83,10 @@ def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tupl
     return tools, triggers
 
 def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
-    """Extract concrete tool IDs from a file spec.
+    """Extract concrete tool IDs from deterministic tool fields only.
 
-    Prefer concrete tool names over abstract roles. Supported fields:
-    - required_tools
-    - selected_tools
-    - tool_ids
-    - selected_tool_ids
-    - allowed_tools
-    - required_tool_slots entries with tool_id/candidate_tool_id/capability/name
+    required_tool_slots / tool_intents are semantic intent text, not selected
+    concrete tool IDs. They should affect semantic recall, not exact tool match.
     """
     ids: set[str] = set()
     spec = spec if isinstance(spec, dict) else {}
@@ -105,22 +100,6 @@ def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
     ):
         value = spec.get(key)
         for item in _as_list(value):
-            text = str(item or "").strip()
-            if text:
-                ids.add(text)
-
-    for item in _as_list(spec.get("required_tool_slots")):
-        if isinstance(item, dict):
-            tool_id = (
-                item.get("tool_id")
-                or item.get("candidate_tool_id")
-                or item.get("capability")
-                or item.get("capability_id")
-                or item.get("name")
-            )
-            if tool_id:
-                ids.add(str(tool_id).strip())
-        else:
             text = str(item or "").strip()
             if text:
                 ids.add(text)

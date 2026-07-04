@@ -1048,6 +1048,40 @@ def _fill_required_skill_plan_fields(data: dict[str, Any]) -> dict[str, Any]:
 
     return result
 
+_RUNTIME_INPUT_FILE_PLACEHOLDER_RE = re.compile(r"^__RUNTIME_INPUT_FILE(?:_(\d+))?__$")
+
+
+def _normalize_skill_plan_input_field_names(inputs: Any) -> list[str]:
+    """Normalize platform runtime placeholders into stable argv field names.
+
+    __RUNTIME_INPUT_FILE__ is a placeholder value, not an argv key.
+    SkillPlan.inputs should contain business/runtime argument keys such as
+    input_file, input_file_1, etc.
+    """
+    raw_items = inputs if isinstance(inputs, list) else ([] if inputs in (None, "") else [inputs])
+    normalized: list[str] = []
+    used: set[str] = set()
+
+    for raw in raw_items:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+
+        match = _RUNTIME_INPUT_FILE_PLACEHOLDER_RE.fullmatch(text)
+        if match:
+            index = match.group(1)
+            if index in (None, "", "0"):
+                key = "input_file"
+            else:
+                key = f"input_file_{index}"
+        else:
+            key = text
+
+        if key not in used:
+            used.add(key)
+            normalized.append(key)
+
+    return normalized
 
 def _skill_plan_entry_for_file(
     *,
@@ -1061,7 +1095,29 @@ def _skill_plan_entry_for_file(
 
     This is the only bridge between FileSpecOut/frontend payload and the backend
     SkillPlanEntry dataclass. Do not manually construct SkillPlanEntry elsewhere.
+
+    Important: FileSpecOut may carry tool_binding_summary from prepare-plan's
+    ToolPool. SkillPlanEntry has no top-level field for it, so preserve it under
+    runtime_contract.tool_binding_summary before dataclass filtering.
     """
+
+    def _string_list(value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        raw = value if isinstance(value, list) else [value]
+        out: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    def _merge_unique(left: Any, right: Any) -> list[str]:
+        out: list[str] = []
+        for item in [*_string_list(left), *_string_list(right)]:
+            if item not in out:
+                out.append(item)
+        return out
 
     _validate_file_path(file_path)
 
@@ -1097,6 +1153,43 @@ def _skill_plan_entry_for_file(
         data["file_type"] = data.get("file_type") or "skill"
         data["runtime"] = data.get("runtime") or "none"
 
+    # Preserve ToolPool binding from FileSpecOut. It is not a SkillPlanEntry
+    # dataclass field, so store it under runtime_contract before filtering.
+    raw_binding = data.get("tool_binding_summary")
+    if isinstance(raw_binding, dict) and raw_binding:
+        runtime_contract = data.get("runtime_contract")
+        if not isinstance(runtime_contract, dict):
+            runtime_contract = {}
+
+        existing_binding = runtime_contract.get("tool_binding_summary")
+        if not isinstance(existing_binding, dict) or not existing_binding:
+            runtime_contract["tool_binding_summary"] = raw_binding
+
+        allowed_tool_ids = _merge_unique(
+            _merge_unique(raw_binding.get("primary_tool_ids"), raw_binding.get("secondary_tool_ids")),
+            raw_binding.get("allowed_tool_ids"),
+        )
+        if allowed_tool_ids:
+            runtime_contract["selected_tools"] = _merge_unique(runtime_contract.get("selected_tools"), allowed_tool_ids)
+            runtime_contract["allowed_tools"] = _merge_unique(runtime_contract.get("allowed_tools"), allowed_tool_ids)
+            runtime_contract["tool_names"] = _merge_unique(runtime_contract.get("tool_names"), allowed_tool_ids)
+
+        allowed_imports = _merge_unique(
+            raw_binding.get("allowed_import_paths"),
+            raw_binding.get("allowed_function_imports"),
+        )
+        if allowed_imports:
+            runtime_contract["allowed_imports"] = _merge_unique(runtime_contract.get("allowed_imports"), allowed_imports)
+
+        allowed_helpers = _string_list(raw_binding.get("allowed_helper_imports"))
+        if allowed_helpers:
+            runtime_contract["allowed_helper_imports"] = _merge_unique(
+                runtime_contract.get("allowed_helper_imports"),
+                allowed_helpers,
+            )
+
+        data["runtime_contract"] = runtime_contract
+
     # Recompute capability defaults only when caller did not provide them, then
     # normalize even explicit frontend/model payloads so resource/meta files and
     # over-broad SkillPlan capabilities do not leak into runtime warnings.
@@ -1120,6 +1213,7 @@ def _skill_plan_entry_for_file(
         data["inputs"] = list(data.get("inputs") or default_inputs or [])
         data["outputs"] = list(data.get("outputs") or default_outputs or [])
 
+    data["inputs"] = _normalize_skill_plan_input_field_names(data.get("inputs"))
     data["purpose"] = str(data.get("purpose") or purpose or f"{file_path} 的职责说明")
 
     constructor_kwargs = _fill_required_skill_plan_fields(data)

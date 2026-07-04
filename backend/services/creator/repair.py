@@ -3419,21 +3419,34 @@ def _runtime_tool_contract_static_blockers(
 ) -> list[dict[str, Any]]:
     """Deterministically validate runtime_tools helper imports/calls.
 
-    This check is intentionally about the tool contract only. It does not
-    validate payload field names, helper argument field names, stdout keys, or
-    downstream interface alignment; those remain E2E responsibilities.
+    This check must use the same file-binding contract as runtime_import_guard.
+    It must not re-derive allowed tools from role, required_capabilities, or
+    natural-language responsibility hints.
     """
     if not str(script_content or "").strip():
         return []
+
     try:
         tree = ast.parse(script_content or "")
     except SyntaxError:
         return []
 
+    def _string_list(value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        raw = value if isinstance(value, list) else [value]
+        out: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
     runtime_prefix = "backend.services.runtime_tools"
     imported_helpers: dict[str, str] = {}
     runtime_module_aliases: dict[str, str] = {}
     imported_modules: set[str] = set()
+
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = str(node.module or "")
@@ -3453,57 +3466,81 @@ def _runtime_tool_contract_static_blockers(
     if not imported_helpers and not imported_modules:
         return []
 
-    selected_tool_names = {
-        str(item or "").strip()
-        for item in (
-            list(getattr(skill_plan_entry, "selected_tools", []) or [])
-            + list(getattr(skill_plan_entry, "required_capabilities", []) or [])
-            + list(getattr(skill_plan_entry, "optional_capabilities", []) or [])
-        )
-        if str(item or "").strip()
-    }
-    allowed_import_paths: set[str] = set()
     runtime_contract = getattr(skill_plan_entry, "runtime_contract", None)
-    if isinstance(runtime_contract, dict):
-        for key in ("selected_tools", "allowed_tools", "tool_names", "capabilities"):
-            raw = runtime_contract.get(key)
-            if isinstance(raw, list):
-                selected_tool_names.update(str(item or "").strip() for item in raw if str(item or "").strip())
-        raw_imports = runtime_contract.get("allowed_imports")
-        if isinstance(raw_imports, list):
-            for item in raw_imports:
-                value = str(item or "").strip()
-                if not value:
-                    continue
-                if "." in value:
-                    allowed_import_paths.add(value)
-                else:
-                    selected_tool_names.add(value)
+    if not isinstance(runtime_contract, dict):
+        runtime_contract = {}
+
+    binding = runtime_contract.get("tool_binding_summary")
+    if not isinstance(binding, dict):
+        binding = {}
+
+    allowed_tool_ids: set[str] = set()
+    allowed_tool_ids.update(_string_list(binding.get("allowed_tool_ids")))
+    allowed_tool_ids.update(_string_list(binding.get("primary_tool_ids")))
+    allowed_tool_ids.update(_string_list(binding.get("secondary_tool_ids")))
+
+    # Legacy runtime_contract selected/allowed tool ids are allowed only as
+    # deterministic resolver output, not as natural-language role/capability text.
+    allowed_tool_ids.update(_string_list(runtime_contract.get("selected_tools")))
+    allowed_tool_ids.update(_string_list(runtime_contract.get("allowed_tools")))
+    allowed_tool_ids.update(_string_list(runtime_contract.get("tool_names")))
+
+    allowed_helpers: set[str] = set(_string_list(binding.get("allowed_helper_imports")))
+    allowed_helpers.update(_string_list(runtime_contract.get("allowed_helper_imports")))
+
+    allowed_import_paths: set[str] = set(_string_list(binding.get("allowed_import_paths")))
+    allowed_import_paths.update(_string_list(runtime_contract.get("allowed_imports")))
+
+    allowed_function_imports: set[str] = set(_string_list(binding.get("allowed_function_imports")))
+    allowed_import_paths.update(allowed_function_imports)
+
+    try:
+        from backend.services.runtime_tools import __all__ as runtime_tools_all  # type: ignore
+        exported_runtime_helpers = {str(item) for item in runtime_tools_all}
+    except Exception:
+        exported_runtime_helpers = set()
 
     all_caps = list_tool_capabilities()
-    known_tool_names = {str(getattr(cap, "name", "") or "").strip() for cap in all_caps if str(getattr(cap, "name", "") or "").strip()}
-    selected_tool_names = {name for name in selected_tool_names if name in known_tool_names}
+    known_tool_names = {
+        str(getattr(cap, "name", "") or "").strip()
+        for cap in all_caps
+        if str(getattr(cap, "name", "") or "").strip()
+    }
+    allowed_tool_ids = {tool_id for tool_id in allowed_tool_ids if tool_id in known_tool_names}
+
     helper_to_tools: dict[str, set[str]] = {}
     helper_to_imports: dict[str, set[str]] = {}
+
     for cap in all_caps:
-        names = {str(getattr(cap, "name", "") or "").strip()}
-        for value in list(getattr(cap, "helper_imports", []) or []):
-            helper_to_tools.setdefault(str(value), set()).update(names)
+        cap_name = str(getattr(cap, "name", "") or "").strip()
+        if not cap_name:
+            continue
+
+        for helper in list(getattr(cap, "helper_imports", []) or []):
+            helper_name = str(helper or "").strip()
+            if helper_name:
+                helper_to_tools.setdefault(helper_name, set()).add(cap_name)
+
         for fn in list(getattr(cap, "functions", []) or []):
             function_name = str(getattr(fn, "function_name", "") or "").strip()
             import_path = str(getattr(fn, "import_path", "") or "").strip()
             if function_name:
-                helper_to_tools.setdefault(function_name, set()).update(names)
+                helper_to_tools.setdefault(function_name, set()).add(cap_name)
                 if import_path:
                     helper_to_imports.setdefault(function_name, set()).add(import_path)
 
-    allowed_helpers: set[str] = set()
-    allowlist_present = bool(selected_tool_names or allowed_import_paths)
+    # Expand allowed helpers/imports from explicitly bound tools.
     for cap in all_caps:
         cap_name = str(getattr(cap, "name", "") or "").strip()
-        if cap_name not in selected_tool_names:
+        if cap_name not in allowed_tool_ids:
             continue
-        allowed_helpers.update(str(item) for item in (getattr(cap, "helper_imports", []) or []) if str(item))
+
+        allowed_helpers.update(
+            str(item).strip()
+            for item in (getattr(cap, "helper_imports", []) or [])
+            if str(item or "").strip()
+        )
+
         for fn in list(getattr(cap, "functions", []) or []):
             function_name = str(getattr(fn, "function_name", "") or "").strip()
             import_path = str(getattr(fn, "import_path", "") or "").strip()
@@ -3511,23 +3548,53 @@ def _runtime_tool_contract_static_blockers(
                 allowed_helpers.add(function_name)
             if import_path:
                 allowed_import_paths.add(import_path)
+                if function_name:
+                    allowed_import_paths.add(f"{import_path}.{function_name}")
+
+    allowlist_present = bool(
+        allowed_helpers
+        or allowed_import_paths
+        or allowed_function_imports
+        or allowed_tool_ids
+    )
 
     issues: list[dict[str, Any]] = []
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
     requirement_id = req_items[0].id if req_items else ""
     failed_file = getattr(skill_plan_entry, "path", "") or (req_items[0].target_file if req_items else "")
 
-    for local_name, helper_name in sorted(imported_helpers.items()):
-        known = helper_name in helper_to_tools
-        helper_imports = helper_to_imports.get(helper_name) or set()
-        actual_import_ok = not helper_imports or any(module in helper_imports for module in imported_modules)
-        allowed = (
-            not allowlist_present
+    def helper_known(helper_name: str) -> bool:
+        return (
+            helper_name in exported_runtime_helpers
+            or helper_name in helper_to_tools
             or helper_name in allowed_helpers
-            or bool(helper_imports & allowed_import_paths)
-            or any(module in allowed_import_paths for module in imported_modules)
         )
-        if not known or not actual_import_ok or not allowed:
+
+    def helper_allowed(helper_name: str, imported_module: str = "") -> bool:
+        if not allowlist_present:
+            return True
+        if helper_name in allowed_helpers:
+            return True
+        if f"{runtime_prefix}.{helper_name}" in allowed_import_paths:
+            return True
+        if imported_module and imported_module in allowed_import_paths:
+            return True
+        helper_imports = helper_to_imports.get(helper_name) or set()
+        if helper_imports & allowed_import_paths:
+            return True
+        if any(f"{path}.{helper_name}" in allowed_import_paths for path in helper_imports):
+            return True
+        return False
+
+    for local_name, helper_name in sorted(imported_helpers.items()):
+        module_ok = (
+            runtime_prefix in imported_modules
+            or any(module == runtime_prefix or module.startswith(runtime_prefix + ".") for module in imported_modules)
+        )
+        known = helper_known(helper_name)
+        allowed = helper_allowed(helper_name, runtime_prefix)
+
+        if not known or not module_ok or not allowed:
             issues.append({
                 "id": "tool_contract_mismatch",
                 "requirement_id": requirement_id,
@@ -3535,35 +3602,37 @@ def _runtime_tool_contract_static_blockers(
                 "failed_function": local_name,
                 "code_region": f"runtime_tools import/call: {helper_name}",
                 "reason": (
-                    "Imported runtime helper is not present in the Tool Registry."
-                    if not known or not actual_import_ok
-                    else "Imported runtime helper is not allowed by selected tools / allowed imports."
+                    "Imported runtime helper is not exported by runtime_tools or registered/bound tool metadata."
+                    if not known or not module_ok
+                    else "Imported runtime helper is not allowed by current_file_tool_binding."
                 ),
-                "missing_evidence": ["valid runtime helper allowed by selected_tools/allowed_imports/tool registry"],
-                "minimal_edit": "Use only a real helper supplied by the selected Tool Registry function cards, or implement the responsibility without guessing runtime_tools helpers.",
+                "missing_evidence": ["runtime helper must be present in current_file_tool_binding.allowed_helper_imports"],
+                "minimal_edit": (
+                    "Use only helpers allowed by Current File Tool Binding, or implement the responsibility "
+                    "without importing backend.services.runtime_tools."
+                ),
                 "allowed_scope": "current script only",
                 "details": {
                     "helper": helper_name,
-                    "selected_tools": sorted(selected_tool_names),
-                    "allowed_imports": sorted(allowed_import_paths),
-                    "known_tools": sorted(helper_to_tools.get(helper_name) or []),
+                    "binding_allowed_tool_ids": sorted(allowed_tool_ids),
+                    "binding_allowed_helpers": sorted(allowed_helpers),
+                    "binding_allowed_import_paths": sorted(allowed_import_paths),
+                    "known_tools_for_helper": sorted(helper_to_tools.get(helper_name) or []),
                 },
             })
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         if not isinstance(node.func.value, ast.Name) or node.func.value.id not in runtime_module_aliases:
             continue
+
         helper_name = str(node.func.attr or "")
-        known = helper_name in helper_to_tools
-        helper_imports = helper_to_imports.get(helper_name) or set()
-        module_name = next((module for alias, module in runtime_module_aliases.items() if alias == node.func.value.id), "")
-        allowed = (
-            not allowlist_present
-            or helper_name in allowed_helpers
-            or bool(helper_imports & allowed_import_paths)
-            or bool(module_name and module_name in allowed_import_paths)
-        )
+        module_name = runtime_module_aliases.get(node.func.value.id, "")
+
+        known = helper_known(helper_name)
+        allowed = helper_allowed(helper_name, module_name)
+
         if not known or not allowed:
             issues.append({
                 "id": "tool_contract_mismatch",
@@ -3572,20 +3641,25 @@ def _runtime_tool_contract_static_blockers(
                 "failed_function": helper_name,
                 "code_region": f"runtime_tools call: {node.func.value.id}.{helper_name}",
                 "reason": (
-                    "Called runtime helper is not present in the Tool Registry."
+                    "Called runtime helper is not exported by runtime_tools or registered/bound tool metadata."
                     if not known
-                    else "Called runtime helper is not allowed by selected tools / allowed imports."
+                    else "Called runtime helper is not allowed by current_file_tool_binding."
                 ),
-                "missing_evidence": ["valid runtime helper allowed by selected_tools/allowed_imports/tool registry"],
-                "minimal_edit": "Use only a real helper supplied by the selected Tool Registry function cards, or implement the responsibility without guessing runtime_tools helpers.",
+                "missing_evidence": ["runtime helper must be present in current_file_tool_binding.allowed_helper_imports"],
+                "minimal_edit": (
+                    "Use only helpers allowed by Current File Tool Binding, or implement the responsibility "
+                    "without importing backend.services.runtime_tools."
+                ),
                 "allowed_scope": "current script only",
                 "details": {
                     "helper": helper_name,
-                    "selected_tools": sorted(selected_tool_names),
-                    "allowed_imports": sorted(allowed_import_paths),
-                    "known_tools": sorted(helper_to_tools.get(helper_name) or []),
+                    "binding_allowed_tool_ids": sorted(allowed_tool_ids),
+                    "binding_allowed_helpers": sorted(allowed_helpers),
+                    "binding_allowed_import_paths": sorted(allowed_import_paths),
+                    "known_tools_for_helper": sorted(helper_to_tools.get(helper_name) or []),
                 },
             })
+
     return issues
 
 

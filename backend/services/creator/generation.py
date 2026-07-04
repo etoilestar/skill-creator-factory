@@ -503,8 +503,10 @@ def _script_generation_skeleton(
         "        raise ValueError('missing JSON argv')\n"
         "    payload = json.loads(sys.argv[1])\n"
         "    return strict_json_argv_guard(payload, {\n"
-        "        # Replace input_text with args actually used by run(args). Use {} for true no-input scripts.\n"
-        "        'input_text': {'type': str, 'required': True},\n"
+        "        # Fill this spec with the actual argv keys used by run(args).\n"
+        "        # Use {} for true no-input scripts.\n"
+        "        # Key names must come from the current script contract/SKILL.md command,\n"
+        "        # never from placeholder examples such as input_text.\n"
         "    })\n\n"
         "def run(args: dict) -> dict:\n"
         "    # TODO: implement the canonical contract using selected tools or real local logic.\n"
@@ -636,6 +638,88 @@ def _ensure_python_script_core_binding(binding: dict[str, Any], plan_entry: Skil
     merged["allowed_helper_imports"] = _stable_unique([*(merged.get("allowed_helper_imports") or []), "strict_json_argv_guard"])
     return merged
 
+def _string_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    raw = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _tool_ids_from_binding_summary(binding: dict[str, Any]) -> list[str]:
+    if not isinstance(binding, dict):
+        return []
+    out: list[str] = []
+    for key in ("primary_tool_ids", "allowed_tool_ids", "secondary_tool_ids"):
+        for item in _string_list(binding.get(key)):
+            if item not in out:
+                out.append(item)
+    return out
+
+
+def _snippet_to_dict(snippet: Any) -> dict[str, Any]:
+    if hasattr(snippet, "model_dump"):
+        return snippet.model_dump(mode="json")
+    if hasattr(snippet, "__dict__"):
+        return dict(snippet.__dict__)
+    if isinstance(snippet, dict):
+        return dict(snippet)
+    return {"text": str(snippet)}
+
+
+def _available_tool_cards_from_binding(binding: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Build code-model tool cards from the actual Current File Tool Binding.
+
+    This is not semantic routing. Tool selection already happened in ToolPool.
+    This function only converts bound registry tools into prompt-visible cards.
+    """
+    available_tools: list[dict[str, Any]] = []
+    tool_function_cards: list[str] = []
+    selected_tool_names: list[str] = []
+
+    for tool_name in _tool_ids_from_binding_summary(binding):
+        cap = get_tool_capability(tool_name)
+        if cap is None:
+            continue
+
+        selected_tool_names.append(tool_name)
+        tool_function_cards.extend(function_cards_for_tool(cap))
+
+        snippets = [_snippet_to_dict(snippet) for snippet in (getattr(cap, "snippets", []) or [])]
+
+        for fn in getattr(cap, "functions", []) or []:
+            function_name = str(getattr(fn, "function_name", "") or "").strip()
+            import_path = str(getattr(fn, "import_path", "") or "").strip()
+            if not function_name or not import_path:
+                continue
+
+            example_call = str(getattr(fn, "example_call", "") or "").strip()
+            call_template = example_call or f"from {import_path} import {function_name}\nresult = {function_name}(...)"
+
+            available_tools.append({
+                "tool_id": f"{tool_name}.{function_name}",
+                "capability_name": tool_name,
+                "description": str(getattr(fn, "when_to_use", "") or getattr(fn, "short_description", "") or getattr(cap, "display_name", "") or tool_name),
+                "call_template": call_template,
+                "signature": str(getattr(fn, "signature", "") or ""),
+                "input_schema": getattr(fn, "input_schema", None) or getattr(cap, "input_schema", {}) or {},
+                "output_schema": getattr(fn, "output_schema", None) or getattr(cap, "output_schema", {}) or {},
+                "return_contract": str(getattr(fn, "return_contract", "") or ""),
+                "example_return": str(getattr(fn, "example_return", "") or ""),
+                "example_stdout": str(getattr(fn, "example_stdout", "") or ""),
+                "common_mistakes": list(getattr(fn, "common_mistakes", []) or getattr(cap, "common_mistakes", []) or []),
+                "snippets": snippets,
+                "usage_policy": str(getattr(fn, "usage_policy", "") or getattr(cap, "usage_policy", "") or ""),
+                "required_env": list(getattr(fn, "required_env", []) or getattr(cap, "required_env", []) or []),
+                "required_secrets": list(getattr(fn, "required_secrets", []) or getattr(cap, "required_secrets", []) or []),
+                "artifact_outputs": list(getattr(fn, "artifact_outputs", []) or getattr(cap, "artifact_outputs", []) or []),
+            })
+
+    return available_tools, tool_function_cards, selected_tool_names
 
 def _script_local_contract_payload(
     *,
@@ -655,34 +739,48 @@ def _script_local_contract_payload(
     implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
     command_argv_contract = _command_argv_contract_for_script(file_path, "", plan_entry)
 
-    available_tools: list[dict[str, Any]] = []
-    tool_function_cards: list[str] = []
-    selected_tool_names: list[str] = []
+    tool_binding_summary = {}
+    if isinstance(plan_entry.runtime_contract, dict):
+        tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
 
-    for tool in (implementation_resolution.available_tools or implementation_resolution.selected_tools or []):
-        capability_name = str(tool.tool_id).split(".")[0]
-        selected_tool_names.append(capability_name)
-        cap = get_tool_capability(capability_name)
-        if cap is not None:
-            tool_function_cards.extend(function_cards_for_tool(cap))
+    derived_tool_binding = _tool_binding_from_resolution(implementation_resolution)
+    tool_binding_summary = _merge_tool_binding_summary(tool_binding_summary, derived_tool_binding)
+    tool_binding_summary = _ensure_python_script_core_binding(tool_binding_summary, plan_entry)
 
-        available_tools.append({
-            "tool_id": tool.tool_id,
-            "description": tool.description,
-            "call_template": call_template_for_tool(tool),
-            "signature": tool.signature,
-            "input_schema": tool.input_schema,
-            "output_schema": tool.output_schema,
-            "return_contract": tool.return_contract,
-            "example_return": tool.example_return,
-            "example_stdout": tool.example_stdout,
-            "common_mistakes": tool.common_mistakes,
-            "snippets": tool.snippets,
-            "usage_policy": tool.usage_policy,
-            "required_env": tool.required_env,
-            "required_secrets": tool.required_secrets,
-            "artifact_outputs": tool.artifact_outputs,
-        })
+    # Prefer the actual file binding from ToolPool. This keeps code generation,
+    # import guard, and responsibility review on the same tool contract.
+    available_tools, tool_function_cards, selected_tool_names = _available_tool_cards_from_binding(tool_binding_summary)
+
+    # Fallback only when no binding-derived tool cards exist.
+    if not available_tools:
+        available_tools = []
+        tool_function_cards = []
+        selected_tool_names = []
+
+        for tool in (implementation_resolution.available_tools or implementation_resolution.selected_tools or []):
+            capability_name = str(tool.tool_id).split(".")[0]
+            selected_tool_names.append(capability_name)
+            cap = get_tool_capability(capability_name)
+            if cap is not None:
+                tool_function_cards.extend(function_cards_for_tool(cap))
+
+            available_tools.append({
+                "tool_id": tool.tool_id,
+                "description": tool.description,
+                "call_template": call_template_for_tool(tool),
+                "signature": tool.signature,
+                "input_schema": tool.input_schema,
+                "output_schema": tool.output_schema,
+                "return_contract": tool.return_contract,
+                "example_return": tool.example_return,
+                "example_stdout": tool.example_stdout,
+                "common_mistakes": tool.common_mistakes,
+                "snippets": tool.snippets,
+                "usage_policy": tool.usage_policy,
+                "required_env": tool.required_env,
+                "required_secrets": tool.required_secrets,
+                "artifact_outputs": tool.artifact_outputs,
+            })
 
     tool_snippets = resolve_tool_snippets_for_context(
         role=plan_entry.role or "",
@@ -695,13 +793,6 @@ def _script_local_contract_payload(
         file_path=file_path,
         max_snippets=8,
     )
-
-    tool_binding_summary = {}
-    if isinstance(plan_entry.runtime_contract, dict):
-        tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
-    derived_tool_binding = _tool_binding_from_resolution(implementation_resolution)
-    tool_binding_summary = _merge_tool_binding_summary(tool_binding_summary, derived_tool_binding)
-    tool_binding_summary = _ensure_python_script_core_binding(tool_binding_summary, plan_entry)
 
     return {
         "file_path": file_path,
@@ -942,8 +1033,10 @@ def _build_script_generate_file_prompt_variant(
         "script 可以有 optional/default/config 参数；这些参数不需要来自平台 IO，也不需要出现在 recommended_inputs。required 参数必须能由 SKILL.md command 提供非空值；optional/default 参数应在 guard spec 或 run/main 默认逻辑中自洽。",
         "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
         "硬性 argv guard 规则：run() 只能使用 strict_json_argv_guard 返回的 args；run() 不得重新 json.loads(sys.argv[1])，不得直接使用未校验 payload。",
-        "硬性 argv guard 规则：骨架 spec 中的 input_text 只是示例，必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
+        "硬性 argv guard 规则：骨架 spec 中的示例字段必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
         "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
+        "available_tools/custom_tools 的返回值只是中间结果，不能直接作为最终 stdout 返回；最终 run(args) 返回的 dict 必须覆盖 output_contract.stdout_schema.required 的所有字段，字段名逐字一致，且核心字段值必须来自输入、工具结果、模型结果或本地处理结果。",
+        "如果工具返回字段名与 stdout_schema.required 不一致，必须在当前脚本内做语义映射/聚合；不得返回 markdown_text/source_file/output_format 等工具中间字段来替代 paragraphs/sections/full_document/markdown_summary。",
         "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
         "只根据轻量上下文实现：script_goal、inputs、outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
         "覆盖要求硬规则：如果 local_contract.coverage_requirements 声明了输入来源、输入格式、核心动作、输出变体、参考读取或最终平台输出义务，当前脚本必须在自己的职责范围内实际读取/处理/产出这些义务；单脚本 full-coverage contract 必须覆盖全部声明能力。",

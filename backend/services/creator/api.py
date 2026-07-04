@@ -4368,7 +4368,12 @@ async def generate_file(request: GenerateFileRequest):
                                     ]
                                     if new_requests:
                                         for req_item in new_requests:
-                                            spec_dict = {"path": request.file_path, "role": request.role or "generic_script"}
+                                            spec_dict = dict(file_specs_for_explore[0]) if file_specs_for_explore else {
+                                                "path": request.file_path,
+                                                "role": request.role or "generic_script",
+                                            }
+                                            spec_dict.setdefault("path", request.file_path)
+                                            spec_dict.setdefault("role", request.role or "generic_script")
                                             gate_evt = gate_tool_request(req_item, file_role=str(spec_dict.get("role") or "generic_script"), file_spec=spec_dict)
                                             existing_pool.gate_events.append(gate_evt)
                                             if gate_evt.decision == "allow":

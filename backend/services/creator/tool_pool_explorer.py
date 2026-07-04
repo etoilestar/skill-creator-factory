@@ -82,6 +82,51 @@ def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tupl
                 tools.add(str(tool).strip()); triggers.append({'source':'uploaded_files.candidate_tools','tool_id':str(tool).strip(),'file':item.get('name') or item.get('path') or item.get('filename')})
     return tools, triggers
 
+def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
+    """Extract concrete tool IDs from a file spec.
+
+    Prefer concrete tool names over abstract roles. Supported fields:
+    - required_tools
+    - selected_tools
+    - tool_ids
+    - selected_tool_ids
+    - allowed_tools
+    - required_tool_slots entries with tool_id/candidate_tool_id/capability/name
+    """
+    ids: set[str] = set()
+    spec = spec if isinstance(spec, dict) else {}
+
+    for key in (
+        "required_tools",
+        "selected_tools",
+        "tool_ids",
+        "selected_tool_ids",
+        "allowed_tools",
+    ):
+        value = spec.get(key)
+        for item in _as_list(value):
+            text = str(item or "").strip()
+            if text:
+                ids.add(text)
+
+    for item in _as_list(spec.get("required_tool_slots")):
+        if isinstance(item, dict):
+            tool_id = (
+                item.get("tool_id")
+                or item.get("candidate_tool_id")
+                or item.get("capability")
+                or item.get("capability_id")
+                or item.get("name")
+            )
+            if tool_id:
+                ids.add(str(tool_id).strip())
+        else:
+            text = str(item or "").strip()
+            if text:
+                ids.add(text)
+
+    return {item for item in ids if item}
+
 def _normalize_tokens(text: str) -> set[str]:
     raw = (text or '').lower()
     raw_nospace = raw.replace(' ', '')
@@ -160,45 +205,141 @@ def score_tool_for_file_request(cap: ToolCapability, *, text: str, tokens: set[s
             score-=30; features.append(f'negative_tag:{neg}')
     return score, features, sorted(set(terms)), '; '.join(features[:6])
 
-def explore_tool_pool(*, user_request: str = '', blueprint_text: str = '', file_specs: list[dict[str, Any]] | None = None, uploaded_files: list[dict[str, Any]] | None = None, current_tool_pool: Any = None, available_tool_registry: Any = None, missing_tool_configs: Any = None) -> ToolPoolExplorationResult:
-    uploaded_files=[u.model_dump(mode='json') if hasattr(u,'model_dump') else dict(u) for u in (uploaded_files or []) if isinstance(u, dict) or hasattr(u,'model_dump')]
-    registry=list(available_tool_registry or list_tool_capabilities())
-    uploaded_candidate_tools, triggers=_candidate_tools_from_uploaded(uploaded_files)
-    scored=[]; requests=[]
+def explore_tool_pool(
+    *,
+    user_request: str = "",
+    blueprint_text: str = "",
+    file_specs: list[dict[str, Any]] | None = None,
+    uploaded_files: list[dict[str, Any]] | None = None,
+    current_tool_pool: Any = None,
+    available_tool_registry: Any = None,
+    missing_tool_configs: Any = None,
+) -> ToolPoolExplorationResult:
+    uploaded_files = [
+        u.model_dump(mode="json") if hasattr(u, "model_dump") else dict(u)
+        for u in (uploaded_files or [])
+        if isinstance(u, dict) or hasattr(u, "model_dump")
+    ]
+    registry = list(available_tool_registry or list_tool_capabilities())
+    uploaded_candidate_tools, triggers = _candidate_tools_from_uploaded(uploaded_files)
+
+    scored: list[dict[str, Any]] = []
+    requests: list[ToolPoolAddToolRequest] = []
+
     for spec in file_specs or []:
-        target=str(spec.get('path') or spec.get('target_file') or '')
-        if not target.startswith('scripts/'): continue
-        text='\n'.join([user_request, blueprint_text, ' '.join(_texts(spec)), ' '.join(_texts(uploaded_files))])
-        tokens=_normalize_tokens(text)
-        exts=_file_exts(spec) | _file_exts(uploaded_files)
-        outputs=[str(x) for x in _texts(spec.get('outputs') or spec.get('output_schema') or {})]
-        role=str(spec.get('role') or 'generic_script')
-        selected={str(x) for x in _as_list(spec.get('selected_tools')) if str(x)}
-        raw_slots=_as_list(spec.get('required_tool_slots'))
-        slots={str(x.get('tool_id') or x.get('capability') or x.get('capability_id') or x.get('name') or x) for x in raw_slots if str(x)}
-        candidates=[]
+        target = str(spec.get("path") or spec.get("target_file") or "").replace("\\", "/")
+        if not target.startswith("scripts/"):
+            continue
+
+        text = "\n".join([
+            user_request,
+            blueprint_text,
+            " ".join(_texts(spec)),
+            " ".join(_texts(uploaded_files)),
+        ])
+        tokens = _normalize_tokens(text)
+        exts = _file_exts(spec) | _file_exts(uploaded_files)
+        outputs = [str(x) for x in _texts(spec.get("outputs") or spec.get("output_schema") or {})]
+
+        # role is retained only as a weak scoring hint, not as the source of truth.
+        role = str(spec.get("role") or "generic_script")
+
+        # Concrete tool IDs are the source of truth.
+        selected = _tool_ids_from_spec(spec)
+
+        raw_slots = _as_list(spec.get("required_tool_slots"))
+        slots: set[str] = set()
+        for item in raw_slots:
+            if isinstance(item, dict):
+                value = (
+                    item.get("tool_id")
+                    or item.get("candidate_tool_id")
+                    or item.get("capability")
+                    or item.get("capability_id")
+                    or item.get("name")
+                )
+                if value:
+                    slots.add(str(value).strip())
+            else:
+                text_item = str(item or "").strip()
+                if text_item:
+                    slots.add(text_item)
+
+        candidates: list[dict[str, Any]] = []
+
         for cap in registry:
-            score, features, terms, reason=score_tool_for_file_request(cap, text=text, tokens=tokens, exts=exts, outputs=outputs, role=role, selected_tools=selected, required_slots=slots, uploaded_candidate_tools=uploaded_candidate_tools)
+            score, features, terms, reason = score_tool_for_file_request(
+                cap,
+                text=text,
+                tokens=tokens,
+                exts=exts,
+                outputs=outputs,
+                role=role,
+                selected_tools=selected,
+                required_slots=slots,
+                uploaded_candidate_tools=uploaded_candidate_tools,
+            )
+
             if score <= 0 and cap.name not in selected and cap.name not in uploaded_candidate_tools:
                 continue
-            row={'target_file':target,'tool_id':cap.name,'score':score,'matched_features':features,'matched_terms':terms,'semantic_reason':reason,'candidate_source':'semantic_registry'}
+
+            row = {
+                "target_file": target,
+                "tool_id": cap.name,
+                "score": score,
+                "matched_features": features,
+                "matched_terms": terms,
+                "semantic_reason": reason,
+                "candidate_source": "semantic_registry",
+            }
             candidates.append(row)
-        candidates.sort(key=lambda r: r['score'], reverse=True)
-        # keep top candidates but always include explicit selected/uploaded candidates
-        keep=[]
+
+        candidates.sort(key=lambda r: r["score"], reverse=True)
+
+        # Keep top candidates but always include explicit selected/uploaded tools.
+        keep: list[dict[str, Any]] = []
         for row in candidates:
-            if len(keep) < 3 or row['tool_id'] in selected or row['tool_id'] in uploaded_candidate_tools:
+            if (
+                len(keep) < 3
+                or row["tool_id"] in selected
+                or row["tool_id"] in uploaded_candidate_tools
+            ):
                 keep.append(row)
-        # Derive a single capability_group for all tools discovered for this file spec.
-        # All top-ranked tools for the same file compete for the same "slot", so they share
-        # one group — the highest-scoring tool becomes primary, the rest become secondary.
-        # This is derived from the top matched terms of the best candidate (generic, not hardcoded).
-        if keep:
-            top_terms = [t for t in (keep[0].get('matched_terms') or []) if t]
-            file_capability_group = '_'.join(top_terms[:2]) if top_terms else (keep[0]['tool_id'] if keep else target.replace('/', '_'))
+
+        # Concrete selected tool IDs should form their own capability group when present.
+        # This prevents unrelated top candidates from competing under an abstract role name.
+        if selected:
+            file_capability_group = "required_tools"
+        elif keep:
+            top_terms = [t for t in (keep[0].get("matched_terms") or []) if t]
+            file_capability_group = "_".join(top_terms[:2]) if top_terms else keep[0]["tool_id"]
         else:
-            file_capability_group = target.replace('/', '_')
-        for rank,row in enumerate(keep,1):
-            row['rank']=rank; scored.append(row)
-            requests.append(ToolPoolAddToolRequest(target_file=target, requested_capability=file_capability_group, candidate_tool_id=row['tool_id'], source='registry_exploration', reason=row['semantic_reason'], confidence=min(1.0, row['score']/100.0), score=row['score'], matched_features=row['matched_features'], matched_terms=row['matched_terms'], rank=rank, candidate_source=row['candidate_source'], semantic_reason=row['semantic_reason']))
-    return ToolPoolExplorationResult(candidate_tool_requests=requests, scored_candidates=scored, uploaded_file_triggers=triggers, confidence=0.85, reason='semantic registry recall and scoring')
+            file_capability_group = target.replace("/", "_")
+
+        for rank, row in enumerate(keep, 1):
+            row["rank"] = rank
+            scored.append(row)
+            requests.append(
+                ToolPoolAddToolRequest(
+                    target_file=target,
+                    requested_capability=file_capability_group,
+                    candidate_tool_id=row["tool_id"],
+                    source="registry_exploration",
+                    reason=row["semantic_reason"],
+                    confidence=min(1.0, row["score"] / 100.0),
+                    score=row["score"],
+                    matched_features=row["matched_features"],
+                    matched_terms=row["matched_terms"],
+                    rank=rank,
+                    candidate_source=row["candidate_source"],
+                    semantic_reason=row["semantic_reason"],
+                )
+            )
+
+    return ToolPoolExplorationResult(
+        candidate_tool_requests=requests,
+        scored_candidates=scored,
+        uploaded_file_triggers=triggers,
+        confidence=0.85,
+        reason="semantic registry recall and concrete tool-id scoring",
+    )

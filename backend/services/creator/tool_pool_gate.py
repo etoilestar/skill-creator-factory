@@ -44,29 +44,187 @@ def _check_function_imports(cap: Any) -> tuple[list[str], list[str], list[str], 
         allowed_paths.append(import_path); allowed_functions.append(function_name)
     return allowed_paths, allowed_functions, checked_paths, checked_functions, messages
 
-def gate_tool_request(request: ToolPoolAddToolRequest | dict[str, Any], *, file_role: str = 'generic_script', file_spec: dict[str, Any] | None = None) -> ToolPoolGateEvent:
+def _declared_tool_ids(file_spec: dict[str, Any] | None) -> set[str]:
+    """Return concrete tool IDs explicitly requested by the file spec.
+
+    Tool selection should be driven by tool IDs such as:
+    - required_tools: ["unified_file_text_read", "text_generation"]
+    - selected_tools: ["create_pdf_document"]
+    - required_tool_slots: [{"tool_id": "..."}]
+
+    File role remains only a coarse file/resource category and must not be used
+    to reject a concrete tool candidate for scripts/**.
+    """
+    spec = file_spec if isinstance(file_spec, dict) else {}
+    ids: set[str] = set()
+
+    for key in (
+        "required_tools",
+        "selected_tools",
+        "tool_ids",
+        "selected_tool_ids",
+        "allowed_tools",
+        "required_capabilities",
+    ):
+        value = spec.get(key)
+        if isinstance(value, list):
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    ids.add(text)
+        elif isinstance(value, str) and value.strip():
+            ids.add(value.strip())
+
+    slots = spec.get("required_tool_slots")
+    if isinstance(slots, list):
+        for item in slots:
+            if isinstance(item, dict):
+                tool_id = (
+                    item.get("tool_id")
+                    or item.get("candidate_tool_id")
+                    or item.get("capability")
+                    or item.get("capability_id")
+                    or item.get("name")
+                )
+                if tool_id:
+                    ids.add(str(tool_id).strip())
+            else:
+                text = str(item or "").strip()
+                if text:
+                    ids.add(text)
+
+    return {item for item in ids if item}
+
+def gate_tool_request(
+    request: ToolPoolAddToolRequest | dict[str, Any],
+    *,
+    file_role: str = "generic_script",
+    file_spec: dict[str, Any] | None = None,
+) -> ToolPoolGateEvent:
+    """Gate a candidate runtime tool for a Creator script.
+
+    Important policy:
+    - Runtime tools may bind only to scripts/**.
+    - references/assets/SKILL.md-like resources must never receive runtime tools.
+    - Concrete tool identity is candidate_tool_id / required_tools / selected_tools.
+    - File role is no longer used as a hard allow/deny rule for scripts/**,
+      because roles such as composite_generator are too coarse and can block
+      valid concrete tools like unified_file_text_read.
+    """
     req = request if isinstance(request, ToolPoolAddToolRequest) else ToolPoolAddToolRequest(**request)
-    if not req.target_file.startswith('scripts/') or file_role in RESOURCE_ROLES:
-        return ToolPoolGateEvent(decision='blocked_by_policy', tool_id=req.candidate_tool_id, target_file=req.target_file, messages=['runtime tools may only bind to scripts/**, never references/assets'], score=req.score, matched_features=req.matched_features)
+    target_file = str(req.target_file or "").replace("\\", "/")
+    role = str(file_role or "").strip()
+
+    if not target_file.startswith("scripts/") or role in RESOURCE_ROLES:
+        return ToolPoolGateEvent(
+            decision="blocked_by_policy",
+            tool_id=req.candidate_tool_id,
+            target_file=req.target_file,
+            messages=["runtime tools may only bind to scripts/**, never references/assets"],
+            score=req.score,
+            matched_features=req.matched_features,
+        )
+
     cap = get_tool_capability(req.candidate_tool_id)
     if cap is None:
-        return ToolPoolGateEvent(decision='not_found', tool_id=req.candidate_tool_id, target_file=req.target_file, messages=['tool_id is not registered'], suggested_replacements=list(SUGGESTED.values()), score=req.score, matched_features=req.matched_features)
-    if not cap.enabled_by_default or not cap.allow_creator_use or str(cap.approval_status or '').lower() in {'disabled','denied','blocked'}:
-        return ToolPoolGateEvent(decision='blocked_by_policy', tool_id=cap.name, target_file=req.target_file, messages=['tool is disabled or not allowed for Creator use'], score=req.score, matched_features=req.matched_features)
-    roles = set(cap.roles or []) | set(cap.allowed_roles or [])
-    if roles and file_role and file_role not in roles:
-        return ToolPoolGateEvent(decision='role_mismatch', tool_id=cap.name, target_file=req.target_file, messages=[f'tool role mismatch: {file_role} not in {sorted(roles)}'], score=req.score, matched_features=req.matched_features)
+        return ToolPoolGateEvent(
+            decision="not_found",
+            tool_id=req.candidate_tool_id,
+            target_file=req.target_file,
+            messages=["tool_id is not registered"],
+            suggested_replacements=list(SUGGESTED.values()),
+            score=req.score,
+            matched_features=req.matched_features,
+        )
+
+    if (
+        not cap.enabled_by_default
+        or not cap.allow_creator_use
+        or str(cap.approval_status or "").lower() in {"disabled", "denied", "blocked"}
+    ):
+        return ToolPoolGateEvent(
+            decision="blocked_by_policy",
+            tool_id=cap.name,
+            target_file=req.target_file,
+            messages=["tool is disabled or not allowed for Creator use"],
+            score=req.score,
+            matched_features=req.matched_features,
+        )
+
+    declared_ids = _declared_tool_ids(file_spec)
+    messages: list[str] = []
+    if declared_ids:
+        if cap.name in declared_ids or req.candidate_tool_id in declared_ids:
+            messages.append(f"tool explicitly declared by file spec: {cap.name}")
+        else:
+            messages.append(
+                "tool accepted by semantic exploration; explicit tool declarations are "
+                f"{sorted(declared_ids)}"
+            )
+
     helper_imports = list(cap.helper_imports or [])
     denied = [h for h in helper_imports if h not in set(RUNTIME_TOOLS_ALL)]
     if denied:
-        return ToolPoolGateEvent(decision='deny', tool_id=cap.name, target_file=req.target_file, denied_helper_imports=denied, messages=['helper_imports are not exported by backend.services.runtime_tools.__all__'], suggested_replacements=[SUGGESTED[h] for h in denied if h in SUGGESTED], score=req.score, matched_features=req.matched_features)
+        return ToolPoolGateEvent(
+            decision="deny",
+            tool_id=cap.name,
+            target_file=req.target_file,
+            denied_helper_imports=denied,
+            messages=[
+                "helper_imports are not exported by backend.services.runtime_tools.__all__",
+                *messages,
+            ],
+            suggested_replacements=[SUGGESTED[h] for h in denied if h in SUGGESTED],
+            score=req.score,
+            matched_features=req.matched_features,
+        )
+
     import_paths, function_imports, checked_paths, checked_functions, import_messages = _check_function_imports(cap)
-    has_custom_functions=bool(checked_paths)
+    has_custom_functions = bool(checked_paths)
     if has_custom_functions and not import_paths:
-        return ToolPoolGateEvent(decision='deny', tool_id=cap.name, target_file=req.target_file, checked_import_paths=checked_paths, checked_functions=checked_functions, messages=import_messages or ['custom tool import_path/function unavailable'], score=req.score, matched_features=req.matched_features)
-    missing_env = [name for name in list(cap.required_env or []) + list(cap.required_secrets or []) if not os.environ.get(str(name))]
+        return ToolPoolGateEvent(
+            decision="deny",
+            tool_id=cap.name,
+            target_file=req.target_file,
+            checked_import_paths=checked_paths,
+            checked_functions=checked_functions,
+            messages=(import_messages or ["custom tool import_path/function unavailable"]) + messages,
+            score=req.score,
+            matched_features=req.matched_features,
+        )
+
+    missing_env = [
+        name
+        for name in list(cap.required_env or []) + list(cap.required_secrets or [])
+        if not os.environ.get(str(name))
+    ]
     missing_deps = _missing_deps(list(cap.dependencies or []))
-    decision = 'allow'
-    if missing_env: decision='require_config'
-    elif missing_deps: decision='require_dependency'
-    return ToolPoolGateEvent(decision=decision, tool_id=cap.name, target_file=req.target_file, allowed_helper_imports=helper_imports, allowed_import_paths=import_paths, allowed_function_imports=function_imports, checked_import_paths=checked_paths, checked_functions=checked_functions, required_env=list(cap.required_env or [])+list(cap.required_secrets or []), missing_env=missing_env, dependencies=list(cap.dependencies or []), missing_dependencies=missing_deps, messages=import_messages or ['allowed' if decision=='allow' else decision], score=req.score, matched_features=req.matched_features)
+
+    decision = "allow"
+    if missing_env:
+        decision = "require_config"
+    elif missing_deps:
+        decision = "require_dependency"
+
+    final_messages = import_messages or []
+    if not final_messages:
+        final_messages = ["allowed" if decision == "allow" else decision]
+    final_messages.extend(messages)
+
+    return ToolPoolGateEvent(
+        decision=decision,
+        tool_id=cap.name,
+        target_file=req.target_file,
+        allowed_helper_imports=helper_imports,
+        allowed_import_paths=import_paths,
+        allowed_function_imports=function_imports,
+        checked_import_paths=checked_paths,
+        checked_functions=checked_functions,
+        required_env=list(cap.required_env or []) + list(cap.required_secrets or []),
+        missing_env=missing_env,
+        dependencies=list(cap.dependencies or []),
+        missing_dependencies=missing_deps,
+        messages=final_messages,
+        score=req.score,
+        matched_features=req.matched_features,
+    )

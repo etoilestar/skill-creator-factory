@@ -1048,41 +1048,6 @@ def _fill_required_skill_plan_fields(data: dict[str, Any]) -> dict[str, Any]:
 
     return result
 
-_RUNTIME_INPUT_FILE_PLACEHOLDER_RE = re.compile(r"^__RUNTIME_INPUT_FILE(?:_(\d+))?__$")
-
-
-def _normalize_skill_plan_input_field_names(inputs: Any) -> list[str]:
-    """Normalize platform runtime placeholders into stable argv field names.
-
-    __RUNTIME_INPUT_FILE__ is a placeholder value, not an argv key.
-    SkillPlan.inputs should contain business/runtime argument keys such as
-    input_file, input_file_1, etc.
-    """
-    raw_items = inputs if isinstance(inputs, list) else ([] if inputs in (None, "") else [inputs])
-    normalized: list[str] = []
-    used: set[str] = set()
-
-    for raw in raw_items:
-        text = str(raw or "").strip()
-        if not text:
-            continue
-
-        match = _RUNTIME_INPUT_FILE_PLACEHOLDER_RE.fullmatch(text)
-        if match:
-            index = match.group(1)
-            if index in (None, "", "0"):
-                key = "input_file"
-            else:
-                key = f"input_file_{index}"
-        else:
-            key = text
-
-        if key not in used:
-            used.add(key)
-            normalized.append(key)
-
-    return normalized
-
 def _skill_plan_entry_for_file(
     *,
     file_path: str,
@@ -1213,7 +1178,6 @@ def _skill_plan_entry_for_file(
         data["inputs"] = list(data.get("inputs") or default_inputs or [])
         data["outputs"] = list(data.get("outputs") or default_outputs or [])
 
-    data["inputs"] = _normalize_skill_plan_input_field_names(data.get("inputs"))
     data["purpose"] = str(data.get("purpose") or purpose or f"{file_path} 的职责说明")
 
     constructor_kwargs = _fill_required_skill_plan_fields(data)

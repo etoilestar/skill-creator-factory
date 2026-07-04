@@ -899,6 +899,60 @@ def _message_role_chars(messages: list[dict], role: str) -> int:
         if isinstance(message, dict) and message.get("role") == role
     )
 
+def _existing_script_argv_context_for_skill_md(
+    *,
+    skill_name: str,
+    declared_paths: set[str] | list[str],
+) -> str:
+    """Collect strict_json_argv_guard schemas from already generated scripts.
+
+    This is advisory context for SKILL.md command block generation.
+    It does not infer business argv names from SkillPlan/RequirementGraph.
+    """
+    try:
+        skill_dir = settings.skills_path / skill_name
+    except Exception:
+        return ""
+
+    items: list[dict[str, Any]] = []
+    for raw_path in sorted(str(path) for path in declared_paths or []):
+        script_path = raw_path.replace("\\", "/").strip()
+        if not script_path.startswith("scripts/") or not script_path.endswith(".py"):
+            continue
+
+        abs_path = skill_dir / script_path
+        if not abs_path.is_file():
+            continue
+
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+            schema = extract_python_strict_argv_schema(content)
+        except Exception as exc:
+            schema = {"error": f"{type(exc).__name__}: {exc}"}
+
+        run_analysis: dict[str, Any] = {}
+        try:
+            run_analysis = _python_run_args_analysis(content)
+        except Exception:
+            run_analysis = {}
+
+        items.append({
+            "script_path": script_path,
+            "strict_json_argv_schema": schema,
+            "run_args_analysis": run_analysis,
+            "note": (
+                "Advisory for SKILL.md command JSON argv generation. "
+                "Do not rename script argv keys here; E2E will validate and repair mapping."
+            ),
+        })
+
+    if not items:
+        return ""
+
+    return (
+        "已生成脚本入口参数事实（来自 strict_json_argv_guard / run(args) AST，仅供 SKILL.md command block 优先参考）：\n"
+        + json.dumps(items, ensure_ascii=False, indent=2, default=str)
+    )
 
 def _build_script_generate_file_prompt_variant(
     *,
@@ -1017,55 +1071,48 @@ def _build_script_generate_file_prompt_variant(
 
     instruction = [
         f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。',
-        "必须满足以下脚本文件合同（局部合同）：",
-        "只实现当前文件；不要重新规划整个 Skill；不要输出 Markdown fence、解释、文件名标题或多文件包。",
-        "scripts/ 生成不会追加聊天历史，也不会注入完整蓝图。",
-        "外层调用、参数传递和 stdout 解析由 Creator 的确定性规则处理；你不要自由改协议，只实现内部逻辑。",
-        "脚本必须读取一个 JSON object argv（Python: 读取 sys.argv[1] 并 json.loads 解析；Node: process.argv[2]；Bash: $1），并向 stdout 输出结构化 JSON object。",
-        "系统提供 mandatory script core tool: strict_json_argv_guard；它不是可选 selected business tool，所有 Python scripts/*.py 必须 import 并调用它。",
-        "硬性 argv guard 规则：必须在 parse_args 或等价入口解析 sys.argv[1]，然后调用 strict_json_argv_guard(payload, spec)；spec 由当前脚本 run/main 实际读取的参数决定。",
-        "strict_json_argv_guard spec 是当前脚本入口接口事实；不要生成额外的 canonical argv contract。",
-        "strict_json_argv_guard spec 应优先参考当前脚本职责、脚本计划、脚本骨架、command_argv_contract、local_contract inputs/outputs、SKILL.md command 附近的 argv JSON contract、RequirementGraph/SkillPlan 推荐 inputs/outputs、E2E repair trace 已形成的字段链路；这些都是共同推荐，不是字段白名单。",
-        "script 推荐使用 SKILL.md command 已经映射出来的 argv key；如果脚本内部变量名不同，可以在脚本内部做局部变量转换。",
-        "不要因为 SKILL.md block 写错字段，就让 strict_json_argv_guard 迁就 block；如果 E2E 发现 block 与 guard 不一致，应修 SKILL.md block。",
-        "脚本只需保证 strict_json_argv_guard spec、run(args)、main() 自洽：run(args) 只读取 guard 声明并返回的 args key，guard required key 应被 run(args) 消费。",
-        "不要为了使用平台字段名而强行把脚本接口改成 user_request/input/text/payload 等平台 root；平台 root 是来源，不是脚本必需参数名。",
-        "script 可以有 optional/default/config 参数；这些参数不需要来自平台 IO，也不需要出现在 recommended_inputs。required 参数必须能由 SKILL.md command 提供非空值；optional/default 参数应在 guard spec 或 run/main 默认逻辑中自洽。",
-        "硬性 argv guard 规则：strict_json_argv_guard 必须在核心逻辑前 fail-fast 校验 unknown/missing/empty/type；参数错误时不得输出成功 JSON。",
-        "硬性 argv guard 规则：run() 只能使用 strict_json_argv_guard 返回的 args；run() 不得重新 json.loads(sys.argv[1])，不得直接使用未校验 payload。",
-        "硬性 argv guard 规则：骨架 spec 中的示例字段必须替换为 run(args) 实际读取的参数；禁止保留 input_text/example/TODO/ellipsis 占位 spec；确实无输入时也必须调用 strict_json_argv_guard(payload, {})。",
-        "stdout JSON 不得包含 error 字段；必须至少包含 stdout_schema.required 中的字段且值非空。",
-        "available_tools/custom_tools 的返回值只是中间结果，不能直接作为最终 stdout 返回；最终 run(args) 返回的 dict 必须覆盖 output_contract.stdout_schema.required 的所有字段，字段名逐字一致，且核心字段值必须来自输入、工具结果、模型结果或本地处理结果。",
-        "如果工具返回字段名与 stdout_schema.required 不一致，必须在当前脚本内做语义映射/聚合；不得返回 markdown_text/source_file/output_format 等工具中间字段来替代 paragraphs/sections/full_document/markdown_summary。",
-        "必须读取输入并输出符合 stdout_schema.required 的非空字段；不要通过 error 字段、{}、空文件或空路径绕过运行和产物校验。",
-        "只根据轻量上下文实现：script_goal、inputs、outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
-        "覆盖要求硬规则：如果 local_contract.coverage_requirements 声明了输入来源、输入格式、核心动作、输出变体、参考读取或最终平台输出义务，当前脚本必须在自己的职责范围内实际读取/处理/产出这些义务；单脚本 full-coverage contract 必须覆盖全部声明能力。",
-        "覆盖要求硬规则：声明支持多个输入变体时，不要只实现其中一个窄分支；应使用通用分发/解析逻辑，或在当前脚本职责中清楚交付可执行覆盖。",
-        "覆盖要求硬规则：如果声明 JSON + Markdown 等多种输出，stdout 必须包含对应非空字段，并至少包含 text/markdown/file_paths/file_outputs 等最终平台可消费字段之一。",
-        "覆盖要求硬规则：strict_json_argv_guard required keys 是脚本入口事实；SKILL.md command argv key 必须与这些 key 一致。脚本不得为了适配错误 command block 把 input_files/file_path/input_path/model 等同义字段来回迁就。",
-        "覆盖要求硬规则：如果声明 reference_path 或 required reference read，脚本要么读取并消费它，要么把它作为 optional 并在 stdout/metadata 中说明其缺省不影响核心逻辑；不要 required 但不用。",
-        "覆盖要求边界：coverage_requirements 是职责约束，不是 argv/stdout 字段；禁止生成 coverage:*、covered:*、declared_requirement_terms 等伪运行时字段，禁止把 coverage terms 当成 strict_json_argv_guard required keys。",
-        "argv key 一致性硬规则：如果 local_contract.command_argv_contract.argv_keys 已声明字段，strict_json_argv_guard spec 与 run(args) 应优先逐字采用这些 key；若后续 E2E 发现 SKILL.md block 与 guard 不一致，默认修 SKILL.md block，不改脚本 guard。",
-        "raw role/capability 只能作为 hint，不能当硬合同。",
-        "统一按 script_composition 生成脚本：代码模型根据功能目标自行决定如何组合 argv 输入、本地逻辑、标准库和 available_tools。",
-        "available_tools 是基础能力候选，不是完整业务方案枚举；不要因为缺少某个专用工具就放弃实现当前脚本职责。",
-        "当前脚本可以定义局部 helper，使用标准库或运行环境中已有通用库做字段适配、内容组织、格式转换、文件处理和产物组装。",
-        "可以调用一个或多个 available_tools，也可以完全用本地确定性逻辑实现；关键是核心输入必须影响核心输出或产物内容。",
-        "工具/helper/标准库如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。",
-        "平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。",
-        "helper filename 硬规则：create_pdf_document/create_pdf/create_docx/create_pptx 等 artifact helper 的 filename 只传 basename，例如 filename=\"report.pdf\"；禁止 filename=full_path 或 filename=absolute_path。",
-        "helper 返回硬规则：优先 return result 或原样转发 result[\"pdf_path\"]/result[\"file_outputs\"]；不要手动重写 helper 返回路径；不要用 cwd-relative os.path.exists(\"outputs/...\") 校验产物。",
-        "如果当前脚本需要外部文件或用户上传资源，应从 JSON argv 的显式合同字段或通用 envelope 字段读取，例如 input_files/files/resources；不要在源码中写死 smoke 样例路径。",
-        "Creator smoke 可能会在 input_files/files/resources 中提供真实样例文件，用于验证脚本是否能处理外部文件；这只是试运行输入，不是业务逻辑常量。",
-        "第一轮只修当前脚本；不要修改或重规划上下游链路，第二轮 E2E 才修整链路。",
+        "目标：生成一个可运行的单文件脚本，只实现当前文件职责，输出源码本身。",
+        "脚本文件必须读取一个 JSON object argv，并向 stdout 输出一个 JSON object。",
+        "Python scripts/*.py 必须 import 并调用 strict_json_argv_guard；它用于声明脚本第一轮 argv 接口，并在 E2E 中暴露调用映射问题。",
+        "strict_json_argv_guard spec 由当前脚本实现真实需要的入口参数决定；spec、run(args)、main()/入口逻辑必须内部一致。",
+        "run(args) 只能读取 strict_json_argv_guard 返回的 args；guard required key 必须被 run(args) 消费。",
+        "参数校验应在核心逻辑前完成；缺失、空值、类型错误或未知参数应 fail-fast，不输出成功 JSON。",
+        "无输入脚本也应调用 strict_json_argv_guard(payload, {})，保持统一入口协议。",
+        "脚本第一轮可以选择清晰、稳定的 argv key；SkillPlan/RequirementGraph/workflow allocation/local_contract 中的 inputs 只提供语义输入提示和 SKILL.md block 参考，不是 argv key 白名单。",
+        "command_argv_contract、SKILL.md command、E2E repair trace 如果存在，表示已有运行映射证据；第一轮生成可参考，但脚本 guard/run(args) 自洽性优先。",
+        "SKILL.md block 应参考脚本 guard spec 形成调用模板；如果 E2E 发现 block 与 guard 不一致，优先修复运行映射。只有脚本 guard、run(args)、stdout 或职责实现本身不成立时才修脚本。",
+        "平台 root/envelope 字段是运行来源，不是脚本必须采用的参数名；脚本可以在 guard 后做局部变量转换。",
+        "optional/default/config 参数可以由脚本默认逻辑处理；required 参数必须由 guard 声明并由 run(args) 实际使用。",
+        "stdout JSON 不得包含 error 字段；必须覆盖 output_contract.stdout_schema.required 中的字段，字段名逐字一致且值非空。",
+        "available_tools/custom_tools 的返回值是中间结果；最终 run(args) 返回的 dict 必须按 output_contract.stdout_schema.required 组织。",
+        "如果工具返回结构与 stdout_schema.required 不一致，脚本需要在本地完成语义映射、聚合或格式整理；只有字段名和语义都满足 required schema 时才能直接转发。",
+        "核心输入必须影响核心输出或产物内容；不要用空对象、空文件、固定示例或无关默认值绕过职责。",
+        "只根据轻量上下文实现：script_goal、semantic inputs/outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
+        "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；它用于判断脚本是否覆盖声明的输入来源、输入格式、核心动作、输出形态、参考读取和最终交付义务。",
+        "如果 coverage_requirements 声明多个输入变体，脚本应实现通用解析或分发逻辑，使核心职责覆盖这些变体。",
+        "如果 coverage_requirements 声明多种输出形态，stdout 必须通过 output_contract.stdout_schema.required 中的字段交付对应非空结果。",
+        "如果声明需要读取 reference/resource，脚本应在当前职责范围内读取并消费；若缺省不影响核心逻辑，应在 guard/default/metadata 中保持自洽。",
+        "coverage_requirements 只作为职责约束，不得生成 coverage:*、covered:* 或 declared_requirement_terms 等运行时字段。",
+        "raw role/capability 只能作为 hint，不能覆盖 purpose、output_contract、tool binding 和脚本实际职责。",
+        "统一按 script_composition 生成脚本：代码模型根据功能目标组合 argv 输入、本地逻辑、标准库和 available_tools。",
+        "available_tools 是当前文件可用基础能力，不是完整业务方案枚举；脚本负责把工具结果组织成当前文件的业务输出。",
+        "当前脚本可以定义局部 helper，使用标准库或已允许依赖完成字段适配、内容组织、格式转换、文件处理和产物组装。",
+        "工具、helper、标准库的组合方式由脚本实现决定；后续 import、dependency、调用、stdout 或 artifact 问题由静态检查和 E2E 暴露。",
+        "如果生成 artifact，产物路径、文件名和 helper 返回值应遵循 output_contract/artifact_contract/runtime_envelope 中的约定。",
+        "如果当前脚本需要外部文件、上传资源或运行时资源，应从 JSON argv 或 runtime envelope 中读取；试运行输入只用于验证处理能力，不应写成业务常量。",
+        "第一轮只生成当前脚本；上下游运行映射、placeholder、command block 与脚本 guard 的最终对齐由 E2E 处理。",
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(local_contract, ensure_ascii=False, indent=2),
         "Current Skill Tool Pool / Current File Tool Binding（硬约束）：",
-        json.dumps(local_contract.get("current_file_tool_binding") or {"allowed_helper_imports": local_contract.get("allowed_helper_imports", [])}, ensure_ascii=False, indent=2),
-        "Current File Tool Binding.allowed_helper_imports 只约束 `from backend.services.runtime_tools import ...`；未列入 allowed_helper_imports 的 runtime_tools helper 绝不能导入；未列入 allowed_import_paths/allowed_function_imports 的 custom_tools 绝不能导入；禁止 import *，禁止按格式猜 read_pdf_text/read_xlsx_text/read_txt_text。",
-        "工具优先级固定：1) primary_tools/primary_tool_ids 与批准 helper；2) fallback_tools/secondary_tool_ids；3) 无合适工具时 Python 标准库；4) 标准库不足且已有安全依赖时使用已允许/已安装依赖；5) 仍无法实现才返回明确 blocker，绝不伪造 runtime_tools/helper/custom_tools。",
-        "没有平台 helper 时，允许使用 Python 标准库完成本地纯计算/解析/转换；如果 tool binding.dependencies 或平台环境中已有安全第三方库，也可直接 import 该库自实现。不要因为没有 helper 就写 not supported，除非标准库和依赖库都无法完成。",
+        json.dumps(
+            local_contract.get("current_file_tool_binding")
+            or {"allowed_helper_imports": local_contract.get("allowed_helper_imports", [])},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "工具导入边界：只能导入 Current File Tool Binding 中允许的 runtime_tools helper、custom tool import path 或 function；标准库和已允许依赖可用于本地实现。",
+        "工具使用优先级：优先使用 primary/fallback tools 与批准 helper；没有合适工具时使用标准库或已允许依赖完成本地逻辑；无法完成时返回清晰 blocker。",
         "动态工具函数卡片（从 registry/manifest 读取，不硬编码工具名）：",
         "\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无",
         "动态工具 Snippet 指南（从 registry/manifest 读取，不硬编码工具名）：",
@@ -1098,11 +1145,8 @@ def _build_generate_file_prompt(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
 ) -> list[dict]:
-    """Build a minimal generation prompt for a single Skill file.
+    """Build a minimal generation prompt for a single Skill file."""
 
-    The model is asked to output *only* raw file content — no fences, no JSON,
-    no explanations.  This maximises reliability for small or unstable models.
-    """
     ext = Path(file_path).suffix.lower()
     lang = _LANG_LABELS.get(ext, "文本")
 
@@ -1120,35 +1164,49 @@ def _build_generate_file_prompt(
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)
     declared_paths = _extract_declared_skill_paths(blueprint_text)
     declared_paths_text = "\n".join(f"- {path}" for path in declared_paths) or "- （蓝图未显式列出资源文件）"
+
     plan_entry = _skill_plan_entry_for_file(
-        file_path=file_path, purpose=purpose, blueprint_text=blueprint_text, role=role, skill_plan_entry=skill_plan_entry
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_text=blueprint_text,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
     )
+
     generated_file_contract_text = _build_generated_file_contract_text(
-        file_path, blueprint_text, purpose, role=role, skill_plan_entry=skill_plan_entry
+        file_path,
+        blueprint_text,
+        purpose,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
     )
+
     skill_md_contract_text = generated_file_contract_text if file_path == "SKILL.md" else ""
     skill_md_e2e_authoring_guide = (
         _build_skill_md_e2e_authoring_guide(blueprint_text)
         if file_path == "SKILL.md"
         else ""
     )
-    tool_usage_prompt = ""
-    script_skeleton_text = _script_generation_skeleton(
-        file_path,
-        purpose,
-        blueprint_text,
-        role=plan_entry.role,
-        skill_plan_entry=skill_plan_entry,
-    ) if file_path.startswith("scripts/") else ""
-    kernel_reference_context = _creator_kernel_reference_context()
-    plan_summary = (
-        f"SkillPlan role：{plan_entry.role}；"
-        f"inputs：{', '.join(plan_entry.inputs)}；"
-        f"outputs：{', '.join(plan_entry.outputs)}；"
-        f"language：{plan_entry.language}；"
-        f"runtime：{plan_entry.runtime}；"
-        f"command_template：{_script_command_template(file_path, blueprint_text, plan_entry)}；"
-        f"forbidden_capabilities：{', '.join(plan_entry.forbidden_capabilities)}"
+
+    script_argv_context = (
+        _existing_script_argv_context_for_skill_md(
+            skill_name=skill_name,
+            declared_paths=declared_paths,
+        )
+        if file_path == "SKILL.md"
+        else ""
+    )
+
+    script_skeleton_text = (
+        _script_generation_skeleton(
+            file_path,
+            purpose,
+            blueprint_text,
+            role=plan_entry.role,
+            skill_plan_entry=skill_plan_entry,
+        )
+        if file_path.startswith("scripts/")
+        else ""
     )
 
     if file_path == "SKILL.md":
@@ -1162,36 +1220,39 @@ def _build_generate_file_prompt(
             "description: <一句话说明本 Skill 的用途>\n"
             "---\n"
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
-            "4. SKILL.md 第一轮只需生成静态可解析的使用说明和命令块；内部脚本流转由第二轮 E2E 真实执行验证。\n"
-            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
+            "4. SKILL.md 第一轮只生成静态可解析的使用说明、资源说明和脚本命令块；内部脚本流转由第二轮 E2E 真实执行验证。\n"
+            "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个真实 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
             "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后传入一个 JSON object argv。\n"
-            "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role: ...、inputs: ...、outputs: ...。\n"
-            "6b. command JSON argv keys 是当前脚本入口接口字段，不是平台字段白名单；argv keys 必须优先使用脚本入口参数提示字段。\n"
-            "6b-1. 如果脚本计划、脚本骨架、command_argv_contract 或 strict_json_argv_guard spec 已声明字段，command block 必须逐字使用这些 key；不得自行发明 input_file/input_path/input_files/file_path/model 等同义字段。\n"
-            "6b-2. 第一轮必须尽量让 SKILL.md command JSON argv 与脚本入口字段对齐；stdout/final artifact 闭环仍保留到第二轮 E2E 真实执行验证。\n"
-            "6c. 允许脚本需要的 optional/default/config 参数、reference/assets 路径、runtime constants、格式控制参数出现在 argv 中；不要要求所有 argv key 都来自平台 IO，也不要要求使用所有平台输入字段。\n"
-            "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。argv key 不必等于这些平台字段名。\n"
+            "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
+            "6b. command JSON argv key 应优先参考已生成脚本的 strict_json_argv_guard schema；如果没有脚本 guard schema，再参考脚本计划、command_argv_contract 和语义输入提示。\n"
+            "6c. command JSON argv key 是脚本入口接口字段，不是平台字段白名单；argv value 才负责绑定平台输入、前序 stdout、reference/assets、literal/default 或 runtime constant。\n"
+            "6d. 不要为同一语义输入同时编造多个别名字段；选定一个 argv key 后，command block、argv JSON contract 和正文说明要一致。\n"
+            "6e. 第一轮只需尽量让 SKILL.md command JSON argv 与脚本入口字段对齐；最终运行映射由第二轮 E2E 真实执行验证和修复。\n"
+            "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
             "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
-            "10. JSON argv 必须是标准 JSON：不得在 JSON argv 值里写 {{input_files[0]}}、{{references/...}}、{{assets/...}} 等复杂模板表达式；运行时输入文件使用 __RUNTIME_INPUT_FILE__ / __RUNTIME_INPUT_FILE_0__ 等安全占位符；reference/assets 文件使用普通相对路径字符串；模型名使用 TEXT_MODEL。\n"
-            "10a. 每个核心执行命令附近必须写 **argv JSON contract**；这是提示词级映射说明，不是硬校验 schema。对每个 argv.<key> 说明 type、source_kind、source、required、default（如有）。source_kind 只能用通用类别：platform_input、previous_stdout、reference_file、asset_file、literal_default、runtime_constant、script_default。\n"
-            "10b. argv key 可以是脚本接口字段；argv value 如果是动态值，应能从平台 input envelope 或前序 stdout 解析；argv value 如果是 literal/default/reference/assets/runtime constant，不需要来自平台字段。SKILL.md 至少要体现平台输入槽位如何映射到脚本 argv key，但脚本 argv key 不必等于平台槽位名。\n"
+            "10. JSON argv 必须是标准 JSON；动态值必须作为 JSON 字符串值出现。运行时输入文件可使用安全 sentinel，reference/assets 文件使用普通相对路径字符串，模型名使用运行时常量字符串。\n"
+            "10a. 每个核心执行命令附近必须写 **argv JSON contract**；这是提示词级映射说明，不是硬校验 schema。对每个 argv.<key> 说明 type、source_kind、source、required、default（如有）。\n"
+            "10b. source_kind 只能用通用类别：platform_input、previous_stdout、reference_file、asset_file、literal_default、runtime_constant、script_default。\n"
+            "10c. argv key 可以是脚本接口字段；argv value 如果是动态值，应能从平台 input envelope 或前序 stdout 解析；argv value 如果是 literal/default/reference/assets/runtime constant，不需要来自平台字段。\n"
             "11. 若需要数值默认值，直接写固定 JSON 数字；不要把动态数值 placeholder 裸露在 JSON 中。\n"
             "12. 批量处理、列表处理或多文件处理应由对应脚本内部完成，SKILL.md 静态说明中不展开自然语言循环。\n"
             "13. 列表或对象字段必须通过整值占位符传递；不要写成由无来源拆分字段拼接的列表。\n"
             "14. 如果蓝图包含 references/ 资源，SKILL.md 正文必须在“参考资料/资源”小节明确引用每个 references/ 路径，并说明何时读取。\n"
             "15. 不要在输出内容的外侧套 ``` 代码块，但 SKILL.md 正文内部必须按需包含标准 ```bash fenced code block。\n"
-            "16. 禁止只写‘立即调用 `scripts/...`’这种隐式执行描述；必须写明 assistant 应输出可执行 fenced block。\n"
-            "17. 禁止复制 Creator 界面流程、确认清单、‘点击开始创建/开始生成’、系统将自动创建文件等平台创建流程文案。\n"
+            "16. 禁止只写隐式执行描述；必须写明可执行 fenced block。\n"
+            "17. 禁止复制 Creator 界面流程、确认清单、点击开始创建/开始生成、系统将自动创建文件等平台创建流程文案。\n"
             "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "19. 命令中 JSON key 是当前脚本读取的 argv 字段；{{placeholder}} 优先来自 external envelope 或显式 fields/defaults/input binding。内部上游 stdout 字段闭环只在第二轮 E2E 验证。\n"
+            "19. 命令中 JSON key 是当前脚本读取的 argv 字段；placeholder 优先来自 external envelope 或显式 fields/defaults/input binding。内部上游 stdout 字段闭环只在第二轮 E2E 验证。\n"
             "20. 不要在第一轮为下游脚本固定无来源中间字段名；placeholder 来源和修复交给第二轮 E2E。\n"
             "21. 第一轮不要求声明最终 stdout 字段闭环；脚本 stdout 与平台标准输出字段由第二轮 E2E 真实执行验证。\n"
             "22. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本路径、资源使用、脚本调用顺序（如有）和最终产物类型；不要固定特定中间字段。\n"
             "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
-            "24. 如果蓝图在“禁止隐式执行/示例/反例/例如/比如”语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
+            "24. 如果蓝图在禁止隐式执行、示例、反例、例如、比如等语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
             "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
+            "已生成脚本入口参数上下文：\n"
+            f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按静态作者指南生成第一版 command，后续由 E2E 对齐。'}\n\n"
             "以下 SKILL.md first-round static authoring guide 只约束静态格式和平台边界；内部脚本流转交给第二轮 E2E 验证：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
@@ -1199,6 +1260,7 @@ def _build_generate_file_prompt(
             f"蓝图声明的文件路径（必须覆盖对应 scripts/references 要求）：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（已移除 Creator UI 确认文案），你的内容必须与此一致：\n\n{clean_blueprint_text}"
         )
+
     elif file_path.startswith("scripts/"):
         local_contract = _script_local_contract_payload(
             file_path=file_path,
@@ -1213,15 +1275,16 @@ def _build_generate_file_prompt(
             "生成前只使用以下轻量上下文：script_goal、inputs、outputs、available_tools、resource_refs、output_contract、rules。\n"
             "统一按 script_composition 理解：根据功能目标组合 argv 输入、本地逻辑和 available_tools；available_tools 只做候选召回，不是最终裁决。\n"
             "工具/helper 如何组合不作为第一轮 hard gate；如 import/dependency、调用、stdout 或 artifact 失败，再修当前脚本。\n"
-"平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。\n"
-            "helper filename 硬规则：create_pdf_document/create_pdf/create_docx/create_pptx 等 artifact helper 的 filename 只传 basename，例如 filename=\"report.pdf\"；禁止 filename=full_path 或 filename=absolute_path。\n"
-            "helper 返回硬规则：优先 return result 或原样转发 result[\"pdf_path\"]/result[\"file_outputs\"]；不要手动重写 helper 返回路径；不要用 cwd-relative os.path.exists(\"outputs/...\") 校验产物。\n"
+            "平台 IO 硬规则：OUTPUT_DIR 本身就是最终输出目录；禁止 OUTPUT_DIR/outputs；禁止 os.path.join(OUTPUT_DIR, \"outputs\") 或 os.path.join(output_dir, \"outputs\")；禁止 replace(\"/tmp/\", \"outputs/\")。\n"
+            "helper filename 硬规则：artifact helper 的 filename 只传 basename；禁止 filename=full_path 或 filename=absolute_path。\n"
+            "helper 返回硬规则：优先 return result 或原样转发 helper 返回的 artifact/stdout 字段；不要手动重写 helper 返回路径。\n"
             "references/assets 只能作为 resource_refs/asset_refs 读取，不能作为 dependencies、allowed_imports 或 pip install 依赖。\n"
             "生成后第一轮只校验协议 + 运行 + 产物：argv JSON、入口、stdout JSON object、required outputs、artifact_created、import/dependency 和危险系统操作。\n\n"
             "轻量脚本上下文：\n"
             f"{json.dumps(local_contract, ensure_ascii=False, indent=2)}\n\n"
             f"固定脚本骨架（仅约束入口/JSON stdout；输出时补全为可运行源码）：\n{script_skeleton_text}"
         )
+
     elif file_path.startswith("references/"):
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 参考资料文件。\n\n'
@@ -1235,6 +1298,7 @@ def _build_generate_file_prompt(
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图（参考资料职责说明见 references/ 部分）：\n\n{clean_blueprint_text}"
         )
+
     elif file_path.startswith("assets/"):
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 资源文件。\n\n'
@@ -1247,6 +1311,7 @@ def _build_generate_file_prompt(
             f"蓝图声明的文件路径：\n{declared_paths_text}\n\n"
             f"以下是已确认的蓝图：\n\n{clean_blueprint_text}"
         )
+
     else:
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成 {file_path} 文件。\n\n'
@@ -1259,15 +1324,8 @@ def _build_generate_file_prompt(
     messages: list[dict] = _creator_file_generation_messages(instruction)
 
     if file_path.startswith("scripts/"):
-        # Scripts are generated from a short system rule plus a user-visible concrete task.
-        # Do not append conversation history: recent Creator UI
-        # copy (file-list previews, confirmation instructions, panel messages)
-        # has repeatedly polluted first-pass script output.
         return messages
 
-    # Include recent user context but skip Creator UI confirmation text. Assistant
-    # blueprint confirmations often contain "click Start" operational prose that
-    # must never be copied into generated files.
     for msg in conversation_history[-_MAX_HISTORY_TURNS:]:
         if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
             continue

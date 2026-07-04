@@ -105,28 +105,67 @@ def _skill_md_command_normalizer_context(
     skill_dir: Path,
     skill_md: str,
 ) -> tuple[list[Any], dict[str, Any], Any | None]:
-    """Collect existing E2E contract context for command normalization."""
+    """Collect existing E2E contract context for command normalization.
+
+    The key addition is script_argv_schema extracted from the generated script's
+    strict_json_argv_guard.  This lets SKILL.md command normalization prefer the
+    script's actual first-round argv interface without inferring argument names
+    from SkillPlan/RequirementGraph field names.
+    """
     script_files = (
         sorted((skill_dir / "scripts").glob("*.py"))
         if (skill_dir / "scripts").is_dir()
         else []
     )
+
     entries: list[Any] = []
     runtime_specs: dict[str, Any] = {}
+
     for script_file in script_files:
         rel = script_file.relative_to(skill_dir).as_posix()
+
         try:
             entry = _skill_plan_entry_for_file(file_path=rel, blueprint_text=skill_md)
         except Exception:
-            continue
-        entries.append(entry)
-        command_template = str(getattr(entry, "command_template", "") or "")
+            entry = None
+
+        if entry is not None:
+            entries.append(entry)
+
+        spec: dict[str, Any] = {}
+
+        command_template = str(getattr(entry, "command_template", "") or "") if entry is not None else ""
         if command_template:
-            runtime_specs[rel] = {"command_template": command_template}
+            spec["command_template"] = command_template
+
+        try:
+            script_content = script_file.read_text(encoding="utf-8", errors="replace")
+            argv_schema = extract_python_strict_argv_schema(script_content)
+        except Exception:
+            argv_schema = {}
+
+        if isinstance(argv_schema, dict) and argv_schema:
+            allowed_keys = argv_schema.get("allowed_keys")
+            required_keys = argv_schema.get("required_keys")
+            optional_keys = argv_schema.get("optional_keys")
+            expected_types = argv_schema.get("expected_types")
+
+            has_useful_schema = any(
+                isinstance(value, (list, dict)) and bool(value)
+                for value in (allowed_keys, required_keys, optional_keys, expected_types)
+            )
+
+            if has_useful_schema:
+                spec["script_argv_schema"] = argv_schema
+
+        if spec:
+            runtime_specs[rel] = spec
+
     try:
         requirement_graph = _load_requirement_graph_for_e2e(skill_dir)
     except Exception:
         requirement_graph = None
+
     return entries, runtime_specs, requirement_graph
 
 

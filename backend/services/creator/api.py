@@ -18,7 +18,13 @@ from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
 from .tool_pool_builder import build_tool_pool
 from .tool_pool_explorer import explore_tool_pool
 from .tool_pool_gate import gate_tool_request
-from .tool_pool_models import ToolPoolTool
+from .tool_pool_models import (
+    ToolPoolAddToolRequest,
+    ToolPoolDeniedRequest,
+    ToolPoolFileBinding,
+    ToolPoolMissingRequest,
+    ToolPoolTool,
+)
 from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
@@ -213,35 +219,421 @@ _VALIDATOR_ONLY_LAYERS = {
 _MISSING_CAPABILITY_KEYWORDS = {"tool", "helper", "capability", "dependency", "runtime"}
 
 
-def _has_responsibility_missing_capability_issue(issues: list[Any]) -> bool:
-    """Return True if any responsibility issue signals missing tools/capabilities/dependencies.
+def _has_responsibility_missing_capability_issue(
+    issues: list[Any],
+) -> bool:
+    """Detect responsibility failures that reference a real registry capability.
 
-    Triggers secondary tool-pool exploration when passed=False is caused by the lack
-    of an available tool, helper, or dependency — not just by stub implementations.
+    This uses structured issue IDs and exact registry capability/helper
+    identities. It does not classify arbitrary prose by generic words such as
+    "tool" or "helper".
     """
+    explicit_issue_ids = {
+        "responsibility_tool_binding_failed",
+        "missing_tool_binding",
+        "missing_required_tool",
+    }
+
+    registry_identities: set[str] = set()
+
+    for cap in list_tool_capabilities():
+        capability_id = str(getattr(cap, "name", "") or "").strip()
+        if capability_id:
+            registry_identities.add(capability_id)
+
+        for fn in getattr(cap, "functions", []) or []:
+            function_name = str(
+                getattr(fn, "function_name", "") or ""
+            ).strip()
+            if not function_name:
+                continue
+
+            registry_identities.add(function_name)
+
+            if capability_id:
+                registry_identities.add(
+                    f"{capability_id}.{function_name}"
+                )
+
+    def _iter_issue_text(value: Any) -> list[str]:
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+
+        if isinstance(value, dict):
+            out: list[str] = []
+            for key, item in value.items():
+                out.extend(_iter_issue_text(key))
+                out.extend(_iter_issue_text(item))
+            return out
+
+        if isinstance(value, (list, tuple, set)):
+            out: list[str] = []
+            for item in value:
+                out.extend(_iter_issue_text(item))
+            return out
+
+        return [str(value)]
+
+    def _contains_registry_identity(text: str) -> bool:
+        lowered = str(text or "").lower()
+
+        for identity in registry_identities:
+            token = identity.lower()
+            if not token:
+                continue
+
+            if re.search(
+                rf"(?<![A-Za-z0-9_])"
+                rf"{re.escape(token)}"
+                rf"(?![A-Za-z0-9_])",
+                lowered,
+            ):
+                return True
+
+        return False
+
     for issue in issues or []:
         if not isinstance(issue, dict):
             continue
-        # Explicit issue IDs for tool-binding responsibility failures
-        issue_id = str(issue.get("id") or "")
-        if issue_id in {
-            "responsibility_tool_binding_failed",
-            "missing_tool_binding",
-            "missing_required_tool",
-        }:
+
+        issue_id = str(issue.get("id") or "").strip()
+        if issue_id in explicit_issue_ids:
             return True
-        # missing_evidence list mentioning tool/helper/capability/dependency
-        missing_ev = issue.get("missing_evidence")
-        if isinstance(missing_ev, list):
-            for ev in missing_ev:
-                ev_str = str(ev).lower()
-                if any(kw in ev_str for kw in _MISSING_CAPABILITY_KEYWORDS):
+
+        structured_tool_fields = (
+            "tool_id",
+            "candidate_tool_id",
+            "capability",
+            "capability_id",
+            "required_tool",
+            "missing_tool",
+            "helper",
+            "helper_name",
+        )
+
+        for field_name in structured_tool_fields:
+            field_value = issue.get(field_name)
+            for text in _iter_issue_text(field_value):
+                if _contains_registry_identity(text):
                     return True
-        # semantic_failure text mentioning missing tool/helper/capability
-        semantic = str(issue.get("semantic_failure") or "").lower()
-        if any(kw in semantic for kw in _MISSING_CAPABILITY_KEYWORDS):
-            return True
+
+        review_fields = (
+            "missing_evidence",
+            "semantic_failure",
+            "reason",
+            "minimal_edit",
+            "repair_instruction",
+            "repair_instructions",
+            "details",
+        )
+
+        for field_name in review_fields:
+            for text in _iter_issue_text(issue.get(field_name)):
+                if _contains_registry_identity(text):
+                    return True
+
     return False
+
+def _apply_tool_requests_to_current_file_binding(
+    *,
+    skill_name: str,
+    target_file: str,
+    file_spec: dict[str, Any],
+    requests: list[ToolPoolAddToolRequest],
+    source_phase: str,
+) -> dict[str, Any]:
+    """Gate and apply tool requests to one file binding.
+
+    Tool availability is evaluated per target file. A tool already present in
+    ToolPool.tools may still need to be attached to another file binding.
+    """
+    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    pool = load_tool_pool(skill_dir)
+
+    binding = get_file_binding(pool, target_file)
+    if binding is None:
+        binding = ToolPoolFileBinding(
+            target_file=target_file,
+            allowed_tool_ids=["script_argv_guard"],
+            primary_tool_ids=["script_argv_guard"],
+            allowed_helper_imports=["strict_json_argv_guard"],
+        )
+        pool.file_bindings.append(binding)
+
+    def _merge_unique(
+        current: list[Any],
+        incoming: list[Any],
+    ) -> list[Any]:
+        out = list(current or [])
+        for item in incoming or []:
+            if item not in out:
+                out.append(item)
+        return out
+
+    current_allowed_tool_ids = set(binding.allowed_tool_ids or [])
+
+    pending_requests = [
+        request
+        for request in requests or []
+        if request.target_file == target_file
+        and request.candidate_tool_id not in current_allowed_tool_ids
+    ]
+
+    allowed_new = 0
+    missing_new = 0
+    denied_new = 0
+
+    required_capabilities = {
+        str(item or "").strip()
+        for item in (
+            file_spec.get("required_capabilities")
+            if isinstance(file_spec, dict)
+            else []
+        ) or []
+        if str(item or "").strip()
+    }
+
+    for request in pending_requests:
+        gate_event = gate_tool_request(
+            request,
+            file_role=str(
+                file_spec.get("role") or "generic_script"
+            ),
+            file_spec=file_spec,
+        )
+        pool.gate_events.append(gate_event)
+
+        binding.scored_tools.append({
+            "tool_id": gate_event.tool_id,
+            "score": request.score,
+            "rank": request.rank,
+            "matched_features": request.matched_features,
+            "matched_terms": request.matched_terms,
+            "decision": gate_event.decision,
+            "reason": "; ".join(gate_event.messages),
+            "target_file": target_file,
+            "source_phase": source_phase,
+        })
+        binding.matched_features_by_tool[
+            gate_event.tool_id
+        ] = list(request.matched_features or [])
+
+        if gate_event.decision == "allow":
+            capability = get_tool_capability(gate_event.tool_id)
+
+            existing_tool = next(
+                (
+                    tool
+                    for tool in pool.tools
+                    if tool.tool_id == gate_event.tool_id
+                ),
+                None,
+            )
+
+            if existing_tool is None:
+                existing_tool = ToolPoolTool(
+                    tool_id=gate_event.tool_id,
+                    status="allowed",
+                    source="repair_request",
+                    source_phase=source_phase,
+                    target_files=[target_file],
+                    allowed_helper_imports=list(
+                        gate_event.allowed_helper_imports
+                    ),
+                    allowed_import_paths=list(
+                        gate_event.allowed_import_paths
+                    ),
+                    allowed_function_imports=list(
+                        gate_event.allowed_function_imports
+                    ),
+                    score=request.score,
+                    matched_features=list(
+                        request.matched_features or []
+                    ),
+                    matched_terms=list(
+                        request.matched_terms or []
+                    ),
+                    allowed_roles=list(
+                        (
+                            getattr(capability, "roles", [])
+                            if capability is not None
+                            else []
+                        )
+                        or []
+                    ),
+                    input_schema=(
+                        getattr(capability, "input_schema", {})
+                        if capability is not None
+                        else {}
+                    )
+                    or {},
+                    output_schema=(
+                        getattr(capability, "output_schema", {})
+                        if capability is not None
+                        else {}
+                    )
+                    or {},
+                    required_env=list(gate_event.required_env),
+                    dependencies=list(gate_event.dependencies),
+                    reason=request.reason,
+                    gate_result=gate_event.decision,
+                    gate_messages=list(gate_event.messages),
+                )
+                pool.tools.append(existing_tool)
+            else:
+                existing_tool.target_files = _merge_unique(
+                    existing_tool.target_files,
+                    [target_file],
+                )
+                existing_tool.allowed_helper_imports = _merge_unique(
+                    existing_tool.allowed_helper_imports,
+                    gate_event.allowed_helper_imports,
+                )
+                existing_tool.allowed_import_paths = _merge_unique(
+                    existing_tool.allowed_import_paths,
+                    gate_event.allowed_import_paths,
+                )
+                existing_tool.allowed_function_imports = _merge_unique(
+                    existing_tool.allowed_function_imports,
+                    gate_event.allowed_function_imports,
+                )
+                existing_tool.required_env = _merge_unique(
+                    existing_tool.required_env,
+                    gate_event.required_env,
+                )
+                existing_tool.dependencies = _merge_unique(
+                    existing_tool.dependencies,
+                    gate_event.dependencies,
+                )
+                existing_tool.matched_features = _merge_unique(
+                    existing_tool.matched_features,
+                    request.matched_features,
+                )
+                existing_tool.matched_terms = _merge_unique(
+                    existing_tool.matched_terms,
+                    request.matched_terms,
+                )
+                existing_tool.score = max(
+                    float(existing_tool.score or 0.0),
+                    float(request.score or 0.0),
+                )
+
+            binding.allowed_tool_ids = _merge_unique(
+                binding.allowed_tool_ids,
+                [gate_event.tool_id],
+            )
+
+            non_core_primary = [
+                tool_id
+                for tool_id in binding.primary_tool_ids
+                if tool_id != "script_argv_guard"
+            ]
+
+            is_required_capability = (
+                gate_event.tool_id in required_capabilities
+            )
+
+            if is_required_capability or not non_core_primary:
+                binding.primary_tool_ids = _merge_unique(
+                    binding.primary_tool_ids,
+                    [gate_event.tool_id],
+                )
+            else:
+                binding.secondary_tool_ids = _merge_unique(
+                    binding.secondary_tool_ids,
+                    [gate_event.tool_id],
+                )
+
+            binding.allowed_helper_imports = _merge_unique(
+                binding.allowed_helper_imports,
+                gate_event.allowed_helper_imports,
+            )
+            binding.allowed_import_paths = _merge_unique(
+                binding.allowed_import_paths,
+                gate_event.allowed_import_paths,
+            )
+            binding.allowed_function_imports = _merge_unique(
+                binding.allowed_function_imports,
+                gate_event.allowed_function_imports,
+            )
+            binding.required_env = _merge_unique(
+                binding.required_env,
+                gate_event.required_env,
+            )
+            binding.dependencies = _merge_unique(
+                binding.dependencies,
+                gate_event.dependencies,
+            )
+
+            if capability is not None:
+                binding.snippets = _merge_unique(
+                    binding.snippets,
+                    [
+                        (
+                            snippet.model_dump(mode="json")
+                            if hasattr(snippet, "model_dump")
+                            else dict(snippet.__dict__)
+                            if hasattr(snippet, "__dict__")
+                            else snippet
+                        )
+                        for snippet in (
+                            getattr(capability, "snippets", []) or []
+                        )
+                    ],
+                )
+
+            current_allowed_tool_ids.add(gate_event.tool_id)
+            allowed_new += 1
+            continue
+
+        if gate_event.decision in {
+            "require_config",
+            "require_dependency",
+        }:
+            pool.missing_requests.append(
+                ToolPoolMissingRequest(
+                    target_file=target_file,
+                    tool_id=gate_event.tool_id,
+                    missing_env=list(gate_event.missing_env),
+                    missing_dependencies=list(
+                        gate_event.missing_dependencies
+                    ),
+                    reason="; ".join(gate_event.messages),
+                )
+            )
+            missing_new += 1
+            continue
+
+        pool.denied_requests.append(
+            ToolPoolDeniedRequest(
+                target_file=target_file,
+                tool_id=gate_event.tool_id,
+                helper_imports=list(
+                    gate_event.denied_helper_imports
+                ),
+                reason=gate_event.decision,
+                messages=list(gate_event.messages),
+                suggested_replacements=list(
+                    gate_event.suggested_replacements
+                ),
+            )
+        )
+        denied_new += 1
+
+    if pending_requests:
+        save_tool_pool(skill_dir, pool)
+
+    return {
+        "requested": len(pending_requests),
+        "allowed_new": allowed_new,
+        "missing_new": missing_new,
+        "denied_new": denied_new,
+        "binding": binding.model_dump(mode="json"),
+    }
 
 def _split_e2e_blocking_errors(errors: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
     """Separate deterministic workflow failures from advisory validator issues."""
@@ -2840,7 +3232,161 @@ def normalize_skill_md_failures(failures: list[dict[str, Any]]) -> list[dict[str
             failure["repair_ops"] = ops
     return [failure for failure in resolved if classify_skill_md_failure_severity(failure) == "hard"]
 
+def _tool_requests_for_matching_forbidden_helpers(
+    *,
+    file_path: str,
+    role: str | None,
+    skill_plan_entry: dict[str, Any] | None,
+    import_guard_result: Any,
+) -> list[ToolPoolAddToolRequest]:
+    """Return gated tool requests for forbidden helpers that match the file contract.
 
+    A runtime helper is eligible only when:
+    - import guard reports it as forbidden rather than unknown;
+    - it belongs to a registered capability;
+    - resolve_implementation already matches that callable to the current
+      canonical file contract.
+
+    The function only proposes tool requests. gate_tool_request remains the
+    authorization boundary.
+    """
+    error_type = str(
+        getattr(import_guard_result, "error_type", "")
+        or (
+            import_guard_result.get("error_type")
+            if isinstance(import_guard_result, dict)
+            else ""
+        )
+        or ""
+    )
+
+    if error_type != "generated_pool_forbidden_import":
+        return []
+
+    forbidden_imports = (
+        list(getattr(import_guard_result, "forbidden_imports", []) or [])
+        if not isinstance(import_guard_result, dict)
+        else list(
+            import_guard_result.get("forbidden_imports") or []
+        )
+    )
+
+    forbidden_helpers = {
+        str(item or "").strip()
+        for item in forbidden_imports
+        if str(item or "").strip()
+        and "." not in str(item or "").strip()
+    }
+
+    if not forbidden_helpers:
+        return []
+
+    entry = _skill_plan_entry_for_file(
+        file_path=file_path,
+        role=role,
+        skill_plan_entry=skill_plan_entry,
+    )
+
+    required_stdout_fields: list[str] = []
+
+    for field_name in list(entry.outputs or []):
+        text = str(field_name or "").strip()
+        if text and text not in required_stdout_fields:
+            required_stdout_fields.append(text)
+
+    artifact_contract = (
+        entry.artifact_contract
+        if isinstance(entry.artifact_contract, dict)
+        else {}
+    )
+
+    for field_name in (
+        artifact_contract.get("stdout_fields") or []
+    ):
+        text = str(field_name or "").strip()
+        if text and text not in required_stdout_fields:
+            required_stdout_fields.append(text)
+
+    stdout_schema = {
+        "type": "object",
+        "required": required_stdout_fields,
+        "properties": {
+            field_name: {}
+            for field_name in required_stdout_fields
+        },
+    }
+
+    canonical_contract = compile_canonical_file_contract(
+        entry,
+        stdout_schema,
+    )
+    resolution = resolve_implementation(
+        entry,
+        canonical_contract,
+    )
+
+    requests: list[ToolPoolAddToolRequest] = []
+    seen_capabilities: set[str] = set()
+
+    for tool in (
+        resolution.available_tools
+        or resolution.selected_tools
+        or []
+    ):
+        import_path = str(
+            getattr(tool, "import_path", "") or ""
+        ).strip()
+        function_name = str(
+            getattr(tool, "function_name", "") or ""
+        ).strip()
+
+        if import_path != "backend.services.runtime_tools":
+            continue
+
+        if function_name not in forbidden_helpers:
+            continue
+
+        tool_id = str(
+            getattr(tool, "tool_id", "") or ""
+        ).strip()
+        capability_id = tool_id.split(".", 1)[0]
+
+        if (
+            not capability_id
+            or capability_id in seen_capabilities
+            or get_tool_capability(capability_id) is None
+        ):
+            continue
+
+        seen_capabilities.add(capability_id)
+
+        requests.append(
+            ToolPoolAddToolRequest(
+                target_file=file_path,
+                requested_capability=capability_id,
+                candidate_tool_id=capability_id,
+                source="repair_request",
+                reason=(
+                    "Generated script imported a registered runtime helper "
+                    "that resolve_implementation matched to the current "
+                    "canonical file contract."
+                ),
+                confidence=1.0,
+                score=100.0,
+                matched_features=[
+                    "registered_runtime_helper",
+                    "canonical_contract_match",
+                    "import_guard_forbidden_unbound",
+                ],
+                matched_terms=[function_name],
+                candidate_source="runtime_import_guard",
+                semantic_reason=(
+                    f"{function_name} matches current canonical contract"
+                ),
+            )
+        )
+
+    return requests
 
 
 def _structured_failure_signature(stage_error: FileGenerationStageError, deterministic_error: str) -> str:
@@ -3864,11 +4410,90 @@ async def generate_file(request: GenerateFileRequest):
                             detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
                         ) from guard_exc
                     if not import_guard_result.success:
-                        raise FileGenerationStageError(
-                            source="runtime_import_guard",
-                            layer=import_guard_result.error_type or "runtime_import_guard_failed",
-                            detail=json.dumps(import_guard_result.model_dump(mode="json"), ensure_ascii=False, default=str),
+                        binding_requests = (
+                            _tool_requests_for_matching_forbidden_helpers(
+                                file_path=request.file_path,
+                                role=request.role,
+                                skill_plan_entry=effective_skill_plan_entry,
+                                import_guard_result=import_guard_result,
+                            )
                         )
+
+                        if binding_requests:
+                            expansion_result = (
+                                _apply_tool_requests_to_current_file_binding(
+                                    skill_name=skill_name,
+                                    target_file=request.file_path,
+                                    file_spec=(
+                                        dict(effective_skill_plan_entry)
+                                        if isinstance(
+                                            effective_skill_plan_entry,
+                                            dict,
+                                        )
+                                        else {
+                                            "path": request.file_path,
+                                            "role": (
+                                                    request.role
+                                                    or "generic_script"
+                                            ),
+                                        }
+                                    ),
+                                    requests=binding_requests,
+                                    source_phase="runtime_import_guard",
+                                )
+                            )
+
+                            if expansion_result.get("allowed_new", 0) > 0:
+                                refreshed_tool_pool = load_tool_pool(
+                                    settings.skills_path / skill_name
+                                )
+                                file_binding = get_file_binding(
+                                    refreshed_tool_pool,
+                                    request.file_path,
+                                )
+                                last_file_binding = file_binding
+
+                                import_guard_result = guard_runtime_imports(
+                                    content,
+                                    request.file_path,
+                                    file_binding,
+                                )
+                                last_import_guard_result = import_guard_result
+
+                                logger.info(
+                                    "[Creator][runtime_import_guard][binding_retry] %s",
+                                    json.dumps(
+                                        {
+                                            "event": (
+                                                "runtime_import_guard_binding_retry"
+                                            ),
+                                            "file_path": request.file_path,
+                                            "expansion_result": expansion_result,
+                                            "guard_success": (
+                                                import_guard_result.success
+                                            ),
+                                            "error_type": (
+                                                import_guard_result.error_type
+                                            ),
+                                        },
+                                        ensure_ascii=False,
+                                        default=str,
+                                    ),
+                                )
+
+                        if not import_guard_result.success:
+                            raise FileGenerationStageError(
+                                source="runtime_import_guard",
+                                layer=(
+                                        import_guard_result.error_type
+                                        or "runtime_import_guard_failed"
+                                ),
+                                detail=json.dumps(
+                                    import_guard_result.model_dump(mode="json"),
+                                    ensure_ascii=False,
+                                    default=str,
+                                ),
+                            )
 
                 try:
 
@@ -4536,83 +5161,69 @@ async def generate_file(request: GenerateFileRequest):
                         has_missing_capability = _has_responsibility_missing_capability_issue(responsibility_issues)
                         if (has_stubs or has_missing_capability) and tool_re_explore_count < 1 and request.file_path.startswith("scripts/"):
                             try:
-                                # Build a full file spec from the canonical entry so the
-                                # explorer has enough context (path/role/purpose/inputs/outputs/
-                                # selected_tools/required_tool_slots/runtime_contract/
-                                # tool_binding_summary).
-                                if effective_skill_plan_entry and isinstance(effective_skill_plan_entry, dict):
-                                    _explore_spec = dict(effective_skill_plan_entry)
-                                    _explore_spec.setdefault("path", request.file_path)
-                                    _explore_spec.setdefault("role", request.role or "generic_script")
-                                    file_specs_for_explore = [_explore_spec]
+                                if (
+                                        effective_skill_plan_entry
+                                        and isinstance(effective_skill_plan_entry, dict)
+                                ):
+                                    explore_spec = dict(effective_skill_plan_entry)
+                                    explore_spec.setdefault("path", request.file_path)
+                                    explore_spec.setdefault(
+                                        "role",
+                                        request.role or "generic_script",
+                                    )
                                 else:
-                                    file_specs_for_explore = [{"path": request.file_path, "role": request.role or "generic_script"}]
+                                    explore_spec = {
+                                        "path": request.file_path,
+                                        "role": request.role or "generic_script",
+                                    }
+
                                 re_explored = explore_tool_pool(
-                                    user_request=getattr(request, "user_request", "") or request.purpose or "",
+                                    user_request=(
+                                            getattr(request, "user_request", "")
+                                            or request.purpose
+                                            or ""
+                                    ),
                                     blueprint_text=request.blueprint_text or "",
-                                    file_specs=file_specs_for_explore,
+                                    file_specs=[explore_spec],
                                 )
-                                if re_explored.candidate_tool_requests:
-                                    existing_pool = load_tool_pool(settings.skills_path / skill_name)
-                                    existing_allowed = {t.tool_id for t in existing_pool.tools}
-                                    new_requests = [
-                                        r for r in re_explored.candidate_tool_requests
-                                        if r.candidate_tool_id not in existing_allowed
-                                    ]
-                                    if new_requests:
-                                        for req_item in new_requests:
-                                            spec_dict = dict(file_specs_for_explore[0]) if file_specs_for_explore else {
-                                                "path": request.file_path,
-                                                "role": request.role or "generic_script",
-                                            }
-                                            spec_dict.setdefault("path", request.file_path)
-                                            spec_dict.setdefault("role", request.role or "generic_script")
-                                            gate_evt = gate_tool_request(req_item, file_role=str(spec_dict.get("role") or "generic_script"), file_spec=spec_dict)
-                                            existing_pool.gate_events.append(gate_evt)
-                                            if gate_evt.decision == "allow":
-                                                cap = get_tool_capability(gate_evt.tool_id)
-                                                existing_pool.tools.append(ToolPoolTool(
-                                                    tool_id=gate_evt.tool_id,
-                                                    status="allowed",
-                                                    source="repair_request",
-                                                    source_phase="responsibility_repair",
-                                                    target_files=[request.file_path],
-                                                    allowed_helper_imports=gate_evt.allowed_helper_imports,
-                                                    allowed_import_paths=gate_evt.allowed_import_paths,
-                                                    allowed_function_imports=gate_evt.allowed_function_imports,
-                                                    score=req_item.score,
-                                                    matched_features=req_item.matched_features,
-                                                    matched_terms=req_item.matched_terms,
-                                                    allowed_roles=list((cap.roles if cap else []) or []),
-                                                    input_schema=(cap.input_schema if cap else {}) or {},
-                                                    output_schema=(cap.output_schema if cap else {}) or {},
-                                                    required_env=gate_evt.required_env,
-                                                    dependencies=gate_evt.dependencies,
-                                                    reason=req_item.reason,
-                                                    gate_result=gate_evt.decision,
-                                                    gate_messages=gate_evt.messages,
-                                                ))
-                                                binding = next((b for b in existing_pool.file_bindings if b.target_file == request.file_path), None)
-                                                if binding is None:
-                                                    from .tool_pool_models import ToolPoolFileBinding
-                                                    binding = ToolPoolFileBinding(target_file=request.file_path)
-                                                    existing_pool.file_bindings.append(binding)
-                                                if gate_evt.tool_id not in binding.allowed_tool_ids:
-                                                    binding.allowed_tool_ids.append(gate_evt.tool_id)
-                                                binding.allowed_helper_imports = list(dict.fromkeys(binding.allowed_helper_imports + gate_evt.allowed_helper_imports))
-                                                binding.allowed_import_paths = list(dict.fromkeys(binding.allowed_import_paths + gate_evt.allowed_import_paths))
-                                                binding.allowed_function_imports = list(dict.fromkeys(binding.allowed_function_imports + gate_evt.allowed_function_imports))
-                                        save_tool_pool(settings.skills_path / skill_name, existing_pool)
-                                        logger.info(
-                                            "[Creator][tool_re_explore] skill=%s file=%s new_candidates=%d allowed_new=%d",
-                                            skill_name, request.file_path, len(new_requests),
-                                            sum(1 for e in existing_pool.gate_events[-len(new_requests):] if e.decision == "allow"),
-                                        )
+
+                                expansion_result = (
+                                    _apply_tool_requests_to_current_file_binding(
+                                        skill_name=skill_name,
+                                        target_file=request.file_path,
+                                        file_spec=explore_spec,
+                                        requests=list(
+                                            re_explored.candidate_tool_requests or []
+                                        ),
+                                        source_phase="responsibility_repair",
+                                    )
+                                )
+
+                                logger.info(
+                                    "[Creator][tool_re_explore] %s",
+                                    json.dumps(
+                                        {
+                                            "event": "tool_re_explore",
+                                            "skill_name": skill_name,
+                                            "file_path": request.file_path,
+                                            **expansion_result,
+                                        },
+                                        ensure_ascii=False,
+                                        default=str,
+                                    ),
+                                )
+
                                 tool_re_explore_count += 1
+
                             except Exception as re_explore_exc:
                                 logger.warning(
-                                    "[Creator][tool_re_explore] re-exploration failed skill=%s file=%s error=%s",
-                                    skill_name, request.file_path, re_explore_exc,
+                                    (
+                                        "[Creator][tool_re_explore] "
+                                        "re-exploration failed skill=%s file=%s error=%s"
+                                    ),
+                                    skill_name,
+                                    request.file_path,
+                                    re_explore_exc,
                                 )
                         feedback = (
                             "RESPONSIBILITY_PATCH_STAGE\n"

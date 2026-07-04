@@ -728,68 +728,53 @@ def _script_local_contract_payload(
     plan_entry: SkillPlanEntry,
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return the only business contract a script-generation prompt should need.
+    """Build the local contract for one generated script.
 
-    通用原则：
-    - available_tools 只是基础能力候选，不是完整业务方案枚举；
-    - 没有召回到专用工具，不代表脚本不能实现；
-    - script 可以通过标准库、本地 helper、一个或多个基础工具组合完成职责。
+    Current File Tool Binding is the single source of truth for callable
+    runtime/custom tools exposed to the code model.
+
+    resolve_implementation remains useful for implementation evidence and local
+    composition analysis, but it does not grant helper-import permissions.
     """
-    canonical_contract = compile_canonical_file_contract(plan_entry, stdout_schema)
-    implementation_resolution = resolve_implementation(plan_entry, canonical_contract)
-    command_argv_contract = _command_argv_contract_for_script(file_path, "", plan_entry)
+    canonical_contract = compile_canonical_file_contract(
+        plan_entry,
+        stdout_schema,
+    )
+    implementation_resolution = resolve_implementation(
+        plan_entry,
+        canonical_contract,
+    )
+    command_argv_contract = _command_argv_contract_for_script(
+        file_path,
+        "",
+        plan_entry,
+    )
 
-    tool_binding_summary = {}
+    tool_binding_summary: dict[str, Any] = {}
     if isinstance(plan_entry.runtime_contract, dict):
-        tool_binding_summary = plan_entry.runtime_contract.get("tool_binding_summary") or {}
+        raw_binding = plan_entry.runtime_contract.get("tool_binding_summary")
+        if isinstance(raw_binding, dict):
+            tool_binding_summary = dict(raw_binding)
 
-    derived_tool_binding = _tool_binding_from_resolution(implementation_resolution)
-    tool_binding_summary = _merge_tool_binding_summary(tool_binding_summary, derived_tool_binding)
-    tool_binding_summary = _ensure_python_script_core_binding(tool_binding_summary, plan_entry)
+    tool_binding_summary = _ensure_python_script_core_binding(
+        tool_binding_summary,
+        plan_entry,
+    )
 
-    # Prefer the actual file binding from ToolPool. This keeps code generation,
-    # import guard, and responsibility review on the same tool contract.
-    available_tools, tool_function_cards, selected_tool_names = _available_tool_cards_from_binding(tool_binding_summary)
+    available_tools, tool_function_cards, selected_tool_names = (
+        _available_tool_cards_from_binding(tool_binding_summary)
+    )
 
-    # Fallback only when no binding-derived tool cards exist.
-    if not available_tools:
-        available_tools = []
-        tool_function_cards = []
-        selected_tool_names = []
-
-        for tool in (implementation_resolution.available_tools or implementation_resolution.selected_tools or []):
-            capability_name = str(tool.tool_id).split(".")[0]
-            selected_tool_names.append(capability_name)
-            cap = get_tool_capability(capability_name)
-            if cap is not None:
-                tool_function_cards.extend(function_cards_for_tool(cap))
-
-            available_tools.append({
-                "tool_id": tool.tool_id,
-                "description": tool.description,
-                "call_template": call_template_for_tool(tool),
-                "signature": tool.signature,
-                "input_schema": tool.input_schema,
-                "output_schema": tool.output_schema,
-                "return_contract": tool.return_contract,
-                "example_return": tool.example_return,
-                "example_stdout": tool.example_stdout,
-                "common_mistakes": tool.common_mistakes,
-                "snippets": tool.snippets,
-                "usage_policy": tool.usage_policy,
-                "required_env": tool.required_env,
-                "required_secrets": tool.required_secrets,
-                "artifact_outputs": tool.artifact_outputs,
-            })
+    bound_capability_ids = [
+        tool_name
+        for tool_name in selected_tool_names
+        if get_tool_capability(tool_name) is not None
+    ]
 
     tool_snippets = resolve_tool_snippets_for_context(
         role=plan_entry.role or "",
-        capabilities=list(dict.fromkeys([
-            req.capability_id
-            for req in canonical_contract.capability_requirements
-            if req.capability_id
-        ])),
-        tool_names=list(dict.fromkeys(selected_tool_names)),
+        capabilities=list(dict.fromkeys(bound_capability_ids)),
+        tool_names=list(dict.fromkeys(bound_capability_ids)),
         file_path=file_path,
         max_snippets=8,
     )
@@ -806,7 +791,10 @@ def _script_local_contract_payload(
         "tool_snippets": tool_snippets,
         "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
         "current_file_tool_binding": tool_binding_summary,
-        "allowed_helper_imports": tool_binding_summary.get("allowed_helper_imports", []),
+        "allowed_helper_imports": tool_binding_summary.get(
+            "allowed_helper_imports",
+            [],
+        ),
         "resource_refs": canonical_contract.resource_refs,
         "output_contract": {
             "stdout_schema": stdout_schema,
@@ -814,49 +802,80 @@ def _script_local_contract_payload(
         },
         "platform_io_contract": build_platform_io_contract(),
         "platform_io_rules": platform_io_contract_prompt_text(),
-        "coverage_requirements": (plan_entry.runtime_contract or {}).get("coverage_requirements", {}),
+        "coverage_requirements": (
+            plan_entry.runtime_contract or {}
+        ).get(
+            "coverage_requirements",
+            {},
+        ),
         "runtime_contract": plan_entry.runtime_contract or {},
         "command_argv_contract": command_argv_contract,
         "runtime_envelope": {
             "description": (
                 "Creator/Skill runtime may provide a generic JSON argv envelope. "
-                "Scripts should read explicit contract fields when present, and may also use "
-                "generic envelope fields such as payload, user_request, fields, options, "
-                "input_files, files, and resources when they need external user inputs or files."
+                "Scripts should read the inputs required by their own guard/run "
+                "contract and may receive external values from the runtime envelope."
             ),
-            "generic_fields": ["payload", "user_request", "fields", "options", "input_files", "files", "resources"],
+            "generic_fields": [
+                "payload",
+                "user_request",
+                "fields",
+                "options",
+                "input_files",
+                "files",
+                "resources",
+            ],
             "smoke_note": (
-                "Smoke test may provide real sample files through input_files/files/resources. "
-                "Do not hardcode sample paths; read them from argv if needed."
+                "Smoke inputs may include real runtime files or resources. "
+                "The script should consume runtime argv rather than embedding "
+                "trial values in business logic."
             ),
         },
         "rules": [
-            "Use script_composition: combine argv inputs, local logic, standard library, and any useful available_tools to satisfy this single script goal.",
-            "available_tools are recalled base capabilities, not an exhaustive list of business solutions; the script may implement composition/adaptation locally instead of waiting for a specialized tool.",
-            "current_file_tool_binding.allowed_helper_imports only constrains imports of the form `from backend.services.runtime_tools import ...`; backend.services.runtime_tools is not an open namespace.",
-            "Never import runtime_tools helpers that are not listed in current_file_tool_binding.allowed_helper_imports; never guess helper names from file formats; forbidden examples include read_pdf_text, read_xlsx_text, read_txt_text, read_excel_text.",
-            "If importing from backend.services.runtime_tools.custom_tools or any custom import_path, both import_path and function name must appear in current_file_tool_binding.allowed_import_paths / allowed_function_imports; unlisted custom_tools imports are forbidden.",
-            "Tool priority is fixed: (1) use current_file_tool_binding primary tool/helper; (2) if primary is unsuitable, use fallback/secondary tool/helper; (3) when no suitable bound tool exists, use Python standard library; (4) if standard library is insufficient and a safe dependency is already allowed/installed, use that dependency; (5) only then return a clear blocker, never fabricate tools.",
-            "If no platform helper is bound, implement local pure computation/parsing/conversion with Python standard library when feasible.",
-            "If tool binding dependencies or the platform environment already provide a safe third-party library, import that library directly and implement the task without runtime_tools.",
-            "Do not write not-supported fallbacks just because a helper is absent; only report a blocker when neither standard library nor available dependencies can complete the task.",
-            "Prefer current_file_tool_binding.primary_tool_ids; use secondary_tool_ids as fallback when primary is unavailable or not relevant.",
-            "Do not choose extract_pdf_text just because the user said PDF; follow Current File Tool Binding and scored_tools selection reasons.",
-            "If a capability is missing, return/describe a tool_pool_request instead of inventing a runtime_tools import.",
-            "Standard-library imports and already-available runtime libraries may be used for local composition.",
-            "References/assets are resource_refs only, not pip/install/import dependencies.",
-            "First round fixes only the current script; end-to-end chain repair happens later.",
+            (
+                "Use script_composition: combine validated argv inputs, local "
+                "logic, standard library, and useful available_tools to satisfy "
+                "the current script responsibility."
+            ),
+            (
+                "available_tools and Current File Tool Binding describe the "
+                "callable tools currently bound to this file."
+            ),
+            (
+                "Imports from backend.services.runtime_tools must come from "
+                "current_file_tool_binding.allowed_helper_imports."
+            ),
+            (
+                "Custom tool imports must follow "
+                "current_file_tool_binding.allowed_import_paths and "
+                "allowed_function_imports."
+            ),
+            (
+                "Prefer primary tools, then secondary tools. Standard-library "
+                "or allowed local implementation may be used when a bound tool "
+                "does not cover the required local transformation."
+            ),
+            (
+                "Core inputs must participate in the produced business result "
+                "or artifact."
+            ),
+            (
+                "References and assets are runtime resources, not Python "
+                "dependency declarations."
+            ),
+            (
+                "First-round generation implements the current script; "
+                "cross-step execution alignment is verified by E2E."
+            ),
         ],
         "implementation_resolution": {
             "mode": implementation_resolution.mode,
-            "available_tools": available_tools,
-            "tool_function_cards": tool_function_cards,
-            "tool_snippets": tool_snippets,
-            "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
-            "allowed_imports": implementation_resolution.allowed_imports,
-            "declared_dependencies": implementation_resolution.declared_dependencies,
             "required_evidence": implementation_resolution.required_evidence,
-            "reason": implementation_resolution.reason,
+            "reason": (
+                "Implementation composition evidence only. Callable tool "
+                "permissions are represented by current_file_tool_binding "
+                "and available_tools."
+            ),
         },
     }
 

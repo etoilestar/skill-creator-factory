@@ -83,13 +83,17 @@ def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tupl
     return tools, triggers
 
 def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
-    """Extract concrete tool IDs from deterministic tool fields only.
+    """Extract concrete registry tool IDs from deterministic file-spec fields.
 
-    required_tool_slots / tool_intents are semantic intent text, not selected
-    concrete tool IDs. They should affect semantic recall, not exact tool match.
+    Explicit tool fields are always treated as concrete tool selections.
+
+    required_capabilities are semantic capability requirements in general.
+    However, when a required capability exactly matches a registered capability
+    ID, that match is also concrete registry evidence and should not be dropped
+    by semantic top-k recall.
     """
-    ids: set[str] = set()
     spec = spec if isinstance(spec, dict) else {}
+    ids: set[str] = set()
 
     for key in (
         "required_tools",
@@ -98,13 +102,23 @@ def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
         "selected_tool_ids",
         "allowed_tools",
     ):
-        value = spec.get(key)
-        for item in _as_list(value):
+        for item in _as_list(spec.get(key)):
             text = str(item or "").strip()
             if text:
                 ids.add(text)
 
-    return {item for item in ids if item}
+    registered_tool_ids = {
+        str(cap.name or "").strip()
+        for cap in list_tool_capabilities()
+        if str(cap.name or "").strip()
+    }
+
+    for item in _as_list(spec.get("required_capabilities")):
+        capability_id = str(item or "").strip()
+        if capability_id and capability_id in registered_tool_ids:
+            ids.add(capability_id)
+
+    return ids
 
 def _normalize_tokens(text: str) -> set[str]:
     raw = (text or '').lower()

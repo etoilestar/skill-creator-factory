@@ -988,6 +988,10 @@ def _build_script_generate_file_prompt_variant(
     Scripts must not receive the full blueprint, creator UI copy, global kernel
     docs, or E2E/platform workflow text. The platform owns invocation/stdout
     parsing; the model only implements this one file's internals.
+
+    Current File Tool Binding is the single source of truth for callable tools.
+    ``implementation_resolution`` is implementation evidence only and must not
+    be used as a tool-permission or available-tool source.
     """
     plan_entry = _skill_plan_entry_for_file(
         file_path=file_path,
@@ -996,163 +1000,538 @@ def _build_script_generate_file_prompt_variant(
         role=role,
         skill_plan_entry=skill_plan_entry,
     )
-    stdout_schema = _script_stdout_schema_for_entry(plan_entry)
+
+    stdout_schema = _script_stdout_schema_for_entry(
+        plan_entry
+    )
+
     local_contract = _script_local_contract_payload(
         file_path=file_path,
         purpose=purpose,
         plan_entry=plan_entry,
         stdout_schema=stdout_schema,
     )
-    if isinstance(skill_plan_entry, dict) and isinstance(skill_plan_entry.get("tool_binding_summary"), dict):
-        local_contract["current_file_tool_binding"] = skill_plan_entry.get("tool_binding_summary") or {}
-        local_contract["allowed_helper_imports"] = list((skill_plan_entry.get("tool_binding_summary") or {}).get("allowed_helper_imports") or [])
+
+    if (
+        isinstance(skill_plan_entry, dict)
+        and isinstance(
+            skill_plan_entry.get(
+                "tool_binding_summary"
+            ),
+            dict,
+        )
+    ):
+        raw_binding = (
+            skill_plan_entry.get(
+                "tool_binding_summary"
+            )
+            or {}
+        )
+
+        local_contract[
+            "current_file_tool_binding"
+        ] = raw_binding
+
+        local_contract[
+            "allowed_helper_imports"
+        ] = list(
+            raw_binding.get(
+                "allowed_helper_imports"
+            )
+            or []
+        )
 
     implementation_payload = (
-        local_contract.get("implementation_resolution")
-        if isinstance(local_contract.get("implementation_resolution"), dict)
+        local_contract.get(
+            "implementation_resolution"
+        )
+        if isinstance(
+            local_contract.get(
+                "implementation_resolution"
+            ),
+            dict,
+        )
         else {}
     )
-    implementation_mode = str(implementation_payload.get("mode") or "script_composition")
+
+    implementation_mode = str(
+        implementation_payload.get("mode")
+        or "script_composition"
+    )
 
     if implementation_mode == "unresolved":
-        # unresolved 只能说明“没有召回到完整专用工具方案”，不能说明脚本无法实现。
-        # Creator 的定位是：平台提供基础工具与运行环境，script 通过标准库、本地 helper、
-        # 一个或多个基础工具组合完成业务职责。
+        # unresolved 只能说明没有召回到完整专用工具方案，
+        # 不能说明脚本无法通过本地组合实现。
         logger.warning(
-            "[Creator][script_generation_contract][implementation_unresolved_downgraded] file_path=%s reason=%s",
+            "[Creator][script_generation_contract]"
+            "[implementation_unresolved_downgraded] "
+            "file_path=%s reason=%s",
             file_path,
-            str(implementation_payload.get("reason") or ""),
+            str(
+                implementation_payload.get("reason")
+                or ""
+            ),
         )
-        implementation_mode = "script_composition"
-        implementation_payload["mode"] = "script_composition"
-        implementation_payload["unresolved_advisory"] = (
+
+        implementation_mode = (
+            "script_composition"
+        )
+
+        implementation_payload[
+            "mode"
+        ] = "script_composition"
+
+        implementation_payload[
+            "unresolved_advisory"
+        ] = (
             implementation_payload.get("reason")
-            or "no specialized tool resolution; use script composition"
+            or (
+                "no specialized tool resolution; "
+                "use script composition"
+            )
         )
-        local_contract["implementation_resolution"] = implementation_payload
+
+        local_contract[
+            "implementation_resolution"
+        ] = implementation_payload
 
     script_skeleton_text = ""
-    if variant in {"standard", "simplified"}:
-        script_skeleton_text = _script_generation_skeleton(
-            file_path,
-            purpose,
-            "",
-            role=plan_entry.role,
-            skill_plan_entry=skill_plan_entry,
+
+    if variant in {
+        "standard",
+        "simplified",
+    }:
+        script_skeleton_text = (
+            _script_generation_skeleton(
+                file_path,
+                purpose,
+                "",
+                role=plan_entry.role,
+                skill_plan_entry=(
+                    skill_plan_entry
+                ),
+            )
         )
 
-    resolution_payload = (
-        local_contract.get("implementation_resolution")
-        if isinstance(local_contract.get("implementation_resolution"), dict)
-        else {}
-    )
+    # Current File Tool Binding-derived top-level contract fields are the
+    # callable-tool truth. Do not read available_tools from
+    # implementation_resolution.
     selected_tools_payload = (
-        resolution_payload.get("available_tools")
-        if isinstance(resolution_payload, dict)
-        else []
-    )
-    tool_function_cards = (
-        local_contract.get("tool_function_cards")
-        if isinstance(local_contract.get("tool_function_cards"), list)
-        else []
-    )
-    tool_snippets = (
-        local_contract.get("tool_snippets")
-        if isinstance(local_contract.get("tool_snippets"), list)
+        local_contract.get("available_tools")
+        if isinstance(
+            local_contract.get(
+                "available_tools"
+            ),
+            list,
+        )
         else []
     )
 
-    current_binding = local_contract.get("current_file_tool_binding") or {}
+    tool_function_cards = (
+        local_contract.get(
+            "tool_function_cards"
+        )
+        if isinstance(
+            local_contract.get(
+                "tool_function_cards"
+            ),
+            list,
+        )
+        else []
+    )
+
+    tool_snippets = (
+        local_contract.get("tool_snippets")
+        if isinstance(
+            local_contract.get(
+                "tool_snippets"
+            ),
+            list,
+        )
+        else []
+    )
+
+    current_binding = (
+        local_contract.get(
+            "current_file_tool_binding"
+        )
+        if isinstance(
+            local_contract.get(
+                "current_file_tool_binding"
+            ),
+            dict,
+        )
+        else {}
+    )
+
+    available_tool_ids = [
+        str(tool.get("tool_id") or "")
+        for tool in selected_tools_payload
+        if (
+            isinstance(tool, dict)
+            and str(
+                tool.get("tool_id") or ""
+            ).strip()
+        )
+    ]
+
+    allowed_import_paths = list(
+        current_binding.get(
+            "allowed_import_paths"
+        )
+        or []
+    )
+
+    allowed_function_imports = list(
+        current_binding.get(
+            "allowed_function_imports"
+        )
+        or []
+    )
+
+    binding_dependencies = list(
+        current_binding.get("dependencies")
+        or []
+    )
+
+    allowed_helper_imports = list(
+        current_binding.get(
+            "allowed_helper_imports"
+        )
+        or local_contract.get(
+            "allowed_helper_imports"
+        )
+        or []
+    )
+
     logger.info(
-        "[Creator][script_generation_contract] file_path=%s inputs=%s outputs=%s output_contract=%s resource_refs=%s mode=%s available_tools=%s tool_function_cards_count=%d tool_snippets_count=%d required_evidence=%s allowed_imports=%s declared_dependencies=%s reason=%s current_file_binding.allowed_helper_imports=%s allowed_import_paths=%s allowed_function_imports=%s runtime_import_guard_result.success=%s runtime_import_guard_result.error_type=%s",
+        "[Creator][script_generation_contract] "
+        "file_path=%s "
+        "inputs=%s "
+        "outputs=%s "
+        "output_contract=%s "
+        "resource_refs=%s "
+        "mode=%s "
+        "available_tools=%s "
+        "tool_function_cards_count=%d "
+        "tool_snippets_count=%d "
+        "required_evidence=%s "
+        "allowed_imports=%s "
+        "declared_dependencies=%s "
+        "reason=%s "
+        "current_file_binding.allowed_helper_imports=%s "
+        "allowed_import_paths=%s "
+        "allowed_function_imports=%s "
+        "runtime_import_guard_result.success=%s "
+        "runtime_import_guard_result.error_type=%s",
         file_path,
-        json.dumps(local_contract.get("inputs") or [], ensure_ascii=False),
-        json.dumps(local_contract.get("outputs") or [], ensure_ascii=False),
-        json.dumps(local_contract.get("output_contract") or {}, ensure_ascii=False, sort_keys=True),
-        json.dumps(local_contract.get("resource_refs") or [], ensure_ascii=False, sort_keys=True),
+        json.dumps(
+            local_contract.get("inputs")
+            or [],
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            local_contract.get("outputs")
+            or [],
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            local_contract.get(
+                "output_contract"
+            )
+            or {},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        json.dumps(
+            local_contract.get(
+                "resource_refs"
+            )
+            or [],
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         implementation_mode,
         json.dumps(
-            [tool.get("tool_id") for tool in selected_tools_payload if isinstance(tool, dict)],
+            available_tool_ids,
             ensure_ascii=False,
         ),
         len(tool_function_cards),
         len(tool_snippets),
-        json.dumps(resolution_payload.get("required_evidence") or [], ensure_ascii=False),
-        json.dumps(resolution_payload.get("allowed_imports") or [], ensure_ascii=False),
-        json.dumps(resolution_payload.get("declared_dependencies") or [], ensure_ascii=False),
-        str(resolution_payload.get("reason") or ""),
-        json.dumps(current_binding.get("allowed_helper_imports") or local_contract.get("allowed_helper_imports") or [], ensure_ascii=False),
-        json.dumps(current_binding.get("allowed_import_paths") or [], ensure_ascii=False),
-        json.dumps(current_binding.get("allowed_function_imports") or [], ensure_ascii=False),
+        json.dumps(
+            implementation_payload.get(
+                "required_evidence"
+            )
+            or [],
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            allowed_import_paths,
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            binding_dependencies,
+            ensure_ascii=False,
+        ),
+        str(
+            implementation_payload.get("reason")
+            or ""
+        ),
+        json.dumps(
+            allowed_helper_imports,
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            allowed_import_paths,
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            allowed_function_imports,
+            ensure_ascii=False,
+        ),
         None,
         None,
     )
 
     instruction = [
-        f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。',
-        "目标：生成一个可运行的单文件脚本，只实现当前文件职责，输出源码本身。",
-        "脚本文件必须读取一个 JSON object argv，并向 stdout 输出一个 JSON object。",
-        "Python scripts/*.py 必须 import 并调用 strict_json_argv_guard；它用于声明脚本第一轮 argv 接口，并在 E2E 中暴露调用映射问题。",
-        "strict_json_argv_guard spec 由当前脚本实现真实需要的入口参数决定；spec、run(args)、main()/入口逻辑必须内部一致。",
-        "run(args) 只能读取 strict_json_argv_guard 返回的 args；guard required key 必须被 run(args) 消费。",
-        "参数校验应在核心逻辑前完成；缺失、空值、类型错误或未知参数应 fail-fast，不输出成功 JSON。",
-        "无输入脚本也应调用 strict_json_argv_guard(payload, {})，保持统一入口协议。",
-        "脚本第一轮可以选择清晰、稳定的 argv key；SkillPlan/RequirementGraph/workflow allocation/local_contract 中的 inputs 只提供语义输入提示和 SKILL.md block 参考，不是 argv key 白名单。",
-        "command_argv_contract、SKILL.md command、E2E repair trace 如果存在，表示已有运行映射证据；第一轮生成可参考，但脚本 guard/run(args) 自洽性优先。",
-        "SKILL.md block 应参考脚本 guard spec 形成调用模板；如果 E2E 发现 block 与 guard 不一致，优先修复运行映射。只有脚本 guard、run(args)、stdout 或职责实现本身不成立时才修脚本。",
-        "平台 root/envelope 字段是运行来源，不是脚本必须采用的参数名；脚本可以在 guard 后做局部变量转换。",
-        "optional/default/config 参数可以由脚本默认逻辑处理；required 参数必须由 guard 声明并由 run(args) 实际使用。",
-        "stdout JSON 不得包含 error 字段；必须覆盖 output_contract.stdout_schema.required 中的字段，字段名逐字一致且值非空。",
-        "available_tools/custom_tools 的返回值是中间结果；最终 run(args) 返回的 dict 必须按 output_contract.stdout_schema.required 组织。",
-        "如果工具返回结构与 stdout_schema.required 不一致，脚本需要在本地完成语义映射、聚合或格式整理；只有字段名和语义都满足 required schema 时才能直接转发。",
-        "核心输入必须影响核心输出或产物内容；不要用空对象、空文件、固定示例或无关默认值绕过职责。",
-        "只根据轻量上下文实现：script_goal、semantic inputs/outputs、coverage_requirements、available_tools、tool_function_cards、tool_snippets、tool_snippet_prompt、resource_refs、output_contract、runtime_envelope、rules。",
-        "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；它用于判断脚本是否覆盖声明的输入来源、输入格式、核心动作、输出形态、参考读取和最终交付义务。",
-        "如果 coverage_requirements 声明多个输入变体，脚本应实现通用解析或分发逻辑，使核心职责覆盖这些变体。",
-        "如果 coverage_requirements 声明多种输出形态，stdout 必须通过 output_contract.stdout_schema.required 中的字段交付对应非空结果。",
-        "如果声明需要读取 reference/resource，脚本应在当前职责范围内读取并消费；若缺省不影响核心逻辑，应在 guard/default/metadata 中保持自洽。",
-        "coverage_requirements 只作为职责约束，不得生成 coverage:*、covered:* 或 declared_requirement_terms 等运行时字段。",
-        "raw role/capability 只能作为 hint，不能覆盖 purpose、output_contract、tool binding 和脚本实际职责。",
-        "统一按 script_composition 生成脚本：代码模型根据功能目标组合 argv 输入、本地逻辑、标准库和 available_tools。",
-        "available_tools 是当前文件可用基础能力，不是完整业务方案枚举；脚本负责把工具结果组织成当前文件的业务输出。",
-        "当前脚本可以定义局部 helper，使用标准库或已允许依赖完成字段适配、内容组织、格式转换、文件处理和产物组装。",
-        "工具、helper、标准库的组合方式由脚本实现决定；后续 import、dependency、调用、stdout 或 artifact 问题由静态检查和 E2E 暴露。",
-        "如果生成 artifact，产物路径、文件名和 helper 返回值应遵循 output_contract/artifact_contract/runtime_envelope 中的约定。",
-        "如果当前脚本需要外部文件、上传资源或运行时资源，应从 JSON argv 或 runtime envelope 中读取；试运行输入只用于验证处理能力，不应写成业务常量。",
-        "第一轮只生成当前脚本；上下游运行映射、placeholder、command block 与脚本 guard 的最终对齐由 E2E 处理。",
+        (
+            f'你正在为 Skill 包 "{skill_name}" '
+            f"生成单个脚本文件：{file_path}。"
+        ),
+        (
+            "目标：生成一个可运行的单文件脚本，"
+            "只实现当前文件职责，输出源码本身。"
+        ),
+        (
+            "脚本文件必须读取一个 JSON object argv，"
+            "并向 stdout 输出一个 JSON object。"
+        ),
+        (
+            "Python scripts/*.py 必须 import 并调用 "
+            "strict_json_argv_guard；"
+            "它用于声明脚本第一轮 argv 接口，"
+            "并在 E2E 中暴露调用映射问题。"
+        ),
+        (
+            "strict_json_argv_guard spec 由当前脚本实现真实需要的"
+            "入口参数决定；spec、run(args)、main()/入口逻辑必须内部一致。"
+        ),
+        (
+            "run(args) 只能读取 strict_json_argv_guard 返回的 args；"
+            "guard required key 必须被 run(args) 消费。"
+        ),
+        (
+            "参数校验应在核心逻辑前完成；缺失、空值、类型错误或"
+            "未知参数应 fail-fast，不输出成功 JSON。"
+        ),
+        (
+            "无输入脚本也应调用 "
+            "strict_json_argv_guard(payload, {})，保持统一入口协议。"
+        ),
+        (
+            "脚本第一轮可以选择清晰、稳定的 argv key；"
+            "SkillPlan/RequirementGraph/workflow allocation/"
+            "local_contract 中的 inputs 只提供语义输入提示和 "
+            "SKILL.md block 参考，不是 argv key 白名单。"
+        ),
+        (
+            "command_argv_contract、SKILL.md command、E2E repair trace "
+            "如果存在，表示已有运行映射证据；第一轮生成可参考，"
+            "但脚本 guard/run(args) 自洽性优先。"
+        ),
+        (
+            "SKILL.md block 应参考脚本 guard spec 形成调用模板；"
+            "如果 E2E 发现 block 与 guard 不一致，优先修复运行映射。"
+            "只有脚本 guard、run(args)、stdout 或职责实现本身不成立时"
+            "才修脚本。"
+        ),
+        (
+            "平台 root/envelope 字段是运行来源，"
+            "不是脚本必须采用的参数名；"
+            "脚本可以在 guard 后做局部变量转换。"
+        ),
+        (
+            "optional/default/config 参数可以由脚本默认逻辑处理；"
+            "required 参数必须由 guard 声明并由 run(args) 实际使用。"
+        ),
+        (
+            "stdout JSON 不得包含 error 字段；"
+            "必须覆盖 output_contract.stdout_schema.required 中的字段，"
+            "字段名逐字一致且值非空。"
+        ),
+        (
+            "available_tools/custom_tools 的返回值是中间结果；"
+            "最终 run(args) 返回的 dict 必须按 "
+            "output_contract.stdout_schema.required 组织。"
+        ),
+        (
+            "如果工具返回结构与 stdout_schema.required 不一致，"
+            "脚本需要在本地完成语义映射、聚合或格式整理；"
+            "只有字段名和语义都满足 required schema 时才能直接转发。"
+        ),
+        (
+            "核心输入必须影响核心输出或产物内容；"
+            "不要用空对象、空文件、固定示例或无关默认值绕过职责。"
+        ),
+        (
+            "只根据轻量上下文实现：script_goal、semantic inputs/outputs、"
+            "coverage_requirements、available_tools、tool_function_cards、"
+            "tool_snippets、tool_snippet_prompt、resource_refs、"
+            "output_contract、runtime_envelope、rules。"
+        ),
+        (
+            "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
+            "它用于判断脚本是否覆盖声明的输入来源、输入格式、核心动作、"
+            "输出形态、参考读取和最终交付义务。"
+        ),
+        (
+            "如果 coverage_requirements 声明多个输入变体，"
+            "脚本应实现通用解析或分发逻辑，使核心职责覆盖这些变体。"
+        ),
+        (
+            "如果 coverage_requirements 声明多种输出形态，"
+            "stdout 必须通过 output_contract.stdout_schema.required "
+            "中的字段交付对应非空结果。"
+        ),
+        (
+            "如果声明需要读取 reference/resource，"
+            "脚本应在当前职责范围内读取并消费；"
+            "若缺省不影响核心逻辑，应在 guard/default/metadata 中保持自洽。"
+        ),
+        (
+            "coverage_requirements 只作为职责约束，"
+            "不得生成 coverage:*、covered:* 或 "
+            "declared_requirement_terms 等运行时字段。"
+        ),
+        (
+            "raw role/capability 只能作为 hint，"
+            "不能覆盖 purpose、output_contract、tool binding 和脚本实际职责。"
+        ),
+        (
+            "统一按 script_composition 生成脚本："
+            "代码模型根据功能目标组合 argv 输入、本地逻辑、"
+            "标准库和 available_tools。"
+        ),
+        (
+            "available_tools 是当前文件可用基础能力，"
+            "不是完整业务方案枚举；"
+            "脚本负责把工具结果组织成当前文件的业务输出。"
+        ),
+        (
+            "当前脚本可以定义局部 helper，使用标准库或已允许依赖"
+            "完成字段适配、内容组织、格式转换、文件处理和产物组装。"
+        ),
+        (
+            "工具、helper、标准库的组合方式由脚本实现决定；"
+            "后续 import、dependency、调用、stdout 或 artifact 问题"
+            "由静态检查和 E2E 暴露。"
+        ),
+        (
+            "如果生成 artifact，产物路径、文件名和 helper 返回值"
+            "应遵循 output_contract/artifact_contract/"
+            "runtime_envelope 中的约定。"
+        ),
+        (
+            "如果当前脚本需要外部文件、上传资源或运行时资源，"
+            "应从 JSON argv 或 runtime envelope 中读取；"
+            "试运行输入只用于验证处理能力，不应写成业务常量。"
+        ),
+        (
+            "第一轮只生成当前脚本；上下游运行映射、placeholder、"
+            "command block 与脚本 guard 的最终对齐由 E2E 处理。"
+        ),
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
-        json.dumps(local_contract, ensure_ascii=False, indent=2),
-        "Current Skill Tool Pool / Current File Tool Binding（硬约束）：",
         json.dumps(
-            local_contract.get("current_file_tool_binding")
-            or {"allowed_helper_imports": local_contract.get("allowed_helper_imports", [])},
+            local_contract,
             ensure_ascii=False,
             indent=2,
         ),
-        "工具导入边界：只能导入 Current File Tool Binding 中允许的 runtime_tools helper、custom tool import path 或 function；标准库和已允许依赖可用于本地实现。",
-        "工具使用优先级：优先使用 primary/fallback tools 与批准 helper；没有合适工具时使用标准库或已允许依赖完成本地逻辑；无法完成时返回清晰 blocker。",
-        "动态工具函数卡片（从 registry/manifest 读取，不硬编码工具名）：",
-        "\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无",
-        "动态工具 Snippet 指南（从 registry/manifest 读取，不硬编码工具名）：",
-        str(local_contract.get("tool_snippet_prompt") or "当前脚本可用工具 Snippets: 无"),
+        (
+            "Current Skill Tool Pool / Current File Tool Binding"
+            "（硬约束）："
+        ),
+        json.dumps(
+            local_contract.get(
+                "current_file_tool_binding"
+            )
+            or {
+                "allowed_helper_imports": (
+                    local_contract.get(
+                        "allowed_helper_imports",
+                        [],
+                    )
+                )
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        (
+            "工具导入边界：只能导入 Current File Tool Binding "
+            "中允许的 runtime_tools helper、custom tool import path "
+            "或 function；标准库和已允许依赖可用于本地实现。"
+        ),
+        (
+            "工具使用优先级：优先使用 primary/fallback tools 与批准 helper；"
+            "没有合适工具时使用标准库或已允许依赖完成本地逻辑；"
+            "无法完成时返回清晰 blocker。"
+        ),
+        (
+            "动态工具函数卡片（从 registry/manifest 读取，"
+            "不硬编码工具名）："
+        ),
+        (
+            "\n\n---\n\n".join(
+                tool_function_cards
+            )
+            if tool_function_cards
+            else "无"
+        ),
+        (
+            "动态工具 Snippet 指南（从 registry/manifest 读取，"
+            "不硬编码工具名）："
+        ),
+        str(
+            local_contract.get(
+                "tool_snippet_prompt"
+            )
+            or "当前脚本可用工具 Snippets: 无"
+        ),
     ]
 
     if variant == "standard":
-        instruction.append("不注入完整蓝图、kernel 文档或额外工具清单；只使用上面的轻量上下文。")
+        instruction.append(
+            "不注入完整蓝图、kernel 文档或额外工具清单；"
+            "只使用上面的轻量上下文。"
+        )
 
     if script_skeleton_text:
         instruction.extend([
-            "固定脚本骨架 / 动态协议骨架（根据当前 outputs 生成；输出时应补全为可运行源码）：",
+            (
+                "固定脚本骨架 / 动态协议骨架"
+                "（根据当前 outputs 生成；"
+                "输出时应补全为可运行源码）："
+            ),
             script_skeleton_text,
         ])
 
     if variant == "minimal":
-        instruction.append("极简要求：返回可运行脚本源码，import strict_json_argv_guard，在入口解析 sys.argv[1] 后调用 strict_json_argv_guard(payload, spec)，run() 只使用返回的 args，真实处理输入，成功时打印满足 stdout_schema 的 JSON object。")
+        instruction.append(
+            "极简要求：返回可运行脚本源码，"
+            "import strict_json_argv_guard，"
+            "在入口解析 sys.argv[1] 后调用 "
+            "strict_json_argv_guard(payload, spec)，"
+            "run() 只使用返回的 args，真实处理输入，"
+            "成功时打印满足 stdout_schema 的 JSON object。"
+        )
 
     return _creator_file_generation_messages(
         "\n\n".join(instruction),
-        system_rule="你是 Creator 脚本文件生成器。只输出单个目标脚本源码；禁止解释、Markdown fence 或多文件包。",
+        system_rule=(
+            "你是 Creator 脚本文件生成器。"
+            "只输出单个目标脚本源码；"
+            "禁止解释、Markdown fence 或多文件包。"
+        ),
     )
 
 def _build_generate_file_prompt(

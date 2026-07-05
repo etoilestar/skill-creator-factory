@@ -54,29 +54,31 @@ class CreatorRepairScope:
 
 @dataclass
 class CreatorDiffProposal:
-    """Repair proposal.
+    """Normalized in-memory source repair proposal.
 
-    主路径是 exact_replace：
+    主 transport 是 literal OLD/NEW exact_replace envelope。
+
+    Transport parser 会把 literal source text 直接归一化为：
+
     {
-      "target_file": "scripts/x.py",
-      "reason": "...",
-      "edits": [
-        {"old": "当前文件中逐字复制的旧片段", "new": "替换后的新片段"}
-      ]
+        "old": "当前目标文件中的真实旧片段",
+        "new": "准备写回目标文件的真实新片段",
     }
 
-    兜底兼容 unified diff：
-    {
-      "target_file": "scripts/x.py",
-      "reason": "...",
-      "diff": "--- a/scripts/x.py\n+++ b/scripts/x.py\n@@ ..."
-    }
+    apply 层不关心 proposal 最初来自：
+    - literal exact_replace envelope；
+    - legacy exact_replace JSON；
+    - unified diff compatibility path。
+
+    apply 层只消费已经归一化后的 target_file / edits / diff。
     """
 
     target_file: str
     reason: str
     diff: str = ""
-    edits: list[dict[str, str]] = field(default_factory=list)
+    edits: list[dict[str, str]] = field(
+        default_factory=list
+    )
     raw: dict[str, Any] | None = None
     mode: str = "exact_replace"
 
@@ -154,20 +156,482 @@ def _looks_like_unified_diff(diff_text: str) -> bool:
 
     return has_old and has_new and has_hunk
 
+def _normalize_source_patch_prompt_text(
+    text: str,
+) -> str:
+    """Normalize legacy source-patch wording before model prompting.
 
-def _format_diff_response_violation(error: Exception, raw_text: str) -> str:
+    这里只迁移 Creator 自己的 source patch transport 表述。
+
+    不推断：
+    - 业务字段；
+    - argv key；
+    - stdout key；
+    - capability；
+    - tool；
+    - target content。
+    """
+    value = str(text or "")
+
+    replacements = (
+        (
+            "优先输出 edits old_lines/new_lines "
+            "exact_replace patch",
+            "优先输出 literal OLD/NEW exact_replace "
+            "patch envelope",
+        ),
+        (
+            "old_lines/new_lines（兼容 old/new）",
+            "literal OLD/NEW",
+        ),
+        (
+            "old_lines/new_lines exact_replace",
+            "literal OLD/NEW exact_replace",
+        ),
+        (
+            "exact_replace JSON patch",
+            "literal exact_replace patch envelope",
+        ),
+        (
+            "old_lines 必须包含",
+            "OLD 必须包含",
+        ),
+        (
+            "纳入 old_lines",
+            "纳入 OLD",
+        ),
+        (
+            "new_lines",
+            "NEW",
+        ),
+        (
+            "old_lines",
+            "OLD",
+        ),
+    )
+
+    for old, new in replacements:
+        value = value.replace(old, new)
+
+    return value
+
+
+def _build_literal_patch_boundary(
+    *,
+    current_content: str,
+    file_path: str,
+) -> str:
+    """Build a marker token not present in current target content."""
+    path_token = re.sub(
+        r"[^A-Za-z0-9]+",
+        "_",
+        str(file_path or ""),
+    ).strip("_").upper()
+
+    path_token = (
+        path_token or "TARGET"
+    )[-40:]
+
+    base = f"CREATOR_PATCH_{path_token}"
+    candidate = base
+    index = 1
+
+    source = str(current_content or "")
+
+    while candidate in source:
+        index += 1
+        candidate = f"{base}_{index}"
+
+    return candidate
+
+
+def _literal_patch_marker(
+    boundary: str,
+    kind: str,
+) -> str:
+    return f"<<<{kind}:{boundary}>>>"
+
+
+def _literal_patch_protocol_example(
+    *,
+    file_path: str,
+    boundary: str,
+) -> str:
+    """Return a format-only literal patch example."""
     return (
-        "FORMAT_VIOLATION：上一次输出不是可接受的 repair diff proposal。\n"
-        f"解析错误：{type(error).__name__}: {error}\n\n"
-        "你必须重新输出严格 JSON object，且只包含 target_file、reason、edits 或 diff。\n"
-        "首选 edits[].old_lines/new_lines；diff 必须是 single-file unified diff，必须包含 ---、+++、@@ hunk。\n"
-        "禁止输出完整文件源码。\n"
-        "禁止输出 Markdown 解释。\n"
-        "禁止新增、删除或修改其它文件。\n\n"
-        "上一次输出片段如下：\n"
-        "```text\n"
-        f"{str(raw_text or '')[:4000]}\n"
-        "```"
+        f"{_literal_patch_marker(boundary, 'CREATOR_PATCH')}\n"
+        f"TARGET_FILE: {file_path}\n"
+        "REASON: 只修复当前真实失败\n"
+        "\n"
+        f"{_literal_patch_marker(boundary, 'EDIT')}\n"
+        f"{_literal_patch_marker(boundary, 'OLD')}\n"
+        "python scripts/example.py "
+        "'{\"topic\": \"{{topic}}\"}'\n"
+        f"{_literal_patch_marker(boundary, 'NEW')}\n"
+        "python scripts/example.py "
+        "'{\"topic\": \"{{text_content}}\"}'\n"
+        f"{_literal_patch_marker(boundary, 'END_EDIT')}\n"
+        "\n"
+        f"{_literal_patch_marker(boundary, 'END_PATCH')}"
+    )
+
+
+def _find_literal_patch_marker(
+    text: str,
+    marker: str,
+    *,
+    start: int = 0,
+) -> re.Match[str] | None:
+    """Find one literal-patch marker as a standalone line."""
+    pattern = re.compile(
+        rf"(?m)^[ \t]*"
+        rf"{re.escape(marker)}"
+        rf"[ \t]*(?:\r?\n|$)"
+    )
+
+    return pattern.search(
+        str(text or ""),
+        max(0, start),
+    )
+
+
+def _remove_one_protocol_terminal_newline(
+    text: str,
+) -> str:
+    """Remove exactly one envelope separator newline.
+
+    marker 必须独占一行。
+
+    因此 literal payload 与下一个 marker 之间会存在一次
+    protocol separator newline。
+
+    这里只删除一次，不 strip 其它空白，避免修改真实源码。
+    """
+    value = str(text or "")
+
+    if value.endswith("\r\n"):
+        return value[:-2]
+
+    if value.endswith("\n"):
+        return value[:-1]
+
+    return value
+
+
+def _extract_literal_exact_replace_proposal(
+    text: str,
+    *,
+    expected_target_file: str,
+    boundary: str,
+) -> CreatorDiffProposal | None:
+    """Parse one literal OLD/NEW exact-replace patch envelope.
+
+    OLD 和 NEW 是目标文件 literal source text。
+
+    不调用 json.loads。
+    不做 JSON string unescape。
+    不修复 escape。
+    不猜模型意图。
+    """
+    source = str(text or "").strip()
+
+    if not boundary:
+        return None
+
+    patch_marker = _literal_patch_marker(
+        boundary,
+        "CREATOR_PATCH",
+    )
+
+    edit_marker = _literal_patch_marker(
+        boundary,
+        "EDIT",
+    )
+
+    old_marker = _literal_patch_marker(
+        boundary,
+        "OLD",
+    )
+
+    new_marker = _literal_patch_marker(
+        boundary,
+        "NEW",
+    )
+
+    end_edit_marker = _literal_patch_marker(
+        boundary,
+        "END_EDIT",
+    )
+
+    end_patch_marker = _literal_patch_marker(
+        boundary,
+        "END_PATCH",
+    )
+
+    if (
+        "<<<CREATOR_PATCH:" in source
+        and patch_marker not in source
+    ):
+        raise ValueError(
+            "literal patch boundary 不匹配："
+            f"expected={boundary!r}"
+        )
+
+    patch_start = _find_literal_patch_marker(
+        source,
+        patch_marker,
+    )
+
+    if patch_start is None:
+        return None
+
+    patch_end = _find_literal_patch_marker(
+        source,
+        end_patch_marker,
+        start=patch_start.end(),
+    )
+
+    if patch_end is None:
+        raise ValueError(
+            "literal exact_replace patch 缺少 "
+            f"{end_patch_marker}"
+        )
+
+    if source[
+        :patch_start.start()
+    ].strip():
+        raise ValueError(
+            "literal exact_replace patch 前存在额外输出；"
+            "只能返回 patch envelope。"
+        )
+
+    if source[
+        patch_end.end():
+    ].strip():
+        raise ValueError(
+            "literal exact_replace patch 后存在额外输出；"
+            "只能返回 patch envelope。"
+        )
+
+    body = source[
+        patch_start.end():
+        patch_end.start()
+    ]
+
+    first_edit = _find_literal_patch_marker(
+        body,
+        edit_marker,
+    )
+
+    if first_edit is None:
+        raise ValueError(
+            "literal exact_replace patch 没有 EDIT。"
+        )
+
+    header = body[
+        :first_edit.start()
+    ]
+
+    target_match = re.search(
+        r"(?m)^[ \t]*"
+        r"TARGET_FILE:"
+        r"[ \t]*(.+?)[ \t]*\r?$",
+        header,
+    )
+
+    if target_match is None:
+        raise ValueError(
+            "literal exact_replace patch "
+            "缺少 TARGET_FILE。"
+        )
+
+    target_file = _strip_diff_path_prefix(
+        target_match.group(1)
+    )
+
+    if target_file != expected_target_file:
+        raise ValueError(
+            "literal exact_replace target_file 不匹配："
+            f"expected={expected_target_file!r}, "
+            f"actual={target_file!r}"
+        )
+
+    reason_match = re.search(
+        r"(?m)^[ \t]*"
+        r"REASON:"
+        r"[ \t]*(.*?)[ \t]*\r?$",
+        header,
+    )
+
+    reason = (
+        reason_match.group(1).strip()
+        if reason_match
+        else "literal exact_replace proposal"
+    )
+
+    edits: list[
+        dict[str, str]
+    ] = []
+
+    cursor = first_edit.start()
+
+    while cursor < len(body):
+        if not body[
+            cursor:
+        ].strip():
+            break
+
+        edit_start = _find_literal_patch_marker(
+            body,
+            edit_marker,
+            start=cursor,
+        )
+
+        if edit_start is None:
+            raise ValueError(
+                "literal exact_replace patch "
+                "EDIT 结构不完整。"
+            )
+
+        if body[
+            cursor:
+            edit_start.start()
+        ].strip():
+            raise ValueError(
+                "literal exact_replace EDIT "
+                "之间存在非法内容。"
+            )
+
+        old_start = _find_literal_patch_marker(
+            body,
+            old_marker,
+            start=edit_start.end(),
+        )
+
+        if old_start is None:
+            raise ValueError(
+                "literal exact_replace EDIT "
+                "缺少 OLD marker。"
+            )
+
+        if body[
+            edit_start.end():
+            old_start.start()
+        ].strip():
+            raise ValueError(
+                "EDIT 与 OLD marker "
+                "之间存在非法内容。"
+            )
+
+        new_start = _find_literal_patch_marker(
+            body,
+            new_marker,
+            start=old_start.end(),
+        )
+
+        if new_start is None:
+            raise ValueError(
+                "literal exact_replace EDIT "
+                "缺少 NEW marker。"
+            )
+
+        end_edit = _find_literal_patch_marker(
+            body,
+            end_edit_marker,
+            start=new_start.end(),
+        )
+
+        if end_edit is None:
+            raise ValueError(
+                "literal exact_replace EDIT "
+                "缺少 END_EDIT marker。"
+            )
+
+        old = (
+            _remove_one_protocol_terminal_newline(
+                body[
+                    old_start.end():
+                    new_start.start()
+                ]
+            )
+        )
+
+        new = (
+            _remove_one_protocol_terminal_newline(
+                body[
+                    new_start.end():
+                    end_edit.start()
+                ]
+            )
+        )
+
+        if not old:
+            raise ValueError(
+                "literal exact_replace OLD 不能为空。"
+            )
+
+        edits.append({
+            "old": old,
+            "new": new,
+        })
+
+        cursor = end_edit.end()
+
+    if not edits:
+        raise ValueError(
+            "literal exact_replace patch "
+            "没有有效 edits。"
+        )
+
+    return CreatorDiffProposal(
+        target_file=target_file,
+        reason=reason,
+        edits=edits,
+        raw={
+            "target_file": target_file,
+            "reason": reason,
+            "transport": (
+                "literal_exact_replace"
+            ),
+            "boundary": boundary,
+            "edit_count": len(edits),
+        },
+        mode="exact_replace",
+    )
+
+def _format_diff_response_violation(
+    error: Exception,
+    raw_text: str,
+    *,
+    file_path: str,
+    boundary: str,
+) -> str:
+    example = _literal_patch_protocol_example(
+        file_path=file_path,
+        boundary=boundary,
+    )
+
+    return (
+        "FORMAT_VIOLATION：上一次输出不是可接受的 "
+        "literal repair patch envelope。\n"
+        f"解析错误："
+        f"{type(error).__name__}: {error}\n\n"
+        "重新输出 literal OLD/NEW exact_replace patch。\n"
+        "OLD 和 NEW 是目标文件字面源码，不是 JSON string。\n"
+        "不要 JSON encode OLD/NEW；"
+        "不要为了 transport 给源码中的双引号增加反斜杠。\n"
+        "例如目标文件中是 \"，"
+        "OLD/NEW 中仍然直接写 \"；"
+        "只有目标文件本身真的包含反斜杠时才写反斜杠。\n"
+        "{{placeholder}} 是普通 literal source text，"
+        "原样复制。\n"
+        "必须继续使用完全相同的 boundary。\n"
+        "禁止输出完整文件、JSON patch、unified diff、"
+        "Markdown fence 或 envelope 外解释。\n\n"
+        "协议形态示例（只展示格式，不可照抄示例源码）：\n"
+        f"{example}\n\n"
+        "上一次输出片段：\n"
+        f"{str(raw_text or '')[:4000]}"
     )
 
 class CreatorRepairProposalParseError(ValueError):
@@ -292,93 +756,254 @@ def _extract_json_or_diff_proposal(
     *,
     expected_target_file: str,
     allow_tool_explore: bool = True,
+    literal_boundary: str | None = None,
 ) -> CreatorDiffProposal:
-    """Parse model repair proposal.
+    """Parse a Creator source-repair proposal.
 
-    优先接受 exact_replace JSON：
+    Main transport:
+    - literal OLD/NEW exact-replace envelope
 
-    {
-      "target_file": "scripts/x.py",
-      "reason": "...",
-      "edits": [
-        {"old": "...", "new": "..."}
-      ]
-    }
-
-    兜底接受 unified diff，但不推荐让 Qwen 主路径写 diff。
+    Compatibility fallbacks:
+    - legacy exact_replace JSON
+    - single-file unified diff
     """
-
     raw_text = str(text or "").strip()
-    stripped = _strip_outer_code_fence(raw_text)
 
-    parsed: dict[str, Any] | None = None
-    parser_error = ""
+    stripped = _strip_outer_code_fence(
+        raw_text
+    )
+
+    parser_errors: list[str] = []
+
+    parsed: dict[
+        str,
+        Any,
+    ] | None = None
+
     diff_extraction_attempted = False
     lines_fallback_attempted = False
 
+    # ---------------------------------------------------------
+    # Pass 1: literal OLD/NEW exact_replace
+    # ---------------------------------------------------------
+
+    if literal_boundary:
+        try:
+            literal_proposal = (
+                _extract_literal_exact_replace_proposal(
+                    raw_text,
+                    expected_target_file=(
+                        expected_target_file
+                    ),
+                    boundary=literal_boundary,
+                )
+            )
+
+        except Exception as exc:
+            raise CreatorRepairProposalParseError(
+                "修复模型返回了 malformed literal "
+                "exact_replace patch envelope。",
+                parser_error=(
+                    "literal_exact_replace: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                last_output_excerpt=raw_text,
+                diff_extraction_attempted=False,
+                lines_fallback_attempted=False,
+            ) from exc
+
+        if literal_proposal is not None:
+            return literal_proposal
+
+    # ---------------------------------------------------------
+    # Pass 2: legacy strict JSON compatibility
+    # ---------------------------------------------------------
+
     try:
-        maybe_json = json.loads(stripped)
-        if isinstance(maybe_json, dict):
+        maybe_json = json.loads(
+            stripped
+        )
+
+        if isinstance(
+            maybe_json,
+            dict,
+        ):
             parsed = maybe_json
+
+        else:
+            parser_errors.append(
+                "top-level JSON must be object; "
+                f"actual="
+                f"{type(maybe_json).__name__}"
+            )
+
     except json.JSONDecodeError as exc:
-        parser_error = f"{type(exc).__name__}: {exc}"
-        parsed = None
+        parser_errors.append(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # ---------------------------------------------------------
+    # Pass 3: extracted legacy patch-like JSON
+    # ---------------------------------------------------------
 
     if parsed is None:
-        json_text = _extract_patch_like_json_text(raw_text)
+        json_text = (
+            _extract_patch_like_json_text(
+                raw_text
+            )
+        )
+
         if json_text:
             try:
-                maybe_json = json.loads(json_text)
-                if isinstance(maybe_json, dict):
-                    parsed = maybe_json
-            except json.JSONDecodeError as exc:
-                parser_error = f"{type(exc).__name__}: {exc}"
-                parsed = None
+                maybe_json = json.loads(
+                    json_text
+                )
 
-    if isinstance(parsed, dict):
+                if isinstance(
+                    maybe_json,
+                    dict,
+                ):
+                    parsed = maybe_json
+
+                else:
+                    parser_errors.append(
+                        "extracted patch JSON "
+                        "must be object"
+                    )
+
+            except json.JSONDecodeError as exc:
+                parser_errors.append(
+                    "extracted JSON: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    if isinstance(
+        parsed,
+        dict,
+    ):
         lines_fallback_attempted = True
-        return _coerce_patch_schema_fields(parsed, expected_target_file=expected_target_file, allow_tool_explore=allow_tool_explore)
+
+        return _coerce_patch_schema_fields(
+            parsed,
+            expected_target_file=(
+                expected_target_file
+            ),
+            allow_tool_explore=(
+                allow_tool_explore
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # Pass 4: malformed JSON carrying recoverable diff
+    # ---------------------------------------------------------
 
     diff_extraction_attempted = True
-    recovered_diff = _extract_diff_payload_from_malformed_patch_text(raw_text)
+
+    recovered_diff = (
+        _extract_diff_payload_from_malformed_patch_text(
+            raw_text
+        )
+    )
+
     if recovered_diff:
-        old_path, new_path = _unified_diff_target_files(recovered_diff)
-        if new_path != expected_target_file or old_path not in {expected_target_file, new_path}:
-            raise ValueError(f"recovered diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}")
+        old_path, new_path = (
+            _unified_diff_target_files(
+                recovered_diff
+            )
+        )
+
+        if (
+            new_path != expected_target_file
+            or old_path not in {
+                expected_target_file,
+                new_path,
+            }
+        ):
+            raise ValueError(
+                "recovered diff target_file 不匹配："
+                f"expected="
+                f"{expected_target_file!r}, "
+                f"actual={new_path!r}"
+            )
+
         return CreatorDiffProposal(
             target_file=expected_target_file,
-            reason="recovered unified diff proposal",
+            reason=(
+                "recovered unified diff proposal"
+            ),
             diff=recovered_diff,
-            raw={"target_file": expected_target_file, "diff": recovered_diff},
+            raw={
+                "target_file": (
+                    expected_target_file
+                ),
+                "diff": recovered_diff,
+            },
             mode="unified_diff",
         )
 
-    raw_diff = stripped
-    fence_match = re.search(r"```(?:diff|patch)?\s*(.*?)```", raw_text, re.S | re.I)
-    if fence_match:
-        raw_diff = fence_match.group(1).strip()
+    # ---------------------------------------------------------
+    # Pass 5: raw unified diff compatibility
+    # ---------------------------------------------------------
 
-    if not _looks_like_unified_diff(raw_diff):
-        raise CreatorRepairProposalParseError(
-            "修复模型没有返回 exact_replace JSON，也没有返回 raw unified diff。"
-            "如果输出的是完整源码，必须拒绝并要求模型重新输出 edits old_lines/new_lines patch。"
-            ,
-            parser_error=parser_error or "no patch-schema JSON or unified diff found",
-            last_output_excerpt=raw_text,
-            diff_extraction_attempted=diff_extraction_attempted,
-            lines_fallback_attempted=lines_fallback_attempted,
+    raw_diff = stripped
+
+    fence_match = re.search(
+        r"```(?:diff|patch)?\s*(.*?)```",
+        raw_text,
+        re.S | re.I,
+    )
+
+    if fence_match:
+        raw_diff = (
+            fence_match
+            .group(1)
+            .strip()
         )
 
-    old_path, new_path = _unified_diff_target_files(raw_diff)
+    if not _looks_like_unified_diff(
+        raw_diff
+    ):
+        raise CreatorRepairProposalParseError(
+            "修复模型没有返回 literal exact_replace "
+            "patch envelope，也没有返回兼容的 "
+            "legacy patch JSON 或 raw unified diff。",
+            parser_error=(
+                " | ".join(parser_errors)
+                or (
+                    "no supported patch "
+                    "proposal found"
+                )
+            ),
+            last_output_excerpt=raw_text,
+            diff_extraction_attempted=(
+                diff_extraction_attempted
+            ),
+            lines_fallback_attempted=(
+                lines_fallback_attempted
+            ),
+        )
+
+    old_path, new_path = (
+        _unified_diff_target_files(
+            raw_diff
+        )
+    )
 
     if new_path != expected_target_file:
         raise ValueError(
-            f"raw diff target_file 不匹配：expected={expected_target_file!r}, actual={new_path!r}"
+            "raw diff target_file 不匹配："
+            f"expected={expected_target_file!r}, "
+            f"actual={new_path!r}"
         )
 
-    if old_path not in {expected_target_file, new_path}:
+    if old_path not in {
+        expected_target_file,
+        new_path,
+    }:
         raise ValueError(
-            f"raw diff old file 不匹配：expected={expected_target_file!r}, actual={old_path!r}"
+            "raw diff old file 不匹配："
+            f"expected={expected_target_file!r}, "
+            f"actual={old_path!r}"
         )
 
     return CreatorDiffProposal(
@@ -1448,27 +2073,61 @@ async def _request_repair_diff_proposal(
     target_rule: str,
     format_retry_limit: int = 2,
 ) -> CreatorDiffProposal:
-    """Ask coding model for a repair patch proposal.
+    """Ask coding model for one literal localized source patch."""
+    boundary = _build_literal_patch_boundary(
+        current_content=current_content,
+        file_path=file_path,
+    )
 
-    优先要求 exact_replace old_lines/new_lines。
-    兜底兼容 unified diff。
-    """
+    example = _literal_patch_protocol_example(
+        file_path=file_path,
+        boundary=boundary,
+    )
+
+    scope_payload = scope.to_prompt_dict()
+
+    scope_payload["notes"] = [
+        _normalize_source_patch_prompt_text(
+            note
+        )
+        for note in (
+            scope_payload.get("notes")
+            or []
+        )
+    ]
+
+    normalized_target_rule = (
+        _normalize_source_patch_prompt_text(
+            target_rule
+        )
+    )
 
     messages = [
         {
             "role": "system",
             "content": (
                 "你是 superskills Creator 的局部修复代码模型。\n"
-                "你只能输出严格 JSON object，不能输出 Markdown 解释。\n"
-                "你不能输出完整文件，只能输出 target_file 的局部 patch。\n"
-                "优先使用 edits old_lines/new_lines exact_replace 格式，不要手写 unified diff hunk 行号。\n"
-                "本轮只允许修复 target_file。\n"
-                "不要新增文件、删除文件、修改其它文件。\n"
+                "你只能输出 literal exact_replace patch envelope；"
+                "不能输出 JSON patch、unified diff、"
+                "Markdown 解释或完整文件。\n"
+                "OLD 和 NEW 是目标文件 literal source text，"
+                "不是 JSON string。\n"
+                "因此源码中的双引号、单引号、反斜杠、正则、"
+                "shell JSON argv、{{placeholder}} "
+                "必须按目标文件真实内容原样输出。\n"
+                "禁止为了 patch transport 增加 JSON escape；"
+                "禁止把普通 \" 改写成 \\\"。\n"
+                "本轮只允许修复 target_file；"
+                "不要新增文件、删除文件或修改其它文件。\n"
                 "不要在 Creator repair 层重新定义平台 IO。"
-                "收到 basic_format/python_compile_error/markdown_basic_format_error 时，只修格式；"
-                "不要修改工具选择、argv schema、stdout 字段或业务职责。"
-                "只有 sandbox/E2E 错误才修 workflow/argv/stdout/artifact 链路。"
-                "平台兼容性会由后续 sandbox / smoke / E2E 真实试运行判断。\n"
+                "收到 basic_format/python_compile_error/"
+                "markdown_basic_format_error 时，只修格式；"
+                "不要修改工具选择、argv schema、"
+                "stdout 字段或业务职责。"
+                "只有 sandbox/E2E 错误才修 "
+                "workflow/argv/stdout/artifact 链路。"
+                "平台兼容性由后续 sandbox / smoke / "
+                "E2E 真实试运行判断。\n"
             ),
         },
         {
@@ -1476,9 +2135,9 @@ async def _request_repair_diff_proposal(
             "content": (
                 f"目标文件：{file_path}\n\n"
                 "RepairScope：\n"
-                f"{json.dumps(scope.to_prompt_dict(), ensure_ascii=False, indent=2)}\n\n"
+                f"{json.dumps(scope_payload, ensure_ascii=False, indent=2)}\n\n"
                 "本轮修复规则：\n"
-                f"{target_rule}\n\n"
+                f"{normalized_target_rule}\n\n"
                 "sandbox IO 前置协议：\n"
                 f"{_sandbox_io_contract_text_for_creator()}\n\n"
                 "真实失败来源：\n"
@@ -1489,30 +2148,36 @@ async def _request_repair_diff_proposal(
                 "```text\n"
                 f"{current_content}\n"
                 "```\n\n"
-                "只返回严格 JSON object。对 SKILL.md、Markdown、shell command block、包含 JSON argv 的片段，首选如下 old_lines/new_lines 格式：\n"
-                "{\n"
-                f"  \"target_file\": \"{file_path}\",\n"
-                "  \"reason\": \"为什么这个 patch 只修复当前真实失败\",\n"
-                "  \"edits\": [\n"
-                "    {\n"
-                "      \"old_lines\": [\n"
-                "        \"从当前文件逐行复制的旧内容\"\n"
-                "      ],\n"
-                "      \"new_lines\": [\n"
-                "        \"替换后的新内容\"\n"
-                "      ]\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
+                "只返回 literal patch envelope。\n"
+                "协议形态示例仅展示 transport 格式，"
+                "示例源码不可照抄：\n"
+                f"{example}\n\n"
                 "要求：\n"
-                "1. old_lines 每个数组元素是一行当前文件原文；后端会用 \\n join，不需要在单个字符串里转义整段 shell JSON。\n"
-                "2. new_lines 每个数组元素是一行目标文件内容；proposal JSON 的转义不能污染目标文件内容。\n"
-                "3. 不要为了让 proposal JSON 合法，就把 SKILL.md 里的 shell argv 改成带反斜杠的内容。\n"
-                "4. old_lines join 后必须从当前文件逐字复制，且唯一出现。\n"
-                "5. 不要输出完整文件源码。\n"
-                "6. 不要输出 Markdown。\n"
-                "7. 不要手写 unified diff，除非你非常确定 hunk 完全正确。\n"
-                "8. old/new 单字符串仅为兼容旧格式；本轮不要作为首选。\n"
+                f"1. 必须原样使用 boundary={boundary}；"
+                "所有 marker 必须独占一行。\n"
+                f"2. TARGET_FILE 必须严格等于 {file_path}。\n"
+                "3. OLD 必须从当前目标文件逐字复制；"
+                "OLD 是源码，不是 JSON string，"
+                "不做 JSON escaping。\n"
+                "4. NEW 是最终写回目标文件的真实源码；"
+                "NEW 也不是 JSON string，"
+                "不做 transport escaping。\n"
+                "5. shell JSON argv 中原文是 \"，"
+                "OLD/NEW 就直接写 \"；"
+                "原文没有反斜杠时不得添加反斜杠。\n"
+                "6. {{placeholder}} 原样保留；"
+                "不要把双花括号当成 patch JSON 错误。\n"
+                "7. OLD 必须在当前文件中形成唯一可靠匹配；"
+                "优先复制完整失败行或更长连续局部片段。\n"
+                "8. NEW 必须产生真实语义变化；"
+                "OLD 与 NEW 完全相同的 no-op 禁止提交。\n"
+                "9. 每个 EDIT 只修改一个连续局部片段；"
+                "确有多个独立局部修改时可以输出多个 EDIT。\n"
+                "10. 删除内容时允许 NEW 为空。\n"
+                "11. 不要输出完整文件；"
+                "不要输出 ```json、```diff "
+                "或其它 Markdown fence；"
+                "不要输出 envelope 外文字。\n"
             ),
         },
     ]
@@ -1520,21 +2185,34 @@ async def _request_repair_diff_proposal(
     last_error: Exception | None = None
     last_text = ""
 
-    for attempt in range(1, max(1, format_retry_limit) + 1):
-        text = await complete_chat_once(messages, model)
+    for attempt in range(
+        1,
+        max(1, format_retry_limit) + 1,
+    ):
+        text = await complete_chat_once(
+            messages,
+            model,
+        )
+
         last_text = text
 
         try:
             return _extract_json_or_diff_proposal(
                 text,
                 expected_target_file=file_path,
-                allow_tool_explore=scope.allow_tool_explore,
+                allow_tool_explore=(
+                    scope.allow_tool_explore
+                ),
+                literal_boundary=boundary,
             )
 
         except Exception as exc:
             last_error = exc
+
             logger.warning(
-                "[Creator][repair_patch][format_violation] file=%s model=%s attempt=%d/%d error=%s",
+                "[Creator][repair_patch]"
+                "[format_violation] "
+                "file=%s model=%s attempt=%d/%d error=%s",
                 file_path,
                 model,
                 attempt,
@@ -1547,23 +2225,55 @@ async def _request_repair_diff_proposal(
 
             messages.append({
                 "role": "assistant",
-                "content": str(text or "")[:6000],
-            })
-            messages.append({
-                "role": "user",
-                "content": _format_diff_response_violation(exc, text),
+                "content": (
+                    str(text or "")[:6000]
+                ),
             })
 
+            messages.append({
+                "role": "user",
+                "content": (
+                    _format_diff_response_violation(
+                        exc,
+                        text,
+                        file_path=file_path,
+                        boundary=boundary,
+                    )
+                ),
+            })
+
+    last_error_type = (
+        type(last_error).__name__
+        if last_error
+        else "Unknown"
+    )
+
     raise CreatorRepairProposalParseError(
-        "修复模型连续没有返回合法 patch proposal，已拒绝应用。\n"
+        "修复模型连续没有返回合法 literal "
+        "patch proposal，已拒绝应用。\n"
         f"target_file={file_path}\n"
-        f"last_error={type(last_error).__name__ if last_error else 'Unknown'}: {last_error}\n"
+        f"last_error={last_error_type}: "
+        f"{last_error}\n"
         "last_output_excerpt:\n"
         f"{str(last_text or '')[:4000]}",
-        parser_error=str(last_error or ""),
+        parser_error=str(
+            last_error or ""
+        ),
         last_output_excerpt=last_text,
-        diff_extraction_attempted=bool(getattr(last_error, "diff_extraction_attempted", False)),
-        lines_fallback_attempted=bool(getattr(last_error, "lines_fallback_attempted", False)),
+        diff_extraction_attempted=bool(
+            getattr(
+                last_error,
+                "diff_extraction_attempted",
+                False,
+            )
+        ),
+        lines_fallback_attempted=bool(
+            getattr(
+                last_error,
+                "lines_fallback_attempted",
+                False,
+            )
+        ),
     )
 
 async def _request_and_apply_repair_patch(
@@ -1576,20 +2286,27 @@ async def _request_and_apply_repair_patch(
     task_context: str,
     target_rule: str,
     patch_retry_limit: int = 3,
-) -> tuple[CreatorDiffProposal, str, dict[str, Any]]:
-    """Request patch, apply patch, and retry on parse/apply failure.
+) -> tuple[
+    CreatorDiffProposal,
+    str,
+    dict[str, Any],
+]:
+    """Request, apply, and retry one localized source patch.
 
-    不做业务规则判断。
-    只做：
-    - 格式失败反馈；
-    - old_lines/new_lines（兼容 old/new）匹配失败反馈；
-    - no-op patch 反馈；
-    - runtime traceback 优先级反馈。
+    This layer only owns:
+    - proposal transport/parse feedback;
+    - literal OLD/NEW matching feedback;
+    - no-op feedback;
+    - runtime traceback priority feedback.
+
+    Business correctness remains owned by smoke/sandbox/E2E reruns.
     """
-
     runtime_priority_note = ""
+
     if any(
-        marker in str(failure_text or "")
+        marker in str(
+            failure_text or ""
+        )
         for marker in (
             "Traceback",
             "stderr=",
@@ -1604,113 +2321,289 @@ async def _request_and_apply_repair_patch(
         )
     ):
         runtime_priority_note = (
-            "RUNTIME_TRACEBACK_PRIORITY：这是 smoke/trial run 真实运行失败。"
-            "修复时必须优先依据 raw stderr Traceback、exit_code、报错源码行和异常类型。"
-            "validator 的解释只作为辅助说明；如果 validator 解释与 Traceback 冲突，以 Traceback 为准。"
+            "RUNTIME_TRACEBACK_PRIORITY："
+            "这是 smoke/trial run 真实运行失败。"
+            "修复时必须优先依据 raw stderr Traceback、"
+            "exit_code、报错源码行和异常类型。"
+            "validator 的解释只作为辅助说明；"
+            "如果 validator 解释与 Traceback 冲突，"
+            "以 Traceback 为准。"
             "不要修改与 Traceback 无关的位置。"
         )
 
     argv_probe_note = ""
-    if scope.phase == "workflow_e2e" and any(
-        marker in f"{failure_text}\n{task_context}"
-        for marker in ("argv_schema_error", "strict_json_argv_guard")
+
+    if (
+        scope.phase == "workflow_e2e"
+        and any(
+            marker
+            in f"{failure_text}\n{task_context}"
+            for marker in (
+                "argv_schema_error",
+                "strict_json_argv_guard",
+            )
+        )
     ):
         argv_probe_note = (
-            "ARGV_SCHEMA_REPAIR_ALIGNMENT：strict_json_argv_guard 是探针，不是默认修复目标；"
-            "禁止只 patch guard schema。修复要对齐 SKILL.md block 调用、script entry、script core；"
+            "ARGV_SCHEMA_REPAIR_ALIGNMENT："
+            "strict_json_argv_guard 是探针，"
+            "不是默认修复目标；"
+            "禁止只 patch guard schema。"
+            "修复要对齐 SKILL.md block 调用、"
+            "script entry、script core；"
             "不能删除业务参数/功能覆盖面。"
         )
 
-    extra_notes = "\n\n".join(note for note in (runtime_priority_note, argv_probe_note) if note)
-    accumulated_failure = failure_text + ("\n\n" + extra_notes if extra_notes else "")
-    accumulated_context = task_context + ("\n\n" + extra_notes if extra_notes else "")
+    extra_notes = "\n\n".join(
+        note
+        for note in (
+            runtime_priority_note,
+            argv_probe_note,
+        )
+        if note
+    )
+
+    accumulated_failure = (
+        failure_text
+        + (
+            "\n\n" + extra_notes
+            if extra_notes
+            else ""
+        )
+    )
+
+    accumulated_context = (
+        task_context
+        + (
+            "\n\n" + extra_notes
+            if extra_notes
+            else ""
+        )
+    )
+
     last_error: Exception | None = None
     last_proposal_excerpt = ""
-    failed_proposal_counts: dict[str, int] = {}
 
-    for attempt in range(1, max(1, patch_retry_limit) + 1):
+    failed_proposal_counts: dict[
+        str,
+        int,
+    ] = {}
+
+    for attempt in range(
+        1,
+        max(1, patch_retry_limit) + 1,
+    ):
         proposal_signature: str | None = None
+
         try:
-            proposal = await _request_repair_diff_proposal(
-                model=model,
-                file_path=file_path,
-                current_content=current_content,
-                failure_text=accumulated_failure,
-                scope=scope,
-                task_context=accumulated_context,
-                target_rule=target_rule,
-                format_retry_limit=2,
+            proposal = (
+                await _request_repair_diff_proposal(
+                    model=model,
+                    file_path=file_path,
+                    current_content=current_content,
+                    failure_text=accumulated_failure,
+                    scope=scope,
+                    task_context=accumulated_context,
+                    target_rule=target_rule,
+                    format_retry_limit=2,
+                )
             )
 
-            proposal_signature_payload = proposal.raw if proposal.raw is not None else {
-                "target_file": proposal.target_file,
-                "reason": proposal.reason,
+            # 注意：
+            # signature 使用 normalized semantic patch。
+            #
+            # 不使用 proposal.raw。
+            # 不使用 reason。
+            # 不使用 literal boundary。
+            #
+            # 防止模型仅修改 transport 序列化方式或 reason
+            # 来绕过 repeated proposal detection。
+            proposal_signature_payload = {
+                "target_file": (
+                    proposal.target_file
+                ),
                 "mode": proposal.mode,
-                "diff": proposal.diff[:2000],
+                "diff": proposal.diff,
                 "edits": proposal.edits,
             }
-            last_proposal_excerpt = json.dumps(
+
+            last_proposal_excerpt = (
+                json.dumps(
+                    {
+                        "normalized_patch": (
+                            proposal_signature_payload
+                        ),
+                        "reason": proposal.reason,
+                        "transport": (
+                            proposal.raw or {}
+                        ).get(
+                            "transport"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )[:5000]
+            )
+
+            proposal_signature = json.dumps(
                 proposal_signature_payload,
                 ensure_ascii=False,
+                sort_keys=True,
                 default=str,
-            )[:5000]
-            proposal_signature = json.dumps(proposal_signature_payload, ensure_ascii=False, sort_keys=True, default=str)
+            )
 
-            if failed_proposal_counts.get(proposal_signature, 0) >= 1:
+            if (
+                failed_proposal_counts.get(
+                    proposal_signature,
+                    0,
+                )
+                >= 1
+            ):
                 repeated_excerpt = ""
+
                 if proposal.edits:
-                    old_text = str(proposal.edits[0].get("old") or "")
-                    approx = _find_approximate_substring_span(current_content, old_text)
-                    repeated_excerpt = str(approx.get("matched_excerpt") or "")
+                    old_text = str(
+                        proposal
+                        .edits[0]
+                        .get("old")
+                        or ""
+                    )
+
+                    approx = (
+                        _find_approximate_substring_span(
+                            current_content,
+                            old_text,
+                        )
+                    )
+
+                    repeated_excerpt = str(
+                        approx.get(
+                            "matched_excerpt"
+                        )
+                        or ""
+                    )
+
                 raise ValueError(
-                    "REPEATED_UNAPPLICABLE_PROPOSAL：连续两轮 proposal 完全相同且上一轮不可应用，"
-                    "禁止再次提交同一 old。请直接复制下面最相近候选原文片段作为新的 old，或提供更长唯一片段。\n"
+                    "REPEATED_UNAPPLICABLE_PROPOSAL："
+                    "连续两轮 normalized patch 完全相同，"
+                    "且上一轮不可应用。"
+                    "修改 reason、boundary 或 transport "
+                    "序列化方式不算新的 patch。"
+                    "请直接复制下面最相近候选原文片段"
+                    "作为新的 OLD，或提供更长唯一 OLD。\n"
                     "```text\n"
                     f"{repeated_excerpt}\n"
                     "```"
                 )
 
-            candidate, diff_stats = _validate_repair_diff_scope(
-                proposal=proposal,
-                current_content=current_content,
-                scope=scope,
+            candidate, diff_stats = (
+                _validate_repair_diff_scope(
+                    proposal=proposal,
+                    current_content=current_content,
+                    scope=scope,
+                )
             )
 
-            diff_stats["repair_patch_attempt"] = attempt
-            return proposal, candidate, diff_stats
+            diff_stats[
+                "repair_patch_attempt"
+            ] = attempt
+
+            return (
+                proposal,
+                candidate,
+                diff_stats,
+            )
 
         except Exception as exc:
             last_error = exc
+
             if proposal_signature is not None:
-                failed_proposal_counts[proposal_signature] = failed_proposal_counts.get(proposal_signature, 0) + 1
+                failed_proposal_counts[
+                    proposal_signature
+                ] = (
+                    failed_proposal_counts.get(
+                        proposal_signature,
+                        0,
+                    )
+                    + 1
+                )
+
             is_markdown_hard_format_regression = (
-                (file_path == "SKILL.md" or file_path.startswith("references/") or _is_markdown_file(file_path))
+                (
+                    file_path == "SKILL.md"
+                    or file_path.startswith(
+                        "references/"
+                    )
+                    or _is_markdown_file(
+                        file_path
+                    )
+                )
                 and (
-                    "hard_format_regression" in str(exc)
-                    or "markdown.fences.unclosed" in str(exc)
-                    or "markdown.fences.bash_unclosed" in str(exc)
-                    or "markdown.frontmatter.unclosed" in str(exc)
-                    or "model_patch_allowed" in str(exc)
+                    "hard_format_regression"
+                    in str(exc)
+                    or "markdown.fences.unclosed"
+                    in str(exc)
+                    or "markdown.fences.bash_unclosed"
+                    in str(exc)
+                    or "markdown.frontmatter.unclosed"
+                    in str(exc)
+                    or "model_patch_allowed"
+                    in str(exc)
                 )
             )
-            if is_markdown_hard_format_regression and scope.phase == "workflow_e2e":
+
+            if (
+                is_markdown_hard_format_regression
+                and scope.phase == "workflow_e2e"
+            ):
                 last_failure = (
-                    "PATCH_CANDIDATE_FORMAT_REGRESSED：原始 Markdown 格式已通过，但候选 patch 造成 hard_format_regression，已拒绝且未修改原文件。\n"
-                    "继续生成更小的 content-only patch：不要修 frontmatter；不要修 code fence；不要新增/删除 ``` 行；"
-                    "只修改失败命令那一行；old_lines 必须包含当前文件中的完整真实命令行；"
-                    "不要把 ```bash 和闭合 ``` 纳入 old_lines，除非完整包含闭合 fence。\n"
+                    "PATCH_CANDIDATE_FORMAT_REGRESSED："
+                    "原始 Markdown 格式已通过，"
+                    "但候选 patch 造成 hard_format_regression，"
+                    "已拒绝且未修改原文件。\n"
+                    "继续生成更小的 content-only patch："
+                    "不要修 frontmatter；"
+                    "不要修 code fence；"
+                    "不要新增/删除 ``` 行；"
+                    "只修改失败命令那一行；"
+                    "OLD 必须包含当前文件中的完整真实命令行；"
+                    "不要把 ```bash 和闭合 ``` 纳入 OLD，"
+                    "除非完整包含闭合 fence。\n"
                     f"validator_error={exc}"
                 )
-                accumulated_failure = failure_text + "\n\n" + last_failure
-                accumulated_context = task_context + "\n\n" + last_failure
+
+                accumulated_failure = (
+                    failure_text
+                    + "\n\n"
+                    + last_failure
+                )
+
+                accumulated_context = (
+                    task_context
+                    + "\n\n"
+                    + last_failure
+                )
+
                 continue
+
             if is_markdown_hard_format_regression:
                 raise
-            if isinstance(exc, CreatorRepairNoopPatch) or "REPEATED_UNAPPLICABLE_PROPOSAL" in str(exc):
+
+            # repeated semantic patch 才直接停止。
+            #
+            # CreatorRepairNoopPatch 不再在这里 break，
+            # 必须进入下面的 NO_OP_PATCH_REJECTED feedback。
+            if (
+                "REPEATED_UNAPPLICABLE_PROPOSAL"
+                in str(exc)
+            ):
                 break
 
             logger.warning(
-                "[Creator][repair_patch][apply_or_parse_failed] file=%s model=%s attempt=%d/%d error=%s",
+                "[Creator][repair_patch]"
+                "[apply_or_parse_failed] "
+                "file=%s model=%s "
+                "attempt=%d/%d error=%s",
                 file_path,
                 model,
                 attempt,
@@ -1721,55 +2614,113 @@ async def _request_and_apply_repair_patch(
             if attempt >= patch_retry_limit:
                 break
 
+            is_noop_patch = (
+                isinstance(
+                    exc,
+                    CreatorRepairNoopPatch,
+                )
+                or "proposal_noop"
+                in str(exc)
+                or "no-op"
+                in str(exc)
+                or "没有产生任何变化"
+                in str(exc)
+                or "old 与 new 完全相同"
+                in str(exc)
+            )
+
             no_op_note = ""
-            if (
-                "no-op" in str(exc)
-                or "没有产生任何变化" in str(exc)
-                or "old 与 new 完全相同" in str(exc)
-            ):
+
+            if is_noop_patch:
                 no_op_note = (
-                    "NO_OP_PATCH_REJECTED：上一轮 patch 没有产生真实变化。"
-                    "你不能提交 old 与 new 完全相同的 edit。"
-                    "new 必须真实改变当前失败内容。"
-                    "如果目标是在文件末尾补充内容，请让 old 选中当前文件末尾的一段真实文本，"
-                    "new 在该片段基础上追加缺失内容。"
+                    "NO_OP_PATCH_REJECTED："
+                    "上一轮 patch 在解析为真实 OLD/NEW 后"
+                    "没有产生目标文件变化。"
+                    "不能提交 OLD 与 NEW 完全相同的 edit。"
+                    "也不能只改变 patch transport 的 boundary、"
+                    "reason 或转义写法。"
+                    "NEW 必须真实改变当前失败内容。"
+                    "如果目标是在文件末尾补充内容，"
+                    "让 OLD 选中当前文件末尾的一段真实文本，"
+                    "NEW 在该片段基础上追加缺失内容。"
                 )
 
             apply_feedback = (
-                "\n\nPATCH_APPLY_OR_PARSE_FAILED：上一轮 patch 没有被后端接受。\n"
-                f"失败类型：{type(exc).__name__}\n"
+                "\n\n"
+                "PATCH_APPLY_OR_PARSE_FAILED："
+                "上一轮 patch 没有被后端接受。\n"
+                f"失败类型："
+                f"{type(exc).__name__}\n"
                 f"失败原因：{exc}\n\n"
                 f"{runtime_priority_note}\n\n"
                 f"{no_op_note}\n\n"
-                "请重新输出 exact_replace JSON patch，不要输出完整文件，不要手写 unified diff。\n"
-                "old 必须从当前目标文件逐字复制，且只出现一次。\n"
-                "new 必须真实改变当前失败内容。\n"
-                "如果 old 没匹配，请复制更准确的当前文件片段。\n"
-                "如果 old 匹配多次，请提供更长 old 片段。\n\n"
-                "上一轮 proposal 摘要：\n"
+                "请重新输出 literal OLD/NEW exact_replace "
+                "patch envelope。"
+                "不要输出完整文件、JSON patch "
+                "或 unified diff。\n"
+                "OLD 必须从当前目标文件逐字复制，"
+                "且只出现一次。\n"
+                "NEW 必须真实改变当前失败内容。\n"
+                "OLD/NEW 中的引号和反斜杠"
+                "是目标文件字面内容；"
+                "不要为了 transport 添加 JSON escape。\n"
+                "如果 OLD 没匹配，"
+                "复制更准确的当前文件片段。\n"
+                "如果 OLD 匹配多次，"
+                "提供更长 OLD 片段。\n\n"
+                "上一轮 normalized proposal 摘要：\n"
                 "```text\n"
                 f"{last_proposal_excerpt}\n"
                 "```\n"
             )
 
-            accumulated_failure = failure_text + apply_feedback
-            accumulated_context = task_context + apply_feedback
+            accumulated_failure = (
+                failure_text
+                + apply_feedback
+            )
 
-    if isinstance(last_error, CreatorRepairProposalParseError):
+            accumulated_context = (
+                task_context
+                + apply_feedback
+            )
+
+    if isinstance(
+        last_error,
+        CreatorRepairProposalParseError,
+    ):
         raise CreatorRepairProposalParseError(
-            "修复模型连续提出无法解析的 patch，已停止本轮 repair。\n"
+            "修复模型连续提出无法解析的 patch，"
+            "已停止本轮 repair。\n"
             f"target_file={file_path}\n"
             f"last_error={last_error}",
-            parser_error=last_error.parser_error,
-            last_output_excerpt=last_error.last_output_excerpt,
-            diff_extraction_attempted=last_error.diff_extraction_attempted,
-            lines_fallback_attempted=last_error.lines_fallback_attempted,
+            parser_error=(
+                last_error.parser_error
+            ),
+            last_output_excerpt=(
+                last_error.last_output_excerpt
+            ),
+            diff_extraction_attempted=(
+                last_error
+                .diff_extraction_attempted
+            ),
+            lines_fallback_attempted=(
+                last_error
+                .lines_fallback_attempted
+            ),
         )
 
+    last_error_type = (
+        type(last_error).__name__
+        if last_error
+        else "Unknown"
+    )
+
     raise ValueError(
-        "修复模型连续提出无法解析或无法应用的 patch，已停止本轮 repair。\n"
+        "修复模型连续提出无法解析或无法应用的 patch，"
+        "已停止本轮 repair。\n"
         f"target_file={file_path}\n"
-        f"last_error={type(last_error).__name__ if last_error else 'Unknown'}: {last_error}\n"
+        f"last_error={last_error_type}: "
+        f"{last_error}\n"
     )
 
 async def _repair_generated_file_with_feedback(

@@ -13,20 +13,47 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 class ToolPoolAddToolRequest(BaseModel):
-    target_file: str
-    requested_capability: str = ''
+    """Planner proposal for one Skill-wide ToolPool tool.
+
+    target_file is retained only for backward compatibility with historical
+    Creator payloads. Skill-wide ToolPool authorization does not use it.
+    """
+
+    target_file: str = ""
+
+    requested_capability: str = ""
+
     candidate_tool_id: str
-    source: ToolPoolSource = 'registry_exploration'
-    reason: str = ''
-    expected_input: dict[str, Any] = Field(default_factory=dict)
-    expected_output: dict[str, Any] = Field(default_factory=dict)
+
+    source: ToolPoolSource = "registry_exploration"
+
+    reason: str = ""
+
+    expected_input: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+    expected_output: dict[str, Any] = Field(
+        default_factory=dict
+    )
+
     confidence: float = 1.0
+
     score: float = 0.0
-    matched_features: list[str] = Field(default_factory=list)
-    matched_terms: list[str] = Field(default_factory=list)
+
+    matched_features: list[str] = Field(
+        default_factory=list
+    )
+
+    matched_terms: list[str] = Field(
+        default_factory=list
+    )
+
     rank: int = 0
-    candidate_source: str = ''
-    semantic_reason: str = ''
+
+    candidate_source: str = ""
+
+    semantic_reason: str = ""
 
 class ToolPoolGateEvent(BaseModel):
     decision: GateDecision

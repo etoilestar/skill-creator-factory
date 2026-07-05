@@ -22,89 +22,83 @@ def build_tool_pool(
     uploaded_files: list[dict[str, Any]] | None = None,
     current_tool_pool: ToolPoolModel | None = None,
 ) -> ToolPoolModel:
-    """Preserve the current shared ToolPool and ensure script bindings exist.
+    """Preserve and normalize the current Skill-wide ToolPool.
 
     Tool discovery is owned by the planning model.
 
-    This function must not:
-    - explore registry tools;
-    - select business tools;
-    - Gate new business tools.
+    Backend Gate is the only authorization authority.
 
-    It only preserves the current Skill ToolPool and creates missing
-    per-script ranking records.
+    This function does not:
+    - explore Registry tools;
+    - select business tools;
+    - Gate new business tools;
+    - create per-file authorization bindings.
+
+    ToolPool.tools is the single Skill-wide authorization source.
     """
 
     _ = user_request
     _ = blueprint_text
+    _ = file_specs
     _ = uploaded_files
 
     pool = (
-        current_tool_pool.model_copy(deep=True)
+        current_tool_pool.model_copy(
+            deep=True
+        )
         if current_tool_pool is not None
-        else ToolPoolModel(skill_name=skill_name)
+        else ToolPoolModel(
+            skill_name=skill_name
+        )
     )
 
-    pool.skill_name = skill_name
+    pool.skill_name = str(
+        skill_name or ""
+    )
 
-    existing_targets = {
-        binding.target_file
-        for binding in pool.file_bindings
-    }
+    # Per-file authorization is retired.
+    # Drop historical persisted bindings while keeping the model field for
+    # backward-compatible JSON loading.
+    pool.file_bindings = []
 
-    valid_script_targets: set[str] = set()
+    # target_files was historical ranking/binding metadata.
+    # Tool authorization now belongs to the Skill.
+    for tool in pool.tools:
+        tool.target_files = []
 
-    for spec in file_specs or []:
-        target = str(
-            spec.get("path")
-            or spec.get("target_file")
-            or ""
-        ).strip()
+    for denied in pool.denied_requests:
+        denied.target_file = ""
 
-        if not target.startswith("scripts/"):
-            continue
+    for missing in pool.missing_requests:
+        missing.target_file = ""
 
-        valid_script_targets.add(target)
+    for event in pool.gate_events:
+        event.target_file = ""
 
-        if target in existing_targets:
-            continue
-
-        pool.file_bindings.append(
-            ToolPoolFileBinding(
-                target_file=target,
-                allowed_tool_ids=[
-                    "script_argv_guard",
-                ],
-                primary_tool_ids=[
-                    "script_argv_guard",
-                ],
-                allowed_helper_imports=list(
-                    CORE_HELPERS
-                ),
-                input_schema=(
-                    spec.get("inputs")
-                    if isinstance(
-                        spec.get("inputs"),
-                        dict,
-                    )
-                    else {}
-                ),
-                output_schema=(
-                    spec.get("outputs")
-                    if isinstance(
-                        spec.get("outputs"),
-                        dict,
-                    )
-                    else {}
-                ),
-            )
+    pool.exploration_candidates = [
+        {
+            key: value
+            for key, value in row.items()
+            if key != "target_file"
+        }
+        for row in (
+            pool.exploration_candidates
+            or []
         )
+        if isinstance(row, dict)
+    ]
 
-    pool.file_bindings = [
-        binding
-        for binding in pool.file_bindings
-        if binding.target_file
-        in valid_script_targets
+    pool.scored_candidates = [
+        {
+            key: value
+            for key, value in row.items()
+            if key != "target_file"
+        }
+        for row in (
+            pool.scored_candidates
+            or []
+        )
+        if isinstance(row, dict)
     ]
 
     return pool

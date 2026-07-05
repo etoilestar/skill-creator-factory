@@ -26,7 +26,6 @@ from .tool_pool_gate import gate_tool_request
 from .tool_pool_models import (
     ToolPoolAddToolRequest,
     ToolPoolDeniedRequest,
-    ToolPoolFileBinding,
     ToolPoolMissingRequest,
     ToolPoolTool,
 )
@@ -671,37 +670,62 @@ def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
 def _planner_shared_tool_context(
     skill_name: str | None,
 ) -> dict[str, Any]:
-    """Build the planner's discovery catalog + current shared ToolPool view."""
+    """Build planner discovery context for the shared Skill ToolPool."""
+
     pool = ToolPoolModel(
-        skill_name=str(skill_name or "")
+        skill_name=str(
+            skill_name or ""
+        )
     )
 
-    if str(skill_name or "").strip():
+    if str(
+        skill_name or ""
+    ).strip():
         try:
             skill_dir = (
                 settings.skills_path
-                / _validate_skill_name(str(skill_name))
+                / _validate_skill_name(
+                    str(skill_name)
+                )
             )
-            pool = load_tool_pool(skill_dir)
+
+            pool = load_tool_pool(
+                skill_dir
+            )
 
             if not pool.skill_name:
-                pool.skill_name = str(skill_name)
+                pool.skill_name = str(
+                    skill_name
+                )
 
         except Exception:
             pool = ToolPoolModel(
-                skill_name=str(skill_name or "")
+                skill_name=str(
+                    skill_name or ""
+                )
             )
 
     return {
         "available_tool_catalog": (
             _creator_tool_catalog_for_planner()
         ),
-        "current_tool_pool": tool_pool_snapshot(pool),
+
+        "current_tool_pool": (
+            tool_pool_snapshot(pool)
+        ),
+
         "tool_contract": {
             "catalog_is_discovery_space": True,
             "tool_pool_is_authorization_source": True,
+
+            "authorization_scope": "skill",
+            "per_file_tool_authorization": False,
+
             "planner_may_propose_changes": True,
             "backend_gate_decides": True,
+
+            "file_responsibility_decides_usage": True,
+
             "code_model_may_not_expand_pool": True,
             "responsibility_judge_may_not_expand_pool": True,
             "e2e_may_not_expand_pool": True,
@@ -917,19 +941,20 @@ async def _plan_final_tool_pool(
     uploaded_files: list[dict[str, Any]],
     requested_model: str | None,
 ) -> dict[str, Any]:
-    """Let the planning model select concrete ToolPool tools.
+    """Let the planning model select Skill-wide ToolPool tools.
 
-    Planner selects exact Registry tool IDs.
+    Planner selects exact Registry tool IDs for the whole Skill.
 
     Backend Gate is the only authorization authority.
 
-    This function does not perform deterministic capability closure and does not
-    let backend infer which semantic capability should map to which tool.
+    Script ownership is not part of ToolPool planning.
     """
 
     skill_dir = (
         settings.skills_path
-        / _validate_skill_name(skill_name)
+        / _validate_skill_name(
+            skill_name
+        )
     )
 
     skill_dir.mkdir(
@@ -945,10 +970,28 @@ async def _plan_final_tool_pool(
         _creator_tool_catalog_for_planner()
     )
 
+    valid_tool_ids = {
+        str(
+            item.get("tool_id")
+            or ""
+        ).strip()
+        for item in tool_catalog
+        if (
+            isinstance(item, dict)
+            and str(
+                item.get("tool_id")
+                or ""
+            ).strip()
+        )
+    }
+
     prompt = """
 你是 Creator ToolPool 规划模型。
 
-你只负责为当前 Skill 选择具体工具。
+你只负责为整个 Skill 选择具体工具。
+
+ToolPool 是 Skill 级共享授权池。
+工具不绑定到单个脚本。
 
 你不是工具说明助手。
 不要解释工具目录。
@@ -956,6 +999,7 @@ async def _plan_final_tool_pool(
 不要修改 blueprint。
 不要修改 SkillPlan。
 不要修改脚本 purpose、inputs、outputs。
+不要规划工具属于哪个脚本。
 
 输入中包含：
 
@@ -966,29 +1010,29 @@ async def _plan_final_tool_pool(
    用户已经确认的创建目标。
 
 3. file_specs
-   最终 scripts/** 文件职责。
+   当前 Skill 所有 scripts/** 的最终职责。
+   你需要整体阅读这些职责，只用于判断整个 Skill 需要哪些工具。
 
 4. requirement_graph
-   当前职责图谱。
+   当前 Skill 职责图谱。
 
 5. current_tool_pool
-   当前已经授权的 Skill 共享工具池。
+   当前 Skill 已授权的共享工具池。
 
 6. available_tool_catalog
    Tool Registry 完整工具目录。
 
-available_tool_catalog 中每个工具包含真实工具合同，包括：
+available_tool_catalog 中每个工具包含真实工具合同：
 
 - tool_id
 - display_name
 - prompt_guidance
-- required_capabilities
 - input_schema
 - output_schema
 - artifact_outputs
 - side_effects
 
-functions 中还包含：
+functions 中包含：
 
 - function_name
 - import_path
@@ -1007,15 +1051,22 @@ functions 中还包含：
 
 规划规则：
 
-- 根据用户目标和 scripts/** 的真实职责选择工具。
-- 不要只根据 tool_id 名称判断。
-- 必须阅读工具 description、function contract 和 IO。
-- 一个脚本可以选择多个工具。
-- 如果标准库和普通 Python 确定性逻辑足够完成职责，不需要添加工具。
-- 如果职责需要模型生成、图像生成、视觉理解、搜索、外部服务或 Registry 提供的 artifact 能力，应选择实际匹配工具。
+- 根据用户目标和所有 scripts/** 的整体职责，选择整个 Skill 运行所需工具。
+- 一个工具一旦被 Skill ToolPool 授权，当前 Skill 的脚本都可以看到该工具合同。
+- 具体脚本是否调用某个工具，由代码模型结合当前文件职责自行决定。
+- 不要输出 target_file。
+- 不要规划工具属于哪个脚本。
+- 不要根据文件名给工具分组。
+- 不要只根据 tool_id 名称判断工具用途。
+- 必须阅读 description、function contract、输入输出和 return contract。
+- 如果标准库和普通 Python 确定性逻辑足够完成整个 Skill 的相关职责，不需要添加工具。
+- 如果 Skill 需要开放式模型生成、图像生成、视觉理解、搜索、外部服务或 Registry artifact 能力，应选择真实匹配工具。
 - current_tool_pool 已有 allowed 工具时不要重复添加。
 - candidate_tool_id 必须逐字等于 available_tool_catalog 中真实 tool_id。
-- 你只提出工具选择建议；Backend Gate 决定是否真正授权。
+- function_name 不是 tool_id。
+- import_path 不是 tool_id。
+- candidate_tool_id 禁止填写 generate_text_with_llm、describe_image_with_vision 等 function_name，除非该字符串本身也是目录中真实 tool_id。
+- 你只提出 Skill ToolPool 工具建议；Backend Gate 决定是否授权。
 
 只输出严格 JSON object。
 
@@ -1031,14 +1082,13 @@ functions 中还包含：
   "tool_pool_patch": {
     "add_tool_requests": [
       {
-        "target_file": "scripts/x.py",
-        "requested_capability": "当前脚本需要的能力",
+        "requested_capability": "整个 Skill 需要的能力",
         "candidate_tool_id": "Registry 中真实 tool_id",
         "reason": "根据工具真实 function contract 和 IO 说明选择原因"
       }
     ],
     "remove_tool_requests": [],
-    "reason": "本轮 ToolPool 规划原因",
+    "reason": "本轮 Skill ToolPool 规划原因",
     "affected_files": []
   }
 }
@@ -1046,9 +1096,11 @@ functions 中还包含：
 
     payload = {
         "skill_name": skill_name,
+
         "user_request": str(
             user_request or ""
         ),
+
         "confirmed_summary": (
             confirmed_summary
             if isinstance(
@@ -1057,25 +1109,32 @@ functions 中还包含：
             )
             else {}
         ),
+
         "blueprint_text": str(
             blueprint_text or ""
         )[:16000],
+
         "file_specs": [
             spec
             for spec in (
                 file_specs or []
             )
-            if isinstance(spec, dict)
-            and _normalize_skill_path(
-                str(
-                    spec.get("path")
-                    or spec.get(
-                        "target_file"
+            if (
+                isinstance(spec, dict)
+                and _normalize_skill_path(
+                    str(
+                        spec.get("path")
+                        or spec.get(
+                            "target_file"
+                        )
+                        or ""
                     )
-                    or ""
+                ).startswith(
+                    "scripts/"
                 )
-            ).startswith("scripts/")
+            )
         ],
+
         "requirement_graph": (
             requirement_graph
             if isinstance(
@@ -1084,14 +1143,17 @@ functions 中还包含：
             )
             else {}
         ),
+
         "uploaded_files": (
             uploaded_files or []
         ),
+
         "current_tool_pool": (
             tool_pool_snapshot(
                 current_pool
             )
         ),
+
         "available_tool_catalog": (
             tool_catalog
         ),
@@ -1101,11 +1163,13 @@ functions 中还包含：
         "creator_prepare_plan",
         requested_model=requested_model,
         reason=(
-            "creator final tool pool planning"
+            "creator final Skill ToolPool planning"
         ),
     )
 
-    messages: list[dict[str, str]] = [
+    messages: list[
+        dict[str, str]
+    ] = [
         {
             "role": "system",
             "content": prompt,
@@ -1147,8 +1211,96 @@ functions 中还包含：
                     "missing tool_pool_patch object"
                 )
 
-            ToolPoolPatch.model_validate(
-                raw_patch
+            validated_patch = (
+                ToolPoolPatch.model_validate(
+                    raw_patch
+                )
+            )
+
+            invalid_tool_ids = sorted({
+                str(
+                    request.candidate_tool_id
+                    or ""
+                ).strip()
+                for request in (
+                    validated_patch
+                    .add_tool_requests
+                    or []
+                )
+                if (
+                    not str(
+                        request.candidate_tool_id
+                        or ""
+                    ).strip()
+                    or str(
+                        request.candidate_tool_id
+                        or ""
+                    ).strip()
+                    not in valid_tool_ids
+                )
+            })
+
+            if invalid_tool_ids:
+                raise ValueError(
+                    "candidate_tool_id must be an exact "
+                    "Registry tool_id; invalid="
+                    + json.dumps(
+                        invalid_tool_ids,
+                        ensure_ascii=False,
+                    )
+                )
+
+            normalized_requests: list[
+                ToolPoolAddToolRequest
+            ] = []
+
+            seen_tool_ids: set[str] = set()
+
+            for request in (
+                validated_patch
+                .add_tool_requests
+                or []
+            ):
+                tool_id = str(
+                    request.candidate_tool_id
+                    or ""
+                ).strip()
+
+                if tool_id in seen_tool_ids:
+                    continue
+
+                seen_tool_ids.add(
+                    tool_id
+                )
+
+                normalized_requests.append(
+                    request.model_copy(
+                        update={
+                            "target_file": "",
+                        }
+                    )
+                )
+
+            validated_patch = (
+                validated_patch.model_copy(
+                    update={
+                        "add_tool_requests": (
+                            normalized_requests
+                        ),
+                        "update_file_bindings": [],
+                        "affected_files": [],
+                    }
+                )
+            )
+
+            planner_output = dict(
+                planner_output
+            )
+
+            planner_output[
+                "tool_pool_patch"
+            ] = validated_patch.model_dump(
+                mode="json"
             )
 
             break
@@ -1159,7 +1311,7 @@ functions 中还包含：
             logger.warning(
                 "[Creator]"
                 "[final_tool_planning]"
-                "[format_error] "
+                "[protocol_error] "
                 "skill=%s attempt=%d error=%s",
                 skill_name,
                 attempt + 1,
@@ -1179,19 +1331,28 @@ functions 中还包含：
             messages.append({
                 "role": "user",
                 "content": (
-                    "上一轮输出格式错误。\n"
+                    "上一轮 ToolPool 输出不符合协议。\n"
                     "不要重新解释工具目录。\n"
-                    "不要输出 Markdown、工具介绍或代码。\n"
-                    "只把你的工具选择结果输出为约定 JSON object。\n"
+                    "不要重新设计 Skill。\n"
+                    "只修正 ToolPool JSON。\n"
+                    "不要输出 target_file。\n"
+                    "candidate_tool_id 必须使用真实 Registry tool_id，"
+                    "不能使用 function_name 或 import_path。\n"
                     "顶层必须包含 tool_pool_patch。\n"
-                    f"格式错误："
-                    f"{type(exc).__name__}: {exc}"
+                    f"错误：{type(exc).__name__}: {exc}\n"
+                    "可用 Registry tool_id："
+                    + json.dumps(
+                        sorted(
+                            valid_tool_ids
+                        ),
+                        ensure_ascii=False,
+                    )
                 ),
             })
 
     else:
         raise ValueError(
-            "final ToolPool planner failed: "
+            "final Skill ToolPool planner failed: "
             f"{last_error}"
         )
 
@@ -1215,396 +1376,6 @@ functions 中还包含：
     }
 
 
-def _apply_tool_requests_to_current_file_binding(
-    *,
-    skill_name: str,
-    target_file: str,
-    file_spec: dict[str, Any],
-    requests: list[ToolPoolAddToolRequest],
-    source_phase: str,
-) -> dict[str, Any]:
-    """Gate planner requests into the single shared Skill ToolPool.
-
-    ToolPool.tools is the authorization source.
-
-    file_bindings only records target-file preference/ranking. Once a tool has
-    been approved into ToolPool.tools, another target file does not need to
-    re-authorize the same tool.
-    """
-    skill_dir = (
-        settings.skills_path
-        / _validate_skill_name(skill_name)
-    )
-
-    skill_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    pool = load_tool_pool(skill_dir)
-    pool.skill_name = skill_name
-
-    binding = get_file_binding(
-        pool,
-        target_file,
-        raw=True,
-    )
-
-    if binding is None:
-        binding = ToolPoolFileBinding(
-            target_file=target_file,
-            allowed_tool_ids=["script_argv_guard"],
-            primary_tool_ids=["script_argv_guard"],
-            allowed_helper_imports=[
-                "strict_json_argv_guard",
-            ],
-        )
-        pool.file_bindings.append(binding)
-
-    def merge_unique(
-        current: list[Any],
-        incoming: list[Any],
-    ) -> list[Any]:
-        out = list(current or [])
-
-        for item in incoming or []:
-            if item not in out:
-                out.append(item)
-
-        return out
-
-    unique_requests: list[ToolPoolAddToolRequest] = []
-    seen_request_ids: set[tuple[str, str]] = set()
-
-    for request in requests or []:
-        if request.target_file != target_file:
-            continue
-
-        request_key = (
-            request.target_file,
-            request.candidate_tool_id,
-        )
-
-        if request_key in seen_request_ids:
-            continue
-
-        seen_request_ids.add(request_key)
-        unique_requests.append(request)
-
-    allowed_new = 0
-    attached_existing = 0
-    missing_new = 0
-    denied_new = 0
-
-    def attach_tool_projection(
-        tool: ToolPoolTool,
-        request: ToolPoolAddToolRequest,
-        *,
-        decision: str,
-        messages: list[str],
-    ) -> None:
-        capability = get_tool_capability(tool.tool_id)
-
-        binding.allowed_tool_ids = merge_unique(
-            binding.allowed_tool_ids,
-            [tool.tool_id],
-        )
-
-        non_core_primary = [
-            tool_id
-            for tool_id in binding.primary_tool_ids
-            if tool_id != "script_argv_guard"
-        ]
-
-        if request.rank <= 1 or not non_core_primary:
-            binding.primary_tool_ids = merge_unique(
-                binding.primary_tool_ids,
-                [tool.tool_id],
-            )
-        else:
-            binding.secondary_tool_ids = merge_unique(
-                binding.secondary_tool_ids,
-                [tool.tool_id],
-            )
-
-        binding.allowed_helper_imports = merge_unique(
-            binding.allowed_helper_imports,
-            tool.allowed_helper_imports,
-        )
-
-        binding.allowed_import_paths = merge_unique(
-            binding.allowed_import_paths,
-            tool.allowed_import_paths,
-        )
-
-        binding.allowed_function_imports = merge_unique(
-            binding.allowed_function_imports,
-            tool.allowed_function_imports,
-        )
-
-        binding.required_env = merge_unique(
-            binding.required_env,
-            tool.required_env,
-        )
-
-        binding.dependencies = merge_unique(
-            binding.dependencies,
-            tool.dependencies,
-        )
-
-        binding.matched_features_by_tool[
-            tool.tool_id
-        ] = list(request.matched_features or [])
-
-        score_row = {
-            "tool_id": tool.tool_id,
-            "score": request.score,
-            "rank": request.rank,
-            "matched_features": list(
-                request.matched_features or []
-            ),
-            "matched_terms": list(
-                request.matched_terms or []
-            ),
-            "decision": decision,
-            "reason": "; ".join(messages),
-            "target_file": target_file,
-            "source_phase": source_phase,
-        }
-
-        if score_row not in binding.scored_tools:
-            binding.scored_tools.append(score_row)
-
-        if capability is not None:
-            snippets = []
-
-            for snippet in (
-                getattr(capability, "snippets", []) or []
-            ):
-                if hasattr(snippet, "model_dump"):
-                    snippets.append(
-                        snippet.model_dump(mode="json")
-                    )
-                elif hasattr(snippet, "__dict__"):
-                    snippets.append(
-                        dict(snippet.__dict__)
-                    )
-                else:
-                    snippets.append(snippet)
-
-            binding.snippets = merge_unique(
-                binding.snippets,
-                snippets,
-            )
-
-    for request in unique_requests:
-        existing_tool = next(
-            (
-                tool
-                for tool in pool.tools
-                if tool.tool_id
-                == request.candidate_tool_id
-                and tool.status == "allowed"
-            ),
-            None,
-        )
-
-        if existing_tool is not None:
-            existing_tool.target_files = merge_unique(
-                existing_tool.target_files,
-                [target_file],
-            )
-
-            existing_tool.matched_features = merge_unique(
-                existing_tool.matched_features,
-                request.matched_features,
-            )
-
-            existing_tool.matched_terms = merge_unique(
-                existing_tool.matched_terms,
-                request.matched_terms,
-            )
-
-            existing_tool.score = max(
-                float(existing_tool.score or 0.0),
-                float(request.score or 0.0),
-            )
-
-            attach_tool_projection(
-                existing_tool,
-                request,
-                decision="already_allowed_in_shared_pool",
-                messages=[
-                    "Tool already passed backend gate for "
-                    "the current Skill ToolPool."
-                ],
-            )
-
-            attached_existing += 1
-            continue
-
-        gate_event = gate_tool_request(
-            request,
-            file_role=str(
-                file_spec.get("role")
-                or "generic_script"
-            ),
-            file_spec=file_spec,
-        )
-
-        pool.gate_events.append(gate_event)
-
-        if gate_event.decision == "allow":
-            capability = get_tool_capability(
-                gate_event.tool_id
-            )
-
-            tool = ToolPoolTool(
-                tool_id=gate_event.tool_id,
-                status="allowed",
-                source=request.source,
-                source_phase=source_phase,
-                target_files=[target_file],
-                allowed_helper_imports=list(
-                    gate_event.allowed_helper_imports
-                ),
-                allowed_import_paths=list(
-                    gate_event.allowed_import_paths
-                ),
-                allowed_function_imports=list(
-                    gate_event.allowed_function_imports
-                ),
-                score=request.score,
-                matched_features=list(
-                    request.matched_features or []
-                ),
-                matched_terms=list(
-                    request.matched_terms or []
-                ),
-                allowed_roles=list(
-                    (
-                        getattr(capability, "roles", [])
-                        if capability is not None
-                        else []
-                    )
-                    or []
-                ),
-                input_schema=(
-                    getattr(
-                        capability,
-                        "input_schema",
-                        {},
-                    )
-                    if capability is not None
-                    else {}
-                )
-                or {},
-                output_schema=(
-                    getattr(
-                        capability,
-                        "output_schema",
-                        {},
-                    )
-                    if capability is not None
-                    else {}
-                )
-                or {},
-                required_env=list(
-                    gate_event.required_env
-                ),
-                dependencies=list(
-                    gate_event.dependencies
-                ),
-                reason=request.reason,
-                gate_result=gate_event.decision,
-                gate_messages=list(
-                    gate_event.messages
-                ),
-            )
-
-            pool.tools.append(tool)
-
-            attach_tool_projection(
-                tool,
-                request,
-                decision=gate_event.decision,
-                messages=list(gate_event.messages),
-            )
-
-            allowed_new += 1
-            continue
-
-        if gate_event.decision in {
-            "require_config",
-            "require_dependency",
-        }:
-            pool.missing_requests.append(
-                ToolPoolMissingRequest(
-                    target_file=target_file,
-                    tool_id=gate_event.tool_id,
-                    missing_env=list(
-                        gate_event.missing_env
-                    ),
-                    missing_dependencies=list(
-                        gate_event.missing_dependencies
-                    ),
-                    reason="; ".join(
-                        gate_event.messages
-                    ),
-                )
-            )
-
-            missing_new += 1
-            continue
-
-        pool.denied_requests.append(
-            ToolPoolDeniedRequest(
-                target_file=target_file,
-                tool_id=gate_event.tool_id,
-                helper_imports=list(
-                    gate_event.denied_helper_imports
-                ),
-                reason=gate_event.decision,
-                messages=list(gate_event.messages),
-                suggested_replacements=list(
-                    gate_event.suggested_replacements
-                ),
-            )
-        )
-
-        denied_new += 1
-
-    if unique_requests:
-        save_tool_pool(
-            skill_dir,
-            pool,
-        )
-
-    current_pool = load_tool_pool(skill_dir)
-
-    return {
-        "requested": len(unique_requests),
-        "allowed_new": allowed_new,
-        "attached_existing": attached_existing,
-        "missing_new": missing_new,
-        "denied_new": denied_new,
-        "binding": (
-            get_file_binding(
-                current_pool,
-                target_file,
-            ).model_dump(mode="json")
-            if get_file_binding(
-                current_pool,
-                target_file,
-            )
-            is not None
-            else {}
-        ),
-        "tool_pool": tool_pool_snapshot(
-            current_pool
-        ),
-    }
-
 def _apply_planner_tool_pool_patch(
     *,
     skill_name: str,
@@ -1612,21 +1383,33 @@ def _apply_planner_tool_pool_patch(
     source_phase: str,
     allow_remove: bool,
 ) -> dict[str, Any]:
-    """Apply a planner-proposed ToolPoolPatch through the backend gate.
+    """Apply a planner proposal to the shared Skill ToolPool.
 
-    Planning phases may add/remove tools.
+    Planner selects exact Registry tool IDs.
 
-    Responsibility-feedback planning may only append tools.
+    Backend Gate authorizes the proposed tool for the current Skill.
 
-    Code model, responsibility judge and E2E must never call this function.
+    There is no per-file tool authorization.
+
+    Code model, responsibility judge, repair model, and E2E must never call this
+    function to expand ToolPool.
     """
+
     raw_patch = (
-        planner_output.get("tool_pool_patch")
-        if isinstance(planner_output, dict)
+        planner_output.get(
+            "tool_pool_patch"
+        )
+        if isinstance(
+            planner_output,
+            dict,
+        )
         else None
     )
 
-    if not isinstance(raw_patch, dict):
+    if not isinstance(
+        raw_patch,
+        dict,
+    ):
         return {
             "requested": 0,
             "allowed_new": 0,
@@ -1641,10 +1424,13 @@ def _apply_planner_tool_pool_patch(
         patch = ToolPoolPatch.model_validate(
             raw_patch
         )
+
     except Exception as exc:
         logger.warning(
-            "[Creator][planner_tool_pool_patch]"
-            "[invalid_patch] phase=%s skill=%s error=%s",
+            "[Creator]"
+            "[planner_tool_pool_patch]"
+            "[invalid_patch] "
+            "phase=%s skill=%s error=%s",
             source_phase,
             skill_name,
             exc,
@@ -1664,7 +1450,9 @@ def _apply_planner_tool_pool_patch(
             ),
         }
 
-    if not str(skill_name or "").strip():
+    if not str(
+        skill_name or ""
+    ).strip():
         return {
             "requested": 0,
             "allowed_new": 0,
@@ -1690,16 +1478,45 @@ def _apply_planner_tool_pool_patch(
         exist_ok=True,
     )
 
-    pool = load_tool_pool(skill_dir)
+    pool = load_tool_pool(
+        skill_dir
+    )
+
     pool.skill_name = safe_skill_name
+
+    # Retire historical per-file authorization state.
+    pool.file_bindings = []
+
+    for tool in pool.tools:
+        tool.target_files = []
+
+    def merge_unique(
+        current: list[Any],
+        incoming: list[Any],
+    ) -> list[Any]:
+        result = list(
+            current or []
+        )
+
+        for item in (
+            incoming or []
+        ):
+            if item not in result:
+                result.append(item)
+
+        return result
 
     removed_ids: set[str] = set()
 
     if allow_remove:
         for raw_remove in (
-            patch.remove_tool_requests or []
+            patch.remove_tool_requests
+            or []
         ):
-            if not isinstance(raw_remove, dict):
+            if not isinstance(
+                raw_remove,
+                dict,
+            ):
                 continue
 
             tool_id = str(
@@ -1711,140 +1528,30 @@ def _apply_planner_tool_pool_patch(
             ).strip()
 
             if tool_id:
-                removed_ids.add(tool_id)
+                removed_ids.add(
+                    tool_id
+                )
 
     if removed_ids:
         pool.tools = [
             tool
             for tool in pool.tools
-            if tool.tool_id not in removed_ids
+            if tool.tool_id
+            not in removed_ids
         ]
-
-        remaining_tools = {
-            tool.tool_id: tool
-            for tool in pool.tools
-            if tool.status == "allowed"
-        }
-
-        remaining_ids = set(remaining_tools)
-
-        for binding in pool.file_bindings:
-            is_script = binding.target_file.startswith(
-                "scripts/"
-            )
-
-            core_ids = (
-                ["script_argv_guard"]
-                if is_script
-                else []
-            )
-
-            current_preferred = [
-                tool_id
-                for tool_id in (
-                    binding.allowed_tool_ids or []
-                )
-                if tool_id in remaining_ids
-            ]
-
-            binding.allowed_tool_ids = list(
-                dict.fromkeys([
-                    *core_ids,
-                    *current_preferred,
-                ])
-            )
-
-            binding.primary_tool_ids = list(
-                dict.fromkeys([
-                    *core_ids,
-                    *[
-                        tool_id
-                        for tool_id in (
-                            binding.primary_tool_ids
-                            or []
-                        )
-                        if tool_id in remaining_ids
-                    ],
-                ])
-            )
-
-            primary_ids = set(
-                binding.primary_tool_ids
-            )
-
-            binding.secondary_tool_ids = [
-                tool_id
-                for tool_id in dict.fromkeys(
-                    binding.secondary_tool_ids
-                    or []
-                )
-                if tool_id in remaining_ids
-                and tool_id not in primary_ids
-            ]
-
-            binding.allowed_helper_imports = (
-                ["strict_json_argv_guard"]
-                if is_script
-                else []
-            )
-
-            binding.allowed_import_paths = []
-            binding.allowed_function_imports = []
-            binding.required_env = []
-            binding.dependencies = []
-            binding.snippets = []
-
-            for tool_id in current_preferred:
-                tool = remaining_tools.get(tool_id)
-
-                if tool is None:
-                    continue
-
-                binding.allowed_helper_imports = list(
-                    dict.fromkeys([
-                        *binding.allowed_helper_imports,
-                        *tool.allowed_helper_imports,
-                    ])
-                )
-
-                binding.allowed_import_paths = list(
-                    dict.fromkeys([
-                        *binding.allowed_import_paths,
-                        *tool.allowed_import_paths,
-                    ])
-                )
-
-                binding.allowed_function_imports = list(
-                    dict.fromkeys([
-                        *binding.allowed_function_imports,
-                        *tool.allowed_function_imports,
-                    ])
-                )
-
-                binding.required_env = list(
-                    dict.fromkeys([
-                        *binding.required_env,
-                        *tool.required_env,
-                    ])
-                )
-
-                binding.dependencies = list(
-                    dict.fromkeys([
-                        *binding.dependencies,
-                        *tool.dependencies,
-                    ])
-                )
 
         pool.denied_requests = [
             item
             for item in pool.denied_requests
-            if item.tool_id not in removed_ids
+            if item.tool_id
+            not in removed_ids
         ]
 
         pool.missing_requests = [
             item
             for item in pool.missing_requests
-            if item.tool_id not in removed_ids
+            if item.tool_id
+            not in removed_ids
         ]
 
     proposal_source = (
@@ -1858,20 +1565,31 @@ def _apply_planner_tool_pool_patch(
         ToolPoolAddToolRequest
     ] = []
 
-    for request in (
-        patch.add_tool_requests or []
-    ):
-        target_file = _normalize_skill_path(
-            request.target_file
-        )
+    seen_tool_ids: set[str] = set()
 
-        if not target_file.startswith("scripts/"):
+    for request in (
+        patch.add_tool_requests
+        or []
+    ):
+        tool_id = str(
+            request.candidate_tool_id
+            or ""
+        ).strip()
+
+        if not tool_id:
             continue
+
+        if tool_id in seen_tool_ids:
+            continue
+
+        seen_tool_ids.add(
+            tool_id
+        )
 
         add_requests.append(
             request.model_copy(
                 update={
-                    "target_file": target_file,
+                    "target_file": "",
                     "source": proposal_source,
                 }
             )
@@ -1879,104 +1597,389 @@ def _apply_planner_tool_pool_patch(
 
     pool.exploration_candidates = [
         {
-            **request.model_dump(mode="json"),
+            "requested_capability": (
+                request.requested_capability
+            ),
+            "candidate_tool_id": (
+                request.candidate_tool_id
+            ),
+            "reason": request.reason,
+            "confidence": request.confidence,
+            "score": request.score,
+            "matched_features": list(
+                request.matched_features
+                or []
+            ),
+            "matched_terms": list(
+                request.matched_terms
+                or []
+            ),
+            "rank": request.rank,
+            "candidate_source": (
+                request.candidate_source
+            ),
+            "semantic_reason": (
+                request.semantic_reason
+            ),
             "proposal_phase": source_phase,
-            "proposal_owner": "planning_model",
+            "proposal_owner": (
+                "planning_model"
+            ),
+            "authorization_scope": "skill",
         }
         for request in add_requests
     ]
 
     pool.scored_candidates = [
         {
-            "tool_id": request.candidate_tool_id,
-            "target_file": request.target_file,
+            "tool_id": (
+                request.candidate_tool_id
+            ),
             "requested_capability": (
                 request.requested_capability
             ),
             "score": request.score,
             "rank": request.rank,
             "reason": request.reason,
+            "matched_features": list(
+                request.matched_features
+                or []
+            ),
+            "matched_terms": list(
+                request.matched_terms
+                or []
+            ),
             "proposal_phase": source_phase,
-            "proposal_owner": "planning_model",
+            "proposal_owner": (
+                "planning_model"
+            ),
+            "authorization_scope": "skill",
         }
         for request in add_requests
     ]
+
+    total = {
+        "requested": len(
+            add_requests
+        ),
+        "allowed_new": 0,
+        "attached_existing": 0,
+        "missing_new": 0,
+        "denied_new": 0,
+        "removed": len(
+            removed_ids
+        ),
+        "patch_present": True,
+    }
+
+    for request in add_requests:
+        tool_id = str(
+            request.candidate_tool_id
+            or ""
+        ).strip()
+
+        # Current proposal supersedes old denied/missing state for the same tool.
+        pool.denied_requests = [
+            item
+            for item in pool.denied_requests
+            if item.tool_id != tool_id
+        ]
+
+        pool.missing_requests = [
+            item
+            for item in pool.missing_requests
+            if item.tool_id != tool_id
+        ]
+
+        existing_tool = next(
+            (
+                tool
+                for tool in pool.tools
+                if (
+                    tool.tool_id == tool_id
+                    and tool.status
+                    == "allowed"
+                )
+            ),
+            None,
+        )
+
+        if existing_tool is not None:
+            existing_tool.target_files = []
+
+            existing_tool.source_phase = (
+                source_phase
+            )
+
+            existing_tool.score = max(
+                float(
+                    existing_tool.score
+                    or 0.0
+                ),
+                float(
+                    request.score
+                    or 0.0
+                ),
+            )
+
+            existing_tool.matched_features = (
+                merge_unique(
+                    existing_tool
+                    .matched_features,
+                    request.matched_features,
+                )
+            )
+
+            existing_tool.matched_terms = (
+                merge_unique(
+                    existing_tool
+                    .matched_terms,
+                    request.matched_terms,
+                )
+            )
+
+            if request.reason:
+                existing_tool.reason = (
+                    request.reason
+                )
+
+            total[
+                "attached_existing"
+            ] += 1
+
+            continue
+
+        gate_event = gate_tool_request(
+            request
+        )
+
+        gate_event.target_file = ""
+
+        pool.gate_events.append(
+            gate_event
+        )
+
+        if gate_event.decision == "allow":
+            capability = get_tool_capability(
+                gate_event.tool_id
+            )
+
+            tool = ToolPoolTool(
+                tool_id=gate_event.tool_id,
+                status="allowed",
+                source=request.source,
+                source_phase=source_phase,
+
+                target_files=[],
+
+                allowed_helper_imports=list(
+                    gate_event
+                    .allowed_helper_imports
+                    or []
+                ),
+
+                allowed_import_paths=list(
+                    gate_event
+                    .allowed_import_paths
+                    or []
+                ),
+
+                allowed_function_imports=list(
+                    gate_event
+                    .allowed_function_imports
+                    or []
+                ),
+
+                score=request.score,
+
+                matched_features=list(
+                    request.matched_features
+                    or []
+                ),
+
+                matched_terms=list(
+                    request.matched_terms
+                    or []
+                ),
+
+                allowed_roles=list(
+                    (
+                        getattr(
+                            capability,
+                            "roles",
+                            [],
+                        )
+                        if capability
+                        is not None
+                        else []
+                    )
+                    or []
+                ),
+
+                input_schema=(
+                    getattr(
+                        capability,
+                        "input_schema",
+                        {},
+                    )
+                    if capability
+                    is not None
+                    else {}
+                )
+                or {},
+
+                output_schema=(
+                    getattr(
+                        capability,
+                        "output_schema",
+                        {},
+                    )
+                    if capability
+                    is not None
+                    else {}
+                )
+                or {},
+
+                required_env=list(
+                    gate_event.required_env
+                    or []
+                ),
+
+                dependencies=list(
+                    gate_event.dependencies
+                    or []
+                ),
+
+                reason=request.reason,
+
+                gate_result=(
+                    gate_event.decision
+                ),
+
+                gate_messages=list(
+                    gate_event.messages
+                    or []
+                ),
+            )
+
+            pool.tools.append(
+                tool
+            )
+
+            total[
+                "allowed_new"
+            ] += 1
+
+            continue
+
+        if gate_event.decision in {
+            "require_config",
+            "require_dependency",
+        }:
+            pool.missing_requests.append(
+                ToolPoolMissingRequest(
+                    target_file="",
+                    tool_id=(
+                        gate_event.tool_id
+                    ),
+                    missing_env=list(
+                        gate_event.missing_env
+                        or []
+                    ),
+                    missing_dependencies=list(
+                        gate_event
+                        .missing_dependencies
+                        or []
+                    ),
+                    reason="; ".join(
+                        gate_event.messages
+                        or []
+                    ),
+                )
+            )
+
+            total[
+                "missing_new"
+            ] += 1
+
+            continue
+
+        pool.denied_requests.append(
+            ToolPoolDeniedRequest(
+                target_file="",
+                tool_id=(
+                    gate_event.tool_id
+                ),
+                helper_imports=list(
+                    gate_event
+                    .denied_helper_imports
+                    or []
+                ),
+                reason=(
+                    gate_event.decision
+                ),
+                messages=list(
+                    gate_event.messages
+                    or []
+                ),
+                suggested_replacements=list(
+                    gate_event
+                    .suggested_replacements
+                    or []
+                ),
+            )
+        )
+
+        total[
+            "denied_new"
+        ] += 1
+
+    pool.file_bindings = []
 
     save_tool_pool(
         skill_dir,
         pool,
     )
 
-    grouped: dict[
-        str,
-        list[ToolPoolAddToolRequest],
-    ] = {}
+    current_pool = load_tool_pool(
+        skill_dir
+    )
 
-    for request in add_requests:
-        grouped.setdefault(
-            request.target_file,
-            [],
-        ).append(request)
-
-    total = {
-        "requested": 0,
-        "allowed_new": 0,
-        "attached_existing": 0,
-        "missing_new": 0,
-        "denied_new": 0,
-        "removed": len(removed_ids),
-        "patch_present": True,
-    }
-
-    for target_file, target_requests in (
-        grouped.items()
-    ):
-        result = (
-            _apply_tool_requests_to_current_file_binding(
-                skill_name=safe_skill_name,
-                target_file=target_file,
-                file_spec={
-                    "path": target_file,
-                    "role": "generic_script",
-                },
-                requests=target_requests,
-                source_phase=source_phase,
-            )
+    total["tool_pool"] = (
+        tool_pool_snapshot(
+            current_pool
         )
-
-        for key in (
-            "requested",
-            "allowed_new",
-            "attached_existing",
-            "missing_new",
-            "denied_new",
-        ):
-            total[key] += int(
-                result.get(key) or 0
-            )
-
-    current_pool = load_tool_pool(skill_dir)
-
-    total["tool_pool"] = tool_pool_snapshot(
-        current_pool
     )
 
     logger.info(
-        "[Creator][planner_tool_pool_patch] %s",
+        "[Creator]"
+        "[planner_tool_pool_patch] %s",
         json.dumps(
             {
-                "event": "planner_tool_pool_patch",
-                "skill_name": safe_skill_name,
-                "source_phase": source_phase,
+                "event": (
+                    "planner_tool_pool_patch"
+                ),
+                "skill_name": (
+                    safe_skill_name
+                ),
+                "source_phase": (
+                    source_phase
+                ),
+                "authorization_scope": (
+                    "skill"
+                ),
                 **{
                     key: value
-                    for key, value in total.items()
+                    for key, value
+                    in total.items()
                     if key != "tool_pool"
                 },
                 "current_tool_ids": [
                     tool.tool_id
-                    for tool in current_pool.tools
-                    if tool.status == "allowed"
+                    for tool
+                    in current_pool.tools
+                    if tool.status
+                    == "allowed"
                 ],
             },
             ensure_ascii=False,

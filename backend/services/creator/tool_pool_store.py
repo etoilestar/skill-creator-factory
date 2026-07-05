@@ -42,6 +42,160 @@ def _stable_unique(values):
             out.append(value)
     return out
 
+def get_skill_tool_binding(
+    pool: ToolPoolModel,
+    *,
+    target_file: str = "",
+    include_script_core: bool = False,
+) -> ToolPoolFileBinding:
+    """Project the Skill-wide ToolPool into one prompt/runtime binding view.
+
+    This is not persisted per-file authorization.
+
+    ToolPool.tools is the only Skill-wide authorization source.
+
+    target_file is only contextual metadata for the consumer.
+
+    include_script_core=True adds Creator's mandatory Python script guard
+    capability to the projection. It does not add a business tool to ToolPool.
+    """
+
+    allowed_tools = [
+        tool
+        for tool in pool.tools
+        if tool.status == "allowed"
+        and str(tool.tool_id or "").strip()
+    ]
+
+    core_tool_ids = (
+        ["script_argv_guard"]
+        if include_script_core
+        else []
+    )
+
+    core_helpers = (
+        ["strict_json_argv_guard"]
+        if include_script_core
+        else []
+    )
+
+    shared_tool_ids = _stable_unique([
+        tool.tool_id
+        for tool in allowed_tools
+        if str(tool.tool_id or "").strip()
+    ])
+
+    allowed_tool_ids = _stable_unique([
+        *core_tool_ids,
+        *shared_tool_ids,
+    ])
+
+    allowed_helper_imports = _stable_unique([
+        *core_helpers,
+        *[
+            helper
+            for tool in allowed_tools
+            for helper in (
+                tool.allowed_helper_imports
+                or []
+            )
+        ],
+    ])
+
+    allowed_import_paths = _stable_unique([
+        import_path
+        for tool in allowed_tools
+        for import_path in (
+            tool.allowed_import_paths
+            or []
+        )
+    ])
+
+    allowed_function_imports = _stable_unique([
+        function_name
+        for tool in allowed_tools
+        for function_name in (
+            tool.allowed_function_imports
+            or []
+        )
+    ])
+
+    required_env = _stable_unique([
+        env_name
+        for tool in allowed_tools
+        for env_name in (
+            tool.required_env
+            or []
+        )
+    ])
+
+    dependencies = _stable_unique([
+        dependency
+        for tool in allowed_tools
+        for dependency in (
+            tool.dependencies
+            or []
+        )
+    ])
+
+    scored_tools = [
+        {
+            "tool_id": tool.tool_id,
+            "score": tool.score,
+            "matched_features": list(
+                tool.matched_features or []
+            ),
+            "matched_terms": list(
+                tool.matched_terms or []
+            ),
+            "decision": (
+                "allowed_in_skill_tool_pool"
+            ),
+            "reason": tool.reason,
+            "source_phase": tool.source_phase,
+        }
+        for tool in allowed_tools
+    ]
+
+    matched_features_by_tool = {
+        tool.tool_id: list(
+            tool.matched_features or []
+        )
+        for tool in allowed_tools
+    }
+
+    return ToolPoolFileBinding(
+        target_file=str(target_file or ""),
+        allowed_tool_ids=allowed_tool_ids,
+
+        # There is no longer per-file primary/secondary ranking.
+        # All Skill-authorized tools are equally available.
+        primary_tool_ids=list(
+            allowed_tool_ids
+        ),
+        secondary_tool_ids=[],
+
+        allowed_helper_imports=(
+            allowed_helper_imports
+        ),
+        allowed_import_paths=(
+            allowed_import_paths
+        ),
+        allowed_function_imports=(
+            allowed_function_imports
+        ),
+        scored_tools=scored_tools,
+        matched_features_by_tool=(
+            matched_features_by_tool
+        ),
+        required_env=required_env,
+        dependencies=dependencies,
+        snippets=[],
+        input_schema={},
+        output_schema={},
+        denied_helper_imports=[],
+        repair_notes=[],
+    )
 
 def get_file_binding(
     pool: ToolPoolModel,
@@ -49,199 +203,77 @@ def get_file_binding(
     *,
     raw: bool = False,
 ) -> ToolPoolFileBinding | None:
-    """Return one script binding.
+    """Backward-compatible script projection accessor.
 
-    ToolPool.tools is the shared Skill-wide authorization source.
+    Creator no longer persists independent per-file tool authorization.
 
-    raw=False:
-        Return an effective read projection. Shared allowed ToolPool tools are
-        merged into the file binding and the returned object is detached from
-        pool.file_bindings.
+    raw=True therefore has no mutable per-file binding to return.
 
-    raw=True:
-        Return the persisted mutable file-binding object itself. Shared ToolPool
-        projection is not merged. Callers may mutate this object and then persist
-        the containing ToolPool.
+    raw=False returns a transient projection of the current Skill-wide ToolPool
+    for scripts/** consumers.
 
-    File bindings preserve per-file ranking and local metadata. They do not form
-    independent authorization pools.
+    The function name is retained temporarily to avoid rewriting generation,
+    responsibility review, import guard, and existing API call sites in the same
+    migration.
     """
 
-    binding = next(
-        (
-            item
-            for item in pool.file_bindings
-            if item.target_file == target_file
-        ),
-        None,
-    )
+    normalized_target = str(
+        target_file or ""
+    ).replace(
+        "\\",
+        "/",
+    ).strip()
 
     if raw:
-        return binding
+        return None
 
-    if binding is None:
-        if not target_file.startswith(
-            "scripts/"
-        ):
-            return None
+    if not normalized_target.startswith(
+        "scripts/"
+    ):
+        return None
 
-        binding = ToolPoolFileBinding(
-            target_file=target_file,
-            allowed_tool_ids=[
-                "script_argv_guard",
-            ],
-            primary_tool_ids=[
-                "script_argv_guard",
-            ],
-            allowed_helper_imports=[
-                "strict_json_argv_guard",
-            ],
-        )
-
-    effective = binding.model_copy(
-        deep=True
+    return get_skill_tool_binding(
+        pool,
+        target_file=normalized_target,
+        include_script_core=True,
     )
-
-    def merge_unique(
-        current: list[Any],
-        incoming: list[Any],
-    ) -> list[Any]:
-        result = list(current or [])
-
-        for item in incoming or []:
-            if item not in result:
-                result.append(item)
-
-        return result
-
-    allowed_tools = [
-        tool
-        for tool in pool.tools
-        if tool.status == "allowed"
-    ]
-
-    shared_tool_ids = [
-        tool.tool_id
-        for tool in allowed_tools
-        if tool.tool_id
-    ]
-
-    effective.allowed_tool_ids = (
-        merge_unique(
-            effective.allowed_tool_ids,
-            shared_tool_ids,
-        )
-    )
-
-    effective.allowed_helper_imports = (
-        merge_unique(
-            effective.allowed_helper_imports,
-            [
-                helper
-                for tool in allowed_tools
-                for helper
-                in tool.allowed_helper_imports
-            ],
-        )
-    )
-
-    effective.allowed_import_paths = (
-        merge_unique(
-            effective.allowed_import_paths,
-            [
-                import_path
-                for tool in allowed_tools
-                for import_path
-                in tool.allowed_import_paths
-            ],
-        )
-    )
-
-    effective.allowed_function_imports = (
-        merge_unique(
-            effective.allowed_function_imports,
-            [
-                function_name
-                for tool in allowed_tools
-                for function_name
-                in tool.allowed_function_imports
-            ],
-        )
-    )
-
-    effective.required_env = merge_unique(
-        effective.required_env,
-        [
-            env_name
-            for tool in allowed_tools
-            for env_name in tool.required_env
-        ],
-    )
-
-    effective.dependencies = merge_unique(
-        effective.dependencies,
-        [
-            dependency
-            for tool in allowed_tools
-            for dependency
-            in tool.dependencies
-        ],
-    )
-
-    primary_ids = set(
-        effective.primary_tool_ids or []
-    )
-
-    effective.secondary_tool_ids = (
-        merge_unique(
-            effective.secondary_tool_ids,
-            [
-                tool_id
-                for tool_id in shared_tool_ids
-                if tool_id not in primary_ids
-            ],
-        )
-    )
-
-    return effective
-
 
 def get_allowed_helper_imports(
     pool: ToolPoolModel,
     target_file: str,
 ) -> list[str]:
-    binding = get_file_binding(pool, target_file)
-    return list(binding.allowed_helper_imports) if binding else []
+    """Return helpers allowed by the current Skill ToolPool projection."""
+
+    binding = get_file_binding(
+        pool,
+        target_file,
+    )
+
+    if binding is None:
+        return []
+
+    return list(
+        binding.allowed_helper_imports
+        or []
+    )
 
 
-def tool_pool_snapshot(pool: ToolPoolModel) -> dict:
-    """Return the canonical current-Skill ToolPool view for every model/backend.
+def tool_pool_snapshot(
+    pool: ToolPoolModel,
+) -> dict:
+    """Return the canonical Skill-wide ToolPool view.
 
-    Planner, code model and responsibility judge should receive projections
-    derived from this same persisted pool.
+    ToolPool.tools is the only authorization source.
+
+    file_bindings is retained as an empty compatibility field so old frontend
+    and stored payload readers do not fail during the migration.
     """
-    target_files = _stable_unique([
-        *[
-            binding.target_file
-            for binding in pool.file_bindings
-            if str(binding.target_file or "").strip()
-        ],
-        *[
-            target_file
-            for tool in pool.tools
-            for target_file in (tool.target_files or [])
-            if str(target_file or "").strip()
-        ],
-    ])
 
-    effective_bindings = []
-
-    for target_file in target_files:
-        binding = get_file_binding(pool, target_file)
-        if binding is not None:
-            effective_bindings.append(
-                binding.model_dump(mode="json")
-            )
+    skill_binding = get_skill_tool_binding(
+        pool,
+        target_file="",
+        include_script_core=False,
+    )
 
     return {
         "skill_name": pool.skill_name,
@@ -249,31 +281,84 @@ def tool_pool_snapshot(pool: ToolPoolModel) -> dict:
         "source": pool.source,
         "created_at": pool.created_at,
         "updated_at": pool.updated_at,
+
+        "authorization_scope": "skill",
+
+        "allowed_tool_ids": list(
+            skill_binding.allowed_tool_ids
+        ),
+
+        "allowed_helper_imports": list(
+            skill_binding.allowed_helper_imports
+        ),
+
+        "allowed_import_paths": list(
+            skill_binding.allowed_import_paths
+        ),
+
+        "allowed_function_imports": list(
+            skill_binding.allowed_function_imports
+        ),
+
+        "required_env": list(
+            skill_binding.required_env
+        ),
+
+        "dependencies": list(
+            skill_binding.dependencies
+        ),
+
+        "skill_binding": (
+            skill_binding.model_dump(
+                mode="json"
+            )
+        ),
+
         "tools": [
-            tool.model_dump(mode="json")
+            tool.model_dump(
+                mode="json"
+            )
             for tool in pool.tools
             if tool.status == "allowed"
         ],
-        "file_bindings": effective_bindings,
+
+        # Legacy compatibility only.
+        # Per-file authorization is no longer used.
+        "file_bindings": [],
+
         "denied_requests": [
-            item.model_dump(mode="json")
+            item.model_dump(
+                mode="json"
+            )
             for item in pool.denied_requests
         ],
+
         "missing_requests": [
-            item.model_dump(mode="json")
+            item.model_dump(
+                mode="json"
+            )
             for item in pool.missing_requests
         ],
+
         "gate_events": [
-            item.model_dump(mode="json")
+            item.model_dump(
+                mode="json"
+            )
             for item in pool.gate_events
         ],
+
         "exploration_candidates": list(
-            pool.exploration_candidates or []
+            pool.exploration_candidates
+            or []
         ),
+
         "scored_candidates": list(
-            pool.scored_candidates or []
+            pool.scored_candidates
+            or []
         ),
+
         "uploaded_file_triggers": list(
-            pool.uploaded_file_triggers or []
+            pool.uploaded_file_triggers
+            or []
         ),
     }

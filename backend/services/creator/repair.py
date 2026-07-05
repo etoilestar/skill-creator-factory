@@ -1867,7 +1867,11 @@ async def _repair_generated_file_with_feedback(
             _creator_tool_context_for_script(
                 file_path=file_path,
                 skill_plan_entry=plan_entry,
-                failure_layer=_failure_layer_from_error_text(validation_error),
+                failure_layer=(
+                    _failure_layer_from_error_text(
+                        validation_error
+                    )
+                ),
                 error_text=validation_error,
                 include_snippets=True,
                 rediscover_for_repair=False,
@@ -1875,33 +1879,80 @@ async def _repair_generated_file_with_feedback(
                     "target_file": file_path,
                     "script_content": current_content,
                     "structured_failure": {
-                        "validation_error": validation_error,
+                        "validation_error": (
+                            validation_error
+                        ),
                         "targeted_repair": targeted_repair,
-                        "failed_checks": failed_checks_text,
+                        "failed_checks": (
+                            failed_checks_text
+                        ),
                     },
-                    "runtime_contract": getattr(plan_entry, "runtime_contract", None),
-                    "coverage_requirements": getattr(plan_entry, "coverage_requirements", None),
-                    "artifact_contract": getattr(plan_entry, "artifact_contract", None),
-                    "stdout_schema": getattr(getattr(plan_entry, "runtime_contract", None), "stdout_schema", None),
-                    "command_argv_contract": getattr(plan_entry, "command_template", None),
+                    "runtime_contract": getattr(
+                        plan_entry,
+                        "runtime_contract",
+                        None,
+                    ),
+                    "artifact_contract": getattr(
+                        plan_entry,
+                        "artifact_contract",
+                        None,
+                    ),
+                    "command_argv_contract": getattr(
+                        plan_entry,
+                        "command_template",
+                        None,
+                    ),
                 },
+                current_file_binding=(
+                        current_file_binding or {}
+                ),
             )
             if plan_entry is not None
             else ""
         )
 
         repair_snippet_text = ""
+
         if plan_entry is not None:
+            bound_tool_ids: list[str] = []
+
+            for key in (
+                    "primary_tool_ids",
+                    "secondary_tool_ids",
+                    "allowed_tool_ids",
+            ):
+                for tool_id in (
+                                       current_file_binding or {}
+                               ).get(key, []) or []:
+                    tool_id = str(tool_id or "").strip()
+
+                    if (
+                            tool_id
+                            and tool_id not in bound_tool_ids
+                    ):
+                        bound_tool_ids.append(tool_id)
+
             snippets = resolve_tool_snippets_for_context(
                 role=plan_entry.role,
-                capabilities=list(plan_entry.required_capabilities or []) + list(plan_entry.optional_capabilities or []),
-                tool_names=[],
+                capabilities=bound_tool_ids,
+                tool_names=bound_tool_ids,
                 file_path=file_path,
-                failure_layer=_failure_layer_from_error_text(validation_error),
-                error_text=validation_error + "\n" + current_content[-6000:],
+                failure_layer=(
+                    _failure_layer_from_error_text(
+                        validation_error
+                    )
+                ),
+                error_text=(
+                        validation_error
+                        + "\n"
+                        + current_content[-6000:]
+                ),
                 max_snippets=5,
             )
-            repair_snippet_text = tool_snippet_prompt(snippets)
+
+            repair_snippet_text = (
+                tool_snippet_prompt(snippets)
+            )
 
         guard_success = bool((import_guard_result or {}).get("success")) if isinstance(import_guard_result, dict) else False
         failure_layer = _failure_layer_from_error_text(validation_error)

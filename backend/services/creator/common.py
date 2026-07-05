@@ -1750,67 +1750,160 @@ class FileGenerationStageError(Exception):
 def _creator_tool_context_for_script(
     *,
     file_path: str,
-    skill_plan_entry: SkillPlanEntry | dict[str, Any] | None,
+    skill_plan_entry: SkillPlanEntry
+    | dict[str, Any]
+    | None,
     blueprint_text: str = "",
     failure_layer: str | None = None,
     error_text: str | None = None,
     include_snippets: bool = True,
     rediscover_for_repair: bool = False,
     repair_context: dict[str, Any] | None = None,
+    current_file_binding: dict[str, Any] | None = None,
 ) -> str:
-    """Build tool context from explicit SkillPlan contract and registry metadata only."""
+    """Build code/repair tool context only from the shared ToolPool projection.
+
+    Registry semantic resolution and repair-time rediscovery are intentionally
+    forbidden here.
+
+    The planner owns discovery.
+    The backend gate owns authorization.
+    Code and repair models only consume the current shared ToolPool.
+    """
     if not file_path.startswith("scripts/"):
         return ""
-    entry = skill_plan_entry or _skill_plan_entry_for_file(file_path=file_path, blueprint_text=blueprint_text)
-    tool_resolve = resolve_tools_for_skill_plan_entry(entry)
-    parts = ["【Plan selected tools】\n" + tool_resolve.tool_usage_prompt]
-    if failure_layer or error_text:
-        role = str(entry.get("role") if isinstance(entry, dict) else getattr(entry, "role", "") or "")
-        required = list(entry.get("required_capabilities", []) if isinstance(entry, dict) else getattr(entry, "required_capabilities", []) or [])
-        optional = list(entry.get("optional_capabilities", []) if isinstance(entry, dict) else getattr(entry, "optional_capabilities", []) or [])
-        allowed = list(entry.get("allowed_capabilities", []) if isinstance(entry, dict) else getattr(entry, "allowed_capabilities", []) or [])
-        forbidden = list(entry.get("forbidden_capabilities", []) if isinstance(entry, dict) else getattr(entry, "forbidden_capabilities", []) or [])
-        from ..creator_tool_registry import tool_layer_prompt_for_context
-        parts.append(tool_layer_prompt_for_context(
-            role=role,
-            required_capabilities=required,
-            optional_capabilities=optional,
-            allowed_capabilities=allowed,
-            forbidden_capabilities=forbidden,
+
+    entry = (
+        skill_plan_entry
+        or _skill_plan_entry_for_file(
+            file_path=file_path,
+            blueprint_text=blueprint_text,
+        )
+    )
+
+    binding: dict[str, Any] = {}
+
+    if isinstance(current_file_binding, dict):
+        binding = dict(current_file_binding)
+
+    if not binding:
+        entry_data = (
+            entry
+            if isinstance(entry, dict)
+            else getattr(entry, "__dict__", {})
+        )
+
+        runtime_contract = (
+            entry_data.get("runtime_contract")
+            if isinstance(entry_data, dict)
+            else {}
+        )
+
+        if isinstance(runtime_contract, dict):
+            raw_binding = runtime_contract.get(
+                "tool_binding_summary"
+            )
+
+            if isinstance(raw_binding, dict):
+                binding = dict(raw_binding)
+
+        if (
+            not binding
+            and isinstance(entry_data, dict)
+            and isinstance(
+                entry_data.get("tool_binding_summary"),
+                dict,
+            )
+        ):
+            binding = dict(
+                entry_data["tool_binding_summary"]
+            )
+
+    tool_ids: list[str] = []
+
+    for key in (
+        "primary_tool_ids",
+        "secondary_tool_ids",
+        "allowed_tool_ids",
+    ):
+        for tool_id in binding.get(key) or []:
+            tool_id = str(tool_id or "").strip()
+
+            if tool_id and tool_id not in tool_ids:
+                tool_ids.append(tool_id)
+
+    cards: list[str] = []
+
+    for tool_id in tool_ids:
+        capability = get_tool_capability(tool_id)
+
+        if capability is None:
+            continue
+
+        cards.extend(
+            function_cards_for_tool(capability)
+        )
+
+    snippets = []
+
+    if include_snippets and tool_ids:
+        snippets = resolve_tool_snippets_for_context(
+            role=str(
+                (
+                    entry.get("role")
+                    if isinstance(entry, dict)
+                    else getattr(entry, "role", "")
+                )
+                or ""
+            ),
+            capabilities=tool_ids,
+            tool_names=tool_ids,
+            file_path=file_path,
             failure_layer=failure_layer,
             error_text=error_text,
-        ))
-        if include_snippets:
-            snippets = resolve_tool_snippets_for_context(
-                role=role,
-                capabilities=[*required, *optional, *allowed],
-                tool_names=[*required, *optional, *allowed],
-                file_path=file_path,
-                failure_layer=failure_layer,
-                error_text=error_text,
-                max_snippets=6,
+            max_snippets=6,
+        )
+
+    parts = [
+        (
+            "【Current Shared Skill ToolPool "
+            "Projection — hard authorization boundary】\n"
+            + json.dumps(
+                binding,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
             )
-            if snippets:
-                parts.append(tool_snippet_prompt(snippets))
-    if rediscover_for_repair:
-        rediscovered = _rediscover_tool_context_for_repair(
-            entry=entry,
-            file_path=file_path,
-            skill_md=blueprint_text,
-            script_content=str((repair_context or {}).get("script_content") or ""),
-            repair_context=repair_context,
         )
+    ]
+
+    if cards:
         parts.append(
-            "【Rediscovered candidate tools for current repair】\n"
-            + (rediscovered or "无匹配候选工具；请使用本地确定性实现，不要发明未列出的平台 helper。")
-            + "\n\n本轮脚本 repair 工具规则：\n"
-            "- 如果候选工具能补齐当前缺失职责，优先使用候选工具。\n"
-            "- 不得发明未列出的平台 helper。\n"
-            "- 不得调用 disabled / draft / failed custom tool。\n"
-            "- 如果当前脚本用了未知 helper，必须删除该 helper，改用候选工具或本地确定性实现。\n"
-            "- rediscovered tools 只是本次修复候选，不代表自动修改 selected_tools。"
+            "【Approved Tool Function Cards】\n"
+            + "\n\n---\n\n".join(cards)
         )
-    return "\n\n".join(part for part in parts if part)
+
+    if snippets:
+        parts.append(
+            tool_snippet_prompt(snippets)
+        )
+
+    parts.append(
+        "工具规则：\n"
+        "- 只能使用 Current Shared Skill ToolPool Projection 中 allowed_tool_ids 对应工具。\n"
+        "- primary_tool_ids / secondary_tool_ids 只表示推荐顺序，不形成不同工具池。\n"
+        "- required_capabilities / optional_capabilities 不是工具授权来源。\n"
+        "- 不得根据 Registry、文件职责或错误文本自行发现新工具。\n"
+        "- 不得请求 tool_pool_patch。\n"
+        "- 如果当前池缺能力，只能由责任判决反馈后交给规划模型重新探索并提案。\n"
+        "- E2E 阶段禁止工具探索。"
+    )
+
+    return "\n\n".join(
+        part
+        for part in parts
+        if part
+    )
 
 
 def _rediscover_tool_context_for_repair(

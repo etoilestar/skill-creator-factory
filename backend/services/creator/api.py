@@ -14,7 +14,12 @@ from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
-from .tool_pool_store import save_tool_pool, load_tool_pool, get_file_binding
+from .tool_pool_store import (
+    save_tool_pool,
+    load_tool_pool,
+    get_file_binding,
+    tool_pool_snapshot,
+)
 from .tool_pool_builder import build_tool_pool
 from .tool_pool_explorer import explore_tool_pool
 from .tool_pool_gate import gate_tool_request
@@ -139,6 +144,164 @@ def _build_strict_compile_rewrite_prompt(
         },
     ]
 
+def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
+    """Return the complete registered-tool catalog visible to the planner.
+
+    The catalog is discovery space, not authorization.
+
+    Only ToolPool.tools represents tools approved for the current Skill.
+    """
+    catalog: list[dict[str, Any]] = []
+
+    for capability in list_tool_capabilities():
+        functions = []
+
+        for function in getattr(capability, "functions", []) or []:
+            functions.append({
+                "function_name": str(
+                    getattr(function, "function_name", "") or ""
+                ),
+                "import_path": str(
+                    getattr(function, "import_path", "") or ""
+                ),
+                "signature": str(
+                    getattr(function, "signature", "") or ""
+                ),
+                "description": str(
+                    getattr(function, "when_to_use", "")
+                    or getattr(function, "short_description", "")
+                    or ""
+                ),
+                "input_schema": (
+                    getattr(function, "input_schema", None)
+                    or {}
+                ),
+                "output_schema": (
+                    getattr(function, "output_schema", None)
+                    or {}
+                ),
+            })
+
+        catalog.append({
+            "tool_id": str(
+                getattr(capability, "name", "") or ""
+            ),
+            "display_name": str(
+                getattr(capability, "display_name", "") or ""
+            ),
+            "category": str(
+                getattr(capability, "category", "") or ""
+            ),
+            "roles": list(
+                getattr(capability, "roles", []) or []
+            ),
+            "required_capabilities": list(
+                getattr(
+                    capability,
+                    "required_capabilities",
+                    [],
+                )
+                or []
+            ),
+            "optional_capabilities": list(
+                getattr(
+                    capability,
+                    "optional_capabilities",
+                    [],
+                )
+                or []
+            ),
+            "prompt_guidance": str(
+                getattr(capability, "prompt_guidance", "")
+                or ""
+            ),
+            "input_schema": (
+                getattr(capability, "input_schema", {})
+                or {}
+            ),
+            "output_schema": (
+                getattr(capability, "output_schema", {})
+                or {}
+            ),
+            "artifact_outputs": list(
+                getattr(capability, "artifact_outputs", [])
+                or []
+            ),
+            "enabled_by_default": bool(
+                getattr(
+                    capability,
+                    "enabled_by_default",
+                    False,
+                )
+            ),
+            "allow_creator_use": bool(
+                getattr(
+                    capability,
+                    "allow_creator_use",
+                    False,
+                )
+            ),
+            "created_by": str(
+                getattr(capability, "created_by", "")
+                or ""
+            ),
+            "approval_status": str(
+                getattr(
+                    capability,
+                    "approval_status",
+                    "",
+                )
+                or ""
+            ),
+            "test_status": str(
+                getattr(capability, "test_status", "")
+                or ""
+            ),
+            "functions": functions,
+        })
+
+    return catalog
+
+
+def _planner_shared_tool_context(
+    skill_name: str | None,
+) -> dict[str, Any]:
+    """Build the planner's discovery catalog + current shared ToolPool view."""
+    pool = ToolPoolModel(
+        skill_name=str(skill_name or "")
+    )
+
+    if str(skill_name or "").strip():
+        try:
+            skill_dir = (
+                settings.skills_path
+                / _validate_skill_name(str(skill_name))
+            )
+            pool = load_tool_pool(skill_dir)
+
+            if not pool.skill_name:
+                pool.skill_name = str(skill_name)
+
+        except Exception:
+            pool = ToolPoolModel(
+                skill_name=str(skill_name or "")
+            )
+
+    return {
+        "available_tool_catalog": (
+            _creator_tool_catalog_for_planner()
+        ),
+        "current_tool_pool": tool_pool_snapshot(pool),
+        "tool_contract": {
+            "catalog_is_discovery_space": True,
+            "tool_pool_is_authorization_source": True,
+            "planner_may_propose_changes": True,
+            "backend_gate_decides": True,
+            "code_model_may_not_expand_pool": True,
+            "responsibility_judge_may_not_expand_pool": True,
+            "e2e_may_not_expand_pool": True,
+        },
+    }
 
 def _entry_text_for_declared_support(skill_plan_entry: Any) -> str:
     if isinstance(skill_plan_entry, dict):
@@ -346,247 +509,314 @@ def _apply_tool_requests_to_current_file_binding(
     requests: list[ToolPoolAddToolRequest],
     source_phase: str,
 ) -> dict[str, Any]:
-    """Gate and apply tool requests to one file binding.
+    """Gate planner requests into the single shared Skill ToolPool.
 
-    Tool availability is evaluated per target file. A tool already present in
-    ToolPool.tools may still need to be attached to another file binding.
+    ToolPool.tools is the authorization source.
+
+    file_bindings only records target-file preference/ranking. Once a tool has
+    been approved into ToolPool.tools, another target file does not need to
+    re-authorize the same tool.
     """
-    skill_dir = settings.skills_path / _validate_skill_name(skill_name)
-    pool = load_tool_pool(skill_dir)
+    skill_dir = (
+        settings.skills_path
+        / _validate_skill_name(skill_name)
+    )
 
-    binding = get_file_binding(pool, target_file)
+    skill_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    pool.skill_name = skill_name
+
+    binding = get_file_binding(
+        pool,
+        target_file,
+        raw=True,
+    )
+
     if binding is None:
         binding = ToolPoolFileBinding(
             target_file=target_file,
             allowed_tool_ids=["script_argv_guard"],
             primary_tool_ids=["script_argv_guard"],
-            allowed_helper_imports=["strict_json_argv_guard"],
+            allowed_helper_imports=[
+                "strict_json_argv_guard",
+            ],
         )
         pool.file_bindings.append(binding)
 
-    def _merge_unique(
+    def merge_unique(
         current: list[Any],
         incoming: list[Any],
     ) -> list[Any]:
         out = list(current or [])
+
         for item in incoming or []:
             if item not in out:
                 out.append(item)
+
         return out
 
-    current_allowed_tool_ids = set(binding.allowed_tool_ids or [])
+    unique_requests: list[ToolPoolAddToolRequest] = []
+    seen_request_ids: set[tuple[str, str]] = set()
 
-    pending_requests = [
-        request
-        for request in requests or []
-        if request.target_file == target_file
-        and request.candidate_tool_id not in current_allowed_tool_ids
-    ]
+    for request in requests or []:
+        if request.target_file != target_file:
+            continue
+
+        request_key = (
+            request.target_file,
+            request.candidate_tool_id,
+        )
+
+        if request_key in seen_request_ids:
+            continue
+
+        seen_request_ids.add(request_key)
+        unique_requests.append(request)
 
     allowed_new = 0
+    attached_existing = 0
     missing_new = 0
     denied_new = 0
 
-    required_capabilities = {
-        str(item or "").strip()
-        for item in (
-            file_spec.get("required_capabilities")
-            if isinstance(file_spec, dict)
-            else []
-        ) or []
-        if str(item or "").strip()
-    }
+    def attach_tool_projection(
+        tool: ToolPoolTool,
+        request: ToolPoolAddToolRequest,
+        *,
+        decision: str,
+        messages: list[str],
+    ) -> None:
+        capability = get_tool_capability(tool.tool_id)
 
-    for request in pending_requests:
+        binding.allowed_tool_ids = merge_unique(
+            binding.allowed_tool_ids,
+            [tool.tool_id],
+        )
+
+        non_core_primary = [
+            tool_id
+            for tool_id in binding.primary_tool_ids
+            if tool_id != "script_argv_guard"
+        ]
+
+        if request.rank <= 1 or not non_core_primary:
+            binding.primary_tool_ids = merge_unique(
+                binding.primary_tool_ids,
+                [tool.tool_id],
+            )
+        else:
+            binding.secondary_tool_ids = merge_unique(
+                binding.secondary_tool_ids,
+                [tool.tool_id],
+            )
+
+        binding.allowed_helper_imports = merge_unique(
+            binding.allowed_helper_imports,
+            tool.allowed_helper_imports,
+        )
+
+        binding.allowed_import_paths = merge_unique(
+            binding.allowed_import_paths,
+            tool.allowed_import_paths,
+        )
+
+        binding.allowed_function_imports = merge_unique(
+            binding.allowed_function_imports,
+            tool.allowed_function_imports,
+        )
+
+        binding.required_env = merge_unique(
+            binding.required_env,
+            tool.required_env,
+        )
+
+        binding.dependencies = merge_unique(
+            binding.dependencies,
+            tool.dependencies,
+        )
+
+        binding.matched_features_by_tool[
+            tool.tool_id
+        ] = list(request.matched_features or [])
+
+        score_row = {
+            "tool_id": tool.tool_id,
+            "score": request.score,
+            "rank": request.rank,
+            "matched_features": list(
+                request.matched_features or []
+            ),
+            "matched_terms": list(
+                request.matched_terms or []
+            ),
+            "decision": decision,
+            "reason": "; ".join(messages),
+            "target_file": target_file,
+            "source_phase": source_phase,
+        }
+
+        if score_row not in binding.scored_tools:
+            binding.scored_tools.append(score_row)
+
+        if capability is not None:
+            snippets = []
+
+            for snippet in (
+                getattr(capability, "snippets", []) or []
+            ):
+                if hasattr(snippet, "model_dump"):
+                    snippets.append(
+                        snippet.model_dump(mode="json")
+                    )
+                elif hasattr(snippet, "__dict__"):
+                    snippets.append(
+                        dict(snippet.__dict__)
+                    )
+                else:
+                    snippets.append(snippet)
+
+            binding.snippets = merge_unique(
+                binding.snippets,
+                snippets,
+            )
+
+    for request in unique_requests:
+        existing_tool = next(
+            (
+                tool
+                for tool in pool.tools
+                if tool.tool_id
+                == request.candidate_tool_id
+                and tool.status == "allowed"
+            ),
+            None,
+        )
+
+        if existing_tool is not None:
+            existing_tool.target_files = merge_unique(
+                existing_tool.target_files,
+                [target_file],
+            )
+
+            existing_tool.matched_features = merge_unique(
+                existing_tool.matched_features,
+                request.matched_features,
+            )
+
+            existing_tool.matched_terms = merge_unique(
+                existing_tool.matched_terms,
+                request.matched_terms,
+            )
+
+            existing_tool.score = max(
+                float(existing_tool.score or 0.0),
+                float(request.score or 0.0),
+            )
+
+            attach_tool_projection(
+                existing_tool,
+                request,
+                decision="already_allowed_in_shared_pool",
+                messages=[
+                    "Tool already passed backend gate for "
+                    "the current Skill ToolPool."
+                ],
+            )
+
+            attached_existing += 1
+            continue
+
         gate_event = gate_tool_request(
             request,
             file_role=str(
-                file_spec.get("role") or "generic_script"
+                file_spec.get("role")
+                or "generic_script"
             ),
             file_spec=file_spec,
         )
+
         pool.gate_events.append(gate_event)
 
-        binding.scored_tools.append({
-            "tool_id": gate_event.tool_id,
-            "score": request.score,
-            "rank": request.rank,
-            "matched_features": request.matched_features,
-            "matched_terms": request.matched_terms,
-            "decision": gate_event.decision,
-            "reason": "; ".join(gate_event.messages),
-            "target_file": target_file,
-            "source_phase": source_phase,
-        })
-        binding.matched_features_by_tool[
-            gate_event.tool_id
-        ] = list(request.matched_features or [])
-
         if gate_event.decision == "allow":
-            capability = get_tool_capability(gate_event.tool_id)
+            capability = get_tool_capability(
+                gate_event.tool_id
+            )
 
-            existing_tool = next(
-                (
-                    tool
-                    for tool in pool.tools
-                    if tool.tool_id == gate_event.tool_id
+            tool = ToolPoolTool(
+                tool_id=gate_event.tool_id,
+                status="allowed",
+                source=request.source,
+                source_phase=source_phase,
+                target_files=[target_file],
+                allowed_helper_imports=list(
+                    gate_event.allowed_helper_imports
                 ),
-                None,
-            )
-
-            if existing_tool is None:
-                existing_tool = ToolPoolTool(
-                    tool_id=gate_event.tool_id,
-                    status="allowed",
-                    source="repair_request",
-                    source_phase=source_phase,
-                    target_files=[target_file],
-                    allowed_helper_imports=list(
-                        gate_event.allowed_helper_imports
-                    ),
-                    allowed_import_paths=list(
-                        gate_event.allowed_import_paths
-                    ),
-                    allowed_function_imports=list(
-                        gate_event.allowed_function_imports
-                    ),
-                    score=request.score,
-                    matched_features=list(
-                        request.matched_features or []
-                    ),
-                    matched_terms=list(
-                        request.matched_terms or []
-                    ),
-                    allowed_roles=list(
-                        (
-                            getattr(capability, "roles", [])
-                            if capability is not None
-                            else []
-                        )
-                        or []
-                    ),
-                    input_schema=(
-                        getattr(capability, "input_schema", {})
+                allowed_import_paths=list(
+                    gate_event.allowed_import_paths
+                ),
+                allowed_function_imports=list(
+                    gate_event.allowed_function_imports
+                ),
+                score=request.score,
+                matched_features=list(
+                    request.matched_features or []
+                ),
+                matched_terms=list(
+                    request.matched_terms or []
+                ),
+                allowed_roles=list(
+                    (
+                        getattr(capability, "roles", [])
                         if capability is not None
-                        else {}
+                        else []
                     )
-                    or {},
-                    output_schema=(
-                        getattr(capability, "output_schema", {})
-                        if capability is not None
-                        else {}
+                    or []
+                ),
+                input_schema=(
+                    getattr(
+                        capability,
+                        "input_schema",
+                        {},
                     )
-                    or {},
-                    required_env=list(gate_event.required_env),
-                    dependencies=list(gate_event.dependencies),
-                    reason=request.reason,
-                    gate_result=gate_event.decision,
-                    gate_messages=list(gate_event.messages),
+                    if capability is not None
+                    else {}
                 )
-                pool.tools.append(existing_tool)
-            else:
-                existing_tool.target_files = _merge_unique(
-                    existing_tool.target_files,
-                    [target_file],
+                or {},
+                output_schema=(
+                    getattr(
+                        capability,
+                        "output_schema",
+                        {},
+                    )
+                    if capability is not None
+                    else {}
                 )
-                existing_tool.allowed_helper_imports = _merge_unique(
-                    existing_tool.allowed_helper_imports,
-                    gate_event.allowed_helper_imports,
-                )
-                existing_tool.allowed_import_paths = _merge_unique(
-                    existing_tool.allowed_import_paths,
-                    gate_event.allowed_import_paths,
-                )
-                existing_tool.allowed_function_imports = _merge_unique(
-                    existing_tool.allowed_function_imports,
-                    gate_event.allowed_function_imports,
-                )
-                existing_tool.required_env = _merge_unique(
-                    existing_tool.required_env,
-                    gate_event.required_env,
-                )
-                existing_tool.dependencies = _merge_unique(
-                    existing_tool.dependencies,
-                    gate_event.dependencies,
-                )
-                existing_tool.matched_features = _merge_unique(
-                    existing_tool.matched_features,
-                    request.matched_features,
-                )
-                existing_tool.matched_terms = _merge_unique(
-                    existing_tool.matched_terms,
-                    request.matched_terms,
-                )
-                existing_tool.score = max(
-                    float(existing_tool.score or 0.0),
-                    float(request.score or 0.0),
-                )
-
-            binding.allowed_tool_ids = _merge_unique(
-                binding.allowed_tool_ids,
-                [gate_event.tool_id],
+                or {},
+                required_env=list(
+                    gate_event.required_env
+                ),
+                dependencies=list(
+                    gate_event.dependencies
+                ),
+                reason=request.reason,
+                gate_result=gate_event.decision,
+                gate_messages=list(
+                    gate_event.messages
+                ),
             )
 
-            non_core_primary = [
-                tool_id
-                for tool_id in binding.primary_tool_ids
-                if tool_id != "script_argv_guard"
-            ]
+            pool.tools.append(tool)
 
-            is_required_capability = (
-                gate_event.tool_id in required_capabilities
-            )
-
-            if is_required_capability or not non_core_primary:
-                binding.primary_tool_ids = _merge_unique(
-                    binding.primary_tool_ids,
-                    [gate_event.tool_id],
-                )
-            else:
-                binding.secondary_tool_ids = _merge_unique(
-                    binding.secondary_tool_ids,
-                    [gate_event.tool_id],
-                )
-
-            binding.allowed_helper_imports = _merge_unique(
-                binding.allowed_helper_imports,
-                gate_event.allowed_helper_imports,
-            )
-            binding.allowed_import_paths = _merge_unique(
-                binding.allowed_import_paths,
-                gate_event.allowed_import_paths,
-            )
-            binding.allowed_function_imports = _merge_unique(
-                binding.allowed_function_imports,
-                gate_event.allowed_function_imports,
-            )
-            binding.required_env = _merge_unique(
-                binding.required_env,
-                gate_event.required_env,
-            )
-            binding.dependencies = _merge_unique(
-                binding.dependencies,
-                gate_event.dependencies,
+            attach_tool_projection(
+                tool,
+                request,
+                decision=gate_event.decision,
+                messages=list(gate_event.messages),
             )
 
-            if capability is not None:
-                binding.snippets = _merge_unique(
-                    binding.snippets,
-                    [
-                        (
-                            snippet.model_dump(mode="json")
-                            if hasattr(snippet, "model_dump")
-                            else dict(snippet.__dict__)
-                            if hasattr(snippet, "__dict__")
-                            else snippet
-                        )
-                        for snippet in (
-                            getattr(capability, "snippets", []) or []
-                        )
-                    ],
-                )
-
-            current_allowed_tool_ids.add(gate_event.tool_id)
             allowed_new += 1
             continue
 
@@ -598,13 +828,18 @@ def _apply_tool_requests_to_current_file_binding(
                 ToolPoolMissingRequest(
                     target_file=target_file,
                     tool_id=gate_event.tool_id,
-                    missing_env=list(gate_event.missing_env),
+                    missing_env=list(
+                        gate_event.missing_env
+                    ),
                     missing_dependencies=list(
                         gate_event.missing_dependencies
                     ),
-                    reason="; ".join(gate_event.messages),
+                    reason="; ".join(
+                        gate_event.messages
+                    ),
                 )
             )
+
             missing_new += 1
             continue
 
@@ -622,18 +857,420 @@ def _apply_tool_requests_to_current_file_binding(
                 ),
             )
         )
+
         denied_new += 1
 
-    if pending_requests:
-        save_tool_pool(skill_dir, pool)
+    if unique_requests:
+        save_tool_pool(
+            skill_dir,
+            pool,
+        )
+
+    current_pool = load_tool_pool(skill_dir)
 
     return {
-        "requested": len(pending_requests),
+        "requested": len(unique_requests),
         "allowed_new": allowed_new,
+        "attached_existing": attached_existing,
         "missing_new": missing_new,
         "denied_new": denied_new,
-        "binding": binding.model_dump(mode="json"),
+        "binding": (
+            get_file_binding(
+                current_pool,
+                target_file,
+            ).model_dump(mode="json")
+            if get_file_binding(
+                current_pool,
+                target_file,
+            )
+            is not None
+            else {}
+        ),
+        "tool_pool": tool_pool_snapshot(
+            current_pool
+        ),
     }
+
+def _apply_planner_tool_pool_patch(
+    *,
+    skill_name: str,
+    planner_output: dict[str, Any],
+    source_phase: str,
+    allow_remove: bool,
+) -> dict[str, Any]:
+    """Apply a planner-proposed ToolPoolPatch through the backend gate.
+
+    Planning phases may add/remove tools.
+
+    Responsibility-feedback planning may only append tools.
+
+    Code model, responsibility judge and E2E must never call this function.
+    """
+    raw_patch = (
+        planner_output.get("tool_pool_patch")
+        if isinstance(planner_output, dict)
+        else None
+    )
+
+    if not isinstance(raw_patch, dict):
+        return {
+            "requested": 0,
+            "allowed_new": 0,
+            "attached_existing": 0,
+            "missing_new": 0,
+            "denied_new": 0,
+            "removed": 0,
+            "patch_present": False,
+        }
+
+    try:
+        patch = ToolPoolPatch.model_validate(
+            raw_patch
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Creator][planner_tool_pool_patch]"
+            "[invalid_patch] phase=%s skill=%s error=%s",
+            source_phase,
+            skill_name,
+            exc,
+        )
+
+        return {
+            "requested": 0,
+            "allowed_new": 0,
+            "attached_existing": 0,
+            "missing_new": 0,
+            "denied_new": 0,
+            "removed": 0,
+            "patch_present": True,
+            "invalid_patch": True,
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+    if not str(skill_name or "").strip():
+        return {
+            "requested": 0,
+            "allowed_new": 0,
+            "attached_existing": 0,
+            "missing_new": 0,
+            "denied_new": 0,
+            "removed": 0,
+            "patch_present": True,
+            "skipped": "skill_name_missing",
+        }
+
+    safe_skill_name = _validate_skill_name(
+        skill_name
+    )
+
+    skill_dir = (
+        settings.skills_path
+        / safe_skill_name
+    )
+
+    skill_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    pool = load_tool_pool(skill_dir)
+    pool.skill_name = safe_skill_name
+
+    removed_ids: set[str] = set()
+
+    if allow_remove:
+        for raw_remove in (
+            patch.remove_tool_requests or []
+        ):
+            if not isinstance(raw_remove, dict):
+                continue
+
+            tool_id = str(
+                raw_remove.get("tool_id")
+                or raw_remove.get(
+                    "candidate_tool_id"
+                )
+                or ""
+            ).strip()
+
+            if tool_id:
+                removed_ids.add(tool_id)
+
+    if removed_ids:
+        pool.tools = [
+            tool
+            for tool in pool.tools
+            if tool.tool_id not in removed_ids
+        ]
+
+        remaining_tools = {
+            tool.tool_id: tool
+            for tool in pool.tools
+            if tool.status == "allowed"
+        }
+
+        remaining_ids = set(remaining_tools)
+
+        for binding in pool.file_bindings:
+            is_script = binding.target_file.startswith(
+                "scripts/"
+            )
+
+            core_ids = (
+                ["script_argv_guard"]
+                if is_script
+                else []
+            )
+
+            current_preferred = [
+                tool_id
+                for tool_id in (
+                    binding.allowed_tool_ids or []
+                )
+                if tool_id in remaining_ids
+            ]
+
+            binding.allowed_tool_ids = list(
+                dict.fromkeys([
+                    *core_ids,
+                    *current_preferred,
+                ])
+            )
+
+            binding.primary_tool_ids = list(
+                dict.fromkeys([
+                    *core_ids,
+                    *[
+                        tool_id
+                        for tool_id in (
+                            binding.primary_tool_ids
+                            or []
+                        )
+                        if tool_id in remaining_ids
+                    ],
+                ])
+            )
+
+            primary_ids = set(
+                binding.primary_tool_ids
+            )
+
+            binding.secondary_tool_ids = [
+                tool_id
+                for tool_id in dict.fromkeys(
+                    binding.secondary_tool_ids
+                    or []
+                )
+                if tool_id in remaining_ids
+                and tool_id not in primary_ids
+            ]
+
+            binding.allowed_helper_imports = (
+                ["strict_json_argv_guard"]
+                if is_script
+                else []
+            )
+
+            binding.allowed_import_paths = []
+            binding.allowed_function_imports = []
+            binding.required_env = []
+            binding.dependencies = []
+            binding.snippets = []
+
+            for tool_id in current_preferred:
+                tool = remaining_tools.get(tool_id)
+
+                if tool is None:
+                    continue
+
+                binding.allowed_helper_imports = list(
+                    dict.fromkeys([
+                        *binding.allowed_helper_imports,
+                        *tool.allowed_helper_imports,
+                    ])
+                )
+
+                binding.allowed_import_paths = list(
+                    dict.fromkeys([
+                        *binding.allowed_import_paths,
+                        *tool.allowed_import_paths,
+                    ])
+                )
+
+                binding.allowed_function_imports = list(
+                    dict.fromkeys([
+                        *binding.allowed_function_imports,
+                        *tool.allowed_function_imports,
+                    ])
+                )
+
+                binding.required_env = list(
+                    dict.fromkeys([
+                        *binding.required_env,
+                        *tool.required_env,
+                    ])
+                )
+
+                binding.dependencies = list(
+                    dict.fromkeys([
+                        *binding.dependencies,
+                        *tool.dependencies,
+                    ])
+                )
+
+        pool.denied_requests = [
+            item
+            for item in pool.denied_requests
+            if item.tool_id not in removed_ids
+        ]
+
+        pool.missing_requests = [
+            item
+            for item in pool.missing_requests
+            if item.tool_id not in removed_ids
+        ]
+
+    proposal_source = (
+        "repair_request"
+        if source_phase
+        == "responsibility_feedback"
+        else "blueprint_preselect"
+    )
+
+    add_requests: list[
+        ToolPoolAddToolRequest
+    ] = []
+
+    for request in (
+        patch.add_tool_requests or []
+    ):
+        target_file = _normalize_skill_path(
+            request.target_file
+        )
+
+        if not target_file.startswith("scripts/"):
+            continue
+
+        add_requests.append(
+            request.model_copy(
+                update={
+                    "target_file": target_file,
+                    "source": proposal_source,
+                }
+            )
+        )
+
+    pool.exploration_candidates = [
+        {
+            **request.model_dump(mode="json"),
+            "proposal_phase": source_phase,
+            "proposal_owner": "planning_model",
+        }
+        for request in add_requests
+    ]
+
+    pool.scored_candidates = [
+        {
+            "tool_id": request.candidate_tool_id,
+            "target_file": request.target_file,
+            "requested_capability": (
+                request.requested_capability
+            ),
+            "score": request.score,
+            "rank": request.rank,
+            "reason": request.reason,
+            "proposal_phase": source_phase,
+            "proposal_owner": "planning_model",
+        }
+        for request in add_requests
+    ]
+
+    save_tool_pool(
+        skill_dir,
+        pool,
+    )
+
+    grouped: dict[
+        str,
+        list[ToolPoolAddToolRequest],
+    ] = {}
+
+    for request in add_requests:
+        grouped.setdefault(
+            request.target_file,
+            [],
+        ).append(request)
+
+    total = {
+        "requested": 0,
+        "allowed_new": 0,
+        "attached_existing": 0,
+        "missing_new": 0,
+        "denied_new": 0,
+        "removed": len(removed_ids),
+        "patch_present": True,
+    }
+
+    for target_file, target_requests in (
+        grouped.items()
+    ):
+        result = (
+            _apply_tool_requests_to_current_file_binding(
+                skill_name=safe_skill_name,
+                target_file=target_file,
+                file_spec={
+                    "path": target_file,
+                    "role": "generic_script",
+                },
+                requests=target_requests,
+                source_phase=source_phase,
+            )
+        )
+
+        for key in (
+            "requested",
+            "allowed_new",
+            "attached_existing",
+            "missing_new",
+            "denied_new",
+        ):
+            total[key] += int(
+                result.get(key) or 0
+            )
+
+    current_pool = load_tool_pool(skill_dir)
+
+    total["tool_pool"] = tool_pool_snapshot(
+        current_pool
+    )
+
+    logger.info(
+        "[Creator][planner_tool_pool_patch] %s",
+        json.dumps(
+            {
+                "event": "planner_tool_pool_patch",
+                "skill_name": safe_skill_name,
+                "source_phase": source_phase,
+                **{
+                    key: value
+                    for key, value in total.items()
+                    if key != "tool_pool"
+                },
+                "current_tool_ids": [
+                    tool.tool_id
+                    for tool in current_pool.tools
+                    if tool.status == "allowed"
+                ],
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+
+    return total
 
 def _split_e2e_blocking_errors(errors: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
     """Separate deterministic workflow failures from advisory validator issues."""
@@ -1153,10 +1790,36 @@ async def _repair_prepare_blueprint_protocol(
 ) -> str:
     repaired = str(blueprint_text or "")
     seen = {repaired}
-    for _ in range(MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS):
-        prompt = load_kernel_creator_for_phase("prepare_plan") + """
-你只修复 internal_blueprint_text 的 Creator 硬协议问题。只输出修复后的蓝图正文，不要 JSON，不要 Markdown 解释。
-修复要求：
+
+    for _ in range(
+        MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS
+    ):
+        tool_context = _planner_shared_tool_context(
+            request.skill_name
+        )
+
+        prompt = (
+            load_kernel_creator_for_phase(
+                "prepare_plan"
+            )
+            + """
+你只修复 internal_blueprint_text 的 Creator 硬协议问题，同时检查因为蓝图职责修正导致的共享 ToolPool 变化。
+
+只输出严格 JSON object：
+
+{
+  "internal_blueprint_text": "修复后的完整蓝图正文",
+  "tool_pool_patch": {
+    "add_tool_requests": [],
+    "remove_tool_requests": [],
+    "reason": "",
+    "affected_files": []
+  }
+}
+
+不要 Markdown 解释。
+
+蓝图修复要求：
 - 不要把运行时用户输入文件写入 assets；
 - 不要输出 assets/、assets/<name.ext>、assets/* 或动态 assets path；
 - 如果不需要静态素材，删除 assets 文件计划；
@@ -1164,28 +1827,217 @@ async def _repair_prepare_blueprint_protocol(
 - 目录结构与 SkillPlan path 必须一致；
 - dependencies 只能写运行前静态依赖；
 - 运行时产物只能出现在脚本 outputs/stdout JSON/file_outputs。
+
+工具规则：
+- available_tool_catalog 是完整发现目录。
+- current_tool_pool 是当前 Skill 唯一共享工具池。
+- 如果蓝图协议修复同时改变了脚本职责或真实能力需求，必须在同一轮通过 tool_pool_patch 提出变化。
+- add_tool_requests 只能使用 available_tool_catalog 中真实存在的精确 tool_id。
+- current_tool_pool 中已有工具不要重复 add。
+- 修正后的蓝图不再需要某工具时，可以 remove。
+- tool_pool_patch 只是规划模型提案，后台 Gate 才能授权 add。
+- 不得建立文件级独立工具池。
 """
-        route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare blueprint protocol repair")
-        text = await complete_chat_once([
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps({"blueprint_text": repaired, "protocol_errors": protocol_errors}, ensure_ascii=False, default=str)},
-        ], route.model)
-        candidate = str(text or "").strip()
-        if candidate.startswith("```"):
-            candidate = re.sub(r"^```(?:markdown|md)?\s*", "", candidate, flags=re.IGNORECASE).strip()
-            candidate = re.sub(r"\s*```$", "", candidate).strip()
-        if not _prepare_repair_candidate_is_valid(candidate):
+        )
+
+        route = route_model(
+            "creator_prepare_plan",
+            requested_model=request.model,
+            reason=(
+                "creator prepare blueprint "
+                "protocol repair"
+            ),
+        )
+
+        text = await complete_chat_once(
+            [
+                {
+                    "role": "system",
+                    "content": prompt,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "blueprint_text": repaired,
+                            "protocol_errors": (
+                                protocol_errors
+                            ),
+                            **tool_context,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+            route.model,
+        )
+
+        data = _parse_prepare_plan_json(text)
+
+        candidate = str(
+            data.get("internal_blueprint_text")
+            or ""
+        ).strip()
+
+        if not _prepare_repair_candidate_is_valid(
+            candidate
+        ):
             continue
+
         if candidate in seen:
             break
+
+        patch_skill_name = str(
+            data.get("skill_name")
+            or request.skill_name
+            or ""
+        )
+
+        if patch_skill_name:
+            _apply_planner_tool_pool_patch(
+                skill_name=patch_skill_name,
+                planner_output=data,
+                source_phase=(
+                    "prepare_blueprint_repair"
+                ),
+                allow_remove=True,
+            )
+
         repaired = candidate
         seen.add(repaired)
-        repaired = _normalize_prepare_blueprint_references(repaired)
-        protocol_errors = _preflight_prepare_blueprint_text(repaired)
+
+        repaired = (
+            _normalize_prepare_blueprint_references(
+                repaired
+            )
+        )
+
+        protocol_errors = (
+            _preflight_prepare_blueprint_text(
+                repaired
+            )
+        )
+
         if not protocol_errors:
             break
+
     return repaired
 
+async def _plan_tool_pool_patch_from_responsibility_feedback(
+    *,
+    skill_name: str,
+    target_file: str,
+    file_spec: dict[str, Any],
+    responsibility_issues: list[dict[str, Any]],
+    script_content: str,
+    requested_model: str | None,
+) -> dict[str, Any]:
+    """Let the planning model decide whether responsibility feedback needs tools.
+
+    The responsibility judge only reports the problem.
+
+    The planner decides whether the problem is:
+    - a code implementation problem, or
+    - a real capability gap requiring a ToolPool proposal.
+
+    Backend Gate remains the only authorization step.
+    """
+    tool_context = _planner_shared_tool_context(
+        skill_name
+    )
+
+    prompt = (
+        load_kernel_creator_for_phase("prepare_plan")
+        + """
+你是 Creator 规划模型。
+
+当前第一轮脚本生产完成后，责任判决模型反馈当前文件没有完成职责。
+
+你的任务不是修代码。
+你的任务只是判断：当前反馈是否揭示了共享 ToolPool 中缺少真实能力。
+
+只输出严格 JSON object：
+
+{
+  "gap_type": "code_problem" | "capability_gap",
+  "reason": "",
+  "tool_pool_patch": {
+    "add_tool_requests": [],
+    "remove_tool_requests": [],
+    "reason": "",
+    "affected_files": []
+  }
+}
+
+规则：
+- available_tool_catalog 是完整工具发现目录。
+- current_tool_pool 是当前 Skill 唯一共享 ToolPool。
+- 责任判决模型无权选择、授权或添加工具。
+- 写代码模型无权选择、授权或添加 ToolPool 外工具。
+- 你是规划模型；只有你可以根据责任反馈重新探索 available_tool_catalog 并提出 proposal。
+- 如果当前 ToolPool 已足够，或者问题只是代码没有正确使用已有工具/本地逻辑，则 gap_type=code_problem，add_tool_requests=[]。
+- 只有职责客观需要 current_tool_pool 中不存在的能力，而且 available_tool_catalog 中存在匹配工具时，才 gap_type=capability_gap 并提出 add_tool_requests。
+- candidate_tool_id 必须精确来自 available_tool_catalog。
+- 不得根据文件名、角色名或固定业务词表机械匹配工具；必须结合当前文件责任、责任判决反馈、现有 ToolPool 和工具真实函数能力进行语义判断。
+- 本阶段只能追加工具，remove_tool_requests 必须为空。
+- proposal 仍需 Backend Gate；你不能自行授权。
+"""
+    )
+
+    payload = {
+        "skill_name": skill_name,
+        "target_file": target_file,
+        "file_spec": file_spec,
+        "responsibility_issues": (
+            responsibility_issues
+        ),
+        "script_content": str(
+            script_content or ""
+        )[:16000],
+        **tool_context,
+    }
+
+    route = route_model(
+        "creator_prepare_plan",
+        requested_model=requested_model,
+        reason=(
+            "creator responsibility feedback "
+            "tool planning"
+        ),
+    )
+
+    text = await complete_chat_once(
+        [
+            {
+                "role": "system",
+                "content": prompt,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        ],
+        route.model,
+    )
+
+    data = _parse_prepare_plan_json(text)
+
+    result = _apply_planner_tool_pool_patch(
+        skill_name=skill_name,
+        planner_output=data,
+        source_phase="responsibility_feedback",
+        allow_remove=False,
+    )
+
+    return {
+        "planner_decision": data,
+        **result,
+    }
 
 def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanReviewSummary, *, skill_name: str, issues: list[dict[str, Any]]) -> PreparePlanResponse:
     return PreparePlanResponse(
@@ -1198,11 +2050,43 @@ def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanR
     )
 
 
-async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest) -> dict[str, Any]:
-    existing_context = _read_prepare_existing_skill_context(request.skill_name) if request.mode == "revise" else {}
-    system_prompt = load_kernel_creator_for_phase("prepare_plan") + """
+async def _generate_internal_blueprint_or_questions(
+    request: PreparePlanRequest,
+) -> dict[str, Any]:
+    """Only judge requirement maturity and collect business clarification.
 
+    Tool discovery must not happen here. The first legal tool-discovery point is
+    _prepare_summarize_confirmed_requirements(), after business clarification has
+    finished and creation points are being determined.
+    """
+    existing_context = (
+        _read_prepare_existing_skill_context(
+            request.skill_name
+        )
+        if request.mode == "revise"
+        else {}
+    )
+
+    system_prompt = (
+        load_kernel_creator_for_phase("prepare_plan")
+        + """
 你现在服务 /api/creator/prepare-plan。只输出严格 JSON object，不要 Markdown，不要解释文本。
+
+当前阶段只负责：
+1. 判断业务需求是否已经足够明确；
+2. 信息不足时提出一个真正阻塞创建计划的业务问题；
+3. 信息足够时形成 provisional internal_blueprint_text，供后续创建要点归纳使用。
+
+当前阶段不是工具发现阶段。
+不得探索工具目录。
+不得选择具体工具。
+不得提出 tool_pool_patch。
+不得因为上传文件中的 candidate_tools 或平台已有工具反向修改用户需求。
+不得输出或填写具体 selected_tools。
+不得输出或填写具体 required_tool_slots。
+required_capabilities 只能表达语义能力需求，不能填写注册工具 ID。
+
+真正的工具发现与 ToolPool 调整发生在后续创建要点、最终蓝图、蓝图修复和责任反馈规划阶段。
 
 返回格式：
 {
@@ -1218,67 +2102,135 @@ async def _generate_internal_blueprint_or_questions(request: PreparePlanRequest)
     "risks": [],
     "changes": []
   },
-  "internal_blueprint_text": "当 status=ready 时填写完整 Skill 架构蓝图",
+  "internal_blueprint_text": "当 status=ready 时填写 provisional Skill 架构蓝图",
   "skill_name": "可选",
   "blockers": []
 }
 
-约束：
+规划约束：
 - status=ready 之前必须先判断需求成熟度；不要直接把粗需求扩写成 ready 蓝图。
-- 信息足够时 status=ready，并生成完整 internal_blueprint_text。
-- 信息不足且 clarification_rounds 未达到上限时 status=needs_clarification，clarifying_questions 必须只包含 1 个问题，且只能问当前最阻塞生成/E2E 的问题；问题必须带 2-4 个选项。
+- 信息足够时 status=ready，并生成 provisional internal_blueprint_text。
+- 信息不足且 clarification_rounds 未达到上限时 status=needs_clarification。
+- clarifying_questions 必须只包含 1 个问题。
+- 只能问当前最阻塞生成或 E2E 的业务问题。
+- 问题必须带 2-4 个选项。
 - 每轮 needs_clarification 只能问一个问题；下一个问题必须基于 conversation_history 和 human_feedback 中上一轮的回答继续判断。
 - 如果 clarification_rounds 达到上限，不得继续返回业务澄清问题；达到上限后必须归纳创建要点，并询问用户是否补充。
 - 创建要点必须体现蓝图和责任图谱合同需要落实的功能，不要输出风险项。
 - 用户确认无补充后，不得继续 needs_clarification，必须生成 internal_blueprint_text。
-- 用户补充后，重新归纳要点；达到补充上限后必须生成 internal_blueprint_text。
+- 用户补充后，重新归纳业务需求；达到补充上限后必须生成 internal_blueprint_text。
 - “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；不要和业务问题放在同一轮。
-- 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充；如果用户选择“没有，按上面的选择继续”，且其他阻塞点已解决，才可以 ready。
-- 无法继续且用户必须先提供外部素材/权限/上下文时 status=blocked，并说明 blockers。
+- 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充。
+- 无法继续且用户必须先提供外部素材、权限或上下文时 status=blocked，并说明 blockers。
 - 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
 - 文件数量只在 prepare-plan 蓝图阶段决定；蓝图通过后不得新增、删除、拆分或合并脚本文件。
-- 不默认单脚本，也不按自然语言步骤机械增加脚本；脚本数量必须来自任务复杂度、工具边界、输入输出合同、可验证中间产物。
-- 原子任务或高度耦合任务可用 1 个脚本；存在清晰阶段边界、不同工具族、不同产物类型、解析-生成-构建链路、fanout/aggregate 边界时应拆为多个脚本。
+- 不默认单脚本，也不按自然语言步骤机械增加脚本。
+- 脚本数量必须来自任务复杂度、输入输出合同、可验证中间产物和职责边界。
+- 原子任务或高度耦合任务可用 1 个脚本。
+- 存在清晰阶段边界、不同产物类型、解析-生成-构建链路、fanout/aggregate 边界时可拆为多个脚本。
 - 当前平台没有显式 loop/map/foreach 节点；批量、逐项、顺序映射和聚合交付必须由某个脚本内部承担。
-- uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets；先判断 reference_only/runtime_input/asset_candidate。没有用户明确确认“固定加入 Skill assets”不得写入 assets/**。
-- confirmed_uploaded_assets 是用户确认过的可用素材；蓝图中来自上传文件的 assets/** 只能引用这里列出的 asset_target_path，并标记 uploaded/source/provided/user_upload，不得生成其内容。
-- unselected_uploaded_files 只能作为上下文或运行时输入参考；asset_decision=reference_only/runtime_input/unknown 的文件不得写入 assets/**。
+- uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets。
+- uploaded_files 中的 candidate_tools 只是上传分析阶段提供的候选元数据；当前阶段不得据此选择工具或写入 ToolPool。
+- confirmed_uploaded_assets 是用户确认过的可用静态素材。
+- unselected_uploaded_files 只能作为上下文或运行时输入参考。
+- 没有用户明确确认“固定加入 Skill assets”不得写入 assets/**。
 - 如果上传文件用途不明确，必须追问并区分：只作为本次创建参考、作为未来运行 Skill 的输入、固定加入 Skill assets。
 - assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
-- 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path；目录结构不要列具体文件名，具体文件只在 SkillPlan 中声明。
-- 资源清单只能列 SkillPlan path 中已声明的 references/assets；dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
-- 不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图；不确定是否需要 reference 时，默认不创建 reference 文件，也不要写入资源清单。
+- 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path。
+- 目录结构不要列具体文件名；具体文件只在 SkillPlan 中声明。
+- 资源清单只能列 SkillPlan path 中已声明的 references/assets。
+- dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
+- 不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图。
+- 不确定是否需要 reference 时默认不创建 reference 文件，也不要写入资源清单。
 - 如确需 reference，必须在 SkillPlan 中声明完整 reference block：path/role/inputs/outputs/dependencies/required_capabilities/forbidden_capabilities/references。
-- 需要使用已有工具时，脚本必须写 required_tool_slots 或 selected_tools；不要只依赖 required_capabilities。reference 文件和 asset 文件不得声明运行时工具能力。
-- 当 uploaded_files 的 candidate_tools 包含 vision_understanding 且需求需要理解图片内容时，应在脚本中声明 required_tool_slots: [vision_understanding] 或 selected_tools: [vision_understanding]；不要只写 required_capabilities。
-- 上传图片需要理解内容时使用 vision_understanding，不要要求用户手动描述图片，不要把图像理解误当 image_generation，不要把上传图片默认加入 assets。
+- provisional blueprint 中可以描述“需要图像理解”“需要文本生成”“需要构建 PDF”等语义能力，但不能填写具体注册 tool_id。
 """
-    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
+    )
+
+    confirmed_uploaded_assets, unselected_uploaded_files = (
+        _split_uploaded_asset_decisions(
+            request.uploaded_files
+        )
+    )
+
     payload = {
         "mode": request.mode,
         "skill_name": request.skill_name,
         "user_request": request.user_request,
-        "conversation_history": request.conversation_history,
+        "conversation_history": (
+            request.conversation_history
+        ),
         "uploaded_files": request.uploaded_files,
-        "confirmed_uploaded_assets": confirmed_uploaded_assets,
-        "unselected_uploaded_files": unselected_uploaded_files,
-        "previous_blueprint_text": request.previous_blueprint_text,
+        "confirmed_uploaded_assets": (
+            confirmed_uploaded_assets
+        ),
+        "unselected_uploaded_files": (
+            unselected_uploaded_files
+        ),
+        "previous_blueprint_text": (
+            request.previous_blueprint_text
+        ),
         "human_feedback": request.human_feedback,
         "existing_skill_context": existing_context,
-        "clarification_rounds": _count_prepare_business_clarification_rounds(request),
-        "max_clarification_rounds": MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS,
-        "clarification_limit_reached": _prepare_business_clarification_limit_reached(request),
-        "supplement_rounds": _count_prepare_supplement_rounds(request),
-        "max_supplement_rounds": MAX_PREPARE_SUPPLEMENT_ROUNDS,
-        "user_confirmed_no_more_supplement": _prepare_user_confirmed_no_more_supplement(request),
+        "clarification_rounds": (
+            _count_prepare_business_clarification_rounds(
+                request
+            )
+        ),
+        "max_clarification_rounds": (
+            MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS
+        ),
+        "clarification_limit_reached": (
+            _prepare_business_clarification_limit_reached(
+                request
+            )
+        ),
+        "supplement_rounds": (
+            _count_prepare_supplement_rounds(
+                request
+            )
+        ),
+        "max_supplement_rounds": (
+            MAX_PREPARE_SUPPLEMENT_ROUNDS
+        ),
+        "user_confirmed_no_more_supplement": (
+            _prepare_user_confirmed_no_more_supplement(
+                request
+            )
+        ),
     }
-    route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare plan")
-    text = await complete_chat_once([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-    ], route.model)
-    return _parse_prepare_plan_json(text)
 
+    route = route_model(
+        "creator_prepare_plan",
+        requested_model=request.model,
+        reason="creator prepare plan",
+    )
+
+    text = await complete_chat_once(
+        [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        ],
+        route.model,
+    )
+
+    data = _parse_prepare_plan_json(text)
+
+    # Defensive boundary: this phase must never mutate ToolPool even if the
+    # model returns an unexpected patch field.
+    data.pop("tool_pool_patch", None)
+
+    return data
 
 async def _prepare_summarize_confirmed_requirements(
     *,
@@ -1286,45 +2238,191 @@ async def _prepare_summarize_confirmed_requirements(
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
     prepared = prepared or {}
-    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
-    base = _coerce_prepare_summary(prepared.get("review_summary"))
-    prompt = load_kernel_creator_for_phase("prepare_plan") + """
-你只归纳 Creator 创建要点，不生成蓝图，不提风险。只输出严格 JSON object，字段为 goal/input/output/workflow/files_to_create_or_update/assets_to_upload/risks/changes。
+
+    confirmed_uploaded_assets, unselected_uploaded_files = (
+        _split_uploaded_asset_decisions(
+            request.uploaded_files
+        )
+    )
+
+    base = _coerce_prepare_summary(
+        prepared.get("review_summary")
+    )
+
+    tool_context = _planner_shared_tool_context(
+        request.skill_name
+        or prepared.get("skill_name")
+    )
+
+    prompt = (
+        load_kernel_creator_for_phase("prepare_plan")
+        + """
+你只归纳 Creator 创建要点，同时检查当前 Skill 的工具需求。不要生成蓝图，不提风险。只输出严格 JSON object。
+
+输出字段：
+{
+  "goal": "",
+  "input": "",
+  "output": "",
+  "workflow": [],
+  "files_to_create_or_update": [],
+  "assets_to_upload": [],
+  "risks": [],
+  "changes": [],
+  "tool_pool_patch": {
+    "add_tool_requests": [],
+    "remove_tool_requests": [],
+    "reason": "",
+    "affected_files": []
+  }
+}
+
 创建要点必须体现后续 internal_blueprint_text、SkillPlan 和 requirement graph 需要落实的功能合同：目标功能、运行时输入、运行时输出、处理流程、文件职责、脚本 inputs/outputs/stdout JSON 字段、资源边界、默认决策。
-risks 必须输出空数组。assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得放入。未明确但必须落地的部分使用默认推荐项：最小可用、可执行可验证、JSON + 可读 Markdown、最小文件集、不确定不创建 assets path。
+
+同时基于这些创建要点检查工具需求：
+- available_tool_catalog 是完整工具发现目录。
+- current_tool_pool 是当前 Skill 唯一共享 ToolPool。
+- 你只能通过 tool_pool_patch 提出 ToolPool 变化。
+- candidate_tool_id 必须是 available_tool_catalog 中的精确 tool_id。
+- 已在 current_tool_pool 中的工具不要重复 add。
+- 用户补充导致工具不再需要时，通过 remove_tool_requests 提案删除。
+- 不要创建另一套候选池。
+- 不要让后端、代码模型或判决模型自行从 Registry 语义选工具。
+- 工具提案和创建要点必须基于同一轮需求判断同时完成。
+
+risks 必须输出空数组。
+assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得放入。
+未明确但必须落地的部分使用默认推荐项：最小可用、可执行可验证、JSON + 可读 Markdown、最小文件集、不确定不创建 assets path。
 """
+    )
+
     payload = {
         "user_request": request.user_request,
-        "conversation_history": request.conversation_history,
+        "conversation_history": (
+            request.conversation_history
+        ),
         "human_feedback": request.human_feedback,
         "uploaded_files": request.uploaded_files,
-        "confirmed_uploaded_assets": confirmed_uploaded_assets,
-        "unselected_uploaded_files": unselected_uploaded_files,
-        "model_summary": base.model_dump(mode="json"),
+        "confirmed_uploaded_assets": (
+            confirmed_uploaded_assets
+        ),
+        "unselected_uploaded_files": (
+            unselected_uploaded_files
+        ),
+        "model_summary": base.model_dump(
+            mode="json"
+        ),
+        **tool_context,
     }
+
+    parsed: dict[str, Any] = {}
+
     try:
-        route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator prepare requirements summary")
-        text = await complete_chat_once([
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-        ], route.model)
-        summary = _coerce_prepare_summary(_parse_prepare_plan_json(text))
+        route = route_model(
+            "creator_prepare_plan",
+            requested_model=request.model,
+            reason=(
+                "creator prepare requirements summary"
+            ),
+        )
+
+        text = await complete_chat_once(
+            [
+                {
+                    "role": "system",
+                    "content": prompt,
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+            route.model,
+        )
+
+        parsed = _parse_prepare_plan_json(text)
+
+        summary_source = (
+            parsed.get("review_summary")
+            if isinstance(
+                parsed.get("review_summary"),
+                dict,
+            )
+            else parsed
+        )
+
+        summary = _coerce_prepare_summary(
+            summary_source
+        )
+
     except Exception:
         summary = base
+
+    patch_skill_name = str(
+        request.skill_name
+        or prepared.get("skill_name")
+        or ""
+    )
+
+    if patch_skill_name and parsed:
+        _apply_planner_tool_pool_patch(
+            skill_name=patch_skill_name,
+            planner_output=parsed,
+            source_phase="prepare_summary",
+            allow_remove=True,
+        )
+
     if not summary.goal:
-        summary.goal = str(request.user_request or "创建一个可执行 Skill").strip()[:500]
+        summary.goal = str(
+            request.user_request
+            or "创建一个可执行 Skill"
+        ).strip()[:500]
+
     if not summary.input:
-        summary.input = "运行时由用户提供文本、文件、参数或素材；未明确的文件默认作为运行时输入。"
+        summary.input = (
+            "运行时由用户提供文本、文件、参数或素材；"
+            "未明确的文件默认作为运行时输入。"
+        )
+
     if not summary.output:
-        summary.output = "默认返回结构化 JSON + 可读 Markdown；如生成文件则返回 OUTPUT_DIR 文件路径。"
+        summary.output = (
+            "默认返回结构化 JSON + 可读 Markdown；"
+            "如生成文件则返回 OUTPUT_DIR 文件路径。"
+        )
+
     if not summary.workflow:
-        summary.workflow = ["读取运行时输入", "按 Skill 目标处理并验证关键字段", "返回 stdout JSON 和可读结果"]
+        summary.workflow = [
+            "读取运行时输入",
+            "按 Skill 目标处理并验证关键字段",
+            "返回 stdout JSON 和可读结果",
+        ]
+
     if not summary.files_to_create_or_update:
-        summary.files_to_create_or_update = ["SKILL.md"]
+        summary.files_to_create_or_update = [
+            "SKILL.md"
+        ]
+
     summary.risks = []
+
     if not summary.changes:
-        summary.changes = ["默认决策：优先最小可用、可执行可验证；不确定的素材按运行时输入处理，不创建 assets path。"]
-    summary.assets_to_upload = [p for p in summary.assets_to_upload if str(p).strip().startswith("assets/")]
+        summary.changes = [
+            (
+                "默认决策：优先最小可用、可执行可验证；"
+                "不确定的素材按运行时输入处理，"
+                "不创建 assets path。"
+            )
+        ]
+
+    summary.assets_to_upload = [
+        path
+        for path in summary.assets_to_upload
+        if str(path).strip().startswith("assets/")
+    ]
+
     return summary
 
 
@@ -1333,29 +2431,128 @@ async def _generate_internal_blueprint_from_confirmed_summary(
     request: PreparePlanRequest,
     summary: PreparePlanReviewSummary,
 ) -> dict[str, Any]:
-    prompt = load_kernel_creator_for_phase("prepare_plan") + """
-基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text。只输出严格 JSON object：{"status":"ready","internal_blueprint_text":"...","review_summary":{...},"skill_name":"..."}。
-不得继续返回 needs_clarification，不得询问问题。未明确的非关键偏好使用默认推荐项。运行时输入默认不作为 Creator assets。输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
-资源清单只能列 SkillPlan path 中已声明的 references/assets；dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图；不确定是否需要 reference 时默认不创建 reference 文件，也不要写入资源清单。如确需 reference，必须在 SkillPlan 中声明完整 reference block：path/role/inputs/outputs/dependencies/required_capabilities/forbidden_capabilities/references。
+    tool_context = _planner_shared_tool_context(
+        request.skill_name
+    )
+
+    prompt = (
+        load_kernel_creator_for_phase("prepare_plan")
+        + """
+基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text，并同时重新检查当前共享 ToolPool 是否与最终蓝图职责一致。
+
+只输出严格 JSON object：
+
+{
+  "status": "ready",
+  "internal_blueprint_text": "...",
+  "review_summary": {},
+  "skill_name": "...",
+  "tool_pool_patch": {
+    "add_tool_requests": [],
+    "remove_tool_requests": [],
+    "reason": "",
+    "affected_files": []
+  }
+}
+
+不得继续返回 needs_clarification，不得询问问题。
+未明确的非关键偏好使用默认推荐项。
+运行时输入默认不作为 Creator assets。
+
+输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
+
+工具规则：
+- available_tool_catalog 是工具发现空间。
+- current_tool_pool 是当前 Skill 唯一共享 ToolPool。
+- 根据最终创建要点和本轮生成的蓝图职责，同时检查 current_tool_pool。
+- 需要新工具时，只通过 tool_pool_patch.add_tool_requests 提案。
+- 已有工具因最终蓝图变化不再需要时，通过 remove_tool_requests 提案。
+- candidate_tool_id 必须精确来自 available_tool_catalog。
+- 后台 Gate 决定 add 是否生效。
+- 不得把 selected_tools、required_tool_slots 或 required_capabilities 当成另一套授权来源。
+- 蓝图、ToolPool proposal 和脚本职责必须语义一致。
+- 不要为不同脚本建立不同工具池；当前 Skill 只能有 current_tool_pool 一套工具池。
+- file-level primary/secondary 只能表达推荐顺序，不能形成独立授权池。
+
+资源清单只能列 SkillPlan path 中已声明的 references/assets。
+dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
+不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图。
+不确定是否需要 reference 时默认不创建 reference 文件。
 """
-    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
+    )
+
+    confirmed_uploaded_assets, unselected_uploaded_files = (
+        _split_uploaded_asset_decisions(
+            request.uploaded_files
+        )
+    )
+
     payload = {
-        "confirmed_summary": summary.model_dump(mode="json"),
+        "confirmed_summary": summary.model_dump(
+            mode="json"
+        ),
         "user_request": request.user_request,
-        "conversation_history": request.conversation_history,
+        "conversation_history": (
+            request.conversation_history
+        ),
         "human_feedback": request.human_feedback,
         "uploaded_files": request.uploaded_files,
-        "confirmed_uploaded_assets": confirmed_uploaded_assets,
-        "unselected_uploaded_files": unselected_uploaded_files,
+        "confirmed_uploaded_assets": (
+            confirmed_uploaded_assets
+        ),
+        "unselected_uploaded_files": (
+            unselected_uploaded_files
+        ),
+        **tool_context,
     }
-    route = route_model("creator_prepare_plan", requested_model=request.model, reason="creator confirmed summary to blueprint")
-    text = await complete_chat_once([
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-    ], route.model)
+
+    route = route_model(
+        "creator_prepare_plan",
+        requested_model=request.model,
+        reason="creator confirmed summary to blueprint",
+    )
+
+    text = await complete_chat_once(
+        [
+            {
+                "role": "system",
+                "content": prompt,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        ],
+        route.model,
+    )
+
     data = _parse_prepare_plan_json(text)
+
     data["status"] = "ready"
-    data.setdefault("review_summary", summary.model_dump(mode="json"))
+
+    data.setdefault(
+        "review_summary",
+        summary.model_dump(mode="json"),
+    )
+
+    patch_skill_name = str(
+        data.get("skill_name")
+        or request.skill_name
+        or ""
+    )
+
+    if patch_skill_name:
+        _apply_planner_tool_pool_patch(
+            skill_name=patch_skill_name,
+            planner_output=data,
+            source_phase="confirmed_summary_blueprint",
+            allow_remove=True,
+        )
+
     return data
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
@@ -2426,24 +3623,86 @@ async def prepare_plan(request: PreparePlanRequest):
         for item in (getattr(request, "uploaded_files", []) or [])
         if isinstance(item, dict) or hasattr(item, "model_dump")
     ]
-    tool_pool = build_tool_pool(skill_name=plan.skill_name, user_request=getattr(request, "user_request", "") or "", blueprint_text=plan.blueprint_text or blueprint_text, file_specs=file_specs_payload, uploaded_files=uploaded_files_payload)
-    skill_dir_for_tool_pool = settings.skills_path / _validate_skill_name(plan.skill_name)
-    skill_dir_for_tool_pool.mkdir(parents=True, exist_ok=True)
-    save_tool_pool(skill_dir_for_tool_pool, tool_pool)
-    binding_by_path = {binding.target_file: binding for binding in tool_pool.file_bindings}
+    skill_dir_for_tool_pool = (
+            settings.skills_path
+            / _validate_skill_name(plan.skill_name)
+    )
+
+    skill_dir_for_tool_pool.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    current_tool_pool = load_tool_pool(
+        skill_dir_for_tool_pool
+    )
+
+    tool_pool = build_tool_pool(
+        skill_name=plan.skill_name,
+        user_request=(
+                getattr(request, "user_request", "")
+                or ""
+        ),
+        blueprint_text=(
+                plan.blueprint_text
+                or blueprint_text
+        ),
+        file_specs=file_specs_payload,
+        uploaded_files=uploaded_files_payload,
+        current_tool_pool=current_tool_pool,
+    )
+
+    save_tool_pool(
+        skill_dir_for_tool_pool,
+        tool_pool,
+    )
     for file_spec in plan.files or []:
-        binding = binding_by_path.get(getattr(file_spec, "path", ""))
-        if binding is not None and hasattr(file_spec, "tool_binding_summary"):
+        binding = get_file_binding(
+            tool_pool,
+            getattr(file_spec, "path", ""),
+        )
+
+        if (
+                binding is not None
+                and hasattr(
+            file_spec,
+            "tool_binding_summary",
+        )
+        ):
             file_spec.tool_binding_summary = {
-                "allowed_tool_ids": binding.allowed_tool_ids,
-                "primary_tool_ids": binding.primary_tool_ids,
-                "secondary_tool_ids": binding.secondary_tool_ids,
-                "allowed_helper_imports": binding.allowed_helper_imports,
-                "allowed_import_paths": binding.allowed_import_paths,
-                "allowed_function_imports": binding.allowed_function_imports,
-                "scored_tools": binding.scored_tools,
-                "matched_features_by_tool": binding.matched_features_by_tool,
-                "denied_helper_imports": binding.denied_helper_imports,
+                "allowed_tool_ids": (
+                    binding.allowed_tool_ids
+                ),
+                "primary_tool_ids": (
+                    binding.primary_tool_ids
+                ),
+                "secondary_tool_ids": (
+                    binding.secondary_tool_ids
+                ),
+                "allowed_helper_imports": (
+                    binding.allowed_helper_imports
+                ),
+                "allowed_import_paths": (
+                    binding.allowed_import_paths
+                ),
+                "allowed_function_imports": (
+                    binding.allowed_function_imports
+                ),
+                "scored_tools": (
+                    binding.scored_tools
+                ),
+                "matched_features_by_tool": (
+                    binding.matched_features_by_tool
+                ),
+                "denied_helper_imports": (
+                    binding.denied_helper_imports
+                ),
+                "required_env": (
+                    binding.required_env
+                ),
+                "dependencies": (
+                    binding.dependencies
+                ),
             }
     gate_events = [g.model_dump(mode="json") for g in tool_pool.gate_events]
     tool_pool_summary = {
@@ -4410,90 +5669,20 @@ async def generate_file(request: GenerateFileRequest):
                             detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
                         ) from guard_exc
                     if not import_guard_result.success:
-                        binding_requests = (
-                            _tool_requests_for_matching_forbidden_helpers(
-                                file_path=request.file_path,
-                                role=request.role,
-                                skill_plan_entry=effective_skill_plan_entry,
-                                import_guard_result=import_guard_result,
-                            )
+                        raise FileGenerationStageError(
+                            source="runtime_import_guard",
+                            layer=(
+                                    import_guard_result.error_type
+                                    or "runtime_import_guard_failed"
+                            ),
+                            detail=json.dumps(
+                                import_guard_result.model_dump(
+                                    mode="json"
+                                ),
+                                ensure_ascii=False,
+                                default=str,
+                            ),
                         )
-
-                        if binding_requests:
-                            expansion_result = (
-                                _apply_tool_requests_to_current_file_binding(
-                                    skill_name=skill_name,
-                                    target_file=request.file_path,
-                                    file_spec=(
-                                        dict(effective_skill_plan_entry)
-                                        if isinstance(
-                                            effective_skill_plan_entry,
-                                            dict,
-                                        )
-                                        else {
-                                            "path": request.file_path,
-                                            "role": (
-                                                    request.role
-                                                    or "generic_script"
-                                            ),
-                                        }
-                                    ),
-                                    requests=binding_requests,
-                                    source_phase="runtime_import_guard",
-                                )
-                            )
-
-                            if expansion_result.get("allowed_new", 0) > 0:
-                                refreshed_tool_pool = load_tool_pool(
-                                    settings.skills_path / skill_name
-                                )
-                                file_binding = get_file_binding(
-                                    refreshed_tool_pool,
-                                    request.file_path,
-                                )
-                                last_file_binding = file_binding
-
-                                import_guard_result = guard_runtime_imports(
-                                    content,
-                                    request.file_path,
-                                    file_binding,
-                                )
-                                last_import_guard_result = import_guard_result
-
-                                logger.info(
-                                    "[Creator][runtime_import_guard][binding_retry] %s",
-                                    json.dumps(
-                                        {
-                                            "event": (
-                                                "runtime_import_guard_binding_retry"
-                                            ),
-                                            "file_path": request.file_path,
-                                            "expansion_result": expansion_result,
-                                            "guard_success": (
-                                                import_guard_result.success
-                                            ),
-                                            "error_type": (
-                                                import_guard_result.error_type
-                                            ),
-                                        },
-                                        ensure_ascii=False,
-                                        default=str,
-                                    ),
-                                )
-
-                        if not import_guard_result.success:
-                            raise FileGenerationStageError(
-                                source="runtime_import_guard",
-                                layer=(
-                                        import_guard_result.error_type
-                                        or "runtime_import_guard_failed"
-                                ),
-                                detail=json.dumps(
-                                    import_guard_result.model_dump(mode="json"),
-                                    ensure_ascii=False,
-                                    default=str,
-                                ),
-                            )
 
                 try:
 
@@ -5154,56 +6343,62 @@ async def generate_file(request: GenerateFileRequest):
                         #    caused the responsibility failure.
                         # The result is a proposal only — it still passes through the gate
                         # before any tool is added to the allowed pool.
-                        has_stubs = any(
-                            str(issue.get("id") or "") in {"stub_implementation", "stub_branch"}
-                            for issue in (responsibility_issues or [])
-                        )
-                        has_missing_capability = _has_responsibility_missing_capability_issue(responsibility_issues)
-                        if (has_stubs or has_missing_capability) and tool_re_explore_count < 1 and request.file_path.startswith("scripts/"):
+                        if (
+                                tool_re_explore_count < 1
+                                and request.file_path.startswith("scripts/")
+                        ):
                             try:
                                 if (
                                         effective_skill_plan_entry
-                                        and isinstance(effective_skill_plan_entry, dict)
+                                        and isinstance(
+                                    effective_skill_plan_entry,
+                                    dict,
+                                )
                                 ):
-                                    explore_spec = dict(effective_skill_plan_entry)
-                                    explore_spec.setdefault("path", request.file_path)
-                                    explore_spec.setdefault(
+                                    planner_file_spec = dict(
+                                        effective_skill_plan_entry
+                                    )
+                                    planner_file_spec.setdefault(
+                                        "path",
+                                        request.file_path,
+                                    )
+                                    planner_file_spec.setdefault(
                                         "role",
                                         request.role or "generic_script",
                                     )
                                 else:
-                                    explore_spec = {
+                                    planner_file_spec = {
                                         "path": request.file_path,
-                                        "role": request.role or "generic_script",
+                                        "role": (
+                                                request.role
+                                                or "generic_script"
+                                        ),
                                     }
 
-                                re_explored = explore_tool_pool(
-                                    user_request=(
-                                            getattr(request, "user_request", "")
-                                            or request.purpose
-                                            or ""
-                                    ),
-                                    blueprint_text=request.blueprint_text or "",
-                                    file_specs=[explore_spec],
-                                )
-
-                                expansion_result = (
-                                    _apply_tool_requests_to_current_file_binding(
+                                expansion_result = await (
+                                    _plan_tool_pool_patch_from_responsibility_feedback(
                                         skill_name=skill_name,
                                         target_file=request.file_path,
-                                        file_spec=explore_spec,
-                                        requests=list(
-                                            re_explored.candidate_tool_requests or []
+                                        file_spec=planner_file_spec,
+                                        responsibility_issues=(
+                                            responsibility_issues
                                         ),
-                                        source_phase="responsibility_repair",
+                                        script_content=candidate or "",
+                                        requested_model=(
+                                                request.model
+                                                or route.model
+                                        ),
                                     )
                                 )
 
                                 logger.info(
-                                    "[Creator][tool_re_explore] %s",
+                                    "[Creator]"
+                                    "[responsibility_tool_planning] %s",
                                     json.dumps(
                                         {
-                                            "event": "tool_re_explore",
+                                            "event": (
+                                                "responsibility_tool_planning"
+                                            ),
                                             "skill_name": skill_name,
                                             "file_path": request.file_path,
                                             **expansion_result,
@@ -5215,15 +6410,15 @@ async def generate_file(request: GenerateFileRequest):
 
                                 tool_re_explore_count += 1
 
-                            except Exception as re_explore_exc:
+                            except Exception as planning_exc:
                                 logger.warning(
-                                    (
-                                        "[Creator][tool_re_explore] "
-                                        "re-exploration failed skill=%s file=%s error=%s"
-                                    ),
+                                    "[Creator]"
+                                    "[responsibility_tool_planning] "
+                                    "planning failed skill=%s "
+                                    "file=%s error=%s",
                                     skill_name,
                                     request.file_path,
-                                    re_explore_exc,
+                                    planning_exc,
                                 )
                         feedback = (
                             "RESPONSIBILITY_PATCH_STAGE\n"

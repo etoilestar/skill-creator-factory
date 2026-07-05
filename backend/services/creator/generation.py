@@ -1004,7 +1004,30 @@ def _build_script_generate_file_prompt_variant(
     stdout_schema = _script_stdout_schema_for_entry(
         plan_entry
     )
+    if (
+            isinstance(skill_plan_entry, dict)
+            and isinstance(
+        skill_plan_entry.get(
+            "tool_binding_summary"
+        ),
+        dict,
+    )
+    ):
+        runtime_contract = dict(
+            plan_entry.runtime_contract or {}
+        )
 
+        runtime_contract[
+            "tool_binding_summary"
+        ] = dict(
+            skill_plan_entry[
+                "tool_binding_summary"
+            ]
+        )
+
+        plan_entry.runtime_contract = (
+            runtime_contract
+        )
     local_contract = _script_local_contract_payload(
         file_path=file_path,
         purpose=purpose,

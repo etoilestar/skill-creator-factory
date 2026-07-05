@@ -22,94 +22,89 @@ def build_tool_pool(
     uploaded_files: list[dict[str, Any]] | None = None,
     current_tool_pool: ToolPoolModel | None = None,
 ) -> ToolPoolModel:
-    """Synchronize file projections for the current shared Skill ToolPool.
+    """Preserve the current shared ToolPool and ensure script bindings exist.
 
-    Important:
-    - This function does not discover tools.
-    - This function does not semantically select tools.
-    - This function does not create new tool authorization.
+    Tool discovery is owned by the planning model.
 
-    Tool discovery belongs to the planning model.
-    Tool authorization belongs to backend gate.
-    ToolPool.tools is preserved from the current persisted shared pool.
+    This function must not:
+    - explore registry tools;
+    - select business tools;
+    - Gate new business tools.
 
-    The builder only synchronizes script projection records.
+    It only preserves the current Skill ToolPool and creates missing
+    per-script ranking records.
     """
+
+    _ = user_request
+    _ = blueprint_text
+    _ = uploaded_files
+
     pool = (
         current_tool_pool.model_copy(deep=True)
         if current_tool_pool is not None
         else ToolPoolModel(skill_name=skill_name)
     )
 
-    if skill_name:
-        pool.skill_name = skill_name
+    pool.skill_name = skill_name
 
-    specs_by_path: dict[str, dict[str, Any]] = {}
-
-    for raw_spec in file_specs or []:
-        if not isinstance(raw_spec, dict):
-            continue
-
-        target_file = str(
-            raw_spec.get("path")
-            or raw_spec.get("target_file")
-            or ""
-        ).strip()
-
-        if not target_file.startswith("scripts/"):
-            continue
-
-        specs_by_path[target_file] = raw_spec
-
-    existing_bindings = {
-        binding.target_file: binding
+    existing_targets = {
+        binding.target_file
         for binding in pool.file_bindings
     }
 
-    synchronized_bindings: list[ToolPoolFileBinding] = []
+    valid_script_targets: set[str] = set()
 
-    for target_file, spec in specs_by_path.items():
-        binding = existing_bindings.get(target_file)
+    for spec in file_specs or []:
+        target = str(
+            spec.get("path")
+            or spec.get("target_file")
+            or ""
+        ).strip()
 
-        if binding is None:
-            binding = ToolPoolFileBinding(
-                target_file=target_file,
+        if not target.startswith("scripts/"):
+            continue
+
+        valid_script_targets.add(target)
+
+        if target in existing_targets:
+            continue
+
+        pool.file_bindings.append(
+            ToolPoolFileBinding(
+                target_file=target,
+                allowed_tool_ids=[
+                    "script_argv_guard",
+                ],
+                primary_tool_ids=[
+                    "script_argv_guard",
+                ],
+                allowed_helper_imports=list(
+                    CORE_HELPERS
+                ),
+                input_schema=(
+                    spec.get("inputs")
+                    if isinstance(
+                        spec.get("inputs"),
+                        dict,
+                    )
+                    else {}
+                ),
+                output_schema=(
+                    spec.get("outputs")
+                    if isinstance(
+                        spec.get("outputs"),
+                        dict,
+                    )
+                    else {}
+                ),
             )
-        else:
-            binding = binding.model_copy(deep=True)
+        )
 
-        binding.allowed_tool_ids = _uniq([
-            "script_argv_guard",
-            *(binding.allowed_tool_ids or []),
-        ])
-
-        binding.primary_tool_ids = _uniq([
-            "script_argv_guard",
-            *(binding.primary_tool_ids or []),
-        ])
-
-        binding.allowed_helper_imports = _uniq([
-            *CORE_HELPERS,
-            *(binding.allowed_helper_imports or []),
-        ])
-
-        if isinstance(spec.get("inputs"), dict):
-            binding.input_schema = dict(spec["inputs"])
-
-        if isinstance(spec.get("outputs"), dict):
-            binding.output_schema = dict(spec["outputs"])
-
-        synchronized_bindings.append(binding)
-
-    pool.file_bindings = synchronized_bindings
-
-    valid_script_paths = set(specs_by_path)
-
-    for tool in pool.tools:
-        tool.target_files = [
-            target_file
-            for target_file in (tool.target_files or [])
-            if target_file in valid_script_paths
-        ]
+    pool.file_bindings = [
+        binding
+        for binding in pool.file_bindings
+        if binding.target_file
+        in valid_script_targets
+    ]
 
     return pool

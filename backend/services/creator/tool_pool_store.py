@@ -46,46 +46,51 @@ def _stable_unique(values):
 def get_file_binding(
     pool: ToolPoolModel,
     target_file: str,
-    *,
-    raw: bool = False,
 ) -> ToolPoolFileBinding | None:
-    """Return the target-file projection of the shared Skill ToolPool.
+    """Return the effective binding for one script.
 
-    ToolPool.tools is the single authorization source for the current Skill.
+    pool.tools is the shared Skill-wide authorization source.
 
-    file_bindings only keeps target-file preference/ranking metadata:
-    - primary_tool_ids
-    - secondary_tool_ids
-    - scored_tools
-    - matched_features_by_tool
-
-    It must not narrow the Skill-wide callable tool set.
-
-    raw=True is reserved for backend mutation code that needs the persisted
-    projection object itself.
+    file_bindings only preserve per-file ranking and local metadata.
+    Therefore every script sees the same allowed ToolPool, while
+    primary/secondary ordering may differ by target file.
     """
-    stored = next(
+
+    binding = next(
         (
-            binding
-            for binding in pool.file_bindings
-            if binding.target_file == target_file
+            item
+            for item in pool.file_bindings
+            if item.target_file == target_file
         ),
         None,
     )
 
-    if raw:
-        return stored
+    if binding is None:
+        if not target_file.startswith("scripts/"):
+            return None
 
-    is_script = str(target_file or "").startswith("scripts/")
+        binding = ToolPoolFileBinding(
+            target_file=target_file,
+            allowed_tool_ids=["script_argv_guard"],
+            primary_tool_ids=["script_argv_guard"],
+            allowed_helper_imports=[
+                "strict_json_argv_guard",
+            ],
+        )
 
-    if stored is None and not is_script:
-        return None
+    effective = binding.model_copy(deep=True)
 
-    binding = (
-        stored.model_copy(deep=True)
-        if stored is not None
-        else ToolPoolFileBinding(target_file=target_file)
-    )
+    def merge_unique(
+        current: list[Any],
+        incoming: list[Any],
+    ) -> list[Any]:
+        result = list(current or [])
+
+        for item in incoming or []:
+            if item not in result:
+                result.append(item)
+
+        return result
 
     allowed_tools = [
         tool
@@ -93,87 +98,77 @@ def get_file_binding(
         if tool.status == "allowed"
     ]
 
-    core_tool_ids = ["script_argv_guard"] if is_script else []
-    core_helper_imports = ["strict_json_argv_guard"] if is_script else []
-
-    shared_tool_ids = _stable_unique([
+    shared_tool_ids = [
         tool.tool_id
         for tool in allowed_tools
-        if str(tool.tool_id or "").strip()
-    ])
-
-    binding.allowed_tool_ids = _stable_unique([
-        *core_tool_ids,
-        *shared_tool_ids,
-    ])
-
-    allowed_id_set = set(binding.allowed_tool_ids)
-
-    preferred_primary = [
-        tool_id
-        for tool_id in (binding.primary_tool_ids or [])
-        if tool_id in allowed_id_set
+        if tool.tool_id
     ]
 
-    binding.primary_tool_ids = _stable_unique([
-        *core_tool_ids,
-        *preferred_primary,
-    ])
+    effective.allowed_tool_ids = merge_unique(
+        effective.allowed_tool_ids,
+        shared_tool_ids,
+    )
 
-    primary_set = set(binding.primary_tool_ids)
-
-    preferred_secondary = [
-        tool_id
-        for tool_id in (binding.secondary_tool_ids or [])
-        if tool_id in allowed_id_set
-        and tool_id not in primary_set
-    ]
-
-    shared_secondary = [
-        tool_id
-        for tool_id in shared_tool_ids
-        if tool_id not in primary_set
-    ]
-
-    binding.secondary_tool_ids = _stable_unique([
-        *preferred_secondary,
-        *shared_secondary,
-    ])
-
-    binding.allowed_helper_imports = _stable_unique([
-        *core_helper_imports,
-        *[
+    effective.allowed_helper_imports = merge_unique(
+        effective.allowed_helper_imports,
+        [
             helper
             for tool in allowed_tools
-            for helper in (tool.allowed_helper_imports or [])
+            for helper in tool.allowed_helper_imports
         ],
-    ])
+    )
 
-    binding.allowed_import_paths = _stable_unique([
-        import_path
-        for tool in allowed_tools
-        for import_path in (tool.allowed_import_paths or [])
-    ])
+    effective.allowed_import_paths = merge_unique(
+        effective.allowed_import_paths,
+        [
+            import_path
+            for tool in allowed_tools
+            for import_path in tool.allowed_import_paths
+        ],
+    )
 
-    binding.allowed_function_imports = _stable_unique([
-        function_import
-        for tool in allowed_tools
-        for function_import in (tool.allowed_function_imports or [])
-    ])
+    effective.allowed_function_imports = merge_unique(
+        effective.allowed_function_imports,
+        [
+            function_name
+            for tool in allowed_tools
+            for function_name
+            in tool.allowed_function_imports
+        ],
+    )
 
-    binding.required_env = _stable_unique([
-        env_name
-        for tool in allowed_tools
-        for env_name in (tool.required_env or [])
-    ])
+    effective.required_env = merge_unique(
+        effective.required_env,
+        [
+            env_name
+            for tool in allowed_tools
+            for env_name in tool.required_env
+        ],
+    )
 
-    binding.dependencies = _stable_unique([
-        dependency
-        for tool in allowed_tools
-        for dependency in (tool.dependencies or [])
-    ])
+    effective.dependencies = merge_unique(
+        effective.dependencies,
+        [
+            dependency
+            for tool in allowed_tools
+            for dependency in tool.dependencies
+        ],
+    )
 
-    return binding
+    primary_ids = set(
+        effective.primary_tool_ids or []
+    )
+
+    effective.secondary_tool_ids = merge_unique(
+        effective.secondary_tool_ids,
+        [
+            tool_id
+            for tool_id in shared_tool_ids
+            if tool_id not in primary_ids
+        ],
+    )
+
+    return effective
 
 
 def get_allowed_helper_imports(

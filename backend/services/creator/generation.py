@@ -728,55 +728,120 @@ def _script_local_contract_payload(
     plan_entry: SkillPlanEntry,
     stdout_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build the local contract for one generated script.
+    """Build one code model's local script contract.
 
-    Current File Tool Binding is the single source of truth for callable
-    runtime/custom tools exposed to the code model.
+    Current File Tool Binding is the authorization truth.
 
-    resolve_implementation remains useful for implementation evidence and local
-    composition analysis, but it does not grant helper-import permissions.
+    Rich callable tool contracts are projected dynamically from Registry at
+    prompt-construction time.
     """
-    canonical_contract = compile_canonical_file_contract(
-        plan_entry,
-        stdout_schema,
-    )
-    implementation_resolution = resolve_implementation(
-        plan_entry,
-        canonical_contract,
-    )
-    command_argv_contract = _command_argv_contract_for_script(
-        file_path,
-        "",
-        plan_entry,
+
+    canonical_contract = (
+        compile_canonical_file_contract(
+            plan_entry,
+            stdout_schema,
+        )
     )
 
-    tool_binding_summary: dict[str, Any] = {}
-    if isinstance(plan_entry.runtime_contract, dict):
-        raw_binding = plan_entry.runtime_contract.get("tool_binding_summary")
-        if isinstance(raw_binding, dict):
-            tool_binding_summary = dict(raw_binding)
-
-    tool_binding_summary = _ensure_python_script_core_binding(
-        tool_binding_summary,
-        plan_entry,
+    implementation_resolution = (
+        resolve_implementation(
+            plan_entry,
+            canonical_contract,
+        )
     )
 
-    available_tools, tool_function_cards, selected_tool_names = (
-        _available_tool_cards_from_binding(tool_binding_summary)
+    command_argv_contract = (
+        _command_argv_contract_for_script(
+            file_path,
+            "",
+            plan_entry,
+        )
+    )
+
+    tool_binding_summary: dict[
+        str,
+        Any,
+    ] = {}
+
+    if isinstance(
+        plan_entry.runtime_contract,
+        dict,
+    ):
+        raw_binding = (
+            plan_entry.runtime_contract.get(
+                "tool_binding_summary"
+            )
+        )
+
+        if isinstance(
+            raw_binding,
+            dict,
+        ):
+            tool_binding_summary = dict(
+                raw_binding
+            )
+
+    tool_binding_summary = (
+        _ensure_python_script_core_binding(
+            tool_binding_summary,
+            plan_entry,
+        )
+    )
+
+    projection_gaps = (
+        _bound_callable_tool_contract_projection_gaps(
+            tool_binding_summary
+        )
+    )
+
+    if projection_gaps:
+        raise ValueError(
+            "BOUND_CALLABLE_TOOL_CONTRACT_MISSING: "
+            "Current File Tool Binding contains "
+            "authorized callable tools whose Registry "
+            "function contracts cannot be projected "
+            "into the code-model prompt. "
+            + json.dumps(
+                projection_gaps,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+
+    (
+        available_tools,
+        tool_function_cards,
+        selected_tool_names,
+    ) = _available_tool_cards_from_binding(
+        tool_binding_summary
     )
 
     bound_capability_ids = [
         tool_name
-        for tool_name in selected_tool_names
-        if get_tool_capability(tool_name) is not None
+        for tool_name
+        in selected_tool_names
+        if get_tool_capability(
+            tool_name
+        )
+        is not None
     ]
 
-    tool_snippets = resolve_tool_snippets_for_context(
-        role=plan_entry.role or "",
-        capabilities=list(dict.fromkeys(bound_capability_ids)),
-        tool_names=list(dict.fromkeys(bound_capability_ids)),
-        file_path=file_path,
-        max_snippets=8,
+    tool_snippets = (
+        resolve_tool_snippets_for_context(
+            role=plan_entry.role or "",
+            capabilities=list(
+                dict.fromkeys(
+                    bound_capability_ids
+                )
+            ),
+            tool_names=list(
+                dict.fromkeys(
+                    bound_capability_ids
+                )
+            ),
+            file_path=file_path,
+            max_snippets=8,
+        )
     )
 
     return {
@@ -787,34 +852,62 @@ def _script_local_contract_payload(
         "inputs": canonical_contract.inputs,
         "outputs": canonical_contract.outputs,
         "available_tools": available_tools,
-        "tool_function_cards": tool_function_cards,
-        "tool_snippets": tool_snippets,
-        "tool_snippet_prompt": tool_snippet_prompt(tool_snippets),
-        "current_file_tool_binding": tool_binding_summary,
-        "allowed_helper_imports": tool_binding_summary.get(
-            "allowed_helper_imports",
-            [],
+        "tool_function_cards": (
+            tool_function_cards
         ),
-        "resource_refs": canonical_contract.resource_refs,
+        "tool_snippets": tool_snippets,
+        "tool_snippet_prompt": (
+            tool_snippet_prompt(
+                tool_snippets
+            )
+        ),
+        "current_file_tool_binding": (
+            tool_binding_summary
+        ),
+        "allowed_helper_imports": (
+            tool_binding_summary.get(
+                "allowed_helper_imports",
+                [],
+            )
+        ),
+        "resource_refs": (
+            canonical_contract.resource_refs
+        ),
         "output_contract": {
             "stdout_schema": stdout_schema,
-            "artifact_contract": canonical_contract.artifact_contract,
+            "artifact_contract": (
+                canonical_contract
+                .artifact_contract
+            ),
         },
-        "platform_io_contract": build_platform_io_contract(),
-        "platform_io_rules": platform_io_contract_prompt_text(),
+        "platform_io_contract": (
+            build_platform_io_contract()
+        ),
+        "platform_io_rules": (
+            platform_io_contract_prompt_text()
+        ),
         "coverage_requirements": (
-            plan_entry.runtime_contract or {}
+            plan_entry.runtime_contract
+            or {}
         ).get(
             "coverage_requirements",
             {},
         ),
-        "runtime_contract": plan_entry.runtime_contract or {},
-        "command_argv_contract": command_argv_contract,
+        "runtime_contract": (
+            plan_entry.runtime_contract
+            or {}
+        ),
+        "command_argv_contract": (
+            command_argv_contract
+        ),
         "runtime_envelope": {
             "description": (
-                "Creator/Skill runtime may provide a generic JSON argv envelope. "
-                "Scripts should read the inputs required by their own guard/run "
-                "contract and may receive external values from the runtime envelope."
+                "Creator/Skill runtime may provide "
+                "a generic JSON argv envelope. "
+                "Scripts should read the inputs "
+                "required by their own guard/run "
+                "contract and may receive external "
+                "values from the runtime envelope."
             ),
             "generic_fields": [
                 "payload",
@@ -826,55 +919,97 @@ def _script_local_contract_payload(
                 "resources",
             ],
             "smoke_note": (
-                "Smoke inputs may include real runtime files or resources. "
-                "The script should consume runtime argv rather than embedding "
-                "trial values in business logic."
+                "Smoke inputs may include real "
+                "runtime files or resources. "
+                "The script should consume runtime "
+                "argv rather than embedding trial "
+                "values in business logic."
             ),
         },
         "rules": [
             (
-                "Use script_composition: combine validated argv inputs, local "
-                "logic, standard library, and useful available_tools to satisfy "
-                "the current script responsibility."
+                "Use script_composition: combine "
+                "validated argv inputs, local logic, "
+                "standard library, and useful "
+                "available_tools to satisfy the "
+                "current script responsibility."
             ),
             (
-                "available_tools and Current File Tool Binding describe the "
-                "callable tools currently bound to this file."
+                "available_tools and Current File "
+                "Tool Binding describe the callable "
+                "tools currently authorized for the "
+                "current Skill."
             ),
             (
-                "Imports from backend.services.runtime_tools must come from "
-                "current_file_tool_binding.allowed_helper_imports."
+                "For every available_tools item, "
+                "read description, signature, "
+                "input_schema, output_schema, "
+                "return_contract, artifact_outputs, "
+                "side_effects, examples and "
+                "common_mistakes before composing "
+                "the call."
             ),
             (
-                "Custom tool imports must follow "
-                "current_file_tool_binding.allowed_import_paths and "
+                "Imports from "
+                "backend.services.runtime_tools "
+                "must come from current_file_tool_"
+                "binding.allowed_helper_imports."
+            ),
+            (
+                "Custom or non-runtime_tools imports "
+                "must follow current_file_tool_"
+                "binding.allowed_import_paths and "
                 "allowed_function_imports."
             ),
             (
-                "Prefer primary tools, then secondary tools. Standard-library "
-                "or allowed local implementation may be used when a bound tool "
-                "does not cover the required local transformation."
+                "Prefer primary tools, then "
+                "secondary tools."
             ),
             (
-                "Core inputs must participate in the produced business result "
-                "or artifact."
+                "Standard-library or allowed local "
+                "implementation may be used only for "
+                "deterministic local transformations "
+                "that do not replace a required model "
+                "or external-effect capability with "
+                "placeholder behavior."
             ),
             (
-                "References and assets are runtime resources, not Python "
-                "dependency declarations."
+                "Never replace an available model "
+                "generation or artifact-producing "
+                "tool with a fixed template, fake "
+                "path, simulated result, or filename "
+                "string."
             ),
             (
-                "First-round generation implements the current script; "
-                "cross-step execution alignment is verified by E2E."
+                "Core inputs must participate in the "
+                "produced business result or artifact."
+            ),
+            (
+                "References and assets are runtime "
+                "resources, not Python dependency "
+                "declarations."
+            ),
+            (
+                "First-round generation implements "
+                "the current script; cross-step "
+                "execution alignment is verified "
+                "by E2E."
             ),
         ],
         "implementation_resolution": {
-            "mode": implementation_resolution.mode,
-            "required_evidence": implementation_resolution.required_evidence,
+            "mode": (
+                implementation_resolution.mode
+            ),
+            "required_evidence": (
+                implementation_resolution
+                .required_evidence
+            ),
             "reason": (
-                "Implementation composition evidence only. Callable tool "
-                "permissions are represented by current_file_tool_binding "
-                "and available_tools."
+                "Implementation composition evidence "
+                "only. Callable tool permissions are "
+                "represented by "
+                "current_file_tool_binding and "
+                "available_tools."
             ),
         },
     }
@@ -972,6 +1107,100 @@ def _existing_script_argv_context_for_skill_md(
         "已生成脚本入口参数事实（来自 strict_json_argv_guard / run(args) AST，仅供 SKILL.md command block 优先参考）：\n"
         + json.dumps(items, ensure_ascii=False, indent=2, default=str)
     )
+
+def _bound_callable_tool_contract_projection_gaps(
+    binding: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Detect authorized callable tools whose contracts are not prompt-visible."""
+
+    gaps: list[dict[str, Any]] = []
+
+    for tool_id in (
+        _tool_ids_from_binding_summary(
+            binding
+        )
+    ):
+        capability = get_tool_capability(
+            tool_id
+        )
+
+        if capability is None:
+            gaps.append({
+                "tool_id": tool_id,
+                "reason": (
+                    "bound tool_id is missing "
+                    "from Tool Registry"
+                ),
+            })
+
+            continue
+
+        callable_functions = [
+            function
+            for function in (
+                getattr(
+                    capability,
+                    "functions",
+                    [],
+                )
+                or []
+            )
+            if str(
+                getattr(
+                    function,
+                    "import_path",
+                    "",
+                )
+                or ""
+            ).strip()
+            and str(
+                getattr(
+                    function,
+                    "function_name",
+                    "",
+                )
+                or ""
+            ).strip()
+        ]
+
+        # Capability-only metadata may legitimately
+        # expose no callable function.
+        if not callable_functions:
+            continue
+
+        cards = function_cards_for_tool(
+            capability
+        )
+
+        if (
+            len(cards)
+            < len(callable_functions)
+        ):
+            gaps.append({
+                "tool_id": tool_id,
+                "reason": (
+                    "authorized callable tool has "
+                    "functions but not every callable "
+                    "function produced a Tool Function Card"
+                ),
+                "callable_functions": [
+                    str(
+                        getattr(
+                            function,
+                            "function_name",
+                            "",
+                        )
+                        or ""
+                    )
+                    for function
+                    in callable_functions
+                ],
+                "function_card_count": len(
+                    cards
+                ),
+            })
+
+    return gaps
 
 def _build_script_generate_file_prompt_variant(
     *,

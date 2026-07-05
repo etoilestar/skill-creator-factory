@@ -82,17 +82,28 @@ def _candidate_tools_from_uploaded(uploaded_files: list[dict[str, Any]]) -> tupl
                 tools.add(str(tool).strip()); triggers.append({'source':'uploaded_files.candidate_tools','tool_id':str(tool).strip(),'file':item.get('name') or item.get('path') or item.get('filename')})
     return tools, triggers
 
-def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
-    """Extract concrete registry tool IDs from deterministic file-spec fields.
+def _tool_ids_from_spec(
+    spec: dict[str, Any],
+) -> set[str]:
+    """Extract only explicit concrete registry tool IDs.
 
-    Explicit tool fields are always treated as concrete tool selections.
+    Semantic capabilities are not tool authorization.
 
-    required_capabilities are semantic capability requirements in general.
-    However, when a required capability exactly matches a registered capability
-    ID, that match is also concrete registry evidence and should not be dropped
-    by semantic top-k recall.
+    In particular:
+    - required_capabilities expresses semantic obligations;
+    - capability aliases / slot names are discovery hints;
+    - only explicit tool-id fields represent a concrete tool selection.
+
+    A semantic capability must never become a selected tool merely because its
+    text happens to equal a registered tool_id.
     """
-    spec = spec if isinstance(spec, dict) else {}
+
+    spec = (
+        spec
+        if isinstance(spec, dict)
+        else {}
+    )
+
     ids: set[str] = set()
 
     for key in (
@@ -102,23 +113,48 @@ def _tool_ids_from_spec(spec: dict[str, Any]) -> set[str]:
         "selected_tool_ids",
         "allowed_tools",
     ):
-        for item in _as_list(spec.get(key)):
-            text = str(item or "").strip()
+        for item in _as_list(
+            spec.get(key)
+        ):
+            text = str(
+                item
+                or ""
+            ).strip()
+
             if text:
                 ids.add(text)
 
-    registered_tool_ids = {
-        str(cap.name or "").strip()
-        for cap in list_tool_capabilities()
-        if str(cap.name or "").strip()
+    for item in _as_list(
+        spec.get("required_tool_slots")
+    ):
+        if isinstance(item, dict):
+            tool_id = (
+                item.get("tool_id")
+                or item.get(
+                    "candidate_tool_id"
+                )
+            )
+
+            if tool_id:
+                ids.add(
+                    str(tool_id).strip()
+                )
+
+            continue
+
+        text = str(
+            item
+            or ""
+        ).strip()
+
+        if text:
+            ids.add(text)
+
+    return {
+        item
+        for item in ids
+        if item
     }
-
-    for item in _as_list(spec.get("required_capabilities")):
-        capability_id = str(item or "").strip()
-        if capability_id and capability_id in registered_tool_ids:
-            ids.add(capability_id)
-
-    return ids
 
 def _normalize_tokens(text: str) -> set[str]:
     raw = (text or '').lower()

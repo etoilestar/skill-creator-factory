@@ -4815,14 +4815,73 @@ async def _run_script_responsibility_review(
     if stub_issues:
         deterministic_issues += stub_issues
     review_context = review_context if isinstance(review_context, dict) else {}
+    current_file_tool_binding = (
+        review_context.get(
+            "current_file_tool_binding"
+        )
+    )
 
+    if not isinstance(
+        current_file_tool_binding,
+        dict,
+    ):
+        current_file_tool_binding = {}
+
+    authorized_tool_contracts = (
+        tool_contracts_from_binding(
+            current_file_tool_binding
+        )
+    )
     if deterministic_issues:
-        logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
-            "event": "script_responsibility_failed",
-            "file_path": file_path,
-            "model": "deterministic",
-            "issue_count": len(deterministic_issues),
-        }, ensure_ascii=False, default=str))
+        logger.info(
+            "[Creator]"
+            "[script_responsibility]"
+            "[tool_contract_context] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "script_responsibility_"
+                        "tool_contract_context"
+                    ),
+                    "file_path": file_path,
+                    "authorized_tool_ids": [
+                        contract.get("tool_id")
+                        for contract
+                        in authorized_tool_contracts
+                    ],
+                    "tool_contract_count": len(
+                        authorized_tool_contracts
+                    ),
+                    "callable_functions": [
+                        (
+                            f"{contract.get('tool_id')}."
+                            f"{function.get('function_name')}"
+                        )
+                        for contract
+                        in authorized_tool_contracts
+                        for function
+                        in (
+                                contract.get(
+                                    "functions"
+                                )
+                                or []
+                        )
+                        if isinstance(
+                            function,
+                            dict,
+                        )
+                           and str(
+                            function.get(
+                                "function_name"
+                            )
+                            or ""
+                        ).strip()
+                    ],
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
         return {
             "passed": False,
             "issues": deterministic_issues,
@@ -4882,6 +4941,14 @@ async def _run_script_responsibility_review(
                 "- 必须重点检查空壳函数（函数体仅含 pass / ... / raise NotImplementedError）和空壳分支（if/elif/else 仅含 pass / ...）。\n"
                 "- 空壳函数/空壳分支是责任未完成的直接证据；必须在 blocking_issues 中明确指出每一个空壳位置，指明函数名、行号区域和应实现的职责。\n"
                 "- 不得以'结构完整'或'有导入语句'为由跳过空壳检查。\n\n"
+                "已授权工具合同理解规则：\n"
+                "- 当前文件已授权工具合同来自 Tool Registry，是已绑定工具用途、真实 callable function、import、signature、输入 schema、输出 schema、return contract、artifact outputs、side effects、example 和 common mistakes 的事实源。\n"
+                "- 当源码调用已授权工具函数时，必须按照工具合同理解函数真实行为和返回值；不得只根据函数名、变量名或自然语言猜测。\n"
+                "- 例如合同声明函数返回 str，就必须按 str 理解；不得假定返回 dict 或存在合同未声明的字段。\n"
+                "- 例如合同声明函数返回 image_path/file_outputs，应检查源码是否按该真实返回合同消费结果，而不是根据变量名猜测图片已经生成。\n"
+                "- 工具合同只用于理解源码语义和判断当前职责是否真实使用已有能力；不得借此新增工具、授权工具或要求 ToolPool 外工具。\n"
+                "- 如果当前源码没有调用某个已授权工具，不得因为工具已授权就假定其效果已经发生。\n"
+                "- 如果源码调用工具，但返回值没有进入当前职责要求的结果或 artifact，不得仅凭存在 tool call 判定职责完成。\n\n"
                 "工具绑定边界：工具/helper/custom_tools 是否允许，已经由 runtime_import_guard 和 Current File Tool Binding 负责。"
                 "你不得因为 runtime_tools/helper 导入判 failed；如怀疑工具绑定问题，只能设置 delegate_to_backend_contract=true 并放入 advisory_notes。"
                 "没有 deterministic runtime_import_guard failure 时，不得声称\"后端确定性检查判定禁止\"。\n\n"
@@ -4927,8 +4994,12 @@ async def _run_script_responsibility_review(
                 f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
 
                 "当前文件 requirements / must_do：\n"
-                f"{json.dumps(req_payload, ensure_ascii=False, default=str)[:8000]}\n\n"
 
+                f"{json.dumps(req_payload, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "当前文件已授权工具合同"
+                "（来自 Current File Tool Binding "
+                "中的 tool_id 回查 Tool Registry）：\n"
+                f"{json.dumps(authorized_tool_contracts,ensure_ascii=False,default=str,)[:16000]}\n\n"
                 "脚本试运行输出（如本阶段尚未运行则为空或说明未提供）：\n"
                 f"{json.dumps(trial_stdout, ensure_ascii=False, default=str)[:4000]}\n\n"
 

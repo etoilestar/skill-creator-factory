@@ -671,55 +671,228 @@ def _snippet_to_dict(snippet: Any) -> dict[str, Any]:
     return {"text": str(snippet)}
 
 
-def _available_tool_cards_from_binding(binding: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    """Build code-model tool cards from the actual Current File Tool Binding.
+def _available_tool_cards_from_binding(
+    binding: dict[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+]:
+    """Build code-model tool context from authorized Registry contracts.
 
-    This is not semantic routing. Tool selection already happened in ToolPool.
-    This function only converts bound registry tools into prompt-visible cards.
+    Tool selection and authorization already happened before this function.
+
+    Current File Tool Binding provides exact allowed tool IDs.
+    Registry provides descriptions, callable IO, return contracts, examples,
+    mistakes, artifacts, and side effects.
     """
-    available_tools: list[dict[str, Any]] = []
+
+    available_tools: list[
+        dict[str, Any]
+    ] = []
+
     tool_function_cards: list[str] = []
+
     selected_tool_names: list[str] = []
 
-    for tool_name in _tool_ids_from_binding_summary(binding):
-        cap = get_tool_capability(tool_name)
-        if cap is None:
+    contracts = tool_contracts_from_binding(
+        binding
+    )
+
+    for contract in contracts:
+        tool_name = str(
+            contract.get("tool_id")
+            or ""
+        ).strip()
+
+        if not tool_name:
             continue
 
-        selected_tool_names.append(tool_name)
-        tool_function_cards.extend(function_cards_for_tool(cap))
+        selected_tool_names.append(
+            tool_name
+        )
 
-        snippets = [_snippet_to_dict(snippet) for snippet in (getattr(cap, "snippets", []) or [])]
+        capability = get_tool_capability(
+            tool_name
+        )
 
-        for fn in getattr(cap, "functions", []) or []:
-            function_name = str(getattr(fn, "function_name", "") or "").strip()
-            import_path = str(getattr(fn, "import_path", "") or "").strip()
-            if not function_name or not import_path:
+        if capability is not None:
+            tool_function_cards.extend(
+                function_cards_for_tool(
+                    capability
+                )
+            )
+
+        for function in (
+            contract.get("functions")
+            or []
+        ):
+            if not isinstance(
+                function,
+                dict,
+            ):
                 continue
 
-            example_call = str(getattr(fn, "example_call", "") or "").strip()
-            call_template = example_call or f"from {import_path} import {function_name}\nresult = {function_name}(...)"
+            function_name = str(
+                function.get(
+                    "function_name"
+                )
+                or ""
+            ).strip()
+
+            import_path = str(
+                function.get("import_path")
+                or ""
+            ).strip()
+
+            if (
+                not function_name
+                or not import_path
+            ):
+                continue
+
+            example_call = str(
+                function.get("example_call")
+                or ""
+            ).strip()
+
+            call_template = (
+                example_call
+                or (
+                    f"from {import_path} "
+                    f"import {function_name}\n"
+                    f"result = "
+                    f"{function_name}(...)"
+                )
+            )
 
             available_tools.append({
-                "tool_id": f"{tool_name}.{function_name}",
-                "capability_name": tool_name,
-                "description": str(getattr(fn, "when_to_use", "") or getattr(fn, "short_description", "") or getattr(cap, "display_name", "") or tool_name),
-                "call_template": call_template,
-                "signature": str(getattr(fn, "signature", "") or ""),
-                "input_schema": getattr(fn, "input_schema", None) or getattr(cap, "input_schema", {}) or {},
-                "output_schema": getattr(fn, "output_schema", None) or getattr(cap, "output_schema", {}) or {},
-                "return_contract": str(getattr(fn, "return_contract", "") or ""),
-                "example_return": str(getattr(fn, "example_return", "") or ""),
-                "example_stdout": str(getattr(fn, "example_stdout", "") or ""),
-                "common_mistakes": list(getattr(fn, "common_mistakes", []) or getattr(cap, "common_mistakes", []) or []),
-                "snippets": snippets,
-                "usage_policy": str(getattr(fn, "usage_policy", "") or getattr(cap, "usage_policy", "") or ""),
-                "required_env": list(getattr(fn, "required_env", []) or getattr(cap, "required_env", []) or []),
-                "required_secrets": list(getattr(fn, "required_secrets", []) or getattr(cap, "required_secrets", []) or []),
-                "artifact_outputs": list(getattr(fn, "artifact_outputs", []) or getattr(cap, "artifact_outputs", []) or []),
+                "tool_id": (
+                    f"{tool_name}."
+                    f"{function_name}"
+                ),
+                "capability_name": (
+                    tool_name
+                ),
+                "description": str(
+                    function.get(
+                        "when_to_use"
+                    )
+                    or function.get(
+                        "short_description"
+                    )
+                    or contract.get(
+                        "display_name"
+                    )
+                    or tool_name
+                ),
+                "short_description": str(
+                    function.get(
+                        "short_description"
+                    )
+                    or ""
+                ),
+                "when_to_use": str(
+                    function.get(
+                        "when_to_use"
+                    )
+                    or ""
+                ),
+                "call_template": (
+                    call_template
+                ),
+                "signature": str(
+                    function.get("signature")
+                    or ""
+                ),
+                "input_schema": (
+                    function.get(
+                        "input_schema"
+                    )
+                    or contract.get(
+                        "input_schema"
+                    )
+                    or {}
+                ),
+                "output_schema": (
+                    function.get(
+                        "output_schema"
+                    )
+                    or contract.get(
+                        "output_schema"
+                    )
+                    or {}
+                ),
+                "return_contract": str(
+                    function.get(
+                        "return_contract"
+                    )
+                    or ""
+                ),
+                "example_return": str(
+                    function.get(
+                        "example_return"
+                    )
+                    or ""
+                ),
+                "example_stdout": str(
+                    function.get(
+                        "example_stdout"
+                    )
+                    or ""
+                ),
+                "common_mistakes": list(
+                    function.get(
+                        "common_mistakes"
+                    )
+                    or []
+                ),
+                "usage_policy": str(
+                    function.get(
+                        "usage_policy"
+                    )
+                    or contract.get(
+                        "usage_policy"
+                    )
+                    or ""
+                ),
+                "required_env": list(
+                    function.get(
+                        "required_env"
+                    )
+                    or []
+                ),
+                "required_secrets": list(
+                    function.get(
+                        "required_secrets"
+                    )
+                    or []
+                ),
+                "artifact_outputs": list(
+                    function.get(
+                        "artifact_outputs"
+                    )
+                    or contract.get(
+                        "artifact_outputs"
+                    )
+                    or []
+                ),
+                "side_effects": list(
+                    function.get(
+                        "side_effects"
+                    )
+                    or contract.get(
+                        "side_effects"
+                    )
+                    or []
+                ),
             })
 
-    return available_tools, tool_function_cards, selected_tool_names
+    return (
+        available_tools,
+        tool_function_cards,
+        selected_tool_names,
+    )
 
 def _script_local_contract_payload(
     *,

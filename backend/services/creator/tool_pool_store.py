@@ -46,14 +46,25 @@ def _stable_unique(values):
 def get_file_binding(
     pool: ToolPoolModel,
     target_file: str,
+    *,
+    raw: bool = False,
 ) -> ToolPoolFileBinding | None:
-    """Return the effective binding for one script.
+    """Return one script binding.
 
-    pool.tools is the shared Skill-wide authorization source.
+    ToolPool.tools is the shared Skill-wide authorization source.
 
-    file_bindings only preserve per-file ranking and local metadata.
-    Therefore every script sees the same allowed ToolPool, while
-    primary/secondary ordering may differ by target file.
+    raw=False:
+        Return an effective read projection. Shared allowed ToolPool tools are
+        merged into the file binding and the returned object is detached from
+        pool.file_bindings.
+
+    raw=True:
+        Return the persisted mutable file-binding object itself. Shared ToolPool
+        projection is not merged. Callers may mutate this object and then persist
+        the containing ToolPool.
+
+    File bindings preserve per-file ranking and local metadata. They do not form
+    independent authorization pools.
     """
 
     binding = next(
@@ -65,20 +76,31 @@ def get_file_binding(
         None,
     )
 
+    if raw:
+        return binding
+
     if binding is None:
-        if not target_file.startswith("scripts/"):
+        if not target_file.startswith(
+            "scripts/"
+        ):
             return None
 
         binding = ToolPoolFileBinding(
             target_file=target_file,
-            allowed_tool_ids=["script_argv_guard"],
-            primary_tool_ids=["script_argv_guard"],
+            allowed_tool_ids=[
+                "script_argv_guard",
+            ],
+            primary_tool_ids=[
+                "script_argv_guard",
+            ],
             allowed_helper_imports=[
                 "strict_json_argv_guard",
             ],
         )
 
-    effective = binding.model_copy(deep=True)
+    effective = binding.model_copy(
+        deep=True
+    )
 
     def merge_unique(
         current: list[Any],
@@ -104,37 +126,47 @@ def get_file_binding(
         if tool.tool_id
     ]
 
-    effective.allowed_tool_ids = merge_unique(
-        effective.allowed_tool_ids,
-        shared_tool_ids,
+    effective.allowed_tool_ids = (
+        merge_unique(
+            effective.allowed_tool_ids,
+            shared_tool_ids,
+        )
     )
 
-    effective.allowed_helper_imports = merge_unique(
-        effective.allowed_helper_imports,
-        [
-            helper
-            for tool in allowed_tools
-            for helper in tool.allowed_helper_imports
-        ],
+    effective.allowed_helper_imports = (
+        merge_unique(
+            effective.allowed_helper_imports,
+            [
+                helper
+                for tool in allowed_tools
+                for helper
+                in tool.allowed_helper_imports
+            ],
+        )
     )
 
-    effective.allowed_import_paths = merge_unique(
-        effective.allowed_import_paths,
-        [
-            import_path
-            for tool in allowed_tools
-            for import_path in tool.allowed_import_paths
-        ],
+    effective.allowed_import_paths = (
+        merge_unique(
+            effective.allowed_import_paths,
+            [
+                import_path
+                for tool in allowed_tools
+                for import_path
+                in tool.allowed_import_paths
+            ],
+        )
     )
 
-    effective.allowed_function_imports = merge_unique(
-        effective.allowed_function_imports,
-        [
-            function_name
-            for tool in allowed_tools
-            for function_name
-            in tool.allowed_function_imports
-        ],
+    effective.allowed_function_imports = (
+        merge_unique(
+            effective.allowed_function_imports,
+            [
+                function_name
+                for tool in allowed_tools
+                for function_name
+                in tool.allowed_function_imports
+            ],
+        )
     )
 
     effective.required_env = merge_unique(
@@ -151,7 +183,8 @@ def get_file_binding(
         [
             dependency
             for tool in allowed_tools
-            for dependency in tool.dependencies
+            for dependency
+            in tool.dependencies
         ],
     )
 
@@ -159,13 +192,15 @@ def get_file_binding(
         effective.primary_tool_ids or []
     )
 
-    effective.secondary_tool_ids = merge_unique(
-        effective.secondary_tool_ids,
-        [
-            tool_id
-            for tool_id in shared_tool_ids
-            if tool_id not in primary_ids
-        ],
+    effective.secondary_tool_ids = (
+        merge_unique(
+            effective.secondary_tool_ids,
+            [
+                tool_id
+                for tool_id in shared_tool_ids
+                if tool_id not in primary_ids
+            ],
+        )
     )
 
     return effective

@@ -1906,6 +1906,336 @@ def _creator_tool_context_for_script(
     )
 
 
+def tool_ids_from_binding_summary(
+    binding: Any,
+) -> list[str]:
+    """Return exact Registry tool IDs from one Current File Tool Binding.
+
+    Binding is authorization projection only.
+
+    Tool descriptions and callable contracts must be resolved dynamically from
+    Tool Registry using these exact IDs.
+    """
+
+    if hasattr(binding, "model_dump"):
+        try:
+            binding = binding.model_dump(
+                mode="json"
+            )
+        except Exception:
+            binding = {}
+
+    if not isinstance(binding, dict):
+        return []
+
+    tool_ids: list[str] = []
+
+    for key in (
+        "primary_tool_ids",
+        "allowed_tool_ids",
+        "secondary_tool_ids",
+    ):
+        raw_values = binding.get(key)
+
+        if raw_values in (
+            None,
+            "",
+        ):
+            continue
+
+        values = (
+            raw_values
+            if isinstance(raw_values, list)
+            else [raw_values]
+        )
+
+        for raw_tool_id in values:
+            tool_id = str(
+                raw_tool_id
+                or ""
+            ).strip()
+
+            if (
+                tool_id
+                and tool_id not in tool_ids
+            ):
+                tool_ids.append(tool_id)
+
+    return tool_ids
+
+
+def tool_contracts_from_binding(
+    binding: Any,
+) -> list[dict[str, Any]]:
+    """Project authorized binding tool IDs into rich Registry contracts.
+
+    This function does not:
+    - discover tools;
+    - select tools;
+    - authorize tools;
+    - mutate ToolPool.
+
+    It only resolves already-bound exact tool IDs against Tool Registry so code,
+    validation, and repair models can understand the same callable contracts.
+    """
+
+    contracts: list[
+        dict[str, Any]
+    ] = []
+
+    for tool_id in (
+        tool_ids_from_binding_summary(
+            binding
+        )
+    ):
+        capability = get_tool_capability(
+            tool_id
+        )
+
+        if capability is None:
+            continue
+
+        functions: list[
+            dict[str, Any]
+        ] = []
+
+        for function in (
+            getattr(
+                capability,
+                "functions",
+                [],
+            )
+            or []
+        ):
+            function_name = str(
+                getattr(
+                    function,
+                    "function_name",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            import_path = str(
+                getattr(
+                    function,
+                    "import_path",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            functions.append({
+                "function_name": function_name,
+                "import_path": import_path,
+                "short_description": str(
+                    getattr(
+                        function,
+                        "short_description",
+                        "",
+                    )
+                    or ""
+                ),
+                "when_to_use": str(
+                    getattr(
+                        function,
+                        "when_to_use",
+                        "",
+                    )
+                    or ""
+                ),
+                "signature": str(
+                    getattr(
+                        function,
+                        "signature",
+                        "",
+                    )
+                    or ""
+                ),
+                "input_schema": (
+                    getattr(
+                        function,
+                        "input_schema",
+                        None,
+                    )
+                    or {}
+                ),
+                "output_schema": (
+                    getattr(
+                        function,
+                        "output_schema",
+                        None,
+                    )
+                    or {}
+                ),
+                "return_contract": str(
+                    getattr(
+                        function,
+                        "return_contract",
+                        "",
+                    )
+                    or ""
+                ),
+                "artifact_outputs": list(
+                    getattr(
+                        function,
+                        "artifact_outputs",
+                        [],
+                    )
+                    or []
+                ),
+                "side_effects": list(
+                    getattr(
+                        function,
+                        "side_effects",
+                        [],
+                    )
+                    or []
+                ),
+                "example_call": str(
+                    getattr(
+                        function,
+                        "example_call",
+                        "",
+                    )
+                    or ""
+                ),
+                "example_return": str(
+                    getattr(
+                        function,
+                        "example_return",
+                        "",
+                    )
+                    or ""
+                ),
+                "example_stdout": str(
+                    getattr(
+                        function,
+                        "example_stdout",
+                        "",
+                    )
+                    or ""
+                ),
+                "common_mistakes": list(
+                    getattr(
+                        function,
+                        "common_mistakes",
+                        [],
+                    )
+                    or []
+                ),
+                "usage_policy": str(
+                    getattr(
+                        function,
+                        "usage_policy",
+                        "",
+                    )
+                    or getattr(
+                        capability,
+                        "usage_policy",
+                        "",
+                    )
+                    or ""
+                ),
+                "required_env": list(
+                    getattr(
+                        function,
+                        "required_env",
+                        [],
+                    )
+                    or getattr(
+                        capability,
+                        "required_env",
+                        [],
+                    )
+                    or []
+                ),
+                "required_secrets": list(
+                    getattr(
+                        function,
+                        "required_secrets",
+                        [],
+                    )
+                    or getattr(
+                        capability,
+                        "required_secrets",
+                        [],
+                    )
+                    or []
+                ),
+            })
+
+        contracts.append({
+            "tool_id": tool_id,
+            "display_name": str(
+                getattr(
+                    capability,
+                    "display_name",
+                    "",
+                )
+                or ""
+            ),
+            "category": str(
+                getattr(
+                    capability,
+                    "category",
+                    "",
+                )
+                or ""
+            ),
+            "prompt_guidance": str(
+                getattr(
+                    capability,
+                    "prompt_guidance",
+                    "",
+                )
+                or ""
+            ),
+            "usage_policy": str(
+                getattr(
+                    capability,
+                    "usage_policy",
+                    "",
+                )
+                or ""
+            ),
+            "input_schema": (
+                getattr(
+                    capability,
+                    "input_schema",
+                    None,
+                )
+                or {}
+            ),
+            "output_schema": (
+                getattr(
+                    capability,
+                    "output_schema",
+                    None,
+                )
+                or {}
+            ),
+            "artifact_outputs": list(
+                getattr(
+                    capability,
+                    "artifact_outputs",
+                    [],
+                )
+                or []
+            ),
+            "side_effects": list(
+                getattr(
+                    capability,
+                    "side_effects",
+                    [],
+                )
+                or []
+            ),
+            "functions": functions,
+        })
+
+    return contracts
+
 def _rediscover_tool_context_for_repair(
     *,
     entry,

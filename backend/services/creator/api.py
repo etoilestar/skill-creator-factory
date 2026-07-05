@@ -90,344 +90,6 @@ def _post_patch_python_compile_stage_error(file_path: str, content: str) -> File
         detail=json.dumps(detail, ensure_ascii=False, default=str),
     )
 
-def _registry_capability_claims(
-    capability: Any,
-) -> set[str]:
-    """Return formal semantic capability claims made by one registry tool.
-
-    Only formal registry capability declarations participate in deterministic
-    closure.
-
-    Discovery aliases/tags/domain terms are deliberately excluded here because
-    they are fuzzy recall evidence, not hard capability contracts.
-    """
-
-    claims: set[str] = set()
-
-    def add(value: Any) -> None:
-        text = str(
-            value
-            or ""
-        ).strip().lower()
-
-        if text:
-            claims.add(text)
-
-    add(
-        getattr(
-            capability,
-            "name",
-            "",
-        )
-    )
-
-    for value in (
-        getattr(
-            capability,
-            "required_capabilities",
-            [],
-        )
-        or []
-    ):
-        add(value)
-
-    for function in (
-        getattr(
-            capability,
-            "functions",
-            [],
-        )
-        or []
-    ):
-        for value in (
-            getattr(
-                function,
-                "required_capabilities",
-                [],
-            )
-            or []
-        ):
-            add(value)
-
-    return claims
-
-def _tool_pool_capability_gaps(
-    *,
-    file_specs: list[dict[str, Any]],
-    requirement_graph: dict[str, Any],
-    pool: ToolPoolModel,
-) -> list[dict[str, Any]]:
-    """Find deterministic formal capability gaps in the shared ToolPool.
-
-    This check does not select tools.
-
-    It only answers:
-
-        a script declares formal semantic capability X
-        AND Registry knows tools formally claiming X
-        BUT current allowed ToolPool contains no tool formally claiming X
-
-    Fuzzy/free-form capabilities remain planner context and are not turned into
-    hard backend failures by string matching.
-    """
-
-    registry = list_tool_capabilities()
-
-    known_claims: set[str] = set()
-    usable_tools_by_claim: dict[
-        str,
-        list[str],
-    ] = {}
-
-    for capability in registry:
-        claims = _registry_capability_claims(
-            capability
-        )
-
-        known_claims.update(claims)
-
-        if (
-            not bool(
-                getattr(
-                    capability,
-                    "enabled_by_default",
-                    False,
-                )
-            )
-            or not bool(
-                getattr(
-                    capability,
-                    "allow_creator_use",
-                    False,
-                )
-            )
-        ):
-            continue
-
-        for claim in claims:
-            usable_tools_by_claim.setdefault(
-                claim,
-                [],
-            )
-
-            tool_id = str(
-                getattr(
-                    capability,
-                    "name",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            if (
-                tool_id
-                and tool_id
-                not in usable_tools_by_claim[
-                    claim
-                ]
-            ):
-                usable_tools_by_claim[
-                    claim
-                ].append(tool_id)
-
-    satisfied_claims: set[str] = set()
-
-    for tool in (
-        pool.tools
-        or []
-    ):
-        if str(
-            getattr(tool, "status", "")
-            or ""
-        ) != "allowed":
-            continue
-
-        capability = get_tool_capability(
-            str(
-                getattr(
-                    tool,
-                    "tool_id",
-                    "",
-                )
-                or ""
-            )
-        )
-
-        if capability is None:
-            continue
-
-        satisfied_claims.update(
-            _registry_capability_claims(
-                capability
-            )
-        )
-
-    graph_required_by_file: dict[
-        str,
-        list[str],
-    ] = {}
-
-    raw_requirements = (
-        requirement_graph.get(
-            "requirements"
-        )
-        if isinstance(
-            requirement_graph,
-            dict,
-        )
-        else None
-    )
-
-    if isinstance(
-        raw_requirements,
-        list,
-    ):
-        for requirement in raw_requirements:
-            if not isinstance(
-                requirement,
-                dict,
-            ):
-                continue
-
-            target_file = str(
-                requirement.get(
-                    "target_file"
-                )
-                or ""
-            ).strip()
-
-            if not target_file:
-                continue
-
-            for value in (
-                requirement.get(
-                    "required_tools"
-                )
-                or []
-            ):
-                capability_name = str(
-                    value
-                    or ""
-                ).strip().lower()
-
-                if capability_name:
-                    graph_required_by_file.setdefault(
-                        target_file,
-                        [],
-                    ).append(
-                        capability_name
-                    )
-
-    gaps: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-
-    for spec in (
-        file_specs
-        or []
-    ):
-        if not isinstance(spec, dict):
-            continue
-
-        target_file = str(
-            spec.get("path")
-            or spec.get("target_file")
-            or ""
-        ).replace(
-            "\\",
-            "/",
-        ).strip()
-
-        if not target_file.startswith(
-            "scripts/"
-        ):
-            continue
-
-        forbidden = {
-            str(value or "").strip().lower()
-            for value in (
-                spec.get(
-                    "forbidden_capabilities"
-                )
-                or []
-            )
-            if str(value or "").strip()
-        }
-
-        obligations: list[str] = []
-
-        for value in [
-            *(
-                spec.get(
-                    "required_capabilities"
-                )
-                or []
-            ),
-            *graph_required_by_file.get(
-                target_file,
-                [],
-            ),
-        ]:
-            capability_name = str(
-                value
-                or ""
-            ).strip().lower()
-
-            if (
-                capability_name
-                and capability_name
-                not in obligations
-            ):
-                obligations.append(
-                    capability_name
-                )
-
-        for capability_name in obligations:
-            if capability_name in forbidden:
-                continue
-
-            # Free-form semantic hints are planner context.
-            # Only formal Registry-backed claims become deterministic gaps.
-            if capability_name not in known_claims:
-                continue
-
-            if (
-                capability_name
-                in satisfied_claims
-            ):
-                continue
-
-            key = (
-                target_file,
-                capability_name,
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            gaps.append({
-                "target_file": target_file,
-                "required_capability": (
-                    capability_name
-                ),
-                "candidate_tool_ids": list(
-                    usable_tools_by_claim.get(
-                        capability_name,
-                        [],
-                    )
-                ),
-                "reason": (
-                    "The analyzed script contract "
-                    "declares a formal Registry-backed "
-                    "semantic capability, but the current "
-                    "shared ToolPool has no allowed tool "
-                    "whose manifest formally claims that "
-                    "capability."
-                ),
-            })
-
-    return gaps
 
 def _basic_format_repair_feedback(stage_error: FileGenerationStageError) -> str:
     detail = str(getattr(stage_error, "detail", "") or "")
@@ -1254,24 +916,20 @@ async def _plan_final_tool_pool(
     requirement_graph: dict[str, Any],
     uploaded_files: list[dict[str, Any]],
     requested_model: str | None,
-    closure_gaps: list[dict[str, Any]]
-    | None = None,
 ) -> dict[str, Any]:
-    """Run mandatory final ToolPool planning after strict blueprint analysis.
+    """Let the planning model select concrete ToolPool tools.
 
-    Explorer provides candidate recall.
+    Planner selects exact Registry tool IDs.
 
-    Planner reads the complete Registry tool contracts and proposes exact tool
-    IDs.
+    Backend Gate is the only authorization authority.
 
-    Backend gate remains the sole authorization authority.
+    This function does not perform deterministic capability closure and does not
+    let backend infer which semantic capability should map to which tool.
     """
 
     skill_dir = (
         settings.skills_path
-        / _validate_skill_name(
-            skill_name
-        )
+        / _validate_skill_name(skill_name)
     )
 
     skill_dir.mkdir(
@@ -1283,128 +941,114 @@ async def _plan_final_tool_pool(
         skill_dir
     )
 
-    exploration = explore_tool_pool(
-        user_request=user_request,
-        blueprint_text=blueprint_text,
-        file_specs=file_specs,
-        uploaded_files=uploaded_files,
-        current_tool_pool=current_pool,
-        available_tool_registry=(
-            list_tool_capabilities()
-        ),
-        missing_tool_configs=None,
+    tool_catalog = (
+        _creator_tool_catalog_for_planner()
     )
 
-    tool_context = (
-        _planner_shared_tool_context(
-            skill_name
-        )
-    )
+    prompt = """
+你是 Creator ToolPool 规划模型。
 
-    prompt = (
-        load_kernel_creator_for_phase(
-            "prepare_plan"
-        )
-        + """
-你是 Creator 最终 ToolPool 规划器。
+你只负责为当前 Skill 选择具体工具。
 
-只输出严格 JSON object。
-不要输出 Markdown。
+你不是工具说明助手。
+不要解释工具目录。
 不要写代码。
 不要修改 blueprint。
 不要修改 SkillPlan。
 不要修改脚本 purpose、inputs、outputs。
 
-当前阶段已经完成 strict blueprint analyze 和 workflow responsibility allocation。
+输入中包含：
 
-你的唯一职责是：
+1. user_request
+   用户原始目标。
 
-根据原始用户目标、已确认创建要点、最终 scripts/** 职责、RequirementGraph、当前共享 ToolPool 和完整 Registry 工具合同，决定当前 Skill 是否需要向共享 ToolPool 增加或删除具体工具。
+2. confirmed_summary
+   用户已经确认的创建目标。
 
-工具体系：
+3. file_specs
+   最终 scripts/** 文件职责。
 
-1. available_tool_catalog
-   - 完整 Registry 工具发现目录。
-   - 每个 tool 包含真实 functions、import_path、signature、input_schema、output_schema、return_contract、artifact_outputs、side_effects、example 和 common_mistakes。
-   - 这是工具事实源和发现空间，不是授权结果。
+4. requirement_graph
+   当前职责图谱。
 
-2. exploration
-   - Explorer 根据 Registry metadata 产生的候选召回和排序。
-   - 只用于帮助发现候选。
-   - Explorer 无权授权。
-   - 不能因为某候选 rank 高就机械选择。
+5. current_tool_pool
+   当前已经授权的 Skill 共享工具池。
 
-3. current_tool_pool
-   - 当前 Skill 唯一共享 ToolPool。
-   - 只有其中 status=allowed 的工具已经授权。
+6. available_tool_catalog
+   Tool Registry 完整工具目录。
 
-4. tool_pool_patch
-   - 你只能通过 tool_pool_patch 提出具体工具变化。
-   - candidate_tool_id 必须逐字等于 available_tool_catalog 中真实 tool_id。
-   - Backend Gate 才能最终授权。
+available_tool_catalog 中每个工具包含真实工具合同，包括：
 
-判断规则：
+- tool_id
+- display_name
+- prompt_guidance
+- required_capabilities
+- input_schema
+- output_schema
+- artifact_outputs
+- side_effects
 
-- 不得只根据 tool_id 名称判断能力。
-- 必须阅读真实 function contract：
-  short_description、when_to_use、signature、input_schema、output_schema、return_contract、artifact_outputs、side_effects、example_call、example_return、example_stdout、common_mistakes。
-- required_capabilities 是语义能力义务，不是具体 tool_id，也不是授权。
-- 一个脚本可以组合多个工具。
-- 如果职责只是确定性解析、过滤、排序、映射、结构转换或标准库可可靠完成的逻辑，可以选择 local_deterministic。
-- 如果核心职责依赖开放式内容生成、模型推理、平台外部 effect 或 Registry 明确提供的 artifact helper，不得用固定模板、模拟路径、假文件名或本地占位逻辑冒充实现。
-- 如果 current_tool_pool 已有满足能力的真实工具，不重复 add。
-- 已经不再需要的工具可以 remove。
-- enabled_by_default=false、allow_creator_use=false 的工具不得主动选择。
-- configured=false 或存在 missing env/dependency 的工具可以提出，但 Backend Gate 可能拒绝进入 allowed ToolPool；不得假定已经授权。
-- 原始 user_request 和 confirmed_summary 是用户目标事实。不能因为最终脚本合同写弱了，就把“生成内容”默认为“读取用户已有内容”。
-- 本阶段不修语义漂移；发现最终脚本责任与原始目标明显冲突时，在 advisory_notes 中报告，不要通过选择无关工具掩盖合同问题。
+functions 中还包含：
 
-输出协议：
+- function_name
+- import_path
+- short_description
+- when_to_use
+- signature
+- input_schema
+- output_schema
+- return_contract
+- artifact_outputs
+- side_effects
+- example_call
+- example_return
+- example_stdout
+- common_mistakes
+
+规划规则：
+
+- 根据用户目标和 scripts/** 的真实职责选择工具。
+- 不要只根据 tool_id 名称判断。
+- 必须阅读工具 description、function contract 和 IO。
+- 一个脚本可以选择多个工具。
+- 如果标准库和普通 Python 确定性逻辑足够完成职责，不需要添加工具。
+- 如果职责需要模型生成、图像生成、视觉理解、搜索、外部服务或 Registry 提供的 artifact 能力，应选择实际匹配工具。
+- current_tool_pool 已有 allowed 工具时不要重复添加。
+- candidate_tool_id 必须逐字等于 available_tool_catalog 中真实 tool_id。
+- 你只提出工具选择建议；Backend Gate 决定是否真正授权。
+
+只输出严格 JSON object。
+
+禁止 Markdown。
+禁止解释。
+禁止工具介绍。
+禁止代码示例。
+禁止 JSON 外文字。
+
+输出格式：
 
 {
-  "decisions": [
-    {
-      "target_file": "scripts/x.py",
-      "needs": [
-        {
-          "need": "当前职责需要的语义能力或真实 effect",
-          "mode": "existing_tool|add_tool|local_deterministic",
-          "tool_id": "",
-          "reason": "必须引用真实 tool contract 或确定性本地逻辑边界"
-        }
-      ]
-    }
-  ],
-  "advisory_notes": [],
   "tool_pool_patch": {
     "add_tool_requests": [
       {
         "target_file": "scripts/x.py",
-        "requested_capability": "语义能力",
-        "candidate_tool_id": "available_tool_catalog 中真实 tool_id",
-        "reason": "根据具体 function contract 说明为什么匹配",
-        "expected_input": {},
-        "expected_output": {},
-        "confidence": 1.0,
-        "score": 0.0,
-        "matched_features": [],
-        "matched_terms": [],
-        "rank": 1,
-        "candidate_source": "final_contract_planning",
-        "semantic_reason": ""
+        "requested_capability": "当前脚本需要的能力",
+        "candidate_tool_id": "Registry 中真实 tool_id",
+        "reason": "根据工具真实 function contract 和 IO 说明选择原因"
       }
     ],
     "remove_tool_requests": [],
-    "reason": "",
+    "reason": "本轮 ToolPool 规划原因",
     "affected_files": []
   }
 }
-"""
-    )
+""".strip()
 
     payload = {
         "skill_name": skill_name,
-        "user_request": user_request,
+        "user_request": str(
+            user_request or ""
+        ),
         "confirmed_summary": (
             confirmed_summary
             if isinstance(
@@ -1413,21 +1057,44 @@ async def _plan_final_tool_pool(
             )
             else {}
         ),
-        "blueprint_text": blueprint_text,
-        "file_specs": file_specs,
+        "blueprint_text": str(
+            blueprint_text or ""
+        )[:16000],
+        "file_specs": [
+            spec
+            for spec in (
+                file_specs or []
+            )
+            if isinstance(spec, dict)
+            and _normalize_skill_path(
+                str(
+                    spec.get("path")
+                    or spec.get(
+                        "target_file"
+                    )
+                    or ""
+                )
+            ).startswith("scripts/")
+        ],
         "requirement_graph": (
             requirement_graph
+            if isinstance(
+                requirement_graph,
+                dict,
+            )
+            else {}
         ),
-        "exploration": (
-            exploration.model_dump(
-                mode="json"
+        "uploaded_files": (
+            uploaded_files or []
+        ),
+        "current_tool_pool": (
+            tool_pool_snapshot(
+                current_pool
             )
         ),
-        "closure_gaps": (
-            closure_gaps
-            or []
+        "available_tool_catalog": (
+            tool_catalog
         ),
-        **tool_context,
     }
 
     route = route_model(
@@ -1438,29 +1105,95 @@ async def _plan_final_tool_pool(
         ),
     )
 
-    text = await complete_chat_once(
-        [
-            {
-                "role": "system",
-                "content": prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        route.model,
-    )
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": prompt,
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                payload,
+                ensure_ascii=False,
+                default=str,
+            ),
+        },
+    ]
 
-    planner_output = (
-        _parse_prepare_plan_json(
-            text
+    last_error: Exception | None = None
+
+    for attempt in range(2):
+        text = await complete_chat_once(
+            messages,
+            route.model,
         )
-    )
+
+        try:
+            planner_output = (
+                _parse_prepare_plan_json(
+                    text
+                )
+            )
+
+            raw_patch = planner_output.get(
+                "tool_pool_patch"
+            )
+
+            if not isinstance(
+                raw_patch,
+                dict,
+            ):
+                raise ValueError(
+                    "missing tool_pool_patch object"
+                )
+
+            ToolPoolPatch.model_validate(
+                raw_patch
+            )
+
+            break
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.warning(
+                "[Creator]"
+                "[final_tool_planning]"
+                "[format_error] "
+                "skill=%s attempt=%d error=%s",
+                skill_name,
+                attempt + 1,
+                exc,
+            )
+
+            if attempt >= 1:
+                raise
+
+            messages.append({
+                "role": "assistant",
+                "content": str(
+                    text or ""
+                )[:8000],
+            })
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    "上一轮输出格式错误。\n"
+                    "不要重新解释工具目录。\n"
+                    "不要输出 Markdown、工具介绍或代码。\n"
+                    "只把你的工具选择结果输出为约定 JSON object。\n"
+                    "顶层必须包含 tool_pool_patch。\n"
+                    f"格式错误："
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            })
+
+    else:
+        raise ValueError(
+            "final ToolPool planner failed: "
+            f"{last_error}"
+        )
 
     apply_result = (
         _apply_planner_tool_pool_patch(
@@ -1475,282 +1208,12 @@ async def _plan_final_tool_pool(
 
     return {
         "planner_output": planner_output,
-        "exploration": (
-            exploration.model_dump(
-                mode="json"
-            )
-        ),
         "apply_result": apply_result,
         "tool_pool": load_tool_pool(
             skill_dir
         ),
     }
 
-async def _ensure_final_tool_pool_closure(
-    *,
-    skill_name: str,
-    user_request: str,
-    confirmed_summary: dict[str, Any],
-    blueprint_text: str,
-    file_specs: list[dict[str, Any]],
-    requirement_graph: dict[str, Any],
-    uploaded_files: list[dict[str, Any]],
-    requested_model: str | None,
-) -> dict[str, Any]:
-    """Run mandatory final ToolPool planning and formal capability closure."""
-
-    skill_dir = (
-        settings.skills_path
-        / _validate_skill_name(
-            skill_name
-        )
-    )
-
-    skill_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    planning_reports: list[
-        dict[str, Any]
-    ] = []
-
-    planning_errors: list[str] = []
-
-    pool = load_tool_pool(
-        skill_dir
-    )
-
-    closure_gaps = (
-        _tool_pool_capability_gaps(
-            file_specs=file_specs,
-            requirement_graph=(
-                requirement_graph
-            ),
-            pool=pool,
-        )
-    )
-
-    for attempt in range(2):
-        try:
-            report = (
-                await _plan_final_tool_pool(
-                    skill_name=skill_name,
-                    user_request=user_request,
-                    confirmed_summary=(
-                        confirmed_summary
-                    ),
-                    blueprint_text=(
-                        blueprint_text
-                    ),
-                    file_specs=file_specs,
-                    requirement_graph=(
-                        requirement_graph
-                    ),
-                    uploaded_files=(
-                        uploaded_files
-                    ),
-                    requested_model=(
-                        requested_model
-                    ),
-                    closure_gaps=(
-                        closure_gaps
-                    ),
-                )
-            )
-
-        except Exception as exc:
-            planning_errors.append(
-                f"{type(exc).__name__}: {exc}"
-            )
-
-            logger.warning(
-                "[Creator]"
-                "[final_tool_planning]"
-                "[error] "
-                "skill=%s attempt=%d error=%s",
-                skill_name,
-                attempt + 1,
-                exc,
-            )
-
-            continue
-
-        planning_reports.append({
-            "attempt": attempt + 1,
-            "planner_output": (
-                report.get(
-                    "planner_output"
-                )
-                or {}
-            ),
-            "exploration": (
-                report.get(
-                    "exploration"
-                )
-                or {}
-            ),
-            "apply_result": (
-                report.get(
-                    "apply_result"
-                )
-                or {}
-            ),
-        })
-
-        pool = report["tool_pool"]
-
-        closure_gaps = (
-            _tool_pool_capability_gaps(
-                file_specs=file_specs,
-                requirement_graph=(
-                    requirement_graph
-                ),
-                pool=pool,
-            )
-        )
-
-        logger.info(
-            "[Creator]"
-            "[final_tool_planning]"
-            "[closure] %s",
-            json.dumps(
-                {
-                    "event": (
-                        "final_tool_pool_closure"
-                    ),
-                    "skill_name": skill_name,
-                    "attempt": attempt + 1,
-                    "allowed_tool_ids": [
-                        tool.tool_id
-                        for tool in (
-                            pool.tools
-                            or []
-                        )
-                        if tool.status
-                        == "allowed"
-                    ],
-                    "closure_gaps": (
-                        closure_gaps
-                    ),
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
-        )
-
-        if not closure_gaps:
-            return {
-                "tool_pool": pool,
-                "closure_gaps": [],
-                "planning_reports": (
-                    planning_reports
-                ),
-                "planning_errors": (
-                    planning_errors
-                ),
-                "creation_blockers": [],
-                "warnings": [],
-            }
-
-    pool = load_tool_pool(
-        skill_dir
-    )
-
-    blockers: list[
-        dict[str, Any]
-    ] = []
-
-    for gap in closure_gaps:
-        blockers.append({
-            "type": (
-                "tool_pool_capability_gap"
-            ),
-            "blocking": True,
-            "target_file": (
-                gap.get("target_file")
-                or ""
-            ),
-            "capability": (
-                gap.get(
-                    "required_capability"
-                )
-                or ""
-            ),
-            "candidate_tool_ids": list(
-                gap.get(
-                    "candidate_tool_ids"
-                )
-                or []
-            ),
-            "message": (
-                f"{gap.get('target_file') or ''} "
-                "声明了 Registry-backed required "
-                f"capability "
-                f"{gap.get('required_capability') or ''}，"
-                "但最终 ToolPool 规划和 Backend Gate "
-                "之后仍没有 allowed tool 满足该正式能力合同。"
-            ),
-        })
-
-    if planning_errors and not planning_reports:
-        blockers.append({
-            "type": (
-                "final_tool_planner_failed"
-            ),
-            "blocking": True,
-            "target_file": "",
-            "capability": "",
-            "candidate_tool_ids": [],
-            "message": (
-                "最终 ToolPool 规划连续失败，"
-                "Creator 不能在没有最终工具决策的情况下"
-                "继续生成业务脚本。"
-            ),
-            "details": {
-                "errors": planning_errors,
-            },
-        })
-
-    warnings: list[
-        dict[str, Any]
-    ] = []
-
-    if blockers:
-        warnings.append({
-            "severity": (
-                "planning_warning"
-            ),
-            "code": (
-                "tool_pool_capability_"
-                "closure_failed"
-            ),
-            "source": (
-                "final_tool_planning"
-            ),
-            "path": "",
-            "field": "tool_pool",
-            "message": (
-                "Final ToolPool planning did not "
-                "close all formal Registry-backed "
-                "capability obligations. "
-                "Code generation is blocked to avoid "
-                "fake/local placeholder implementations."
-            ),
-            "gaps": closure_gaps,
-            "planning_errors": (
-                planning_errors
-            ),
-        })
-
-    return {
-        "tool_pool": pool,
-        "closure_gaps": closure_gaps,
-        "planning_reports": planning_reports,
-        "planning_errors": planning_errors,
-        "creation_blockers": blockers,
-        "warnings": warnings,
-    }
 
 def _apply_tool_requests_to_current_file_binding(
     *,
@@ -4954,8 +4417,8 @@ async def prepare_plan(request: PreparePlanRequest):
         exist_ok=True,
     )
 
-    tool_closure = (
-        await _ensure_final_tool_pool_closure(
+    tool_planning = (
+        await _plan_final_tool_pool(
             skill_name=plan.skill_name,
             user_request=str(
                 getattr(
@@ -4989,7 +4452,7 @@ async def prepare_plan(request: PreparePlanRequest):
     )
 
     current_tool_pool = (
-        tool_closure["tool_pool"]
+        tool_planning["tool_pool"]
     )
 
     tool_pool = build_tool_pool(
@@ -5019,94 +4482,6 @@ async def prepare_plan(request: PreparePlanRequest):
         skill_dir_for_tool_pool,
         tool_pool,
     )
-
-    plan.warnings = [
-        *(plan.warnings or []),
-        *(
-                tool_closure.get(
-                    "warnings"
-                )
-                or []
-        ),
-    ]
-
-    plan.creation_blockers = [
-        *(plan.creation_blockers or []),
-        *(
-                tool_closure.get(
-                    "creation_blockers"
-                )
-                or []
-        ),
-    ]
-
-    if tool_closure.get(
-            "creation_blockers"
-    ):
-        return PreparePlanResponse(
-            status="blocked",
-            prepare_stage=(
-                "tool_pool_closure_failed"
-            ),
-            clarifying_questions=[],
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-            blueprint_text=(
-                    plan.blueprint_text
-                    or blueprint_text
-            ),
-            skill_name=plan.skill_name,
-            files=plan.files,
-            warnings=plan.warnings,
-            asset_requirements=(
-                plan.asset_requirements
-            ),
-            final_outputs=plan.final_outputs,
-            available_tools=(
-                plan.available_tools
-            ),
-            missing_tool_configs=(
-                plan.missing_tool_configs
-            ),
-            tool_requirements=(
-                plan.tool_requirements
-            ),
-            creation_blockers=(
-                plan.creation_blockers
-            ),
-            requirement_graph=graph_payload,
-            workflow_allocation_summary=(
-                _load_workflow_allocation_summary(
-                    plan.skill_name
-                )
-            ),
-            tool_pool_summary={
-                **tool_pool_snapshot(
-                    tool_pool
-                ),
-                "final_tool_planning": (
-                        tool_closure.get(
-                            "planning_reports"
-                        )
-                        or []
-                ),
-                "closure_gaps": (
-                        tool_closure.get(
-                            "closure_gaps"
-                        )
-                        or []
-                ),
-            },
-            confirmed_uploaded_assets=(
-                confirmed_uploaded_assets
-            ),
-            unselected_uploaded_files=(
-                unselected_uploaded_files
-            ),
-        )
 
     for file_spec in plan.files or []:
         binding = get_file_binding(

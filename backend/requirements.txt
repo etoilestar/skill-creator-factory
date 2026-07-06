@@ -20,3 +20,5 @@ psycopg2-binary
 Pillow
 requests
 
+transformers>=4.46.0,<6.0.0
+safetensors>=0.4.5

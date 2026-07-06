@@ -2,8 +2,11 @@
 
 import hashlib
 import json
+import math
 import shutil
 import traceback
+
+import httpx
 from pathlib import Path
 from typing import Any, Literal
 
@@ -667,6 +670,29 @@ def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
     return catalog
 
 
+_CREATOR_TOOL_EMBEDDING_INDEX_CACHE: (
+    tuple[
+        tuple[str, ...],
+        list[
+            tuple[
+                str,
+                list[float],
+            ]
+        ],
+    ]
+    | None
+) = None
+
+_CREATOR_LOCAL_EMBEDDING_RUNTIME: (
+    tuple[
+        Any,
+        Any,
+        Any,
+        str,
+    ]
+    | None
+) = None
+
 def _planner_shared_tool_context(
     skill_name: str | None,
 ) -> dict[str, Any]:
@@ -751,6 +777,1566 @@ def _entry_text_for_declared_support(skill_plan_entry: Any) -> str:
         ]
     return json.dumps(parts, ensure_ascii=False, default=str).lower()
 
+def _creator_cosine_similarity(
+    left: list[float],
+    right: list[float],
+) -> float:
+    """Return cosine similarity for two embedding vectors."""
+
+    if (
+        not left
+        or not right
+        or len(left) != len(right)
+    ):
+        return -1.0
+
+    dot = sum(
+        left_value * right_value
+        for left_value, right_value
+        in zip(left, right)
+    )
+
+    left_norm = math.sqrt(
+        sum(
+            value * value
+            for value in left
+        )
+    )
+
+    right_norm = math.sqrt(
+        sum(
+            value * value
+            for value in right
+        )
+    )
+
+    denominator = (
+        left_norm * right_norm
+    )
+
+    if not denominator:
+        return -1.0
+
+    return dot / denominator
+
+def _creator_embed_texts_local_fallback(
+    texts: list[str],
+) -> list[list[float]]:
+    """Embed text with the bundled local BGE model on CUDA.
+
+    Expected model directory:
+
+        backend/bge-large-zh-v1.5/
+
+    This is the only fallback after the configured embedding API fails.
+
+    CUDA is required. There is no CPU fallback.
+    """
+
+    global _CREATOR_LOCAL_EMBEDDING_RUNTIME
+
+    normalized_texts = [
+        str(text or "").strip()
+        for text in (
+            texts or []
+        )
+    ]
+
+    if not normalized_texts:
+        return []
+
+    model_path = (
+        Path(__file__)
+        .resolve()
+        .parents[2]
+        / "bge-large-zh-v1.5"
+    )
+
+    if not model_path.is_dir():
+        raise RuntimeError(
+            "local embedding model does not exist: "
+            f"{model_path}"
+        )
+
+    try:
+        import torch
+
+        from transformers import (
+            AutoModel,
+            AutoTokenizer,
+        )
+
+    except Exception as exc:
+        raise RuntimeError(
+            "local embedding runtime requires "
+            "torch and transformers"
+        ) from exc
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is unavailable for local "
+            "embedding fallback"
+        )
+
+    runtime = (
+        _CREATOR_LOCAL_EMBEDDING_RUNTIME
+    )
+
+    runtime_path = (
+        runtime[3]
+        if runtime is not None
+        else ""
+    )
+
+    if (
+        runtime is None
+        or runtime_path
+        != str(model_path)
+    ):
+        tokenizer = (
+            AutoTokenizer.from_pretrained(
+                str(model_path),
+                local_files_only=True,
+            )
+        )
+
+        model = AutoModel.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+            torch_dtype=torch.float16,
+        )
+
+        device = torch.device(
+            "cuda"
+        )
+
+        model = model.to(
+            device
+        )
+
+        model.eval()
+
+        _CREATOR_LOCAL_EMBEDDING_RUNTIME = (
+            tokenizer,
+            model,
+            device,
+            str(model_path),
+        )
+
+        logger.info(
+            "[Creator]"
+            "[tool_embedding]"
+            "[local_model_loaded] "
+            "model_path=%s "
+            "device=%s "
+            "dtype=float16 "
+            "gpu=%s",
+            model_path,
+            device,
+            torch.cuda.get_device_name(0),
+        )
+
+    (
+        tokenizer,
+        model,
+        device,
+        _,
+    ) = _CREATOR_LOCAL_EMBEDDING_RUNTIME
+
+    embeddings: list[
+        list[float]
+    ] = []
+
+    batch_size = 16
+
+    for start in range(
+        0,
+        len(normalized_texts),
+        batch_size,
+    ):
+        batch = normalized_texts[
+            start:start + batch_size
+        ]
+
+        encoded = tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        )
+
+        encoded = {
+            key: value.to(
+                device
+            )
+            for key, value
+            in encoded.items()
+        }
+
+        with torch.inference_mode():
+            output = model(
+                **encoded
+            )
+
+            vectors = (
+                output
+                .last_hidden_state[
+                    :,
+                    0,
+                ]
+            )
+
+            vectors = (
+                torch.nn.functional.normalize(
+                    vectors.float(),
+                    p=2,
+                    dim=1,
+                )
+            )
+
+        embeddings.extend(
+            vectors
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+    if (
+        len(embeddings)
+        != len(normalized_texts)
+    ):
+        raise RuntimeError(
+            "local embedding model returned "
+            "unexpected embedding count: "
+            f"expected={len(normalized_texts)} "
+            f"actual={len(embeddings)}"
+        )
+
+    if any(
+        not embedding
+        for embedding in embeddings
+    ):
+        raise RuntimeError(
+            "local embedding model returned "
+            "an empty embedding vector"
+        )
+
+    return embeddings
+
+def _creator_embed_texts(
+    texts: list[str],
+) -> tuple[
+    list[list[float]],
+    str,
+]:
+    """Embed Creator planning text.
+
+    Strict priority:
+
+    1. configured EMBEDDING_MODEL through /v1/embeddings;
+    2. local backend/bge-large-zh-v1.5/ CUDA inference.
+
+    If both fail, raise.
+
+    There is no structural, lexical, Registry-order, or full-catalog LLM
+    fallback.
+    """
+
+    normalized_texts = [
+        str(text or "").strip()
+        for text in (
+            texts or []
+        )
+    ]
+
+    if not normalized_texts:
+        return [], "empty"
+
+    model_name = str(
+        settings.embedding_model
+        or ""
+    ).strip()
+
+    remote_error: (
+        Exception | None
+    ) = None
+
+    if model_name:
+        try:
+            base_url = str(
+                settings.llm_base_url
+                or ""
+            ).rstrip("/")
+
+            if not base_url:
+                raise RuntimeError(
+                    "llm_base_url is empty"
+                )
+
+            url = (
+                base_url + "/embeddings"
+                if base_url.endswith("/v1")
+                else (
+                    base_url
+                    + "/v1/embeddings"
+                )
+            )
+
+            headers = {
+                "Content-Type": (
+                    "application/json"
+                ),
+            }
+
+            api_key = str(
+                getattr(
+                    settings,
+                    "openai_api_key",
+                    "",
+                )
+                or getattr(
+                    settings,
+                    "llm_api_key",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if api_key:
+                headers[
+                    "Authorization"
+                ] = (
+                    f"Bearer {api_key}"
+                )
+
+            with httpx.Client(
+                timeout=30.0
+            ) as client:
+                response = client.post(
+                    url,
+                    headers=headers,
+                    json={
+                        "model": model_name,
+                        "input": normalized_texts,
+                    },
+                )
+
+                response.raise_for_status()
+
+                body = response.json()
+
+            raw_data = (
+                body.get("data")
+                if isinstance(
+                    body,
+                    dict,
+                )
+                else None
+            )
+
+            if not isinstance(
+                raw_data,
+                list,
+            ):
+                raise RuntimeError(
+                    "embedding API response "
+                    "does not contain data list"
+                )
+
+            indexed_data = [
+                (
+                    int(
+                        item.get(
+                            "index",
+                            index,
+                        )
+                    ),
+                    item,
+                )
+                for index, item
+                in enumerate(raw_data)
+                if isinstance(
+                    item,
+                    dict,
+                )
+            ]
+
+            indexed_data.sort(
+                key=lambda value: value[0]
+            )
+
+            vectors = [
+                [
+                    float(value)
+                    for value in (
+                        item.get(
+                            "embedding"
+                        )
+                        or []
+                    )
+                ]
+                for _, item
+                in indexed_data
+            ]
+
+            if (
+                len(vectors)
+                != len(normalized_texts)
+            ):
+                raise RuntimeError(
+                    "embedding API returned "
+                    "unexpected vector count: "
+                    f"expected="
+                    f"{len(normalized_texts)} "
+                    f"actual={len(vectors)}"
+                )
+
+            if any(
+                not vector
+                for vector in vectors
+            ):
+                raise RuntimeError(
+                    "embedding API returned "
+                    "an empty vector"
+                )
+
+            embedding_dim = len(
+                vectors[0]
+            )
+
+            if any(
+                len(vector)
+                != embedding_dim
+                for vector in vectors
+            ):
+                raise RuntimeError(
+                    "embedding API returned "
+                    "inconsistent embedding dimensions"
+                )
+
+            source = (
+                f"remote:{model_name}"
+            )
+
+            logger.info(
+                "[Creator]"
+                "[tool_embedding]"
+                "[remote_success] "
+                "model=%s "
+                "text_count=%d "
+                "embedding_dim=%d",
+                model_name,
+                len(normalized_texts),
+                embedding_dim,
+            )
+
+            return (
+                vectors,
+                source,
+            )
+
+        except Exception as exc:
+            remote_error = exc
+
+            logger.warning(
+                "[Creator]"
+                "[tool_embedding]"
+                "[remote_failed] "
+                "model=%s "
+                "error=%s",
+                model_name,
+                (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            )
+
+    try:
+        vectors = (
+            _creator_embed_texts_local_fallback(
+                normalized_texts
+            )
+        )
+
+        model_path = (
+            Path(__file__)
+            .resolve()
+            .parents[2]
+            / "bge-large-zh-v1.5"
+        )
+
+        source = (
+            f"local:{model_path}"
+        )
+
+        logger.info(
+            "[Creator]"
+            "[tool_embedding]"
+            "[local_success] "
+            "model=%s "
+            "text_count=%d "
+            "embedding_dim=%d",
+            model_path,
+            len(normalized_texts),
+            (
+                len(vectors[0])
+                if vectors
+                else 0
+            ),
+        )
+
+        return (
+            vectors,
+            source,
+        )
+
+    except Exception as local_exc:
+        logger.error(
+            "[Creator]"
+            "[tool_embedding]"
+            "[failed] "
+            "remote_error=%s "
+            "local_error=%s",
+            (
+                (
+                    f"{type(remote_error).__name__}: "
+                    f"{remote_error}"
+                )
+                if remote_error
+                is not None
+                else (
+                    "embedding model "
+                    "not configured"
+                )
+            ),
+            (
+                f"{type(local_exc).__name__}: "
+                f"{local_exc}"
+            ),
+        )
+
+        raise RuntimeError(
+            "Creator embedding unavailable: "
+            "configured embedding API failed "
+            "and local "
+            "backend/bge-large-zh-v1.5 "
+            "fallback failed"
+        ) from local_exc
+
+def _creator_tool_recall_card_text(
+    tool: dict[str, Any],
+) -> str:
+    """Build compact semantic recall text for one Registry tool."""
+
+    function_cards: list[str] = []
+
+    for function in (
+        tool.get("functions")
+        or []
+    ):
+        if not isinstance(
+            function,
+            dict,
+        ):
+            continue
+
+        function_cards.append(
+            "\n".join([
+                (
+                    "function_name: "
+                    + str(
+                        function.get(
+                            "function_name"
+                        )
+                        or ""
+                    )
+                ),
+                (
+                    "description: "
+                    + str(
+                        function.get(
+                            "short_description"
+                        )
+                        or ""
+                    )
+                ),
+                (
+                    "when_to_use: "
+                    + str(
+                        function.get(
+                            "when_to_use"
+                        )
+                        or ""
+                    )
+                ),
+                (
+                    "signature: "
+                    + str(
+                        function.get(
+                            "signature"
+                        )
+                        or ""
+                    )
+                ),
+                (
+                    "return_contract: "
+                    + str(
+                        function.get(
+                            "return_contract"
+                        )
+                        or ""
+                    )
+                ),
+                (
+                    "required_capabilities: "
+                    + json.dumps(
+                        function.get(
+                            "required_capabilities"
+                        )
+                        or [],
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                ),
+                (
+                    "input_schema: "
+                    + json.dumps(
+                        function.get(
+                            "input_schema"
+                        )
+                        or {},
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                ),
+                (
+                    "output_schema: "
+                    + json.dumps(
+                        function.get(
+                            "output_schema"
+                        )
+                        or {},
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                ),
+                (
+                    "artifact_outputs: "
+                    + json.dumps(
+                        function.get(
+                            "artifact_outputs"
+                        )
+                        or [],
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                ),
+                (
+                    "side_effects: "
+                    + json.dumps(
+                        function.get(
+                            "side_effects"
+                        )
+                        or [],
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                ),
+            ])
+        )
+
+    return "\n".join([
+        (
+            "tool_id: "
+            + str(
+                tool.get("tool_id")
+                or ""
+            )
+        ),
+        (
+            "display_name: "
+            + str(
+                tool.get("display_name")
+                or ""
+            )
+        ),
+        (
+            "category: "
+            + str(
+                tool.get("category")
+                or ""
+            )
+        ),
+        (
+            "prompt_guidance: "
+            + str(
+                tool.get("prompt_guidance")
+                or ""
+            )
+        ),
+        (
+            "capability_aliases: "
+            + json.dumps(
+                tool.get(
+                    "capability_aliases"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "semantic_tags: "
+            + json.dumps(
+                tool.get(
+                    "semantic_tags"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "task_verbs: "
+            + json.dumps(
+                tool.get(
+                    "task_verbs"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "domain_terms: "
+            + json.dumps(
+                tool.get(
+                    "domain_terms"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "required_capabilities: "
+            + json.dumps(
+                tool.get(
+                    "required_capabilities"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "optional_capabilities: "
+            + json.dumps(
+                tool.get(
+                    "optional_capabilities"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "input_schema: "
+            + json.dumps(
+                tool.get("input_schema")
+                or {},
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "output_schema: "
+            + json.dumps(
+                tool.get("output_schema")
+                or {},
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "artifact_outputs: "
+            + json.dumps(
+                tool.get(
+                    "artifact_outputs"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        (
+            "side_effects: "
+            + json.dumps(
+                tool.get("side_effects")
+                or [],
+                ensure_ascii=False,
+                default=str,
+            )
+        ),
+        "",
+        "\n\n".join(
+            function_cards
+        ),
+    ])
+
+def _creator_tool_recall_query(
+    *,
+    user_request: str,
+    confirmed_summary: dict[str, Any],
+    file_specs: list[dict[str, Any]],
+) -> str:
+    """Build one Skill-wide semantic query for Tool Registry recall."""
+
+    script_responsibilities: list[
+        dict[str, Any]
+    ] = []
+
+    for spec in (
+        file_specs or []
+    ):
+        if not isinstance(
+            spec,
+            dict,
+        ):
+            continue
+
+        path = _normalize_skill_path(
+            str(
+                spec.get("path")
+                or spec.get(
+                    "target_file"
+                )
+                or ""
+            )
+        )
+
+        if not path.startswith(
+            "scripts/"
+        ):
+            continue
+
+        if spec.get("required") is False:
+            continue
+
+        script_responsibilities.append({
+            "purpose": str(
+                spec.get("purpose")
+                or ""
+            ).strip(),
+            "inputs": list(
+                spec.get("inputs")
+                or []
+            ),
+            "outputs": list(
+                spec.get("outputs")
+                or []
+            ),
+            "required_capabilities": list(
+                spec.get(
+                    "required_capabilities"
+                )
+                or []
+            ),
+            "forbidden_capabilities": list(
+                spec.get(
+                    "forbidden_capabilities"
+                )
+                or []
+            ),
+            "side_effects": list(
+                spec.get(
+                    "side_effects"
+                )
+                or []
+            ),
+            "artifact_contract": (
+                spec.get(
+                    "artifact_contract"
+                )
+                or {}
+            ),
+        })
+
+    summary = (
+        confirmed_summary
+        if isinstance(
+            confirmed_summary,
+            dict,
+        )
+        else {}
+    )
+
+    return "\n".join([
+        (
+            "检索与以下 Skill 最终职责"
+            "真正匹配的 Tool Registry 工具。"
+        ),
+        "",
+        "用户目标：",
+        str(
+            user_request or ""
+        ),
+        "",
+        "已确认创建要点：",
+        json.dumps(
+            {
+                "goal": (
+                    summary.get("goal")
+                ),
+                "input": (
+                    summary.get("input")
+                ),
+                "output": (
+                    summary.get("output")
+                ),
+                "workflow": (
+                    summary.get("workflow")
+                    or []
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        "",
+        "最终可执行脚本职责：",
+        json.dumps(
+            script_responsibilities,
+            ensure_ascii=False,
+            default=str,
+        ),
+    ])
+
+def _recall_creator_tool_candidates(
+    *,
+    user_request: str,
+    confirmed_summary: dict[str, Any],
+    file_specs: list[dict[str, Any]],
+    top_k: int = 8,
+) -> tuple[
+    list[dict[str, Any]],
+    str,
+]:
+    """Recall a compact Skill-wide Registry candidate set with embeddings.
+
+    Recall uses:
+    - one global Skill responsibility query;
+    - one query for each required script responsibility.
+
+    Script queries only improve recall coverage.
+
+    The final candidate set remains Skill-wide and does not create per-file
+    authorization.
+
+    Embedding failure is fatal. There is no structural or Registry-order
+    fallback.
+    """
+
+    global _CREATOR_TOOL_EMBEDDING_INDEX_CACHE
+
+    raw_catalog = (
+        _creator_tool_catalog_for_planner()
+    )
+
+    catalog = [
+        tool
+        for tool in (
+            raw_catalog or []
+        )
+        if (
+            isinstance(
+                tool,
+                dict,
+            )
+            and str(
+                tool.get("tool_id")
+                or ""
+            ).strip()
+            and bool(
+                tool.get(
+                    "creator_available",
+                    False,
+                )
+            )
+        )
+    ]
+
+    if not catalog:
+        raise RuntimeError(
+            "Creator Tool Registry has no "
+            "available tools"
+        )
+
+    global_query = (
+        _creator_tool_recall_query(
+            user_request=user_request,
+            confirmed_summary=(
+                confirmed_summary
+            ),
+            file_specs=file_specs,
+        )
+    )
+
+    query_texts: list[str] = [
+        global_query
+    ]
+
+    for spec in (
+        file_specs or []
+    ):
+        if not isinstance(
+            spec,
+            dict,
+        ):
+            continue
+
+        path = _normalize_skill_path(
+            str(
+                spec.get("path")
+                or spec.get(
+                    "target_file"
+                )
+                or ""
+            )
+        )
+
+        if not path.startswith(
+            "scripts/"
+        ):
+            continue
+
+        if spec.get("required") is False:
+            continue
+
+        script_query = "\n".join([
+            (
+                "检索与以下单个可执行职责"
+                "真正匹配的 Tool Registry 工具。"
+            ),
+            "",
+            "职责：",
+            str(
+                spec.get("purpose")
+                or ""
+            ),
+            "",
+            "输入：",
+            json.dumps(
+                spec.get("inputs")
+                or [],
+                ensure_ascii=False,
+                default=str,
+            ),
+            "",
+            "输出：",
+            json.dumps(
+                spec.get("outputs")
+                or [],
+                ensure_ascii=False,
+                default=str,
+            ),
+            "",
+            "抽象语义能力：",
+            json.dumps(
+                spec.get(
+                    "required_capabilities"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            ),
+            "",
+            "禁止能力：",
+            json.dumps(
+                spec.get(
+                    "forbidden_capabilities"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            ),
+            "",
+            "Artifact contract：",
+            json.dumps(
+                spec.get(
+                    "artifact_contract"
+                )
+                or {},
+                ensure_ascii=False,
+                default=str,
+            ),
+            "",
+            "Side effects：",
+            json.dumps(
+                spec.get(
+                    "side_effects"
+                )
+                or [],
+                ensure_ascii=False,
+                default=str,
+            ),
+        ])
+
+        query_texts.append(
+            script_query
+        )
+
+    query_texts = list(
+        dict.fromkeys(
+            query_texts
+        )
+    )
+
+    cards: list[
+        tuple[
+            str,
+            str,
+            dict[str, Any],
+        ]
+    ] = []
+
+    for tool in catalog:
+        tool_id = str(
+            tool.get("tool_id")
+            or ""
+        ).strip()
+
+        card_text = (
+            _creator_tool_recall_card_text(
+                tool
+            )
+        )
+
+        cards.append(
+            (
+                tool_id,
+                card_text,
+                tool,
+            )
+        )
+
+    card_texts = [
+        card_text
+        for _, card_text, _
+        in cards
+    ]
+
+    tool_embeddings: list[
+        tuple[
+            str,
+            list[float],
+        ]
+    ]
+
+    query_embeddings: list[
+        list[float]
+    ]
+
+    embedding_source = ""
+
+    cache = (
+        _CREATOR_TOOL_EMBEDDING_INDEX_CACHE
+    )
+
+    if cache is None:
+        combined_texts = [
+            *card_texts,
+            *query_texts,
+        ]
+
+        (
+            combined_embeddings,
+            embedding_source,
+        ) = _creator_embed_texts(
+            combined_texts
+        )
+
+        expected_count = (
+            len(card_texts)
+            + len(query_texts)
+        )
+
+        if (
+            len(combined_embeddings)
+            != expected_count
+        ):
+            raise RuntimeError(
+                "combined tool recall embedding "
+                "returned unexpected vector count"
+            )
+
+        card_embeddings = (
+            combined_embeddings[
+                :len(card_texts)
+            ]
+        )
+
+        query_embeddings = (
+            combined_embeddings[
+                len(card_texts):
+            ]
+        )
+
+        cache_signature = (
+            f"embedding_source:{embedding_source}",
+            *card_texts,
+        )
+
+        tool_embeddings = [
+            (
+                cards[index][0],
+                embedding,
+            )
+            for index, embedding
+            in enumerate(
+                card_embeddings
+            )
+        ]
+
+        _CREATOR_TOOL_EMBEDDING_INDEX_CACHE = (
+            cache_signature,
+            tool_embeddings,
+        )
+
+    else:
+        (
+            query_embeddings,
+            embedding_source,
+        ) = _creator_embed_texts(
+            query_texts
+        )
+
+        cache_signature = (
+            f"embedding_source:{embedding_source}",
+            *card_texts,
+        )
+
+        if cache[0] == cache_signature:
+            tool_embeddings = list(
+                cache[1]
+            )
+
+        else:
+            combined_texts = [
+                *card_texts,
+                *query_texts,
+            ]
+
+            (
+                combined_embeddings,
+                embedding_source,
+            ) = _creator_embed_texts(
+                combined_texts
+            )
+
+            expected_count = (
+                len(card_texts)
+                + len(query_texts)
+            )
+
+            if (
+                len(combined_embeddings)
+                != expected_count
+            ):
+                raise RuntimeError(
+                    "combined tool recall embedding "
+                    "returned unexpected vector count"
+                )
+
+            card_embeddings = (
+                combined_embeddings[
+                    :len(card_texts)
+                ]
+            )
+
+            query_embeddings = (
+                combined_embeddings[
+                    len(card_texts):
+                ]
+            )
+
+            cache_signature = (
+                (
+                    "embedding_source:"
+                    f"{embedding_source}"
+                ),
+                *card_texts,
+            )
+
+            tool_embeddings = [
+                (
+                    cards[index][0],
+                    embedding,
+                )
+                for index, embedding
+                in enumerate(
+                    card_embeddings
+                )
+            ]
+
+            _CREATOR_TOOL_EMBEDDING_INDEX_CACHE = (
+                cache_signature,
+                tool_embeddings,
+            )
+
+    if not query_embeddings:
+        raise RuntimeError(
+            "tool recall query embeddings "
+            "are empty"
+        )
+
+    score_by_tool: dict[
+        str,
+        float,
+    ] = {}
+
+    for (
+        tool_id,
+        tool_embedding,
+    ) in tool_embeddings:
+        best_score = max(
+            _creator_cosine_similarity(
+                query_embedding,
+                tool_embedding,
+            )
+            for query_embedding
+            in query_embeddings
+        )
+
+        score_by_tool[
+            tool_id
+        ] = float(
+            best_score
+        )
+
+    ranked_tool_ids = sorted(
+        score_by_tool,
+        key=lambda tool_id: (
+            score_by_tool[
+                tool_id
+            ]
+        ),
+        reverse=True,
+    )
+
+    candidate_tool_ids = (
+        ranked_tool_ids[
+            :min(
+                max(
+                    1,
+                    top_k,
+                ),
+                len(ranked_tool_ids),
+            )
+        ]
+    )
+
+    by_tool_id = {
+        str(
+            tool.get("tool_id")
+            or ""
+        ).strip(): tool
+        for tool in catalog
+    }
+
+    candidate_cards: list[
+        dict[str, Any]
+    ] = []
+
+    for tool_id in (
+        candidate_tool_ids
+    ):
+        tool = by_tool_id[
+            tool_id
+        ]
+
+        functions: list[
+            dict[str, Any]
+        ] = []
+
+        for function in (
+            tool.get("functions")
+            or []
+        ):
+            if not isinstance(
+                function,
+                dict,
+            ):
+                continue
+
+            functions.append({
+                "function_name": str(
+                    function.get(
+                        "function_name"
+                    )
+                    or ""
+                ),
+                "short_description": str(
+                    function.get(
+                        "short_description"
+                    )
+                    or ""
+                ),
+                "when_to_use": str(
+                    function.get(
+                        "when_to_use"
+                    )
+                    or ""
+                ),
+                "signature": str(
+                    function.get(
+                        "signature"
+                    )
+                    or ""
+                ),
+                "input_schema": (
+                    function.get(
+                        "input_schema"
+                    )
+                    or {}
+                ),
+                "output_schema": (
+                    function.get(
+                        "output_schema"
+                    )
+                    or {}
+                ),
+                "return_contract": str(
+                    function.get(
+                        "return_contract"
+                    )
+                    or ""
+                ),
+                "artifact_outputs": list(
+                    function.get(
+                        "artifact_outputs"
+                    )
+                    or []
+                ),
+                "side_effects": list(
+                    function.get(
+                        "side_effects"
+                    )
+                    or []
+                ),
+                "required_capabilities": list(
+                    function.get(
+                        "required_capabilities"
+                    )
+                    or []
+                ),
+            })
+
+        candidate_cards.append({
+            "tool_id": tool_id,
+            "display_name": str(
+                tool.get("display_name")
+                or ""
+            ),
+            "category": str(
+                tool.get("category")
+                or ""
+            ),
+            "prompt_guidance": str(
+                tool.get("prompt_guidance")
+                or ""
+            ),
+            "capability_aliases": list(
+                tool.get(
+                    "capability_aliases"
+                )
+                or []
+            ),
+            "semantic_tags": list(
+                tool.get(
+                    "semantic_tags"
+                )
+                or []
+            ),
+            "required_capabilities": list(
+                tool.get(
+                    "required_capabilities"
+                )
+                or []
+            ),
+            "optional_capabilities": list(
+                tool.get(
+                    "optional_capabilities"
+                )
+                or []
+            ),
+            "input_schema": (
+                tool.get("input_schema")
+                or {}
+            ),
+            "output_schema": (
+                tool.get("output_schema")
+                or {}
+            ),
+            "artifact_outputs": list(
+                tool.get(
+                    "artifact_outputs"
+                )
+                or []
+            ),
+            "side_effects": list(
+                tool.get("side_effects")
+                or []
+            ),
+            "similarity": (
+                score_by_tool[
+                    tool_id
+                ]
+            ),
+            "functions": functions,
+        })
+
+    logger.info(
+        "[Creator]"
+        "[tool_recall]"
+        "[result] %s",
+        json.dumps(
+            {
+                "event": (
+                    "creator_tool_recall_result"
+                ),
+                "source": (
+                    embedding_source
+                ),
+                "query_count": len(
+                    query_texts
+                ),
+                "registry_tool_count": len(
+                    catalog
+                ),
+                "candidate_tool_ids": (
+                    candidate_tool_ids
+                ),
+                "candidate_scores": {
+                    tool_id: round(
+                        score_by_tool[
+                            tool_id
+                        ],
+                        6,
+                    )
+                    for tool_id
+                    in candidate_tool_ids
+                },
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+
+    return (
+        candidate_cards,
+        embedding_source,
+    )
 
 def _declared_supported_input_formats(*, blueprint_text: str, skill_plan_entry: Any) -> set[str]:
     declared = f"{blueprint_text or ''}\n{_entry_text_for_declared_support(skill_plan_entry)}".lower()
@@ -930,6 +2516,302 @@ def _has_responsibility_missing_capability_issue(
 
     return False
 
+async def _complete_creator_json_object_once(
+    *,
+    messages: list[dict[str, str]],
+    model: str,
+    phase: str,
+    response_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Call an OpenAI-compatible chat endpoint with strict JSON Schema output.
+
+    The provider is asked to constrain generation to response_schema.
+
+    There is no:
+    - prose extraction;
+    - Markdown stripping;
+    - regex JSON recovery;
+    - second LLM retry.
+
+    The complete model content must itself be one JSON object.
+    """
+
+    base_url = str(
+        settings.llm_base_url
+        or ""
+    ).rstrip("/")
+
+    if not base_url:
+        raise RuntimeError(
+            "llm_base_url is empty"
+        )
+
+    if base_url.endswith(
+        "/v1/chat/completions"
+    ):
+        url = base_url
+
+    elif base_url.endswith("/v1"):
+        url = (
+            base_url
+            + "/chat/completions"
+        )
+
+    else:
+        url = (
+            base_url
+            + "/v1/chat/completions"
+        )
+
+    api_key = str(
+        getattr(
+            settings,
+            "llm_api_key",
+            "",
+        )
+        or getattr(
+            settings,
+            "openai_api_key",
+            "",
+        )
+        or "ollama"
+    ).strip()
+
+    headers = {
+        "Content-Type": (
+            "application/json"
+        ),
+        "Authorization": (
+            f"Bearer {api_key}"
+        ),
+    }
+
+    schema_name = "".join(
+        character
+        if (
+            character.isalnum()
+            or character == "_"
+        )
+        else "_"
+        for character in str(
+            phase or ""
+        )
+    ).strip("_")
+
+    schema_name = (
+        schema_name[:64]
+        or "creator_structured_output"
+    )
+
+    payload: dict[str, Any] = {
+        "model": model,
+
+        "messages": messages,
+
+        "stream": False,
+
+        "response_format": {
+            "type": "json_schema",
+
+            "json_schema": {
+                "name": schema_name,
+
+                "strict": True,
+
+                "schema": (
+                    response_schema
+                ),
+            },
+        },
+
+        "temperature": 0,
+    }
+
+    max_tokens = getattr(
+        settings,
+        "max_tokens",
+        None,
+    )
+
+    if max_tokens is not None:
+        payload[
+            "max_tokens"
+        ] = max_tokens
+
+    timeout = float(
+        getattr(
+            settings,
+            "llm_timeout_seconds",
+            120,
+        )
+        or 120
+    )
+
+    logger.info(
+        "[Creator]"
+        "[json_once]"
+        "[request] "
+        "phase=%s "
+        "model=%s "
+        "url=%s "
+        "messages=%d "
+        "schema_name=%s "
+        "schema=%s",
+        phase,
+        model,
+        url,
+        len(messages),
+        schema_name,
+        json.dumps(
+            response_schema,
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        timeout=timeout
+    ) as client:
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+        )
+
+    try:
+        response.raise_for_status()
+
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            "structured-output LLM request failed: "
+            f"status={response.status_code} "
+            f"body={response.text[:4000]}"
+        ) from exc
+
+    try:
+        body = response.json()
+
+    except Exception as exc:
+        raise RuntimeError(
+            "structured-output LLM response "
+            "body is not JSON"
+        ) from exc
+
+    if not isinstance(
+        body,
+        dict,
+    ):
+        raise RuntimeError(
+            "structured-output LLM response "
+            "body is not an object"
+        )
+
+    choices = body.get(
+        "choices"
+    )
+
+    if (
+        not isinstance(
+            choices,
+            list,
+        )
+        or not choices
+    ):
+        raise RuntimeError(
+            "structured-output LLM response "
+            "does not contain choices"
+        )
+
+    choice = choices[0]
+
+    if not isinstance(
+        choice,
+        dict,
+    ):
+        raise RuntimeError(
+            "structured-output LLM first "
+            "choice is not an object"
+        )
+
+    message = (
+        choice.get("message")
+        if isinstance(
+            choice.get("message"),
+            dict,
+        )
+        else {}
+    )
+
+    content = (
+        message.get("content")
+        or choice.get("text")
+        or ""
+    )
+
+    if not isinstance(
+        content,
+        str,
+    ):
+        raise RuntimeError(
+            "structured-output LLM content "
+            "is not a string"
+        )
+
+    content = content.strip()
+
+    if not content:
+        raise RuntimeError(
+            "structured-output LLM returned "
+            "empty content"
+        )
+
+    logger.info(
+        "[Creator]"
+        "[json_once]"
+        "[response] "
+        "phase=%s "
+        "expected_model=%s "
+        "actual_model=%s "
+        "finish_reason=%s "
+        "content_len=%d "
+        "content=\n%s",
+        phase,
+        model,
+        str(
+            body.get("model")
+            or ""
+        ),
+        str(
+            choice.get("finish_reason")
+            or ""
+        ),
+        len(content),
+        content[:8000],
+    )
+
+    try:
+        parsed = json.loads(
+            content
+        )
+
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "structured-output LLM returned "
+            "invalid JSON: "
+            f"{exc}"
+        ) from exc
+
+    if not isinstance(
+        parsed,
+        dict,
+    ):
+        raise ValueError(
+            "structured-output LLM response "
+            "must be a JSON object"
+        )
+
+    return parsed
+
 async def _plan_final_tool_pool(
     *,
     skill_name: str,
@@ -941,14 +2823,28 @@ async def _plan_final_tool_pool(
     uploaded_files: list[dict[str, Any]],
     requested_model: str | None,
 ) -> dict[str, Any]:
-    """Let the planning model select Skill-wide ToolPool tools.
+    """Select the final Skill-wide ToolPool from embedding-recalled candidates.
 
-    Planner selects exact Registry tool IDs for the whole Skill.
+    Pipeline:
 
-    Backend Gate is the only authorization authority.
+        final Skill responsibilities
+        -> embedding Registry recall
+        -> candidate catalog
+        -> JSON Schema constrained Final Tool Planner
+        -> deterministic response validation
+        -> candidate boundary validation
+        -> Backend Gate
+        -> shared Skill ToolPool
 
-    Script ownership is not part of ToolPool planning.
+    Tool authorization remains Skill-wide.
+
+    Script responsibilities are semantic planning context only and never create
+    per-file authorization.
     """
+
+    _ = blueprint_text
+    _ = requirement_graph
+    _ = uploaded_files
 
     skill_dir = (
         settings.skills_path
@@ -966,18 +2862,69 @@ async def _plan_final_tool_pool(
         skill_dir
     )
 
-    tool_catalog = (
-        _creator_tool_catalog_for_planner()
-    )
+    try:
+        (
+            candidate_catalog,
+            recall_source,
+        ) = _recall_creator_tool_candidates(
+            user_request=user_request,
+            confirmed_summary=(
+                confirmed_summary
+            ),
+            file_specs=file_specs,
+            top_k=8,
+        )
 
-    valid_tool_ids = {
+    except Exception as exc:
+        logger.exception(
+            "[Creator]"
+            "[final_tool_planning]"
+            "[tool_recall_failed] "
+            "skill=%s "
+            "error=%s",
+            skill_name,
+            (
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            ),
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "creator_tool_recall_failed"
+                ),
+
+                "message": (
+                    "Tool Registry semantic recall "
+                    "failed. Configured embedding "
+                    "service and local "
+                    "backend/bge-large-zh-v1.5 "
+                    "embedding are unavailable."
+                ),
+
+                "error": (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            },
+        ) from exc
+
+    candidate_tool_ids = {
         str(
             item.get("tool_id")
             or ""
         ).strip()
-        for item in tool_catalog
+        for item in (
+            candidate_catalog
+            or []
+        )
         if (
-            isinstance(item, dict)
+            isinstance(
+                item,
+                dict,
+            )
             and str(
                 item.get("tool_id")
                 or ""
@@ -985,116 +2932,233 @@ async def _plan_final_tool_pool(
         )
     }
 
-    prompt = """
-你是 Creator ToolPool 规划模型。
+    if not candidate_tool_ids:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "creator_tool_recall_empty"
+                ),
 
-你只负责为整个 Skill 选择具体工具。
+                "message": (
+                    "Tool Registry embedding recall "
+                    "returned no Creator candidates."
+                ),
+
+                "skill_name": skill_name,
+            },
+        )
+
+    ordered_candidate_tool_ids = sorted(
+        candidate_tool_ids
+    )
+
+    script_contracts: list[
+        dict[str, Any]
+    ] = []
+
+    for spec in (
+        file_specs or []
+    ):
+        if not isinstance(
+            spec,
+            dict,
+        ):
+            continue
+
+        path = _normalize_skill_path(
+            str(
+                spec.get("path")
+                or spec.get(
+                    "target_file"
+                )
+                or ""
+            )
+        )
+
+        if not path.startswith(
+            "scripts/"
+        ):
+            continue
+
+        if spec.get("required") is False:
+            continue
+
+        script_contracts.append({
+            "purpose": str(
+                spec.get("purpose")
+                or ""
+            ).strip(),
+
+            "inputs": list(
+                spec.get("inputs")
+                or []
+            ),
+
+            "outputs": list(
+                spec.get("outputs")
+                or []
+            ),
+
+            "required_capabilities": list(
+                spec.get(
+                    "required_capabilities"
+                )
+                or []
+            ),
+
+            "forbidden_capabilities": list(
+                spec.get(
+                    "forbidden_capabilities"
+                )
+                or []
+            ),
+
+            "side_effects": list(
+                spec.get(
+                    "side_effects"
+                )
+                or []
+            ),
+
+            "artifact_contract": (
+                spec.get(
+                    "artifact_contract"
+                )
+                or {}
+            ),
+        })
+
+    current_allowed_ids = {
+        str(
+            tool.tool_id
+            or ""
+        ).strip()
+        for tool in (
+            current_pool.tools or []
+        )
+        if (
+            tool.status == "allowed"
+            and str(
+                tool.tool_id
+                or ""
+            ).strip()
+        )
+    }
+
+    protected_tool_ids = {
+        str(
+            tool.tool_id
+            or ""
+        ).strip()
+        for tool in (
+            current_pool.tools or []
+        )
+        if (
+            tool.status == "allowed"
+            and tool.source in {
+                "manual_admin",
+                "system_required",
+            }
+            and str(
+                tool.tool_id
+                or ""
+            ).strip()
+        )
+    }
+
+    response_schema: dict[
+        str,
+        Any,
+    ] = {
+        "type": "object",
+
+        "properties": {
+            "desired_tools": {
+                "type": "array",
+
+                "items": {
+                    "type": "object",
+
+                    "properties": {
+                        "tool_id": {
+                            "type": "string",
+
+                            "enum": (
+                                ordered_candidate_tool_ids
+                            ),
+                        },
+
+                        "reason": {
+                            "type": "string",
+                        },
+                    },
+
+                    "required": [
+                        "tool_id",
+                        "reason",
+                    ],
+
+                    "additionalProperties": False,
+                },
+            },
+
+            "reason": {
+                "type": "string",
+            },
+        },
+
+        "required": [
+            "desired_tools",
+            "reason",
+        ],
+
+        "additionalProperties": False,
+    }
+
+    prompt = """
+你是 Creator Final Tool Planner。
+
+执行一个 Skill 级工具集合选择任务。
+
+根据：
+
+- user_request
+- confirmed_summary
+- script_contracts
+- candidate_tool_catalog
+
+判断整个 Skill 最终真正需要哪些 Registry 工具。
+
+candidate_tool_catalog 只是 embedding 召回的候选空间。
+候选存在不代表必须选择。
 
 ToolPool 是 Skill 级共享授权池。
-工具不绑定到单个脚本。
+不要逐脚本授权。
 
-你不是工具说明助手。
-不要解释工具目录。
-不要写代码。
-不要修改 blueprint。
-不要修改 SkillPlan。
-不要修改脚本 purpose、inputs、outputs。
-不要规划工具属于哪个脚本。
+选择规则：
 
-输入中包含：
+- 只选择 Skill 最终职责真实需要的工具。
+- 普通 Python 或确定性本地逻辑可以完成的职责不选择工具。
+- 不得增加最终 Skill 职责中不存在的能力、外部服务、外部副作用或 artifact 责任。
+- similarity 只表示 embedding recall 排序，不表示必须选择。
+- current_allowed_tool_ids 只是当前状态，不表示必须保留。
 
-1. user_request
-   用户原始目标。
+不要解释 candidate_tool_catalog。
+不要总结工具目录。
+不要输出代码。
+不要重新设计 Skill。
 
-2. confirmed_summary
-   用户已经确认的创建目标。
+响应结构已经由 JSON Schema 强制约束。
 
-3. file_specs
-   当前 Skill 所有 scripts/** 的最终职责。
-   你需要整体阅读这些职责，只用于判断整个 Skill 需要哪些工具。
-
-4. requirement_graph
-   当前 Skill 职责图谱。
-
-5. current_tool_pool
-   当前 Skill 已授权的共享工具池。
-
-6. available_tool_catalog
-   Tool Registry 完整工具目录。
-
-available_tool_catalog 中每个工具包含真实工具合同：
-
-- tool_id
-- display_name
-- prompt_guidance
-- input_schema
-- output_schema
-- artifact_outputs
-- side_effects
-
-functions 中包含：
-
-- function_name
-- import_path
-- short_description
-- when_to_use
-- signature
-- input_schema
-- output_schema
-- return_contract
-- artifact_outputs
-- side_effects
-- example_call
-- example_return
-- example_stdout
-- common_mistakes
-
-规划规则：
-
-- 根据用户目标和所有 scripts/** 的整体职责，选择整个 Skill 运行所需工具。
-- 一个工具一旦被 Skill ToolPool 授权，当前 Skill 的脚本都可以看到该工具合同。
-- 具体脚本是否调用某个工具，由代码模型结合当前文件职责自行决定。
-- 不要输出 target_file。
-- 不要规划工具属于哪个脚本。
-- 不要根据文件名给工具分组。
-- 不要只根据 tool_id 名称判断工具用途。
-- 必须阅读 description、function contract、输入输出和 return contract。
-- 如果标准库和普通 Python 确定性逻辑足够完成整个 Skill 的相关职责，不需要添加工具。
-- 如果 Skill 需要开放式模型生成、图像生成、视觉理解、搜索、外部服务或 Registry artifact 能力，应选择真实匹配工具。
-- current_tool_pool 已有 allowed 工具时不要重复添加。
-- candidate_tool_id 必须逐字等于 available_tool_catalog 中真实 tool_id。
-- function_name 不是 tool_id。
-- import_path 不是 tool_id。
-- candidate_tool_id 禁止填写 generate_text_with_llm、describe_image_with_vision 等 function_name，除非该字符串本身也是目录中真实 tool_id。
-- 你只提出 Skill ToolPool 工具建议；Backend Gate 决定是否授权。
-
-只输出严格 JSON object。
-
-禁止 Markdown。
-禁止解释。
-禁止工具介绍。
-禁止代码示例。
-禁止 JSON 外文字。
-
-输出格式：
-
-{
-  "tool_pool_patch": {
-    "add_tool_requests": [
-      {
-        "requested_capability": "整个 Skill 需要的能力",
-        "candidate_tool_id": "Registry 中真实 tool_id",
-        "reason": "根据工具真实 function contract 和 IO 说明选择原因"
-      }
-    ],
-    "remove_tool_requests": [],
-    "reason": "本轮 Skill ToolPool 规划原因",
-    "affected_files": []
-  }
-}
+只填写 schema 中要求的决策字段。
 """.strip()
 
     payload = {
+        "task": (
+            "select_final_skill_tool_pool"
+        ),
+
         "skill_name": skill_name,
 
         "user_request": str(
@@ -1110,52 +3174,22 @@ functions 中包含：
             else {}
         ),
 
-        "blueprint_text": str(
-            blueprint_text or ""
-        )[:16000],
-
-        "file_specs": [
-            spec
-            for spec in (
-                file_specs or []
-            )
-            if (
-                isinstance(spec, dict)
-                and _normalize_skill_path(
-                    str(
-                        spec.get("path")
-                        or spec.get(
-                            "target_file"
-                        )
-                        or ""
-                    )
-                ).startswith(
-                    "scripts/"
-                )
-            )
-        ],
-
-        "requirement_graph": (
-            requirement_graph
-            if isinstance(
-                requirement_graph,
-                dict,
-            )
-            else {}
+        "script_contracts": (
+            script_contracts
         ),
 
-        "uploaded_files": (
-            uploaded_files or []
+        "recall_source": (
+            recall_source
         ),
 
-        "current_tool_pool": (
-            tool_pool_snapshot(
-                current_pool
+        "current_allowed_tool_ids": (
+            sorted(
+                current_allowed_ids
             )
         ),
 
-        "available_tool_catalog": (
-            tool_catalog
+        "candidate_tool_catalog": (
+            candidate_catalog
         ),
     }
 
@@ -1163,215 +3197,473 @@ functions 中包含：
         "creator_prepare_plan",
         requested_model=requested_model,
         reason=(
-            "creator final Skill ToolPool planning"
+            "creator final Skill "
+            "ToolPool planning"
         ),
     )
 
-    messages: list[
-        dict[str, str]
-    ] = [
-        {
-            "role": "system",
-            "content": prompt,
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
-                payload,
-                ensure_ascii=False,
-                default=str,
-            ),
-        },
-    ]
+    try:
+        planner_output = (
+            await _complete_creator_json_object_once(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    },
+                ],
 
-    last_error: Exception | None = None
+                model=route.model,
 
-    for attempt in range(2):
-        text = await complete_chat_once(
-            messages,
-            route.model,
+                phase=(
+                    "final_tool_planning"
+                ),
+
+                response_schema=(
+                    response_schema
+                ),
+            )
         )
 
-        try:
-            planner_output = (
-                _parse_prepare_plan_json(
-                    text
-                )
-            )
+    except Exception as exc:
+        logger.exception(
+            "[Creator]"
+            "[final_tool_planning]"
+            "[structured_protocol_failed] "
+            "skill=%s "
+            "error=%s",
+            skill_name,
+            (
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            ),
+        )
 
-            raw_patch = planner_output.get(
-                "tool_pool_patch"
-            )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "final_tool_planner_"
+                    "structured_protocol_failed"
+                ),
 
-            if not isinstance(
-                raw_patch,
-                dict,
-            ):
-                raise ValueError(
-                    "missing tool_pool_patch object"
-                )
+                "message": (
+                    "Final Tool Planner failed "
+                    "the JSON Schema protocol."
+                ),
 
-            validated_patch = (
-                ToolPoolPatch.model_validate(
-                    raw_patch
-                )
-            )
+                "error": (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            },
+        ) from exc
 
-            invalid_tool_ids = sorted({
-                str(
-                    request.candidate_tool_id
-                    or ""
-                ).strip()
-                for request in (
-                    validated_patch
-                    .add_tool_requests
-                    or []
-                )
-                if (
-                    not str(
-                        request.candidate_tool_id
-                        or ""
-                    ).strip()
-                    or str(
-                        request.candidate_tool_id
-                        or ""
-                    ).strip()
-                    not in valid_tool_ids
-                )
-            })
+    raw_desired_tools = (
+        planner_output.get(
+            "desired_tools"
+        )
+    )
 
-            if invalid_tool_ids:
-                raise ValueError(
-                    "candidate_tool_id must be an exact "
-                    "Registry tool_id; invalid="
-                    + json.dumps(
-                        invalid_tool_ids,
-                        ensure_ascii=False,
-                    )
-                )
+    planner_reason = (
+        planner_output.get(
+            "reason"
+        )
+    )
 
-            normalized_requests: list[
-                ToolPoolAddToolRequest
-            ] = []
+    if not isinstance(
+        raw_desired_tools,
+        list,
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "final_tool_planner_"
+                    "invalid_shape"
+                ),
 
-            seen_tool_ids: set[str] = set()
+                "message": (
+                    "Final Tool Planner structured "
+                    "response must contain "
+                    "desired_tools as an array."
+                ),
 
-            for request in (
-                validated_patch
-                .add_tool_requests
-                or []
-            ):
-                tool_id = str(
-                    request.candidate_tool_id
-                    or ""
-                ).strip()
+                "planner_output": (
+                    planner_output
+                ),
+            },
+        )
 
-                if tool_id in seen_tool_ids:
-                    continue
+    if not isinstance(
+        planner_reason,
+        str,
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "final_tool_planner_"
+                    "invalid_shape"
+                ),
 
-                seen_tool_ids.add(
-                    tool_id
-                )
+                "message": (
+                    "Final Tool Planner structured "
+                    "response must contain reason "
+                    "as a string."
+                ),
 
-                normalized_requests.append(
-                    request.model_copy(
-                        update={
-                            "target_file": "",
-                        }
-                    )
-                )
+                "planner_output": (
+                    planner_output
+                ),
+            },
+        )
 
-            validated_patch = (
-                validated_patch.model_copy(
-                    update={
-                        "add_tool_requests": (
-                            normalized_requests
-                        ),
-                        "update_file_bindings": [],
-                        "affected_files": [],
-                    }
-                )
-            )
+    selected_by_tool: dict[
+        str,
+        dict[str, str],
+    ] = {}
 
-            planner_output = dict(
-                planner_output
-            )
+    rejected_tool_ids: list[
+        str
+    ] = []
 
-            planner_output[
-                "tool_pool_patch"
-            ] = validated_patch.model_dump(
-                mode="json"
-            )
+    invalid_items: list[
+        dict[str, Any]
+    ] = []
 
-            break
+    for index, raw_tool in enumerate(
+        raw_desired_tools
+    ):
+        if not isinstance(
+            raw_tool,
+            dict,
+        ):
+            invalid_items.append({
+                "index": index,
 
-        except Exception as exc:
-            last_error = exc
-
-            logger.warning(
-                "[Creator]"
-                "[final_tool_planning]"
-                "[protocol_error] "
-                "skill=%s attempt=%d error=%s",
-                skill_name,
-                attempt + 1,
-                exc,
-            )
-
-            if attempt >= 1:
-                raise
-
-            messages.append({
-                "role": "assistant",
-                "content": str(
-                    text or ""
-                )[:8000],
-            })
-
-            messages.append({
-                "role": "user",
-                "content": (
-                    "上一轮 ToolPool 输出不符合协议。\n"
-                    "不要重新解释工具目录。\n"
-                    "不要重新设计 Skill。\n"
-                    "只修正 ToolPool JSON。\n"
-                    "不要输出 target_file。\n"
-                    "candidate_tool_id 必须使用真实 Registry tool_id，"
-                    "不能使用 function_name 或 import_path。\n"
-                    "顶层必须包含 tool_pool_patch。\n"
-                    f"错误：{type(exc).__name__}: {exc}\n"
-                    "可用 Registry tool_id："
-                    + json.dumps(
-                        sorted(
-                            valid_tool_ids
-                        ),
-                        ensure_ascii=False,
-                    )
+                "reason": (
+                    "desired_tools item "
+                    "must be an object"
                 ),
             })
 
-    else:
-        raise ValueError(
-            "final Skill ToolPool planner failed: "
-            f"{last_error}"
+            continue
+
+        raw_tool_id = raw_tool.get(
+            "tool_id"
         )
+
+        raw_reason = raw_tool.get(
+            "reason"
+        )
+
+        if not isinstance(
+            raw_tool_id,
+            str,
+        ):
+            invalid_items.append({
+                "index": index,
+
+                "reason": (
+                    "tool_id must be a string"
+                ),
+            })
+
+            continue
+
+        if not isinstance(
+            raw_reason,
+            str,
+        ):
+            invalid_items.append({
+                "index": index,
+
+                "reason": (
+                    "reason must be a string"
+                ),
+            })
+
+            continue
+
+        tool_id = raw_tool_id.strip()
+        reason = raw_reason.strip()
+
+        if not tool_id:
+            invalid_items.append({
+                "index": index,
+
+                "reason": (
+                    "tool_id must not be empty"
+                ),
+            })
+
+            continue
+
+        if (
+            tool_id
+            not in candidate_tool_ids
+        ):
+            rejected_tool_ids.append(
+                tool_id
+            )
+
+            continue
+
+        selected_by_tool[
+            tool_id
+        ] = {
+            "tool_id": tool_id,
+
+            "reason": reason,
+        }
+
+    if invalid_items:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": (
+                    "final_tool_planner_"
+                    "invalid_desired_tools"
+                ),
+
+                "message": (
+                    "Final Tool Planner returned "
+                    "invalid desired_tools items."
+                ),
+
+                "invalid_items": (
+                    invalid_items
+                ),
+
+                "planner_output": (
+                    planner_output
+                ),
+            },
+        )
+
+    desired_tool_ids = set(
+        selected_by_tool
+    )
+
+    if rejected_tool_ids:
+        logger.warning(
+            "[Creator]"
+            "[final_tool_planning]"
+            "[candidate_boundary_rejected] "
+            "skill=%s "
+            "rejected=%s",
+            skill_name,
+            json.dumps(
+                sorted(
+                    set(
+                        rejected_tool_ids
+                    )
+                ),
+                ensure_ascii=False,
+            ),
+        )
+
+    selected_tools = [
+        selected_by_tool[
+            tool_id
+        ]
+        for tool_id in sorted(
+            selected_by_tool
+        )
+    ]
+
+    add_tool_ids = sorted(
+        desired_tool_ids
+        - current_allowed_ids
+    )
+
+    remove_tool_ids = sorted(
+        current_allowed_ids
+        - desired_tool_ids
+        - protected_tool_ids
+    )
+
+    computed_patch = {
+        "tool_pool_patch": {
+            "add_tool_requests": [
+                {
+                    "requested_capability": (
+                        "Skill final responsibility "
+                        "requires Registry capability"
+                    ),
+
+                    "candidate_tool_id": (
+                        tool_id
+                    ),
+
+                    "reason": (
+                        selected_by_tool[
+                            tool_id
+                        ]["reason"]
+                    ),
+                }
+                for tool_id in (
+                    add_tool_ids
+                )
+            ],
+
+            "remove_tool_requests": [
+                {
+                    "tool_id": tool_id,
+
+                    "reason": (
+                        "tool is not present in "
+                        "the Final Tool Planner "
+                        "complete desired Skill "
+                        "ToolPool set"
+                    ),
+                }
+                for tool_id in (
+                    remove_tool_ids
+                )
+            ],
+
+            "update_file_bindings": [],
+
+            "reason": (
+                "Backend diff from embedding-"
+                "recalled Final Tool Planner "
+                "complete Skill-wide desired set"
+            ),
+
+            "affected_files": [],
+        }
+    }
 
     apply_result = (
         _apply_planner_tool_pool_patch(
             skill_name=skill_name,
-            planner_output=planner_output,
+
+            planner_output=(
+                computed_patch
+            ),
+
             source_phase=(
                 "final_contract_tool_planning"
             ),
+
             allow_remove=True,
         )
     )
 
+    updated_pool = load_tool_pool(
+        skill_dir
+    )
+
+    normalized_planner_output = {
+        "desired_tools": (
+            selected_tools
+        ),
+
+        "desired_tool_ids": (
+            sorted(
+                desired_tool_ids
+            )
+        ),
+
+        "recall_source": (
+            recall_source
+        ),
+
+        "candidate_tool_ids": (
+            ordered_candidate_tool_ids
+        ),
+
+        "rejected_tool_ids": (
+            sorted(
+                set(
+                    rejected_tool_ids
+                )
+            )
+        ),
+
+        "reason": (
+            planner_reason.strip()
+        ),
+    }
+
+    logger.info(
+        "[Creator]"
+        "[final_tool_planning]"
+        "[result] %s",
+        json.dumps(
+            {
+                "event": (
+                    "final_skill_tool_"
+                    "planning_result"
+                ),
+
+                "skill_name": skill_name,
+
+                "recall_source": (
+                    recall_source
+                ),
+
+                "candidate_tool_ids": (
+                    ordered_candidate_tool_ids
+                ),
+
+                "desired_tool_ids": (
+                    sorted(
+                        desired_tool_ids
+                    )
+                ),
+
+                "rejected_tool_ids": (
+                    sorted(
+                        set(
+                            rejected_tool_ids
+                        )
+                    )
+                ),
+
+                "add_tool_ids": (
+                    add_tool_ids
+                ),
+
+                "remove_tool_ids": (
+                    remove_tool_ids
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+
     return {
-        "planner_output": planner_output,
-        "apply_result": apply_result,
-        "tool_pool": load_tool_pool(
-            skill_dir
+        "planner_output": (
+            normalized_planner_output
+        ),
+
+        "computed_patch": (
+            computed_patch
+        ),
+
+        "apply_result": (
+            apply_result
+        ),
+
+        "desired_tool_ids": (
+            sorted(
+                desired_tool_ids
+            )
+        ),
+
+        "tool_pool": (
+            updated_pool
         ),
     }
 
@@ -2575,55 +4867,74 @@ async def _repair_prepare_blueprint_protocol(
     blueprint_text: str,
     protocol_errors: list[dict[str, Any]],
 ) -> str:
-    repaired = str(blueprint_text or "")
-    seen = {repaired}
+    """Repair Creator blueprint hard-protocol violations only.
+
+    Protocol repair does not discover Registry tools and does not mutate the
+    shared Skill ToolPool.
+    """
+
+    repaired = str(
+        blueprint_text or ""
+    )
+
+    seen = {
+        repaired
+    }
+
+    current_errors = list(
+        protocol_errors or []
+    )
 
     for _ in range(
         MAX_PREPARE_BLUEPRINT_REPAIR_ROUNDS
     ):
-        tool_context = _planner_shared_tool_context(
-            request.skill_name
-        )
-
         prompt = (
             load_kernel_creator_for_phase(
                 "prepare_plan"
             )
             + """
-你只修复 internal_blueprint_text 的 Creator 硬协议问题，同时检查因为蓝图职责修正导致的共享 ToolPool 变化。
+你只修复 internal_blueprint_text 的 Creator 硬协议问题。
+
+不要重新设计业务需求。
+不要探索 Tool Registry。
+不要选择工具。
+不要输出 tool_pool_patch。
+不要修改 ToolPool。
 
 只输出严格 JSON object：
 
 {
-  "internal_blueprint_text": "修复后的完整蓝图正文",
-  "tool_pool_patch": {
-    "add_tool_requests": [],
-    "remove_tool_requests": [],
-    "reason": "",
-    "affected_files": []
-  }
+  "internal_blueprint_text": "修复后的完整蓝图正文"
 }
 
 不要 Markdown 解释。
 
-蓝图修复要求：
-- 不要把运行时用户输入文件写入 assets；
-- 不要输出 assets/、assets/<name.ext>、assets/* 或动态 assets path；
-- 如果不需要静态素材，删除 assets 文件计划；
-- 目录结构不要列具体文件名；
-- 目录结构与 SkillPlan path 必须一致；
-- dependencies 只能写运行前静态依赖；
-- 运行时产物只能出现在脚本 outputs/stdout JSON/file_outputs。
+修复要求：
 
-工具规则：
-- available_tool_catalog 是完整发现目录。
-- current_tool_pool 是当前 Skill 唯一共享工具池。
-- 如果蓝图协议修复同时改变了脚本职责或真实能力需求，必须在同一轮通过 tool_pool_patch 提出变化。
-- add_tool_requests 只能使用 available_tool_catalog 中真实存在的精确 tool_id。
-- current_tool_pool 中已有工具不要重复 add。
-- 修正后的蓝图不再需要某工具时，可以 remove。
-- tool_pool_patch 只是规划模型提案，后台 Gate 才能授权 add。
-- 不得建立文件级独立工具池。
+- 只根据 protocol_errors 修复对应协议问题。
+- 保留已经正确的业务目标。
+- 保留已经正确的文件职责。
+- 保留已经正确的脚本文件拓扑。
+- 不新增与 protocol_errors 无关的业务流程。
+
+Creator 协议边界：
+
+- 不要把运行时用户输入文件写入 assets。
+- 不要输出 assets/、assets/<name.ext>、assets/* 或动态 assets path。
+- 如果不需要静态素材，删除 assets 文件计划。
+- 目录结构不要列具体文件名。
+- 目录结构和 SkillPlan path 必须一致。
+- dependencies 只能写运行前静态依赖。
+- 运行时产物只能出现在脚本 outputs/stdout/file_outputs。
+- resources 只能引用 SkillPlan 已声明的 references/assets。
+- references/*.md 引用必须对应 SkillPlan path。
+- 不得把 kernel/protocol 示例 reference path 复制成业务文件。
+- required_capabilities 只能表达抽象语义能力。
+- 不得填写具体 Registry tool_id。
+- 不得填写 selected_tools。
+- 不得填写 required_tool_slots。
+
+具体工具选择由后续 Final Tool Planner 完成。
 """
         )
 
@@ -2648,9 +4959,8 @@ async def _repair_prepare_blueprint_protocol(
                         {
                             "blueprint_text": repaired,
                             "protocol_errors": (
-                                protocol_errors
+                                current_errors
                             ),
-                            **tool_context,
                         },
                         ensure_ascii=False,
                         default=str,
@@ -2660,10 +4970,14 @@ async def _repair_prepare_blueprint_protocol(
             route.model,
         )
 
-        data = _parse_prepare_plan_json(text)
+        data = _parse_prepare_plan_json(
+            text
+        )
 
         candidate = str(
-            data.get("internal_blueprint_text")
+            data.get(
+                "internal_blueprint_text"
+            )
             or ""
         ).strip()
 
@@ -2675,38 +4989,19 @@ async def _repair_prepare_blueprint_protocol(
         if candidate in seen:
             break
 
-        patch_skill_name = str(
-            data.get("skill_name")
-            or request.skill_name
-            or ""
-        )
-
-        if patch_skill_name:
-            _apply_planner_tool_pool_patch(
-                skill_name=patch_skill_name,
-                planner_output=data,
-                source_phase=(
-                    "prepare_blueprint_repair"
-                ),
-                allow_remove=True,
-            )
-
         repaired = candidate
-        seen.add(repaired)
 
-        repaired = (
-            _normalize_prepare_blueprint_references(
-                repaired
-            )
+        seen.add(
+            repaired
         )
 
-        protocol_errors = (
+        current_errors = (
             _preflight_prepare_blueprint_text(
                 repaired
             )
         )
 
-        if not protocol_errors:
+        if not current_errors:
             break
 
     return repaired
@@ -3024,6 +5319,15 @@ async def _prepare_summarize_confirmed_requirements(
     request: PreparePlanRequest,
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
+    """Summarize Creator creation points only.
+
+    This phase never discovers Registry tools and never mutates ToolPool.
+
+    When the upstream business planner already returned a substantive
+    review_summary, reuse it directly instead of calling another LLM merely to
+    summarize the same requirement state again.
+    """
+
     prepared = prepared or {}
 
     confirmed_uploaded_assets, unselected_uploaded_files = (
@@ -3036,17 +5340,53 @@ async def _prepare_summarize_confirmed_requirements(
         prepared.get("review_summary")
     )
 
-    tool_context = _planner_shared_tool_context(
-        request.skill_name
-        or prepared.get("skill_name")
+    base_has_content = bool(
+        str(base.goal or "").strip()
+        and str(base.input or "").strip()
+        and str(base.output or "").strip()
+        and list(base.workflow or [])
     )
 
-    prompt = (
-        load_kernel_creator_for_phase("prepare_plan")
-        + """
-你只归纳 Creator 创建要点，同时检查当前 Skill 的工具需求。不要生成蓝图，不提风险。只输出严格 JSON object。
+    if base_has_content:
+        base.risks = []
 
-输出字段：
+        base.assets_to_upload = [
+            str(path).strip()
+            for path in (
+                base.assets_to_upload
+                or []
+            )
+            if str(path).strip().startswith(
+                "assets/"
+            )
+        ]
+
+        if not base.changes:
+            base.changes = [
+                (
+                    "默认决策：优先最小可用、"
+                    "可执行、可验证的实现。"
+                )
+            ]
+
+        return base
+
+    prompt = (
+        load_kernel_creator_for_phase(
+            "prepare_plan"
+        )
+        + """
+你只负责归纳 Creator 创建要点。
+
+不要生成蓝图。
+不要探索 Tool Registry。
+不要选择工具。
+不要输出 tool_pool_patch。
+不要修改 ToolPool。
+不要输出风险项。
+
+只输出严格 JSON object：
+
 {
   "goal": "",
   "input": "",
@@ -3055,31 +5395,22 @@ async def _prepare_summarize_confirmed_requirements(
   "files_to_create_or_update": [],
   "assets_to_upload": [],
   "risks": [],
-  "changes": [],
-  "tool_pool_patch": {
-    "add_tool_requests": [],
-    "remove_tool_requests": [],
-    "reason": "",
-    "affected_files": []
-  }
+  "changes": []
 }
 
-创建要点必须体现后续 internal_blueprint_text、SkillPlan 和 requirement graph 需要落实的功能合同：目标功能、运行时输入、运行时输出、处理流程、文件职责、脚本 inputs/outputs/stdout JSON 字段、资源边界、默认决策。
+要求：
 
-同时基于这些创建要点检查工具需求：
-- available_tool_catalog 是完整工具发现目录。
-- current_tool_pool 是当前 Skill 唯一共享 ToolPool。
-- 你只能通过 tool_pool_patch 提出 ToolPool 变化。
-- candidate_tool_id 必须是 available_tool_catalog 中的精确 tool_id。
-- 已在 current_tool_pool 中的工具不要重复 add。
-- 用户补充导致工具不再需要时，通过 remove_tool_requests 提案删除。
-- 不要创建另一套候选池。
-- 不要让后端、代码模型或判决模型自行从 Registry 语义选工具。
-- 工具提案和创建要点必须基于同一轮需求判断同时完成。
-
-risks 必须输出空数组。
-assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得放入。
-未明确但必须落地的部分使用默认推荐项：最小可用、可执行可验证、JSON + 可读 Markdown、最小文件集、不确定不创建 assets path。
+- 根据 user_request、conversation_history、human_feedback 和 model_summary 归纳当前业务需求。
+- goal 表达最终业务目标。
+- input 表达 Skill 运行时真实输入。
+- output 表达最终用户可见结果或文件产物。
+- workflow 表达高层业务处理过程。
+- files_to_create_or_update 只表达业务规划中的 Creator 文件。
+- assets_to_upload 只包含创建 Skill 时固定使用的静态 assets。
+- 运行时输入文件不能放入 assets_to_upload。
+- risks 必须是空数组。
+- 不得因为平台支持搜索、微信、数据库、表格、视觉或外部 API 而扩大用户需求。
+- 未明确但必须落地的非关键部分采用最小可用、可执行、可验证的默认方案。
 """
     )
 
@@ -3088,8 +5419,12 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
         "conversation_history": (
             request.conversation_history
         ),
-        "human_feedback": request.human_feedback,
-        "uploaded_files": request.uploaded_files,
+        "human_feedback": (
+            request.human_feedback
+        ),
+        "uploaded_files": (
+            request.uploaded_files
+        ),
         "confirmed_uploaded_assets": (
             confirmed_uploaded_assets
         ),
@@ -3099,10 +5434,9 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
         "model_summary": base.model_dump(
             mode="json"
         ),
-        **tool_context,
     }
 
-    parsed: dict[str, Any] = {}
+    summary = base
 
     try:
         route = route_model(
@@ -3131,7 +5465,9 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
             route.model,
         )
 
-        parsed = _parse_prepare_plan_json(text)
+        parsed = _parse_prepare_plan_json(
+            text
+        )
 
         summary_source = (
             parsed.get("review_summary")
@@ -3149,20 +5485,6 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
     except Exception:
         summary = base
 
-    patch_skill_name = str(
-        request.skill_name
-        or prepared.get("skill_name")
-        or ""
-    )
-
-    if patch_skill_name and parsed:
-        _apply_planner_tool_pool_patch(
-            skill_name=patch_skill_name,
-            planner_output=parsed,
-            source_phase="prepare_summary",
-            allow_remove=True,
-        )
-
     if not summary.goal:
         summary.goal = str(
             request.user_request
@@ -3171,21 +5493,20 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
 
     if not summary.input:
         summary.input = (
-            "运行时由用户提供文本、文件、参数或素材；"
-            "未明确的文件默认作为运行时输入。"
+            "运行时由用户提供已确认的业务输入。"
         )
 
     if not summary.output:
         summary.output = (
-            "默认返回结构化 JSON + 可读 Markdown；"
+            "返回已确认业务目标对应的结果；"
             "如生成文件则返回 OUTPUT_DIR 文件路径。"
         )
 
     if not summary.workflow:
         summary.workflow = [
             "读取运行时输入",
-            "按 Skill 目标处理并验证关键字段",
-            "返回 stdout JSON 和可读结果",
+            "执行已确认的业务处理流程",
+            "验证并返回最终结果",
         ]
 
     if not summary.files_to_create_or_update:
@@ -3198,16 +5519,20 @@ assets_to_upload 只包含 Creator 静态 assets；运行时输入文件不得�
     if not summary.changes:
         summary.changes = [
             (
-                "默认决策：优先最小可用、可执行可验证；"
-                "不确定的素材按运行时输入处理，"
-                "不创建 assets path。"
+                "默认决策：优先最小可用、"
+                "可执行、可验证的实现。"
             )
         ]
 
     summary.assets_to_upload = [
-        path
-        for path in summary.assets_to_upload
-        if str(path).strip().startswith("assets/")
+        str(path).strip()
+        for path in (
+            summary.assets_to_upload
+            or []
+        )
+        if str(path).strip().startswith(
+            "assets/"
+        )
     ]
 
     return summary
@@ -3218,14 +5543,27 @@ async def _generate_internal_blueprint_from_confirmed_summary(
     request: PreparePlanRequest,
     summary: PreparePlanReviewSummary,
 ) -> dict[str, Any]:
-    tool_context = _planner_shared_tool_context(
-        request.skill_name
-    )
+    """Generate an internal blueprint from confirmed creation points.
+
+    Tool discovery is owned exclusively by the Final Tool Planner.
+
+    This phase does not read Registry catalog and does not mutate ToolPool.
+    """
 
     prompt = (
-        load_kernel_creator_for_phase("prepare_plan")
+        load_kernel_creator_for_phase(
+            "prepare_plan"
+        )
         + """
-基于已确认的创建要点、conversation_history、human_feedback 生成 internal_blueprint_text，并同时重新检查当前共享 ToolPool 是否与最终蓝图职责一致。
+根据已经确认的创建要点、conversation_history 和 human_feedback
+生成 internal_blueprint_text。
+
+当前阶段只负责业务蓝图规划。
+
+不要探索 Tool Registry。
+不要选择具体工具。
+不要输出 tool_pool_patch。
+不要修改 ToolPool。
 
 只输出严格 JSON object：
 
@@ -3233,38 +5571,50 @@ async def _generate_internal_blueprint_from_confirmed_summary(
   "status": "ready",
   "internal_blueprint_text": "...",
   "review_summary": {},
-  "skill_name": "...",
-  "tool_pool_patch": {
-    "add_tool_requests": [],
-    "remove_tool_requests": [],
-    "reason": "",
-    "affected_files": []
-  }
+  "skill_name": "..."
 }
 
-不得继续返回 needs_clarification，不得询问问题。
-未明确的非关键偏好使用默认推荐项。
-运行时输入默认不作为 Creator assets。
+不得继续返回 needs_clarification。
+不得询问用户问题。
 
-输出必须满足 analyze_blueprint(strict=True) 可解析，包含基本信息、I/O 契约、目录结构、工作流逻辑、SkillPlan / 文件职责计划、宿主执行方式、资源清单。
+internal_blueprint_text 必须满足 analyze_blueprint(strict=True) 可解析。
 
-工具规则：
-- available_tool_catalog 是工具发现空间。
-- current_tool_pool 是当前 Skill 唯一共享 ToolPool。
-- 根据最终创建要点和本轮生成的蓝图职责，同时检查 current_tool_pool。
-- 需要新工具时，只通过 tool_pool_patch.add_tool_requests 提案。
-- 已有工具因最终蓝图变化不再需要时，通过 remove_tool_requests 提案。
-- candidate_tool_id 必须精确来自 available_tool_catalog。
-- 后台 Gate 决定 add 是否生效。
-- 不得把 selected_tools、required_tool_slots 或 required_capabilities 当成另一套授权来源。
-- 蓝图、ToolPool proposal 和脚本职责必须语义一致。
-- 不要为不同脚本建立不同工具池；当前 Skill 只能有 current_tool_pool 一套工具池。
-- file-level primary/secondary 只能表达推荐顺序，不能形成独立授权池。
+必须包含：
 
-资源清单只能列 SkillPlan path 中已声明的 references/assets。
-dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
-不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图。
-不确定是否需要 reference 时默认不创建 reference 文件。
+- 基本信息；
+- I/O 契约；
+- 目录结构；
+- 工作流逻辑；
+- SkillPlan / 文件职责计划；
+- 宿主执行方式；
+- 资源清单。
+
+业务规则：
+
+- confirmed_summary 是已经确认的业务事实来源。
+- 不得因为平台支持某种能力而扩大 confirmed_summary 中不存在的需求。
+- required_capabilities 只能表达抽象语义能力需求。
+- 不得填写具体 Registry tool_id。
+- 不得填写 selected_tools。
+- 不得填写 required_tool_slots。
+- ToolPool 工具选择由后续 Final Tool Planner 完成。
+
+资源规则：
+
+- 运行时输入默认不是 Creator assets。
+- assets 只表示创建阶段固定静态素材。
+- 运行时生成产物只能写入 scripts outputs/stdout/file_outputs。
+- 资源清单只能列 SkillPlan 已声明的 references/assets。
+- references/*.md 只有业务确实需要静态参考资料时才创建。
+- 不要复制 kernel/protocol 示例 reference 文件路径。
+- 不确定是否需要 reference 时默认不创建。
+
+执行规则：
+
+- 当前平台没有显式 loop/map/foreach runtime node。
+- 逐项处理、批量处理、顺序映射和聚合责任必须落到某个 scripts/*.py 内部。
+- 文件数量必须来自真实职责边界。
+- 不要根据自然语言步骤机械拆分文件。
 """
     )
 
@@ -3282,21 +5632,26 @@ dependencies/references/resource list 中出现的 references/*.md 必须有对�
         "conversation_history": (
             request.conversation_history
         ),
-        "human_feedback": request.human_feedback,
-        "uploaded_files": request.uploaded_files,
+        "human_feedback": (
+            request.human_feedback
+        ),
+        "uploaded_files": (
+            request.uploaded_files
+        ),
         "confirmed_uploaded_assets": (
             confirmed_uploaded_assets
         ),
         "unselected_uploaded_files": (
             unselected_uploaded_files
         ),
-        **tool_context,
     }
 
     route = route_model(
         "creator_prepare_plan",
         requested_model=request.model,
-        reason="creator confirmed summary to blueprint",
+        reason=(
+            "creator confirmed summary to blueprint"
+        ),
     )
 
     text = await complete_chat_once(
@@ -3317,28 +5672,25 @@ dependencies/references/resource list 中出现的 references/*.md 必须有对�
         route.model,
     )
 
-    data = _parse_prepare_plan_json(text)
+    data = _parse_prepare_plan_json(
+        text
+    )
+
+    # Defensive boundary:
+    # blueprint planning cannot mutate ToolPool.
+    data.pop(
+        "tool_pool_patch",
+        None,
+    )
 
     data["status"] = "ready"
 
     data.setdefault(
         "review_summary",
-        summary.model_dump(mode="json"),
+        summary.model_dump(
+            mode="json"
+        ),
     )
-
-    patch_skill_name = str(
-        data.get("skill_name")
-        or request.skill_name
-        or ""
-    )
-
-    if patch_skill_name:
-        _apply_planner_tool_pool_patch(
-            skill_name=patch_skill_name,
-            planner_output=data,
-            source_phase="confirmed_summary_blueprint",
-            allow_remove=True,
-        )
 
     return data
 

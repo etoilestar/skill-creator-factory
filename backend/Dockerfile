@@ -43,7 +43,12 @@ RUN cd /tmp/playwright-install && \
 
 # Install dependencies first (layer cache)
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+# PyTorch CUDA 12.1 runtime for the local embedding fallback.
+RUN pip install --no-cache-dir \
+       torch==2.5.1 \
+             --index-url https://download.pytorch.org/whl/cu121 \
+                 && pip install --no-cache-dir \
+                       -r backend/requirements.txt
 
 # Copy backend source
 COPY backend/ ./backend/

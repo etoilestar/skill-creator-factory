@@ -3,6 +3,13 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
     ports:
       - "58000:8000"
       - "52222:22"  # SSH端口映射

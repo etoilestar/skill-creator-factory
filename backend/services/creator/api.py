@@ -872,11 +872,11 @@ def _creator_embed_texts_local_fallback(
             "torch and transformers"
         ) from exc
 
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is unavailable for local "
-            "embedding fallback"
-        )
+    # if not torch.cuda.is_available():
+    #     raise RuntimeError(
+    #         "CUDA is unavailable for local "
+    #         "embedding fallback"
+    #     )
 
     runtime = (
         _CREATOR_LOCAL_EMBEDDING_RUNTIME
@@ -907,7 +907,7 @@ def _creator_embed_texts_local_fallback(
         )
 
         device = torch.device(
-            "cuda"
+            "cpu"
         )
 
         model = model.to(

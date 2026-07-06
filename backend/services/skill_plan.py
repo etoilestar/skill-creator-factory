@@ -1404,64 +1404,474 @@ def _implementation_strategy_for_slot(slot: ToolSlot) -> ImplementationStrategy:
     return ImplementationStrategy(slot_id=slot.slot_id, strategy="generate_code", reason="slot is implementable with ordinary local code")
 
 
-def normalize_skill_plan(plan: SkillPlan) -> SkillPlan:
-    """Normalize and clean a parsed SkillPlan after model/regex extraction."""
-    entries: list[SkillPlanEntry] = []
-    warnings = list(plan.warnings or [])
+def normalize_skill_plan(
+    plan: SkillPlan,
+) -> SkillPlan:
+    """Normalize a parsed SkillPlan without changing business semantics.
+
+    Capability ownership:
+
+        explicit SkillPlan required_capabilities
+        -> build_skill_plan_entry
+        -> SkillPlanEntry.required_capabilities
+        -> normalize_skill_plan
+        -> FileSpecOut.required_capabilities
+        -> RequirementItem.required_tools
+        -> Creator Tool recall
+
+    This normalizer may:
+    - normalize paths;
+    - remove invalid runtime dependencies;
+    - remove runtime capabilities from resource/meta files;
+    - normalize script runtime/artifact contracts;
+    - normalize explicit business capability lists.
+
+    This normalizer must not:
+    - erase script required_capabilities;
+    - infer capabilities from role or path;
+    - infer capabilities from blueprint prose;
+    - resolve Registry tools;
+    - authorize tools.
+    """
+
+    entries: list[
+        SkillPlanEntry
+    ] = []
+
+    warnings = list(
+        plan.warnings
+        or []
+    )
+
     seen_skill_md = False
+
     prior_outputs: set[str] = set()
 
-    for entry in plan.files:
-        path = entry.path.replace("\\", "/").strip()
+    for entry in (
+        plan.files
+        or []
+    ):
+        path = (
+            str(
+                entry.path
+                or ""
+            )
+            .replace(
+                "\\",
+                "/",
+            )
+            .strip()
+        )
+
         if path == "SKILL.md":
             if seen_skill_md:
-                warnings.append("已移除重复的 SKILL.md 文件计划项；Skill 包只能有一个 SKILL.md。")
+                warnings.append(
+                    (
+                        "已移除重复的 SKILL.md "
+                        "文件计划项；Skill 包只能"
+                        "有一个 SKILL.md。"
+                    )
+                )
+
                 continue
+
             seen_skill_md = True
 
-        raw_capability_hints = _dedupe_capabilities(list(entry.raw_capability_hints or entry.required_capabilities or []))
-        normalized_required: list[str] = []
-        dependencies = [dep for dep in _dedupe_paths(list(entry.dependencies or [])) if not dependency_is_output_semantic(dep, prior_outputs)]
-        removed_deps = set(entry.dependencies or []) - set(dependencies)
-        for dep in sorted(removed_deps):
-            warnings.append(f"已从 {path} dependencies 移除输出/动态路径 {dep}；dependencies 只能表示输入依赖。")
+        raw_capability_hints = (
+            _dedupe_capabilities(
+                list(
+                    entry.raw_capability_hints
+                    or entry.required_capabilities
+                    or []
+                )
+            )
+        )
+
+        # required_capabilities is already the normalized
+        # business capability contract produced by
+        # build_skill_plan_entry.
+        #
+        # Normalize it again only as a defensive layer.
+        # Never replace it with [] merely because this is a
+        # second normalization pass.
+        normalized_required = (
+            normalize_required_capabilities(
+                role=str(
+                    entry.role
+                    or ""
+                ),
+                path=path,
+                required_capabilities=list(
+                    entry.required_capabilities
+                    or []
+                ),
+                user_blueprint_text="",
+            )
+        )
+
+        normalized_optional = [
+            capability
+            for capability
+            in _dedupe_capabilities(
+                list(
+                    entry.optional_capabilities
+                    or []
+                )
+            )
+            if (
+                is_business_capability(
+                    capability
+                )
+                and capability
+                not in normalized_required
+            )
+        ]
+
+        normalized_allowed = [
+            capability
+            for capability
+            in _dedupe_capabilities(
+                list(
+                    entry.allowed_capabilities
+                    or []
+                )
+            )
+            if is_business_capability(
+                capability
+            )
+        ]
+
+        normalized_forbidden = [
+            capability
+            for capability
+            in _dedupe_capabilities(
+                list(
+                    entry.business_forbidden_capabilities
+                    or entry.forbidden_capabilities
+                    or []
+                )
+            )
+            if (
+                is_business_capability(
+                    capability
+                )
+                and capability
+                not in normalized_required
+            )
+        ]
+
+        normalized_platform_capabilities = [
+            capability
+            for capability
+            in _dedupe_capabilities(
+                list(
+                    entry.platform_capabilities
+                    or []
+                )
+            )
+            if (
+                capability_layer(
+                    capability
+                )
+                == "platform_protocol"
+            )
+        ]
+
+        normalized_platform_safety_constraints = [
+            capability
+            for capability
+            in _dedupe_capabilities(
+                list(
+                    entry.platform_safety_constraints
+                    or []
+                )
+            )
+            if is_platform_safety_constraint(
+                capability
+            )
+        ]
+
+        dependencies = [
+            dependency
+            for dependency
+            in _dedupe_paths(
+                list(
+                    entry.dependencies
+                    or []
+                )
+            )
+            if not dependency_is_output_semantic(
+                dependency,
+                prior_outputs,
+            )
+        ]
+
+        removed_dependencies = (
+            set(
+                entry.dependencies
+                or []
+            )
+            - set(
+                dependencies
+            )
+        )
+
+        for dependency in sorted(
+            removed_dependencies
+        ):
+            warnings.append(
+                (
+                    f"已从 {path} dependencies "
+                    "移除输出/动态路径 "
+                    f"{dependency}；"
+                    "dependencies 只能表示"
+                    "运行前输入依赖。"
+                )
+            )
 
         cleaned = replace(
             entry,
+
             path=path,
-            file_kind=file_kind_for_path(path),
-            component_hint=entry.component_hint or entry.role,
-            required_capabilities=normalized_required,
-            raw_capability_hints=raw_capability_hints,
+
+            file_kind=(
+                file_kind_for_path(
+                    path
+                )
+            ),
+
+            component_hint=(
+                entry.component_hint
+                or entry.role
+            ),
+
+            required_capabilities=(
+                normalized_required
+            ),
+
+            raw_capability_hints=(
+                raw_capability_hints
+            ),
+
+            optional_capabilities=(
+                normalized_optional
+            ),
+
+            allowed_capabilities=(
+                normalized_allowed
+            ),
+
+            forbidden_capabilities=(
+                normalized_forbidden
+            ),
+
+            business_capabilities=list(
+                normalized_required
+            ),
+
+            platform_capabilities=(
+                normalized_platform_capabilities
+            ),
+
+            business_forbidden_capabilities=(
+                normalized_forbidden
+            ),
+
+            platform_safety_constraints=(
+                normalized_platform_safety_constraints
+            ),
+
             dependencies=dependencies,
-            forbidden_capabilities=[cap for cap in entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
-            business_capabilities=[],
-            platform_capabilities=[cap for cap in entry.platform_capabilities if capability_layer(cap) == "platform_protocol"],
-            business_forbidden_capabilities=[cap for cap in entry.business_forbidden_capabilities or entry.forbidden_capabilities if cap not in set(normalized_required) and is_business_capability(cap)],
-            platform_safety_constraints=[cap for cap in entry.platform_safety_constraints if is_platform_safety_constraint(cap)],
         )
 
-        if cleaned.role in RESOURCE_ROLES or cleaned.file_type in {"skill_md", "reference", "asset"}:
-            cleaned = replace(cleaned, required_capabilities=[], optional_capabilities=[], allowed_capabilities=[])
+        # Resource/meta files cannot own runtime business
+        # capabilities.
+        #
+        # This is a platform boundary cleanup, not business
+        # capability inference.
+        if (
+            cleaned.role
+            in RESOURCE_ROLES
+            or cleaned.file_type
+            in {
+                "skill_md",
+                "reference",
+                "asset",
+            }
+        ):
+            cleaned = replace(
+                cleaned,
 
-        if cleaned.role == "asset" or cleaned.file_type == "asset" or path.startswith("assets/"):
-            if not _is_asset_upload_only(cleaned):
-                warnings.append(f"已移除非法 asset 文件计划项 {path}；assets/ 只能表示用户上传或系统预置的静态素材，不能是运行时产物。")
+                required_capabilities=[],
+
+                optional_capabilities=[],
+
+                allowed_capabilities=[],
+
+                business_capabilities=[],
+            )
+
+        if (
+            cleaned.role == "asset"
+            or cleaned.file_type == "asset"
+            or path.startswith(
+                "assets/"
+            )
+        ):
+            if not _is_asset_upload_only(
+                cleaned
+            ):
+                warnings.append(
+                    (
+                        "已移除非法 asset 文件计划项 "
+                        f"{path}；"
+                        "assets/ 只能表示用户上传"
+                        "或系统预置的静态素材，"
+                        "不能是运行时产物。"
+                    )
+                )
+
                 continue
-            cleaned = replace(cleaned, inputs=[], outputs=[], dependencies=[], required_capabilities=[], raw_capability_hints=[], optional_capabilities=[], allowed_capabilities=[], business_capabilities=[], platform_capabilities=[], runtime="none", entrypoint="", command_template="", execution_contract={}, layer="static_resource")
 
-        if cleaned.file_type == "reference" and cleaned.path.startswith("references/") and cleaned.runtime != "none":
-            cleaned = replace(cleaned, runtime="none", entrypoint="", command_template="")
+            cleaned = replace(
+                cleaned,
 
-        if cleaned.file_type == "script":
-            slots = _tool_slots_from_structured_contract(cleaned)
-            strategies = [_implementation_strategy_for_slot(slot) for slot in slots]
-            cleaned = replace(cleaned, command_template=_command_template_for_entry_with_values(cleaned), required_tool_slots=slots, implementation_strategy=strategies, runtime_contract={"runtime": cleaned.runtime, "entrypoint": cleaned.path, "argv": "json_object"}, artifact_contract={"stdout_fields": list(cleaned.outputs or []), "final": True})
-            prior_outputs.update(cleaned.outputs or [])
+                inputs=[],
 
-        entries.append(cleaned)
+                outputs=[],
 
-    return SkillPlan(skill_name=plan.skill_name, files=entries, warnings=warnings)
+                dependencies=[],
+
+                required_capabilities=[],
+
+                raw_capability_hints=[],
+
+                optional_capabilities=[],
+
+                allowed_capabilities=[],
+
+                business_capabilities=[],
+
+                platform_capabilities=[],
+
+                runtime="none",
+
+                entrypoint="",
+
+                command_template="",
+
+                execution_contract={},
+
+                runtime_contract={
+                    "runtime": "none",
+                },
+
+                artifact_contract={},
+
+                layer="static_resource",
+            )
+
+        if (
+            cleaned.file_type
+            == "reference"
+            and cleaned.path.startswith(
+                "references/"
+            )
+            and cleaned.runtime
+            != "none"
+        ):
+            cleaned = replace(
+                cleaned,
+
+                runtime="none",
+
+                entrypoint="",
+
+                command_template="",
+
+                execution_contract={},
+
+                runtime_contract={
+                    "runtime": "none",
+                },
+
+                artifact_contract={},
+            )
+
+        if (
+            cleaned.file_type
+            == "script"
+        ):
+            slots = (
+                _tool_slots_from_structured_contract(
+                    cleaned
+                )
+            )
+
+            strategies = [
+                _implementation_strategy_for_slot(
+                    slot
+                )
+                for slot in slots
+            ]
+
+            cleaned = replace(
+                cleaned,
+
+                command_template=(
+                    _command_template_for_entry_with_values(
+                        cleaned
+                    )
+                ),
+
+                required_tool_slots=(
+                    slots
+                ),
+
+                implementation_strategy=(
+                    strategies
+                ),
+
+                runtime_contract={
+                    "runtime": (
+                        cleaned.runtime
+                    ),
+
+                    "entrypoint": (
+                        cleaned.path
+                    ),
+
+                    "argv": (
+                        "json_object"
+                    ),
+                },
+
+                artifact_contract={
+                    "stdout_fields": list(
+                        cleaned.outputs
+                        or []
+                    ),
+
+                    "final": True,
+                },
+            )
+
+            prior_outputs.update(
+                cleaned.outputs
+                or []
+            )
+
+        entries.append(
+            cleaned
+        )
+
+    return SkillPlan(
+        skill_name=plan.skill_name,
+
+        files=entries,
+
+        warnings=warnings,
+    )
 
 
 def validate_file_plan_semantics(plan: SkillPlan) -> list[str]:

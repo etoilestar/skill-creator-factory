@@ -228,6 +228,8 @@ function actionLabel(action) {
   return ACTION_LABELS[action] || action
 }
 
+const pendingBlueprintText = ref('')
+const rootUserRequest = ref('')
 const messages = ref([])
 const input = ref('')
 const streaming = ref(false)
@@ -265,7 +267,13 @@ const reviewSummaryTitle = computed(() => {
 })
 
 // The raw blueprint text extracted from the latest blueprint assistant message
-const blueprintText = computed(() => creationPlan.value?.blueprint_text || '')
+const blueprintText = computed(() => {
+  return (
+    creationPlan.value?.blueprint_text ||
+    pendingBlueprintText.value ||
+    ''
+  )
+})
 
 // History sent to the LLM excludes system action-result messages
 const chatHistory = computed(() => messages.value.filter(m => m.role !== 'system'))
@@ -355,8 +363,14 @@ function removeUploadedContextFile(fileId) {
   uploadedContextFiles.value = uploadedContextFiles.value.filter(file => file.file_id !== fileId)
 }
 
-function shouldPreparePlanRevise({ skillName, previousBlueprintText, humanFeedback }) {
-  return Boolean(skillName || previousBlueprintText || humanFeedback)
+function shouldPreparePlanRevise({
+  skillName,
+  previousBlueprintText,
+}) {
+  return Boolean(
+    skillName ||
+    previousBlueprintText
+  )
 }
 
 async function scrollBottom() {
@@ -391,98 +405,315 @@ async function handleQuickAction(value) {
 
 async function send() {
   let text = input.value.trim()
-  if (!text || streaming.value) return
-  if (pendingSupplementQuestion.value) {
-    text = `${pendingSupplementQuestion.value}\n补充：${text}`
-    pendingSupplementQuestion.value = ''
-    pendingPrepareAction.value = 'submit_supplement'
+
+  if (!text || streaming.value) {
+    return
   }
-  const currentPrepareAction = pendingPrepareAction.value || 'none'
+
+  if (pendingSupplementQuestion.value) {
+    text = (
+      `${pendingSupplementQuestion.value}\n` +
+      `补充：${text}`
+    )
+
+    pendingSupplementQuestion.value = ''
+
+    pendingPrepareAction.value = (
+      'submit_supplement'
+    )
+  }
+
+  const currentPrepareAction = (
+    pendingPrepareAction.value ||
+    'none'
+  )
+
+  const conversationHistoryBeforeCurrent = (
+    chatHistory.value.map(message => ({
+      ...message,
+    }))
+  )
+
+  if (
+    !rootUserRequest.value &&
+    !blueprintText.value &&
+    currentPrepareAction === 'none'
+  ) {
+    rootUserRequest.value = text
+  }
+
+  const effectiveUserRequest = (
+    rootUserRequest.value ||
+    text
+  )
 
   error.value = ''
+
   quickActions.value = []
+
   showCreationPanel.value = false
-  messages.value.push({ role: 'user', content: text })
+
+  messages.value.push({
+    role: 'user',
+    content: text,
+  })
+
   input.value = ''
+
   await scrollBottom()
 
   streaming.value = true
-  currentStatus.value = { message: '正在解析需求并准备创建计划…' }
+
+  currentStatus.value = {
+    message: (
+      '正在解析需求并准备创建计划…'
+    ),
+  }
 
   try {
-    const currentSkillName = resolveCurrentSkillName()
-    const previousBlueprintText = blueprintText.value
+    const currentSkillName = (
+      resolveCurrentSkillName()
+    )
+
+    const previousBlueprintText = (
+      blueprintText.value
+    )
+
     const humanFeedback = text
+
     const mode = shouldPreparePlanRevise({
       skillName: currentSkillName,
+
       previousBlueprintText,
-      humanFeedback,
-    }) ? 'revise' : 'create'
+    })
+      ? 'revise'
+      : 'create'
+
     const payload = {
       mode,
+
       skill_name: currentSkillName,
-      user_request: text,
-      conversation_history: chatHistory.value,
-      previous_blueprint_text: previousBlueprintText,
-      human_feedback: humanFeedback,
-      prepare_action: currentPrepareAction,
-      uploaded_files: collectUploadedFileMetadata(),
+
+      user_request: (
+        effectiveUserRequest
+      ),
+
+      conversation_history: (
+        conversationHistoryBeforeCurrent
+      ),
+
+      previous_blueprint_text: (
+        previousBlueprintText
+      ),
+
+      human_feedback: (
+        humanFeedback
+      ),
+
+      prepare_action: (
+        currentPrepareAction
+      ),
+
+      uploaded_files: (
+        collectUploadedFileMetadata()
+      ),
+
       model: null,
     }
-    const plan = await prepareCreationPlan(payload)
-    if (currentPrepareAction === 'request_supplement') {
+
+    const plan = await prepareCreationPlan(
+      payload
+    )
+
+    if (
+      typeof plan.blueprint_text === 'string' &&
+      plan.blueprint_text.trim()
+    ) {
+      pendingBlueprintText.value = (
+        plan.blueprint_text.trim()
+      )
+    }
+
+    if (plan.skill_name) {
+      skillName.value = plan.skill_name
+    }
+
+    if (
+      currentPrepareAction
+      === 'request_supplement'
+    ) {
       pendingSupplementQuestion.value = text
-    } else if (currentPrepareAction === 'confirm' || currentPrepareAction === 'submit_supplement') {
+
+    } else if (
+      currentPrepareAction === 'confirm' ||
+      currentPrepareAction
+      === 'submit_supplement'
+    ) {
       pendingPrepareAction.value = 'none'
     }
-    const summary = plan.review_summary || null
-    const question = (plan.clarifying_questions || [])[0]
-    const hasSummaryContent = summary && (summary.goal || summary.input || summary.output || summary.workflow?.length || summary.files_to_create_or_update?.length || summary.assets_to_upload?.length || summary.changes?.length)
-    const stage = plan.prepare_stage || ''
-    const isCreationPointsConfirmation = stage === 'creation_points_confirmation' || stage === 'supplement_confirmation' || plan.status === 'ready' || (plan.status === 'needs_clarification' && /创建要点|补充|按这些要点/.test(String(question || '')))
-    reviewSummaryStage.value = stage
-    reviewSummary.value = hasSummaryContent && isCreationPointsConfirmation ? { ...summary, risks: [] } : null
 
-    if (plan.status === 'needs_clarification') {
+    const summary = (
+      plan.review_summary ||
+      null
+    )
+
+    const question = (
+      plan.clarifying_questions ||
+      []
+    )[0]
+
+    const hasSummaryContent = Boolean(
+      summary &&
+      (
+        summary.goal ||
+        summary.input ||
+        summary.output ||
+        summary.workflow?.length ||
+        summary.files_to_create_or_update
+          ?.length ||
+        summary.assets_to_upload?.length ||
+        summary.changes?.length
+      )
+    )
+
+    const stage = (
+      plan.prepare_stage ||
+      ''
+    )
+
+    const isCreationPointsConfirmation = (
+      stage
+      === 'creation_points_confirmation' ||
+      stage
+      === 'supplement_confirmation' ||
+      plan.status === 'ready' ||
+      (
+        plan.status
+        === 'needs_clarification' &&
+        /创建要点|补充|按这些要点/.test(
+          String(question || '')
+        )
+      )
+    )
+
+    reviewSummaryStage.value = stage
+
+    reviewSummary.value = (
+      hasSummaryContent &&
+      isCreationPointsConfirmation
+    )
+      ? {
+          ...summary,
+          risks: [],
+        }
+      : null
+
+    if (
+      plan.status
+      === 'needs_clarification'
+    ) {
       messages.value.push({
         role: 'assistant',
-        content: reviewSummary.value
-          ? `${question || '请确认是否需要补充。'}`
-          : `我还需要确认一个必要信息：
 
-${question || '请补充当前最阻塞创建计划的信息。'}`,
+        content: reviewSummary.value
+          ? (
+              question ||
+              '请确认是否需要补充。'
+            )
+          : (
+              '我还需要确认一个必要信息：\n\n' +
+              (
+                question ||
+                '请补充当前最阻塞创建计划的信息。'
+              )
+            ),
       })
-      quickActions.value = buildClarificationQuickActions(question ? [question] : [], { prepareStage: stage })
+
+      quickActions.value = (
+        buildClarificationQuickActions(
+          question
+            ? [question]
+            : [],
+          {
+            prepareStage: stage,
+          },
+        )
+      )
+
       return
     }
 
     if (plan.status === 'blocked') {
-      const blockers = plan.creation_blockers || []
+      const blockers = (
+        plan.creation_blockers ||
+        []
+      )
+
       messages.value.push({
         role: 'assistant',
-        content: `当前暂时无法继续创建：
 
-${blockers.map((b, i) => `${i + 1}. ${typeof b === 'string' ? b : (b.message || JSON.stringify(b))}`).join('\n')}`,
+        content:
+          '当前暂时无法继续创建：\n\n' +
+          blockers
+            .map(
+              (blocker, index) => {
+                const message = (
+                  typeof blocker === 'string'
+                    ? blocker
+                    : (
+                        blocker.message ||
+                        JSON.stringify(blocker)
+                      )
+                )
+
+                return (
+                  `${index + 1}. ${message}`
+                )
+              },
+            )
+            .join('\n'),
       })
+
       return
     }
 
-
     creationPlan.value = plan
-    skillName.value = plan.skill_name || currentSkillName
+
+    pendingBlueprintText.value = (
+      plan.blueprint_text ||
+      pendingBlueprintText.value
+    )
+
+    skillName.value = (
+      plan.skill_name ||
+      currentSkillName
+    )
+
     showCreationPanel.value = true
+
     messages.value.push({
       role: 'system',
+
       action: 'creator_panel',
+
       name: plan.skill_name,
+
       success: true,
-      message: '已生成创建要点和文件清单，可直接开始生成。',
+
+      message: (
+        '已生成创建要点和文件清单，' +
+        '可直接开始生成。'
+      ),
     })
+
   } catch (e) {
     error.value = e.message
+
   } finally {
     currentStatus.value = null
+
     streaming.value = false
+
     await scrollBottom()
   }
 }
@@ -514,21 +745,44 @@ function onCreationError(errMsg) {
 
 function clearChat() {
   messages.value = []
+
   streamBuffer.value = ''
+
   error.value = ''
+
   currentStatus.value = null
+
   thoughts.value = []
+
   showThoughts.value = false
+
   showCreationPanel.value = false
+
   creationPlan.value = null
+
   reviewSummary.value = null
+
   reviewSummaryStage.value = ''
+
   showInternalBlueprint.value = false
+
   skillName.value = ''
+
   selectedExistingSkillName.value = ''
+
+  pendingBlueprintText.value = ''
+
+  rootUserRequest.value = ''
+
+  pendingSupplementQuestion.value = ''
+
+  pendingPrepareAction.value = 'none'
+
+  quickActions.value = []
+
   uploadedContextFiles.value = []
+
   uploadError.value = ''
-  creatorUploadSessionId.value = `creator-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 </script>

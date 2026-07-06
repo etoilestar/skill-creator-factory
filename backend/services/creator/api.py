@@ -1585,156 +1585,34 @@ def _creator_tool_recall_card_text(
         ),
     ])
 
-def _creator_tool_recall_query(
-    *,
-    user_request: str,
-    confirmed_summary: dict[str, Any],
-    file_specs: list[dict[str, Any]],
-) -> str:
-    """Build one Skill-wide semantic query for Tool Registry recall."""
-
-    script_responsibilities: list[
-        dict[str, Any]
-    ] = []
-
-    for spec in (
-        file_specs or []
-    ):
-        if not isinstance(
-            spec,
-            dict,
-        ):
-            continue
-
-        path = _normalize_skill_path(
-            str(
-                spec.get("path")
-                or spec.get(
-                    "target_file"
-                )
-                or ""
-            )
-        )
-
-        if not path.startswith(
-            "scripts/"
-        ):
-            continue
-
-        if spec.get("required") is False:
-            continue
-
-        script_responsibilities.append({
-            "purpose": str(
-                spec.get("purpose")
-                or ""
-            ).strip(),
-            "inputs": list(
-                spec.get("inputs")
-                or []
-            ),
-            "outputs": list(
-                spec.get("outputs")
-                or []
-            ),
-            "required_capabilities": list(
-                spec.get(
-                    "required_capabilities"
-                )
-                or []
-            ),
-            "forbidden_capabilities": list(
-                spec.get(
-                    "forbidden_capabilities"
-                )
-                or []
-            ),
-            "side_effects": list(
-                spec.get(
-                    "side_effects"
-                )
-                or []
-            ),
-            "artifact_contract": (
-                spec.get(
-                    "artifact_contract"
-                )
-                or {}
-            ),
-        })
-
-    summary = (
-        confirmed_summary
-        if isinstance(
-            confirmed_summary,
-            dict,
-        )
-        else {}
-    )
-
-    return "\n".join([
-        (
-            "检索与以下 Skill 最终职责"
-            "真正匹配的 Tool Registry 工具。"
-        ),
-        "",
-        "用户目标：",
-        str(
-            user_request or ""
-        ),
-        "",
-        "已确认创建要点：",
-        json.dumps(
-            {
-                "goal": (
-                    summary.get("goal")
-                ),
-                "input": (
-                    summary.get("input")
-                ),
-                "output": (
-                    summary.get("output")
-                ),
-                "workflow": (
-                    summary.get("workflow")
-                    or []
-                ),
-            },
-            ensure_ascii=False,
-            default=str,
-        ),
-        "",
-        "最终可执行脚本职责：",
-        json.dumps(
-            script_responsibilities,
-            ensure_ascii=False,
-            default=str,
-        ),
-    ])
 
 def _recall_creator_tool_candidates(
     *,
-    user_request: str,
-    confirmed_summary: dict[str, Any],
     file_specs: list[dict[str, Any]],
-    top_k: int = 8,
+    top_k: int = 3,
 ) -> tuple[
     list[dict[str, Any]],
     str,
 ]:
-    """Recall a compact Skill-wide Registry candidate set with embeddings.
+    """Recall Registry tools independently for each Plan capability.
 
-    Recall uses:
-    - one global Skill responsibility query;
-    - one query for each required script responsibility.
+    required_capabilities already come from the normalized Skill Plan.
 
-    Script queries only improve recall coverage.
+    This function does not:
+    - re-extract capabilities from prose;
+    - use review_summary;
+    - use user_request;
+    - build one whole-Skill semantic query.
 
-    The final candidate set remains Skill-wide and does not create per-file
-    authorization.
+    Each required capability is an independent embedding query.
 
-    Embedding failure is fatal. There is no structural or Registry-order
-    fallback.
+    Candidate set:
+
+        per-capability top-k
+        -> union
+        -> Final Tool Selector
+
+    Tool authorization remains Skill-wide.
     """
 
     global _CREATOR_TOOL_EMBEDDING_INDEX_CACHE
@@ -1772,19 +1650,12 @@ def _recall_creator_tool_candidates(
             "available tools"
         )
 
-    global_query = (
-        _creator_tool_recall_query(
-            user_request=user_request,
-            confirmed_summary=(
-                confirmed_summary
-            ),
-            file_specs=file_specs,
-        )
-    )
+    required_capabilities: list[str] = []
 
-    query_texts: list[str] = [
-        global_query
-    ]
+    capability_owners: dict[
+        str,
+        list[str],
+    ] = {}
 
     for spec in (
         file_specs or []
@@ -1813,84 +1684,90 @@ def _recall_creator_tool_candidates(
         if spec.get("required") is False:
             continue
 
-        script_query = "\n".join([
+        for raw_capability in (
+            spec.get(
+                "required_capabilities"
+            )
+            or []
+        ):
+            capability = str(
+                raw_capability or ""
+            ).strip()
+
+            if not capability:
+                continue
+
+            if (
+                capability
+                not in required_capabilities
+            ):
+                required_capabilities.append(
+                    capability
+                )
+
+            owners = (
+                capability_owners.setdefault(
+                    capability,
+                    [],
+                )
+            )
+
+            if path not in owners:
+                owners.append(
+                    path
+                )
+
+    if not required_capabilities:
+        logger.info(
+            "[Creator]"
+            "[tool_recall]"
+            "[result] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "creator_tool_recall_result"
+                    ),
+                    "source": (
+                        "none:"
+                        "no_required_capabilities"
+                    ),
+                    "required_capabilities": [],
+                    "candidate_tool_ids": [],
+                    "per_capability_candidates": {},
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+        return (
+            [],
+            "none:no_required_capabilities",
+        )
+
+    query_texts = [
+        "\n".join([
             (
-                "检索与以下单个可执行职责"
-                "真正匹配的 Tool Registry 工具。"
+                "匹配能够直接实现以下抽象语义能力的 "
+                "Tool Registry 工具。"
             ),
             "",
-            "职责：",
-            str(
-                spec.get("purpose")
-                or ""
+            (
+                "required_capability: "
+                f"{capability}"
             ),
             "",
-            "输入：",
-            json.dumps(
-                spec.get("inputs")
-                or [],
-                ensure_ascii=False,
-                default=str,
+            (
+                "只判断工具真实能力是否能够实现"
+                "该 capability。"
             ),
-            "",
-            "输出：",
-            json.dumps(
-                spec.get("outputs")
-                or [],
-                ensure_ascii=False,
-                default=str,
-            ),
-            "",
-            "抽象语义能力：",
-            json.dumps(
-                spec.get(
-                    "required_capabilities"
-                )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            ),
-            "",
-            "禁止能力：",
-            json.dumps(
-                spec.get(
-                    "forbidden_capabilities"
-                )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            ),
-            "",
-            "Artifact contract：",
-            json.dumps(
-                spec.get(
-                    "artifact_contract"
-                )
-                or {},
-                ensure_ascii=False,
-                default=str,
-            ),
-            "",
-            "Side effects：",
-            json.dumps(
-                spec.get(
-                    "side_effects"
-                )
-                or [],
-                ensure_ascii=False,
-                default=str,
+            (
+                "不要根据整个 Skill 主题扩大语义。"
             ),
         ])
-
-        query_texts.append(
-            script_query
-        )
-
-    query_texts = list(
-        dict.fromkeys(
-            query_texts
-        )
-    )
+        for capability
+        in required_capabilities
+    ]
 
     cards: list[
         tuple[
@@ -1966,8 +1843,9 @@ def _recall_creator_tool_candidates(
             != expected_count
         ):
             raise RuntimeError(
-                "combined tool recall embedding "
-                "returned unexpected vector count"
+                "combined capability recall "
+                "embedding returned unexpected "
+                "vector count"
             )
 
         card_embeddings = (
@@ -1982,11 +1860,6 @@ def _recall_creator_tool_candidates(
             ]
         )
 
-        cache_signature = (
-            f"embedding_source:{embedding_source}",
-            *card_texts,
-        )
-
         tool_embeddings = [
             (
                 cards[index][0],
@@ -1997,6 +1870,14 @@ def _recall_creator_tool_candidates(
                 card_embeddings
             )
         ]
+
+        cache_signature = (
+            (
+                "embedding_source:"
+                f"{embedding_source}"
+            ),
+            *card_texts,
+        )
 
         _CREATOR_TOOL_EMBEDDING_INDEX_CACHE = (
             cache_signature,
@@ -2012,7 +1893,10 @@ def _recall_creator_tool_candidates(
         )
 
         cache_signature = (
-            f"embedding_source:{embedding_source}",
+            (
+                "embedding_source:"
+                f"{embedding_source}"
+            ),
             *card_texts,
         )
 
@@ -2044,8 +1928,9 @@ def _recall_creator_tool_candidates(
                 != expected_count
             ):
                 raise RuntimeError(
-                    "combined tool recall embedding "
-                    "returned unexpected vector count"
+                    "combined capability recall "
+                    "embedding returned unexpected "
+                    "vector count"
                 )
 
             card_embeddings = (
@@ -2060,14 +1945,6 @@ def _recall_creator_tool_candidates(
                 ]
             )
 
-            cache_signature = (
-                (
-                    "embedding_source:"
-                    f"{embedding_source}"
-                ),
-                *card_texts,
-            )
-
             tool_embeddings = [
                 (
                     cards[index][0],
@@ -2079,62 +1956,138 @@ def _recall_creator_tool_candidates(
                 )
             ]
 
+            cache_signature = (
+                (
+                    "embedding_source:"
+                    f"{embedding_source}"
+                ),
+                *card_texts,
+            )
+
             _CREATOR_TOOL_EMBEDDING_INDEX_CACHE = (
                 cache_signature,
                 tool_embeddings,
             )
 
-    if not query_embeddings:
+    if (
+        len(query_embeddings)
+        != len(required_capabilities)
+    ):
         raise RuntimeError(
-            "tool recall query embeddings "
-            "are empty"
+            "capability recall query embedding "
+            "count does not match Plan "
+            "required_capabilities"
         )
+
+    per_capability_limit = min(
+        max(
+            1,
+            int(top_k or 1),
+        ),
+        len(tool_embeddings),
+    )
+
+    candidate_tool_ids: list[str] = []
 
     score_by_tool: dict[
         str,
         float,
     ] = {}
 
+    recalled_for_capabilities: dict[
+        str,
+        list[str],
+    ] = {}
+
+    per_capability_candidates: dict[
+        str,
+        list[dict[str, Any]],
+    ] = {}
+
     for (
-        tool_id,
-        tool_embedding,
-    ) in tool_embeddings:
-        best_score = max(
-            _creator_cosine_similarity(
-                query_embedding,
-                tool_embedding,
+        capability,
+        query_embedding,
+    ) in zip(
+        required_capabilities,
+        query_embeddings,
+    ):
+        scored_tools = [
+            (
+                tool_id,
+                float(
+                    _creator_cosine_similarity(
+                        query_embedding,
+                        tool_embedding,
+                    )
+                ),
             )
-            for query_embedding
-            in query_embeddings
+            for (
+                tool_id,
+                tool_embedding,
+            ) in tool_embeddings
+        ]
+
+        scored_tools.sort(
+            key=lambda item: item[1],
+            reverse=True,
         )
 
-        score_by_tool[
-            tool_id
-        ] = float(
-            best_score
+        selected_for_capability = (
+            scored_tools[
+                :per_capability_limit
+            ]
         )
 
-    ranked_tool_ids = sorted(
-        score_by_tool,
-        key=lambda tool_id: (
+        per_capability_candidates[
+            capability
+        ] = [
+            {
+                "tool_id": tool_id,
+                "similarity": score,
+            }
+            for (
+                tool_id,
+                score,
+            ) in selected_for_capability
+        ]
+
+        for (
+            tool_id,
+            score,
+        ) in selected_for_capability:
+            if (
+                tool_id
+                not in candidate_tool_ids
+            ):
+                candidate_tool_ids.append(
+                    tool_id
+                )
+
             score_by_tool[
                 tool_id
-            ]
-        ),
-        reverse=True,
-    )
-
-    candidate_tool_ids = (
-        ranked_tool_ids[
-            :min(
-                max(
-                    1,
-                    top_k,
+            ] = max(
+                score_by_tool.get(
+                    tool_id,
+                    -1.0,
                 ),
-                len(ranked_tool_ids),
+                score,
             )
-        ]
-    )
+
+            matched_capabilities = (
+                recalled_for_capabilities
+                .setdefault(
+                    tool_id,
+                    [],
+                )
+            )
+
+            if (
+                capability
+                not in matched_capabilities
+            ):
+                matched_capabilities.append(
+                    capability
+                )
 
     by_tool_id = {
         str(
@@ -2148,12 +2101,16 @@ def _recall_creator_tool_candidates(
         dict[str, Any]
     ] = []
 
-    for tool_id in (
-        candidate_tool_ids
-    ):
-        tool = by_tool_id[
+    for tool_id in candidate_tool_ids:
+        tool = by_tool_id.get(
             tool_id
-        ]
+        )
+
+        if not isinstance(
+            tool,
+            dict,
+        ):
+            continue
 
         functions: list[
             dict[str, Any]
@@ -2173,6 +2130,12 @@ def _recall_creator_tool_candidates(
                 "function_name": str(
                     function.get(
                         "function_name"
+                    )
+                    or ""
+                ),
+                "import_path": str(
+                    function.get(
+                        "import_path"
                     )
                     or ""
                 ),
@@ -2234,65 +2197,100 @@ def _recall_creator_tool_candidates(
 
         candidate_cards.append({
             "tool_id": tool_id,
+
             "display_name": str(
                 tool.get("display_name")
                 or ""
             ),
+
             "category": str(
                 tool.get("category")
                 or ""
             ),
+
             "prompt_guidance": str(
                 tool.get("prompt_guidance")
                 or ""
             ),
+
             "capability_aliases": list(
                 tool.get(
                     "capability_aliases"
                 )
                 or []
             ),
+
             "semantic_tags": list(
                 tool.get(
                     "semantic_tags"
                 )
                 or []
             ),
+
+            "task_verbs": list(
+                tool.get(
+                    "task_verbs"
+                )
+                or []
+            ),
+
+            "domain_terms": list(
+                tool.get(
+                    "domain_terms"
+                )
+                or []
+            ),
+
             "required_capabilities": list(
                 tool.get(
                     "required_capabilities"
                 )
                 or []
             ),
+
             "optional_capabilities": list(
                 tool.get(
                     "optional_capabilities"
                 )
                 or []
             ),
+
             "input_schema": (
                 tool.get("input_schema")
                 or {}
             ),
+
             "output_schema": (
                 tool.get("output_schema")
                 or {}
             ),
+
             "artifact_outputs": list(
                 tool.get(
                     "artifact_outputs"
                 )
                 or []
             ),
+
             "side_effects": list(
                 tool.get("side_effects")
                 or []
             ),
+
             "similarity": (
-                score_by_tool[
-                    tool_id
-                ]
+                score_by_tool.get(
+                    tool_id,
+                    -1.0,
+                )
             ),
+
+            "recalled_for_capabilities": list(
+                recalled_for_capabilities.get(
+                    tool_id,
+                    [],
+                )
+            ),
+
             "functions": functions,
         })
 
@@ -2305,28 +2303,34 @@ def _recall_creator_tool_candidates(
                 "event": (
                     "creator_tool_recall_result"
                 ),
+
                 "source": (
                     embedding_source
                 ),
-                "query_count": len(
-                    query_texts
+
+                "required_capabilities": (
+                    required_capabilities
                 ),
+
+                "capability_owners": (
+                    capability_owners
+                ),
+
+                "top_k_per_capability": (
+                    per_capability_limit
+                ),
+
                 "registry_tool_count": len(
                     catalog
                 ),
+
                 "candidate_tool_ids": (
                     candidate_tool_ids
                 ),
-                "candidate_scores": {
-                    tool_id: round(
-                        score_by_tool[
-                            tool_id
-                        ],
-                        6,
-                    )
-                    for tool_id
-                    in candidate_tool_ids
-                },
+
+                "per_capability_candidates": (
+                    per_capability_candidates
+                ),
             },
             ensure_ascii=False,
             default=str,
@@ -2815,36 +2819,25 @@ async def _complete_creator_json_object_once(
 async def _plan_final_tool_pool(
     *,
     skill_name: str,
-    user_request: str,
-    confirmed_summary: dict[str, Any],
-    blueprint_text: str,
     file_specs: list[dict[str, Any]],
-    requirement_graph: dict[str, Any],
-    uploaded_files: list[dict[str, Any]],
     requested_model: str | None,
 ) -> dict[str, Any]:
-    """Select the final Skill-wide ToolPool from embedding-recalled candidates.
+    """Select the final Skill-wide ToolPool from Plan capability recall.
+
+    Plan already owns semantic capability decomposition.
 
     Pipeline:
 
-        final Skill responsibilities
-        -> embedding Registry recall
-        -> candidate catalog
-        -> JSON Schema constrained Final Tool Planner
-        -> deterministic response validation
-        -> candidate boundary validation
+        final file_specs.required_capabilities
+        -> per-capability embedding recall
+        -> candidate union
+        -> boolean Final Tool Selector
+        -> deterministic Backend diff
         -> Backend Gate
         -> shared Skill ToolPool
 
-    Tool authorization remains Skill-wide.
-
-    Script responsibilities are semantic planning context only and never create
-    per-file authorization.
+    review_summary is never an input to this function.
     """
-
-    _ = blueprint_text
-    _ = requirement_graph
-    _ = uploaded_files
 
     skill_dir = (
         settings.skills_path
@@ -2860,97 +2853,6 @@ async def _plan_final_tool_pool(
 
     current_pool = load_tool_pool(
         skill_dir
-    )
-
-    try:
-        (
-            candidate_catalog,
-            recall_source,
-        ) = _recall_creator_tool_candidates(
-            user_request=user_request,
-            confirmed_summary=(
-                confirmed_summary
-            ),
-            file_specs=file_specs,
-            top_k=8,
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "[Creator]"
-            "[final_tool_planning]"
-            "[tool_recall_failed] "
-            "skill=%s "
-            "error=%s",
-            skill_name,
-            (
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            ),
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": (
-                    "creator_tool_recall_failed"
-                ),
-
-                "message": (
-                    "Tool Registry semantic recall "
-                    "failed. Configured embedding "
-                    "service and local "
-                    "backend/bge-large-zh-v1.5 "
-                    "embedding are unavailable."
-                ),
-
-                "error": (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                ),
-            },
-        ) from exc
-
-    candidate_tool_ids = {
-        str(
-            item.get("tool_id")
-            or ""
-        ).strip()
-        for item in (
-            candidate_catalog
-            or []
-        )
-        if (
-            isinstance(
-                item,
-                dict,
-            )
-            and str(
-                item.get("tool_id")
-                or ""
-            ).strip()
-        )
-    }
-
-    if not candidate_tool_ids:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": (
-                    "creator_tool_recall_empty"
-                ),
-
-                "message": (
-                    "Tool Registry embedding recall "
-                    "returned no Creator candidates."
-                ),
-
-                "skill_name": skill_name,
-            },
-        )
-
-    ordered_candidate_tool_ids = sorted(
-        candidate_tool_ids
     )
 
     script_contracts: list[
@@ -2985,6 +2887,8 @@ async def _plan_final_tool_pool(
             continue
 
         script_contracts.append({
+            "path": path,
+
             "purpose": str(
                 spec.get("purpose")
                 or ""
@@ -3067,176 +2971,20 @@ async def _plan_final_tool_pool(
         )
     }
 
-    response_schema: dict[
-        str,
-        Any,
-    ] = {
-        "type": "object",
-
-        "properties": {
-            "desired_tools": {
-                "type": "array",
-
-                "items": {
-                    "type": "object",
-
-                    "properties": {
-                        "tool_id": {
-                            "type": "string",
-
-                            "enum": (
-                                ordered_candidate_tool_ids
-                            ),
-                        },
-
-                        "reason": {
-                            "type": "string",
-                        },
-                    },
-
-                    "required": [
-                        "tool_id",
-                        "reason",
-                    ],
-
-                    "additionalProperties": False,
-                },
-            },
-
-            "reason": {
-                "type": "string",
-            },
-        },
-
-        "required": [
-            "desired_tools",
-            "reason",
-        ],
-
-        "additionalProperties": False,
-    }
-
-    prompt = """
-你是 Creator Final Tool Planner。
-
-执行一个 Skill 级工具集合选择任务。
-
-根据：
-
-- user_request
-- confirmed_summary
-- script_contracts
-- candidate_tool_catalog
-
-判断整个 Skill 最终真正需要哪些 Registry 工具。
-
-candidate_tool_catalog 只是 embedding 召回的候选空间。
-候选存在不代表必须选择。
-
-ToolPool 是 Skill 级共享授权池。
-不要逐脚本授权。
-
-选择规则：
-
-- 只选择 Skill 最终职责真实需要的工具。
-- 普通 Python 或确定性本地逻辑可以完成的职责不选择工具。
-- 不得增加最终 Skill 职责中不存在的能力、外部服务、外部副作用或 artifact 责任。
-- similarity 只表示 embedding recall 排序，不表示必须选择。
-- current_allowed_tool_ids 只是当前状态，不表示必须保留。
-
-不要解释 candidate_tool_catalog。
-不要总结工具目录。
-不要输出代码。
-不要重新设计 Skill。
-
-响应结构已经由 JSON Schema 强制约束。
-
-只填写 schema 中要求的决策字段。
-""".strip()
-
-    payload = {
-        "task": (
-            "select_final_skill_tool_pool"
-        ),
-
-        "skill_name": skill_name,
-
-        "user_request": str(
-            user_request or ""
-        ),
-
-        "confirmed_summary": (
-            confirmed_summary
-            if isinstance(
-                confirmed_summary,
-                dict,
-            )
-            else {}
-        ),
-
-        "script_contracts": (
-            script_contracts
-        ),
-
-        "recall_source": (
-            recall_source
-        ),
-
-        "current_allowed_tool_ids": (
-            sorted(
-                current_allowed_ids
-            )
-        ),
-
-        "candidate_tool_catalog": (
-            candidate_catalog
-        ),
-    }
-
-    route = route_model(
-        "creator_prepare_plan",
-        requested_model=requested_model,
-        reason=(
-            "creator final Skill "
-            "ToolPool planning"
-        ),
-    )
-
     try:
-        planner_output = (
-            await _complete_creator_json_object_once(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                    },
-                ],
-
-                model=route.model,
-
-                phase=(
-                    "final_tool_planning"
-                ),
-
-                response_schema=(
-                    response_schema
-                ),
-            )
+        (
+            candidate_catalog,
+            recall_source,
+        ) = _recall_creator_tool_candidates(
+            file_specs=file_specs,
+            top_k=3,
         )
 
     except Exception as exc:
         logger.exception(
             "[Creator]"
-            "[final_tool_planning]"
-            "[structured_protocol_failed] "
+            "[final_tool_selection]"
+            "[tool_recall_failed] "
             "skill=%s "
             "error=%s",
             skill_name,
@@ -3250,13 +2998,12 @@ ToolPool 是 Skill 级共享授权池。
             status_code=502,
             detail={
                 "code": (
-                    "final_tool_planner_"
-                    "structured_protocol_failed"
+                    "creator_tool_recall_failed"
                 ),
 
                 "message": (
-                    "Final Tool Planner failed "
-                    "the JSON Schema protocol."
+                    "Tool Registry capability recall "
+                    "failed."
                 ),
 
                 "error": (
@@ -3266,219 +3013,341 @@ ToolPool 是 Skill 级共享授权池。
             },
         ) from exc
 
-    raw_desired_tools = (
-        planner_output.get(
-            "desired_tools"
-        )
-    )
-
-    planner_reason = (
-        planner_output.get(
-            "reason"
-        )
-    )
-
-    if not isinstance(
-        raw_desired_tools,
-        list,
-    ):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": (
-                    "final_tool_planner_"
-                    "invalid_shape"
-                ),
-
-                "message": (
-                    "Final Tool Planner structured "
-                    "response must contain "
-                    "desired_tools as an array."
-                ),
-
-                "planner_output": (
-                    planner_output
-                ),
-            },
-        )
-
-    if not isinstance(
-        planner_reason,
-        str,
-    ):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": (
-                    "final_tool_planner_"
-                    "invalid_shape"
-                ),
-
-                "message": (
-                    "Final Tool Planner structured "
-                    "response must contain reason "
-                    "as a string."
-                ),
-
-                "planner_output": (
-                    planner_output
-                ),
-            },
-        )
-
-    selected_by_tool: dict[
-        str,
-        dict[str, str],
-    ] = {}
-
-    rejected_tool_ids: list[
+    ordered_candidate_tool_ids: list[
         str
     ] = []
 
-    invalid_items: list[
-        dict[str, Any]
-    ] = []
-
-    for index, raw_tool in enumerate(
-        raw_desired_tools
+    for item in (
+        candidate_catalog or []
     ):
         if not isinstance(
-            raw_tool,
+            item,
             dict,
         ):
-            invalid_items.append({
-                "index": index,
-
-                "reason": (
-                    "desired_tools item "
-                    "must be an object"
-                ),
-            })
-
             continue
 
-        raw_tool_id = raw_tool.get(
-            "tool_id"
-        )
-
-        raw_reason = raw_tool.get(
-            "reason"
-        )
-
-        if not isinstance(
-            raw_tool_id,
-            str,
-        ):
-            invalid_items.append({
-                "index": index,
-
-                "reason": (
-                    "tool_id must be a string"
-                ),
-            })
-
-            continue
-
-        if not isinstance(
-            raw_reason,
-            str,
-        ):
-            invalid_items.append({
-                "index": index,
-
-                "reason": (
-                    "reason must be a string"
-                ),
-            })
-
-            continue
-
-        tool_id = raw_tool_id.strip()
-        reason = raw_reason.strip()
-
-        if not tool_id:
-            invalid_items.append({
-                "index": index,
-
-                "reason": (
-                    "tool_id must not be empty"
-                ),
-            })
-
-            continue
+        tool_id = str(
+            item.get("tool_id")
+            or ""
+        ).strip()
 
         if (
             tool_id
-            not in candidate_tool_ids
+            and tool_id
+            not in ordered_candidate_tool_ids
         ):
-            rejected_tool_ids.append(
+            ordered_candidate_tool_ids.append(
                 tool_id
             )
 
-            continue
-
-        selected_by_tool[
-            tool_id
-        ] = {
-            "tool_id": tool_id,
-
-            "reason": reason,
-        }
-
-    if invalid_items:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": (
-                    "final_tool_planner_"
-                    "invalid_desired_tools"
-                ),
-
-                "message": (
-                    "Final Tool Planner returned "
-                    "invalid desired_tools items."
-                ),
-
-                "invalid_items": (
-                    invalid_items
-                ),
-
-                "planner_output": (
-                    planner_output
-                ),
-            },
-        )
-
-    desired_tool_ids = set(
-        selected_by_tool
+    candidate_tool_ids = set(
+        ordered_candidate_tool_ids
     )
 
-    if rejected_tool_ids:
-        logger.warning(
-            "[Creator]"
-            "[final_tool_planning]"
-            "[candidate_boundary_rejected] "
-            "skill=%s "
-            "rejected=%s",
-            skill_name,
-            json.dumps(
+    candidate_by_tool_id = {
+        str(
+            item.get("tool_id")
+            or ""
+        ).strip(): item
+        for item in (
+            candidate_catalog or []
+        )
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and str(
+                item.get("tool_id")
+                or ""
+            ).strip()
+        )
+    }
+
+    desired_tool_ids: set[str] = set()
+
+    selector_output: dict[
+        str,
+        Any,
+    ] = {
+        "decisions": {},
+    }
+
+    if ordered_candidate_tool_ids:
+        decision_properties = {
+            tool_id: {
+                "type": "boolean",
+            }
+            for tool_id
+            in ordered_candidate_tool_ids
+        }
+
+        response_schema: dict[
+            str,
+            Any,
+        ] = {
+            "type": "object",
+
+            "properties": {
+                "decisions": {
+                    "type": "object",
+
+                    "properties": (
+                        decision_properties
+                    ),
+
+                    "required": (
+                        ordered_candidate_tool_ids
+                    ),
+
+                    "additionalProperties": False,
+                },
+            },
+
+            "required": [
+                "decisions",
+            ],
+
+            "additionalProperties": False,
+        }
+
+        prompt = """
+你是 Creator Final Tool Selector。
+
+Plan 已经完成业务拆解，并在每个 scripts/*.py contract 中声明 required_capabilities。
+
+Embedding 已经针对每个 required_capability 独立召回 Tool Registry 候选。
+
+你的任务只有一个：
+
+逐项判断 candidate_tool_catalog 中的候选工具，是否真正需要加入整个 Skill 的共享 ToolPool。
+
+对 decisions 中每个 tool_id 填 true 或 false。
+
+true：
+该工具真实函数能力能够直接实现 script_contracts 中已经声明的 required_capabilities 或 artifact responsibility。
+
+false：
+该工具只是 embedding 相似；
+或能力方向错误；
+或只是实体相似但动作不同；
+或普通 Python 确定性逻辑即可完成；
+或当前 Plan 没有声明对应能力。
+
+特别注意：
+
+- generate/create/build 与 parse/read/extract 是不同能力方向。
+- 生成 PDF 不代表需要解析 PDF。
+- 生成图片不代表需要理解已有图片。
+- required_capabilities 是 Plan 已经确定的语义需求，不要重新解释用户业务。
+- 不要重新设计 Skill。
+- 不要扩大 required_capabilities。
+- 不要输出解释、reason、tool card 或代码。
+
+响应由 JSON Schema 强制。
+只填写 boolean decisions。
+""".strip()
+
+        payload = {
+            "task": (
+                "select_tools_for_"
+                "planned_capabilities"
+            ),
+
+            "skill_name": skill_name,
+
+            "script_contracts": (
+                script_contracts
+            ),
+
+            "current_allowed_tool_ids": (
                 sorted(
-                    set(
-                        rejected_tool_ids
-                    )
-                ),
-                ensure_ascii=False,
+                    current_allowed_ids
+                )
+            ),
+
+            "candidate_tool_catalog": (
+                candidate_catalog
+            ),
+        }
+
+        route = route_model(
+            "creator_prepare_plan",
+            requested_model=(
+                requested_model
+            ),
+            reason=(
+                "creator final capability "
+                "tool selection"
             ),
         )
 
-    selected_tools = [
-        selected_by_tool[
-            tool_id
-        ]
-        for tool_id in sorted(
-            selected_by_tool
+        try:
+            selector_output = (
+                await _complete_creator_json_object_once(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                        },
+                    ],
+
+                    model=route.model,
+
+                    phase=(
+                        "final_tool_selection"
+                    ),
+
+                    response_schema=(
+                        response_schema
+                    ),
+                )
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "[Creator]"
+                "[final_tool_selection]"
+                "[structured_protocol_failed] "
+                "skill=%s "
+                "error=%s",
+                skill_name,
+                (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": (
+                        "final_tool_selector_"
+                        "structured_protocol_failed"
+                    ),
+
+                    "message": (
+                        "Final Tool Selector failed "
+                        "the boolean decision protocol."
+                    ),
+
+                    "error": (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
+                },
+            ) from exc
+
+        raw_decisions = (
+            selector_output.get(
+                "decisions"
+            )
         )
-    ]
+
+        if not isinstance(
+            raw_decisions,
+            dict,
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": (
+                        "final_tool_selector_"
+                        "invalid_shape"
+                    ),
+
+                    "message": (
+                        "Final Tool Selector must "
+                        "return decisions object."
+                    ),
+
+                    "selector_output": (
+                        selector_output
+                    ),
+                },
+            )
+
+        missing_decisions = [
+            tool_id
+            for tool_id
+            in ordered_candidate_tool_ids
+            if tool_id
+            not in raw_decisions
+        ]
+
+        extra_decisions = [
+            str(tool_id)
+            for tool_id
+            in raw_decisions
+            if str(tool_id)
+            not in candidate_tool_ids
+        ]
+
+        invalid_decisions = [
+            tool_id
+            for tool_id, value
+            in raw_decisions.items()
+            if not isinstance(
+                value,
+                bool,
+            )
+        ]
+
+        if (
+            missing_decisions
+            or extra_decisions
+            or invalid_decisions
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": (
+                        "final_tool_selector_"
+                        "invalid_decisions"
+                    ),
+
+                    "message": (
+                        "Final Tool Selector returned "
+                        "an invalid decision table."
+                    ),
+
+                    "missing_decisions": (
+                        missing_decisions
+                    ),
+
+                    "extra_decisions": (
+                        extra_decisions
+                    ),
+
+                    "invalid_decisions": (
+                        invalid_decisions
+                    ),
+
+                    "selector_output": (
+                        selector_output
+                    ),
+                },
+            )
+
+        desired_tool_ids = {
+            tool_id
+            for tool_id
+            in ordered_candidate_tool_ids
+            if (
+                raw_decisions.get(
+                    tool_id
+                )
+                is True
+            )
+        }
 
     add_tool_ids = sorted(
         desired_tool_ids
@@ -3496,8 +3365,21 @@ ToolPool 是 Skill 级共享授权池。
             "add_tool_requests": [
                 {
                     "requested_capability": (
-                        "Skill final responsibility "
-                        "requires Registry capability"
+                        ", ".join(
+                            candidate_by_tool_id
+                            .get(
+                                tool_id,
+                                {},
+                            )
+                            .get(
+                                "recalled_for_capabilities",
+                                [],
+                            )
+                        )
+                        or (
+                            "Skill Plan required "
+                            "capability"
+                        )
                     ),
 
                     "candidate_tool_id": (
@@ -3505,14 +3387,14 @@ ToolPool 是 Skill 级共享授权池。
                     ),
 
                     "reason": (
-                        selected_by_tool[
-                            tool_id
-                        ]["reason"]
+                        "Final Tool Selector marked "
+                        "this Registry candidate as "
+                        "required by the normalized "
+                        "Skill Plan capabilities."
                     ),
                 }
-                for tool_id in (
-                    add_tool_ids
-                )
+                for tool_id
+                in add_tool_ids
             ],
 
             "remove_tool_requests": [
@@ -3520,23 +3402,21 @@ ToolPool 是 Skill 级共享授权池。
                     "tool_id": tool_id,
 
                     "reason": (
-                        "tool is not present in "
-                        "the Final Tool Planner "
-                        "complete desired Skill "
-                        "ToolPool set"
+                        "Tool is not required by the "
+                        "current normalized Skill Plan "
+                        "capability selection."
                     ),
                 }
-                for tool_id in (
-                    remove_tool_ids
-                )
+                for tool_id
+                in remove_tool_ids
             ],
 
             "update_file_bindings": [],
 
             "reason": (
-                "Backend diff from embedding-"
-                "recalled Final Tool Planner "
-                "complete Skill-wide desired set"
+                "Backend diff from capability-level "
+                "embedding recall and boolean Final "
+                "Tool Selector."
             ),
 
             "affected_files": [],
@@ -3563,9 +3443,18 @@ ToolPool 是 Skill 级共享授权池。
         skill_dir
     )
 
-    normalized_planner_output = {
-        "desired_tools": (
-            selected_tools
+    normalized_selector_output = {
+        "decisions": (
+            selector_output.get(
+                "decisions"
+            )
+            if isinstance(
+                selector_output.get(
+                    "decisions"
+                ),
+                dict,
+            )
+            else {}
         ),
 
         "desired_tool_ids": (
@@ -3574,36 +3463,24 @@ ToolPool 是 Skill 级共享授权池。
             )
         ),
 
-        "recall_source": (
-            recall_source
-        ),
-
         "candidate_tool_ids": (
             ordered_candidate_tool_ids
         ),
 
-        "rejected_tool_ids": (
-            sorted(
-                set(
-                    rejected_tool_ids
-                )
-            )
-        ),
-
-        "reason": (
-            planner_reason.strip()
+        "recall_source": (
+            recall_source
         ),
     }
 
     logger.info(
         "[Creator]"
-        "[final_tool_planning]"
+        "[final_tool_selection]"
         "[result] %s",
         json.dumps(
             {
                 "event": (
                     "final_skill_tool_"
-                    "planning_result"
+                    "selection_result"
                 ),
 
                 "skill_name": skill_name,
@@ -3622,14 +3499,6 @@ ToolPool 是 Skill 级共享授权池。
                     )
                 ),
 
-                "rejected_tool_ids": (
-                    sorted(
-                        set(
-                            rejected_tool_ids
-                        )
-                    )
-                ),
-
                 "add_tool_ids": (
                     add_tool_ids
                 ),
@@ -3645,7 +3514,7 @@ ToolPool 是 Skill 级共享授权池。
 
     return {
         "planner_output": (
-            normalized_planner_output
+            normalized_selector_output
         ),
 
         "computed_patch": (
@@ -5314,46 +5183,54 @@ required_capabilities 只能表达语义能力需求，不能填写注册工具 
 
     return data
 
-async def _prepare_summarize_confirmed_requirements(
+async def _project_prepare_review_summary_from_blueprint(
     *,
     request: PreparePlanRequest,
+    blueprint_text: str,
     prepared: dict[str, Any] | None = None,
 ) -> PreparePlanReviewSummary:
-    """Summarize Creator creation points only.
+    """Project the full internal blueprint into a user-facing review summary.
 
-    This phase never discovers Registry tools and never mutates ToolPool.
+    review_summary is display-only.
 
-    When the upstream business planner already returned a substantive
-    review_summary, reuse it directly instead of calling another LLM merely to
-    summarize the same requirement state again.
+    It is never a source for:
+    - blueprint generation;
+    - blueprint repair;
+    - workflow allocation;
+    - Tool recall;
+    - Tool selection;
+    - code generation;
+    - E2E.
+
+    Projection input is the full blueprint only.
     """
 
-    prepared = prepared or {}
+    source_blueprint = str(
+        blueprint_text or ""
+    ).strip()
 
-    confirmed_uploaded_assets, unselected_uploaded_files = (
-        _split_uploaded_asset_decisions(
-            request.uploaded_files
+    prepared = (
+        prepared
+        if isinstance(
+            prepared,
+            dict,
+        )
+        else {}
+    )
+
+    fallback = _coerce_prepare_summary(
+        prepared.get(
+            "review_summary"
         )
     )
 
-    base = _coerce_prepare_summary(
-        prepared.get("review_summary")
-    )
+    if not source_blueprint:
+        fallback.risks = []
 
-    base_has_content = bool(
-        str(base.goal or "").strip()
-        and str(base.input or "").strip()
-        and str(base.output or "").strip()
-        and list(base.workflow or [])
-    )
-
-    if base_has_content:
-        base.risks = []
-
-        base.assets_to_upload = [
+        fallback.assets_to_upload = [
             str(path).strip()
             for path in (
-                base.assets_to_upload
+                fallback.assets_to_upload
                 or []
             )
             if str(path).strip().startswith(
@@ -5361,168 +5238,217 @@ async def _prepare_summarize_confirmed_requirements(
             )
         ]
 
-        if not base.changes:
-            base.changes = [
-                (
-                    "默认决策：优先最小可用、"
-                    "可执行、可验证的实现。"
-                )
-            ]
+        return fallback
 
-        return base
+    response_schema: dict[
+        str,
+        Any,
+    ] = {
+        "type": "object",
 
-    prompt = (
-        load_kernel_creator_for_phase(
-            "prepare_plan"
-        )
-        + """
-你只负责归纳 Creator 创建要点。
+        "properties": {
+            "goal": {
+                "type": "string",
+            },
 
-不要生成蓝图。
-不要探索 Tool Registry。
-不要选择工具。
-不要输出 tool_pool_patch。
-不要修改 ToolPool。
-不要输出风险项。
+            "input": {
+                "type": "string",
+            },
 
-只输出严格 JSON object：
+            "output": {
+                "type": "string",
+            },
 
-{
-  "goal": "",
-  "input": "",
-  "output": "",
-  "workflow": [],
-  "files_to_create_or_update": [],
-  "assets_to_upload": [],
-  "risks": [],
-  "changes": []
-}
+            "workflow": {
+                "type": "array",
 
-要求：
+                "items": {
+                    "type": "string",
+                },
+            },
 
-- 根据 user_request、conversation_history、human_feedback 和 model_summary 归纳当前业务需求。
-- goal 表达最终业务目标。
-- input 表达 Skill 运行时真实输入。
-- output 表达最终用户可见结果或文件产物。
-- workflow 表达高层业务处理过程。
-- files_to_create_or_update 只表达业务规划中的 Creator 文件。
-- assets_to_upload 只包含创建 Skill 时固定使用的静态 assets。
-- 运行时输入文件不能放入 assets_to_upload。
-- risks 必须是空数组。
-- 不得因为平台支持搜索、微信、数据库、表格、视觉或外部 API 而扩大用户需求。
-- 未明确但必须落地的非关键部分采用最小可用、可执行、可验证的默认方案。
-"""
-    )
+            "files_to_create_or_update": {
+                "type": "array",
 
-    payload = {
-        "user_request": request.user_request,
-        "conversation_history": (
-            request.conversation_history
-        ),
-        "human_feedback": (
-            request.human_feedback
-        ),
-        "uploaded_files": (
-            request.uploaded_files
-        ),
-        "confirmed_uploaded_assets": (
-            confirmed_uploaded_assets
-        ),
-        "unselected_uploaded_files": (
-            unselected_uploaded_files
-        ),
-        "model_summary": base.model_dump(
-            mode="json"
-        ),
+                "items": {
+                    "type": "string",
+                },
+            },
+
+            "assets_to_upload": {
+                "type": "array",
+
+                "items": {
+                    "type": "string",
+                },
+            },
+
+            "risks": {
+                "type": "array",
+
+                "items": {
+                    "type": "string",
+                },
+            },
+
+            "changes": {
+                "type": "array",
+
+                "items": {
+                    "type": "string",
+                },
+            },
+        },
+
+        "required": [
+            "goal",
+            "input",
+            "output",
+            "workflow",
+            "files_to_create_or_update",
+            "assets_to_upload",
+            "risks",
+            "changes",
+        ],
+
+        "additionalProperties": False,
     }
 
-    summary = base
+    prompt = """
+你只负责把 internal_blueprint_text 映射成给用户展示的“创建要点”。
+
+这是只读 projection。
+
+internal_blueprint_text 是唯一事实来源。
+
+禁止：
+
+- 补充蓝图中没有的业务需求；
+- 修改输入；
+- 修改输出；
+- 修改工作流；
+- 修改文件拓扑；
+- 重构蓝图；
+- 生成蓝图；
+- 判断工具；
+- 选择工具；
+- 输出风险。
+
+映射规则：
+
+goal：
+概括蓝图的最终 Skill 业务目标。
+
+input：
+概括蓝图 I/O 契约中的真实运行时输入。
+
+output：
+概括蓝图 I/O 契约中的最终用户可见输出。
+
+workflow：
+按蓝图工作流逻辑映射为简短步骤。
+
+files_to_create_or_update：
+映射 SkillPlan 中声明的文件。
+
+assets_to_upload：
+只映射 SkillPlan 中明确声明的静态 assets。
+
+risks：
+必须为空数组。
+
+changes：
+只在蓝图明确描述变更时映射；否则为空数组。
+
+响应结构由 JSON Schema 强制。
+
+只做映射。
+""".strip()
+
+    route = route_model(
+        "creator_prepare_plan",
+        requested_model=request.model,
+        reason=(
+            "creator blueprint to review "
+            "summary projection"
+        ),
+    )
+
+    summary = fallback
 
     try:
-        route = route_model(
-            "creator_prepare_plan",
-            requested_model=request.model,
-            reason=(
-                "creator prepare requirements summary"
+        projected = (
+            await _complete_creator_json_object_once(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "internal_blueprint_text": (
+                                    source_blueprint
+                                ),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    },
+                ],
+
+                model=route.model,
+
+                phase=(
+                    "prepare_review_summary_"
+                    "projection"
+                ),
+
+                response_schema=(
+                    response_schema
+                ),
+            )
+        )
+
+        summary = (
+            _coerce_prepare_summary(
+                projected
+            )
+        )
+
+    except Exception as exc:
+        logger.warning(
+            "[Creator]"
+            "[review_summary_projection]"
+            "[failed] "
+            "error=%s",
+            (
+                f"{type(exc).__name__}: "
+                f"{exc}"
             ),
         )
 
-        text = await complete_chat_once(
-            [
-                {
-                    "role": "system",
-                    "content": prompt,
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                },
-            ],
-            route.model,
+        summary = fallback
+
+    plan_paths = (
+        _extract_prepare_skill_plan_paths(
+            source_blueprint
         )
+    )
 
-        parsed = _parse_prepare_plan_json(
-            text
+    # File list is a deterministic projection.
+    summary.files_to_create_or_update = (
+        plan_paths
+    )
+
+    asset_plan_paths = {
+        path
+        for path in plan_paths
+        if path.startswith(
+            "assets/"
         )
-
-        summary_source = (
-            parsed.get("review_summary")
-            if isinstance(
-                parsed.get("review_summary"),
-                dict,
-            )
-            else parsed
-        )
-
-        summary = _coerce_prepare_summary(
-            summary_source
-        )
-
-    except Exception:
-        summary = base
-
-    if not summary.goal:
-        summary.goal = str(
-            request.user_request
-            or "创建一个可执行 Skill"
-        ).strip()[:500]
-
-    if not summary.input:
-        summary.input = (
-            "运行时由用户提供已确认的业务输入。"
-        )
-
-    if not summary.output:
-        summary.output = (
-            "返回已确认业务目标对应的结果；"
-            "如生成文件则返回 OUTPUT_DIR 文件路径。"
-        )
-
-    if not summary.workflow:
-        summary.workflow = [
-            "读取运行时输入",
-            "执行已确认的业务处理流程",
-            "验证并返回最终结果",
-        ]
-
-    if not summary.files_to_create_or_update:
-        summary.files_to_create_or_update = [
-            "SKILL.md"
-        ]
-
-    summary.risks = []
-
-    if not summary.changes:
-        summary.changes = [
-            (
-                "默认决策：优先最小可用、"
-                "可执行、可验证的实现。"
-            )
-        ]
+    }
 
     summary.assets_to_upload = [
         str(path).strip()
@@ -5530,169 +5456,15 @@ async def _prepare_summarize_confirmed_requirements(
             summary.assets_to_upload
             or []
         )
-        if str(path).strip().startswith(
-            "assets/"
+        if (
+            str(path).strip()
+            in asset_plan_paths
         )
     ]
 
+    summary.risks = []
+
     return summary
-
-
-async def _generate_internal_blueprint_from_confirmed_summary(
-    *,
-    request: PreparePlanRequest,
-    summary: PreparePlanReviewSummary,
-) -> dict[str, Any]:
-    """Generate an internal blueprint from confirmed creation points.
-
-    Tool discovery is owned exclusively by the Final Tool Planner.
-
-    This phase does not read Registry catalog and does not mutate ToolPool.
-    """
-
-    prompt = (
-        load_kernel_creator_for_phase(
-            "prepare_plan"
-        )
-        + """
-根据已经确认的创建要点、conversation_history 和 human_feedback
-生成 internal_blueprint_text。
-
-当前阶段只负责业务蓝图规划。
-
-不要探索 Tool Registry。
-不要选择具体工具。
-不要输出 tool_pool_patch。
-不要修改 ToolPool。
-
-只输出严格 JSON object：
-
-{
-  "status": "ready",
-  "internal_blueprint_text": "...",
-  "review_summary": {},
-  "skill_name": "..."
-}
-
-不得继续返回 needs_clarification。
-不得询问用户问题。
-
-internal_blueprint_text 必须满足 analyze_blueprint(strict=True) 可解析。
-
-必须包含：
-
-- 基本信息；
-- I/O 契约；
-- 目录结构；
-- 工作流逻辑；
-- SkillPlan / 文件职责计划；
-- 宿主执行方式；
-- 资源清单。
-
-业务规则：
-
-- confirmed_summary 是已经确认的业务事实来源。
-- 不得因为平台支持某种能力而扩大 confirmed_summary 中不存在的需求。
-- required_capabilities 只能表达抽象语义能力需求。
-- 不得填写具体 Registry tool_id。
-- 不得填写 selected_tools。
-- 不得填写 required_tool_slots。
-- ToolPool 工具选择由后续 Final Tool Planner 完成。
-
-资源规则：
-
-- 运行时输入默认不是 Creator assets。
-- assets 只表示创建阶段固定静态素材。
-- 运行时生成产物只能写入 scripts outputs/stdout/file_outputs。
-- 资源清单只能列 SkillPlan 已声明的 references/assets。
-- references/*.md 只有业务确实需要静态参考资料时才创建。
-- 不要复制 kernel/protocol 示例 reference 文件路径。
-- 不确定是否需要 reference 时默认不创建。
-
-执行规则：
-
-- 当前平台没有显式 loop/map/foreach runtime node。
-- 逐项处理、批量处理、顺序映射和聚合责任必须落到某个 scripts/*.py 内部。
-- 文件数量必须来自真实职责边界。
-- 不要根据自然语言步骤机械拆分文件。
-"""
-    )
-
-    confirmed_uploaded_assets, unselected_uploaded_files = (
-        _split_uploaded_asset_decisions(
-            request.uploaded_files
-        )
-    )
-
-    payload = {
-        "confirmed_summary": summary.model_dump(
-            mode="json"
-        ),
-        "user_request": request.user_request,
-        "conversation_history": (
-            request.conversation_history
-        ),
-        "human_feedback": (
-            request.human_feedback
-        ),
-        "uploaded_files": (
-            request.uploaded_files
-        ),
-        "confirmed_uploaded_assets": (
-            confirmed_uploaded_assets
-        ),
-        "unselected_uploaded_files": (
-            unselected_uploaded_files
-        ),
-    }
-
-    route = route_model(
-        "creator_prepare_plan",
-        requested_model=request.model,
-        reason=(
-            "creator confirmed summary to blueprint"
-        ),
-    )
-
-    text = await complete_chat_once(
-        [
-            {
-                "role": "system",
-                "content": prompt,
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    default=str,
-                ),
-            },
-        ],
-        route.model,
-    )
-
-    data = _parse_prepare_plan_json(
-        text
-    )
-
-    # Defensive boundary:
-    # blueprint planning cannot mutate ToolPool.
-    data.pop(
-        "tool_pool_patch",
-        None,
-    )
-
-    data["status"] = "ready"
-
-    data.setdefault(
-        "review_summary",
-        summary.model_dump(
-            mode="json"
-        ),
-    )
-
-    return data
 
 def _tool_names_from_entry_contract(entry: Any) -> list[str]:
     data = entry if isinstance(entry, dict) else getattr(entry, "__dict__", {})
@@ -6542,229 +6314,1019 @@ async def _normalize_script_purpose_short_contracts(
             })
 
 
-@router.post("/prepare-plan", response_model=PreparePlanResponse)
-async def prepare_plan(request: PreparePlanRequest):
-    prepare_action = str(request.prepare_action or "none")
-    confirmed_prepare = prepare_action == "confirm" or _prepare_user_confirmed_no_more_supplement(request)
+@router.post(
+    "/prepare-plan",
+    response_model=PreparePlanResponse,
+)
+async def prepare_plan(
+    request: PreparePlanRequest,
+):
+    prepare_action = str(
+        request.prepare_action
+        or "none"
+    )
 
-    if prepare_action == "request_supplement":
-        return PreparePlanResponse(
-            status="needs_clarification",
-            prepare_stage="creation_points_confirmation",
-            clarifying_questions=["好的，请补充你的其他要求。"],
-            review_summary=PreparePlanReviewSummary(),
-            skill_name=request.skill_name or "",
-        )
-
-    if prepare_action == "submit_supplement":
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared={})
-        return PreparePlanResponse(
-            status="needs_clarification",
-            prepare_stage="supplement_confirmation",
-            clarifying_questions=["已根据补充内容更新创建要点。是否按这些要点继续？A. 没有其他补充，按这些要点继续 B. 继续补充说明"],
-            review_summary=_strip_prepare_summary_risks(summary),
-            skill_name=request.skill_name or "",
-        )
-
-    try:
-        prepared = await _generate_internal_blueprint_or_questions(request)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"prepare-plan 生成失败：{exc}") from exc
-
-    raw_status = str(prepared.get("status") or "").strip()
-    status = raw_status if raw_status in {"ready", "needs_clarification", "blocked"} else "needs_clarification"
-    summary = _coerce_prepare_summary(prepared.get("review_summary"))
-    skill_name = str(prepared.get("skill_name") or request.skill_name or "")
-
-    async def summarize_and_confirm(question: str) -> PreparePlanResponse:
-        confirmed = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=[question], review_summary=_strip_prepare_summary_risks(confirmed), skill_name=skill_name)
-
-    if confirmed_prepare and status != "ready":
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
-        status = "ready"
-        skill_name = str(prepared.get("skill_name") or skill_name)
-    elif prepare_action == "none" and _prepare_user_has_provided_supplement_content(request):
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        current_feedback_has_supplement = "补充：" in str(request.human_feedback or "")
-        prior_supplement_rounds = max(0, _count_prepare_supplement_rounds(request) - (1 if current_feedback_has_supplement else 0))
-        if prior_supplement_rounds >= MAX_PREPARE_SUPPLEMENT_ROUNDS:
-            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
-            status = "ready"
-            skill_name = str(prepared.get("skill_name") or skill_name)
-        else:
-            return PreparePlanResponse(
-                status="needs_clarification",
-                prepare_stage="supplement_confirmation",
-                clarifying_questions=["已根据补充内容更新创建要点。是否按这些要点继续？A. 没有其他补充，按这些要点继续 B. 继续补充说明"],
-                review_summary=_strip_prepare_summary_risks(summary),
-                skill_name=skill_name,
+    confirmed_prepare = (
+        prepare_action == "confirm"
+        or (
+            _prepare_user_confirmed_no_more_supplement(
+                request
             )
-    elif prepare_action == "none" and _prepare_feedback_wants_supplement(request):
-        return PreparePlanResponse(
-            status="needs_clarification",
-            prepare_stage="creation_points_confirmation",
-            clarifying_questions=["好的，请补充你的其他要求。"],
-            review_summary=PreparePlanReviewSummary(),
-            skill_name=skill_name,
+        )
+    )
+
+    previous_blueprint_text = str(
+        request.previous_blueprint_text
+        or ""
+    ).strip()
+
+    prepared: dict[
+        str,
+        Any,
+    ] = {}
+
+    summary = (
+        PreparePlanReviewSummary()
+    )
+
+    skill_name = str(
+        request.skill_name
+        or ""
+    )
+
+    blueprint_text = (
+        previous_blueprint_text
+    )
+
+    async def project_summary(
+        current_blueprint_text: str,
+        current_prepared: (
+            dict[str, Any] | None
+        ) = None,
+    ) -> PreparePlanReviewSummary:
+        return (
+            await _project_prepare_review_summary_from_blueprint(
+                request=request,
+
+                blueprint_text=(
+                    current_blueprint_text
+                ),
+
+                prepared=(
+                    current_prepared
+                ),
+            )
         )
 
-    if status == "needs_clarification":
-        if confirmed_prepare:
-            summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
-            status = "ready"
-            skill_name = str(prepared.get("skill_name") or skill_name)
-        elif not _prepare_business_clarification_limit_reached(request):
-            return PreparePlanResponse(
-                status="needs_clarification",
-                prepare_stage="business_clarification",
-                clarifying_questions=_normalize_prepare_clarifying_questions(prepared.get("clarifying_questions")),
-                review_summary=PreparePlanReviewSummary(),
-                skill_name=skill_name,
-            )
-        else:
-            return await summarize_and_confirm(_PREPARE_SUPPLEMENT_QUESTION)
+    async def confirmation_response(
+        *,
+        current_blueprint_text: str,
+        current_prepared: (
+            dict[str, Any] | None
+        ),
+        current_skill_name: str,
+        prepare_stage: str,
+        question: str,
+    ) -> PreparePlanResponse:
+        projected = await project_summary(
+            current_blueprint_text,
+            current_prepared,
+        )
 
-    if status == "blocked" and not confirmed_prepare:
-        return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
-    if status == "blocked" and confirmed_prepare:
-        blockers = prepared.get("blockers") or ["用户确认后仍无法生成可执行蓝图。"]
+        return PreparePlanResponse(
+            status="needs_clarification",
+
+            prepare_stage=prepare_stage,
+
+            clarifying_questions=[
+                question
+            ],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    projected
+                )
+            ),
+
+            blueprint_text=(
+                current_blueprint_text
+            ),
+
+            skill_name=(
+                current_skill_name
+            ),
+        )
+
+    if (
+        prepare_action
+        == "request_supplement"
+    ):
+        if previous_blueprint_text:
+            summary = await project_summary(
+                previous_blueprint_text
+            )
+
+        return PreparePlanResponse(
+            status="needs_clarification",
+
+            prepare_stage=(
+                "creation_points_confirmation"
+            ),
+
+            clarifying_questions=[
+                "好的，请补充你的其他要求。"
+            ],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                previous_blueprint_text
+            ),
+
+            skill_name=(
+                skill_name
+            ),
+        )
+
+    if confirmed_prepare:
+        # Confirmation freezes the existing full blueprint.
+        #
+        # review_summary is never used to reconstruct it.
+        if not previous_blueprint_text:
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=(
+                    skill_name
+                ),
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        (
+                            "missing_confirmed_"
+                            "blueprint_state"
+                        ),
+                        (
+                            "用户确认创建要点时，"
+                            "previous_blueprint_text 为空。"
+                            "Creator 不允许从 review_summary "
+                            "重新生成 full blueprint。"
+                        ),
+                        field=(
+                            "previous_blueprint_text"
+                        ),
+                    )
+                ],
+            )
+
+        prepared = {
+            "status": "ready",
+
+            "internal_blueprint_text": (
+                previous_blueprint_text
+            ),
+
+            "skill_name": skill_name,
+        }
+
+        blueprint_text = (
+            previous_blueprint_text
+        )
+
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
+    else:
+        try:
+            prepared = (
+                await _generate_internal_blueprint_or_questions(
+                    request
+                )
+            )
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "prepare-plan 生成失败："
+                    f"{exc}"
+                ),
+            ) from exc
+
+        raw_status = str(
+            prepared.get("status")
+            or ""
+        ).strip()
+
+        status = (
+            raw_status
+            if raw_status in {
+                "ready",
+                "needs_clarification",
+                "blocked",
+            }
+            else "needs_clarification"
+        )
+
+        skill_name = str(
+            prepared.get("skill_name")
+            or request.skill_name
+            or ""
+        )
+
+        blueprint_text = str(
+            prepared.get(
+                "internal_blueprint_text"
+            )
+            or prepared.get(
+                "blueprint_text"
+            )
+            or ""
+        ).strip()
+
+        if (
+            prepare_action
+            == "submit_supplement"
+        ):
+            # Supplement changes business requirements.
+            #
+            # Therefore the business planner may revise the
+            # previous full blueprint exactly once.
+            #
+            # The result itself becomes the next full blueprint.
+            if status == "needs_clarification":
+                return PreparePlanResponse(
+                    status=(
+                        "needs_clarification"
+                    ),
+
+                    prepare_stage=(
+                        "business_clarification"
+                    ),
+
+                    clarifying_questions=(
+                        _normalize_prepare_clarifying_questions(
+                            prepared.get(
+                                "clarifying_questions"
+                            )
+                        )
+                    ),
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+                )
+
+            if status == "blocked":
+                blockers = (
+                    prepared.get("blockers")
+                    or [
+                        (
+                            "补充要求后仍缺少生成"
+                            "完整蓝图所需的信息。"
+                        )
+                    ]
+                )
+
+                return PreparePlanResponse(
+                    status="blocked",
+
+                    prepare_stage=(
+                        "blueprint_protocol_failed"
+                    ),
+
+                    clarifying_questions=[],
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+
+                    creation_blockers=(
+                        blockers
+                        if isinstance(
+                            blockers,
+                            list,
+                        )
+                        else [
+                            str(blockers)
+                        ]
+                    ),
+                )
+
+            if not blueprint_text:
+                return PreparePlanResponse(
+                    status="blocked",
+
+                    prepare_stage=(
+                        "blueprint_protocol_failed"
+                    ),
+
+                    clarifying_questions=[],
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+
+                    creation_blockers=[
+                        _prepare_protocol_issue(
+                            (
+                                "supplement_blueprint_"
+                                "missing"
+                            ),
+                            (
+                                "补充要求处理后 full "
+                                "blueprint 为空。"
+                            ),
+                        )
+                    ],
+                )
+
+            return await confirmation_response(
+                current_blueprint_text=(
+                    blueprint_text
+                ),
+
+                current_prepared=prepared,
+
+                current_skill_name=(
+                    skill_name
+                ),
+
+                prepare_stage=(
+                    "supplement_confirmation"
+                ),
+
+                question=(
+                    "已根据补充内容更新创建要点。"
+                    "是否按这些要点继续？"
+                    "A. 没有其他补充，按这些要点继续 "
+                    "B. 继续补充说明"
+                ),
+            )
+
+        if status == "needs_clarification":
+            if (
+                not _prepare_business_clarification_limit_reached(
+                    request
+                )
+            ):
+                return PreparePlanResponse(
+                    status=(
+                        "needs_clarification"
+                    ),
+
+                    prepare_stage=(
+                        "business_clarification"
+                    ),
+
+                    clarifying_questions=(
+                        _normalize_prepare_clarifying_questions(
+                            prepared.get(
+                                "clarifying_questions"
+                            )
+                        )
+                    ),
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+                )
+
+            # Planner was explicitly required to finalize a
+            # blueprint at the clarification limit.
+            #
+            # Do not rebuild one from review_summary.
+            if blueprint_text:
+                return await confirmation_response(
+                    current_blueprint_text=(
+                        blueprint_text
+                    ),
+
+                    current_prepared=prepared,
+
+                    current_skill_name=(
+                        skill_name
+                    ),
+
+                    prepare_stage=(
+                        "creation_points_confirmation"
+                    ),
+
+                    question=(
+                        _PREPARE_SUPPLEMENT_QUESTION
+                    ),
+                )
+
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=skill_name,
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        (
+                            "planner_failed_to_"
+                            "finalize_blueprint"
+                        ),
+                        (
+                            "业务澄清达到上限后，"
+                            "规划模型仍未生成 full "
+                            "blueprint。Creator 不允许"
+                            "从 review_summary 重建蓝图。"
+                        ),
+                    )
+                ],
+            )
+
+        if status == "blocked":
+            blockers = (
+                prepared.get("blockers")
+                or [
+                    (
+                        "当前业务条件不足以生成"
+                        "可执行 full blueprint。"
+                    )
+                ]
+            )
+
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text=(
+                    blueprint_text
+                    or previous_blueprint_text
+                ),
+
+                skill_name=skill_name,
+
+                creation_blockers=(
+                    blockers
+                    if isinstance(
+                        blockers,
+                        list,
+                    )
+                    else [
+                        str(blockers)
+                    ]
+                ),
+            )
+
+        if not blueprint_text:
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=skill_name,
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        "empty_blueprint",
+                        (
+                            "规划模型返回 ready，"
+                            "但 full blueprint 为空。"
+                        ),
+                    )
+                ],
+            )
+
+        # First complete blueprint:
+        #
+        # project it for display and freeze it in the
+        # response so the frontend can send it back on
+        # confirmation.
+        return await confirmation_response(
+            current_blueprint_text=(
+                blueprint_text
+            ),
+
+            current_prepared=prepared,
+
+            current_skill_name=(
+                skill_name
+            ),
+
+            prepare_stage=(
+                "creation_points_confirmation"
+            ),
+
+            question=(
+                _PREPARE_SUPPLEMENT_QUESTION
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # From here on, the user has confirmed an existing full blueprint.
+    #
+    # No business planner and no review_summary -> blueprint conversion.
+    # ------------------------------------------------------------------
+
+    blueprint_text = (
+        _normalize_prepare_blueprint_references(
+            blueprint_text
+        )
+    )
+
+    protocol_errors = (
+        _preflight_prepare_blueprint_text(
+            blueprint_text
+        )
+    )
+
+    if protocol_errors:
+        try:
+            blueprint_text = (
+                await _repair_prepare_blueprint_protocol(
+                    request=request,
+
+                    blueprint_text=(
+                        blueprint_text
+                    ),
+
+                    protocol_errors=(
+                        protocol_errors
+                    ),
+                )
+            )
+
+            blueprint_text = (
+                _normalize_prepare_blueprint_references(
+                    blueprint_text
+                )
+            )
+
+            protocol_errors = (
+                _preflight_prepare_blueprint_text(
+                    blueprint_text
+                )
+            )
+
+        except Exception:
+            pass
+
+    if protocol_errors:
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
         return PreparePlanResponse(
             status="blocked",
-            prepare_stage="blueprint_protocol_failed",
+
+            prepare_stage=(
+                "blueprint_protocol_failed"
+            ),
+
             clarifying_questions=[],
-            review_summary=_strip_prepare_summary_risks(summary),
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                blueprint_text
+            ),
+
             skill_name=skill_name,
-            creation_blockers=blockers if isinstance(blockers, list) else [str(blockers)],
+
+            creation_blockers=(
+                protocol_errors
+            ),
         )
-
-    if status == "ready" and not confirmed_prepare:
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        return PreparePlanResponse(
-            status="needs_clarification",
-            prepare_stage="creation_points_confirmation",
-            clarifying_questions=[_PREPARE_SUPPLEMENT_QUESTION],
-            review_summary=_strip_prepare_summary_risks(summary),
-            skill_name=skill_name,
-        )
-
-    blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
-    if not blueprint_text:
-        if confirmed_prepare:
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_protocol_failed",
-                clarifying_questions=[],
-                review_summary=_strip_prepare_summary_risks(summary),
-                skill_name=skill_name,
-                creation_blockers=[_prepare_protocol_issue("empty_blueprint", "用户确认后内部蓝图为空，无法进入创建计划。")],
-            )
-        return await summarize_and_confirm("系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明")
-
-    blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
-    protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
-    if protocol_errors:
-        try:
-            blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=protocol_errors)
-            blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
-            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
-        except Exception:
-            pass
-    if protocol_errors:
-        summary = await _prepare_summarize_confirmed_requirements(request=request, prepared=prepared)
-        try:
-            prepared = await _generate_internal_blueprint_from_confirmed_summary(request=request, summary=summary)
-            blueprint_text = str(prepared.get("internal_blueprint_text") or prepared.get("blueprint_text") or "").strip()
-            blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
-            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
-        except Exception:
-            pass
-    if protocol_errors:
-        if confirmed_prepare:
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_protocol_failed",
-                clarifying_questions=[],
-                review_summary=_strip_prepare_summary_risks(summary),
-                skill_name=skill_name,
-                creation_blockers=protocol_errors,
-            )
-        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
     plan = None
-    analyze_errors: list[dict[str, Any]] = []
+
+    analyze_errors: list[
+        dict[str, Any]
+    ] = []
+
     for attempt in range(3):
         try:
-            plan = await analyze_blueprint(AnalyzeBlueprintRequest(
-                messages=[{"role": "assistant", "content": blueprint_text}],
-                model=request.model,
-                strict=True,
-                refine_contract=True,
-                refine_rounds=3,
-            ))
+            plan = await analyze_blueprint(
+                AnalyzeBlueprintRequest(
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": (
+                                blueprint_text
+                            ),
+                        }
+                    ],
+
+                    model=request.model,
+
+                    strict=True,
+
+                    # Confirmed full blueprint is frozen.
+                    refine_contract=False,
+
+                    refine_rounds=0,
+                )
+            )
+
             break
+
         except HTTPException as exc:
-            analyze_errors = [_prepare_protocol_issue("strict_analyze_failed", "内部蓝图未通过 strict analyze。", field="analyze_blueprint")]
+            analyze_errors = [
+                _prepare_protocol_issue(
+                    "strict_analyze_failed",
+                    (
+                        "内部蓝图未通过 strict "
+                        "analyze。"
+                    ),
+                    field="analyze_blueprint",
+                )
+            ]
+
             if attempt >= 2:
                 break
+
             try:
-                blueprint_text = await _repair_prepare_blueprint_protocol(request=request, blueprint_text=blueprint_text, protocol_errors=[{**analyze_errors[0], "detail": str(exc.detail)}])
-                blueprint_text = _normalize_prepare_blueprint_references(blueprint_text)
+                blueprint_text = (
+                    await _repair_prepare_blueprint_protocol(
+                        request=request,
+
+                        blueprint_text=(
+                            blueprint_text
+                        ),
+
+                        protocol_errors=[
+                            {
+                                **analyze_errors[0],
+
+                                "detail": str(
+                                    exc.detail
+                                ),
+                            }
+                        ],
+                    )
+                )
+
+                blueprint_text = (
+                    _normalize_prepare_blueprint_references(
+                        blueprint_text
+                    )
+                )
+
             except Exception:
                 break
-            protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
-            if protocol_errors:
-                analyze_errors = protocol_errors
-                break
-    if plan is None:
-        if confirmed_prepare:
-            blockers = analyze_errors or [_prepare_protocol_issue("strict_analyze_failed", "用户确认后内部蓝图无法解析为创建计划。", field="analyze_blueprint")]
-            return PreparePlanResponse(
-                status="blocked",
-                prepare_stage="blueprint_analyze_failed",
-                clarifying_questions=[],
-                review_summary=_strip_prepare_summary_risks(summary),
-                skill_name=skill_name,
-                creation_blockers=blockers,
-            )
-        return PreparePlanResponse(status="needs_clarification", prepare_stage="creation_points_confirmation", clarifying_questions=["系统已整理出创建要点，但还需要你确认是否按这些要点继续。A. 按这些要点继续 B. 我补充说明"], review_summary=_strip_prepare_summary_risks(summary), skill_name=skill_name)
 
-    confirmed_uploaded_assets, unselected_uploaded_files = _split_uploaded_asset_decisions(request.uploaded_files)
-    confirmed_asset_paths = {str(item.get("asset_target_path") or "").strip() for item in confirmed_uploaded_assets}
+            protocol_errors = (
+                _preflight_prepare_blueprint_text(
+                    blueprint_text
+                )
+            )
+
+            if protocol_errors:
+                analyze_errors = (
+                    protocol_errors
+                )
+
+                break
+
+    if plan is None:
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
+        blockers = (
+            analyze_errors
+            or [
+                _prepare_protocol_issue(
+                    "strict_analyze_failed",
+                    (
+                        "已确认 full blueprint "
+                        "无法解析为创建计划。"
+                    ),
+                    field="analyze_blueprint",
+                )
+            ]
+        )
+
+        return PreparePlanResponse(
+            status="blocked",
+
+            prepare_stage=(
+                "blueprint_analyze_failed"
+            ),
+
+            clarifying_questions=[],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                blueprint_text
+            ),
+
+            skill_name=skill_name,
+
+            creation_blockers=blockers,
+        )
+
+    (
+        confirmed_uploaded_assets,
+        unselected_uploaded_files,
+    ) = _split_uploaded_asset_decisions(
+        request.uploaded_files
+    )
+
+    confirmed_asset_paths = {
+        str(
+            item.get(
+                "asset_target_path"
+            )
+            or ""
+        ).strip()
+        for item
+        in confirmed_uploaded_assets
+    }
+
     plan.files = [
-        file_spec for file_spec in (plan.files or [])
+        file_spec
+        for file_spec
+        in (
+            plan.files or []
+        )
         if not (
-            str(getattr(file_spec, "path", "") or "").startswith("assets/")
-            and str(getattr(file_spec, "asset_source", "") or "") == "user_upload"
-            and str(getattr(file_spec, "path", "") or "") not in confirmed_asset_paths
+            str(
+                getattr(
+                    file_spec,
+                    "path",
+                    "",
+                )
+                or ""
+            ).startswith(
+                "assets/"
+            )
+            and str(
+                getattr(
+                    file_spec,
+                    "asset_source",
+                    "",
+                )
+                or ""
+            )
+            == "user_upload"
+            and str(
+                getattr(
+                    file_spec,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+            not in confirmed_asset_paths
         )
     ]
+
     plan.asset_requirements = [
-        asset for asset in (plan.asset_requirements or [])
-        if str(getattr(asset, "source", "") or "") != "user_upload"
-        or str(getattr(asset, "path", "") or "") in confirmed_asset_paths
+        asset
+        for asset
+        in (
+            plan.asset_requirements
+            or []
+        )
+        if (
+            str(
+                getattr(
+                    asset,
+                    "source",
+                    "",
+                )
+                or ""
+            )
+            != "user_upload"
+            or str(
+                getattr(
+                    asset,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+            in confirmed_asset_paths
+        )
     ]
 
-    summary_sync_warnings = _sync_prepare_summary_files_from_skill_plan(summary, plan.files)
+    final_blueprint_text = (
+        plan.blueprint_text
+        or blueprint_text
+    )
+
+    summary = await project_summary(
+        final_blueprint_text,
+        prepared,
+    )
+
+    summary_sync_warnings = (
+        _sync_prepare_summary_files_from_skill_plan(
+            summary,
+            plan.files,
+        )
+    )
+
     summary.assets_to_upload = [
-        str(getattr(asset, "path", "") or "").strip()
-        for asset in (plan.asset_requirements or [])
-        if str(getattr(asset, "path", "") or "").strip()
-        and str(getattr(asset, "source", "") or "").strip() in {"user_upload", "bundled"}
-        and not re.search(r"运行时|每次上传|用户输入|runtime", str(getattr(asset, "description", "") or ""), re.I)
+        str(
+            getattr(
+                asset,
+                "path",
+                "",
+            )
+            or ""
+        ).strip()
+        for asset
+        in (
+            plan.asset_requirements
+            or []
+        )
+        if (
+            str(
+                getattr(
+                    asset,
+                    "path",
+                    "",
+                )
+                or ""
+            ).strip()
+            and str(
+                getattr(
+                    asset,
+                    "source",
+                    "",
+                )
+                or ""
+            ).strip()
+            in {
+                "user_upload",
+                "bundled",
+            }
+            and not re.search(
+                (
+                    r"运行时|每次上传|"
+                    r"用户输入|runtime"
+                ),
+                str(
+                    getattr(
+                        asset,
+                        "description",
+                        "",
+                    )
+                    or ""
+                ),
+                re.I,
+            )
+        )
     ]
-    graph_payload = plan.requirement_graph.model_dump(mode="json") if hasattr(plan.requirement_graph, "model_dump") else dict(plan.requirement_graph or {})
-    file_specs_payload = [f.model_dump(mode="json") if hasattr(f, "model_dump") else dict(f) for f in (plan.files or [])]
+
+    graph_payload = (
+        plan.requirement_graph.model_dump(
+            mode="json"
+        )
+        if hasattr(
+            plan.requirement_graph,
+            "model_dump",
+        )
+        else dict(
+            plan.requirement_graph
+            or {}
+        )
+    )
+
+    file_specs_payload = [
+        (
+            file_spec.model_dump(
+                mode="json"
+            )
+            if hasattr(
+                file_spec,
+                "model_dump",
+            )
+            else dict(file_spec)
+        )
+        for file_spec
+        in (
+            plan.files or []
+        )
+    ]
+
     uploaded_files_payload = [
-        item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
-        for item in (getattr(request, "uploaded_files", []) or [])
-        if isinstance(item, dict) or hasattr(item, "model_dump")
+        (
+            item.model_dump(
+                mode="json"
+            )
+            if hasattr(
+                item,
+                "model_dump",
+            )
+            else dict(item)
+        )
+        for item
+        in (
+            getattr(
+                request,
+                "uploaded_files",
+                [],
+            )
+            or []
+        )
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            or hasattr(
+                item,
+                "model_dump",
+            )
+        )
     ]
+
     skill_dir_for_tool_pool = (
-            settings.skills_path
-            / _validate_skill_name(plan.skill_name)
+        settings.skills_path
+        / _validate_skill_name(
+            plan.skill_name
+        )
     )
 
     skill_dir_for_tool_pool.mkdir(
@@ -6775,34 +7337,14 @@ async def prepare_plan(request: PreparePlanRequest):
     tool_planning = (
         await _plan_final_tool_pool(
             skill_name=plan.skill_name,
-            user_request=str(
-                getattr(
-                    request,
-                    "user_request",
-                    "",
-                )
-                or ""
+
+            file_specs=(
+                file_specs_payload
             ),
-            confirmed_summary=(
-                summary.model_dump(
-                    mode="json"
-                )
-                if hasattr(
-                    summary,
-                    "model_dump",
-                )
-                else {}
+
+            requested_model=(
+                request.model
             ),
-            blueprint_text=(
-                    plan.blueprint_text
-                    or blueprint_text
-            ),
-            file_specs=file_specs_payload,
-            requirement_graph=graph_payload,
-            uploaded_files=(
-                uploaded_files_payload
-            ),
-            requested_model=request.model,
         )
     )
 
@@ -6812,6 +7354,7 @@ async def prepare_plan(request: PreparePlanRequest):
 
     tool_pool = build_tool_pool(
         skill_name=plan.skill_name,
+
         user_request=str(
             getattr(
                 request,
@@ -6820,14 +7363,19 @@ async def prepare_plan(request: PreparePlanRequest):
             )
             or ""
         ),
+
         blueprint_text=(
-                plan.blueprint_text
-                or blueprint_text
+            final_blueprint_text
         ),
-        file_specs=file_specs_payload,
+
+        file_specs=(
+            file_specs_payload
+        ),
+
         uploaded_files=(
             uploaded_files_payload
         ),
+
         current_tool_pool=(
             current_tool_pool
         ),
@@ -6838,89 +7386,1656 @@ async def prepare_plan(request: PreparePlanRequest):
         tool_pool,
     )
 
-    for file_spec in plan.files or []:
+    for file_spec in (
+        plan.files or []
+    ):
         binding = get_file_binding(
             tool_pool,
-            getattr(file_spec, "path", ""),
+            getattr(
+                file_spec,
+                "path",
+                "",
+            ),
         )
 
         if (
-                binding is not None
-                and hasattr(
-            file_spec,
-            "tool_binding_summary",
-        )
+            binding is not None
+            and hasattr(
+                file_spec,
+                "tool_binding_summary",
+            )
         ):
             file_spec.tool_binding_summary = {
                 "allowed_tool_ids": (
                     binding.allowed_tool_ids
                 ),
+
                 "primary_tool_ids": (
                     binding.primary_tool_ids
                 ),
+
                 "secondary_tool_ids": (
                     binding.secondary_tool_ids
                 ),
+
                 "allowed_helper_imports": (
                     binding.allowed_helper_imports
                 ),
+
                 "allowed_import_paths": (
                     binding.allowed_import_paths
                 ),
+
                 "allowed_function_imports": (
                     binding.allowed_function_imports
                 ),
+
                 "scored_tools": (
                     binding.scored_tools
                 ),
+
                 "matched_features_by_tool": (
-                    binding.matched_features_by_tool
+                    binding
+                    .matched_features_by_tool
                 ),
+
                 "denied_helper_imports": (
                     binding.denied_helper_imports
                 ),
+
                 "required_env": (
                     binding.required_env
                 ),
+
                 "dependencies": (
                     binding.dependencies
                 ),
             }
-    gate_events = [g.model_dump(mode="json") for g in tool_pool.gate_events]
+
+    gate_events = [
+        event.model_dump(
+            mode="json"
+        )
+        for event
+        in tool_pool.gate_events
+    ]
+
     tool_pool_summary = {
-        "tools": [{"tool_id": t.tool_id, "status": t.status, "target_files": t.target_files, "allowed_helper_imports": t.allowed_helper_imports, "allowed_import_paths": t.allowed_import_paths, "allowed_function_imports": t.allowed_function_imports, "score": t.score, "matched_features": t.matched_features} for t in tool_pool.tools],
-        "file_bindings": [{"target_file": b.target_file, "allowed_tool_ids": b.allowed_tool_ids, "primary_tool_ids": b.primary_tool_ids, "secondary_tool_ids": b.secondary_tool_ids, "allowed_helper_imports": b.allowed_helper_imports, "allowed_import_paths": b.allowed_import_paths, "allowed_function_imports": b.allowed_function_imports, "scored_tools": b.scored_tools, "matched_features_by_tool": b.matched_features_by_tool} for b in tool_pool.file_bindings],
-        "exploration_candidates": tool_pool.exploration_candidates,
-        "scored_candidates": tool_pool.scored_candidates,
-        "uploaded_file_triggers": tool_pool.uploaded_file_triggers,
+        "tools": [
+            {
+                "tool_id": tool.tool_id,
+
+                "status": tool.status,
+
+                "target_files": (
+                    tool.target_files
+                ),
+
+                "allowed_helper_imports": (
+                    tool.allowed_helper_imports
+                ),
+
+                "allowed_import_paths": (
+                    tool.allowed_import_paths
+                ),
+
+                "allowed_function_imports": (
+                    tool.allowed_function_imports
+                ),
+
+                "score": tool.score,
+
+                "matched_features": (
+                    tool.matched_features
+                ),
+            }
+            for tool
+            in tool_pool.tools
+        ],
+
+        "file_bindings": [
+            {
+                "target_file": (
+                    binding.target_file
+                ),
+
+                "allowed_tool_ids": (
+                    binding.allowed_tool_ids
+                ),
+
+                "primary_tool_ids": (
+                    binding.primary_tool_ids
+                ),
+
+                "secondary_tool_ids": (
+                    binding.secondary_tool_ids
+                ),
+
+                "allowed_helper_imports": (
+                    binding.allowed_helper_imports
+                ),
+
+                "allowed_import_paths": (
+                    binding.allowed_import_paths
+                ),
+
+                "allowed_function_imports": (
+                    binding.allowed_function_imports
+                ),
+
+                "scored_tools": (
+                    binding.scored_tools
+                ),
+
+                "matched_features_by_tool": (
+                    binding
+                    .matched_features_by_tool
+                ),
+            }
+            for binding
+            in tool_pool.file_bindings
+        ],
+
+        "exploration_candidates": (
+            tool_pool.exploration_candidates
+        ),
+
+        "scored_candidates": (
+            tool_pool.scored_candidates
+        ),
+
+        "uploaded_file_triggers": (
+            tool_pool.uploaded_file_triggers
+        ),
+
         "gate_events": gate_events,
-        "selected_primary_tools": {b.target_file: b.primary_tool_ids for b in tool_pool.file_bindings},
-        "fallback_tools": {b.target_file: b.secondary_tool_ids for b in tool_pool.file_bindings},
-        "denied_requests": [d.model_dump(mode="json") for d in tool_pool.denied_requests],
-        "missing_requests": [m.model_dump(mode="json") for m in tool_pool.missing_requests],
-        "denied_tools": [d.tool_id for d in tool_pool.denied_requests],
-        "missing_tools": [m.tool_id for m in tool_pool.missing_requests],
-        "rejected_candidates": [event for event in gate_events if event.get("decision") not in {"allow", "require_config", "require_dependency"}],
+
+        "selected_primary_tools": {
+            binding.target_file: (
+                binding.primary_tool_ids
+            )
+            for binding
+            in tool_pool.file_bindings
+        },
+
+        "fallback_tools": {
+            binding.target_file: (
+                binding.secondary_tool_ids
+            )
+            for binding
+            in tool_pool.file_bindings
+        },
+
+        "denied_requests": [
+            denied.model_dump(
+                mode="json"
+            )
+            for denied
+            in tool_pool.denied_requests
+        ],
+
+        "missing_requests": [
+            missing.model_dump(
+                mode="json"
+            )
+            for missing
+            in tool_pool.missing_requests
+        ],
+
+        "denied_tools": [
+            denied.tool_id
+            for denied
+            in tool_pool.denied_requests
+        ],
+
+        "missing_tools": [
+            missing.tool_id
+            for missing
+            in tool_pool.missing_requests
+        ],
+
+        "rejected_candidates": [
+            event
+            for event
+            in gate_events
+            if event.get("decision")
+            not in {
+                "allow",
+                "require_config",
+                "require_dependency",
+            }
+        ],
     }
+
     return PreparePlanResponse(
         status="ready",
+
         prepare_stage="ready",
+
         review_summary=summary,
-        blueprint_text=plan.blueprint_text or blueprint_text,
+
+        blueprint_text=(
+            final_blueprint_text
+        ),
+
         skill_name=plan.skill_name,
+
         files=plan.files,
-        warnings=[*(plan.warnings or []), *summary_sync_warnings],
-        asset_requirements=plan.asset_requirements,
-        final_outputs=plan.final_outputs,
-        available_tools=plan.available_tools,
-        missing_tool_configs=plan.missing_tool_configs,
-        tool_requirements=plan.tool_requirements,
-        creation_blockers=plan.creation_blockers,
-        requirement_graph=graph_payload,
-        workflow_allocation_summary=_load_workflow_allocation_summary(plan.skill_name),
-        tool_pool_summary=tool_pool_summary,
-        confirmed_uploaded_assets=confirmed_uploaded_assets,
-        unselected_uploaded_files=unselected_uploaded_files,
+
+        warnings=[
+            *(
+                plan.warnings
+                or []
+            ),
+            *summary_sync_warnings,
+        ],
+
+        asset_requirements=(
+            plan.asset_requirements
+        ),
+
+        final_outputs=(
+            plan.final_outputs
+        ),
+
+        available_tools=(
+            plan.available_tools
+        ),
+
+        missing_tool_configs=(
+            plan.missing_tool_configs
+        ),
+
+        tool_requirements=(
+            plan.tool_requirements
+        ),
+
+        creation_blockers=(
+            plan.creation_blockers
+        ),
+
+        requirement_graph=(
+            graph_payload
+        ),
+
+        workflow_allocation_summary=(
+            _load_workflow_allocation_summary(
+                plan.skill_name
+            )
+        ),
+
+        tool_pool_summary=(
+            tool_pool_summary
+        ),
+
+        confirmed_uploaded_assets=(
+            confirmed_uploaded_assets
+        ),
+
+        unselected_uploaded_files=(
+            unselected_uploaded_files
+        ),
+    )@router.post(
+    "/prepare-plan",
+    response_model=PreparePlanResponse,
+)
+async def prepare_plan(
+    request: PreparePlanRequest,
+):
+    prepare_action = str(
+        request.prepare_action
+        or "none"
+    )
+
+    confirmed_prepare = (
+        prepare_action == "confirm"
+        or (
+            _prepare_user_confirmed_no_more_supplement(
+                request
+            )
+        )
+    )
+
+    previous_blueprint_text = str(
+        request.previous_blueprint_text
+        or ""
+    ).strip()
+
+    prepared: dict[
+        str,
+        Any,
+    ] = {}
+
+    summary = (
+        PreparePlanReviewSummary()
+    )
+
+    skill_name = str(
+        request.skill_name
+        or ""
+    )
+
+    blueprint_text = (
+        previous_blueprint_text
+    )
+
+    async def project_summary(
+        current_blueprint_text: str,
+        current_prepared: (
+            dict[str, Any] | None
+        ) = None,
+    ) -> PreparePlanReviewSummary:
+        return (
+            await _project_prepare_review_summary_from_blueprint(
+                request=request,
+
+                blueprint_text=(
+                    current_blueprint_text
+                ),
+
+                prepared=(
+                    current_prepared
+                ),
+            )
+        )
+
+    async def confirmation_response(
+        *,
+        current_blueprint_text: str,
+        current_prepared: (
+            dict[str, Any] | None
+        ),
+        current_skill_name: str,
+        prepare_stage: str,
+        question: str,
+    ) -> PreparePlanResponse:
+        projected = await project_summary(
+            current_blueprint_text,
+            current_prepared,
+        )
+
+        return PreparePlanResponse(
+            status="needs_clarification",
+
+            prepare_stage=prepare_stage,
+
+            clarifying_questions=[
+                question
+            ],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    projected
+                )
+            ),
+
+            blueprint_text=(
+                current_blueprint_text
+            ),
+
+            skill_name=(
+                current_skill_name
+            ),
+        )
+
+    if (
+        prepare_action
+        == "request_supplement"
+    ):
+        if previous_blueprint_text:
+            summary = await project_summary(
+                previous_blueprint_text
+            )
+
+        return PreparePlanResponse(
+            status="needs_clarification",
+
+            prepare_stage=(
+                "creation_points_confirmation"
+            ),
+
+            clarifying_questions=[
+                "好的，请补充你的其他要求。"
+            ],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                previous_blueprint_text
+            ),
+
+            skill_name=(
+                skill_name
+            ),
+        )
+
+    if confirmed_prepare:
+        # Confirmation freezes the existing full blueprint.
+        #
+        # review_summary is never used to reconstruct it.
+        if not previous_blueprint_text:
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=(
+                    skill_name
+                ),
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        (
+                            "missing_confirmed_"
+                            "blueprint_state"
+                        ),
+                        (
+                            "用户确认创建要点时，"
+                            "previous_blueprint_text 为空。"
+                            "Creator 不允许从 review_summary "
+                            "重新生成 full blueprint。"
+                        ),
+                        field=(
+                            "previous_blueprint_text"
+                        ),
+                    )
+                ],
+            )
+
+        prepared = {
+            "status": "ready",
+
+            "internal_blueprint_text": (
+                previous_blueprint_text
+            ),
+
+            "skill_name": skill_name,
+        }
+
+        blueprint_text = (
+            previous_blueprint_text
+        )
+
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
+    else:
+        try:
+            prepared = (
+                await _generate_internal_blueprint_or_questions(
+                    request
+                )
+            )
+
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "prepare-plan 生成失败："
+                    f"{exc}"
+                ),
+            ) from exc
+
+        raw_status = str(
+            prepared.get("status")
+            or ""
+        ).strip()
+
+        status = (
+            raw_status
+            if raw_status in {
+                "ready",
+                "needs_clarification",
+                "blocked",
+            }
+            else "needs_clarification"
+        )
+
+        skill_name = str(
+            prepared.get("skill_name")
+            or request.skill_name
+            or ""
+        )
+
+        blueprint_text = str(
+            prepared.get(
+                "internal_blueprint_text"
+            )
+            or prepared.get(
+                "blueprint_text"
+            )
+            or ""
+        ).strip()
+
+        if (
+            prepare_action
+            == "submit_supplement"
+        ):
+            # Supplement changes business requirements.
+            #
+            # Therefore the business planner may revise the
+            # previous full blueprint exactly once.
+            #
+            # The result itself becomes the next full blueprint.
+            if status == "needs_clarification":
+                return PreparePlanResponse(
+                    status=(
+                        "needs_clarification"
+                    ),
+
+                    prepare_stage=(
+                        "business_clarification"
+                    ),
+
+                    clarifying_questions=(
+                        _normalize_prepare_clarifying_questions(
+                            prepared.get(
+                                "clarifying_questions"
+                            )
+                        )
+                    ),
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+                )
+
+            if status == "blocked":
+                blockers = (
+                    prepared.get("blockers")
+                    or [
+                        (
+                            "补充要求后仍缺少生成"
+                            "完整蓝图所需的信息。"
+                        )
+                    ]
+                )
+
+                return PreparePlanResponse(
+                    status="blocked",
+
+                    prepare_stage=(
+                        "blueprint_protocol_failed"
+                    ),
+
+                    clarifying_questions=[],
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+
+                    creation_blockers=(
+                        blockers
+                        if isinstance(
+                            blockers,
+                            list,
+                        )
+                        else [
+                            str(blockers)
+                        ]
+                    ),
+                )
+
+            if not blueprint_text:
+                return PreparePlanResponse(
+                    status="blocked",
+
+                    prepare_stage=(
+                        "blueprint_protocol_failed"
+                    ),
+
+                    clarifying_questions=[],
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+
+                    creation_blockers=[
+                        _prepare_protocol_issue(
+                            (
+                                "supplement_blueprint_"
+                                "missing"
+                            ),
+                            (
+                                "补充要求处理后 full "
+                                "blueprint 为空。"
+                            ),
+                        )
+                    ],
+                )
+
+            return await confirmation_response(
+                current_blueprint_text=(
+                    blueprint_text
+                ),
+
+                current_prepared=prepared,
+
+                current_skill_name=(
+                    skill_name
+                ),
+
+                prepare_stage=(
+                    "supplement_confirmation"
+                ),
+
+                question=(
+                    "已根据补充内容更新创建要点。"
+                    "是否按这些要点继续？"
+                    "A. 没有其他补充，按这些要点继续 "
+                    "B. 继续补充说明"
+                ),
+            )
+
+        if status == "needs_clarification":
+            if (
+                not _prepare_business_clarification_limit_reached(
+                    request
+                )
+            ):
+                return PreparePlanResponse(
+                    status=(
+                        "needs_clarification"
+                    ),
+
+                    prepare_stage=(
+                        "business_clarification"
+                    ),
+
+                    clarifying_questions=(
+                        _normalize_prepare_clarifying_questions(
+                            prepared.get(
+                                "clarifying_questions"
+                            )
+                        )
+                    ),
+
+                    review_summary=(
+                        PreparePlanReviewSummary()
+                    ),
+
+                    blueprint_text=(
+                        previous_blueprint_text
+                    ),
+
+                    skill_name=skill_name,
+                )
+
+            # Planner was explicitly required to finalize a
+            # blueprint at the clarification limit.
+            #
+            # Do not rebuild one from review_summary.
+            if blueprint_text:
+                return await confirmation_response(
+                    current_blueprint_text=(
+                        blueprint_text
+                    ),
+
+                    current_prepared=prepared,
+
+                    current_skill_name=(
+                        skill_name
+                    ),
+
+                    prepare_stage=(
+                        "creation_points_confirmation"
+                    ),
+
+                    question=(
+                        _PREPARE_SUPPLEMENT_QUESTION
+                    ),
+                )
+
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=skill_name,
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        (
+                            "planner_failed_to_"
+                            "finalize_blueprint"
+                        ),
+                        (
+                            "业务澄清达到上限后，"
+                            "规划模型仍未生成 full "
+                            "blueprint。Creator 不允许"
+                            "从 review_summary 重建蓝图。"
+                        ),
+                    )
+                ],
+            )
+
+        if status == "blocked":
+            blockers = (
+                prepared.get("blockers")
+                or [
+                    (
+                        "当前业务条件不足以生成"
+                        "可执行 full blueprint。"
+                    )
+                ]
+            )
+
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text=(
+                    blueprint_text
+                    or previous_blueprint_text
+                ),
+
+                skill_name=skill_name,
+
+                creation_blockers=(
+                    blockers
+                    if isinstance(
+                        blockers,
+                        list,
+                    )
+                    else [
+                        str(blockers)
+                    ]
+                ),
+            )
+
+        if not blueprint_text:
+            return PreparePlanResponse(
+                status="blocked",
+
+                prepare_stage=(
+                    "blueprint_protocol_failed"
+                ),
+
+                clarifying_questions=[],
+
+                review_summary=(
+                    PreparePlanReviewSummary()
+                ),
+
+                blueprint_text="",
+
+                skill_name=skill_name,
+
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        "empty_blueprint",
+                        (
+                            "规划模型返回 ready，"
+                            "但 full blueprint 为空。"
+                        ),
+                    )
+                ],
+            )
+
+        # First complete blueprint:
+        #
+        # project it for display and freeze it in the
+        # response so the frontend can send it back on
+        # confirmation.
+        return await confirmation_response(
+            current_blueprint_text=(
+                blueprint_text
+            ),
+
+            current_prepared=prepared,
+
+            current_skill_name=(
+                skill_name
+            ),
+
+            prepare_stage=(
+                "creation_points_confirmation"
+            ),
+
+            question=(
+                _PREPARE_SUPPLEMENT_QUESTION
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # From here on, the user has confirmed an existing full blueprint.
+    #
+    # No business planner and no review_summary -> blueprint conversion.
+    # ------------------------------------------------------------------
+
+    blueprint_text = (
+        _normalize_prepare_blueprint_references(
+            blueprint_text
+        )
+    )
+
+    protocol_errors = (
+        _preflight_prepare_blueprint_text(
+            blueprint_text
+        )
+    )
+
+    if protocol_errors:
+        try:
+            blueprint_text = (
+                await _repair_prepare_blueprint_protocol(
+                    request=request,
+
+                    blueprint_text=(
+                        blueprint_text
+                    ),
+
+                    protocol_errors=(
+                        protocol_errors
+                    ),
+                )
+            )
+
+            blueprint_text = (
+                _normalize_prepare_blueprint_references(
+                    blueprint_text
+                )
+            )
+
+            protocol_errors = (
+                _preflight_prepare_blueprint_text(
+                    blueprint_text
+                )
+            )
+
+        except Exception:
+            pass
+
+    if protocol_errors:
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
+        return PreparePlanResponse(
+            status="blocked",
+
+            prepare_stage=(
+                "blueprint_protocol_failed"
+            ),
+
+            clarifying_questions=[],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                blueprint_text
+            ),
+
+            skill_name=skill_name,
+
+            creation_blockers=(
+                protocol_errors
+            ),
+        )
+
+    plan = None
+
+    analyze_errors: list[
+        dict[str, Any]
+    ] = []
+
+    for attempt in range(3):
+        try:
+            plan = await analyze_blueprint(
+                AnalyzeBlueprintRequest(
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": (
+                                blueprint_text
+                            ),
+                        }
+                    ],
+
+                    model=request.model,
+
+                    strict=True,
+
+                    # Confirmed full blueprint is frozen.
+                    refine_contract=False,
+
+                    refine_rounds=0,
+                )
+            )
+
+            break
+
+        except HTTPException as exc:
+            analyze_errors = [
+                _prepare_protocol_issue(
+                    "strict_analyze_failed",
+                    (
+                        "内部蓝图未通过 strict "
+                        "analyze。"
+                    ),
+                    field="analyze_blueprint",
+                )
+            ]
+
+            if attempt >= 2:
+                break
+
+            try:
+                blueprint_text = (
+                    await _repair_prepare_blueprint_protocol(
+                        request=request,
+
+                        blueprint_text=(
+                            blueprint_text
+                        ),
+
+                        protocol_errors=[
+                            {
+                                **analyze_errors[0],
+
+                                "detail": str(
+                                    exc.detail
+                                ),
+                            }
+                        ],
+                    )
+                )
+
+                blueprint_text = (
+                    _normalize_prepare_blueprint_references(
+                        blueprint_text
+                    )
+                )
+
+            except Exception:
+                break
+
+            protocol_errors = (
+                _preflight_prepare_blueprint_text(
+                    blueprint_text
+                )
+            )
+
+            if protocol_errors:
+                analyze_errors = (
+                    protocol_errors
+                )
+
+                break
+
+    if plan is None:
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+
+        blockers = (
+            analyze_errors
+            or [
+                _prepare_protocol_issue(
+                    "strict_analyze_failed",
+                    (
+                        "已确认 full blueprint "
+                        "无法解析为创建计划。"
+                    ),
+                    field="analyze_blueprint",
+                )
+            ]
+        )
+
+        return PreparePlanResponse(
+            status="blocked",
+
+            prepare_stage=(
+                "blueprint_analyze_failed"
+            ),
+
+            clarifying_questions=[],
+
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+
+            blueprint_text=(
+                blueprint_text
+            ),
+
+            skill_name=skill_name,
+
+            creation_blockers=blockers,
+        )
+
+    (
+        confirmed_uploaded_assets,
+        unselected_uploaded_files,
+    ) = _split_uploaded_asset_decisions(
+        request.uploaded_files
+    )
+
+    confirmed_asset_paths = {
+        str(
+            item.get(
+                "asset_target_path"
+            )
+            or ""
+        ).strip()
+        for item
+        in confirmed_uploaded_assets
+    }
+
+    plan.files = [
+        file_spec
+        for file_spec
+        in (
+            plan.files or []
+        )
+        if not (
+            str(
+                getattr(
+                    file_spec,
+                    "path",
+                    "",
+                )
+                or ""
+            ).startswith(
+                "assets/"
+            )
+            and str(
+                getattr(
+                    file_spec,
+                    "asset_source",
+                    "",
+                )
+                or ""
+            )
+            == "user_upload"
+            and str(
+                getattr(
+                    file_spec,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+            not in confirmed_asset_paths
+        )
+    ]
+
+    plan.asset_requirements = [
+        asset
+        for asset
+        in (
+            plan.asset_requirements
+            or []
+        )
+        if (
+            str(
+                getattr(
+                    asset,
+                    "source",
+                    "",
+                )
+                or ""
+            )
+            != "user_upload"
+            or str(
+                getattr(
+                    asset,
+                    "path",
+                    "",
+                )
+                or ""
+            )
+            in confirmed_asset_paths
+        )
+    ]
+
+    final_blueprint_text = (
+        plan.blueprint_text
+        or blueprint_text
+    )
+
+    summary = await project_summary(
+        final_blueprint_text,
+        prepared,
+    )
+
+    summary_sync_warnings = (
+        _sync_prepare_summary_files_from_skill_plan(
+            summary,
+            plan.files,
+        )
+    )
+
+    summary.assets_to_upload = [
+        str(
+            getattr(
+                asset,
+                "path",
+                "",
+            )
+            or ""
+        ).strip()
+        for asset
+        in (
+            plan.asset_requirements
+            or []
+        )
+        if (
+            str(
+                getattr(
+                    asset,
+                    "path",
+                    "",
+                )
+                or ""
+            ).strip()
+            and str(
+                getattr(
+                    asset,
+                    "source",
+                    "",
+                )
+                or ""
+            ).strip()
+            in {
+                "user_upload",
+                "bundled",
+            }
+            and not re.search(
+                (
+                    r"运行时|每次上传|"
+                    r"用户输入|runtime"
+                ),
+                str(
+                    getattr(
+                        asset,
+                        "description",
+                        "",
+                    )
+                    or ""
+                ),
+                re.I,
+            )
+        )
+    ]
+
+    graph_payload = (
+        plan.requirement_graph.model_dump(
+            mode="json"
+        )
+        if hasattr(
+            plan.requirement_graph,
+            "model_dump",
+        )
+        else dict(
+            plan.requirement_graph
+            or {}
+        )
+    )
+
+    file_specs_payload = [
+        (
+            file_spec.model_dump(
+                mode="json"
+            )
+            if hasattr(
+                file_spec,
+                "model_dump",
+            )
+            else dict(file_spec)
+        )
+        for file_spec
+        in (
+            plan.files or []
+        )
+    ]
+
+    uploaded_files_payload = [
+        (
+            item.model_dump(
+                mode="json"
+            )
+            if hasattr(
+                item,
+                "model_dump",
+            )
+            else dict(item)
+        )
+        for item
+        in (
+            getattr(
+                request,
+                "uploaded_files",
+                [],
+            )
+            or []
+        )
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            or hasattr(
+                item,
+                "model_dump",
+            )
+        )
+    ]
+
+    skill_dir_for_tool_pool = (
+        settings.skills_path
+        / _validate_skill_name(
+            plan.skill_name
+        )
+    )
+
+    skill_dir_for_tool_pool.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tool_planning = (
+        await _plan_final_tool_pool(
+            skill_name=plan.skill_name,
+
+            file_specs=(
+                file_specs_payload
+            ),
+
+            requested_model=(
+                request.model
+            ),
+        )
+    )
+
+    current_tool_pool = (
+        tool_planning["tool_pool"]
+    )
+
+    tool_pool = build_tool_pool(
+        skill_name=plan.skill_name,
+
+        user_request=str(
+            getattr(
+                request,
+                "user_request",
+                "",
+            )
+            or ""
+        ),
+
+        blueprint_text=(
+            final_blueprint_text
+        ),
+
+        file_specs=(
+            file_specs_payload
+        ),
+
+        uploaded_files=(
+            uploaded_files_payload
+        ),
+
+        current_tool_pool=(
+            current_tool_pool
+        ),
+    )
+
+    save_tool_pool(
+        skill_dir_for_tool_pool,
+        tool_pool,
+    )
+
+    for file_spec in (
+        plan.files or []
+    ):
+        binding = get_file_binding(
+            tool_pool,
+            getattr(
+                file_spec,
+                "path",
+                "",
+            ),
+        )
+
+        if (
+            binding is not None
+            and hasattr(
+                file_spec,
+                "tool_binding_summary",
+            )
+        ):
+            file_spec.tool_binding_summary = {
+                "allowed_tool_ids": (
+                    binding.allowed_tool_ids
+                ),
+
+                "primary_tool_ids": (
+                    binding.primary_tool_ids
+                ),
+
+                "secondary_tool_ids": (
+                    binding.secondary_tool_ids
+                ),
+
+                "allowed_helper_imports": (
+                    binding.allowed_helper_imports
+                ),
+
+                "allowed_import_paths": (
+                    binding.allowed_import_paths
+                ),
+
+                "allowed_function_imports": (
+                    binding.allowed_function_imports
+                ),
+
+                "scored_tools": (
+                    binding.scored_tools
+                ),
+
+                "matched_features_by_tool": (
+                    binding
+                    .matched_features_by_tool
+                ),
+
+                "denied_helper_imports": (
+                    binding.denied_helper_imports
+                ),
+
+                "required_env": (
+                    binding.required_env
+                ),
+
+                "dependencies": (
+                    binding.dependencies
+                ),
+            }
+
+    gate_events = [
+        event.model_dump(
+            mode="json"
+        )
+        for event
+        in tool_pool.gate_events
+    ]
+
+    tool_pool_summary = {
+        "tools": [
+            {
+                "tool_id": tool.tool_id,
+
+                "status": tool.status,
+
+                "target_files": (
+                    tool.target_files
+                ),
+
+                "allowed_helper_imports": (
+                    tool.allowed_helper_imports
+                ),
+
+                "allowed_import_paths": (
+                    tool.allowed_import_paths
+                ),
+
+                "allowed_function_imports": (
+                    tool.allowed_function_imports
+                ),
+
+                "score": tool.score,
+
+                "matched_features": (
+                    tool.matched_features
+                ),
+            }
+            for tool
+            in tool_pool.tools
+        ],
+
+        "file_bindings": [
+            {
+                "target_file": (
+                    binding.target_file
+                ),
+
+                "allowed_tool_ids": (
+                    binding.allowed_tool_ids
+                ),
+
+                "primary_tool_ids": (
+                    binding.primary_tool_ids
+                ),
+
+                "secondary_tool_ids": (
+                    binding.secondary_tool_ids
+                ),
+
+                "allowed_helper_imports": (
+                    binding.allowed_helper_imports
+                ),
+
+                "allowed_import_paths": (
+                    binding.allowed_import_paths
+                ),
+
+                "allowed_function_imports": (
+                    binding.allowed_function_imports
+                ),
+
+                "scored_tools": (
+                    binding.scored_tools
+                ),
+
+                "matched_features_by_tool": (
+                    binding
+                    .matched_features_by_tool
+                ),
+            }
+            for binding
+            in tool_pool.file_bindings
+        ],
+
+        "exploration_candidates": (
+            tool_pool.exploration_candidates
+        ),
+
+        "scored_candidates": (
+            tool_pool.scored_candidates
+        ),
+
+        "uploaded_file_triggers": (
+            tool_pool.uploaded_file_triggers
+        ),
+
+        "gate_events": gate_events,
+
+        "selected_primary_tools": {
+            binding.target_file: (
+                binding.primary_tool_ids
+            )
+            for binding
+            in tool_pool.file_bindings
+        },
+
+        "fallback_tools": {
+            binding.target_file: (
+                binding.secondary_tool_ids
+            )
+            for binding
+            in tool_pool.file_bindings
+        },
+
+        "denied_requests": [
+            denied.model_dump(
+                mode="json"
+            )
+            for denied
+            in tool_pool.denied_requests
+        ],
+
+        "missing_requests": [
+            missing.model_dump(
+                mode="json"
+            )
+            for missing
+            in tool_pool.missing_requests
+        ],
+
+        "denied_tools": [
+            denied.tool_id
+            for denied
+            in tool_pool.denied_requests
+        ],
+
+        "missing_tools": [
+            missing.tool_id
+            for missing
+            in tool_pool.missing_requests
+        ],
+
+        "rejected_candidates": [
+            event
+            for event
+            in gate_events
+            if event.get("decision")
+            not in {
+                "allow",
+                "require_config",
+                "require_dependency",
+            }
+        ],
+    }
+
+    return PreparePlanResponse(
+        status="ready",
+
+        prepare_stage="ready",
+
+        review_summary=summary,
+
+        blueprint_text=(
+            final_blueprint_text
+        ),
+
+        skill_name=plan.skill_name,
+
+        files=plan.files,
+
+        warnings=[
+            *(
+                plan.warnings
+                or []
+            ),
+            *summary_sync_warnings,
+        ],
+
+        asset_requirements=(
+            plan.asset_requirements
+        ),
+
+        final_outputs=(
+            plan.final_outputs
+        ),
+
+        available_tools=(
+            plan.available_tools
+        ),
+
+        missing_tool_configs=(
+            plan.missing_tool_configs
+        ),
+
+        tool_requirements=(
+            plan.tool_requirements
+        ),
+
+        creation_blockers=(
+            plan.creation_blockers
+        ),
+
+        requirement_graph=(
+            graph_payload
+        ),
+
+        workflow_allocation_summary=(
+            _load_workflow_allocation_summary(
+                plan.skill_name
+            )
+        ),
+
+        tool_pool_summary=(
+            tool_pool_summary
+        ),
+
+        confirmed_uploaded_assets=(
+            confirmed_uploaded_assets
+        ),
+
+        unselected_uploaded_files=(
+            unselected_uploaded_files
+        ),
     )
 
 

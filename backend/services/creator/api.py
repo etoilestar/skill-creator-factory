@@ -1327,7 +1327,16 @@ def _creator_embed_texts(
 def _creator_tool_recall_card_text(
     tool: dict[str, Any],
 ) -> str:
-    """Build compact semantic recall text for one Registry tool."""
+    """Build a semantic-only recall card for one Registry tool.
+
+    Recall only needs semantic identity.
+
+    Full execution contracts remain in the candidate card passed to Final Tool
+    Selector, code generation, responsibility judges, and E2E validation.
+
+    Do not flatten JSON schemas, signatures, artifact contracts, return
+    contracts, or side effects into the embedding document.
+    """
 
     function_cards: list[str] = []
 
@@ -1342,277 +1351,267 @@ def _creator_tool_recall_card_text(
             continue
 
         function_cards.append(
-            "\n".join([
-                (
-                    "function_name: "
-                    + str(
-                        function.get(
-                            "function_name"
+            "\n".join(
+                [
+                    (
+                        "function_name: "
+                        + str(
+                            function.get(
+                                "function_name"
+                            )
+                            or ""
                         )
-                        or ""
-                    )
-                ),
-                (
-                    "description: "
-                    + str(
-                        function.get(
-                            "short_description"
+                    ),
+                    (
+                        "description: "
+                        + str(
+                            function.get(
+                                "short_description"
+                            )
+                            or ""
                         )
-                        or ""
-                    )
-                ),
-                (
-                    "when_to_use: "
-                    + str(
-                        function.get(
-                            "when_to_use"
+                    ),
+                    (
+                        "when_to_use: "
+                        + str(
+                            function.get(
+                                "when_to_use"
+                            )
+                            or ""
                         )
-                        or ""
-                    )
-                ),
-                (
-                    "signature: "
-                    + str(
-                        function.get(
-                            "signature"
+                    ),
+                    (
+                        "required_capabilities: "
+                        + json.dumps(
+                            function.get(
+                                "required_capabilities"
+                            )
+                            or [],
+                            ensure_ascii=False,
+                            default=str,
                         )
-                        or ""
-                    )
-                ),
-                (
-                    "return_contract: "
-                    + str(
-                        function.get(
-                            "return_contract"
-                        )
-                        or ""
-                    )
-                ),
-                (
-                    "required_capabilities: "
-                    + json.dumps(
-                        function.get(
-                            "required_capabilities"
-                        )
-                        or [],
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                ),
-                (
-                    "input_schema: "
-                    + json.dumps(
-                        function.get(
-                            "input_schema"
-                        )
-                        or {},
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                ),
-                (
-                    "output_schema: "
-                    + json.dumps(
-                        function.get(
-                            "output_schema"
-                        )
-                        or {},
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                ),
-                (
-                    "artifact_outputs: "
-                    + json.dumps(
-                        function.get(
-                            "artifact_outputs"
-                        )
-                        or [],
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                ),
-                (
-                    "side_effects: "
-                    + json.dumps(
-                        function.get(
-                            "side_effects"
-                        )
-                        or [],
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                ),
-            ])
+                    ),
+                ]
+            )
         )
 
-    return "\n".join([
-        (
-            "tool_id: "
-            + str(
-                tool.get("tool_id")
-                or ""
-            )
-        ),
-        (
-            "display_name: "
-            + str(
-                tool.get("display_name")
-                or ""
-            )
-        ),
-        (
-            "category: "
-            + str(
-                tool.get("category")
-                or ""
-            )
-        ),
-        (
-            "prompt_guidance: "
-            + str(
-                tool.get("prompt_guidance")
-                or ""
-            )
-        ),
-        (
-            "capability_aliases: "
-            + json.dumps(
-                tool.get(
-                    "capability_aliases"
+    return "\n".join(
+        [
+            (
+                "tool_id: "
+                + str(
+                    tool.get("tool_id")
+                    or ""
                 )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "semantic_tags: "
-            + json.dumps(
-                tool.get(
-                    "semantic_tags"
+            ),
+            (
+                "display_name: "
+                + str(
+                    tool.get("display_name")
+                    or ""
                 )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "task_verbs: "
-            + json.dumps(
-                tool.get(
-                    "task_verbs"
+            ),
+            (
+                "category: "
+                + str(
+                    tool.get("category")
+                    or ""
                 )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "domain_terms: "
-            + json.dumps(
-                tool.get(
-                    "domain_terms"
+            ),
+            (
+                "prompt_guidance: "
+                + str(
+                    tool.get(
+                        "prompt_guidance"
+                    )
+                    or ""
                 )
-                or [],
-                ensure_ascii=False,
-                default=str,
+            ),
+            (
+                "capability_aliases: "
+                + json.dumps(
+                    tool.get(
+                        "capability_aliases"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "semantic_tags: "
+                + json.dumps(
+                    tool.get(
+                        "semantic_tags"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "task_verbs: "
+                + json.dumps(
+                    tool.get(
+                        "task_verbs"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "domain_terms: "
+                + json.dumps(
+                    tool.get(
+                        "domain_terms"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "required_capabilities: "
+                + json.dumps(
+                    tool.get(
+                        "required_capabilities"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "optional_capabilities: "
+                + json.dumps(
+                    tool.get(
+                        "optional_capabilities"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            "",
+            "\n\n".join(
+                function_cards
+            ),
+        ]
+    )
+
+def _creator_tool_exact_capability_matches(
+    tool: dict[str, Any],
+    capability: str,
+) -> bool:
+    """Check explicit Registry capability ownership.
+
+    This is deterministic contract matching, not semantic inference.
+
+    A tool is an exact capability candidate when:
+
+    - tool_id exactly equals the capability; or
+    - the top-level Registry contract explicitly requires the capability; or
+    - one of the tool's callable function contracts explicitly requires the
+      capability.
+
+    The backend does not infer support from tool names, paths, roles, business
+    prose, or keywords.
+    """
+
+    capability = str(
+        capability
+        or ""
+    ).strip()
+
+    if not capability:
+        return False
+
+    tool_id = str(
+        tool.get("tool_id")
+        or ""
+    ).strip()
+
+    if tool_id == capability:
+        return True
+
+    top_level_required = {
+        str(item or "").strip()
+        for item in (
+            tool.get(
+                "required_capabilities"
             )
-        ),
-        (
-            "required_capabilities: "
-            + json.dumps(
-                tool.get(
+            or []
+        )
+        if str(item or "").strip()
+    }
+
+    if (
+        capability
+        in top_level_required
+    ):
+        return True
+
+    for function in (
+        tool.get("functions")
+        or []
+    ):
+        if not isinstance(
+            function,
+            dict,
+        ):
+            continue
+
+        function_required = {
+            str(item or "").strip()
+            for item in (
+                function.get(
                     "required_capabilities"
                 )
-                or [],
-                ensure_ascii=False,
-                default=str,
+                or []
             )
-        ),
-        (
-            "optional_capabilities: "
-            + json.dumps(
-                tool.get(
-                    "optional_capabilities"
-                )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "input_schema: "
-            + json.dumps(
-                tool.get("input_schema")
-                or {},
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "output_schema: "
-            + json.dumps(
-                tool.get("output_schema")
-                or {},
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "artifact_outputs: "
-            + json.dumps(
-                tool.get(
-                    "artifact_outputs"
-                )
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        (
-            "side_effects: "
-            + json.dumps(
-                tool.get("side_effects")
-                or [],
-                ensure_ascii=False,
-                default=str,
-            )
-        ),
-        "",
-        "\n\n".join(
-            function_cards
-        ),
-    ])
+            if str(item or "").strip()
+        }
+
+        if (
+            capability
+            in function_required
+        ):
+            return True
+
+    return False
 
 
 def _recall_creator_tool_candidates(
     *,
     file_specs: list[dict[str, Any]],
     top_k: int = 3,
+    semantic_queries: (
+        list[dict[str, Any]]
+        | None
+    ) = None,
 ) -> tuple[
     list[dict[str, Any]],
     str,
 ]:
-    """Recall Registry tools independently for each Plan capability.
-
-    required_capabilities already come from the normalized Skill Plan.
-
-    This function does not:
-    - re-extract capabilities from prose;
-    - use review_summary;
-    - use user_request;
-    - build one whole-Skill semantic query.
-
-    Each required capability is an independent embedding query.
+    """Recall Registry tools with exact-contract seeds plus embedding expansion.
 
     Candidate set:
 
-        per-capability top-k
-        -> union
-        -> Final Tool Selector
+        exact Registry capability matches
+        UNION
+        per-query embedding top-k
 
-    Tool authorization remains Skill-wide.
+    Exact Registry contract matches are completeness seeds.
+
+    Embedding is only semantic expansion. Embedding ranking must never remove a
+    tool that explicitly declares support for a required capability.
+
+    semantic_queries is used by responsibility-feedback replanning so the
+    first-round validator's structured error can use the same recall path
+    instead of exposing the complete Registry catalog to the planning model.
+
+    Tool authorization remains Skill-wide and is still owned by Backend Gate.
     """
 
     global _CREATOR_TOOL_EMBEDDING_INDEX_CACHE
@@ -1624,7 +1623,8 @@ def _recall_creator_tool_candidates(
     catalog = [
         tool
         for tool in (
-            raw_catalog or []
+            raw_catalog
+            or []
         )
         if (
             isinstance(
@@ -1650,7 +1650,9 @@ def _recall_creator_tool_candidates(
             "available tools"
         )
 
-    required_capabilities: list[str] = []
+    required_capabilities: list[
+        str
+    ] = []
 
     capability_owners: dict[
         str,
@@ -1658,7 +1660,8 @@ def _recall_creator_tool_candidates(
     ] = {}
 
     for spec in (
-        file_specs or []
+        file_specs
+        or []
     ):
         if not isinstance(
             spec,
@@ -1691,7 +1694,8 @@ def _recall_creator_tool_candidates(
             or []
         ):
             capability = str(
-                raw_capability or ""
+                raw_capability
+                or ""
             ).strip()
 
             if not capability:
@@ -1706,7 +1710,8 @@ def _recall_creator_tool_candidates(
                 )
 
             owners = (
-                capability_owners.setdefault(
+                capability_owners
+                .setdefault(
                     capability,
                     [],
                 )
@@ -1717,7 +1722,138 @@ def _recall_creator_tool_candidates(
                     path
                 )
 
-    if not required_capabilities:
+    query_items: list[
+        dict[str, Any]
+    ] = [
+        {
+            "query_id": capability,
+            "query_text": "\n".join(
+                [
+                    (
+                        "匹配能够直接实现以下抽象"
+                        "语义能力的 Tool Registry 工具。"
+                    ),
+                    "",
+                    (
+                        "required_capability: "
+                        f"{capability}"
+                    ),
+                    "",
+                    (
+                        "只判断工具真实能力是否能够"
+                        "实现该 capability。"
+                    ),
+                    (
+                        "不要根据整个 Skill 主题"
+                        "扩大语义。"
+                    ),
+                ]
+            ),
+            "exact_capabilities": [
+                capability
+            ],
+            "recalled_capabilities": [
+                capability
+            ],
+            "query_source": (
+                "plan_required_capability"
+            ),
+        }
+        for capability
+        in required_capabilities
+    ]
+
+    for index, raw_query in enumerate(
+        semantic_queries
+        or []
+    ):
+        if not isinstance(
+            raw_query,
+            dict,
+        ):
+            continue
+
+        query_text = str(
+            raw_query.get("query_text")
+            or ""
+        ).strip()
+
+        if not query_text:
+            continue
+
+        query_id = str(
+            raw_query.get("query_id")
+            or f"semantic_query_{index}"
+        ).strip()
+
+        exact_capabilities: list[
+            str
+        ] = []
+
+        for raw_capability in (
+            raw_query.get(
+                "exact_capabilities"
+            )
+            or required_capabilities
+        ):
+            capability = str(
+                raw_capability
+                or ""
+            ).strip()
+
+            if (
+                capability
+                and capability
+                not in exact_capabilities
+            ):
+                exact_capabilities.append(
+                    capability
+                )
+
+        recalled_capabilities: list[
+            str
+        ] = []
+
+        for raw_capability in (
+            raw_query.get(
+                "recalled_capabilities"
+            )
+            or []
+        ):
+            capability = str(
+                raw_capability
+                or ""
+            ).strip()
+
+            if (
+                capability
+                and capability
+                not in recalled_capabilities
+            ):
+                recalled_capabilities.append(
+                    capability
+                )
+
+        query_items.append(
+            {
+                "query_id": query_id,
+                "query_text": query_text,
+                "exact_capabilities": (
+                    exact_capabilities
+                ),
+                "recalled_capabilities": (
+                    recalled_capabilities
+                ),
+                "query_source": str(
+                    raw_query.get(
+                        "query_source"
+                    )
+                    or "semantic_query"
+                ),
+            }
+        )
+
+    if not query_items:
         logger.info(
             "[Creator]"
             "[tool_recall]"
@@ -1729,7 +1865,7 @@ def _recall_creator_tool_candidates(
                     ),
                     "source": (
                         "none:"
-                        "no_required_capabilities"
+                        "no_recall_queries"
                     ),
                     "required_capabilities": [],
                     "candidate_tool_ids": [],
@@ -1742,32 +1878,8 @@ def _recall_creator_tool_candidates(
 
         return (
             [],
-            "none:no_required_capabilities",
+            "none:no_recall_queries",
         )
-
-    query_texts = [
-        "\n".join([
-            (
-                "匹配能够直接实现以下抽象语义能力的 "
-                "Tool Registry 工具。"
-            ),
-            "",
-            (
-                "required_capability: "
-                f"{capability}"
-            ),
-            "",
-            (
-                "只判断工具真实能力是否能够实现"
-                "该 capability。"
-            ),
-            (
-                "不要根据整个 Skill 主题扩大语义。"
-            ),
-        ])
-        for capability
-        in required_capabilities
-    ]
 
     cards: list[
         tuple[
@@ -1783,16 +1895,12 @@ def _recall_creator_tool_candidates(
             or ""
         ).strip()
 
-        card_text = (
-            _creator_tool_recall_card_text(
-                tool
-            )
-        )
-
         cards.append(
             (
                 tool_id,
-                card_text,
+                _creator_tool_recall_card_text(
+                    tool
+                ),
                 tool,
             )
         )
@@ -1803,15 +1911,11 @@ def _recall_creator_tool_candidates(
         in cards
     ]
 
-    tool_embeddings: list[
-        tuple[
-            str,
-            list[float],
-        ]
-    ]
-
-    query_embeddings: list[
-        list[float]
+    query_texts = [
+        str(
+            item["query_text"]
+        )
+        for item in query_items
     ]
 
     embedding_source = ""
@@ -1971,15 +2075,14 @@ def _recall_creator_tool_candidates(
 
     if (
         len(query_embeddings)
-        != len(required_capabilities)
+        != len(query_items)
     ):
         raise RuntimeError(
-            "capability recall query embedding "
-            "count does not match Plan "
-            "required_capabilities"
+            "tool recall query embedding count "
+            "does not match recall queries"
         )
 
-    per_capability_limit = min(
+    per_query_limit = min(
         max(
             1,
             int(top_k or 1),
@@ -1987,7 +2090,9 @@ def _recall_creator_tool_candidates(
         len(tool_embeddings),
     )
 
-    candidate_tool_ids: list[str] = []
+    candidate_tool_ids: list[
+        str
+    ] = []
 
     score_by_tool: dict[
         str,
@@ -1999,18 +2104,42 @@ def _recall_creator_tool_candidates(
         list[str],
     ] = {}
 
-    per_capability_candidates: dict[
+    recall_sources_by_tool: dict[
+        str,
+        list[str],
+    ] = {}
+
+    per_query_candidates: dict[
         str,
         list[dict[str, Any]],
     ] = {}
 
     for (
-        capability,
+        query_item,
         query_embedding,
     ) in zip(
-        required_capabilities,
+        query_items,
         query_embeddings,
     ):
+        query_id = str(
+            query_item.get("query_id")
+            or ""
+        )
+
+        exact_capabilities = list(
+            query_item.get(
+                "exact_capabilities"
+            )
+            or []
+        )
+
+        query_recalled_capabilities = list(
+            query_item.get(
+                "recalled_capabilities"
+            )
+            or []
+        )
+
         scored_tools = [
             (
                 tool_id,
@@ -2024,7 +2153,8 @@ def _recall_creator_tool_candidates(
             for (
                 tool_id,
                 tool_embedding,
-            ) in tool_embeddings
+            )
+            in tool_embeddings
         ]
 
         scored_tools.sort(
@@ -2032,29 +2162,134 @@ def _recall_creator_tool_candidates(
             reverse=True,
         )
 
-        selected_for_capability = (
+        score_lookup = dict(
+            scored_tools
+        )
+
+        embedding_selected = (
             scored_tools[
-                :per_capability_limit
+                :per_query_limit
             ]
         )
 
-        per_capability_candidates[
-            capability
-        ] = [
-            {
-                "tool_id": tool_id,
-                "similarity": score,
-            }
-            for (
-                tool_id,
-                score,
-            ) in selected_for_capability
-        ]
+        exact_matches: dict[
+            str,
+            list[str],
+        ] = {}
 
         for (
             tool_id,
-            score,
-        ) in selected_for_capability:
+            _,
+            tool,
+        ) in cards:
+            matched_capabilities = [
+                capability
+                for capability
+                in exact_capabilities
+                if (
+                    _creator_tool_exact_capability_matches(
+                        tool,
+                        capability,
+                    )
+                )
+            ]
+
+            if matched_capabilities:
+                exact_matches[
+                    tool_id
+                ] = (
+                    matched_capabilities
+                )
+
+        selected_tool_ids: list[
+            str
+        ] = []
+
+        selected_sources: dict[
+            str,
+            list[str],
+        ] = {}
+
+        for tool_id in exact_matches:
+            selected_tool_ids.append(
+                tool_id
+            )
+
+            selected_sources[
+                tool_id
+            ] = [
+                "exact_contract"
+            ]
+
+        for (
+            tool_id,
+            _,
+        ) in embedding_selected:
+            if (
+                tool_id
+                not in selected_tool_ids
+            ):
+                selected_tool_ids.append(
+                    tool_id
+                )
+
+            sources = (
+                selected_sources
+                .setdefault(
+                    tool_id,
+                    [],
+                )
+            )
+
+            if (
+                "embedding_top_k"
+                not in sources
+            ):
+                sources.append(
+                    "embedding_top_k"
+                )
+
+        query_candidates: list[
+            dict[str, Any]
+        ] = []
+
+        for tool_id in selected_tool_ids:
+            score = float(
+                score_lookup.get(
+                    tool_id,
+                    -1.0,
+                )
+            )
+
+            sources = list(
+                selected_sources.get(
+                    tool_id
+                )
+                or []
+            )
+
+            matched_capabilities = list(
+                exact_matches.get(
+                    tool_id
+                )
+                or []
+            )
+
+            query_candidates.append(
+                {
+                    "tool_id": tool_id,
+                    "similarity": score,
+                    "candidate_source": (
+                        "+".join(
+                            sources
+                        )
+                    ),
+                    "matched_capabilities": (
+                        matched_capabilities
+                    ),
+                }
+            )
+
             if (
                 tool_id
                 not in candidate_tool_ids
@@ -2073,7 +2308,24 @@ def _recall_creator_tool_candidates(
                 score,
             )
 
-            matched_capabilities = (
+            tool_sources = (
+                recall_sources_by_tool
+                .setdefault(
+                    tool_id,
+                    [],
+                )
+            )
+
+            for source in sources:
+                if (
+                    source
+                    not in tool_sources
+                ):
+                    tool_sources.append(
+                        source
+                    )
+
+            matched_for_tool = (
                 recalled_for_capabilities
                 .setdefault(
                     tool_id,
@@ -2081,13 +2333,27 @@ def _recall_creator_tool_candidates(
                 )
             )
 
-            if (
-                capability
-                not in matched_capabilities
-            ):
-                matched_capabilities.append(
+            for capability in [
+                *query_recalled_capabilities,
+                *matched_capabilities,
+            ]:
+                capability = str(
                     capability
-                )
+                    or ""
+                ).strip()
+
+                if (
+                    capability
+                    and capability
+                    not in matched_for_tool
+                ):
+                    matched_for_tool.append(
+                        capability
+                    )
+
+        per_query_candidates[
+            query_id
+        ] = query_candidates
 
     by_tool_id = {
         str(
@@ -2126,173 +2392,179 @@ def _recall_creator_tool_candidates(
             ):
                 continue
 
-            functions.append({
-                "function_name": str(
-                    function.get(
-                        "function_name"
+            functions.append(
+                {
+                    "function_name": str(
+                        function.get(
+                            "function_name"
+                        )
+                        or ""
+                    ),
+                    "import_path": str(
+                        function.get(
+                            "import_path"
+                        )
+                        or ""
+                    ),
+                    "short_description": str(
+                        function.get(
+                            "short_description"
+                        )
+                        or ""
+                    ),
+                    "when_to_use": str(
+                        function.get(
+                            "when_to_use"
+                        )
+                        or ""
+                    ),
+                    "signature": str(
+                        function.get(
+                            "signature"
+                        )
+                        or ""
+                    ),
+                    "input_schema": (
+                        function.get(
+                            "input_schema"
+                        )
+                        or {}
+                    ),
+                    "output_schema": (
+                        function.get(
+                            "output_schema"
+                        )
+                        or {}
+                    ),
+                    "return_contract": str(
+                        function.get(
+                            "return_contract"
+                        )
+                        or ""
+                    ),
+                    "artifact_outputs": list(
+                        function.get(
+                            "artifact_outputs"
+                        )
+                        or []
+                    ),
+                    "side_effects": list(
+                        function.get(
+                            "side_effects"
+                        )
+                        or []
+                    ),
+                    "required_capabilities": list(
+                        function.get(
+                            "required_capabilities"
+                        )
+                        or []
+                    ),
+                }
+            )
+
+        candidate_cards.append(
+            {
+                "tool_id": tool_id,
+                "display_name": str(
+                    tool.get(
+                        "display_name"
                     )
                     or ""
                 ),
-                "import_path": str(
-                    function.get(
-                        "import_path"
+                "category": str(
+                    tool.get("category")
+                    or ""
+                ),
+                "prompt_guidance": str(
+                    tool.get(
+                        "prompt_guidance"
                     )
                     or ""
                 ),
-                "short_description": str(
-                    function.get(
-                        "short_description"
+                "capability_aliases": list(
+                    tool.get(
+                        "capability_aliases"
                     )
-                    or ""
+                    or []
                 ),
-                "when_to_use": str(
-                    function.get(
-                        "when_to_use"
+                "semantic_tags": list(
+                    tool.get(
+                        "semantic_tags"
                     )
-                    or ""
+                    or []
                 ),
-                "signature": str(
-                    function.get(
-                        "signature"
+                "task_verbs": list(
+                    tool.get(
+                        "task_verbs"
                     )
-                    or ""
+                    or []
+                ),
+                "domain_terms": list(
+                    tool.get(
+                        "domain_terms"
+                    )
+                    or []
+                ),
+                "required_capabilities": list(
+                    tool.get(
+                        "required_capabilities"
+                    )
+                    or []
+                ),
+                "optional_capabilities": list(
+                    tool.get(
+                        "optional_capabilities"
+                    )
+                    or []
                 ),
                 "input_schema": (
-                    function.get(
+                    tool.get(
                         "input_schema"
                     )
                     or {}
                 ),
                 "output_schema": (
-                    function.get(
+                    tool.get(
                         "output_schema"
                     )
                     or {}
                 ),
-                "return_contract": str(
-                    function.get(
-                        "return_contract"
-                    )
-                    or ""
-                ),
                 "artifact_outputs": list(
-                    function.get(
+                    tool.get(
                         "artifact_outputs"
                     )
                     or []
                 ),
                 "side_effects": list(
-                    function.get(
+                    tool.get(
                         "side_effects"
                     )
                     or []
                 ),
-                "required_capabilities": list(
-                    function.get(
-                        "required_capabilities"
+                "similarity": (
+                    score_by_tool.get(
+                        tool_id,
+                        -1.0,
+                    )
+                ),
+                "recalled_for_capabilities": list(
+                    recalled_for_capabilities
+                    .get(
+                        tool_id
                     )
                     or []
                 ),
-            })
-
-        candidate_cards.append({
-            "tool_id": tool_id,
-
-            "display_name": str(
-                tool.get("display_name")
-                or ""
-            ),
-
-            "category": str(
-                tool.get("category")
-                or ""
-            ),
-
-            "prompt_guidance": str(
-                tool.get("prompt_guidance")
-                or ""
-            ),
-
-            "capability_aliases": list(
-                tool.get(
-                    "capability_aliases"
-                )
-                or []
-            ),
-
-            "semantic_tags": list(
-                tool.get(
-                    "semantic_tags"
-                )
-                or []
-            ),
-
-            "task_verbs": list(
-                tool.get(
-                    "task_verbs"
-                )
-                or []
-            ),
-
-            "domain_terms": list(
-                tool.get(
-                    "domain_terms"
-                )
-                or []
-            ),
-
-            "required_capabilities": list(
-                tool.get(
-                    "required_capabilities"
-                )
-                or []
-            ),
-
-            "optional_capabilities": list(
-                tool.get(
-                    "optional_capabilities"
-                )
-                or []
-            ),
-
-            "input_schema": (
-                tool.get("input_schema")
-                or {}
-            ),
-
-            "output_schema": (
-                tool.get("output_schema")
-                or {}
-            ),
-
-            "artifact_outputs": list(
-                tool.get(
-                    "artifact_outputs"
-                )
-                or []
-            ),
-
-            "side_effects": list(
-                tool.get("side_effects")
-                or []
-            ),
-
-            "similarity": (
-                score_by_tool.get(
-                    tool_id,
-                    -1.0,
-                )
-            ),
-
-            "recalled_for_capabilities": list(
-                recalled_for_capabilities.get(
-                    tool_id,
-                    [],
-                )
-            ),
-
-            "functions": functions,
-        })
+                "recall_sources": list(
+                    recall_sources_by_tool
+                    .get(
+                        tool_id
+                    )
+                    or []
+                ),
+                "functions": functions,
+            }
+        )
 
     logger.info(
         "[Creator]"
@@ -2303,33 +2575,26 @@ def _recall_creator_tool_candidates(
                 "event": (
                     "creator_tool_recall_result"
                 ),
-
                 "source": (
                     embedding_source
                 ),
-
                 "required_capabilities": (
                     required_capabilities
                 ),
-
                 "capability_owners": (
                     capability_owners
                 ),
-
-                "top_k_per_capability": (
-                    per_capability_limit
+                "top_k_per_query": (
+                    per_query_limit
                 ),
-
                 "registry_tool_count": len(
                     catalog
                 ),
-
                 "candidate_tool_ids": (
                     candidate_tool_ids
                 ),
-
                 "per_capability_candidates": (
-                    per_capability_candidates
+                    per_query_candidates
                 ),
             },
             ensure_ascii=False,
@@ -5207,31 +5472,277 @@ Creator 协议边界：
 
     return repaired
 
+def _creator_responsibility_feedback_recall_query(
+    *,
+    target_file: str,
+    file_spec: dict[str, Any],
+    responsibility_issues: list[
+        dict[str, Any]
+    ],
+) -> str:
+    """Build a compact embedding query from first-round responsibility errors.
+
+    Only responsibility semantics are projected into the embedding query.
+
+    The full script source and complete Tool contracts are intentionally not
+    embedded here because they introduce implementation/schema noise.
+    """
+
+    issue_fields = (
+        "id",
+        "failed_function",
+        "code_region",
+        "reason",
+        "missing_evidence",
+        "semantic_failure",
+        "minimal_edit",
+        "repair_instruction",
+        "repair_instructions",
+        "tool_id",
+        "candidate_tool_id",
+        "capability",
+        "capability_id",
+        "required_tool",
+        "missing_tool",
+        "helper",
+        "helper_name",
+    )
+
+    compact_issues: list[
+        dict[str, Any]
+    ] = []
+
+    for issue in (
+        responsibility_issues
+        or []
+    ):
+        if not isinstance(
+            issue,
+            dict,
+        ):
+            continue
+
+        compact_issue = {
+            field_name: issue.get(
+                field_name
+            )
+            for field_name
+            in issue_fields
+            if issue.get(
+                field_name
+            )
+            not in (
+                None,
+                "",
+                [],
+                {},
+            )
+        }
+
+        if compact_issue:
+            compact_issues.append(
+                compact_issue
+            )
+
+        if len(compact_issues) >= 8:
+            break
+
+    return "\n".join(
+        [
+            (
+                "根据 Creator 第一轮脚本责任校验反馈，"
+                "召回可能直接补足真实运行能力缺口的 "
+                "Tool Registry 工具。"
+            ),
+            (
+                "这里只做候选召回；不要把普通代码"
+                "实现错误强行解释为新的 capability。"
+            ),
+            "",
+            (
+                "target_file: "
+                f"{target_file}"
+            ),
+            (
+                "purpose: "
+                + str(
+                    file_spec.get(
+                        "purpose"
+                    )
+                    or ""
+                )
+            ),
+            (
+                "inputs: "
+                + json.dumps(
+                    file_spec.get(
+                        "inputs"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "outputs: "
+                + json.dumps(
+                    file_spec.get(
+                        "outputs"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            (
+                "required_capabilities: "
+                + json.dumps(
+                    file_spec.get(
+                        "required_capabilities"
+                    )
+                    or [],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+            "",
+            "responsibility_issues:",
+            json.dumps(
+                compact_issues,
+                ensure_ascii=False,
+                default=str,
+            )[:6000],
+        ]
+    )
+
 async def _plan_tool_pool_patch_from_responsibility_feedback(
     *,
     skill_name: str,
     target_file: str,
     file_spec: dict[str, Any],
-    responsibility_issues: list[dict[str, Any]],
+    responsibility_issues: list[
+        dict[str, Any]
+    ],
     script_content: str,
     requested_model: str | None,
 ) -> dict[str, Any]:
-    """Let the planning model decide whether responsibility feedback needs tools.
+    """Replan ToolPool from first-round responsibility feedback.
 
     The responsibility judge only reports the problem.
 
-    The planner decides whether the problem is:
-    - a code implementation problem, or
+    Candidate discovery uses the same Tool recall policy as final planning:
+
+        exact Registry capability seeds
+        UNION
+        embedding semantic top-k
+
+    The planning model decides whether the failure is:
+
+    - a code implementation problem; or
     - a real capability gap requiring a ToolPool proposal.
 
     Backend Gate remains the only authorization step.
     """
-    tool_context = _planner_shared_tool_context(
-        skill_name
+
+    shared_context = (
+        _planner_shared_tool_context(
+            skill_name
+        )
+    )
+
+    feedback_query = (
+        _creator_responsibility_feedback_recall_query(
+            target_file=target_file,
+            file_spec=file_spec,
+            responsibility_issues=(
+                responsibility_issues
+            ),
+        )
+    )
+
+    (
+        candidate_tool_catalog,
+        recall_source,
+    ) = (
+        _recall_creator_tool_candidates(
+            file_specs=[
+                file_spec
+            ],
+            top_k=3,
+            semantic_queries=[
+                {
+                    "query_id": (
+                        "responsibility_feedback"
+                    ),
+                    "query_text": (
+                        feedback_query
+                    ),
+                    "exact_capabilities": list(
+                        file_spec.get(
+                            "required_capabilities"
+                        )
+                        or []
+                    ),
+                    "recalled_capabilities": [],
+                    "query_source": (
+                        "responsibility_feedback"
+                    ),
+                }
+            ],
+        )
+    )
+
+    candidate_tool_ids = {
+        str(
+            item.get("tool_id")
+            or ""
+        ).strip()
+        for item
+        in candidate_tool_catalog
+        if (
+            isinstance(
+                item,
+                dict,
+            )
+            and str(
+                item.get("tool_id")
+                or ""
+            ).strip()
+        )
+    }
+
+    logger.info(
+        "[Creator]"
+        "[responsibility_tool_recall]"
+        "[result] %s",
+        json.dumps(
+            {
+                "event": (
+                    "creator_responsibility_"
+                    "tool_recall_result"
+                ),
+                "skill_name": (
+                    skill_name
+                ),
+                "target_file": (
+                    target_file
+                ),
+                "source": (
+                    recall_source
+                ),
+                "candidate_tool_ids": sorted(
+                    candidate_tool_ids
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
     )
 
     prompt = (
-        load_kernel_creator_for_phase("prepare_plan")
+        load_kernel_creator_for_phase(
+            "prepare_plan"
+        )
         + """
 你是 Creator 规划模型。
 
@@ -5239,6 +5750,17 @@ async def _plan_tool_pool_patch_from_responsibility_feedback(
 
 你的任务不是修代码。
 你的任务只是判断：当前反馈是否揭示了共享 ToolPool 中缺少真实能力。
+
+candidate_tool_catalog 已由统一 Tool recall 层产生：
+
+1. Registry exact capability contract seed；
+2. embedding semantic top-k expansion；
+3. 两者取并集。
+
+你只能在 candidate_tool_catalog 中判断是否存在真实能力补充。
+
+不要重新扫描完整 Tool Registry。
+不要自行提出候选集合之外的工具。
 
 只输出严格 JSON object：
 
@@ -5254,15 +5776,21 @@ async def _plan_tool_pool_patch_from_responsibility_feedback(
 }
 
 规则：
-- available_tool_catalog 是完整工具发现目录。
+
+- candidate_tool_catalog 是统一 Tool recall 候选集合。
 - current_tool_pool 是当前 Skill 唯一共享 ToolPool。
+- responsibility_issues 是责任判决模型报告的问题事实。
+- required_capabilities 是当前文件已经声明的业务能力合同。
 - 责任判决模型无权选择、授权或添加工具。
 - 写代码模型无权选择、授权或添加 ToolPool 外工具。
-- 你是规划模型；只有你可以根据责任反馈重新探索 available_tool_catalog 并提出 proposal。
+- 你是规划模型；你只在 candidate_tool_catalog 内判断是否需要提出 ToolPool proposal。
 - 如果当前 ToolPool 已足够，或者问题只是代码没有正确使用已有工具/本地逻辑，则 gap_type=code_problem，add_tool_requests=[]。
-- 只有职责客观需要 current_tool_pool 中不存在的能力，而且 available_tool_catalog 中存在匹配工具时，才 gap_type=capability_gap 并提出 add_tool_requests。
-- candidate_tool_id 必须精确来自 available_tool_catalog。
-- 不得根据文件名、角色名或固定业务词表机械匹配工具；必须结合当前文件责任、责任判决反馈、现有 ToolPool 和工具真实函数能力进行语义判断。
+- 只有职责客观需要 current_tool_pool 中不存在的能力，而且 candidate_tool_catalog 中存在真实匹配工具时，才 gap_type=capability_gap 并提出 add_tool_requests。
+- candidate_tool_id 必须精确来自 candidate_tool_catalog。
+- 不得根据文件名、角色名或固定业务词表机械匹配工具。
+- 必须结合当前文件责任、责任判决反馈、当前 ToolPool 和候选工具真实函数能力进行语义判断。
+- exact_contract 只表示 Registry 明确声明支持相关 capability，因此必须进入候选；它不代表必须选择。
+- embedding_top_k 只表示语义近邻候选；相似不代表应该选择。
 - 本阶段只能追加工具，remove_tool_requests 必须为空。
 - proposal 仍需 Backend Gate；你不能自行授权。
 """
@@ -5276,14 +5804,34 @@ async def _plan_tool_pool_patch_from_responsibility_feedback(
             responsibility_issues
         ),
         "script_content": str(
-            script_content or ""
+            script_content
+            or ""
         )[:16000],
-        **tool_context,
+        "tool_recall_source": (
+            recall_source
+        ),
+        "candidate_tool_catalog": (
+            candidate_tool_catalog
+        ),
+        "current_tool_pool": (
+            shared_context.get(
+                "current_tool_pool"
+            )
+            or {}
+        ),
+        "tool_contract": (
+            shared_context.get(
+                "tool_contract"
+            )
+            or {}
+        ),
     }
 
     route = route_model(
         "creator_prepare_plan",
-        requested_model=requested_model,
+        requested_model=(
+            requested_model
+        ),
         reason=(
             "creator responsibility feedback "
             "tool planning"
@@ -5308,17 +5856,90 @@ async def _plan_tool_pool_patch_from_responsibility_feedback(
         route.model,
     )
 
-    data = _parse_prepare_plan_json(text)
+    data = _parse_prepare_plan_json(
+        text
+    )
 
-    result = _apply_planner_tool_pool_patch(
-        skill_name=skill_name,
-        planner_output=data,
-        source_phase="responsibility_feedback",
-        allow_remove=False,
+    raw_patch = (
+        data.get(
+            "tool_pool_patch"
+        )
+        if isinstance(
+            data,
+            dict,
+        )
+        else None
+    )
+
+    invalid_candidate_tool_ids: list[
+        str
+    ] = []
+
+    if isinstance(
+        raw_patch,
+        dict,
+    ):
+        for raw_request in (
+            raw_patch.get(
+                "add_tool_requests"
+            )
+            or []
+        ):
+            if not isinstance(
+                raw_request,
+                dict,
+            ):
+                continue
+
+            candidate_tool_id = str(
+                raw_request.get(
+                    "candidate_tool_id"
+                )
+                or ""
+            ).strip()
+
+            if (
+                candidate_tool_id
+                and candidate_tool_id
+                not in candidate_tool_ids
+                and candidate_tool_id
+                not in invalid_candidate_tool_ids
+            ):
+                invalid_candidate_tool_ids.append(
+                    candidate_tool_id
+                )
+
+    if invalid_candidate_tool_ids:
+        raise RuntimeError(
+            (
+                "responsibility feedback planner "
+                "proposed tool IDs outside "
+                "embedding/exact recall candidates: "
+            )
+            + ", ".join(
+                invalid_candidate_tool_ids
+            )
+        )
+
+    result = (
+        _apply_planner_tool_pool_patch(
+            skill_name=skill_name,
+            planner_output=data,
+            source_phase=(
+                "responsibility_feedback"
+            ),
+            allow_remove=False,
+        )
     )
 
     return {
         "planner_decision": data,
+        "tool_recall_source": (
+            recall_source
+        ),
+        "candidate_tool_ids": sorted(
+            candidate_tool_ids
+        ),
         **result,
     }
 

@@ -4599,44 +4599,366 @@ def _extract_prepare_skill_plan_paths(blueprint_text: str) -> list[str]:
     return paths
 
 
-def _preflight_prepare_blueprint_text(blueprint_text: str) -> list[dict[str, Any]]:
-    issues: list[dict[str, Any]] = []
-    text = str(blueprint_text or "")
-    plan_paths = _extract_prepare_skill_plan_paths(text)
-    plan_path_set = set(plan_paths)
-    dynamic_re = re.compile(r"[<>{}\*]|\$\{|\[[^\]]*(?:name|path|file|ext|文件|名称)[^\]]*\]", re.I)
-    runtime_dir_re = re.compile(r"^(?:outputs?|OUTPUT_DIR|generated|build|dist|tmp)(?:/|$)", re.I)
+def _preflight_prepare_blueprint_text(
+    blueprint_text: str,
+) -> list[dict[str, Any]]:
+    """Validate explicit SkillPlan protocol fields without semantic reconstruction.
+
+    Only explicit SkillPlan blocks are contract sources.
+
+    A path appearing in prose, examples, protocol documentation, or host
+    execution guidance does not create a file-plan responsibility.
+    """
+
+    issues: list[
+        dict[str, Any]
+    ] = []
+
+    text = str(
+        blueprint_text
+        or ""
+    )
+
+    plan_paths = (
+        _extract_prepare_skill_plan_paths(
+            text
+        )
+    )
+
+    plan_path_set = set(
+        plan_paths
+    )
+
+    dynamic_re = re.compile(
+        (
+            r"[<>{}\*]|\$\{|"
+            r"\[[^\]]*"
+            r"(?:name|path|file|ext|文件|名称)"
+            r"[^\]]*\]"
+        ),
+        re.I,
+    )
+
+    runtime_dir_re = re.compile(
+        (
+            r"^(?:outputs?|OUTPUT_DIR|"
+            r"generated|build|dist|tmp)"
+            r"(?:/|$)"
+        ),
+        re.I,
+    )
+
+    runtime_dependency_re = re.compile(
+        (
+            r"outputs?/|OUTPUT_DIR|generated/|"
+            r"build/|dist/|tmp/|[<>{}\*]"
+        ),
+        re.I,
+    )
+
+    def plan_block(
+        path: str,
+    ) -> str:
+        match = re.search(
+            (
+                rf"(?ims)"
+                rf"^\s*-\s*path\s*:\s*"
+                rf"`?{re.escape(path)}`?\s*$"
+                rf"([\s\S]*?)"
+                rf"(?="
+                rf"^\s*-\s*path\s*:|"
+                rf"^\s*#{{1,6}}\s+|"
+                rf"\Z"
+                rf")"
+            ),
+            text,
+        )
+
+        return (
+            match.group(1)
+            if match
+            else ""
+        )
+
+    def list_field_values(
+        block: str,
+        field_name: str,
+    ) -> list[str]:
+        match = re.search(
+            (
+                rf"(?im)"
+                rf"^\s*{re.escape(field_name)}"
+                rf"\s*:\s*"
+                rf"\[?([^\]\n]*)\]?"
+                rf"\s*$"
+            ),
+            block,
+        )
+
+        if not match:
+            return []
+
+        raw = str(
+            match.group(1)
+            or ""
+        )
+
+        values: list[
+            str
+        ] = []
+
+        for item in re.split(
+            r"[,，、]\s*",
+            raw,
+        ):
+            value = (
+                str(item or "")
+                .strip()
+                .strip("'\"`")
+            )
+
+            if (
+                value
+                and value not in values
+            ):
+                values.append(
+                    value
+                )
+
+        return values
 
     for path in plan_paths:
-        normalized = _normalize_skill_path(path)
-        if normalized in {"assets", "assets/"}:
-            issues.append(_prepare_protocol_issue("invalid_asset_directory_path", "assets 不能声明为目录路径。", path=path))
-        if normalized.startswith("assets/") and dynamic_re.search(normalized):
-            issues.append(_prepare_protocol_issue("invalid_asset_placeholder_path", "assets path 不能包含占位符或通配符。", path=path))
-        if not normalized or normalized.endswith("/") or _is_directory_like_skill_path(normalized) or dynamic_re.search(normalized):
-            issues.append(_prepare_protocol_issue("invalid_dynamic_or_directory_path", "SkillPlan path 必须是具体文件路径。", path=path))
-        if runtime_dir_re.search(normalized):
-            issues.append(_prepare_protocol_issue("runtime_artifact_path_in_skill_plan", "运行时产物目录不能出现在 SkillPlan path。", path=path))
-        if normalized.startswith("assets/"):
-            block_match = re.search(rf"(?ims)^\s*-\s*path\s*:\s*`?{re.escape(path)}`?\s*$([\s\S]*?)(?=^\s*-\s*path\s*:|\Z)", text)
-            block = block_match.group(1) if block_match else ""
-            if not re.search(r"(?im)^\s*source\s*:\s*(user_upload|bundled)\s*$", block):
-                issues.append(_prepare_protocol_issue("asset_missing_source", "assets path 必须声明 source=user_upload 或 source=bundled。", path=path, field="source"))
-            if re.search(r"运行时|每次上传|用户输入|runtime\s+input|粘贴|待用户上传", block, re.I):
-                issues.append(_prepare_protocol_issue("runtime_input_described_as_asset", "运行时用户输入文件不能描述为 Creator assets。", path=path))
+        normalized = _normalize_skill_path(
+            path
+        )
 
-    for dep_match in re.finditer(r"(?im)^\s*dependencies\s*:\s*\[?([^\]\n]*)\]?", text):
-        deps = dep_match.group(1)
-        if re.search(r"outputs?/|OUTPUT_DIR|generated/|build/|dist/|tmp/|[<>{}\*]", deps, re.I):
-            issues.append(_prepare_protocol_issue("invalid_runtime_dependency", "dependencies 只能写运行前静态依赖，不能包含运行时产物、动态文件名或输出目录。", field="dependencies"))
+        block = plan_block(
+            path
+        )
 
-    declared_paths = set(_extract_declared_skill_paths(text))
-    concrete_declared = {
-        p for p in declared_paths
-        if p.startswith(("scripts/", "references/", "assets/")) and _has_file_extension(p)
-    }
-    for path in sorted(concrete_declared - plan_path_set):
-        issues.append(_prepare_protocol_issue("directory_or_text_path_missing_from_skill_plan", f"蓝图中出现的具体文件 {path} 必须在 SkillPlan path 中声明。", path=path))
+        if normalized in {
+            "assets",
+            "assets/",
+        }:
+            issues.append(
+                _prepare_protocol_issue(
+                    "invalid_asset_directory_path",
+                    (
+                        "assets 不能声明为"
+                        "目录路径。"
+                    ),
+                    path=path,
+                )
+            )
+
+        if (
+            normalized.startswith(
+                "assets/"
+            )
+            and dynamic_re.search(
+                normalized
+            )
+        ):
+            issues.append(
+                _prepare_protocol_issue(
+                    "invalid_asset_placeholder_path",
+                    (
+                        "assets path 不能包含"
+                        "占位符或通配符。"
+                    ),
+                    path=path,
+                )
+            )
+
+        if (
+            not normalized
+            or normalized.endswith("/")
+            or _is_directory_like_skill_path(
+                normalized
+            )
+            or dynamic_re.search(
+                normalized
+            )
+        ):
+            issues.append(
+                _prepare_protocol_issue(
+                    (
+                        "invalid_dynamic_or_"
+                        "directory_path"
+                    ),
+                    (
+                        "SkillPlan path 必须是"
+                        "具体文件路径。"
+                    ),
+                    path=path,
+                )
+            )
+
+        if runtime_dir_re.search(
+            normalized
+        ):
+            issues.append(
+                _prepare_protocol_issue(
+                    (
+                        "runtime_artifact_path_"
+                        "in_skill_plan"
+                    ),
+                    (
+                        "运行时产物目录不能出现"
+                        "在 SkillPlan path。"
+                    ),
+                    path=path,
+                )
+            )
+
+        if normalized.startswith(
+            "assets/"
+        ):
+            if not re.search(
+                (
+                    r"(?im)"
+                    r"^\s*source\s*:\s*"
+                    r"(user_upload|bundled)\s*$"
+                ),
+                block,
+            ):
+                issues.append(
+                    _prepare_protocol_issue(
+                        "asset_missing_source",
+                        (
+                            "assets path 必须声明 "
+                            "source=user_upload "
+                            "或 source=bundled。"
+                        ),
+                        path=path,
+                        field="source",
+                    )
+                )
+
+            if re.search(
+                (
+                    r"运行时|每次上传|用户输入|"
+                    r"runtime\s+input|粘贴|"
+                    r"待用户上传"
+                ),
+                block,
+                re.I,
+            ):
+                issues.append(
+                    _prepare_protocol_issue(
+                        (
+                            "runtime_input_"
+                            "described_as_asset"
+                        ),
+                        (
+                            "运行时用户输入文件"
+                            "不能描述为 Creator assets。"
+                        ),
+                        path=path,
+                    )
+                )
+
+        dependencies = list_field_values(
+            block,
+            "dependencies",
+        )
+
+        references = list_field_values(
+            block,
+            "references",
+        )
+
+        for dependency in dependencies:
+            if runtime_dependency_re.search(
+                dependency
+            ):
+                issues.append(
+                    _prepare_protocol_issue(
+                        "invalid_runtime_dependency",
+                        (
+                            "dependencies 只能写"
+                            "运行前静态依赖，不能包含"
+                            "运行时产物、动态文件名"
+                            "或输出目录。"
+                        ),
+                        path=path,
+                        field="dependencies",
+                    )
+                )
+
+                continue
+
+            normalized_dependency = (
+                _normalize_skill_path(
+                    dependency
+                )
+            )
+
+            if (
+                normalized_dependency.startswith(
+                    (
+                        "references/",
+                        "assets/",
+                    )
+                )
+                and _has_file_extension(
+                    normalized_dependency
+                )
+                and normalized_dependency
+                not in plan_path_set
+            ):
+                issues.append(
+                    _prepare_protocol_issue(
+                        (
+                            "dependency_missing_"
+                            "from_skill_plan"
+                        ),
+                        (
+                            "SkillPlan dependencies "
+                            "引用了未声明的静态文件 "
+                            f"{normalized_dependency}。"
+                        ),
+                        path=normalized_dependency,
+                        field="dependencies",
+                    )
+                )
+
+        for reference in references:
+            normalized_reference = (
+                _normalize_skill_path(
+                    reference
+                )
+            )
+
+            if (
+                normalized_reference.startswith(
+                    (
+                        "references/",
+                        "assets/",
+                    )
+                )
+                and _has_file_extension(
+                    normalized_reference
+                )
+                and normalized_reference
+                not in plan_path_set
+            ):
+                issues.append(
+                    _prepare_protocol_issue(
+                        (
+                            "reference_missing_"
+                            "from_skill_plan"
+                        ),
+                        (
+                            "SkillPlan references "
+                            "引用了未声明的静态文件 "
+                            f"{normalized_reference}。"
+                        ),
+                        path=normalized_reference,
+                        field="references",
+                    )
+                )
+
     return issues
 
 
@@ -4719,15 +5041,25 @@ def _insert_prepare_reference_plan_blocks(blueprint_text: str, blocks: list[str]
     return (before + addition + "\n" + after).strip()
 
 
-def _normalize_prepare_blueprint_references(blueprint_text: str) -> str:
-    """Deterministically add SkillPlan entries for concrete references/*.md mentions."""
-    text = str(blueprint_text or "")
-    plan_paths = set(_extract_prepare_skill_plan_paths(text))
-    missing_refs = sorted(path for path in _extract_prepare_reference_paths(text) if path not in plan_paths)
-    if not missing_refs:
-        return text
-    blocks = [_prepare_reference_plan_block(path) for path in missing_refs]
-    return _insert_prepare_reference_plan_blocks(text, blocks)
+def _normalize_prepare_blueprint_references(
+    blueprint_text: str,
+) -> str:
+    """Preserve the blueprint reference plan exactly as declared.
+
+    Reference files are business-plan facts.
+
+    The backend must not create a new SkillPlan reference entry merely because a
+    references/*.md path appears in prose, protocol guidance, command examples,
+    or explanatory text.
+
+    Missing concrete references are validated by
+    _preflight_prepare_blueprint_text against explicit SkillPlan fields.
+    """
+
+    return str(
+        blueprint_text
+        or ""
+    ).strip()
 
 
 async def _repair_prepare_blueprint_protocol(
@@ -5004,12 +5336,13 @@ def _blocked_prepare_response(request: PreparePlanRequest, summary: PreparePlanR
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
 ) -> dict[str, Any]:
-    """Only judge requirement maturity and collect business clarification.
+    """Judge business requirement maturity and produce the provisional blueprint.
 
-    Tool discovery must not happen here. The first legal tool-discovery point is
-    _prepare_summarize_confirmed_requirements(), after business clarification has
-    finished and creation points are being determined.
+    This phase owns business action semantics and blueprint planning.
+
+    Tool discovery and ToolPool mutation are forbidden here.
     """
+
     existing_context = (
         _read_prepare_existing_skill_context(
             request.skill_name
@@ -5019,27 +5352,88 @@ async def _generate_internal_blueprint_or_questions(
     )
 
     system_prompt = (
-        load_kernel_creator_for_phase("prepare_plan")
+        load_kernel_creator_for_phase(
+            "prepare_plan"
+        )
         + """
-你现在服务 /api/creator/prepare-plan。只输出严格 JSON object，不要 Markdown，不要解释文本。
+你现在服务 /api/creator/prepare-plan。
+
+只输出严格 JSON object。
+不要 Markdown。
+不要解释 JSON 外文本。
 
 当前阶段只负责：
+
 1. 判断业务需求是否已经足够明确；
 2. 信息不足时提出一个真正阻塞创建计划的业务问题；
-3. 信息足够时形成 provisional internal_blueprint_text，供后续创建要点归纳使用。
+3. 信息足够时生成 provisional internal_blueprint_text。
 
-当前阶段不是工具发现阶段。
-不得探索工具目录。
-不得选择具体工具。
-不得提出 tool_pool_patch。
-不得因为上传文件中的 candidate_tools 或平台已有工具反向修改用户需求。
-不得输出或填写具体 selected_tools。
-不得输出或填写具体 required_tool_slots。
-required_capabilities 只能表达语义能力需求，不能填写注册工具 ID。
+internal_blueprint_text 是完整业务蓝图事实源。
 
-真正的工具发现与 ToolPool 调整发生在后续创建要点、最终蓝图、蓝图修复和责任反馈规划阶段。
+review_summary 只是同一响应中的临时展示摘要。
+后端不会使用 review_summary 重建蓝图。
+因此必须先正确规划完整蓝图，再映射摘要；不得反过来根据摘要扩写蓝图。
 
-返回格式：
+当前阶段不是 Tool Registry 发现阶段。
+
+禁止：
+
+- 探索工具目录；
+- 选择具体 Registry tool_id；
+- 提出 tool_pool_patch；
+- 修改 ToolPool；
+- 根据 uploaded_files.candidate_tools 反向修改业务需求；
+- 输出 selected_tools；
+- 输出 required_tool_slots。
+
+required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义能力。
+
+## 业务动作方向必须保持
+
+先区分：
+
+- 用户明确提供什么；
+- 用户要求系统生成、创建、编写、转换、分析或处理什么；
+- 最终必须交付什么。
+
+不得把“用户要求系统生成的对象”自动改成“用户必须先提供的输入”。
+
+例如：
+
+- 用户要求生成/编写某个内容时，该内容默认是系统责任，不是运行时前置输入；
+- 只有用户明确表示“我会提供已有内容”“基于我上传的内容处理”时，才把已有完整内容作为输入；
+- 用户要求生成 artifact，不代表需要解析同类已有 artifact；
+- 用户要求生成图像，不代表需要理解已有图像；
+- 用户要求构建文档，不代表需要读取或解析已有同类文档。
+
+必须保留用户动作方向。
+
+不得只抓取业务实体而丢失动作。
+
+规划 I/O 时：
+
+- input 必须是用户实际提供的最小前置条件；
+- output 必须覆盖用户要求系统完成的最终责任；
+- workflow 必须真实包含从 input 到 output 的业务动作链；
+- 不得把 output 倒置成 input；
+- 不得把生成任务降级为已有内容的格式转换，除非用户明确这样要求。
+
+## Capability 声明规则
+
+每个 script 的 required_capabilities 必须来自该 script 实际执行动作。
+
+动作方向必须一致：
+
+- generate/create/build 与 parse/read/extract 不等价；
+- 生成某类 artifact 不自动需要该 artifact 的解析能力；
+- 生成图片不自动需要视觉理解能力；
+- 只有脚本确实消费并语义理解已有图片时，才声明图像/视觉理解能力；
+- capability 不得根据相邻概念、文件名或最终 artifact 类型机械扩展。
+
+不得填写具体 Registry tool_id。
+
+## 返回格式
+
 {
   "status": "ready" | "needs_clarification" | "blocked",
   "clarifying_questions": ["只包含一个真正必要且带选项的问题"],
@@ -5053,97 +5447,126 @@ required_capabilities 只能表达语义能力需求，不能填写注册工具 
     "risks": [],
     "changes": []
   },
-  "internal_blueprint_text": "当 status=ready 时填写 provisional Skill 架构蓝图",
+  "internal_blueprint_text": "status=ready 时填写 provisional Skill 架构蓝图",
   "skill_name": "可选",
   "blockers": []
 }
 
-规划约束：
-- status=ready 之前必须先判断需求成熟度；不要直接把粗需求扩写成 ready 蓝图。
-- 信息足够时 status=ready，并生成 provisional internal_blueprint_text。
-- 信息不足且 clarification_rounds 未达到上限时 status=needs_clarification。
-- clarifying_questions 必须只包含 1 个问题。
-- 只能问当前最阻塞生成或 E2E 的业务问题。
-- 问题必须带 2-4 个选项。
-- 每轮 needs_clarification 只能问一个问题；下一个问题必须基于 conversation_history 和 human_feedback 中上一轮的回答继续判断。
-- 如果 clarification_rounds 达到上限，不得继续返回业务澄清问题；达到上限后必须归纳创建要点，并询问用户是否补充。
-- 创建要点必须体现蓝图和责任图谱合同需要落实的功能，不要输出风险项。
-- 用户确认无补充后，不得继续 needs_clarification，必须生成 internal_blueprint_text。
-- 用户补充后，重新归纳业务需求；达到补充上限后必须生成 internal_blueprint_text。
-- “是否还有其他补充内容”必须作为所有必要问题解决后的单独一轮问题；不要和业务问题放在同一轮。
-- 如果用户选择“有，我补充说明”，不得 ready，应等待用户补充。
-- 无法继续且用户必须先提供外部素材、权限或上下文时 status=blocked，并说明 blockers。
-- 不要询问使用平台、使用频率、质量/速度优先级、是否拆模块等非阻塞问题。
-- 文件数量只在 prepare-plan 蓝图阶段决定；蓝图通过后不得新增、删除、拆分或合并脚本文件。
-- 不默认单脚本，也不按自然语言步骤机械增加脚本。
-- 脚本数量必须来自任务复杂度、输入输出合同、可验证中间产物和职责边界。
-- 原子任务或高度耦合任务可用 1 个脚本。
-- 存在清晰阶段边界、不同产物类型、解析-生成-构建链路、fanout/aggregate 边界时可拆为多个脚本。
-- 当前平台没有显式 loop/map/foreach 节点；批量、逐项、顺序映射和聚合交付必须由某个脚本内部承担。
+## 规划约束
+
+- status=ready 前先判断需求成熟度。
+- 信息不足且 clarification_rounds 未达到上限时，status=needs_clarification。
+- clarifying_questions 只能有 1 个问题。
+- 问题必须是当前最阻塞创建计划的问题，并带 2-4 个选项。
+- 每轮只能问一个业务问题。
+- 后续问题必须结合 conversation_history 与 human_feedback 中已有回答。
+- 已经回答过的问题不得重复询问。
+- clarification_rounds 达到上限时不得继续无限追问。
+- 用户确认无补充后不得继续 needs_clarification。
+- 用户补充业务要求时，可以基于 previous_blueprint_text 与新增 feedback 修订 full blueprint。
+- 除真实 supplement/revise 外，不得重新定义已经明确的业务动作方向。
+
+- 文件数量只在 blueprint planning 阶段决定。
+- 不默认单脚本。
+- 不按自然语言步骤机械拆文件。
+- 脚本数量来自真实职责边界、输入输出合同、中间产物和可验证阶段边界。
+- 高度耦合任务可以使用一个脚本。
+- 清晰的阶段边界、不同 artifact 类型或真实 producer/consumer 边界可以拆脚本。
+- 当前平台没有显式 loop/map/foreach runtime node。
+- 内部遍历、批处理、顺序映射可以由脚本内部实现。
+- 内部循环不代表 script boundary input/output 必须是集合类型。
+
 - uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets。
-- uploaded_files 中的 candidate_tools 只是上传分析阶段提供的候选元数据；当前阶段不得据此选择工具或写入 ToolPool。
-- confirmed_uploaded_assets 是用户确认过的可用静态素材。
-- unselected_uploaded_files 只能作为上下文或运行时输入参考。
-- 没有用户明确确认“固定加入 Skill assets”不得写入 assets/**。
-- 如果上传文件用途不明确，必须追问并区分：只作为本次创建参考、作为未来运行 Skill 的输入、固定加入 Skill assets。
-- assets/** 只能声明 user_upload 或 bundled；不要把运行时用户输入文件或运行时产物放入 assets。
-- 不要生成 assets/、assets/<name.ext>、assets/* 或动态 assets path。
-- 目录结构不要列具体文件名；具体文件只在 SkillPlan 中声明。
-- 资源清单只能列 SkillPlan path 中已声明的 references/assets。
-- dependencies/references/resource list 中出现的 references/*.md 必须有对应 SkillPlan path。
-- 不要把 kernel/protocol 示例 reference 文件名抄进业务蓝图。
-- 不确定是否需要 reference 时默认不创建 reference 文件，也不要写入资源清单。
-- 如确需 reference，必须在 SkillPlan 中声明完整 reference block：path/role/inputs/outputs/dependencies/required_capabilities/forbidden_capabilities/references。
-- provisional blueprint 中可以描述“需要图像理解”“需要文本生成”“需要构建 PDF”等语义能力，但不能填写具体注册 tool_id。
+- confirmed_uploaded_assets 才是用户确认加入 Skill 的静态素材。
+- 没有用户明确确认，不得创建 assets/**。
+- 运行时用户输入不是 Creator assets。
+- 运行时生成产物不是 Creator assets。
+- assets/** 只能声明 source=user_upload 或 source=bundled。
+
+- 目录结构只展示目录。
+- 具体文件只在 SkillPlan 中声明。
+- references/*.md 只有业务确实需要静态参考资料时才创建。
+- 协议示例、kernel 示例、命令示例中的 references/*.md 路径不是业务文件。
+- 不确定是否需要 reference 时默认不创建。
+- dependencies/references 中真实引用的静态文件必须在 SkillPlan 中显式声明。
+
+- provisional blueprint 可以声明 text_generation、image_generation、pdf_generation 等抽象语义能力。
+- 具体 Registry Tool 选择由后续 Final Tool Selector 完成。
 """
     )
 
-    confirmed_uploaded_assets, unselected_uploaded_files = (
-        _split_uploaded_asset_decisions(
-            request.uploaded_files
-        )
+    (
+        confirmed_uploaded_assets,
+        unselected_uploaded_files,
+    ) = _split_uploaded_asset_decisions(
+        request.uploaded_files
     )
 
     payload = {
         "mode": request.mode,
-        "skill_name": request.skill_name,
-        "user_request": request.user_request,
+
+        "skill_name": (
+            request.skill_name
+        ),
+
+        "user_request": (
+            request.user_request
+        ),
+
         "conversation_history": (
             request.conversation_history
         ),
-        "uploaded_files": request.uploaded_files,
+
+        "uploaded_files": (
+            request.uploaded_files
+        ),
+
         "confirmed_uploaded_assets": (
             confirmed_uploaded_assets
         ),
+
         "unselected_uploaded_files": (
             unselected_uploaded_files
         ),
+
         "previous_blueprint_text": (
             request.previous_blueprint_text
         ),
-        "human_feedback": request.human_feedback,
-        "existing_skill_context": existing_context,
+
+        "human_feedback": (
+            request.human_feedback
+        ),
+
+        "existing_skill_context": (
+            existing_context
+        ),
+
         "clarification_rounds": (
             _count_prepare_business_clarification_rounds(
                 request
             )
         ),
+
         "max_clarification_rounds": (
             MAX_PREPARE_BUSINESS_CLARIFICATION_ROUNDS
         ),
+
         "clarification_limit_reached": (
             _prepare_business_clarification_limit_reached(
                 request
             )
         ),
+
         "supplement_rounds": (
             _count_prepare_supplement_rounds(
                 request
             )
         ),
+
         "max_supplement_rounds": (
             MAX_PREPARE_SUPPLEMENT_ROUNDS
         ),
+
         "user_confirmed_no_more_supplement": (
             _prepare_user_confirmed_no_more_supplement(
                 request
@@ -5154,14 +5577,19 @@ required_capabilities 只能表达语义能力需求，不能填写注册工具 
     route = route_model(
         "creator_prepare_plan",
         requested_model=request.model,
-        reason="creator prepare plan",
+        reason=(
+            "creator business action "
+            "and blueprint planning"
+        ),
     )
 
     text = await complete_chat_once(
         [
             {
                 "role": "system",
-                "content": system_prompt,
+                "content": (
+                    system_prompt
+                ),
             },
             {
                 "role": "user",
@@ -5175,11 +5603,24 @@ required_capabilities 只能表达语义能力需求，不能填写注册工具 
         route.model,
     )
 
-    data = _parse_prepare_plan_json(text)
+    data = _parse_prepare_plan_json(
+        text
+    )
 
-    # Defensive boundary: this phase must never mutate ToolPool even if the
-    # model returns an unexpected patch field.
-    data.pop("tool_pool_patch", None)
+    data.pop(
+        "tool_pool_patch",
+        None,
+    )
+
+    data.pop(
+        "selected_tools",
+        None,
+    )
+
+    data.pop(
+        "required_tool_slots",
+        None,
+    )
 
     return data
 
@@ -5731,101 +6172,388 @@ async def _extract_requirement_graph_with_validator(
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
-    """Build deterministic responsibility graph and optionally apply compact model patches."""
-    graph = validate_requirement_graph_schema(build_default_requirement_graph(files_out), files_out)
-    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator responsibility graph patch")
-    file_payload = [file_spec.model_dump(mode="json", exclude={"requirements"}) for file_spec in files_out]
+    """Build the responsibility graph deterministically and allow compact patches.
+
+    Capability ownership is immutable in this phase.
+
+    required_tools come only from:
+
+        FileSpecOut.required_capabilities
+
+    The validator may append:
+    - must_do;
+    - must_not_do;
+    - depends_on.
+
+    The validator may not replace the graph or patch capabilities.
+    """
+
+    _ = blueprint_text
+
+    graph = validate_requirement_graph_schema(
+        build_default_requirement_graph(
+            files_out
+        ),
+        files_out,
+    )
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=(
+            "creator responsibility graph "
+            "compact patch"
+        ),
+    )
+
+    file_payload = [
+        file_spec.model_dump(
+            mode="json",
+            exclude={
+                "requirements",
+            },
+        )
+        for file_spec
+        in files_out
+    ]
+
     messages = [
         {
             "role": "system",
             "content": (
-                "你是 Creator requirement graph patcher，只输出严格 JSON object。\n"
-                "后端已经根据 file_plan/contracts 生成 deterministic requirement graph；你只能返回 compact patches。\n"
-                "patch 只能补充 must_do、must_not_do、depends_on；不得输出 purpose、constraints、evidence_policy、graph_quality、non_requirements、expected、minimal_edit。\n"
-                "platform_io_contract 是 deterministic and immutable，只读参考；不得输出、修改或 patch platform_io_contract。\n"
-                "requirement graph patcher 不负责字段级强对齐；inputs/outputs 是共同推荐字段；platform_io_contract 只读。不得把平台字段词表复制成内部业务字段，不得输出字段映射硬规则。\n"
-                "不得 patch platform_input_node/platform_output_node/platform_io_contract，不得输出 dataflow_edges 作为 hard contract。\n"
-                "purpose 已由 workflow_allocation 或原始文件计划确定；requirement_graph 阶段不得修改 purpose，不得重新划分脚本职责，不得改写 final inputs / final outputs。\n"
-                "must_do 只补关键职责缺口，保持短句、少量条目。\n"
-                "返回格式：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"must_do\":[],\"must_not_do\":[],\"depends_on\":[]}]}。"
-                "不得 patch platform_input_node 或 platform_output_node；平台边界节点由系统确定性注入并覆盖模型输出。"
+                "你是 Creator requirement graph patcher。"
+                "只输出严格 JSON object。\n\n"
+
+                "后端已经从 normalized file_plan/contracts "
+                "确定性生成责任图谱。\n"
+
+                "required_tools 已由 "
+                "FileSpecOut.required_capabilities "
+                "确定，是只读能力合同。\n\n"
+
+                "你只能补充：\n"
+                "- must_do\n"
+                "- must_not_do\n"
+                "- depends_on\n\n"
+
+                "禁止：\n"
+                "- 输出完整 requirements graph；\n"
+                "- 修改 required_tools；\n"
+                "- 增加 capability；\n"
+                "- 删除 capability；\n"
+                "- 修改 purpose；\n"
+                "- 修改 inputs；\n"
+                "- 修改 outputs；\n"
+                "- 修改 file topology；\n"
+                "- 修改 platform boundary；\n"
+                "- 输出 constraints；\n"
+                "- 输出 evidence_policy；\n\n"
+
+                "must_do 只补 normalized file contract "
+                "尚未明确表达、但从相邻 script contracts "
+                "可以直接证明的关键责任。\n"
+
+                "不要从完整蓝图自然语言、协议示例、"
+                "Creator 文档模板中提取 requirement terms。\n"
+
+                "每个 patch 字段最多 8 个条目；"
+                "每个条目保持简短。\n\n"
+
+                "返回：\n"
+                "{"
+                "\"patches\":["
+                "{"
+                "\"target_file\":\"scripts/x.py\","
+                "\"must_do\":[],"
+                "\"must_not_do\":[],"
+                "\"depends_on\":[]"
+                "}"
+                "]"
+                "}"
             ),
         },
         {
             "role": "user",
             "content": (
-                "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
-                "file_plan_and_contracts:\n" + json.dumps(file_payload, ensure_ascii=False, default=str)[:20000] + "\n\n"
-                "platform_io_contract (read-only, deterministic, immutable):\n" + platform_io_contract_prompt_text() + "\n\n"
-                "deterministic_responsibility_graph:\n" + graph.model_dump_json()[:12000]
+                "normalized_file_plan_and_contracts:\n"
+                + json.dumps(
+                    file_payload,
+                    ensure_ascii=False,
+                    default=str,
+                )[:20000]
+                + "\n\n"
+                "deterministic_responsibility_graph:\n"
+                + graph.model_dump_json()[:16000]
+                + "\n\n"
+                "platform_io_contract "
+                "(read-only, deterministic):\n"
+                + platform_io_contract_prompt_text()
             ),
         },
     ]
+
     try:
-        text = await complete_chat_once(messages, route.model)
-        data = parse_requirement_graph_result(text)
-        if isinstance(data, dict) and "patches" not in data and "requirements" in data:
-            graph_from_validator = normalize_requirement_graph(data)
-            graph_from_validator.requirement_graph_source = "validator"
-            graph_from_validator.requirement_graph_quality = "full"
-            return validate_requirement_graph_schema(graph_from_validator, files_out)
-        patches = data.get("patches", []) if isinstance(data, dict) else []
-        if not isinstance(patches, list):
-            raise RequirementGraphValidationError("Responsibility graph patch JSON must contain patches list.", code="validator_incomplete")
-        by_file = {item.target_file: item for item in graph.requirements}
-        allowed = {"target_file", "must_do", "must_not_do", "depends_on"}
-        ignored_purpose_targets: list[str] = []
-        requirement_targets: list[str] = []
-        for idx, patch in enumerate(patches):
-            if not isinstance(patch, dict):
-                raise RequirementGraphValidationError("Responsibility graph patch item must be object.", code="validator_incomplete", details={"index": idx})
-            unknown_fields = set(patch) - allowed
-            if "purpose" in unknown_fields:
-                target_for_log = str(patch.get("target_file") or "").strip()
-                if target_for_log:
-                    ignored_purpose_targets.append(target_for_log)
-                unknown_fields.remove("purpose")
+        text = await complete_chat_once(
+            messages,
+            route.model,
+        )
+
+        data = parse_requirement_graph_result(
+            text
+        )
+
+        patches = (
+            data.get("patches")
+            if isinstance(
+                data,
+                dict,
+            )
+            else None
+        )
+
+        if not isinstance(
+            patches,
+            list,
+        ):
+            raise RequirementGraphValidationError(
+                (
+                    "Responsibility graph validator "
+                    "must return compact patches list."
+                ),
+                code="validator_incomplete",
+            )
+
+        by_file = {
+            item.target_file: item
+            for item
+            in graph.requirements
+        }
+
+        allowed_fields = {
+            "target_file",
+            "must_do",
+            "must_not_do",
+            "depends_on",
+        }
+
+        requirement_targets: list[
+            str
+        ] = []
+
+        for index, patch in enumerate(
+            patches
+        ):
+            if not isinstance(
+                patch,
+                dict,
+            ):
+                raise RequirementGraphValidationError(
+                    (
+                        "Responsibility graph patch "
+                        "item must be an object."
+                    ),
+                    code="validator_incomplete",
+                    details={
+                        "index": index,
+                    },
+                )
+
+            unknown_fields = (
+                set(patch)
+                - allowed_fields
+            )
+
             if unknown_fields:
-                raise RequirementGraphValidationError("Requirement graph patch contains unsupported fields.", code="validator_incomplete", details={"index": idx, "fields": sorted(unknown_fields)})
-            target = str(patch.get("target_file") or "").strip()
-            item = by_file.get(target)
-            if not item:
+                raise RequirementGraphValidationError(
+                    (
+                        "Requirement graph patch "
+                        "contains unsupported fields."
+                    ),
+                    code="validator_incomplete",
+                    details={
+                        "index": index,
+                        "fields": sorted(
+                            unknown_fields
+                        ),
+                    },
+                )
+
+            target = str(
+                patch.get("target_file")
+                or ""
+            ).strip()
+
+            item = by_file.get(
+                target
+            )
+
+            if item is None:
                 continue
+
             patched_requirement = False
-            for field_name in ("must_do", "must_not_do", "depends_on"):
-                values = RequirementItem._coerce_string_list(patch.get(field_name))
-                if values:
-                    existing = list(getattr(item, field_name))
-                    for value in values:
-                        if value not in existing:
-                            existing.append(value)
-                            patched_requirement = True
-                    setattr(item, field_name, existing)
+
+            for field_name in (
+                "must_do",
+                "must_not_do",
+                "depends_on",
+            ):
+                values = (
+                    RequirementItem
+                    ._coerce_string_list(
+                        patch.get(
+                            field_name
+                        )
+                    )
+                )
+
+                if not values:
+                    continue
+
+                if len(values) > 8:
+                    raise RequirementGraphValidationError(
+                        (
+                            "Requirement graph patch "
+                            "contains too many items."
+                        ),
+                        code="validator_incomplete",
+                        details={
+                            "index": index,
+                            "field": field_name,
+                            "count": len(values),
+                        },
+                    )
+
+                if any(
+                    len(value) > 800
+                    for value in values
+                ):
+                    raise RequirementGraphValidationError(
+                        (
+                            "Requirement graph patch "
+                            "contains an oversized "
+                            "responsibility item."
+                        ),
+                        code="validator_incomplete",
+                        details={
+                            "index": index,
+                            "field": field_name,
+                        },
+                    )
+
+                existing = list(
+                    getattr(
+                        item,
+                        field_name,
+                    )
+                )
+
+                for value in values:
+                    if value not in existing:
+                        existing.append(
+                            value
+                        )
+
+                        patched_requirement = (
+                            True
+                        )
+
+                setattr(
+                    item,
+                    field_name,
+                    existing,
+                )
+
             if patched_requirement:
-                requirement_targets.append(target)
-        graph.requirement_graph_source = "deterministic+patch"
-        logger.info("[Creator][requirement_graph_patch][result] %s", json.dumps({
-            "event": "requirement_graph_patch_result",
-            "patch_count": len(patches),
-            "requirement_targets": sorted(set(requirement_targets)),
-            "ignored_purpose_targets": sorted(set(ignored_purpose_targets)),
-        }, ensure_ascii=False, default=str))
-        return graph
+                requirement_targets.append(
+                    target
+                )
+
+        graph.requirement_graph_source = (
+            "deterministic_file_contracts+"
+            "compact_patch"
+        )
+
+        logger.info(
+            "[Creator]"
+            "[requirement_graph_patch]"
+            "[result] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "requirement_graph_patch_result"
+                    ),
+                    "patch_count": len(
+                        patches
+                    ),
+                    "requirement_targets": sorted(
+                        set(
+                            requirement_targets
+                        )
+                    ),
+                    "capability_source": (
+                        "file_specs."
+                        "required_capabilities"
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+        return validate_requirement_graph_schema(
+            graph,
+            files_out,
+        )
+
     except Exception as exc:
         if warnings is not None:
-            code = getattr(exc, "code", "validator_error")
+            code = getattr(
+                exc,
+                "code",
+                "validator_error",
+            )
+
             warnings.append({
-                "severity": "validator_warning",
+                "severity": (
+                    "validator_warning"
+                ),
                 "code": str(code),
-                "source": "responsibility_graph",
+                "source": (
+                    "responsibility_graph"
+                ),
                 "path": "",
-                "field": "requirement_graph",
-                "message": f"Responsibility graph patch model failed; using deterministic graph: {exc}",
+                "field": (
+                    "requirement_graph"
+                ),
+                "message": (
+                    "Responsibility graph patch "
+                    "model failed; using deterministic "
+                    f"graph: {exc}"
+                ),
             })
-        logger.info("[Creator][requirement_graph_patch][failed] %s", json.dumps({
-            "event": "requirement_graph_patch_failed",
-            "error": f"{type(exc).__name__}: {exc}",
-        }, ensure_ascii=False, default=str))
+
+        logger.info(
+            "[Creator]"
+            "[requirement_graph_patch]"
+            "[failed] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "requirement_graph_patch_failed"
+                    ),
+                    "error": (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
+                    "fallback": (
+                        "deterministic_file_contracts"
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
         return graph
 
 
@@ -5897,68 +6625,188 @@ def _normalize_file_plan_for_requirement_coverage(
     final_outputs: list[Any] | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Attach declared requirement coverage as script responsibility metadata.
+    """Attach compact deterministic coverage metadata.
 
-    Coverage is a planning/generation constraint only. It must never be
-    converted into runtime argv/stdout fields, and this pass must not create
-    generic bridge scripts that hide real planning gaps.
+    review_summary is display-only and never participates in backend
+    responsibility semantics.
+
+    The full blueprint is also not tokenized into generic requirement terms.
+
+    Coverage metadata only preserves normalized contract facts that are already
+    present on each FileSpecOut.
     """
-    warnings = warnings if warnings is not None else []
-    review_text = ""
-    if review_summary is not None:
-        review_text = json.dumps(review_summary.model_dump(mode="json"), ensure_ascii=False, default=str)
-    declared_terms = _coverage_terms_from_text("\n".join([blueprint_text or "", review_text, json.dumps(final_outputs or [], ensure_ascii=False, default=str)]))
-    if not declared_terms:
-        return
-    scripts = [item for item in files_out if item.path.startswith("scripts/") and item.required]
+
+    _ = blueprint_text
+    _ = review_summary
+    _ = final_outputs
+
+    warnings = (
+        warnings
+        if warnings is not None
+        else []
+    )
+
+    scripts = [
+        item
+        for item in (
+            files_out or []
+        )
+        if (
+            item.path.startswith(
+                "scripts/"
+            )
+            and item.required
+        )
+    ]
+
     if not scripts:
         return
 
-    covered_terms: set[str] = set()
-    for item in scripts:
-        text = _script_contract_text(item)
-        covered_terms.update(term for term in declared_terms if term in text)
-    missing_terms = [term for term in declared_terms if term not in covered_terms]
-
-    coverage_requirements = {
-        "declared_requirement_terms": declared_terms,
-        "declared_input_sources": _coverage_terms_from_text(str(getattr(review_summary, "input", "") if review_summary else "")),
-        "declared_input_formats": _coverage_terms_from_text(blueprint_text),
-        "required_core_actions": _coverage_terms_from_text(" ".join(getattr(review_summary, "workflow", []) if review_summary else [])),
-        "required_output_variants": _coverage_terms_from_text("\n".join([str(getattr(review_summary, "output", "") if review_summary else ""), json.dumps(final_outputs or [], ensure_ascii=False, default=str)])),
-        "required_reference_reads": [item.path for item in files_out if item.path.startswith("references/")],
-        "final_platform_output_obligations": [str(x) for x in (final_outputs or []) if str(x).strip()],
-    }
-
-    single_script = len(scripts) == 1
-    if single_script:
-        coverage_requirements["single_script_full_coverage_contract"] = True
+    single_script = (
+        len(scripts) == 1
+    )
 
     for script in scripts:
-        runtime_contract = dict(script.runtime_contract or {})
-        runtime_contract["coverage_requirements"] = dict(coverage_requirements)
-        script.runtime_contract = runtime_contract
+        required_reference_reads: list[
+            str
+        ] = []
+
+        for raw_path in [
+            *list(
+                script.dependencies
+                or []
+            ),
+            *list(
+                script.reference_files
+                or []
+            ),
+        ]:
+            path = str(
+                raw_path or ""
+            ).strip()
+
+            if (
+                path.startswith(
+                    "references/"
+                )
+                and path
+                not in required_reference_reads
+            ):
+                required_reference_reads.append(
+                    path
+                )
+
+        coverage_requirements = {
+            "required_capabilities": list(
+                script.required_capabilities
+                or []
+            ),
+
+            "required_reference_reads": (
+                required_reference_reads
+            ),
+        }
+
+        if single_script:
+            coverage_requirements[
+                "single_script_full_coverage_contract"
+            ] = True
+
+        runtime_contract = dict(
+            script.runtime_contract
+            or {}
+        )
+
+        runtime_contract[
+            "coverage_requirements"
+        ] = coverage_requirements
+
+        script.runtime_contract = (
+            runtime_contract
+        )
 
     if single_script:
         warnings.append({
             "severity": "info",
-            "code": "single_script_full_coverage_contract",
-            "source": "analyze_blueprint",
+
+            "code": (
+                "single_script_full_"
+                "coverage_contract"
+            ),
+
+            "source": (
+                "analyze_blueprint"
+            ),
+
             "path": scripts[0].path,
-            "field": "runtime_contract.coverage_requirements",
-            "message": "Single required script must satisfy the declared full-coverage responsibility contract; coverage is not an argv/stdout field.",
-            "missing_terms": missing_terms[:20],
+
+            "field": (
+                "runtime_contract."
+                "coverage_requirements"
+            ),
+
+            "message": (
+                "Single required script owns the "
+                "full normalized SkillPlan "
+                "responsibility. Coverage metadata "
+                "contains only explicit capability "
+                "and reference contracts."
+            ),
         })
-    if missing_terms:
-        warnings.append({
-            "severity": "planning_warning",
-            "code": "requirement_coverage_incomplete",
-            "source": "analyze_blueprint",
-            "path": "",
-            "field": "runtime_contract.coverage_requirements",
-            "missing_terms": missing_terms[:30],
-            "message": "File plan does not explicitly cover all declared requirement terms; planner should expand real script responsibilities or decompose into real workflow scripts.",
-        })
+
+    logger.info(
+        "[Creator]"
+        "[requirement_coverage]"
+        "[compact] %s",
+        json.dumps(
+            {
+                "event": (
+                    "creator_requirement_"
+                    "coverage_compact"
+                ),
+
+                "script_count": len(
+                    scripts
+                ),
+
+                "single_script": (
+                    single_script
+                ),
+
+                "capabilities_by_script": {
+                    script.path: list(
+                        script
+                        .required_capabilities
+                        or []
+                    )
+                    for script
+                    in scripts
+                },
+
+                "references_by_script": {
+                    script.path: list(
+                        (
+                            script.runtime_contract
+                            or {}
+                        )
+                        .get(
+                            "coverage_requirements",
+                            {},
+                        )
+                        .get(
+                            "required_reference_reads",
+                            [],
+                        )
+                        or []
+                    )
+                    for script
+                    in scripts
+                },
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
 
 async def _allocate_workflow_script_responsibilities(
     *,
@@ -5966,196 +6814,753 @@ async def _allocate_workflow_script_responsibilities(
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
-) -> tuple[str, set[str], bool]:
-    """Return (summary, applied patch targets, allocation resolved flag) after patching script contracts."""
+) -> tuple[
+    str,
+    set[str],
+    bool,
+]:
+    """Reconcile responsibilities only across multiple executable scripts.
+
+    A single required script already owns its blueprint-declared responsibility
+    and does not need inter-script allocation.
+
+    Internal iteration, fanout, mapping, or aggregation never implies that the
+    script boundary itself must use list/collection inputs or outputs.
+
+    Cardinality may change only when an actual upstream/downstream script
+    contract proves that the current boundary cannot connect the executable
+    workflow.
+    """
+
+    _ = blueprint_text
+
     targets = [
         file_spec
-        for file_spec in files_out
-        if file_spec.path.startswith("scripts/") and file_spec.required
+        for file_spec in (
+            files_out or []
+        )
+        if (
+            file_spec.path.startswith(
+                "scripts/"
+            )
+            and file_spec.required
+        )
     ]
+
     if not targets:
-        return "", set(), True
-    route = route_model(VALIDATOR_TASK, requested_model=requested_model, reason="creator workflow responsibility allocation")
+        return (
+            "",
+            set(),
+            True,
+        )
+
+    if len(targets) == 1:
+        target = targets[0]
+
+        summary = (
+            "Single required script keeps the "
+            "normalized blueprint contract. "
+            "Any internal iteration, mapping, "
+            "fanout, or aggregation remains an "
+            "implementation responsibility inside "
+            "the script and does not change the "
+            "workflow boundary IO cardinality."
+        )
+
+        logger.info(
+            "[Creator]"
+            "[workflow_allocation]"
+            "[single_script_preserved] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "workflow_allocation_"
+                        "single_script_preserved"
+                    ),
+
+                    "target": target.path,
+
+                    "inputs": list(
+                        target.inputs
+                        or []
+                    ),
+
+                    "outputs": list(
+                        target.outputs
+                        or []
+                    ),
+
+                    "required_capabilities": list(
+                        target
+                        .required_capabilities
+                        or []
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+        # Also protect the existing purpose from the
+        # later purpose-short-contract model pass.
+        return (
+            summary,
+            {
+                target.path,
+            },
+            True,
+        )
+
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=(
+            "creator cross-script workflow "
+            "responsibility allocation"
+        ),
+    )
+
     all_nodes = [
         {
             "path": item.path,
+
             "purpose": item.purpose,
+
             "role": item.role,
+
             "required": item.required,
-            "inputs": item.inputs,
-            "outputs": item.outputs,
-            "dependencies": item.dependencies,
+
+            "inputs": list(
+                item.inputs
+                or []
+            ),
+
+            "outputs": list(
+                item.outputs
+                or []
+            ),
+
+            "dependencies": list(
+                item.dependencies
+                or []
+            ),
+
+            "required_capabilities": list(
+                item.required_capabilities
+                or []
+            ),
+
+            "artifact_contract": (
+                item.artifact_contract
+                or {}
+            ),
         }
         for item in files_out
-        if item.path == "SKILL.md" or item.path.startswith(("scripts/", "references/", "assets/"))
+        if (
+            item.path == "SKILL.md"
+            or item.path.startswith(
+                (
+                    "scripts/",
+                    "references/",
+                    "assets/",
+                )
+            )
+        )
     ]
+
     payload = [
         {
             "path": item.path,
+
             "purpose": item.purpose,
+
             "role": item.role,
-            "inputs": item.inputs,
-            "outputs": item.outputs,
-            "dependencies": item.dependencies,
+
+            "inputs": list(
+                item.inputs
+                or []
+            ),
+
+            "outputs": list(
+                item.outputs
+                or []
+            ),
+
+            "dependencies": list(
+                item.dependencies
+                or []
+            ),
+
+            "required_capabilities": list(
+                item.required_capabilities
+                or []
+            ),
+
+            "artifact_contract": (
+                item.artifact_contract
+                or {}
+            ),
         }
         for item in targets
     ]
+
     messages = [
-        {"role": "system", "content": (
-            "你是 Creator workflow executable responsibility allocator，只输出严格 JSON object。\n"
-            "先在内部区分 executable workflow graph 与 reference/context graph（不要输出复杂结构）。\n"
-            "executable workflow graph 只能包含：platform guaranteed input envelope、required scripts/*.py、scripts stdout、scripts artifacts、final artifact；只有这些节点/边可以承担运行时 dataflow。\n"
-            "输出的 inputs/outputs 是 recommended shared vocabulary，用于 SKILL.md 和 script 生成时尽量采用一致字段；它们不是 hard validation schema，不要求与平台 IO 字段名相等，也不要求第一轮图谱阶段完全闭合。平台 IO 只作为来源/出口层说明。\n"
-            "SKILL.md、references/*.md、assets/** 只能作为 reference/context graph 中的说明、规范或资源上下文，不能作为可执行 dataflow 节点：SKILL.md 不承担字段转换、循环、聚合、排序、映射或产物生成；references/*.md 不产生 stdout 字段，不补齐 producer，不补齐集合结果；assets/** 只是上传或静态资源输入，不主动生成中间结果。\n"
-            "逐边判断：平台输入如何进入第一步；每个 required script 消费什么上游 stdout/artifact 或 platform runtime 输入；当前脚本完整交付什么；下游真正需要什么；是否存在局部自洽但全局断链；是否存在隐式循环、隐式聚合、集合到单项再到集合的问题；是否需要最小联动调整相邻上下游脚本的 purpose/inputs/outputs。\n"
-            "责任分配必须先从全局可执行合同推导，再落到单个脚本。全局合同由最终产物目标、下游消费者 inputs、上游已能交付的 outputs、平台执行能力边界、可执行脚本链路闭环共同决定；原始 SkillPlanEntry inputs/outputs 只作为局部能力提示，不能覆盖全局闭环。\n"
-            "责任优先级从高到低：全局可执行闭环 > 最终产物目标 > 下游消费者真实输入需求 > 平台执行能力边界 > scripts stdout/artifact 串接 > allocation 后的 final inputs/final outputs > 当前脚本 purpose > 原始 blueprint/原始单脚本计划/references/SKILL.md 描述。低优先级信息与高优先级合同冲突时，必须以高优先级合同为准。\n"
-            "职责分配禁止依据 role 名称、文件名或固定业务词表；必须依据当前脚本的上游输入、下游消费者、声明能力与禁止能力、可观察信息、实际可交付输出、全局最终产物需要的中间结果。\n"
-            "任何运行链路闭环、字段转换、子字段提取、集合遍历、聚合交付、顺序映射，都必须落到 scripts/*.py 或平台真实 runtime 能力中；不得用 SKILL.md 的自然语言、reference 的规则说明、assets 的存在来解释缺失的 producer、loop、aggregation 或 field mapping。\n"
-            "当前平台没有显式可执行 loop/map/foreach 节点。如果蓝图语义需要逐项处理、批量处理、一一对应、多输入单元生成多输出单元、聚合交付或顺序映射，必须把该执行责任落到某个脚本内部；不得只在 purpose 或 SKILL.md 中写逐项调用、每个生成一个、依次处理、保持对应，却没有任何脚本承担真实循环/聚合。\n"
-            "如果原始单脚本合同表达‘单项输入 -> 单项输出’，但下游需要集合/聚合结果且平台没有 loop/map/foreach，则该脚本最终责任必须提升为‘集合/整体输入 -> 集合/聚合输出’；单项处理只能作为脚本内部循环体，不能作为 workflow 级 final inputs/final outputs。\n"
-            "如果下游脚本需要消费上游集合元素中的子字段（例如从某个 structured collection item 中读取 description/text/scene/metadata），这不是自动存在的 workflow 顶层变量。除非上游脚本明确把该字段作为 stdout 顶层输出，否则下游不能直接把它作为 input；若平台没有显式 loop/map/foreach 节点，遍历集合并提取子字段的责任必须落到某个脚本内部。\n"
-            "workflow_allocation_summary、patch purpose、patch inputs、patch outputs 必须描述同一个全局责任合同；summary 不得继续描述被替换掉的旧脚本级 inputs/outputs。purpose 的来源必须与 patch inputs 字段名和粒度一致，purpose 的交付必须与 patch outputs 字段名和粒度一致，不得出现 outputs 与 purpose 中单复数/类型/字段名模糊或冲突。\n"
-            "patch 默认只改当前脚本 purpose/final inputs/final outputs；如果当前职责调整影响直接上游或直接下游，可以同步 patch 相邻 required scripts 的 purpose/inputs/outputs，做最小联动。不要新增文件，不硬编码业务字段，不按字段名、文件名、role、单复数机械判断。\n"
-            "coverage_requirements 是职责约束，不是运行时 argv/stdout 字段；不得把 coverage:* 或 covered:* 写进 inputs/outputs，不得把 coverage bridge 当成真实 workflow step。coverage 不足时只能扩展真实脚本 purpose/contract，不能制造伪字段。\n"
-            "workflow allocation patch 中的 inputs/outputs 表示 final inputs/final outputs；如果 patch 提供 inputs/outputs，默认替换原始 inputs/outputs，不再默认 append。只有明确设置 replace_inputs=false 或 replace_outputs=false 时才按 legacy append 兼容。需要把旧单项接口升级为整体/集合接口时，应提供 inputs/outputs 并保持默认替换，避免错误旧字段残留。\n"
-            "只输出 compact patches；不要新增复杂结构。purpose 格式：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
-            "返回：{\"workflow_allocation_summary\":\"...\",\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"...\",\"inputs\":[],\"outputs\":[],\"replace_inputs\":true,\"replace_outputs\":true}]}"
-        )},
-        {"role": "user", "content": (
-            "blueprint_text:\n" + (blueprint_text or "")[:14000] + "\n\n"
-            "graph_nodes_from_file_plan:\n" + json.dumps(all_nodes, ensure_ascii=False, default=str)[:20000] + "\n\n"
-            "required_scripts_to_patch:\n" + json.dumps(payload, ensure_ascii=False, default=str)[:16000]
-        )},
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator cross-script workflow "
+                "responsibility allocator。"
+                "只输出严格 JSON object。\n\n"
+
+                "当前 normalized file plan 已经确定：\n"
+                "- 文件拓扑；\n"
+                "- 每个 script 的业务职责；\n"
+                "- required_capabilities；\n"
+                "- 基础 inputs / outputs。\n\n"
+
+                "你只负责多脚本之间的 executable "
+                "handoff reconciliation。\n\n"
+
+                "只检查：\n"
+                "1. 上游 script outputs 是否能够作为"
+                "下游 script inputs 的真实来源；\n"
+                "2. 是否存在跨 script 缺失 producer；\n"
+                "3. 是否存在跨 script 缺失 aggregation "
+                "owner；\n"
+                "4. 最终 artifact 是否有 required script "
+                "负责交付。\n\n"
+
+                "禁止：\n"
+                "- 重新解释用户业务；\n"
+                "- 修改 required_capabilities；\n"
+                "- 新增或删除文件；\n"
+                "- 因内部 for/loop/map 行为改变 script "
+                "boundary cardinality；\n"
+                "- 因一个文本内部有多个段落，就把 "
+                "string input 改成 list input；\n"
+                "- 因脚本内部生成多个中间 artifact，"
+                "就把最终单 artifact output 改成 list；\n"
+                "- 根据 role 名、文件名、单复数机械"
+                "推断字段类型。\n\n"
+
+                "只有存在明确跨 script contract evidence "
+                "时，才能修改 inputs / outputs。\n"
+
+                "例如：下游 required script 明确消费一个"
+                "集合，而上游只声明单项 output，并且没有"
+                "其他 script 承担 aggregation，此时才允许"
+                "调整边界合同。\n\n"
+
+                "patch 默认只做最小联动。\n"
+
+                "purpose、inputs、outputs 必须描述同一个"
+                "最终跨脚本 handoff contract。\n\n"
+
+                "返回：\n"
+                "{"
+                "\"workflow_allocation_summary\":\"...\","
+                "\"patches\":["
+                "{"
+                "\"target_file\":\"scripts/x.py\","
+                "\"purpose\":\"...\","
+                "\"inputs\":[],"
+                "\"outputs\":[],"
+                "\"replace_inputs\":true,"
+                "\"replace_outputs\":true"
+                "}"
+                "]"
+                "}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "normalized_workflow_nodes:\n"
+                + json.dumps(
+                    all_nodes,
+                    ensure_ascii=False,
+                    default=str,
+                )[:24000]
+                + "\n\n"
+                "required_scripts:\n"
+                + json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                )[:20000]
+            ),
+        },
     ]
-    logger.info("[Creator][workflow_allocation][start] %s", json.dumps({
-        "event": "workflow_allocation_start",
-        "script_count": len(targets),
-        "scripts": [item.path for item in targets],
-    }, ensure_ascii=False, default=str))
+
+    logger.info(
+        "[Creator]"
+        "[workflow_allocation]"
+        "[start] %s",
+        json.dumps(
+            {
+                "event": (
+                    "workflow_allocation_start"
+                ),
+
+                "script_count": len(
+                    targets
+                ),
+
+                "scripts": [
+                    item.path
+                    for item
+                    in targets
+                ],
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+    )
+
     try:
         conflict_feedback = ""
-        data: dict[str, Any] = {}
-        patches: list[Any] = []
-        fatal_conflicts: list[dict[str, Any]] = []
-        soft_conflicts: list[dict[str, Any]] = []
+
+        patches_candidate: list[
+            Any
+        ] = []
+
+        patches: list[
+            Any
+        ] = []
+
+        fatal_conflicts: list[
+            dict[str, Any]
+        ] = []
+
+        soft_conflicts: list[
+            dict[str, Any]
+        ] = []
+
         summary = ""
+
         for attempt in range(2):
-            attempt_messages = list(messages)
+            attempt_messages = list(
+                messages
+            )
+
             if conflict_feedback:
                 attempt_messages.append({
                     "role": "user",
+
                     "content": (
-                        "上一次 workflow allocation JSON 存在 final contract 一致性冲突；"
-                        "请只修正 JSON，不新增复杂结构。冲突如下：\n"
-                        f"{conflict_feedback[:6000]}\n\n"
-                        "修正要求：workflow_allocation_summary、patch purpose、patch inputs、patch outputs "
-                        "必须描述同一个全局责任合同；inputs/outputs 是 final inputs/final outputs。"
+                        "上一次 compact patch 存在"
+                        "跨脚本 final contract 冲突。"
+                        "只修正 JSON patch，不重新规划业务。\n\n"
+
+                        f"{conflict_feedback[:6000]}"
                     ),
                 })
-            data = _parse_validator_json_object(await complete_chat_once(attempt_messages, route.model))
-            patches_candidate = data.get("patches") if isinstance(data, dict) else None
-            summary = str(data.get("workflow_allocation_summary") or "").strip() if isinstance(data, dict) else ""
-            if not isinstance(patches_candidate, list):
-                raise ValueError("missing patches list")
-            conflict_report = _workflow_allocation_patch_conflicts(patches_candidate)
-            fatal_conflicts = list(conflict_report.get("fatal", []))
-            soft_conflicts = list(conflict_report.get("soft", []))
+
+            data = (
+                _parse_validator_json_object(
+                    await complete_chat_once(
+                        attempt_messages,
+                        route.model,
+                    )
+                )
+            )
+
+            patches_candidate = (
+                data.get("patches")
+                if isinstance(
+                    data,
+                    dict,
+                )
+                else None
+            )
+
+            summary = str(
+                data.get(
+                    "workflow_allocation_summary"
+                )
+                or ""
+            ).strip()
+
+            if not isinstance(
+                patches_candidate,
+                list,
+            ):
+                raise ValueError(
+                    "missing patches list"
+                )
+
+            conflict_report = (
+                _workflow_allocation_patch_conflicts(
+                    patches_candidate
+                )
+            )
+
+            fatal_conflicts = list(
+                conflict_report.get(
+                    "fatal",
+                    [],
+                )
+            )
+
+            soft_conflicts = list(
+                conflict_report.get(
+                    "soft",
+                    [],
+                )
+            )
+
             if not fatal_conflicts:
-                patches = patches_candidate
+                patches = (
+                    patches_candidate
+                )
+
                 break
-            conflict_feedback = json.dumps(fatal_conflicts, ensure_ascii=False, default=str)
-            logger.info("[Creator][workflow_allocation][contract_conflict] %s", json.dumps({
-                "event": "workflow_allocation_contract_conflict",
-                "attempt": attempt + 1,
-                "fatal_conflicts": fatal_conflicts,
-                "soft_conflicts": soft_conflicts,
-            }, ensure_ascii=False, default=str))
+
+            conflict_feedback = json.dumps(
+                fatal_conflicts,
+                ensure_ascii=False,
+                default=str,
+            )
+
+            logger.info(
+                "[Creator]"
+                "[workflow_allocation]"
+                "[contract_conflict] %s",
+                json.dumps(
+                    {
+                        "event": (
+                            "workflow_allocation_"
+                            "contract_conflict"
+                        ),
+
+                        "attempt": (
+                            attempt + 1
+                        ),
+
+                        "fatal_conflicts": (
+                            fatal_conflicts
+                        ),
+
+                        "soft_conflicts": (
+                            soft_conflicts
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
+
         else:
+            fatal_targets = {
+                str(
+                    item.get(
+                        "target_file"
+                    )
+                    or ""
+                ).strip()
+                for item
+                in fatal_conflicts
+                if isinstance(
+                    item,
+                    dict,
+                )
+            }
+
             patches = [
-                patch for patch in (patches_candidate if isinstance(patches_candidate, list) else [])
-                if isinstance(patch, dict)
-                and str(patch.get("target_file") or "").strip()
-                not in {str(item.get("target_file") or "").strip() for item in fatal_conflicts if isinstance(item, dict)}
+                patch
+                for patch
+                in (
+                    patches_candidate
+                    if isinstance(
+                        patches_candidate,
+                        list,
+                    )
+                    else []
+                )
+                if (
+                    isinstance(
+                        patch,
+                        dict,
+                    )
+                    and str(
+                        patch.get(
+                            "target_file"
+                        )
+                        or ""
+                    ).strip()
+                    not in fatal_targets
+                )
             ]
-        allocation_resolved = not fatal_conflicts
-        if soft_conflicts:
-            logger.info("[Creator][workflow_allocation][soft_conflict] %s", json.dumps({
-                "event": "workflow_allocation_soft_conflict",
-                "soft_conflicts": soft_conflicts,
-                "allocation_resolved": allocation_resolved,
-            }, ensure_ascii=False, default=str))
-        if soft_conflicts and warnings is not None:
+
+        allocation_resolved = (
+            not fatal_conflicts
+        )
+
+        if (
+            soft_conflicts
+            and warnings is not None
+        ):
             warnings.append({
-                "severity": "validator_warning",
-                "code": "workflow_allocation_soft_conflict",
-                "source": "analyze_blueprint",
+                "severity": (
+                    "validator_warning"
+                ),
+
+                "code": (
+                    "workflow_allocation_"
+                    "soft_conflict"
+                ),
+
+                "source": (
+                    "analyze_blueprint"
+                ),
+
                 "path": "",
+
                 "field": "inputs",
+
                 "message": (
-                    "Workflow allocation had soft input wording conflicts; "
-                    "safe patches were kept because final outputs were consistent."
+                    "Cross-script allocation had "
+                    "soft wording conflicts; safe "
+                    "patches were retained."
                 ),
-                "details": soft_conflicts,
+
+                "details": (
+                    soft_conflicts
+                ),
             })
-        if fatal_conflicts and warnings is not None:
+
+        if (
+            fatal_conflicts
+            and warnings is not None
+        ):
             warnings.append({
-                "severity": "validator_warning",
-                "code": "workflow_allocation_unresolved",
-                "source": "analyze_blueprint",
-                "path": "",
-                "field": "outputs",
-                "message": (
-                    "Workflow allocation still has fatal final-output contract conflicts after retry; "
-                    "only patches without fatal conflicts were applied and global contract is unresolved."
+                "severity": (
+                    "validator_warning"
                 ),
-                "details": fatal_conflicts,
+
+                "code": (
+                    "workflow_allocation_unresolved"
+                ),
+
+                "source": (
+                    "analyze_blueprint"
+                ),
+
+                "path": "",
+
+                "field": "outputs",
+
+                "message": (
+                    "Cross-script allocation still "
+                    "has fatal final contract "
+                    "conflicts after retry."
+                ),
+
+                "details": (
+                    fatal_conflicts
+                ),
             })
-        if not isinstance(patches, list):
-            raise ValueError("missing patches list")
-        by_path = {item.path: item for item in targets}
-        applied: list[str] = []
+
+        by_path = {
+            item.path: item
+            for item
+            in targets
+        }
+
+        allowed_patch_fields = {
+            "target_file",
+            "purpose",
+            "inputs",
+            "outputs",
+            "replace_inputs",
+            "replace_outputs",
+        }
+
+        applied: list[
+            str
+        ] = []
+
         for patch in patches:
-            if not isinstance(patch, dict):
+            if not isinstance(
+                patch,
+                dict,
+            ):
                 continue
-            target = str(patch.get("target_file") or "").strip()
-            purpose = str(patch.get("purpose") or "").strip()
-            if target in by_path and purpose:
-                script = by_path[target]
-                script.purpose = purpose
-                for field_name, replace_flag in (("inputs", "replace_inputs"), ("outputs", "replace_outputs")):
-                    cleaned = _clean_allocation_io_values(patch.get(field_name))
-                    if cleaned is not None:
-                        if patch.get(replace_flag) is not False:
-                            setattr(script, field_name, cleaned)
-                        else:
-                            existing = list(getattr(script, field_name) or [])
-                            for value in cleaned:
-                                if value not in existing:
-                                    existing.append(value)
-                            setattr(script, field_name, existing)
-                applied.append(target)
-        logger.info("[Creator][workflow_allocation][result] %s", json.dumps({
-            "event": "workflow_allocation_result",
-            "applied_targets": applied,
-            "summary": summary,
-        }, ensure_ascii=False, default=str))
-        return summary, set(applied), allocation_resolved
+
+            unknown_fields = (
+                set(patch)
+                - allowed_patch_fields
+            )
+
+            if unknown_fields:
+                continue
+
+            target = str(
+                patch.get("target_file")
+                or ""
+            ).strip()
+
+            purpose = str(
+                patch.get("purpose")
+                or ""
+            ).strip()
+
+            script = by_path.get(
+                target
+            )
+
+            if (
+                script is None
+                or not purpose
+            ):
+                continue
+
+            script.purpose = purpose
+
+            for (
+                field_name,
+                replace_flag,
+            ) in (
+                (
+                    "inputs",
+                    "replace_inputs",
+                ),
+                (
+                    "outputs",
+                    "replace_outputs",
+                ),
+            ):
+                cleaned = (
+                    _clean_allocation_io_values(
+                        patch.get(
+                            field_name
+                        )
+                    )
+                )
+
+                if cleaned is None:
+                    continue
+
+                if (
+                    patch.get(
+                        replace_flag
+                    )
+                    is not False
+                ):
+                    setattr(
+                        script,
+                        field_name,
+                        cleaned,
+                    )
+
+                else:
+                    existing = list(
+                        getattr(
+                            script,
+                            field_name,
+                        )
+                        or []
+                    )
+
+                    for value in cleaned:
+                        if value not in existing:
+                            existing.append(
+                                value
+                            )
+
+                    setattr(
+                        script,
+                        field_name,
+                        existing,
+                    )
+
+            applied.append(
+                target
+            )
+
+        logger.info(
+            "[Creator]"
+            "[workflow_allocation]"
+            "[result] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "workflow_allocation_result"
+                    ),
+
+                    "applied_targets": (
+                        applied
+                    ),
+
+                    "summary": summary,
+
+                    "allocation_scope": (
+                        "cross_script_only"
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+        return (
+            summary,
+            set(applied),
+            allocation_resolved,
+        )
+
     except Exception as exc:
-        logger.info("[Creator][workflow_allocation][failed] %s", json.dumps({
-            "event": "workflow_allocation_failed",
-            "error": f"{type(exc).__name__}: {exc}",
-        }, ensure_ascii=False, default=str))
+        logger.info(
+            "[Creator]"
+            "[workflow_allocation]"
+            "[failed] %s",
+            json.dumps(
+                {
+                    "event": (
+                        "workflow_allocation_failed"
+                    ),
+
+                    "error": (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
         if warnings is not None:
             warnings.append({
-                "severity": "validator_warning",
-                "code": "workflow_allocation_failed",
-                "source": "analyze_blueprint",
+                "severity": (
+                    "validator_warning"
+                ),
+
+                "code": (
+                    "workflow_allocation_failed"
+                ),
+
+                "source": (
+                    "analyze_blueprint"
+                ),
+
                 "path": "",
+
                 "field": "purpose",
-                "message": f"Workflow responsibility allocation failed; keeping parsed purposes: {exc}",
+
+                "message": (
+                    "Cross-script workflow "
+                    "responsibility allocation "
+                    "failed; keeping normalized "
+                    f"file contracts: {exc}"
+                ),
             })
-        return "", set(), False
+
+        return (
+            "",
+            set(),
+            False,
+        )
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
     value = str(text or "")
@@ -6315,1367 +7720,6 @@ async def _normalize_script_purpose_short_contracts(
 
 
 @router.post(
-    "/prepare-plan",
-    response_model=PreparePlanResponse,
-)
-async def prepare_plan(
-    request: PreparePlanRequest,
-):
-    prepare_action = str(
-        request.prepare_action
-        or "none"
-    )
-
-    confirmed_prepare = (
-        prepare_action == "confirm"
-        or (
-            _prepare_user_confirmed_no_more_supplement(
-                request
-            )
-        )
-    )
-
-    previous_blueprint_text = str(
-        request.previous_blueprint_text
-        or ""
-    ).strip()
-
-    prepared: dict[
-        str,
-        Any,
-    ] = {}
-
-    summary = (
-        PreparePlanReviewSummary()
-    )
-
-    skill_name = str(
-        request.skill_name
-        or ""
-    )
-
-    blueprint_text = (
-        previous_blueprint_text
-    )
-
-    async def project_summary(
-        current_blueprint_text: str,
-        current_prepared: (
-            dict[str, Any] | None
-        ) = None,
-    ) -> PreparePlanReviewSummary:
-        return (
-            await _project_prepare_review_summary_from_blueprint(
-                request=request,
-
-                blueprint_text=(
-                    current_blueprint_text
-                ),
-
-                prepared=(
-                    current_prepared
-                ),
-            )
-        )
-
-    async def confirmation_response(
-        *,
-        current_blueprint_text: str,
-        current_prepared: (
-            dict[str, Any] | None
-        ),
-        current_skill_name: str,
-        prepare_stage: str,
-        question: str,
-    ) -> PreparePlanResponse:
-        projected = await project_summary(
-            current_blueprint_text,
-            current_prepared,
-        )
-
-        return PreparePlanResponse(
-            status="needs_clarification",
-
-            prepare_stage=prepare_stage,
-
-            clarifying_questions=[
-                question
-            ],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    projected
-                )
-            ),
-
-            blueprint_text=(
-                current_blueprint_text
-            ),
-
-            skill_name=(
-                current_skill_name
-            ),
-        )
-
-    if (
-        prepare_action
-        == "request_supplement"
-    ):
-        if previous_blueprint_text:
-            summary = await project_summary(
-                previous_blueprint_text
-            )
-
-        return PreparePlanResponse(
-            status="needs_clarification",
-
-            prepare_stage=(
-                "creation_points_confirmation"
-            ),
-
-            clarifying_questions=[
-                "好的，请补充你的其他要求。"
-            ],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-
-            blueprint_text=(
-                previous_blueprint_text
-            ),
-
-            skill_name=(
-                skill_name
-            ),
-        )
-
-    if confirmed_prepare:
-        # Confirmation freezes the existing full blueprint.
-        #
-        # review_summary is never used to reconstruct it.
-        if not previous_blueprint_text:
-            return PreparePlanResponse(
-                status="blocked",
-
-                prepare_stage=(
-                    "blueprint_protocol_failed"
-                ),
-
-                clarifying_questions=[],
-
-                review_summary=(
-                    PreparePlanReviewSummary()
-                ),
-
-                blueprint_text="",
-
-                skill_name=(
-                    skill_name
-                ),
-
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        (
-                            "missing_confirmed_"
-                            "blueprint_state"
-                        ),
-                        (
-                            "用户确认创建要点时，"
-                            "previous_blueprint_text 为空。"
-                            "Creator 不允许从 review_summary "
-                            "重新生成 full blueprint。"
-                        ),
-                        field=(
-                            "previous_blueprint_text"
-                        ),
-                    )
-                ],
-            )
-
-        prepared = {
-            "status": "ready",
-
-            "internal_blueprint_text": (
-                previous_blueprint_text
-            ),
-
-            "skill_name": skill_name,
-        }
-
-        blueprint_text = (
-            previous_blueprint_text
-        )
-
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-
-    else:
-        try:
-            prepared = (
-                await _generate_internal_blueprint_or_questions(
-                    request
-                )
-            )
-
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "prepare-plan 生成失败："
-                    f"{exc}"
-                ),
-            ) from exc
-
-        raw_status = str(
-            prepared.get("status")
-            or ""
-        ).strip()
-
-        status = (
-            raw_status
-            if raw_status in {
-                "ready",
-                "needs_clarification",
-                "blocked",
-            }
-            else "needs_clarification"
-        )
-
-        skill_name = str(
-            prepared.get("skill_name")
-            or request.skill_name
-            or ""
-        )
-
-        blueprint_text = str(
-            prepared.get(
-                "internal_blueprint_text"
-            )
-            or prepared.get(
-                "blueprint_text"
-            )
-            or ""
-        ).strip()
-
-        if (
-            prepare_action
-            == "submit_supplement"
-        ):
-            # Supplement changes business requirements.
-            #
-            # Therefore the business planner may revise the
-            # previous full blueprint exactly once.
-            #
-            # The result itself becomes the next full blueprint.
-            if status == "needs_clarification":
-                return PreparePlanResponse(
-                    status=(
-                        "needs_clarification"
-                    ),
-
-                    prepare_stage=(
-                        "business_clarification"
-                    ),
-
-                    clarifying_questions=(
-                        _normalize_prepare_clarifying_questions(
-                            prepared.get(
-                                "clarifying_questions"
-                            )
-                        )
-                    ),
-
-                    review_summary=(
-                        PreparePlanReviewSummary()
-                    ),
-
-                    blueprint_text=(
-                        previous_blueprint_text
-                    ),
-
-                    skill_name=skill_name,
-                )
-
-            if status == "blocked":
-                blockers = (
-                    prepared.get("blockers")
-                    or [
-                        (
-                            "补充要求后仍缺少生成"
-                            "完整蓝图所需的信息。"
-                        )
-                    ]
-                )
-
-                return PreparePlanResponse(
-                    status="blocked",
-
-                    prepare_stage=(
-                        "blueprint_protocol_failed"
-                    ),
-
-                    clarifying_questions=[],
-
-                    review_summary=(
-                        PreparePlanReviewSummary()
-                    ),
-
-                    blueprint_text=(
-                        previous_blueprint_text
-                    ),
-
-                    skill_name=skill_name,
-
-                    creation_blockers=(
-                        blockers
-                        if isinstance(
-                            blockers,
-                            list,
-                        )
-                        else [
-                            str(blockers)
-                        ]
-                    ),
-                )
-
-            if not blueprint_text:
-                return PreparePlanResponse(
-                    status="blocked",
-
-                    prepare_stage=(
-                        "blueprint_protocol_failed"
-                    ),
-
-                    clarifying_questions=[],
-
-                    review_summary=(
-                        PreparePlanReviewSummary()
-                    ),
-
-                    blueprint_text=(
-                        previous_blueprint_text
-                    ),
-
-                    skill_name=skill_name,
-
-                    creation_blockers=[
-                        _prepare_protocol_issue(
-                            (
-                                "supplement_blueprint_"
-                                "missing"
-                            ),
-                            (
-                                "补充要求处理后 full "
-                                "blueprint 为空。"
-                            ),
-                        )
-                    ],
-                )
-
-            return await confirmation_response(
-                current_blueprint_text=(
-                    blueprint_text
-                ),
-
-                current_prepared=prepared,
-
-                current_skill_name=(
-                    skill_name
-                ),
-
-                prepare_stage=(
-                    "supplement_confirmation"
-                ),
-
-                question=(
-                    "已根据补充内容更新创建要点。"
-                    "是否按这些要点继续？"
-                    "A. 没有其他补充，按这些要点继续 "
-                    "B. 继续补充说明"
-                ),
-            )
-
-        if status == "needs_clarification":
-            if (
-                not _prepare_business_clarification_limit_reached(
-                    request
-                )
-            ):
-                return PreparePlanResponse(
-                    status=(
-                        "needs_clarification"
-                    ),
-
-                    prepare_stage=(
-                        "business_clarification"
-                    ),
-
-                    clarifying_questions=(
-                        _normalize_prepare_clarifying_questions(
-                            prepared.get(
-                                "clarifying_questions"
-                            )
-                        )
-                    ),
-
-                    review_summary=(
-                        PreparePlanReviewSummary()
-                    ),
-
-                    blueprint_text=(
-                        previous_blueprint_text
-                    ),
-
-                    skill_name=skill_name,
-                )
-
-            # Planner was explicitly required to finalize a
-            # blueprint at the clarification limit.
-            #
-            # Do not rebuild one from review_summary.
-            if blueprint_text:
-                return await confirmation_response(
-                    current_blueprint_text=(
-                        blueprint_text
-                    ),
-
-                    current_prepared=prepared,
-
-                    current_skill_name=(
-                        skill_name
-                    ),
-
-                    prepare_stage=(
-                        "creation_points_confirmation"
-                    ),
-
-                    question=(
-                        _PREPARE_SUPPLEMENT_QUESTION
-                    ),
-                )
-
-            return PreparePlanResponse(
-                status="blocked",
-
-                prepare_stage=(
-                    "blueprint_protocol_failed"
-                ),
-
-                clarifying_questions=[],
-
-                review_summary=(
-                    PreparePlanReviewSummary()
-                ),
-
-                blueprint_text="",
-
-                skill_name=skill_name,
-
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        (
-                            "planner_failed_to_"
-                            "finalize_blueprint"
-                        ),
-                        (
-                            "业务澄清达到上限后，"
-                            "规划模型仍未生成 full "
-                            "blueprint。Creator 不允许"
-                            "从 review_summary 重建蓝图。"
-                        ),
-                    )
-                ],
-            )
-
-        if status == "blocked":
-            blockers = (
-                prepared.get("blockers")
-                or [
-                    (
-                        "当前业务条件不足以生成"
-                        "可执行 full blueprint。"
-                    )
-                ]
-            )
-
-            return PreparePlanResponse(
-                status="blocked",
-
-                prepare_stage=(
-                    "blueprint_protocol_failed"
-                ),
-
-                clarifying_questions=[],
-
-                review_summary=(
-                    PreparePlanReviewSummary()
-                ),
-
-                blueprint_text=(
-                    blueprint_text
-                    or previous_blueprint_text
-                ),
-
-                skill_name=skill_name,
-
-                creation_blockers=(
-                    blockers
-                    if isinstance(
-                        blockers,
-                        list,
-                    )
-                    else [
-                        str(blockers)
-                    ]
-                ),
-            )
-
-        if not blueprint_text:
-            return PreparePlanResponse(
-                status="blocked",
-
-                prepare_stage=(
-                    "blueprint_protocol_failed"
-                ),
-
-                clarifying_questions=[],
-
-                review_summary=(
-                    PreparePlanReviewSummary()
-                ),
-
-                blueprint_text="",
-
-                skill_name=skill_name,
-
-                creation_blockers=[
-                    _prepare_protocol_issue(
-                        "empty_blueprint",
-                        (
-                            "规划模型返回 ready，"
-                            "但 full blueprint 为空。"
-                        ),
-                    )
-                ],
-            )
-
-        # First complete blueprint:
-        #
-        # project it for display and freeze it in the
-        # response so the frontend can send it back on
-        # confirmation.
-        return await confirmation_response(
-            current_blueprint_text=(
-                blueprint_text
-            ),
-
-            current_prepared=prepared,
-
-            current_skill_name=(
-                skill_name
-            ),
-
-            prepare_stage=(
-                "creation_points_confirmation"
-            ),
-
-            question=(
-                _PREPARE_SUPPLEMENT_QUESTION
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # From here on, the user has confirmed an existing full blueprint.
-    #
-    # No business planner and no review_summary -> blueprint conversion.
-    # ------------------------------------------------------------------
-
-    blueprint_text = (
-        _normalize_prepare_blueprint_references(
-            blueprint_text
-        )
-    )
-
-    protocol_errors = (
-        _preflight_prepare_blueprint_text(
-            blueprint_text
-        )
-    )
-
-    if protocol_errors:
-        try:
-            blueprint_text = (
-                await _repair_prepare_blueprint_protocol(
-                    request=request,
-
-                    blueprint_text=(
-                        blueprint_text
-                    ),
-
-                    protocol_errors=(
-                        protocol_errors
-                    ),
-                )
-            )
-
-            blueprint_text = (
-                _normalize_prepare_blueprint_references(
-                    blueprint_text
-                )
-            )
-
-            protocol_errors = (
-                _preflight_prepare_blueprint_text(
-                    blueprint_text
-                )
-            )
-
-        except Exception:
-            pass
-
-    if protocol_errors:
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-
-        return PreparePlanResponse(
-            status="blocked",
-
-            prepare_stage=(
-                "blueprint_protocol_failed"
-            ),
-
-            clarifying_questions=[],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-
-            blueprint_text=(
-                blueprint_text
-            ),
-
-            skill_name=skill_name,
-
-            creation_blockers=(
-                protocol_errors
-            ),
-        )
-
-    plan = None
-
-    analyze_errors: list[
-        dict[str, Any]
-    ] = []
-
-    for attempt in range(3):
-        try:
-            plan = await analyze_blueprint(
-                AnalyzeBlueprintRequest(
-                    messages=[
-                        {
-                            "role": "assistant",
-                            "content": (
-                                blueprint_text
-                            ),
-                        }
-                    ],
-
-                    model=request.model,
-
-                    strict=True,
-
-                    # Confirmed full blueprint is frozen.
-                    refine_contract=False,
-
-                    refine_rounds=0,
-                )
-            )
-
-            break
-
-        except HTTPException as exc:
-            analyze_errors = [
-                _prepare_protocol_issue(
-                    "strict_analyze_failed",
-                    (
-                        "内部蓝图未通过 strict "
-                        "analyze。"
-                    ),
-                    field="analyze_blueprint",
-                )
-            ]
-
-            if attempt >= 2:
-                break
-
-            try:
-                blueprint_text = (
-                    await _repair_prepare_blueprint_protocol(
-                        request=request,
-
-                        blueprint_text=(
-                            blueprint_text
-                        ),
-
-                        protocol_errors=[
-                            {
-                                **analyze_errors[0],
-
-                                "detail": str(
-                                    exc.detail
-                                ),
-                            }
-                        ],
-                    )
-                )
-
-                blueprint_text = (
-                    _normalize_prepare_blueprint_references(
-                        blueprint_text
-                    )
-                )
-
-            except Exception:
-                break
-
-            protocol_errors = (
-                _preflight_prepare_blueprint_text(
-                    blueprint_text
-                )
-            )
-
-            if protocol_errors:
-                analyze_errors = (
-                    protocol_errors
-                )
-
-                break
-
-    if plan is None:
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-
-        blockers = (
-            analyze_errors
-            or [
-                _prepare_protocol_issue(
-                    "strict_analyze_failed",
-                    (
-                        "已确认 full blueprint "
-                        "无法解析为创建计划。"
-                    ),
-                    field="analyze_blueprint",
-                )
-            ]
-        )
-
-        return PreparePlanResponse(
-            status="blocked",
-
-            prepare_stage=(
-                "blueprint_analyze_failed"
-            ),
-
-            clarifying_questions=[],
-
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
-                )
-            ),
-
-            blueprint_text=(
-                blueprint_text
-            ),
-
-            skill_name=skill_name,
-
-            creation_blockers=blockers,
-        )
-
-    (
-        confirmed_uploaded_assets,
-        unselected_uploaded_files,
-    ) = _split_uploaded_asset_decisions(
-        request.uploaded_files
-    )
-
-    confirmed_asset_paths = {
-        str(
-            item.get(
-                "asset_target_path"
-            )
-            or ""
-        ).strip()
-        for item
-        in confirmed_uploaded_assets
-    }
-
-    plan.files = [
-        file_spec
-        for file_spec
-        in (
-            plan.files or []
-        )
-        if not (
-            str(
-                getattr(
-                    file_spec,
-                    "path",
-                    "",
-                )
-                or ""
-            ).startswith(
-                "assets/"
-            )
-            and str(
-                getattr(
-                    file_spec,
-                    "asset_source",
-                    "",
-                )
-                or ""
-            )
-            == "user_upload"
-            and str(
-                getattr(
-                    file_spec,
-                    "path",
-                    "",
-                )
-                or ""
-            )
-            not in confirmed_asset_paths
-        )
-    ]
-
-    plan.asset_requirements = [
-        asset
-        for asset
-        in (
-            plan.asset_requirements
-            or []
-        )
-        if (
-            str(
-                getattr(
-                    asset,
-                    "source",
-                    "",
-                )
-                or ""
-            )
-            != "user_upload"
-            or str(
-                getattr(
-                    asset,
-                    "path",
-                    "",
-                )
-                or ""
-            )
-            in confirmed_asset_paths
-        )
-    ]
-
-    final_blueprint_text = (
-        plan.blueprint_text
-        or blueprint_text
-    )
-
-    summary = await project_summary(
-        final_blueprint_text,
-        prepared,
-    )
-
-    summary_sync_warnings = (
-        _sync_prepare_summary_files_from_skill_plan(
-            summary,
-            plan.files,
-        )
-    )
-
-    summary.assets_to_upload = [
-        str(
-            getattr(
-                asset,
-                "path",
-                "",
-            )
-            or ""
-        ).strip()
-        for asset
-        in (
-            plan.asset_requirements
-            or []
-        )
-        if (
-            str(
-                getattr(
-                    asset,
-                    "path",
-                    "",
-                )
-                or ""
-            ).strip()
-            and str(
-                getattr(
-                    asset,
-                    "source",
-                    "",
-                )
-                or ""
-            ).strip()
-            in {
-                "user_upload",
-                "bundled",
-            }
-            and not re.search(
-                (
-                    r"运行时|每次上传|"
-                    r"用户输入|runtime"
-                ),
-                str(
-                    getattr(
-                        asset,
-                        "description",
-                        "",
-                    )
-                    or ""
-                ),
-                re.I,
-            )
-        )
-    ]
-
-    graph_payload = (
-        plan.requirement_graph.model_dump(
-            mode="json"
-        )
-        if hasattr(
-            plan.requirement_graph,
-            "model_dump",
-        )
-        else dict(
-            plan.requirement_graph
-            or {}
-        )
-    )
-
-    file_specs_payload = [
-        (
-            file_spec.model_dump(
-                mode="json"
-            )
-            if hasattr(
-                file_spec,
-                "model_dump",
-            )
-            else dict(file_spec)
-        )
-        for file_spec
-        in (
-            plan.files or []
-        )
-    ]
-
-    uploaded_files_payload = [
-        (
-            item.model_dump(
-                mode="json"
-            )
-            if hasattr(
-                item,
-                "model_dump",
-            )
-            else dict(item)
-        )
-        for item
-        in (
-            getattr(
-                request,
-                "uploaded_files",
-                [],
-            )
-            or []
-        )
-        if (
-            isinstance(
-                item,
-                dict,
-            )
-            or hasattr(
-                item,
-                "model_dump",
-            )
-        )
-    ]
-
-    skill_dir_for_tool_pool = (
-        settings.skills_path
-        / _validate_skill_name(
-            plan.skill_name
-        )
-    )
-
-    skill_dir_for_tool_pool.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    tool_planning = (
-        await _plan_final_tool_pool(
-            skill_name=plan.skill_name,
-
-            file_specs=(
-                file_specs_payload
-            ),
-
-            requested_model=(
-                request.model
-            ),
-        )
-    )
-
-    current_tool_pool = (
-        tool_planning["tool_pool"]
-    )
-
-    tool_pool = build_tool_pool(
-        skill_name=plan.skill_name,
-
-        user_request=str(
-            getattr(
-                request,
-                "user_request",
-                "",
-            )
-            or ""
-        ),
-
-        blueprint_text=(
-            final_blueprint_text
-        ),
-
-        file_specs=(
-            file_specs_payload
-        ),
-
-        uploaded_files=(
-            uploaded_files_payload
-        ),
-
-        current_tool_pool=(
-            current_tool_pool
-        ),
-    )
-
-    save_tool_pool(
-        skill_dir_for_tool_pool,
-        tool_pool,
-    )
-
-    for file_spec in (
-        plan.files or []
-    ):
-        binding = get_file_binding(
-            tool_pool,
-            getattr(
-                file_spec,
-                "path",
-                "",
-            ),
-        )
-
-        if (
-            binding is not None
-            and hasattr(
-                file_spec,
-                "tool_binding_summary",
-            )
-        ):
-            file_spec.tool_binding_summary = {
-                "allowed_tool_ids": (
-                    binding.allowed_tool_ids
-                ),
-
-                "primary_tool_ids": (
-                    binding.primary_tool_ids
-                ),
-
-                "secondary_tool_ids": (
-                    binding.secondary_tool_ids
-                ),
-
-                "allowed_helper_imports": (
-                    binding.allowed_helper_imports
-                ),
-
-                "allowed_import_paths": (
-                    binding.allowed_import_paths
-                ),
-
-                "allowed_function_imports": (
-                    binding.allowed_function_imports
-                ),
-
-                "scored_tools": (
-                    binding.scored_tools
-                ),
-
-                "matched_features_by_tool": (
-                    binding
-                    .matched_features_by_tool
-                ),
-
-                "denied_helper_imports": (
-                    binding.denied_helper_imports
-                ),
-
-                "required_env": (
-                    binding.required_env
-                ),
-
-                "dependencies": (
-                    binding.dependencies
-                ),
-            }
-
-    gate_events = [
-        event.model_dump(
-            mode="json"
-        )
-        for event
-        in tool_pool.gate_events
-    ]
-
-    tool_pool_summary = {
-        "tools": [
-            {
-                "tool_id": tool.tool_id,
-
-                "status": tool.status,
-
-                "target_files": (
-                    tool.target_files
-                ),
-
-                "allowed_helper_imports": (
-                    tool.allowed_helper_imports
-                ),
-
-                "allowed_import_paths": (
-                    tool.allowed_import_paths
-                ),
-
-                "allowed_function_imports": (
-                    tool.allowed_function_imports
-                ),
-
-                "score": tool.score,
-
-                "matched_features": (
-                    tool.matched_features
-                ),
-            }
-            for tool
-            in tool_pool.tools
-        ],
-
-        "file_bindings": [
-            {
-                "target_file": (
-                    binding.target_file
-                ),
-
-                "allowed_tool_ids": (
-                    binding.allowed_tool_ids
-                ),
-
-                "primary_tool_ids": (
-                    binding.primary_tool_ids
-                ),
-
-                "secondary_tool_ids": (
-                    binding.secondary_tool_ids
-                ),
-
-                "allowed_helper_imports": (
-                    binding.allowed_helper_imports
-                ),
-
-                "allowed_import_paths": (
-                    binding.allowed_import_paths
-                ),
-
-                "allowed_function_imports": (
-                    binding.allowed_function_imports
-                ),
-
-                "scored_tools": (
-                    binding.scored_tools
-                ),
-
-                "matched_features_by_tool": (
-                    binding
-                    .matched_features_by_tool
-                ),
-            }
-            for binding
-            in tool_pool.file_bindings
-        ],
-
-        "exploration_candidates": (
-            tool_pool.exploration_candidates
-        ),
-
-        "scored_candidates": (
-            tool_pool.scored_candidates
-        ),
-
-        "uploaded_file_triggers": (
-            tool_pool.uploaded_file_triggers
-        ),
-
-        "gate_events": gate_events,
-
-        "selected_primary_tools": {
-            binding.target_file: (
-                binding.primary_tool_ids
-            )
-            for binding
-            in tool_pool.file_bindings
-        },
-
-        "fallback_tools": {
-            binding.target_file: (
-                binding.secondary_tool_ids
-            )
-            for binding
-            in tool_pool.file_bindings
-        },
-
-        "denied_requests": [
-            denied.model_dump(
-                mode="json"
-            )
-            for denied
-            in tool_pool.denied_requests
-        ],
-
-        "missing_requests": [
-            missing.model_dump(
-                mode="json"
-            )
-            for missing
-            in tool_pool.missing_requests
-        ],
-
-        "denied_tools": [
-            denied.tool_id
-            for denied
-            in tool_pool.denied_requests
-        ],
-
-        "missing_tools": [
-            missing.tool_id
-            for missing
-            in tool_pool.missing_requests
-        ],
-
-        "rejected_candidates": [
-            event
-            for event
-            in gate_events
-            if event.get("decision")
-            not in {
-                "allow",
-                "require_config",
-                "require_dependency",
-            }
-        ],
-    }
-
-    return PreparePlanResponse(
-        status="ready",
-
-        prepare_stage="ready",
-
-        review_summary=summary,
-
-        blueprint_text=(
-            final_blueprint_text
-        ),
-
-        skill_name=plan.skill_name,
-
-        files=plan.files,
-
-        warnings=[
-            *(
-                plan.warnings
-                or []
-            ),
-            *summary_sync_warnings,
-        ],
-
-        asset_requirements=(
-            plan.asset_requirements
-        ),
-
-        final_outputs=(
-            plan.final_outputs
-        ),
-
-        available_tools=(
-            plan.available_tools
-        ),
-
-        missing_tool_configs=(
-            plan.missing_tool_configs
-        ),
-
-        tool_requirements=(
-            plan.tool_requirements
-        ),
-
-        creation_blockers=(
-            plan.creation_blockers
-        ),
-
-        requirement_graph=(
-            graph_payload
-        ),
-
-        workflow_allocation_summary=(
-            _load_workflow_allocation_summary(
-                plan.skill_name
-            )
-        ),
-
-        tool_pool_summary=(
-            tool_pool_summary
-        ),
-
-        confirmed_uploaded_assets=(
-            confirmed_uploaded_assets
-        ),
-
-        unselected_uploaded_files=(
-            unselected_uploaded_files
-        ),
-    )@router.post(
     "/prepare-plan",
     response_model=PreparePlanResponse,
 )

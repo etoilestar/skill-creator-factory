@@ -496,69 +496,360 @@ def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
     )
 
 
-def build_default_requirement_graph(files: list[Any]) -> RequirementGraph:
-    """Build a deterministic responsibility graph from file_plan/contracts."""
-    items: list[RequirementItem] = []
-    for file_spec in files or []:
-        path = str(getattr(file_spec, "path", "") or "")
-        if not path or path == "SKILL.md" or path.startswith("assets/"):
+def build_default_requirement_graph(
+    files: list[Any],
+) -> RequirementGraph:
+    """Build the deterministic responsibility graph from normalized file contracts.
+
+    Capability source:
+
+        FileSpecOut.required_capabilities
+        -> RequirementItem.required_tools
+
+    No model performs capability extraction in this function.
+
+    Concrete Registry tool IDs are not mixed into required_tools or
+    optional_tools.
+
+    Creator-only runtime metadata such as ToolPool binding and coverage
+    diagnostics are not business responsibilities and therefore are not copied
+    into must_do.
+    """
+
+    items: list[
+        RequirementItem
+    ] = []
+
+    excluded_runtime_contract_keys = {
+        "coverage_requirements",
+        "tool_binding_summary",
+        "selected_tools",
+        "allowed_tools",
+        "tool_names",
+        "allowed_imports",
+        "allowed_function_imports",
+        "allowed_helper_imports",
+    }
+
+    for file_spec in (
+        files or []
+    ):
+        path = str(
+            getattr(
+                file_spec,
+                "path",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            not path
+            or path == "SKILL.md"
+            or path.startswith(
+                "assets/"
+            )
+        ):
             continue
-        purpose = str(getattr(file_spec, "purpose", "") or "").strip()
-        inputs = [str(x).strip() for x in (getattr(file_spec, "inputs", []) or []) if str(x).strip()]
-        outputs = [str(x).strip() for x in (getattr(file_spec, "outputs", []) or []) if str(x).strip()]
-        required_tools = [str(x).strip() for x in (getattr(file_spec, "required_capabilities", []) or []) if str(x).strip()]
-        optional_tools = [str(x).strip() for x in (getattr(file_spec, "selected_tools", []) or []) if str(x).strip() and str(x).strip() not in required_tools]
-        depends_on = [str(x).strip() for x in (getattr(file_spec, "dependencies", []) or []) if str(x).strip()]
-        must_do = [purpose] if purpose else []
-        constraints: list[RequirementConstraint] = []
-        runtime_contract = getattr(file_spec, "runtime_contract", None) or {}
-        artifact_contract = getattr(file_spec, "artifact_contract", None) or {}
-        for label, contract in (("runtime_contract", runtime_contract), ("artifact_contract", artifact_contract)):
-            if isinstance(contract, dict):
-                for key, value in contract.items():
-                    if value not in (None, "", [], {}):
-                        must_do.append(f"Honor {label}.{key}: {value}")
-                        constraints.append(RequirementConstraint(
-                            name=str(key),
-                            kind="contract",
-                            value=value,
-                            comparator="declared",
-                            source="default_contract",
-                            required=True,
-                        ))
-        if not _file_spec_has_substantive_responsibility(file_spec) and not (purpose or inputs or outputs or depends_on):
+
+        purpose = str(
+            getattr(
+                file_spec,
+                "purpose",
+                "",
+            )
+            or ""
+        ).strip()
+
+        inputs = [
+            str(value).strip()
+            for value in (
+                getattr(
+                    file_spec,
+                    "inputs",
+                    [],
+                )
+                or []
+            )
+            if str(value).strip()
+        ]
+
+        outputs = [
+            str(value).strip()
+            for value in (
+                getattr(
+                    file_spec,
+                    "outputs",
+                    [],
+                )
+                or []
+            )
+            if str(value).strip()
+        ]
+
+        required_capabilities = [
+            str(capability).strip()
+            for capability in (
+                getattr(
+                    file_spec,
+                    "required_capabilities",
+                    [],
+                )
+                or []
+            )
+            if str(capability).strip()
+        ]
+
+        depends_on = [
+            str(value).strip()
+            for value in (
+                getattr(
+                    file_spec,
+                    "dependencies",
+                    [],
+                )
+                or []
+            )
+            if str(value).strip()
+        ]
+
+        must_do = (
+            [purpose]
+            if purpose
+            else []
+        )
+
+        constraints: list[
+            RequirementConstraint
+        ] = []
+
+        runtime_contract = (
+            getattr(
+                file_spec,
+                "runtime_contract",
+                None,
+            )
+            or {}
+        )
+
+        artifact_contract = (
+            getattr(
+                file_spec,
+                "artifact_contract",
+                None,
+            )
+            or {}
+        )
+
+        if isinstance(
+            runtime_contract,
+            dict,
+        ):
+            for key, value in (
+                runtime_contract.items()
+            ):
+                if (
+                    key
+                    in excluded_runtime_contract_keys
+                ):
+                    continue
+
+                if value in (
+                    None,
+                    "",
+                    [],
+                    {},
+                ):
+                    continue
+
+                must_do.append(
+                    (
+                        "Honor runtime_contract."
+                        f"{key}: {value}"
+                    )
+                )
+
+                constraints.append(
+                    RequirementConstraint(
+                        name=str(key),
+                        kind="contract",
+                        value=value,
+                        comparator="declared",
+                        source=(
+                            "default_contract"
+                        ),
+                        required=True,
+                    )
+                )
+
+        if isinstance(
+            artifact_contract,
+            dict,
+        ):
+            for key, value in (
+                artifact_contract.items()
+            ):
+                if value in (
+                    None,
+                    "",
+                    [],
+                    {},
+                ):
+                    continue
+
+                must_do.append(
+                    (
+                        "Honor artifact_contract."
+                        f"{key}: {value}"
+                    )
+                )
+
+                constraints.append(
+                    RequirementConstraint(
+                        name=str(key),
+                        kind="contract",
+                        value=value,
+                        comparator="declared",
+                        source=(
+                            "default_contract"
+                        ),
+                        required=True,
+                    )
+                )
+
+        if (
+            not _file_spec_has_substantive_responsibility(
+                file_spec
+            )
+            and not (
+                purpose
+                or inputs
+                or outputs
+                or depends_on
+            )
+        ):
             continue
-        items.append(RequirementItem(
-            target_file=path,
-            role=str(getattr(file_spec, "role", "") or getattr(file_spec, "file_kind", "") or "").strip(),
-            runtime=str(getattr(file_spec, "runtime", "") or "none"),
-            owner_step=str(getattr(file_spec, "entrypoint", "") or path),
-            purpose=purpose or f"Implement the declared file responsibility for {path}.",
-            inputs=inputs,
-            outputs=outputs,
-            depends_on=depends_on,
-            required_tools=required_tools,
-            optional_tools=optional_tools,
-            must_do=must_do,
-            must_not_do=[
-                "Do not hard-code undeclared input/output names.",
-                "Do not add unrelated responsibilities to this file.",
-            ],
-            constraints=constraints,
-            evidence_policy={
-                "first_round": "Review compact responsibility evidence in the target file.",
-                "e2e": "E2E validates runtime execution and IO alignment.",
-            },
-        ))
-    platform_input_node, platform_output_node = _platform_boundary_nodes()
+
+        items.append(
+            RequirementItem(
+                target_file=path,
+
+                role=str(
+                    getattr(
+                        file_spec,
+                        "role",
+                        "",
+                    )
+                    or getattr(
+                        file_spec,
+                        "file_kind",
+                        "",
+                    )
+                    or ""
+                ).strip(),
+
+                runtime=str(
+                    getattr(
+                        file_spec,
+                        "runtime",
+                        "",
+                    )
+                    or "none"
+                ),
+
+                owner_step=str(
+                    getattr(
+                        file_spec,
+                        "entrypoint",
+                        "",
+                    )
+                    or path
+                ),
+
+                purpose=(
+                    purpose
+                    or (
+                        "Implement the declared "
+                        "file responsibility for "
+                        f"{path}."
+                    )
+                ),
+
+                inputs=inputs,
+
+                outputs=outputs,
+
+                depends_on=(
+                    depends_on
+                ),
+
+                # Capability source is exactly the
+                # normalized file plan.
+                required_tools=list(
+                    required_capabilities
+                ),
+
+                # Do not mix concrete Tool IDs with
+                # semantic capabilities.
+                optional_tools=[],
+
+                must_do=must_do,
+
+                must_not_do=[
+                    (
+                        "Do not hard-code undeclared "
+                        "input/output names."
+                    ),
+                    (
+                        "Do not add unrelated "
+                        "responsibilities to this file."
+                    ),
+                ],
+
+                constraints=constraints,
+
+                evidence_policy={
+                    "first_round": (
+                        "Review compact responsibility "
+                        "evidence in the target file."
+                    ),
+                    "e2e": (
+                        "E2E validates runtime "
+                        "execution and IO alignment."
+                    ),
+                },
+            )
+        )
+
+    (
+        platform_input_node,
+        platform_output_node,
+    ) = _platform_boundary_nodes()
+
     return RequirementGraph(
         requirements=items,
-        platform_io_contract=build_platform_io_contract(),
-        platform_input_node=platform_input_node,
-        platform_output_node=platform_output_node,
+
+        platform_io_contract=(
+            build_platform_io_contract()
+        ),
+
+        platform_input_node=(
+            platform_input_node
+        ),
+
+        platform_output_node=(
+            platform_output_node
+        ),
+
         dataflow_edges=[],
-        requirement_graph_source="fallback",
-        requirement_graph_quality="fallback_coarse",
+
+        requirement_graph_source=(
+            "deterministic_file_contracts"
+        ),
+
+        requirement_graph_quality=(
+            "normalized_responsibility"
+        ),
     )
 
 

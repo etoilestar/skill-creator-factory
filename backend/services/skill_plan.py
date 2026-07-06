@@ -112,13 +112,44 @@ def normalize_required_capabilities(
     required_capabilities: list[str],
     user_blueprint_text: str = "",
 ) -> list[str]:
-    """Deprecated compatibility shim: capabilities are hints, not contracts.
+    """Normalize explicitly planned business capabilities.
 
-    Creator normalized plans keep model-provided capability names in
-    ``raw_capability_hints`` for diagnostics only. They must not drive role
-    validation, tool-slot inference, implementation strategy, or script prompts.
+    Capability decomposition is owned by the planning model and SkillPlan.
+
+    This function must not:
+    - infer capabilities from role;
+    - infer capabilities from file path;
+    - mine blueprint prose for extra capabilities;
+    - resolve Registry tools;
+    - authorize tools.
+
+    It only preserves explicitly declared business capabilities and removes
+    platform/Creator/resource-layer capability names.
+
+    The normalized result is the shared semantic capability source for:
+    - FileSpecOut.required_capabilities;
+    - RequirementItem.required_tools;
+    - Creator Tool embedding recall.
     """
-    return []
+
+    _ = role
+    _ = path
+    _ = user_blueprint_text
+
+    normalized = _dedupe_capabilities(
+        list(
+            required_capabilities
+            or []
+        )
+    )
+
+    return [
+        capability
+        for capability in normalized
+        if is_business_capability(
+            capability
+        )
+    ]
 
 RESOURCE_ROLES: frozenset[str] = frozenset({"skill_overview", "reference", "asset"})
 _CREATOR_INTERNAL_REFERENCE_PATHS: tuple[str, ...] = (
@@ -772,57 +803,359 @@ def build_skill_plan_entry(
     blueprint_summary: str = "",
     reference_files: list[str] | None = None,
 ) -> SkillPlanEntry:
+    """Build one normalized SkillPlanEntry from an explicit SkillPlan block.
+
+    Business capability decomposition comes only from the explicit
+    required_capabilities declaration in the concrete file block.
+
+    This function does not infer business capabilities from:
+    - role;
+    - file name;
+    - global blueprint words;
+    - Tool Registry.
+
+    The normalized required_capabilities field is the shared semantic source
+    used by responsibility graph construction and Creator Tool recall.
+    """
+
     classification = file_role_classifier(
         file_path=file_path,
         purpose=purpose,
         blueprint_summary=blueprint_summary,
     )
-    file_type = file_type_for_path(file_path)
-    explicit_required_capabilities = _explicit_list_field("required_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    explicit_optional_capabilities = _explicit_list_field("optional_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    explicit_allowed_capabilities = _explicit_list_field("allowed_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    explicit_side_effects = _explicit_list_field("side_effects", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or []
-    explicit_tool_slots = _explicit_list_field("required_tool_slots", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary) or []
-    role = classification.role
-    role_reason = classification.reason
-    explicit_inputs = _explicit_list_field("inputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    explicit_outputs = _explicit_list_field("outputs", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    explicit_default_values = _explicit_default_values(file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    file_kind = file_kind_for_path(file_path)
-    default_inputs, default_outputs = default_io_for_file_kind(file_kind)
-    inputs = explicit_inputs if explicit_inputs is not None else default_inputs
-    inputs = _augment_inputs_for_role(role, inputs, purpose=purpose, blueprint_summary=blueprint_summary)
-    outputs = explicit_outputs if explicit_outputs is not None else default_outputs
-    all_reference_files = _dedupe_paths(list(reference_files or []))
-    skill_local_references = [ref for ref in all_reference_files if _is_skill_local_reference(ref)]
-    creator_internal_references = [ref for ref in all_reference_files if _is_creator_internal_reference(ref)]
-    for ref in _CREATOR_INTERNAL_REFERENCE_PATHS:
-        if ref not in creator_internal_references:
-            creator_internal_references.append(ref)
-    explicit_dependencies = _explicit_list_field("dependencies", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    dependencies = _dedupe_paths([ref for ref in (explicit_dependencies or skill_local_references) if _is_skill_local_reference(ref)])
-    raw_required_capabilities = explicit_required_capabilities or []
-    raw_capability_hints = _dedupe_capabilities(raw_required_capabilities)
-    platform_capabilities = [cap for cap in raw_capability_hints if capability_layer(cap) == "platform_protocol"]
-    required_capabilities: list[str] = []
-    optional_capabilities = [cap for cap in (explicit_optional_capabilities or []) if is_business_capability(cap)]
-    allowed_capabilities = [cap for cap in (explicit_allowed_capabilities or []) if is_business_capability(cap)]
-    explicit_forbidden = (
-        _explicit_list_field("business_forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-        or _explicit_list_field("forbidden_capabilities", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
+
+    file_type = file_type_for_path(
+        file_path
     )
-    raw_forbidden_capabilities = explicit_forbidden or []
-    platform_safety_constraints = [cap for cap in _dedupe_capabilities(raw_forbidden_capabilities) if is_platform_safety_constraint(cap)]
-    forbidden_capabilities = [
-        capability for capability in _dedupe_capabilities(raw_forbidden_capabilities)
-        if is_business_capability(capability) and capability not in required_capabilities
+
+    explicit_required_capabilities = (
+        _explicit_list_field(
+            "required_capabilities",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    explicit_optional_capabilities = (
+        _explicit_list_field(
+            "optional_capabilities",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    explicit_allowed_capabilities = (
+        _explicit_list_field(
+            "allowed_capabilities",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    explicit_side_effects = (
+        _explicit_list_field(
+            "side_effects",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+        or []
+    )
+
+    explicit_tool_slots = (
+        _explicit_list_field(
+            "required_tool_slots",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+        or []
+    )
+
+    role = classification.role
+
+    role_reason = (
+        classification.reason
+    )
+
+    explicit_inputs = (
+        _explicit_list_field(
+            "inputs",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    explicit_outputs = (
+        _explicit_list_field(
+            "outputs",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    explicit_default_values = (
+        _explicit_default_values(
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    file_kind = file_kind_for_path(
+        file_path
+    )
+
+    (
+        default_inputs,
+        default_outputs,
+    ) = default_io_for_file_kind(
+        file_kind
+    )
+
+    inputs = (
+        explicit_inputs
+        if explicit_inputs is not None
+        else default_inputs
+    )
+
+    inputs = _augment_inputs_for_role(
+        role,
+        inputs,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
+    )
+
+    outputs = (
+        explicit_outputs
+        if explicit_outputs is not None
+        else default_outputs
+    )
+
+    all_reference_files = _dedupe_paths(
+        list(
+            reference_files
+            or []
+        )
+    )
+
+    skill_local_references = [
+        reference
+        for reference
+        in all_reference_files
+        if _is_skill_local_reference(
+            reference
+        )
     ]
-    detected_language = language_for_path(file_path)
-    explicit_language = _explicit_scalar_field("language", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    language = explicit_language if explicit_language in {"python", "javascript", "bash", "sql", "yaml", "json", "markdown", "html", "css", "text"} else detected_language
-    detected_runtime = runtime_for_language(language, file_type)
-    explicit_runtime = _explicit_scalar_field("runtime", file_path=file_path, purpose=purpose, blueprint_summary=blueprint_summary)
-    runtime = explicit_runtime if explicit_runtime in {"python", "node", "bash", "shell", "generic", "none"} else detected_runtime
+
+    creator_internal_references = [
+        reference
+        for reference
+        in all_reference_files
+        if _is_creator_internal_reference(
+            reference
+        )
+    ]
+
+    for reference in (
+        _CREATOR_INTERNAL_REFERENCE_PATHS
+    ):
+        if (
+            reference
+            not in creator_internal_references
+        ):
+            creator_internal_references.append(
+                reference
+            )
+
+    explicit_dependencies = (
+        _explicit_list_field(
+            "dependencies",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    dependencies = _dedupe_paths([
+        reference
+        for reference in (
+            explicit_dependencies
+            or skill_local_references
+        )
+        if _is_skill_local_reference(
+            reference
+        )
+    ])
+
+    raw_required_capabilities = (
+        explicit_required_capabilities
+        or []
+    )
+
+    raw_capability_hints = (
+        _dedupe_capabilities(
+            raw_required_capabilities
+        )
+    )
+
+    platform_capabilities = [
+        capability
+        for capability
+        in raw_capability_hints
+        if capability_layer(
+            capability
+        )
+        == "platform_protocol"
+    ]
+
+    required_capabilities = (
+        normalize_required_capabilities(
+            role=str(role or ""),
+            path=file_path,
+            required_capabilities=(
+                raw_required_capabilities
+            ),
+            user_blueprint_text="",
+        )
+    )
+
+    optional_capabilities = [
+        capability
+        for capability
+        in _dedupe_capabilities(
+            explicit_optional_capabilities
+            or []
+        )
+        if (
+            is_business_capability(
+                capability
+            )
+            and capability
+            not in required_capabilities
+        )
+    ]
+
+    allowed_capabilities = [
+        capability
+        for capability
+        in _dedupe_capabilities(
+            explicit_allowed_capabilities
+            or []
+        )
+        if is_business_capability(
+            capability
+        )
+    ]
+
+    explicit_forbidden = (
+        _explicit_list_field(
+            "business_forbidden_capabilities",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+        or _explicit_list_field(
+            "forbidden_capabilities",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    raw_forbidden_capabilities = (
+        explicit_forbidden
+        or []
+    )
+
+    platform_safety_constraints = [
+        capability
+        for capability
+        in _dedupe_capabilities(
+            raw_forbidden_capabilities
+        )
+        if is_platform_safety_constraint(
+            capability
+        )
+    ]
+
+    forbidden_capabilities = [
+        capability
+        for capability
+        in _dedupe_capabilities(
+            raw_forbidden_capabilities
+        )
+        if (
+            is_business_capability(
+                capability
+            )
+            and capability
+            not in required_capabilities
+        )
+    ]
+
+    detected_language = language_for_path(
+        file_path
+    )
+
+    explicit_language = (
+        _explicit_scalar_field(
+            "language",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    language = (
+        explicit_language
+        if explicit_language in {
+            "python",
+            "javascript",
+            "bash",
+            "sql",
+            "yaml",
+            "json",
+            "markdown",
+            "html",
+            "css",
+            "text",
+        }
+        else detected_language
+    )
+
+    detected_runtime = runtime_for_language(
+        language,
+        file_type,
+    )
+
+    explicit_runtime = (
+        _explicit_scalar_field(
+            "runtime",
+            file_path=file_path,
+            purpose=purpose,
+            blueprint_summary=blueprint_summary,
+        )
+    )
+
+    runtime = (
+        explicit_runtime
+        if explicit_runtime in {
+            "python",
+            "node",
+            "bash",
+            "shell",
+            "generic",
+            "none",
+        }
+        else detected_runtime
+    )
+
     return SkillPlanEntry(
         path=file_path,
         file_type=file_type,
@@ -832,38 +1165,138 @@ def build_skill_plan_entry(
         component_hint=role,
         inputs=inputs,
         outputs=outputs,
-        default_values=explicit_default_values,
+        default_values=(
+            explicit_default_values
+        ),
         dependencies=dependencies,
-        side_effects=explicit_side_effects,
-        required_capabilities=required_capabilities,
-        raw_capability_hints=raw_capability_hints,
-        optional_capabilities=optional_capabilities,
-        allowed_capabilities=allowed_capabilities,
-        forbidden_capabilities=forbidden_capabilities,
-        business_capabilities=required_capabilities,
-        platform_capabilities=platform_capabilities,
-        business_forbidden_capabilities=forbidden_capabilities,
-        platform_safety_constraints=platform_safety_constraints,
-        execution_contract={"runtime": runtime, "entrypoint": file_path} if file_type == "script" else {},
-        runtime_contract={"runtime": runtime, "entrypoint": file_path, "argv": "json_object"} if file_type == "script" else {"runtime": "none"},
-        artifact_contract={"stdout_fields": list(outputs or []), "final": bool(file_type == "script")} if file_type == "script" else {},
-        layer="business_skill" if file_type in {"skill", "script", "skill_md"} else "static_resource",
-        # Public/final SKILL.md references are skill-local only.  Creator
-        # kernel references remain separate internal context and must never be
-        # merged into reference_files/skill_local_references.
-        reference_files=skill_local_references,
-        skill_local_references=skill_local_references,
-        creator_internal_references=creator_internal_references,
+        side_effects=(
+            explicit_side_effects
+        ),
+
+        required_capabilities=(
+            required_capabilities
+        ),
+
+        raw_capability_hints=(
+            raw_capability_hints
+        ),
+
+        optional_capabilities=(
+            optional_capabilities
+        ),
+
+        allowed_capabilities=(
+            allowed_capabilities
+        ),
+
+        forbidden_capabilities=(
+            forbidden_capabilities
+        ),
+
+        business_capabilities=list(
+            required_capabilities
+        ),
+
+        platform_capabilities=(
+            platform_capabilities
+        ),
+
+        business_forbidden_capabilities=(
+            forbidden_capabilities
+        ),
+
+        platform_safety_constraints=(
+            platform_safety_constraints
+        ),
+
+        execution_contract=(
+            {
+                "runtime": runtime,
+                "entrypoint": file_path,
+            }
+            if file_type == "script"
+            else {}
+        ),
+
+        runtime_contract=(
+            {
+                "runtime": runtime,
+                "entrypoint": file_path,
+                "argv": "json_object",
+            }
+            if file_type == "script"
+            else {
+                "runtime": "none",
+            }
+        ),
+
+        artifact_contract=(
+            {
+                "stdout_fields": list(
+                    outputs or []
+                ),
+                "final": bool(
+                    file_type == "script"
+                ),
+            }
+            if file_type == "script"
+            else {}
+        ),
+
+        layer=(
+            "business_skill"
+            if file_type in {
+                "skill",
+                "script",
+                "skill_md",
+            }
+            else "static_resource"
+        ),
+
+        reference_files=(
+            skill_local_references
+        ),
+
+        skill_local_references=(
+            skill_local_references
+        ),
+
+        creator_internal_references=(
+            creator_internal_references
+        ),
+
         language=language,
         runtime=runtime,
-        entrypoint=file_path if file_type == "script" else "",
-        command_template=command_template_for_entry(file_path, runtime, inputs) if file_type == "script" else "",
-        required_tool_slots=explicit_tool_slots,
+
+        entrypoint=(
+            file_path
+            if file_type == "script"
+            else ""
+        ),
+
+        command_template=(
+            command_template_for_entry(
+                file_path,
+                runtime,
+                inputs,
+            )
+            if file_type == "script"
+            else ""
+        ),
+
+        required_tool_slots=(
+            explicit_tool_slots
+        ),
+
         required=required,
         can_skip=can_skip,
-        confidence=classification.confidence,
+        confidence=(
+            classification.confidence
+        ),
         reason=role_reason,
-        heuristic_signals=classification.heuristic_signals,
+        heuristic_signals=(
+            classification.heuristic_signals
+        ),
     )
 
 

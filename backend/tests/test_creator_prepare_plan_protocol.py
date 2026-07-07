@@ -464,36 +464,44 @@ def _assert_normalized_reference_block(text: str, path: str):
 
 
 def test_normalize_prepare_references_adds_dependency_reference_to_skill_plan():
-    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/workflows.md]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
-    _assert_normalized_reference_block(text, "references/workflows.md")
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/test-dependency-boundary.md]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
+    _assert_normalized_reference_block(text, "references/test-dependency-boundary.md")
 
 
 def test_normalize_prepare_references_adds_references_field_reference_to_skill_plan():
-    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: [references/output-patterns.md]")
-    _assert_normalized_reference_block(text, "references/output-patterns.md")
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: []\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: [references/test-reference-boundary.md]")
+    _assert_normalized_reference_block(text, "references/test-reference-boundary.md")
 
 
-def test_normalize_prepare_references_adds_resource_list_reference_to_skill_plan():
-    text = _blueprint_with_reference_mention("- [ ] references/best-practices.md")
-    _assert_normalized_reference_block(text, "references/best-practices.md")
+def test_normalize_prepare_references_is_idempotent():
+    path = "references/test-idempotent-boundary.md"
+    text = _ready_blueprint(f"- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [{path}]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
+    once = api._normalize_prepare_blueprint_references(text)
+    twice = api._normalize_prepare_blueprint_references(once)
+    assert once == twice
+    assert twice.count(f"- path: `{path}`") == 1
 
 
-def test_normalize_prepare_references_adds_body_backtick_reference_to_skill_plan():
-    text = _blueprint_with_reference_mention("正文需要读取 `references/interaction-guide.md` 作为交互规范。")
-    _assert_normalized_reference_block(text, "references/interaction-guide.md")
+def test_normalize_prepare_references_does_not_add_incidental_mentions():
+    text = _blueprint_with_reference_mention("资源展示：- [ ] references/test-incidental-resource.md\n正文提到 `references/test-incidental-prose.md`，但 SkillPlan 没有显式 dependencies/references。")
+    normalized = api._normalize_prepare_blueprint_references(text)
+    assert "- path: `references/test-incidental-resource.md`" not in normalized
+    assert "- path: `references/test-incidental-prose.md`" not in normalized
+    assert normalized == text.strip()
 
 
 def test_normalize_prepare_references_ignores_wildcards_and_placeholders():
-    text = _blueprint_with_reference_mention("不要补 `references/*.md`、references/<name>.md、references/[file].md 或 references/ 目录。")
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/*.md, references/<name>.md, references/[file].md, references/]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
     normalized = api._normalize_prepare_blueprint_references(text)
     assert "- path: `references/*.md`" not in normalized
     assert "- path: `references/<name>.md`" not in normalized
     assert "- path: `references/[file].md`" not in normalized
-    assert normalized == text
+    assert normalized == text.strip()
 
 
 def test_preflight_missing_skill_plan_message_includes_path():
-    issues = api._preflight_prepare_blueprint_text(_blueprint_with_reference_mention("- [ ] references/workflows.md"))
-    issue = next(i for i in issues if i["code"] == "directory_or_text_path_missing_from_skill_plan")
-    assert issue["path"] == "references/workflows.md"
-    assert "references/workflows.md" in issue["message"]
+    text = _ready_blueprint("- path: `scripts/process.py`\n  role: script\n  inputs: []\n  outputs: []\n  dependencies: [references/test-missing-preflight.md]\n  required_capabilities: []\n  forbidden_capabilities: []\n  references: []")
+    issues = api._preflight_prepare_blueprint_text(text)
+    issue = next(i for i in issues if i["code"] == "dependency_missing_from_skill_plan")
+    assert issue["path"] == "references/test-missing-preflight.md"
+    assert "references/test-missing-preflight.md" in issue["message"]

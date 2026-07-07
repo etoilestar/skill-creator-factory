@@ -5303,13 +5303,37 @@ def _is_valid_prepare_reference_path(path: str) -> bool:
 
 
 def _extract_prepare_reference_paths(blueprint_text: str) -> set[str]:
-    """Extract concrete references/*.md mentions from the whole prepare blueprint."""
+    """Extract concrete references/*.md paths from explicit SkillPlan fields.
+
+    Only SkillPlan block ``dependencies`` and ``references`` fields are topology
+    facts. Incidental paths in prose, examples, resource checklists, or protocol
+    context must not create Skill-local static files.
+    """
+
     paths: set[str] = set()
-    pattern = re.compile(r"(?<![\w./-])(references/[^\s`'\"，,。；;:)）]+\.md)(?![\w./-])", re.I)
-    for match in pattern.finditer(str(blueprint_text or "")):
-        path = _normalize_skill_path(match.group(1).strip())
-        if _is_valid_prepare_reference_path(path):
-            paths.add(path)
+    text = str(blueprint_text or "")
+    block_re = re.compile(
+        (
+            r"(?ims)^\s*-\s*path\s*:\s*`?([^`\n]+?)`?\s*$"
+            r"(?P<block>[\s\S]*?)"
+            r"(?=^\s*-\s*path\s*:|^\s*#{1,6}\s+|\Z)"
+        )
+    )
+    field_re = re.compile(
+        r"(?im)^\s*(dependencies|references)\s*:\s*\[?([^\]\n]*)\]?\s*$"
+    )
+
+    for block_match in block_re.finditer(text):
+        block = block_match.group("block") or ""
+        for field_match in field_re.finditer(block):
+            raw = str(field_match.group(2) or "")
+            for item in re.split(r"[,，、]\s*", raw):
+                path = _normalize_skill_path(
+                    str(item or "").strip().strip("'\"`")
+                )
+                if _is_valid_prepare_reference_path(path):
+                    paths.add(path)
+
     return paths
 
 
@@ -5318,7 +5342,7 @@ def _prepare_reference_plan_block(path: str) -> str:
         f"- path: `{path}`\n"
         "  file_type: reference\n"
         "  role: reference\n"
-        "  purpose: 运行前静态参考资料，供相关脚本按 dependencies/reference_files 读取。\n"
+        "  purpose: 运行前静态参考资源，供声明它的文件消费\n"
         "  required: true\n"
         "  can_skip: false\n"
         "  inputs: []\n"
@@ -5350,22 +5374,47 @@ def _insert_prepare_reference_plan_blocks(blueprint_text: str, blocks: list[str]
 def _normalize_prepare_blueprint_references(
     blueprint_text: str,
 ) -> str:
-    """Preserve the blueprint reference plan exactly as declared.
+    """Ensure explicit SkillPlan reference dependencies have file blocks.
 
-    Reference files are business-plan facts.
-
-    The backend must not create a new SkillPlan reference entry merely because a
-    references/*.md path appears in prose, protocol guidance, command examples,
-    or explanatory text.
-
-    Missing concrete references are validated by
-    _preflight_prepare_blueprint_text against explicit SkillPlan fields.
+    This is a structural prepare-plan normalization only: it follows concrete
+    ``references/*.md`` paths already declared by SkillPlan ``dependencies`` or
+    ``references`` fields, and never infers files from prose or resource lists.
     """
 
-    return str(
+    text = str(
         blueprint_text
         or ""
     ).strip()
+
+    if not text:
+        return ""
+
+    plan_paths = set(
+        _extract_prepare_skill_plan_paths(
+            text
+        )
+    )
+
+    missing = sorted(
+        path
+        for path in _extract_prepare_reference_paths(
+            text
+        )
+        if path not in plan_paths
+    )
+
+    if not missing:
+        return text
+
+    return _insert_prepare_reference_plan_blocks(
+        text,
+        [
+            _prepare_reference_plan_block(
+                path
+            )
+            for path in missing
+        ],
+    )
 
 
 async def _repair_prepare_blueprint_protocol(
@@ -5487,6 +5536,12 @@ Creator 协议边界：
             )
             or ""
         ).strip()
+
+        candidate = (
+            _normalize_prepare_blueprint_references(
+                candidate
+            )
+        )
 
         if not _prepare_repair_candidate_is_valid(
             candidate
@@ -6551,12 +6606,12 @@ required_capabilities 只属于
 - 具体文件只在 SkillPlan 中声明。
 
 - references/*.md
-  只有业务确实需要静态参考资料时才创建。
+  只有业务 Skill 自身在运行前确实需要读取某个静态参考资源时才声明；不确定时默认不声明 reference。
+
+- Creator/Kernel 内部参考资料只是创建阶段规划上下文，不属于业务 Skill 的本地静态资源；不得复制、改写或截取内部 reference path/basename 后写入 SkillPlan dependencies、references 或资源清单。
 
 - 协议示例、kernel 示例、命令示例中的
   references/*.md 路径不是业务文件。
-
-- 不确定是否需要 reference 时默认不创建。
 
 - dependencies/references 中真实引用的静态文件
   必须在 SkillPlan 中显式声明。
@@ -9329,6 +9384,12 @@ async def prepare_plan(
             or ""
         ).strip()
 
+        blueprint_text = (
+            _normalize_prepare_blueprint_references(
+                blueprint_text
+            )
+        )
+
         if (
             prepare_action
             == "submit_supplement"
@@ -9744,6 +9805,12 @@ async def prepare_plan(
     ] = []
 
     for attempt in range(3):
+        blueprint_text = (
+            _normalize_prepare_blueprint_references(
+                blueprint_text
+            )
+        )
+
         try:
             plan = await analyze_blueprint(
                 AnalyzeBlueprintRequest(

@@ -1391,394 +1391,119 @@ def _generic_three_script_specs():
     ]
 
 
-def test_structured_semantic_handoff_schema_normalizes_preserved_structure():
-    from backend.services.creator import api
+def test_arbitrary_constraint_projects_from_filespec_to_requirement_item():
+    spec = _script_spec(
+        constraints=[{
+            "name": "image_count_relationship",
+            "kind": "responsibility_constraint",
+            "value": {"expected": "one caption per image"},
+            "comparator": "describes",
+            "unit": "",
+            "required": True,
+        }]
+    )
+    req = build_default_requirement_graph([spec]).requirements[0]
+    assert len(req.constraints) == 1
+    assert req.constraints[0].name == "image_count_relationship"
+    assert req.constraints[0].value == {"expected": "one caption per image"}
 
-    specs = _generic_three_script_specs()
-    handoffs = api._normalize_semantic_handoffs([
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "ordered semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "per_item",
-            "correspondence": "preserve",
-            "ordering": "preserve",
-        }
-    ], specs)
 
-    assert handoffs == [
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "ordered semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "per_item",
-            "correspondence": "preserve",
-            "ordering": "preserve",
-        }
+def test_arbitrary_constraints_share_same_transport_path():
+    spec = _script_spec(
+        constraints=[
+            {"name": "font_size", "kind": "typography", "value": 14, "comparator": "describes", "required": True},
+            {"name": "quality_threshold", "kind": "evaluation", "value": {"minimum": "high"}, "comparator": "describes", "required": True},
+        ]
+    )
+    req = build_default_requirement_graph([spec]).requirements[0]
+    assert [(c.name, c.kind, c.value) for c in req.constraints] == [
+        ("font_size", "typography", 14),
+        ("quality_threshold", "evaluation", {"minimum": "high"}),
     ]
 
 
-def test_structured_semantic_handoff_unknown_enum_is_normalized_to_unknown():
-    from backend.services.creator import api
+def test_producer_payload_includes_only_current_target_constraints():
+    from backend.services.creator.generation import _script_responsibility_requirements_payload
 
-    handoffs = api._normalize_semantic_handoffs([
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "semantic units",
-            "cardinality": "random_value",
-            "consumption_mode": "random_value",
-            "correspondence": "random_value",
-            "ordering": "random_value",
-        }
-    ], _generic_three_script_specs())
-
-    assert handoffs[0]["cardinality"] == "unknown"
-    assert handoffs[0]["consumption_mode"] == "unknown"
-    assert handoffs[0]["correspondence"] == "unknown"
-    assert handoffs[0]["ordering"] == "unknown"
-
-
-def test_structured_semantic_handoff_unknown_script_target_is_dropped():
-    from backend.services.creator import api
-
-    handoffs = api._normalize_semantic_handoffs([
-        {
-            "producer": "scripts/missing.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "per_item",
-            "correspondence": "preserve",
-            "ordering": "preserve",
-        }
-    ], _generic_three_script_specs())
-
-    assert handoffs == []
-
-
-def test_collection_per_item_handoff_appends_complete_collection_responsibility():
-    from backend.services.creator import api
-
-    graph = build_default_requirement_graph(_generic_three_script_specs())
-    api._append_structured_handoff_requirements(graph, [
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "ordered semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "per_item",
-            "correspondence": "preserve",
-            "ordering": "preserve",
-        }
+    graph = build_default_requirement_graph([
+        _script_spec(path="scripts/a.py", constraints=[{"name": "a_only", "kind": "layout", "value": "grid", "comparator": "describes"}]),
+        _script_spec(path="scripts/b.py", constraints=[{"name": "b_only", "kind": "frequency", "value": "daily", "comparator": "describes"}]),
     ])
-
-    req = next(item for item in graph.requirements if item.target_file == "scripts/transform.py")
-    text = "\n".join(req.must_do)
-    assert "complete upstream semantic collection" in text
-    assert "each required semantic unit" in text
-    assert "complete result collection" in text
-    assert "Preserve sufficient correspondence" in text
-    assert "Preserve the semantic ordering" in text
+    payload = _script_responsibility_requirements_payload(file_path="scripts/a.py", requirements=graph.requirements)
+    assert len(payload) == 1
+    assert payload[0]["target_file"] == "scripts/a.py"
+    assert [c["name"] for c in payload[0]["constraints"]] == ["a_only"]
 
 
-def test_whole_collection_handoff_does_not_add_per_item_responsibility():
-    from backend.services.creator import api
-
-    graph = build_default_requirement_graph(_generic_three_script_specs())
-    api._append_structured_handoff_requirements(graph, [
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "whole_collection",
-            "correspondence": "unknown",
-            "ordering": "unknown",
-        }
-    ])
-
-    req = next(item for item in graph.requirements if item.target_file == "scripts/transform.py")
-    text = "\n".join(req.must_do)
-    assert "complete upstream semantic collection" in text
-    assert "each required semantic unit" not in text
-
-
-def test_aggregate_handoff_does_not_auto_require_correspondence():
-    from backend.services.creator import api
-
-    graph = build_default_requirement_graph(_generic_three_script_specs())
-    api._append_structured_handoff_requirements(graph, [
-        {
-            "producer": "scripts/transform.py",
-            "consumer": "scripts/assemble.py",
-            "semantic_product": "transformed semantic units",
-            "cardinality": "collection",
-            "consumption_mode": "aggregate",
-            "correspondence": "not_required",
-            "ordering": "unknown",
-        }
-    ])
-
-    req = next(item for item in graph.requirements if item.target_file == "scripts/assemble.py")
-    text = "\n".join(req.must_do)
-    assert "declared aggregate semantic result" in text
-    assert "Preserve sufficient correspondence" not in text
-
-
-@pytest.mark.asyncio
-async def test_requirement_graph_empty_patch_is_incomplete_and_falls_back(monkeypatch):
-    from backend.services.creator import api
-
-    async def fake_complete(**_kwargs):
-        return {
-            "patches": [
-                {"target_file": "scripts/source.py", "must_do": ["Own source responsibility."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/transform.py", "must_do": [], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/assemble.py", "must_do": ["Own assemble responsibility."], "must_not_do": [], "depends_on": []},
-            ]
-        }
-
-    warnings = []
-    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
-    graph = await api._extract_requirement_graph_with_validator(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-        warnings=warnings,
+def test_runtime_and_artifact_contracts_do_not_become_semantic_must_do():
+    spec = _script_spec(
+        runtime_contract={"command_args": {"topic": "{{topic}}"}},
+        artifact_contract={"stdout_fields": ["semantic artifact"], "final": True},
     )
+    req = build_default_requirement_graph([spec]).requirements[0]
+    joined = "\n".join(req.must_do)
+    assert "Honor runtime_contract" not in joined
+    assert "Honor artifact_contract" not in joined
+    assert all(constraint.source != "default_contract" for constraint in req.constraints)
 
-    assert graph.requirement_graph_source == "deterministic_file_contracts"
-    assert warnings[-1]["code"] == "validator_incomplete"
-    assert "scripts/transform.py" in warnings[-1]["details"]["missing_compiled_targets"]
 
+def test_internal_blueprint_constraints_flow_to_skillplan_and_filespec():
+    from backend.services.blueprint_parser import parse_blueprint
 
-@pytest.mark.asyncio
-async def test_requirement_graph_compiler_retry_recovers_missing_target(monkeypatch):
-    from backend.services.creator import api
+    internal_blueprint_text = '''
+📋 Skill 架构蓝图
+- **Skill 名称**: constraint-flow
+- scripts/: `scripts/render.py`
+  scripts/render.py
+  role: generic_script
+  inputs: topic
+  outputs: artifact
+  constraints: [{"name":"image_count_relationship","kind":"responsibility","value":{"rule":"one caption per image"},"comparator":"describes","required":true}]
+'''
+    plan = parse_blueprint([{"role": "assistant", "content": internal_blueprint_text}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/render.py")
+    assert entry.constraints == [{
+        "name": "image_count_relationship",
+        "kind": "responsibility",
+        "value": {"rule": "one caption per image"},
+        "comparator": "describes",
+        "required": True,
+    }]
 
-    calls = []
-
-    async def fake_complete(**_kwargs):
-        calls.append(_kwargs)
-        if len(calls) == 1:
-            return {
-                "patches": [
-                    {"target_file": "scripts/source.py", "must_do": ["Own source responsibility."], "must_not_do": [], "depends_on": []},
-                    {"target_file": "scripts/transform.py", "must_do": ["Own transform responsibility."], "must_not_do": [], "depends_on": []},
-                ]
-            }
-        return {
-            "patches": [
-                {"target_file": "scripts/source.py", "must_do": ["Own source responsibility."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/transform.py", "must_do": ["Own transform responsibility."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/assemble.py", "must_do": ["Own assemble responsibility."], "must_not_do": [], "depends_on": []},
-            ]
-        }
-
-    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
-    graph = await api._extract_requirement_graph_with_validator(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
+    spec = FileSpecOut(
+        path=entry.path,
+        purpose=entry.purpose,
+        required=entry.required,
+        can_skip=entry.can_skip,
+        file_type=entry.file_type,
+        file_kind=entry.file_kind,
+        role=entry.role,
+        inputs=entry.inputs,
+        outputs=entry.outputs,
+        constraints=entry.constraints,
     )
-
-    assert len(calls) == 2
-    assert graph.requirement_graph_source == "deterministic_file_contracts+normalized_responsibility_compilation"
+    assert spec.constraints == entry.constraints
 
 
-@pytest.mark.asyncio
-async def test_requirement_graph_compiler_retry_exhausted_falls_back_with_diagnostics(monkeypatch):
-    from backend.services.creator import api
+def test_producer_and_judge_requirement_payload_constraints_match():
+    from backend.services.creator.common import RequirementConstraint, requirement_item_prompt_payload
+    from backend.services.creator.generation import _script_responsibility_requirements_payload
 
-    calls = []
-
-    async def fake_complete(**_kwargs):
-        calls.append(_kwargs)
-        return {
-            "patches": [
-                {"target_file": "scripts/source.py", "must_do": ["Own source responsibility."], "must_not_do": [], "depends_on": []},
-            ]
-        }
-
-    warnings = []
-    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
-    graph = await api._extract_requirement_graph_with_validator(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-        warnings=warnings,
-    )
-
-    assert len(calls) == 2
-    assert graph.requirement_graph_source == "deterministic_file_contracts"
-    assert warnings[-1]["details"]["compiler_attempts"] == 2
-    assert warnings[-1]["details"]["returned_patch_targets"] == ["scripts/source.py"]
-    assert set(warnings[-1]["details"]["required_script_targets"]) == {"scripts/source.py", "scripts/transform.py", "scripts/assemble.py"}
-
-
-@pytest.mark.asyncio
-async def test_requirement_graph_complete_valid_patches_use_one_compiler_call(monkeypatch):
-    from backend.services.creator import api
-
-    calls = []
-
-    async def fake_complete(**_kwargs):
-        calls.append(_kwargs)
-        return {
-            "patches": [
-                {"target_file": "scripts/source.py", "must_do": ["Own source responsibility."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/transform.py", "must_do": ["Own transform responsibility."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/assemble.py", "must_do": ["Own assemble responsibility."], "must_not_do": [], "depends_on": []},
-            ]
-        }
-
-    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
-    graph = await api._extract_requirement_graph_with_validator(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-    )
-
-    assert len(calls) == 1
-    assert graph.requirement_graph_source == "deterministic_file_contracts+normalized_responsibility_compilation"
-
-
-@pytest.mark.asyncio
-async def test_workflow_allocator_retries_when_semantic_handoffs_key_missing(monkeypatch):
-    from backend.services.creator import api
-
-    calls = []
-
-    async def fake_complete(messages, model):
-        calls.append(messages)
-        if len(calls) == 1:
-            return '{"workflow_allocation_summary":"first","patches":[]}'
-        return '{"workflow_allocation_summary":"second","semantic_handoffs":[{"producer":"scripts/source.py","consumer":"scripts/transform.py","semantic_product":"semantic units","cardinality":"collection","consumption_mode":"per_item","correspondence":"preserve","ordering":"preserve"}],"patches":[]}'
-
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
-    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-    )
-
-    assert len(calls) == 2
-    assert summary == "second"
-    assert applied == set()
-    assert resolved is True
-    assert handoffs[0]["consumption_mode"] == "per_item"
-    assert "semantic_handoffs" in calls[1][-1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_workflow_allocator_accepts_explicit_empty_semantic_handoffs(monkeypatch):
-    from backend.services.creator import api
-
-    calls = []
-
-    async def fake_complete(messages, model):
-        calls.append(messages)
-        return '{"workflow_allocation_summary":"ok","semantic_handoffs":[],"patches":[]}'
-
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
-    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-    )
-
-    assert len(calls) == 1
-    assert summary == "ok"
-    assert applied == set()
-    assert resolved is True
-    assert handoffs == []
-
-@pytest.mark.asyncio
-async def test_workflow_allocator_prompt_distinguishes_unknown_from_not_required(monkeypatch):
-    from backend.services.creator import api
-
-    calls = []
-
-    specs = [
-        _script_spec(path="scripts/source.py", purpose="Produce multiple semantic units for downstream processing.", inputs=["semantic input"], outputs=["semantic result"]),
-        _script_spec(path="scripts/process.py", purpose="Perform per-unit processing for every required semantic unit.", inputs=["semantic result"], outputs=["processed result"]),
-        _script_spec(path="scripts/assemble.py", purpose="Assemble processed results in the ordered downstream assembly.", inputs=["processed result"], outputs=["assembled result"]),
+    req = build_default_requirement_graph([_script_spec(path="scripts/current.py")]).requirements[0]
+    req.constraints = [
+        RequirementConstraint(
+            name="layout_density",
+            kind="layout",
+            value={"max_items_per_row": 3},
+            comparator="describes",
+            required=False,
+        )
     ]
 
-    async def fake_complete(messages, model):
-        calls.append(messages)
-        return '{"workflow_allocation_summary":"ambiguous structure stays unknown","semantic_handoffs":[{"producer":"scripts/source.py","consumer":"scripts/process.py","semantic_product":"semantic result","cardinality":"unknown","consumption_mode":"unknown","correspondence":"unknown","ordering":"unknown"}],"patches":[]}'
+    producer_payload = _script_responsibility_requirements_payload(
+        file_path="scripts/current.py",
+        requirements=[req],
+    )[0]
+    judge_payload = requirement_item_prompt_payload(req)
 
-    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
-    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
-        blueprint_text="ignored",
-        files_out=specs,
-    )
-
-    prompt = calls[0][0]["content"]
-    assert "unknown != not_required" in prompt
-    assert "信息不足必须返回 unknown" in prompt
-    assert "不得直接返回 cardinality=single" in prompt
-    assert "不得因为现有 output 看起来是单个名字就默认 cardinality=single" in prompt
-    assert summary == "ambiguous structure stays unknown"
-    assert handoffs[0]["cardinality"] == "unknown"
-    assert handoffs[0]["correspondence"] == "unknown"
-
-
-@pytest.mark.asyncio
-async def test_requirement_graph_compiler_prompt_keeps_structured_handoff_read_only(monkeypatch):
-    from backend.services.creator import api
-
-    calls = []
-
-    async def fake_complete(**kwargs):
-        calls.append(kwargs)
-        return {
-            "patches": [
-                {"target_file": "scripts/source.py", "must_do": ["Complete owned core action."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/transform.py", "must_do": ["Consume upstream semantic product."], "must_not_do": [], "depends_on": []},
-                {"target_file": "scripts/assemble.py", "must_do": ["Deliver semantic result."], "must_not_do": [], "depends_on": []},
-            ]
-        }
-
-    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
-    graph = await api._extract_requirement_graph_with_validator(
-        blueprint_text="ignored",
-        files_out=_generic_three_script_specs(),
-    )
-
-    prompt = calls[0]["messages"][0]["content"]
-    assert "normalized_semantic_handoffs is read-only structural context" in prompt
-    assert "Do not translate cardinality, consumption_mode, correspondence, or ordering" in prompt
-    assert "Do not create collection, per-item, aggregation, correspondence, or ordering responsibilities" in prompt
-    assert "_append_structured_handoff_requirements" in prompt
-    assert graph.requirement_graph_source == "deterministic_file_contracts+normalized_responsibility_compilation"
-
-
-def test_single_passthrough_handoff_does_not_create_collection_responsibility():
-    from backend.services.creator import api
-
-    graph = build_default_requirement_graph(_generic_three_script_specs())
-    req = next(item for item in graph.requirements if item.target_file == "scripts/transform.py")
-    req.must_do = [
-        "Consume upstream semantic product.",
-        "Complete owned core action.",
-        "Deliver semantic result.",
-    ]
-
-    api._append_structured_handoff_requirements(graph, [
-        {
-            "producer": "scripts/source.py",
-            "consumer": "scripts/transform.py",
-            "semantic_product": "semantic result",
-            "cardinality": "single",
-            "consumption_mode": "passthrough",
-            "correspondence": "preserve",
-            "ordering": "not_required",
-        }
-    ])
-
-    text = "\n".join(req.must_do + req.must_not_do)
-    assert "complete semantic input collection" not in text
-    assert "each required semantic unit" not in text
-    assert "complete result collection" not in text
-    assert "multiple semantic inputs" not in text
-    assert "collapse collection" not in text
-    assert "Preserve sufficient correspondence" in text
+    assert producer_payload["constraints"] == judge_payload["constraints"]

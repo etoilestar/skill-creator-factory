@@ -716,9 +716,7 @@ def _script_responsibility_requirements_payload(
         ):
             continue
 
-        serialized = item.model_dump(
-            mode="json"
-        )
+        serialized = requirement_item_prompt_payload(item)
 
         if str(
             item.id or ""
@@ -1886,6 +1884,10 @@ def _build_script_generate_file_prompt_variant(
             "responsibility_requirements 是当前文件已经编译完成的职责合同，"
             "也是后续单文件职责审查所依据的责任事实。"
             "实现当前脚本时必须完成其中 must_do，遵守 must_not_do；"
+            "constraints 是当前文件拥有的开放 responsibility requirements，"
+            "所有 required=true constraints 都必须实现；"
+            "根据完整 constraint object 理解其语义，不存在固定 constraint vocabulary，"
+            "不要忽略不认识的 constraint；"
             "inputs/outputs 表达语义责任，不要求局部变量名或 argv key "
             "与这些文本逐字一致。"
         ),
@@ -1924,8 +1926,8 @@ def _build_script_generate_file_prompt_variant(
         ),
         (
             "执行顺序：1. Read script_goal; 2. Read responsibility_requirements.must_do; "
-            "3. Read responsibility_requirements.must_not_do; 4. Determine the current file's responsibility closure; "
-            "5. Only then inspect available_tools; 6. Select zero or more tools whose real function contracts directly help implement that responsibility."
+            "3. Read responsibility_requirements.must_not_do; 4. Read responsibility_requirements.constraints; 5. Determine the current file's responsibility closure; "
+            "6. Only then inspect available_tools; 7. Select zero or more tools whose real function contracts directly help implement that responsibility."
         ),
         (
             "available_tools 是 Skill-wide authorized candidate pool，不是当前脚本的责任所有权清单。"

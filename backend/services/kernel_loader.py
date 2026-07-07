@@ -811,7 +811,9 @@ Phase 2 的任务是：
 2. **蓝图格式必须严格遵守 Creator 平台硬协议**，包括：
    - 标题必须逐字使用 `## 📋 Skill 架构蓝图`，不能替换为 ✅ 或其它标题。
    - 必须包含 `### 目录结构`，列出 `SKILL.md`，并按需列出具体 `scripts/*`、`references/*`、`assets/*` 路径；目录结构只用于展示和交叉校验，不是 role/capability 主来源；不需要 references/assets 时也要写明“无需创建”。
-   - 必须包含 `### SkillPlan / 文件职责计划`，每个将创建的业务文件都必须有 `path`、`role`、`inputs`、`outputs`、`dependencies`、`required_capabilities`、`business_forbidden_capabilities`、`references`；Creator 以这里的文件合同作为主解析源。
+   - 必须包含 `### SkillPlan / 文件职责计划`，每个将创建的业务文件都必须有 `path`、`role`、`inputs`、`outputs`、`dependencies`、`constraints`、`required_capabilities`、`business_forbidden_capabilities`、`references`；Creator 以这里的文件合同作为主解析源。
+   - `constraints` 表示当前文件拥有的开放 responsibility requirements。只保留用户或 workflow 已明确要求、且 purpose/inputs/outputs/capabilities 无法完整表达的实现约束。constraints 必须属于当前 target file，不得广播到其它 scripts。后端不解释 constraint 类型，不存在固定 constraint vocabulary。字段必须使用单行合法 JSON array；没有额外 constraints 时写 []。
+   - script entry 模板必须包含：`constraints: [{"name":"...","kind":"...","value":...,"comparator":"describes","required":true}]`；没有额外 constraints 时写 `constraints: []`。
    - `required_capabilities` 只能写业务运行需要的平台工具能力（如 text_generation、image_generation、pdf_generation、web_search、file_output）；不要写脚本基础执行、宿主调度、沙盒运行、确认流程、安全策略等 Creator/Kernel 平台协议能力。
    - `business_forbidden_capabilities` 只能写业务层禁止的工具能力；平台安全限制由 Creator/Kernel 内部管理，不能写进业务 SkillPlan。
    - `scripts/*` 的 role/capability 必须由你在 SkillPlan 中显式规划；Creator 后台不会根据业务词补 role/capability。

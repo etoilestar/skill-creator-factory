@@ -773,6 +773,9 @@ def test_creator_phase2_prompt_requires_blueprint_before_confirmation():
     assert "不要只输出确认问题" in prompt
     assert "Phase 2 期间禁止输出 phase3_start" in prompt
     assert "\"对，开始做吧\"" in prompt
+    assert "constraints` 表示当前文件拥有的开放 responsibility requirements" in prompt
+    assert "字段必须使用单行合法 JSON array" in prompt
+    assert 'constraints: [{"name":"...","kind":"...","value":...,"comparator":"describes","required":true}]' in prompt
 
 
 def test_creator_phase_refinement_revision_hint_overrides_confirmation():

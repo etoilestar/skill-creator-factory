@@ -697,13 +697,10 @@ def build_default_requirement_graph(
                 ):
                     continue
 
-                must_do.append(
-                    (
-                        "Honor artifact_contract."
-                        f"{key}: {value}"
-                    )
-                )
-
+                # Artifact/stdout exact interface contracts are enforced by
+                # canonical file contracts, generation output contracts,
+                # runtime checks and E2E. RequirementGraph remains semantic
+                # and must not turn interface field names into must_do items.
                 constraints.append(
                     RequirementConstraint(
                         name=str(key),
@@ -797,12 +794,12 @@ def build_default_requirement_graph(
 
                 must_not_do=[
                     (
-                        "Do not hard-code undeclared "
-                        "input/output names."
-                    ),
-                    (
                         "Do not add unrelated "
                         "responsibilities to this file."
+                    ),
+                    (
+                        "Do not replace or reimplement core "
+                        "responsibilities assigned to another script."
                     ),
                 ],
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .common import *  # noqa: F403
+from .common import _file_spec_has_substantive_responsibility
 from .contracts import *  # noqa: F403
 from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
@@ -7299,6 +7300,7 @@ async def _extract_requirement_graph_with_validator(
     files_out: list[FileSpecOut],
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
+    workflow_allocation_summary: str = "",
 ) -> RequirementGraph:
     """Compile compact per-file responsibilities from normalized file contracts.
 
@@ -7333,6 +7335,7 @@ async def _extract_requirement_graph_with_validator(
     # Script ownership was already decided during blueprint planning and then
     # normalized by workflow allocation / file-contract processing.
     _ = blueprint_text
+    semantic_handoff_summary = str(workflow_allocation_summary or "").strip()
 
     graph = validate_requirement_graph_schema(
         build_default_requirement_graph(
@@ -7349,6 +7352,16 @@ async def _extract_requirement_graph_with_validator(
             "contract compilation"
         ),
     )
+
+    required_script_targets = sorted({
+        str(file_spec.path or "").strip()
+        for file_spec in files_out
+        if (
+            str(file_spec.path or "").strip().startswith("scripts/")
+            and bool(getattr(file_spec, "required", False))
+            and _file_spec_has_substantive_responsibility(file_spec)
+        )
+    })
 
     file_payload = [
         {
@@ -7473,6 +7486,7 @@ async def _extract_requirement_graph_with_validator(
                 "跨脚本 workflow allocation 已在此前阶段"
                 "负责修正可执行 handoff 合同。\n\n"
 
+                "对所有 required_script_targets 中的脚本，必须逐一返回一个 patch；returned_patch_targets 必须与 required_script_targets 完全相等，不得漏掉、重复、新增、placeholder 或不存在 target。缺任何 target 都会被视为 requirement_graph_validator_incomplete。\n\n"
                 "你的任务不是重新规划 Skill。"
                 "你的任务是把 normalized contracts 中已经存在"
                 "但 deterministic graph 尚未充分展开的"
@@ -7514,14 +7528,27 @@ async def _extract_requirement_graph_with_validator(
                 "1. 当前文件 purpose；\n"
                 "2. 当前文件 semantic inputs / outputs；\n"
                 "3. 当前文件 dependencies / reference_files；\n"
-                "4. 当前文件 runtime_contract；\n"
-                "5. 当前文件 artifact_contract；\n"
-                "6. 其他现有文件 normalized contracts 中"
+                "4. 当前文件 runtime_contract 的语义责任（不是字段名合同）；\n"
+                "5. 当前文件 artifact_contract 的语义交付责任（不得复制 stdout/artifact 字段名为 must_do）；\n"
+                "6. normalized semantic handoff summary 中的结构语义；\n"
+                "7. 其他现有文件 normalized contracts 中"
                 "可以观察到的 producer / consumer handoff；\n"
-                "7. deterministic responsibility graph "
+                "8. deterministic responsibility graph "
                 "中已经存在的责任事实。\n\n"
 
                 "不得使用完整 Blueprint 自然语言重新分配责任。\n\n"
+
+                "## responsibility closure 编译规则\n\n"
+                "每个 required script patch 都必须编译完整责任闭包：\n"
+                "- Core action ownership：把当前文件拥有的核心动作写入 must_do；\n"
+                "- Required semantic input participation：上游语义结果必须进入当前文件核心处理路径，但不得要求精确 argv key、dict key、变量名或字段名；\n"
+                "- Complete delivery obligation：当前文件必须交付完整职责结果，不得只完成一个代表样本、固定分支或部分结果；\n"
+                "- Negative ownership boundary：根据其他 normalized script responsibilities，在 must_not_do 中表达不要承担其他脚本拥有的核心动作语义。\n\n"
+                "semantic handoff structure 规则：\n"
+                "- 当 handoff 声明 cardinality=collection 且 consumption_mode=per_item 时，must_do 应包含 Consume the complete upstream semantic collection、Apply the current file's core action to each required semantic unit、Deliver the complete result collection；must_not_do 应包含 Do not collapse a required collection-processing responsibility into one representative item。\n"
+                "- 当 correspondence=preserve 时，must_do 应包含 Preserve sufficient correspondence between consumed semantic units and produced results for downstream consumption。\n"
+                "- 当 ordering=preserve 时，must_do 应包含 Preserve the semantic ordering required by downstream consumers。\n"
+                "只有 normalized semantic handoff summary 明确声明这些结构时才增加；不要默认所有 collection 都逐项处理，不要根据 role、文件名、字段名、capability 或 ToolPool 猜测。\n\n"
 
                 "## must_do 编译规则\n\n"
 
@@ -7540,8 +7567,7 @@ async def _extract_requirement_graph_with_validator(
                 "- 当前文件的核心输入必须参与其业务输出"
                 "或 artifact；\n"
                 "- 当前文件必须产生其声明的业务 outputs；\n"
-                "- 当前文件必须完成 artifact_contract "
-                "明确声明的交付责任；\n"
+                "- 当前文件必须完成 artifact_contract 表达的语义交付责任，但不要生成 Honor artifact_contract.* 或字段名 must_do；\n"
                 "- 当前文件需要读取声明的静态 dependency "
                 "或 reference 时，必须实际消费该资源；\n"
                 "- 当前文件 output 是其他 existing script "
@@ -7651,6 +7677,12 @@ async def _extract_requirement_graph_with_validator(
                 "deterministic_responsibility_graph:\n"
                 + graph.model_dump_json()[:18000]
                 + "\n\n"
+                "required_script_targets (must equal returned patch target_file set):\n"
+                + json.dumps(required_script_targets, ensure_ascii=False)
+                + "\n\n"
+                "normalized_semantic_handoff_summary:\n"
+                + semantic_handoff_summary[:12000]
+                + "\n\n"
                 "platform_io_contract "
                 "(read-only, deterministic):\n"
                 + platform_io_contract_prompt_text()
@@ -7717,6 +7749,7 @@ async def _extract_requirement_graph_with_validator(
         requirement_targets: list[
             str
         ] = []
+        returned_patch_targets: list[str] = []
 
         for index, patch in enumerate(
             patches
@@ -7761,14 +7794,31 @@ async def _extract_requirement_graph_with_validator(
                 or ""
             ).strip()
 
+            if not target or target not in required_script_targets:
+                raise RequirementGraphValidationError(
+                    "Requirement graph patch target is not an expected required script.",
+                    code="validator_incomplete",
+                    details={"index": index, "target_file": target},
+                )
+
+            if target in returned_patch_targets:
+                raise RequirementGraphValidationError(
+                    "Requirement graph patch contains duplicate target.",
+                    code="validator_incomplete",
+                    details={"index": index, "target_file": target},
+                )
+            returned_patch_targets.append(target)
+
             item = by_file.get(
                 target
             )
 
             if item is None:
-                # The compiler may only patch existing
-                # responsibility nodes.
-                continue
+                raise RequirementGraphValidationError(
+                    "Requirement graph patch target has no requirement node.",
+                    code="validator_incomplete",
+                    details={"index": index, "target_file": target},
+                )
 
             patched_requirement = False
 
@@ -7872,6 +7922,16 @@ async def _extract_requirement_graph_with_validator(
                 requirement_targets.append(
                     target
                 )
+
+        if set(returned_patch_targets) != set(required_script_targets):
+            raise RequirementGraphValidationError(
+                "Requirement graph compiler did not cover every required script target.",
+                code="validator_incomplete",
+                details={
+                    "required_script_targets": required_script_targets,
+                    "returned_patch_targets": sorted(returned_patch_targets),
+                },
+            )
 
         graph.requirement_graph_source = (
             "deterministic_file_contracts+"
@@ -10779,6 +10839,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             files_out=files_out,
             requested_model=request.model,
             warnings=warnings,
+            workflow_allocation_summary=workflow_allocation_summary,
         )
     except RequirementGraphValidationError as exc:
         requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)

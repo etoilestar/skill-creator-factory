@@ -288,6 +288,7 @@ class SkillPlanEntry:
     side_effects: list[str] = field(default_factory=list)
     runtime_contract: dict[str, object] = field(default_factory=dict)
     artifact_contract: dict[str, object] = field(default_factory=dict)
+    constraints: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     required: bool = True
     can_skip: bool = False
@@ -1242,6 +1243,7 @@ def build_skill_plan_entry(
             if file_type == "script"
             else {}
         ),
+        constraints=list(raw.get("constraints") or []) if isinstance(raw.get("constraints"), list) else [],
 
         layer=(
             "business_skill"

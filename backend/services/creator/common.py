@@ -261,17 +261,9 @@ class RequirementItem(BaseModel):
             merged["outputs"] = merged.get("semantic_outputs")
         if not merged.get("must_do"):
             required_components = merged.get("required_components") or []
-            constraints = merged.get("constraints") or []
             values: list[str] = []
             for item in required_components if isinstance(required_components, list) else [required_components]:
                 text = str(item or "").strip()
-                if text:
-                    values.append(text)
-            for constraint in constraints if isinstance(constraints, list) else [constraints]:
-                if isinstance(constraint, dict):
-                    text = str(constraint.get("name") or constraint.get("value") or "").strip()
-                else:
-                    text = str(constraint or "").strip()
                 if text:
                     values.append(text)
             merged["must_do"] = values
@@ -492,6 +484,7 @@ def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
         or getattr(file_spec, "artifact_contract", None)
         or getattr(file_spec, "required_capabilities", None)
         or getattr(file_spec, "runtime_contract", None)
+        or getattr(file_spec, "constraints", None)
         or str(getattr(file_spec, "purpose", "") or "").strip()
     )
 
@@ -519,17 +512,6 @@ def build_default_requirement_graph(
     items: list[
         RequirementItem
     ] = []
-
-    excluded_runtime_contract_keys = {
-        "coverage_requirements",
-        "tool_binding_summary",
-        "selected_tools",
-        "allowed_tools",
-        "tool_names",
-        "allowed_imports",
-        "allowed_function_imports",
-        "allowed_helper_imports",
-    }
 
     for file_spec in (
         files or []
@@ -619,100 +601,22 @@ def build_default_requirement_graph(
             else []
         )
 
-        constraints: list[
-            RequirementConstraint
-        ] = []
-
-        runtime_contract = (
-            getattr(
-                file_spec,
-                "runtime_contract",
-                None,
-            )
-            or {}
-        )
-
-        artifact_contract = (
-            getattr(
-                file_spec,
-                "artifact_contract",
-                None,
-            )
-            or {}
-        )
-
-        if isinstance(
-            runtime_contract,
-            dict,
-        ):
-            for key, value in (
-                runtime_contract.items()
-            ):
-                if (
-                    key
-                    in excluded_runtime_contract_keys
-                ):
-                    continue
-
-                if value in (
-                    None,
-                    "",
-                    [],
-                    {},
-                ):
-                    continue
-
-                must_do.append(
-                    (
-                        "Honor runtime_contract."
-                        f"{key}: {value}"
-                    )
-                )
-
-                constraints.append(
-                    RequirementConstraint(
-                        name=str(key),
-                        kind="contract",
-                        value=value,
-                        comparator="declared",
-                        source=(
-                            "default_contract"
-                        ),
-                        required=True,
-                    )
-                )
-
-        if isinstance(
-            artifact_contract,
-            dict,
-        ):
-            for key, value in (
-                artifact_contract.items()
-            ):
-                if value in (
-                    None,
-                    "",
-                    [],
-                    {},
-                ):
-                    continue
-
-                # Artifact/stdout exact interface contracts are enforced by
-                # canonical file contracts, generation output contracts,
-                # runtime checks and E2E. RequirementGraph remains semantic
-                # and must not turn interface field names into must_do items.
-                constraints.append(
-                    RequirementConstraint(
-                        name=str(key),
-                        kind="contract",
-                        value=value,
-                        comparator="declared",
-                        source=(
-                            "default_contract"
-                        ),
-                        required=True,
-                    )
-                )
+        constraints: list[RequirementConstraint] = []
+        raw_constraints = getattr(file_spec, "constraints", None) or []
+        if not isinstance(raw_constraints, list):
+            raw_constraints = [raw_constraints]
+        for raw_constraint in raw_constraints:
+            try:
+                if isinstance(raw_constraint, RequirementConstraint):
+                    constraints.append(raw_constraint)
+                elif isinstance(raw_constraint, dict):
+                    constraints.append(RequirementConstraint(**raw_constraint))
+                else:
+                    text = str(raw_constraint or "").strip()
+                    if text:
+                        constraints.append(RequirementConstraint(name=text, kind="constraint", value=text, comparator="describes", source="blueprint", required=True))
+            except Exception:
+                continue
 
         if (
             not _file_spec_has_substantive_responsibility(
@@ -941,6 +845,7 @@ class FileSpecOut(BaseModel):
     tool_binding_summary: dict[str, Any] = Field(default_factory=dict)
     runtime_contract: dict[str, Any] = Field(default_factory=dict)
     artifact_contract: dict[str, Any] = Field(default_factory=dict)
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list)
     raw_capability_hints: list[str] = Field(default_factory=list)
     forbidden_capabilities: list[str] = Field(default_factory=list)

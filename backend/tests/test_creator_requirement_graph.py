@@ -1507,3 +1507,29 @@ def test_producer_and_judge_requirement_payload_constraints_match():
     judge_payload = requirement_item_prompt_payload(req)
 
     assert producer_payload["constraints"] == judge_payload["constraints"]
+
+    graph = build_default_requirement_graph([
+        _script_spec(path="scripts/a.py", constraints=[{"name": "a_only", "kind": "layout", "value": "grid", "comparator": "describes"}]),
+        _script_spec(path="scripts/b.py", constraints=[{"name": "b_only", "kind": "frequency", "value": "daily", "comparator": "describes"}]),
+    ])
+    payload = _script_responsibility_requirements_payload(file_path="scripts/a.py", requirements=graph.requirements)
+    assert len(payload) == 1
+    assert payload[0]["target_file"] == "scripts/a.py"
+    assert [c["name"] for c in payload[0]["constraints"]] == ["a_only"]
+
+def test_requirement_graph_persistence_helpers_round_trip(monkeypatch, tmp_path):
+    from backend.services.creator import api
+
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+
+    graph = build_default_requirement_graph([_script_spec(path="scripts/main.py")])
+
+    api._persist_requirement_graph("demo-skill", graph)
+    api._persist_workflow_allocation_summary("demo-skill", "preserved constraints")
+
+    loaded_graph = api._load_persisted_requirement_graph("demo-skill")
+    loaded_summary = api._load_workflow_allocation_summary("demo-skill")
+
+    assert loaded_graph is not None
+    assert loaded_graph.requirements[0].target_file == "scripts/main.py"
+    assert loaded_summary == "preserved constraints"

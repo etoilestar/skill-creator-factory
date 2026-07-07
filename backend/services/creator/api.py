@@ -7333,6 +7333,49 @@ async def _extract_requirement_graph_with_validator(
         files_out,
     )
 
+def _persist_requirement_graph(
+    skill_name: str,
+    graph: RequirementGraph,
+) -> None:
+    metadata_dir = (
+        settings.skills_path
+        / _validate_skill_name(skill_name)
+        / ".creator"
+    )
+    metadata_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (
+        metadata_dir
+        / "requirement_graph.json"
+    ).write_text(
+        graph.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def _persist_workflow_allocation_summary(
+    skill_name: str,
+    summary: str,
+) -> None:
+    metadata_dir = (
+        settings.skills_path
+        / _validate_skill_name(skill_name)
+        / ".creator"
+    )
+    metadata_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (
+        metadata_dir
+        / "workflow_allocation_summary.txt"
+    ).write_text(
+        str(summary or "").strip(),
+        encoding="utf-8",
+    )
+
 def _load_workflow_allocation_summary(skill_name: str) -> str:
     path = settings.skills_path / _validate_skill_name(skill_name) / ".creator" / "workflow_allocation_summary.txt"
     if not path.is_file():

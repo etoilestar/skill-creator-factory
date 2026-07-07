@@ -346,7 +346,7 @@ const emit = defineEmits(['creation-complete', 'creation-error'])
 // Reactive state
 // ---------------------------------------------------------------------------
 
-// File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error'
+// File status: 'pending' | 'generating' | 'preview' | 'writing' | 'done' | 'skipped' | 'error' | 'needs_repair'
 const localFiles = ref(
   [
     ...props.files,
@@ -806,6 +806,7 @@ async function generateOneFile(idx) {
   file.repairMessage = ''
 
   try {
+    let generationSucceeded = false
     for await (const chunk of generateFileStream({
       skillName: localSkillName.value,
       filePath: file.path,
@@ -825,7 +826,26 @@ async function generateOneFile(idx) {
         file.generatedContent += chunk.content
       } else if (typeof chunk?.delta === 'string') {
         file.generatedContent += chunk.delta
+      } else if (chunk?.fileDone) {
+        if (typeof chunk.content === 'string' && chunk.content) {
+          file.generatedContent = chunk.content
+        }
+        if (chunk.success === true && chunk.status === 'success') {
+          generationSucceeded = true
+          break
+        }
+        if (chunk.needsRepair || chunk.success === false || chunk.status === 'needs_repair' || chunk.validationStatus === 'needs_repair') {
+          file.status = 'needs_repair'
+          file.showPreview = true
+          file.error = chunk.error || '生成结果需要人工修复'
+          file.repairMessage = `${chunk.errorType || chunk.status || 'needs_repair'}：${chunk.error || '生成结果需要人工修复'}`
+          return
+        }
+        file.status = 'error'
+        file.error = chunk.error || '生成流结束但未返回成功终态'
+        return
       } else if (chunk?.done) {
+        // SSE stream close/done only means the stream ended. It is not generation success.
         break
       } else if (chunk?.validation) {
         const validationStatus = chunk.validation.status
@@ -853,6 +873,10 @@ async function generateOneFile(idx) {
         }
         throw new Error(chunk.error)
       }
+    }
+
+    if (!generationSucceeded) {
+      throw new Error('生成流已结束，但后端未返回显式成功终态')
     }
 
     if (!file.generatedContent.trim()) {
@@ -951,7 +975,7 @@ async function runCreationFromCurrentIndex() {
     if (file.status === 'preview' && file.generatedContent?.trim()) {
       await writeOneFile(idx)
 
-      if (localFiles.value[idx].status === 'error') {
+      if (localFiles.value[idx].status === 'error' || localFiles.value[idx].status === 'needs_repair') {
         if (file.path === 'SKILL.md') {
           file.showPreview = true
           file.repairMessage = '写入时校验仍未通过，请继续手动微调或重新生成。'
@@ -981,7 +1005,7 @@ async function runCreationFromCurrentIndex() {
 
     await generateOneFile(idx)
 
-    if (localFiles.value[idx].status === 'error') {
+    if (localFiles.value[idx].status === 'error' || localFiles.value[idx].status === 'needs_repair') {
       if (file.path === 'SKILL.md' && file.generatedContent?.trim()) {
         file.showPreview = true
         file.repairMessage = 'SKILL.md 二次校验失败，可手动微调后点击“写入”或“重新生成”。'

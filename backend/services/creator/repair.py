@@ -4085,34 +4085,25 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
     if not isinstance(data, dict):
         return {"passed": True, "failure_type": "script_requirement_validator_error", "issues": [], "advisory_notes": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
     advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
-    raw_issue_items: list[dict[str, Any]] = []
-    for collection_name in ("blocking_issues", "issues"):
-        collection = data.get(collection_name)
-        if isinstance(collection, list):
-            for raw_issue in collection:
-                if isinstance(raw_issue, dict):
-                    raw_issue_items.append(raw_issue)
-                    advisory_notes.append(raw_issue)
     checks = data.get("checks")
     required_ids = {r.id for r in requirements if r.required}
-    candidate_items: list[dict[str, Any]] = []
-    if isinstance(checks, list):
-        candidate_items.extend(item for item in checks if isinstance(item, dict))
-    candidate_items.extend(raw_issue_items)
-    candidate_items.extend(item for item in advisory_notes if isinstance(item, dict) and item not in candidate_items)
-
+    if not isinstance(checks, list):
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": [], "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
+    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
+    missing = sorted(required_ids - seen)
+    if missing:
+        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": checks, "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
     blocking: list[dict[str, Any]] = []
     seen_blockers: set[tuple[str, tuple[str, ...], str]] = set()
-    for check in candidate_items:
-        rid = str(check.get("requirement_id") or "")
-        has_required_evidence_shape = bool(rid and (not required_ids or rid in required_ids))
-        if has_required_evidence_shape:
-            is_blocking = _is_blocking_requirement_check(check, required_ids, file_path=file_path)
-        else:
-            is_blocking = _is_structured_semantic_responsibility_blocker(check, file_path)
-        if not is_blocking:
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        rid = str(check.get("requirement_id") or "").strip()
+        if rid not in required_ids:
             if check not in advisory_notes:
                 advisory_notes.append(check)
+            continue
+        if not _is_blocking_requirement_check(check, required_ids, file_path=file_path):
             continue
         missing_evidence = check.get("missing_evidence") if isinstance(check.get("missing_evidence"), list) else []
         semantic_failure = str(check.get("semantic_failure") or check.get("reason") or check.get("problem") or "Required requirement lacks implementation evidence.")
@@ -4121,34 +4112,22 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
             continue
         seen_blockers.add(key)
         blocking.append({
-                "id": "script_requirement_failed",
-                "requirement_id": rid,
-                "failed_file": file_path,
-                "failed_function": "current script",
-                "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
-                "reason": semantic_failure,
-                "semantic_failure": semantic_failure,
-                "missing_evidence": missing_evidence,
-                "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
-                "allowed_scope": "current file only",
-                "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
-                "details": {"check": {k: v for k, v in check.items() if k != "interface_notes"}, "interface_notes_advisory": check.get("interface_notes") if isinstance(check.get("interface_notes"), list) else []},
-            })
-
+            "id": "script_requirement_failed",
+            "requirement_id": rid,
+            "failed_file": file_path,
+            "failed_function": "current script",
+            "code_region": str(check.get("code_region") or check.get("target_file") or file_path),
+            "reason": semantic_failure,
+            "semantic_failure": semantic_failure,
+            "missing_evidence": missing_evidence,
+            "minimal_edit": str(check.get("minimal_edit") or "Add the smallest implementation evidence for this requirement in the current file."),
+            "allowed_scope": "current file only",
+            "forbidden_scope": "Do not modify SKILL.md, workflow mapping, field names only, or other files.",
+            "details": {"check": {k: v for k, v in check.items() if k != "interface_notes"}, "interface_notes_advisory": check.get("interface_notes") if isinstance(check.get("interface_notes"), list) else []},
+        })
     if blocking:
-        normalized_checks = checks if isinstance(checks, list) else []
-        return {"passed": False, "failure_type": "script_requirement_failed", "issues": blocking, "checks": normalized_checks, "advisory_notes": advisory_notes, "repair_instructions": str(data.get("repair_instructions") or ""), "raw_review": data}
-
-    if not isinstance(checks, list):
-        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": [], "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review missing checks[]", "allowed_scope": "do not repair business files"}], "raw_review": data}
-
-    seen = {str(c.get("requirement_id") or "") for c in checks if isinstance(c, dict)}
-    missing = sorted(required_ids - seen)
-    if missing:
-        return {"passed": True, "failure_type": "script_requirement_validator_incomplete", "issues": [], "checks": checks, "advisory_notes": [*advisory_notes, {"id": "script_requirement_validator_incomplete", "failed_file": file_path, "reason": "review did not cover all required requirements", "missing_requirement_ids": missing, "allowed_scope": "do not repair business files"}], "raw_review": data}
-    return {"passed": True, "failure_type": "none", "issues": [], "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "", "raw_review": data}
-
-
+        return {"passed": False, "failure_type": "script_requirement_failed", "issues": blocking, "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": str(data.get("repair_instructions") or ""), "raw_review": data}
+    return {"passed": True, "failure_type": "", "issues": [], "checks": checks, "advisory_notes": advisory_notes, "repair_instructions": "", "raw_review": data}
 
 def _detect_script_responsibility_static_blockers(
     script_content: str,

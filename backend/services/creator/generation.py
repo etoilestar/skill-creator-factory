@@ -1207,8 +1207,7 @@ def _script_local_contract_payload(
                 "allowed_function_imports."
             ),
             (
-                "Prefer primary tools, then "
-                "secondary tools."
+                "Treat available tools as candidates only after responsibility_requirements are understood."
             ),
             (
                 "Standard-library or allowed local "
@@ -1500,8 +1499,10 @@ def _build_script_generate_file_prompt_variant(
             ]
         )
 
-        plan_entry.runtime_contract = (
-            runtime_contract
+        object.__setattr__(
+            plan_entry,
+            "runtime_contract",
+            runtime_contract,
         )
     local_contract = (
         _script_local_contract_payload(
@@ -1922,9 +1923,19 @@ def _build_script_generate_file_prompt_variant(
             "标准库和 available_tools。"
         ),
         (
-            "available_tools 是当前文件可用基础能力，"
-            "不是完整业务方案枚举；"
-            "脚本负责把工具结果组织成当前文件的业务输出。"
+            "执行顺序：1. Read script_goal; 2. Read responsibility_requirements.must_do; "
+            "3. Read responsibility_requirements.must_not_do; 4. Determine the current file's responsibility closure; "
+            "5. Only then inspect available_tools; 6. Select zero or more tools whose real function contracts directly help implement that responsibility."
+        ),
+        (
+            "available_tools 是 Skill-wide authorized candidate pool，不是当前脚本的责任所有权清单。"
+            "Tool availability does not imply responsibility ownership, does not mean the current script should call that Tool, "
+            "and cannot expand the current file's responsibility boundary."
+        ),
+        (
+            "Do not perform an extra core action merely because a callable Tool for that action is available. "
+            "A Tool may only be used when its real function contract directly contributes to a must_do responsibility of the current file. "
+            "If a Tool would create a separate core product assigned to another script, do not call it from the current file."
         ),
         (
             "当前脚本可以定义局部 helper，使用标准库或已允许依赖"
@@ -1981,7 +1992,7 @@ def _build_script_generate_file_prompt_variant(
             "或 function；标准库和已允许依赖可用于本地实现。"
         ),
         (
-            "工具使用优先级：优先使用 primary/fallback tools 与批准 helper；"
+            "工具使用边界：先确定 responsibility closure，再选择真正服务 must_do 的工具；"
             "没有合适工具时使用标准库或已允许依赖完成本地逻辑；"
             "无法完成时返回清晰 blocker。"
         ),

@@ -223,6 +223,25 @@ export async function* generateFileStream({
       if (raw === '[DONE]') return
       try {
         const parsed = JSON.parse(raw)
+        if (parsed.type === 'file_done') {
+          yield {
+            fileDone: true,
+            done: parsed.done === true,
+            terminal: parsed.terminal === true || parsed.done === true,
+            success: parsed.success === true,
+            status: parsed.status,
+            validationStatus: parsed.validation_status || parsed.status,
+            needsRepair: parsed.needs_repair === true || parsed.status === 'needs_repair' || parsed.validation_status === 'needs_repair' || parsed.success === false,
+            error: parsed.error || parsed.message,
+            errorType: parsed.error_type,
+            editable: parsed.editable,
+            disabled: parsed.disabled,
+            recoverable: parsed.recoverable,
+            content: parsed.content || parsed.draft_content || '',
+            raw: parsed,
+          }
+          return
+        }
         if (parsed.error) {
           yield {
             error: parsed.error,
@@ -237,7 +256,7 @@ export async function* generateFileStream({
           return
         }
         if (parsed.done) {
-          yield { done: true }
+          yield { done: true, success: parsed.success === true, status: parsed.status, raw: parsed }
           return
         }
         if (parsed.validation) {

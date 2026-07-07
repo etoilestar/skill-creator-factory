@@ -6434,6 +6434,47 @@ purpose 必须说明：
 
 才应成为该 script 的语义 inputs。
 
+## responsibility structure alignment
+
+在最终确定每个 script 的 purpose、inputs、outputs 前，
+必须先执行一次内部 responsibility structure alignment：
+workflow responsibility → per-script purpose / semantic inputs / semantic outputs。
+
+检查 workflow 是否已经明确表达：
+
+- 一个职责产生多个可独立消费的语义单元；
+- 下游需要分别对每个语义单元执行自身核心动作；
+- 上游单元与下游结果需要保持对应关系；
+- 下游依赖原始语义顺序；
+- 某责任需要重复执行直到完整语义集合处理完成。
+
+如果 workflow 已明确存在上述 workflow structure responsibility，
+不得在 SkillPlan responsibility contract 中将其压缩为：
+single semantic result → single downstream input → single downstream result。
+
+FilePlan 的 purpose / semantic inputs / semantic outputs
+必须保留足够的 collection、per-unit、correspondence、ordering 语义，
+使后续 workflow allocator 可以仅根据 normalized FileSpecs
+恢复正确 semantic handoff structure。
+
+这不是要求固定字段名。
+inputs / outputs 仍然是 semantic responsibilities。
+可以使用自然语言语义描述 collection 或 corresponding results。
+不得要求 exact argv key、stdout key、dict key 或变量名。
+
+如果 workflow 明确要求：
+semantic collection → consumer 对每个语义单元执行自己的核心动作 → corresponding result collection，
+则 producer contract 不得只表达一个代表性 semantic product，
+consumer contract 不得只表达一个代表性 result。
+
+如果 downstream responsibility 需要 correspondence 或 ordering，
+该结构要求必须保留在相关 script purpose 或 semantic handoff contract 中。
+
+内部 loop / map / batch / repetition 本身不创建新的 script boundary。
+仍按现有 responsibility closure 规则决定 script 数量。
+这里只要求已确定的 script responsibility contract
+不得丢失 workflow 中已有的结构语义。
+
 ## 内部处理与脚本拆分
 
 当前平台没有显式 loop/map/foreach runtime node。
@@ -7535,7 +7576,7 @@ async def _extract_requirement_graph_with_validator(
                 "3. 当前文件 dependencies / reference_files；\n"
                 "4. 当前文件 runtime_contract 的语义责任（不是字段名合同）；\n"
                 "5. 当前文件 artifact_contract 的语义交付责任（不得复制 stdout/artifact 字段名为 must_do）；\n"
-                "6. normalized_semantic_handoffs 中的结构语义；\n"
+                "6. normalized_semantic_handoffs 中的只读结构上下文；\n"
                 "7. 其他现有文件 normalized contracts 中"
                 "可以观察到的 producer / consumer handoff；\n"
                 "8. deterministic responsibility graph "
@@ -7549,11 +7590,13 @@ async def _extract_requirement_graph_with_validator(
                 "- Required semantic input participation：上游语义结果必须进入当前文件核心处理路径，但不得要求精确 argv key、dict key、变量名或字段名；\n"
                 "- Complete delivery obligation：当前文件必须交付完整职责结果，不得只完成一个代表样本、固定分支或部分结果；\n"
                 "- Negative ownership boundary：根据其他 normalized script responsibilities，在 must_not_do 中表达不要承担其他脚本拥有的核心动作语义。\n\n"
-                "semantic handoff structure 规则：\n"
-                "- 当 handoff 声明 cardinality=collection 且 consumption_mode=per_item 时，must_do 应包含 Consume the complete upstream semantic collection、Apply the current file's core action to each required semantic unit、Deliver the complete result collection；must_not_do 应包含 Do not collapse a required collection-processing responsibility into one representative item。\n"
-                "- 当 correspondence=preserve 时，must_do 应包含 Preserve sufficient correspondence between consumed semantic units and produced results for downstream consumption。\n"
-                "- 当 ordering=preserve 时，must_do 应包含 Preserve the semantic ordering required by downstream consumers。\n"
-                "只有 normalized_semantic_handoffs 明确声明这些结构时才增加；human-readable workflow_allocation_summary 只用于理解已有责任背景，不得从 summary 自行创造 cardinality、consumption_mode、correspondence 或 ordering。不要默认所有 collection 都逐项处理，不要根据 role、文件名、字段名、capability 或 ToolPool 猜测。\n\n"
+                "normalized_semantic_handoffs is read-only structural context.\n"
+                "Do not translate cardinality, consumption_mode, correspondence, or ordering into must_do / must_not_do yourself.\n"
+                "Do not create collection, per-item, aggregation, correspondence, or ordering responsibilities in compiler patches.\n"
+                "Structural responsibility compilation is handled separately and deterministically from normalized_semantic_handoffs by _append_structured_handoff_requirements.\n"
+                "RequirementGraph LLM 只负责普通 responsibility closure：Core action ownership、Required semantic input participation、Complete semantic delivery、Negative ownership boundary、depends_on 补充。\n"
+                "禁止在 compiler patches 中自己写 complete semantic input collection、each semantic unit、result collection、multiple semantic inputs/items、collapse collection、preserve correspondence、preserve ordering、aggregate complete set。\n"
+                "human-readable workflow_allocation_summary 只用于理解已有责任背景，不得从 summary 自行创造 cardinality、consumption_mode、correspondence 或 ordering。不要根据 role、文件名、字段名、capability 或 ToolPool 猜测。\n\n"
 
                 "## must_do 编译规则\n\n"
 
@@ -8682,6 +8725,11 @@ async def _allocate_workflow_script_responsibilities(
                 "必须返回 semantic_handoffs。每条 handoff 只能基于现有 normalized FileSpecs、script purpose、semantic inputs、semantic outputs、dependencies 和 normalized workflow responsibility/allocation context。\n"
                 "semantic_product 是上游责任产生并由下游消费的语义结果描述，不是 exact stdout key、argv key、dict key 或变量名。\n"
                 "对每条 producer→consumer handoff 判断：producer 交付 single/collection/unknown；consumer 以 passthrough/per_item/aggregate/whole_collection/unknown 消费；是否 preserve correspondence；是否 preserve ordering。\n"
+                "必须同时检查 normalized script purpose、semantic inputs、semantic outputs、producer / consumer relation 是否表达一致的 handoff structure。\n"
+                "当 purpose / responsibility 明确要求完整多单元处理、逐单元处理、保持对应关系或保持顺序，但 inputs / outputs 只表达单个或结构不明确的 semantic result 时，不得直接返回 cardinality=single、consumption_mode=passthrough、correspondence=not_required、ordering=not_required。\n"
+                "如果已有 normalized responsibility 提供明确 cross-script contract evidence，使用现有 compact patch 做最小 inputs / outputs semantic contract 对齐；如果现有责任信息仍不足以确定，对相应结构字段返回 unknown。\n"
+                "unknown != not_required：信息不足必须返回 unknown；not_required 只能表示已有 normalized responsibility 明确表明该关系不需要保持。\n"
+                "不得因为现有 output 看起来是单个名字就默认 cardinality=single；不得因为 inputs/outputs 没写 collection 就忽略 purpose 中已经存在的明确结构责任；不得从字段名称本身推断结构，只比较 normalized responsibility semantics 是否一致。\n"
                 "collection != per_item；collection 可以被 per_item、aggregate、whole_collection 或 passthrough 消费。禁止默认 cardinality=collection => per_item；禁止默认多个 outputs => collection；不确定时返回 unknown。\n\n"
 
                 "返回：\n"

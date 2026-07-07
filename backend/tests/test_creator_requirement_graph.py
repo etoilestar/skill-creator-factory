@@ -1689,3 +1689,96 @@ async def test_workflow_allocator_accepts_explicit_empty_semantic_handoffs(monke
     assert applied == set()
     assert resolved is True
     assert handoffs == []
+
+@pytest.mark.asyncio
+async def test_workflow_allocator_prompt_distinguishes_unknown_from_not_required(monkeypatch):
+    from backend.services.creator import api
+
+    calls = []
+
+    specs = [
+        _script_spec(path="scripts/source.py", purpose="Produce multiple semantic units for downstream processing.", inputs=["semantic input"], outputs=["semantic result"]),
+        _script_spec(path="scripts/process.py", purpose="Perform per-unit processing for every required semantic unit.", inputs=["semantic result"], outputs=["processed result"]),
+        _script_spec(path="scripts/assemble.py", purpose="Assemble processed results in the ordered downstream assembly.", inputs=["processed result"], outputs=["assembled result"]),
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return '{"workflow_allocation_summary":"ambiguous structure stays unknown","semantic_handoffs":[{"producer":"scripts/source.py","consumer":"scripts/process.py","semantic_product":"semantic result","cardinality":"unknown","consumption_mode":"unknown","correspondence":"unknown","ordering":"unknown"}],"patches":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
+        blueprint_text="ignored",
+        files_out=specs,
+    )
+
+    prompt = calls[0][0]["content"]
+    assert "unknown != not_required" in prompt
+    assert "信息不足必须返回 unknown" in prompt
+    assert "不得直接返回 cardinality=single" in prompt
+    assert "不得因为现有 output 看起来是单个名字就默认 cardinality=single" in prompt
+    assert summary == "ambiguous structure stays unknown"
+    assert handoffs[0]["cardinality"] == "unknown"
+    assert handoffs[0]["correspondence"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_requirement_graph_compiler_prompt_keeps_structured_handoff_read_only(monkeypatch):
+    from backend.services.creator import api
+
+    calls = []
+
+    async def fake_complete(**kwargs):
+        calls.append(kwargs)
+        return {
+            "patches": [
+                {"target_file": "scripts/source.py", "must_do": ["Complete owned core action."], "must_not_do": [], "depends_on": []},
+                {"target_file": "scripts/transform.py", "must_do": ["Consume upstream semantic product."], "must_not_do": [], "depends_on": []},
+                {"target_file": "scripts/assemble.py", "must_do": ["Deliver semantic result."], "must_not_do": [], "depends_on": []},
+            ]
+        }
+
+    monkeypatch.setattr(api, "_complete_creator_json_object_once", fake_complete)
+    graph = await api._extract_requirement_graph_with_validator(
+        blueprint_text="ignored",
+        files_out=_generic_three_script_specs(),
+    )
+
+    prompt = calls[0]["messages"][0]["content"]
+    assert "normalized_semantic_handoffs is read-only structural context" in prompt
+    assert "Do not translate cardinality, consumption_mode, correspondence, or ordering" in prompt
+    assert "Do not create collection, per-item, aggregation, correspondence, or ordering responsibilities" in prompt
+    assert "_append_structured_handoff_requirements" in prompt
+    assert graph.requirement_graph_source == "deterministic_file_contracts+normalized_responsibility_compilation"
+
+
+def test_single_passthrough_handoff_does_not_create_collection_responsibility():
+    from backend.services.creator import api
+
+    graph = build_default_requirement_graph(_generic_three_script_specs())
+    req = next(item for item in graph.requirements if item.target_file == "scripts/transform.py")
+    req.must_do = [
+        "Consume upstream semantic product.",
+        "Complete owned core action.",
+        "Deliver semantic result.",
+    ]
+
+    api._append_structured_handoff_requirements(graph, [
+        {
+            "producer": "scripts/source.py",
+            "consumer": "scripts/transform.py",
+            "semantic_product": "semantic result",
+            "cardinality": "single",
+            "consumption_mode": "passthrough",
+            "correspondence": "preserve",
+            "ordering": "not_required",
+        }
+    ])
+
+    text = "\n".join(req.must_do + req.must_not_do)
+    assert "complete semantic input collection" not in text
+    assert "each required semantic unit" not in text
+    assert "complete result collection" not in text
+    assert "multiple semantic inputs" not in text
+    assert "collapse collection" not in text
+    assert "Preserve sufficient correspondence" in text

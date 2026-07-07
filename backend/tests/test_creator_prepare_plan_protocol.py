@@ -505,3 +505,23 @@ def test_preflight_missing_skill_plan_message_includes_path():
     issue = next(i for i in issues if i["code"] == "dependency_missing_from_skill_plan")
     assert issue["path"] == "references/test-missing-preflight.md"
     assert "references/test-missing-preflight.md" in issue["message"]
+
+@pytest.mark.asyncio
+async def test_blueprint_planner_prompt_preserves_workflow_structure_responsibility(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+
+    prompt = captured[0]["content"]
+    assert "workflow structure responsibility" in prompt
+    assert "SkillPlan responsibility contract" in prompt
+    assert "不得在 SkillPlan responsibility contract 中将其压缩" in prompt
+    assert "collection、per-unit、correspondence、ordering" in prompt
+    assert "不得要求 exact argv key、stdout key、dict key 或变量名" in prompt
+    assert "不得根据字段名" not in prompt[prompt.index("## responsibility structure alignment"):prompt.index("## 内部处理与脚本拆分")]
+    assert "role 映射" not in prompt[prompt.index("## responsibility structure alignment"):prompt.index("## 内部处理与脚本拆分")]

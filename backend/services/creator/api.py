@@ -5472,6 +5472,139 @@ Creator 协议边界：
 
     return repaired
 
+def _requirements_for_generated_file(
+    *,
+    skill_name: str,
+    file_path: str,
+    request_graph: Any = None,
+    skill_plan_entry: Any = None,
+) -> list[RequirementItem]:
+    """Resolve one file's already-compiled responsibility requirements.
+
+    Resolution priority:
+    1. backend-persisted requirement graph;
+    2. request graph from the current Creator plan;
+    3. requirements attached to the current file-plan entry.
+
+    This function does not infer or expand business responsibilities.
+    """
+
+    def _filter_items(
+        raw_items: Any,
+    ) -> list[RequirementItem]:
+        result: list[
+            RequirementItem
+        ] = []
+
+        for raw in raw_items or []:
+            try:
+                if isinstance(
+                    raw,
+                    RequirementItem,
+                ):
+                    item = raw
+
+                elif isinstance(
+                    raw,
+                    dict,
+                ):
+                    item = RequirementItem(
+                        **raw
+                    )
+
+                else:
+                    continue
+
+            except Exception:
+                continue
+
+            if (
+                str(
+                    item.target_file
+                    or ""
+                ).strip()
+                != file_path
+            ):
+                continue
+
+            result.append(
+                item
+            )
+
+        return result
+
+    try:
+        persisted_graph = (
+            _load_persisted_requirement_graph(
+                skill_name
+            )
+        )
+
+    except Exception:
+        persisted_graph = None
+
+    if persisted_graph is not None:
+        persisted_items = _filter_items(
+            persisted_graph.requirements
+        )
+
+        if persisted_items:
+            return persisted_items
+
+    if isinstance(
+        request_graph,
+        RequirementGraph,
+    ):
+        request_items = _filter_items(
+            request_graph.requirements
+        )
+
+        if request_items:
+            return request_items
+
+    elif isinstance(
+        request_graph,
+        dict,
+    ):
+        try:
+            normalized_graph = (
+                normalize_requirement_graph(
+                    request_graph
+                )
+            )
+
+            request_items = _filter_items(
+                normalized_graph.requirements
+            )
+
+            if request_items:
+                return request_items
+
+        except Exception:
+            pass
+
+    if isinstance(
+        skill_plan_entry,
+        dict,
+    ):
+        attached_requirements = (
+            skill_plan_entry.get(
+                "requirements"
+            )
+            or []
+        )
+
+    else:
+        attached_requirements = getattr(
+            skill_plan_entry,
+            "requirements",
+            [],
+        ) or []
+
+    return _filter_items(
+        attached_requirements
+    )
+
 def _creator_responsibility_feedback_recall_query(
     *,
     target_file: str,
@@ -11421,13 +11554,20 @@ async def generate_file(request: GenerateFileRequest):
                 route=route,
             )
 
-            effective_skill_plan_entry = request.skill_plan_entry if isinstance(request.skill_plan_entry, dict) else None
+            effective_skill_plan_entry = (
+                request.skill_plan_entry
+                if isinstance(request.skill_plan_entry, dict)
+                else None
+            )
+            entry_requirements: list[RequirementItem] = []
+
             if request.file_path.startswith("scripts/"):
                 # 后端生成阶段重新构建 canonical entry，避免依赖前端传来的不完整 entry。
                 # 这仍然是单文件合同，不做跨文件 E2E 判断。
+                skill_md_path = settings.skills_path / skill_name / "SKILL.md"
                 skill_md_for_entry = (
-                    (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
-                    if (settings.skills_path / skill_name / "SKILL.md").is_file()
+                    skill_md_path.read_text(encoding="utf-8")
+                    if skill_md_path.is_file()
                     else request.blueprint_text
                 )
                 entry_obj = _skill_plan_entry_for_file(
@@ -11437,10 +11577,21 @@ async def generate_file(request: GenerateFileRequest):
                     role=request.role,
                     skill_plan_entry=effective_skill_plan_entry,
                 )
-                effective_skill_plan_entry = dict(getattr(entry_obj, "__dict__", {}) or {})
+                effective_skill_plan_entry = dict(
+                    getattr(entry_obj, "__dict__", {}) or {}
+                )
+                entry_requirements = _requirements_for_generated_file(
+                    skill_name=skill_name,
+                    file_path=request.file_path,
+                    request_graph=request.requirement_graph,
+                    skill_plan_entry=request.skill_plan_entry,
+                )
+
                 effective_skill_plan_entry.setdefault("path", request.file_path)
                 effective_skill_plan_entry.setdefault("purpose", request.purpose)
-                _, tool_blockers = _creator_tool_readiness_blockers(effective_skill_plan_entry)
+                _, tool_blockers = _creator_tool_readiness_blockers(
+                    effective_skill_plan_entry
+                )
                 if tool_blockers:
                     yield _file_done_error_sse(
                         file_path=request.file_path,
@@ -11449,15 +11600,21 @@ async def generate_file(request: GenerateFileRequest):
                         error_type="tool_not_ready",
                     )
                     return
-
-            prompt_messages = _build_generate_file_prompt(
-                request.file_path,
-                skill_name,
-                request.purpose,
-                request.blueprint_text,
-                request.conversation_history,
-                role=request.role,
-                skill_plan_entry=effective_skill_plan_entry,
+            prompt_messages = (
+                _build_generate_file_prompt(
+                    request.file_path,
+                    skill_name,
+                    request.purpose,
+                    request.blueprint_text,
+                    request.conversation_history,
+                    role=request.role,
+                    skill_plan_entry=(
+                        effective_skill_plan_entry
+                    ),
+                    requirements=(
+                        entry_requirements
+                    ),
+                )
             )
             prompt_variant = "standard"
         except Exception as exc:
@@ -11718,12 +11875,6 @@ async def generate_file(request: GenerateFileRequest):
                             skill_plan_entry=effective_skill_plan_entry,
                         )
 
-                        entry_requirements = []
-                        persisted_graph = _load_persisted_requirement_graph(skill_name)
-                        if persisted_graph is not None:
-                            entry_requirements = [req for req in persisted_graph.requirements if req.target_file == request.file_path]
-                        if not entry_requirements and isinstance(effective_skill_plan_entry, dict):
-                            entry_requirements = effective_skill_plan_entry.get("requirements") or []
                         workflow_allocation_summary = _load_workflow_allocation_summary(skill_name)
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
@@ -12026,6 +12177,7 @@ async def generate_file(request: GenerateFileRequest):
                             blueprint_text=request.blueprint_text,
                             role=request.role,
                             skill_plan_entry=effective_skill_plan_entry,
+                            requirements=entry_requirements,
                             variant=next_variant,
                         )
                         if request.file_path.startswith("scripts/")
@@ -12073,21 +12225,15 @@ async def generate_file(request: GenerateFileRequest):
                                 role=request.role,
                                 skill_plan_entry=effective_skill_plan_entry,
                             )
-                            static_requirements: list[Any] = []
-                            static_graph = _load_persisted_requirement_graph(skill_name)
-                            if static_graph is not None:
-                                static_requirements = [req for req in static_graph.requirements if req.target_file == request.file_path]
-                            if not static_requirements and isinstance(effective_skill_plan_entry, dict):
-                                static_requirements = effective_skill_plan_entry.get("requirements") or []
                             static_blockers = _runtime_tool_contract_static_blockers(
                                 candidate or "",
                                 static_entry,
-                                static_requirements,
+                                entry_requirements,
                             )
                             static_blockers += _detect_script_responsibility_static_blockers(
                                 candidate or "",
                                 static_entry,
-                                static_requirements,
+                                entry_requirements,
                             )
                         except Exception:
                             static_blockers = []

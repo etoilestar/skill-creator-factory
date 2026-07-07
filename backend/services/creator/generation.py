@@ -670,6 +670,68 @@ def _snippet_to_dict(snippet: Any) -> dict[str, Any]:
         return dict(snippet)
     return {"text": str(snippet)}
 
+def _script_responsibility_requirements_payload(
+    *,
+    file_path: str,
+    requirements: Any = None,
+) -> list[dict[str, Any]]:
+    """Project current-file RequirementItem objects into prompt-visible payload.
+
+    No business semantics are inferred here.
+
+    The function only filters the already-compiled responsibility contract by
+    target_file and serializes it for the script production model.
+    """
+
+    payload: list[dict[str, Any]] = []
+
+    for raw in requirements or []:
+        try:
+            if isinstance(
+                raw,
+                RequirementItem,
+            ):
+                item = raw
+
+            elif isinstance(
+                raw,
+                dict,
+            ):
+                item = RequirementItem(
+                    **raw
+                )
+
+            else:
+                continue
+
+        except Exception:
+            continue
+
+        if (
+            str(
+                item.target_file
+                or ""
+            ).strip()
+            != file_path
+        ):
+            continue
+
+        serialized = item.model_dump(
+            mode="json"
+        )
+
+        if str(
+            item.id or ""
+        ).strip():
+            serialized[
+                "requirement_id"
+            ] = item.id
+
+        payload.append(
+            serialized
+        )
+
+    return payload
 
 def _available_tool_cards_from_binding(
     binding: dict[str, Any],
@@ -900,6 +962,7 @@ def _script_local_contract_payload(
     purpose: str,
     plan_entry: SkillPlanEntry,
     stdout_schema: dict[str, Any],
+    requirements: Any = None,
 ) -> dict[str, Any]:
     """Build one code model's local script contract.
 
@@ -913,6 +976,12 @@ def _script_local_contract_payload(
         compile_canonical_file_contract(
             plan_entry,
             stdout_schema,
+        )
+    )
+    responsibility_requirements = (
+        _script_responsibility_requirements_payload(
+            file_path=file_path,
+            requirements=requirements,
         )
     )
 
@@ -1024,6 +1093,9 @@ def _script_local_contract_payload(
         "script_goal": purpose,
         "inputs": canonical_contract.inputs,
         "outputs": canonical_contract.outputs,
+        "responsibility_requirements": (
+            responsibility_requirements
+        ),
         "available_tools": available_tools,
         "tool_function_cards": (
             tool_function_cards
@@ -1383,6 +1455,7 @@ def _build_script_generate_file_prompt_variant(
     blueprint_text: str,
     role: str | None,
     skill_plan_entry: dict[str, Any] | None,
+    requirements: Any = None,
     variant: str,
 ) -> list[dict]:
     """Build script-only prompts using progressively smaller local contracts.
@@ -1430,11 +1503,14 @@ def _build_script_generate_file_prompt_variant(
         plan_entry.runtime_contract = (
             runtime_contract
         )
-    local_contract = _script_local_contract_payload(
-        file_path=file_path,
-        purpose=purpose,
-        plan_entry=plan_entry,
-        stdout_schema=stdout_schema,
+    local_contract = (
+        _script_local_contract_payload(
+            file_path=file_path,
+            purpose=purpose,
+            plan_entry=plan_entry,
+            stdout_schema=stdout_schema,
+            requirements=requirements,
+        )
     )
 
     if (
@@ -1800,9 +1876,17 @@ def _build_script_generate_file_prompt_variant(
         ),
         (
             "只根据轻量上下文实现：script_goal、semantic inputs/outputs、"
-            "coverage_requirements、available_tools、tool_function_cards、"
-            "tool_snippets、tool_snippet_prompt、resource_refs、"
-            "output_contract、runtime_envelope、rules。"
+            "responsibility_requirements、coverage_requirements、"
+            "available_tools、tool_function_cards、tool_snippets、"
+            "tool_snippet_prompt、resource_refs、output_contract、"
+            "runtime_envelope、rules。"
+        ),
+        (
+            "responsibility_requirements 是当前文件已经编译完成的职责合同，"
+            "也是后续单文件职责审查所依据的责任事实。"
+            "实现当前脚本时必须完成其中 must_do，遵守 must_not_do；"
+            "inputs/outputs 表达语义责任，不要求局部变量名或 argv key "
+            "与这些文本逐字一致。"
         ),
         (
             "coverage_requirements 是职责覆盖约束，不是 argv/stdout 字段；"
@@ -1967,6 +2051,7 @@ def _build_generate_file_prompt(
     conversation_history: list[dict],
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
+    requirements: Any = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file."""
 
@@ -1974,14 +2059,19 @@ def _build_generate_file_prompt(
     lang = _LANG_LABELS.get(ext, "文本")
 
     if file_path.startswith("scripts/"):
-        return _build_script_generate_file_prompt_variant(
-            file_path=file_path,
-            skill_name=skill_name,
-            purpose=purpose,
-            blueprint_text=blueprint_text,
-            role=role,
-            skill_plan_entry=skill_plan_entry,
-            variant="standard",
+        return (
+            _build_script_generate_file_prompt_variant(
+                file_path=file_path,
+                skill_name=skill_name,
+                purpose=purpose,
+                blueprint_text=blueprint_text,
+                role=role,
+                skill_plan_entry=(
+                    skill_plan_entry
+                ),
+                requirements=requirements,
+                variant="standard",
+            )
         )
 
     clean_blueprint_text = _clean_blueprint_for_file_prompt(blueprint_text)

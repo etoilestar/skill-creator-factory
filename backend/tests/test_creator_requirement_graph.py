@@ -1445,3 +1445,65 @@ def test_runtime_and_artifact_contracts_do_not_become_semantic_must_do():
     assert "Honor runtime_contract" not in joined
     assert "Honor artifact_contract" not in joined
     assert all(constraint.source != "default_contract" for constraint in req.constraints)
+
+
+def test_internal_blueprint_constraints_flow_to_skillplan_and_filespec():
+    from backend.services.blueprint_parser import parse_blueprint
+
+    internal_blueprint_text = '''
+📋 Skill 架构蓝图
+- **Skill 名称**: constraint-flow
+- scripts/: `scripts/render.py`
+  scripts/render.py
+  role: generic_script
+  inputs: topic
+  outputs: artifact
+  constraints: [{"name":"image_count_relationship","kind":"responsibility","value":{"rule":"one caption per image"},"comparator":"describes","required":true}]
+'''
+    plan = parse_blueprint([{"role": "assistant", "content": internal_blueprint_text}])
+    entry = next(item for item in plan.skill_plan.files if item.path == "scripts/render.py")
+    assert entry.constraints == [{
+        "name": "image_count_relationship",
+        "kind": "responsibility",
+        "value": {"rule": "one caption per image"},
+        "comparator": "describes",
+        "required": True,
+    }]
+
+    spec = FileSpecOut(
+        path=entry.path,
+        purpose=entry.purpose,
+        required=entry.required,
+        can_skip=entry.can_skip,
+        file_type=entry.file_type,
+        file_kind=entry.file_kind,
+        role=entry.role,
+        inputs=entry.inputs,
+        outputs=entry.outputs,
+        constraints=entry.constraints,
+    )
+    assert spec.constraints == entry.constraints
+
+
+def test_producer_and_judge_requirement_payload_constraints_match():
+    from backend.services.creator.common import RequirementConstraint, requirement_item_prompt_payload
+    from backend.services.creator.generation import _script_responsibility_requirements_payload
+
+    req = build_default_requirement_graph([_script_spec(path="scripts/current.py")]).requirements[0]
+    req.constraints = [
+        RequirementConstraint(
+            name="layout_density",
+            kind="layout",
+            value={"max_items_per_row": 3},
+            comparator="describes",
+            required=False,
+        )
+    ]
+
+    producer_payload = _script_responsibility_requirements_payload(
+        file_path="scripts/current.py",
+        requirements=[req],
+    )[0]
+    judge_payload = requirement_item_prompt_payload(req)
+
+    assert producer_payload["constraints"] == judge_payload["constraints"]

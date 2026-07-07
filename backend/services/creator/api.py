@@ -7591,13 +7591,12 @@ async def _allocate_workflow_script_responsibilities(
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> tuple[str, set[str], bool]:
-    """Reconcile constraint ownership without interpreting constraint semantics.
+    """Preserve Blueprint Planner target-local constraints.
 
-    The allocator may append existing/open responsibility constraints to the
-    script that owns them, but this backend function does not classify whether a
-    constraint is about quantity, frequency, font, layout, quality, or any other
-    domain concept. The conservative deterministic path keeps normalized
-    Blueprint Planner ownership unchanged.
+    This deterministic step only normalizes the transport shape for existing
+    per-file constraints. It does not reconcile ownership, reinterpret
+    constraint semantics, call a model, introduce semantic enums, or classify
+    constraint domains.
     """
     _ = (blueprint_text, requested_model, warnings)
     for file_spec in files_out or []:
@@ -7613,7 +7612,7 @@ async def _allocate_workflow_script_responsibilities(
             except Exception:
                 pass
     return (
-        "Using Blueprint Planner per-script responsibility constraints without semantic reclassification.",
+        "Preserved Blueprint Planner target-local constraints and normalized transport shape only.",
         set(),
         True,
     )

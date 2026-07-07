@@ -321,6 +321,24 @@ class RequirementItem(BaseModel):
 
 
 
+
+def requirement_item_prompt_payload(item: Any) -> dict[str, Any]:
+    """Serialize one RequirementItem for Producer/Judge prompts.
+
+    RequirementItem.constraints is excluded from the default model dump, so this
+    helper explicitly transports the same constraints payload to every model
+    consumer without interpreting constraint semantics.
+    """
+    requirement = item if isinstance(item, RequirementItem) else RequirementItem(**item) if isinstance(item, dict) else None
+    if requirement is None:
+        return {"value": str(item)}
+    payload = requirement.model_dump(mode="json")
+    payload["constraints"] = [
+        constraint.model_dump(mode="json")
+        for constraint in requirement.constraints
+    ]
+    return payload
+
 class RequirementGraph(BaseModel):
     # RequirementGraph inputs/outputs are recommended shared vocabulary for SKILL.md
     # and scripts to converge on field names. They are not a field-level hard

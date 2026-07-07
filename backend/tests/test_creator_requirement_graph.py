@@ -1508,6 +1508,14 @@ def test_producer_and_judge_requirement_payload_constraints_match():
 
     assert producer_payload["constraints"] == judge_payload["constraints"]
 
+    graph = build_default_requirement_graph([
+        _script_spec(path="scripts/a.py", constraints=[{"name": "a_only", "kind": "layout", "value": "grid", "comparator": "describes"}]),
+        _script_spec(path="scripts/b.py", constraints=[{"name": "b_only", "kind": "frequency", "value": "daily", "comparator": "describes"}]),
+    ])
+    payload = _script_responsibility_requirements_payload(file_path="scripts/a.py", requirements=graph.requirements)
+    assert len(payload) == 1
+    assert payload[0]["target_file"] == "scripts/a.py"
+    assert [c["name"] for c in payload[0]["constraints"]] == ["a_only"]
 
 def test_requirement_graph_persistence_helpers_round_trip(monkeypatch, tmp_path):
     from backend.services.creator import api

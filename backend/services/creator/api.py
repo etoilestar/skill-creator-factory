@@ -146,8 +146,33 @@ def _build_strict_compile_rewrite_prompt(
         },
     ]
 
+def _creator_tool_has_callable_contract(
+    tool: dict[str, Any],
+) -> bool:
+    """Return whether a catalog tool exposes at least one callable function."""
+
+    for function in tool.get("functions") or []:
+        if not isinstance(function, dict):
+            continue
+
+        function_name = str(
+            function.get("function_name")
+            or ""
+        ).strip()
+
+        import_path = str(
+            function.get("import_path")
+            or ""
+        ).strip()
+
+        if function_name and import_path:
+            return True
+
+    return False
+
+
 def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
-    """Return the complete registry discovery catalog visible to planners.
+    """Return selectable Registry discovery catalog visible to planners.
 
     Registry is the descriptive source of truth.
 
@@ -155,6 +180,7 @@ def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
     - it does not authorize tools;
     - it does not mutate ToolPool;
     - planner may only propose exact tool_ids from this catalog;
+    - capability shells without callable function contracts are excluded;
     - backend gate remains the authorization authority.
 
     The planner must see real callable contracts rather than tool names alone,
@@ -434,7 +460,7 @@ def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
                 ),
             })
 
-        catalog.append({
+        tool_record = {
             "tool_id": str(
                 getattr(capability, "name", "")
                 or ""
@@ -665,7 +691,15 @@ def _creator_tool_catalog_for_planner() -> list[dict[str, Any]]:
             ),
             "functions": functions,
             "snippets": snippets,
-        })
+        }
+
+        if (
+            tool_record["creator_available"]
+            and _creator_tool_has_callable_contract(
+                tool_record
+            )
+        ):
+            catalog.append(tool_record)
 
     return catalog
 
@@ -3379,34 +3413,41 @@ async def _plan_final_tool_pool(
         prompt = """
 你是 Creator Final Tool Selector。
 
-Plan 已经完成业务拆解，并在每个 scripts/*.py contract 中声明 required_capabilities。
+ToolPool 是当前 Skill 允许代码生成模型优先使用的真实工具候选池 / 白名单。
+加入 ToolPool 只表示该工具可用、推荐候选；不表示任何 scripts/*.py 必须调用该工具。
 
-Embedding 已经针对每个 required_capability 独立召回 Tool Registry 候选。
+Plan 和 script_contracts 提供任务责任与能力线索，但不是封闭的工具使用清单。
+
+candidate_tool_catalog 已经是 embedding/exact recall 得到的有限候选；不要重新搜索完整 Registry。
 
 你的任务只有一个：
 
-逐项判断 candidate_tool_catalog 中的候选工具，是否真正需要加入整个 Skill 的共享 ToolPool。
+逐项判断 candidate_tool_catalog 中的候选工具，是否应该作为可选候选加入整个 Skill 的共享 ToolPool。
 
 对 decisions 中每个 tool_id 填 true 或 false。
 
+判断依据：
+- tool function description / when_to_use。
+- tool function input_schema。
+- tool function output_schema。
+- tool function artifact_outputs。
+- tool function side_effects。
+- tool/function required_capabilities。
+- script purpose / inputs / outputs / required_capabilities / artifact_contract。
+
 true：
-该工具真实函数能力能够直接实现 script_contracts 中已经声明的 required_capabilities 或 artifact responsibility。
+该工具的真实 function contract 与任一 script 的真实责任具有合理直接相关性，可能帮助该 script 完成当前责任。即使 Plan.required_capabilities 没有逐字声明该工具对应 capability，也可以设为 true。
 
 false：
-该工具只是 embedding 相似；
-或能力方向错误；
-或只是实体相似但动作不同；
-或普通 Python 确定性逻辑即可完成；
-或当前 Plan 没有声明对应能力。
+该工具只是 embedding 表面相似，但函数能力与 script responsibility 没有实际关系。
 
 特别注意：
 
-- generate/create/build 与 parse/read/extract 是不同能力方向。
-- 生成 PDF 不代表需要解析 PDF。
-- 生成图片不代表需要理解已有图片。
-- required_capabilities 是 Plan 已经确定的语义需求，不要重新解释用户业务。
+- selected=true 只表示将真实工具加入 Skill ToolPool，供代码生成模型选择；不表示脚本必须调用该工具。
+- 最终某个 scripts/*.py 是否调用工具、调用哪个工具，由代码生成模型根据当前文件 responsibility、tool function cards、input/output contract 自主决定。
 - 不要重新设计 Skill。
-- 不要扩大 required_capabilities。
+- 不要修改 Plan。
+- 不要生成代码。
 - 不要输出解释、reason、tool card 或代码。
 
 响应由 JSON Schema 强制。

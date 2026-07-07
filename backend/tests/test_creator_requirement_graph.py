@@ -1640,3 +1640,52 @@ async def test_requirement_graph_complete_valid_patches_use_one_compiler_call(mo
 
     assert len(calls) == 1
     assert graph.requirement_graph_source == "deterministic_file_contracts+normalized_responsibility_compilation"
+
+
+@pytest.mark.asyncio
+async def test_workflow_allocator_retries_when_semantic_handoffs_key_missing(monkeypatch):
+    from backend.services.creator import api
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return '{"workflow_allocation_summary":"first","patches":[]}'
+        return '{"workflow_allocation_summary":"second","semantic_handoffs":[{"producer":"scripts/source.py","consumer":"scripts/transform.py","semantic_product":"semantic units","cardinality":"collection","consumption_mode":"per_item","correspondence":"preserve","ordering":"preserve"}],"patches":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
+        blueprint_text="ignored",
+        files_out=_generic_three_script_specs(),
+    )
+
+    assert len(calls) == 2
+    assert summary == "second"
+    assert applied == set()
+    assert resolved is True
+    assert handoffs[0]["consumption_mode"] == "per_item"
+    assert "semantic_handoffs" in calls[1][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_allocator_accepts_explicit_empty_semantic_handoffs(monkeypatch):
+    from backend.services.creator import api
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return '{"workflow_allocation_summary":"ok","semantic_handoffs":[],"patches":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    summary, applied, resolved, handoffs = await api._allocate_workflow_script_responsibilities(
+        blueprint_text="ignored",
+        files_out=_generic_three_script_specs(),
+    )
+
+    assert len(calls) == 1
+    assert summary == "ok"
+    assert applied == set()
+    assert resolved is True
+    assert handoffs == []

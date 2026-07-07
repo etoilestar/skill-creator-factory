@@ -8656,7 +8656,8 @@ async def _allocate_workflow_script_responsibilities(
 
                 "禁止：\n"
                 "- 重新解释用户业务；\n"
-                "- 修改 target_file、inputs、outputs、required_capabilities、forbidden_capabilities、dependencies；\n"
+                "- 修改 target_file、required_capabilities、forbidden_capabilities、dependencies；\n"
+                "- 无明确跨 script contract evidence 时修改 inputs / outputs；\n"
                 "- 新增或删除文件；\n"
                 "- 因内部 for/loop/map 行为改变 script "
                 "boundary cardinality；\n"
@@ -8666,8 +8667,7 @@ async def _allocate_workflow_script_responsibilities(
                 "就把最终单 artifact output 改成 list；\n"
                 "- 根据 role 名、文件名、字段名、capability 名、单复数、suffix 或业务词表机械推断 handoff structure。\n\n"
 
-                "只有存在明确跨 script contract evidence "
-                "时，才能修改 inputs / outputs。\n"
+                "inputs / outputs 只能通过返回 compact patch 做最小联动修正，且必须有明确跨 script contract evidence；否则保持不变。\n"
 
                 "例如：下游 required script 明确消费一个"
                 "集合，而上游只声明单项 output，并且没有"
@@ -8778,9 +8778,9 @@ async def _allocate_workflow_script_responsibilities(
                     "role": "user",
 
                     "content": (
-                        "上一次 compact patch 存在"
-                        "跨脚本 final contract 冲突。"
-                        "只修正 JSON patch，不重新规划业务。\n\n"
+                        "上一次 workflow allocation response 存在 protocol 或跨脚本 final contract 冲突。"
+                        "不要重新规划业务；请重新返回完整 JSON object，必须同时包含 workflow_allocation_summary、semantic_handoffs 和 patches。"
+                        "semantic_handoffs 可以是 []，但 key 必须存在且值必须是 list。\n\n"
 
                         f"{conflict_feedback[:6000]}"
                     ),
@@ -8811,8 +8811,26 @@ async def _allocate_workflow_script_responsibilities(
                 or ""
             ).strip()
 
+            raw_semantic_handoffs = (
+                data.get("semantic_handoffs")
+                if isinstance(data, dict)
+                else None
+            )
+
+            semantic_handoff_protocol_conflicts: list[dict[str, Any]] = []
+            if (
+                not isinstance(data, dict)
+                or "semantic_handoffs" not in data
+                or not isinstance(raw_semantic_handoffs, list)
+            ):
+                semantic_handoff_protocol_conflicts.append({
+                    "target_file": "",
+                    "field": "semantic_handoffs",
+                    "reason": "workflow allocator response must include semantic_handoffs as a list; [] is valid",
+                })
+
             semantic_handoffs = _normalize_semantic_handoffs(
-                data.get("semantic_handoffs") if isinstance(data, dict) else [],
+                raw_semantic_handoffs if isinstance(raw_semantic_handoffs, list) else [],
                 files_out,
             )
 
@@ -8830,12 +8848,15 @@ async def _allocate_workflow_script_responsibilities(
                 )
             )
 
-            fatal_conflicts = list(
-                conflict_report.get(
-                    "fatal",
-                    [],
-                )
-            )
+            fatal_conflicts = [
+                *semantic_handoff_protocol_conflicts,
+                *list(
+                    conflict_report.get(
+                        "fatal",
+                        [],
+                    )
+                ),
+            ]
 
             soft_conflicts = list(
                 conflict_report.get(

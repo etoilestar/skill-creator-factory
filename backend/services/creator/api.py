@@ -903,7 +903,7 @@ def _creator_embed_texts_local_fallback(
         model = AutoModel.from_pretrained(
             str(model_path),
             local_files_only=True,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float32,
         )
 
         device = torch.device(
@@ -6092,7 +6092,14 @@ async def _generate_internal_blueprint_or_questions(
 ) -> dict[str, Any]:
     """Judge business requirement maturity and produce the provisional blueprint.
 
-    This phase owns business action semantics and blueprint planning.
+    This phase owns:
+    - business action semantics;
+    - runtime input/output planning;
+    - script topology planning;
+    - provisional SkillPlan responsibility boundaries.
+
+    Script count is derived from task complexity and executable responsibility
+    boundaries. Fewer files and more files are both non-goals.
 
     Tool discovery and ToolPool mutation are forbidden here.
     """
@@ -6120,13 +6127,17 @@ async def _generate_internal_blueprint_or_questions(
 
 1. 判断业务需求是否已经足够明确；
 2. 信息不足时提出一个真正阻塞创建计划的业务问题；
-3. 信息足够时生成 provisional internal_blueprint_text。
+3. 信息足够时生成 provisional internal_blueprint_text；
+4. 在 provisional blueprint 中确定合理的 script topology 和文件职责边界。
 
 internal_blueprint_text 是完整业务蓝图事实源。
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。
-因此必须先正确规划完整蓝图，再映射摘要；不得反过来根据摘要扩写蓝图。
+
+因此必须先正确规划完整蓝图，
+再映射摘要；
+不得反过来根据摘要扩写蓝图。
 
 当前阶段不是 Tool Registry 发现阶段。
 
@@ -6140,7 +6151,8 @@ review_summary 只是同一响应中的临时展示摘要。
 - 输出 selected_tools；
 - 输出 required_tool_slots。
 
-required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义能力。
+required_capabilities 只表达当前 scripts/*.py
+真实执行责任所需要的抽象语义能力。
 
 ## 业务动作方向必须保持
 
@@ -6150,15 +6162,29 @@ required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义�
 - 用户要求系统生成、创建、编写、转换、分析或处理什么；
 - 最终必须交付什么。
 
-不得把“用户要求系统生成的对象”自动改成“用户必须先提供的输入”。
+不得把“用户要求系统生成的对象”
+自动改成“用户必须先提供的输入”。
 
 例如：
 
-- 用户要求生成/编写某个内容时，该内容默认是系统责任，不是运行时前置输入；
-- 只有用户明确表示“我会提供已有内容”“基于我上传的内容处理”时，才把已有完整内容作为输入；
-- 用户要求生成 artifact，不代表需要解析同类已有 artifact；
-- 用户要求生成图像，不代表需要理解已有图像；
-- 用户要求构建文档，不代表需要读取或解析已有同类文档。
+- 用户要求生成或编写某个内容时，
+  该内容默认是系统责任，
+  不是运行时前置输入；
+
+- 只有用户明确表示
+  “我会提供已有内容”
+  “基于我上传的内容处理”
+  时，
+  才把已有完整内容作为输入；
+
+- 用户要求生成 artifact，
+  不代表需要解析同类已有 artifact；
+
+- 用户要求生成图像，
+  不代表需要理解已有图像；
+
+- 用户要求构建文档，
+  不代表需要读取或解析已有同类文档。
 
 必须保留用户动作方向。
 
@@ -6170,19 +6196,200 @@ required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义�
 - output 必须覆盖用户要求系统完成的最终责任；
 - workflow 必须真实包含从 input 到 output 的业务动作链；
 - 不得把 output 倒置成 input；
-- 不得把生成任务降级为已有内容的格式转换，除非用户明确这样要求。
+- 不得把生成任务降级为已有内容的格式转换，
+  除非用户明确这样要求。
+
+## Script topology 与责任边界规则
+
+文件数量只在 blueprint planning 阶段决定。
+
+脚本数量必须由任务复杂度和可执行责任边界决定。
+
+“脚本尽可能少”不是目标。
+“脚本尽可能多”也不是目标。
+
+不要为了减少文件数量，
+把多个独立业务责任全部压缩进一个
+composite_generator 或 generic_script。
+
+也不要因为自然语言 workflow 有多个步骤，
+就机械地一项步骤创建一个脚本。
+
+在确定 scripts/* 文件前，
+先识别工作流中的可执行责任。
+
+对每项候选责任判断：
+
+1. 它消费什么运行时输入或前序业务结果；
+
+2. 它产生什么能够被后续处理或最终交付消费的结果；
+
+3. 它执行什么核心业务动作；
+
+4. 它需要哪些抽象语义能力；
+
+5. 它是否形成真实 producer / consumer 边界；
+
+6. 它是否具有独立验证、失败定位或局部修复价值；
+
+7. 它与相邻责任是否高度耦合，
+   是否共享同一核心输入和同一最终输出边界。
+
+脚本数量按责任复杂度决定：
+
+- 简单任务：
+  如果核心执行责任单一，
+  局部步骤高度耦合，
+  共享同一主要输入和输出边界，
+  使用 1 个脚本是合理的。
+
+- 中等或复杂任务：
+  如果存在多个清晰的独立责任闭包，
+  通常规划 2～3 个脚本。
+
+- 更复杂任务：
+  只有存在更多真实、独立、
+  可执行且可验证的责任边界时，
+  才继续增加脚本数量。
+
+2～3 个脚本是复杂任务的常见结果，
+不是固定数量，
+也不是硬上限。
+
+如果 2～3 个清晰责任脚本
+已经能够完整表达工作流，
+不要继续细碎拆分。
+
+多项责任只有满足以下条件时，
+才适合合并到同一个脚本：
+
+- 执行逻辑高度耦合；
+- 主要消费同一组核心业务输入；
+- 主要产生同一责任闭包中的业务结果；
+- 不存在清晰的跨责任 producer / consumer handoff；
+- 合并后仍然能够用一个清晰 purpose
+  描述该文件的主要业务职责。
+
+存在以下事实时，
+应认真考虑形成独立脚本职责：
+
+- 一个责任产生的业务结果
+  被另一个责任继续消费；
+
+- 两个责任具有清晰的 producer / consumer 边界；
+
+- 两个责任执行明显不同的核心业务能力；
+
+- 存在独立的 artifact 生产或最终 artifact 构建责任；
+
+- 某个阶段能够独立验证，
+  并具有独立失败定位或局部修复价值。
+
+以上是拆分证据，
+不是机械拆分条件。
+
+必须结合整个工作流判断。
+
+## 多脚本责任所有权规则
+
+每个 script 必须具有一个清晰的主要业务职责。
+
+purpose 必须说明：
+
+- 当前文件消费什么语义输入；
+- 当前文件真正执行什么核心动作；
+- 当前文件交付什么业务结果。
+
+不要让多个 script 重复拥有同一个核心业务动作。
+
+如果上游 script 已负责产生某项业务结果：
+
+- 下游 script 可以消费、整理、组合、
+  映射或交付该结果；
+
+- 下游 script 不应再次实现
+  上游已经拥有的核心生成或处理责任，
+  除非其自身 SkillPlan purpose
+  明确声明了不同的业务处理责任。
+
+如果下游 script 消费上游结果：
+
+- 上游 outputs 与下游 inputs
+  必须在语义上形成可追踪关系；
+
+- 字段名不要求逐字一致；
+
+- 不得用固定示例值、空列表或无来源常量
+  伪造下游输入。
+
+如果一个值由当前 script 内部产生，
+并且只在当前 script 内部继续消费，
+它属于内部中间值。
+
+不要把这种内部中间值
+声明成当前 script 的 required external input。
+
+只有：
+
+- 用户或 runtime 在脚本启动前提供的值；
+- 静态 resource；
+- 或其他 script 已经产生的前序结果；
+
+才应成为该 script 的语义 inputs。
+
+## 内部处理与脚本拆分
+
+当前平台没有显式 loop/map/foreach runtime node。
+
+内部遍历、批处理、逐项处理、
+顺序映射和局部聚合
+应由拥有该业务责任的 script 内部实现。
+
+内部循环本身：
+
+- 不构成拆脚本理由；
+- 不代表 script boundary input 必须变成集合；
+- 不代表 script boundary output 必须变成集合。
+
+纯局部：
+
+- 字段适配；
+- 数据整理；
+- 格式转换；
+- 参数映射；
+- 小型 deterministic helper 逻辑；
+
+如果只服务于当前责任，
+应保留在所属 script 内部，
+不要单独创建脚本。
 
 ## Capability 声明规则
 
-每个 script 的 required_capabilities 必须来自该 script 实际执行动作。
+每个 script 的 required_capabilities
+必须来自该 script 实际执行动作。
 
 动作方向必须一致：
 
 - generate/create/build 与 parse/read/extract 不等价；
-- 生成某类 artifact 不自动需要该 artifact 的解析能力；
-- 生成图片不自动需要视觉理解能力；
-- 只有脚本确实消费并语义理解已有图片时，才声明图像/视觉理解能力；
-- capability 不得根据相邻概念、文件名或最终 artifact 类型机械扩展。
+
+- 生成某类 artifact
+  不自动需要该 artifact 的解析能力；
+
+- 生成图片
+  不自动需要视觉理解能力；
+
+- 只有脚本确实消费并语义理解已有图片时，
+  才声明图像或视觉理解能力；
+
+- capability 不得根据相邻概念、
+  文件名或最终 artifact 类型机械扩展。
+
+required_capabilities 只属于
+真正执行对应动作的 script。
+
+不要因为下游消费了上游产物，
+就把上游 generation capability
+重复声明给下游。
 
 不得填写具体 Registry tool_id。
 
@@ -6209,43 +6416,116 @@ required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义�
 ## 规划约束
 
 - status=ready 前先判断需求成熟度。
-- 信息不足且 clarification_rounds 未达到上限时，status=needs_clarification。
+
+- 信息不足且 clarification_rounds
+  未达到上限时，
+  status=needs_clarification。
+
 - clarifying_questions 只能有 1 个问题。
-- 问题必须是当前最阻塞创建计划的问题，并带 2-4 个选项。
+
+- 问题必须是当前最阻塞创建计划的问题，
+  并带 2～4 个选项。
+
 - 每轮只能问一个业务问题。
-- 后续问题必须结合 conversation_history 与 human_feedback 中已有回答。
+
+- 后续问题必须结合
+  conversation_history 与 human_feedback
+  中已有回答。
+
 - 已经回答过的问题不得重复询问。
-- clarification_rounds 达到上限时不得继续无限追问。
-- 用户确认无补充后不得继续 needs_clarification。
-- 用户补充业务要求时，可以基于 previous_blueprint_text 与新增 feedback 修订 full blueprint。
-- 除真实 supplement/revise 外，不得重新定义已经明确的业务动作方向。
 
-- 文件数量只在 blueprint planning 阶段决定。
-- 不默认单脚本。
-- 不按自然语言步骤机械拆文件。
-- 脚本数量来自真实职责边界、输入输出合同、中间产物和可验证阶段边界。
-- 高度耦合任务可以使用一个脚本。
-- 清晰的阶段边界、不同 artifact 类型或真实 producer/consumer 边界可以拆脚本。
+- clarification_rounds 达到上限时
+  不得继续无限追问。
+
+- 用户确认无补充后
+  不得继续 needs_clarification。
+
+- 用户补充业务要求时，
+  可以基于 previous_blueprint_text
+  与新增 feedback 修订 full blueprint。
+
+- 除真实 supplement/revise 外，
+  不得重新定义已经明确的业务动作方向。
+
+- script topology 必须在 blueprint planning
+  阶段完成。
+
+- 蓝图通过后，
+  不依赖后续阶段重新新增、删除、
+  拆分或合并 script 文件。
+
+- 简单责任闭包允许 1 个 script。
+
+- 中等或复杂任务通常产生
+  2～3 个清晰责任 script。
+
+- 不把 2～3 当硬编码数量；
+  真实责任边界更多时可以更多，
+  责任单一时可以只有一个。
+
+- 不按自然语言步骤数量机械拆文件。
+
+- 不以最少文件数作为规划目标。
+
+- 不以最多模块数作为规划目标。
+
+- 每个 script 必须有清晰主要职责。
+
+- 多脚本之间不得重复实现
+  同一核心业务责任。
+
+- upstream output 与 downstream input
+  应语义可追踪，
+  但字段名不要求逐字相同。
+
+- script 内部生成且内部消费的中间值
+  不得提升为 required external input。
+
 - 当前平台没有显式 loop/map/foreach runtime node。
-- 内部遍历、批处理、顺序映射可以由脚本内部实现。
-- 内部循环不代表 script boundary input/output 必须是集合类型。
 
-- uploaded_files 是 Creator 创建阶段上下文，不等于 Skill assets。
-- confirmed_uploaded_assets 才是用户确认加入 Skill 的静态素材。
-- 没有用户明确确认，不得创建 assets/**。
+- 内部遍历、批处理、顺序映射和局部聚合
+  由拥有该责任的 script 内部实现。
+
+- 内部循环不改变 script boundary
+  IO cardinality。
+
+- uploaded_files 是 Creator 创建阶段上下文，
+  不等于 Skill assets。
+
+- confirmed_uploaded_assets
+  才是用户确认加入 Skill 的静态素材。
+
+- 没有用户明确确认，
+  不得创建 assets/**。
+
 - 运行时用户输入不是 Creator assets。
+
 - 运行时生成产物不是 Creator assets。
-- assets/** 只能声明 source=user_upload 或 source=bundled。
+
+- assets/** 只能声明
+  source=user_upload 或 source=bundled。
 
 - 目录结构只展示目录。
-- 具体文件只在 SkillPlan 中声明。
-- references/*.md 只有业务确实需要静态参考资料时才创建。
-- 协议示例、kernel 示例、命令示例中的 references/*.md 路径不是业务文件。
-- 不确定是否需要 reference 时默认不创建。
-- dependencies/references 中真实引用的静态文件必须在 SkillPlan 中显式声明。
 
-- provisional blueprint 可以声明 text_generation、image_generation、pdf_generation 等抽象语义能力。
-- 具体 Registry Tool 选择由后续 Final Tool Selector 完成。
+- 具体文件只在 SkillPlan 中声明。
+
+- references/*.md
+  只有业务确实需要静态参考资料时才创建。
+
+- 协议示例、kernel 示例、命令示例中的
+  references/*.md 路径不是业务文件。
+
+- 不确定是否需要 reference 时默认不创建。
+
+- dependencies/references 中真实引用的静态文件
+  必须在 SkillPlan 中显式声明。
+
+- provisional blueprint 可以声明
+  text_generation、image_generation、
+  pdf_generation 等抽象语义能力。
+
+- 具体 Registry Tool 选择
+  由后续 Final Tool Selector 完成。
 """
     )
 
@@ -6341,9 +6621,7 @@ required_capabilities 只表达当前 scripts/*.py 真实需要的抽象语义�
         [
             {
                 "role": "system",
-                "content": (
-                    system_prompt
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
@@ -6926,7 +7204,18 @@ async def _extract_requirement_graph_with_validator(
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
-    """Build the responsibility graph deterministically and allow compact patches.
+    """Compile compact per-file responsibilities from normalized file contracts.
+
+    The full blueprint is intentionally NOT used as responsibility-compiler
+    context.
+
+    Responsibility semantic sources are limited to:
+    - normalized FileSpecOut contracts;
+    - the deterministic RequirementGraph derived from those contracts;
+    - observable relations among existing file contracts.
+
+    This prevents the responsibility compiler from re-planning the business
+    workflow or assigning one blueprint action to multiple scripts.
 
     Capability ownership is immutable in this phase.
 
@@ -6934,14 +7223,19 @@ async def _extract_requirement_graph_with_validator(
 
         FileSpecOut.required_capabilities
 
-    The validator may append:
+    The compiler may append only:
     - must_do;
     - must_not_do;
     - depends_on.
 
-    The validator may not replace the graph or patch capabilities.
+    It may not replace graph nodes, file topology, IO, purpose or capabilities.
     """
 
+    # Kept in the function signature for API/call-site compatibility.
+    #
+    # Intentionally do not expose the complete blueprint to this compiler.
+    # Script ownership was already decided during blueprint planning and then
+    # normalized by workflow allocation / file-contract processing.
     _ = blueprint_text
 
     graph = validate_requirement_graph_schema(
@@ -6955,31 +7249,139 @@ async def _extract_requirement_graph_with_validator(
         VALIDATOR_TASK,
         requested_model=requested_model,
         reason=(
-            "creator responsibility graph "
-            "compact patch"
+            "creator normalized responsibility "
+            "contract compilation"
         ),
     )
 
     file_payload = [
-        file_spec.model_dump(
-            mode="json",
-            exclude={
-                "requirements",
-            },
-        )
-        for file_spec
-        in files_out
+        {
+            "path": (
+                file_spec.path
+            ),
+            "role": (
+                file_spec.role
+            ),
+            "runtime": (
+                file_spec.runtime
+            ),
+            "purpose": (
+                file_spec.purpose
+            ),
+            "inputs": list(
+                file_spec.inputs
+                or []
+            ),
+            "outputs": list(
+                file_spec.outputs
+                or []
+            ),
+            "dependencies": list(
+                file_spec.dependencies
+                or []
+            ),
+            "reference_files": list(
+                file_spec.reference_files
+                or []
+            ),
+            "required_capabilities": list(
+                file_spec.required_capabilities
+                or []
+            ),
+            "forbidden_capabilities": list(
+                file_spec.forbidden_capabilities
+                or []
+            ),
+            "runtime_contract": (
+                file_spec.runtime_contract
+                or {}
+            ),
+            "artifact_contract": (
+                file_spec.artifact_contract
+                or {}
+            ),
+            "required": bool(
+                file_spec.required
+            ),
+        }
+        for file_spec in files_out
     ]
+
+    response_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "patches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target_file": {
+                            "type": "string",
+                        },
+                        "must_do": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                        "must_not_do": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                    "required": [
+                        "target_file",
+                        "must_do",
+                        "must_not_do",
+                        "depends_on",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": [
+            "patches",
+        ],
+        "additionalProperties": False,
+    }
 
     messages = [
         {
             "role": "system",
             "content": (
-                "你是 Creator requirement graph patcher。"
-                "只输出严格 JSON object。\n\n"
+                "你是 Creator normalized responsibility "
+                "contract compiler。\n\n"
 
-                "后端已经从 normalized file_plan/contracts "
-                "确定性生成责任图谱。\n"
+                "只根据 normalized file plan/contracts "
+                "和 deterministic responsibility graph "
+                "编译当前已有文件的责任合同。\n\n"
+
+                "你不会获得完整业务蓝图。"
+                "这是有意的责任隔离边界。\n\n"
+
+                "Blueprint planning 已经决定：\n"
+                "- 文件拓扑；\n"
+                "- script 数量；\n"
+                "- 每个文件的主要业务职责；\n"
+                "- 基础 inputs / outputs；\n"
+                "- required_capabilities。\n\n"
+
+                "跨脚本 workflow allocation 已在此前阶段"
+                "负责修正可执行 handoff 合同。\n\n"
+
+                "你的任务不是重新规划 Skill。"
+                "你的任务是把 normalized contracts 中已经存在"
+                "但 deterministic graph 尚未充分展开的"
+                "当前文件责任，编译成 compact must_do、"
+                "must_not_do 和 depends_on。\n\n"
 
                 "required_tools 已由 "
                 "FileSpecOut.required_capabilities "
@@ -6992,6 +7394,9 @@ async def _extract_requirement_graph_with_validator(
 
                 "禁止：\n"
                 "- 输出完整 requirements graph；\n"
+                "- 新增 requirement node；\n"
+                "- 删除 requirement node；\n"
+                "- 修改 target_file；\n"
                 "- 修改 required_tools；\n"
                 "- 增加 capability；\n"
                 "- 删除 capability；\n"
@@ -7001,29 +7406,140 @@ async def _extract_requirement_graph_with_validator(
                 "- 修改 file topology；\n"
                 "- 修改 platform boundary；\n"
                 "- 输出 constraints；\n"
-                "- 输出 evidence_policy；\n\n"
+                "- 输出 evidence_policy；\n"
+                "- 重新解释用户原始需求；\n"
+                "- 根据文件名猜业务；\n"
+                "- 根据 role 名猜额外业务；\n"
+                "- 根据 capability 名扩展未声明责任。\n\n"
 
-                "must_do 只补 normalized file contract "
-                "尚未明确表达、但从相邻 script contracts "
-                "可以直接证明的关键责任。\n"
+                "## 唯一责任事实来源\n\n"
 
-                "不要从完整蓝图自然语言、协议示例、"
-                "Creator 文档模板中提取 requirement terms。\n"
+                "责任事实只来自：\n"
+                "1. 当前文件 purpose；\n"
+                "2. 当前文件 semantic inputs / outputs；\n"
+                "3. 当前文件 dependencies / reference_files；\n"
+                "4. 当前文件 runtime_contract；\n"
+                "5. 当前文件 artifact_contract；\n"
+                "6. 其他现有文件 normalized contracts 中"
+                "可以观察到的 producer / consumer handoff；\n"
+                "7. deterministic responsibility graph "
+                "中已经存在的责任事实。\n\n"
 
-                "每个 patch 字段最多 8 个条目；"
-                "每个条目保持简短。\n\n"
+                "不得使用完整 Blueprint 自然语言重新分配责任。\n\n"
 
-                "返回：\n"
-                "{"
-                "\"patches\":["
-                "{"
-                "\"target_file\":\"scripts/x.py\","
-                "\"must_do\":[],"
-                "\"must_not_do\":[],"
-                "\"depends_on\":[]"
-                "}"
-                "]"
-                "}"
+                "## must_do 编译规则\n\n"
+
+                "must_do 只补当前文件自己的责任。\n\n"
+
+                "不要简单重复 purpose 原句。\n"
+                "不要重复 deterministic graph 中"
+                "已经存在的同义责任。\n\n"
+
+                "当 normalized contract 已经能够证明"
+                "以下责任事实时，应分别保留为简短 must_do：\n\n"
+
+                "- 当前文件必须实际消费其核心语义输入；\n"
+                "- 当前文件必须执行 purpose 中明确声明的"
+                "核心业务动作；\n"
+                "- 当前文件的核心输入必须参与其业务输出"
+                "或 artifact；\n"
+                "- 当前文件必须产生其声明的业务 outputs；\n"
+                "- 当前文件必须完成 artifact_contract "
+                "明确声明的交付责任；\n"
+                "- 当前文件需要读取声明的静态 dependency "
+                "或 reference 时，必须实际消费该资源；\n"
+                "- 当前文件 output 是其他 existing script "
+                "的业务输入来源时，必须产生可被该下游责任"
+                "实际消费的结果；\n"
+                "- 当前文件消费其他 script 的前序结果时，"
+                "必须使用该前序结果完成自己的业务责任；\n"
+                "- 当前文件承担组合、整理或最终交付时，"
+                "必须基于已经声明的输入结果完成组合或交付，"
+                "不能用固定内容替代输入。\n\n"
+
+                "以上不是业务类型枚举。"
+                "只能在 normalized contracts 已经提供证据时补充。\n\n"
+
+                "## 多脚本责任隔离规则\n\n"
+
+                "必须避免跨文件责任重复。\n\n"
+
+                "如果文件 A 的 normalized purpose "
+                "明确负责产生某项业务结果，"
+                "文件 B 消费 A 的结果：\n\n"
+
+                "- A 的责任是产生其声明结果；\n"
+                "- B 的责任是消费该前序结果并完成 B 自己的"
+                "purpose；\n"
+                "- 不要把 A 的核心生成或处理动作"
+                "再次加入 B.must_do；\n"
+                "- 不要把 B 的下游组合、构建或交付动作"
+                "加入 A.must_do。\n\n"
+
+                "一个 capability 出现在 A，"
+                "不代表 B 也应该执行相同能力。\n\n"
+
+                "一个 downstream input 与 upstream output "
+                "字段名不同，不代表没有 handoff。"
+                "可以根据 purpose、inputs、outputs 的整体语义"
+                "判断可观察关系。\n\n"
+
+                "但是如果 normalized contracts 无法证明关系，"
+                "不要猜测关系。\n\n"
+
+                "内部中间值不会因为在某个 purpose 中出现"
+                "就自动成为跨 script responsibility。\n\n"
+
+                "只有现有 file contracts 能够证明的"
+                "producer / consumer 关系"
+                "才用于责任编译。\n\n"
+
+                "## depends_on 编译规则\n\n"
+
+                "depends_on 只表达责任依赖。\n\n"
+
+                "只能填写 normalized file plan 中"
+                "已经存在的具体文件 path。\n\n"
+
+                "当当前文件的责任需要另一个 existing file "
+                "先产生业务结果，"
+                "或者当前文件明确读取 existing reference/resource，"
+                "才能补 depends_on。\n\n"
+
+                "不要因为两个文件主题相似就建立依赖。\n"
+                "不要创建 self dependency。\n"
+                "不要创建不存在的 path。\n\n"
+
+                "## must_not_do 编译规则\n\n"
+
+                "must_not_do 只表达 normalized contracts "
+                "能够证明的责任边界。\n\n"
+
+                "例如，只有在跨文件所有权已经明确时，"
+                "才可以要求当前文件不要重复承担"
+                "另一个文件已拥有的核心业务责任。\n\n"
+
+                "不要输出：\n"
+                "- 通用代码风格建议；\n"
+                "- Python 最佳实践；\n"
+                "- 固定业务词表；\n"
+                "- 字段名白名单；\n"
+                "- argv key 白名单；\n"
+                "- 与当前文件合同无关的安全口号。\n\n"
+
+                "## 字段与实现自由\n\n"
+
+                "inputs / outputs 表达语义边界。\n"
+                "局部变量名、helper 参数名和 argv key "
+                "不要求与 semantic inputs / outputs 逐字一致。\n\n"
+
+                "不要把字段改名当成责任失败。\n\n"
+
+                "每个 patch 字段最多 8 个条目。\n"
+                "每个条目保持简短、可执行、"
+                "只描述一个责任事实。\n\n"
+
+                "响应结构由 JSON Schema 强制。"
             ),
         },
         {
@@ -7034,10 +7550,10 @@ async def _extract_requirement_graph_with_validator(
                     file_payload,
                     ensure_ascii=False,
                     default=str,
-                )[:20000]
+                )[:24000]
                 + "\n\n"
                 "deterministic_responsibility_graph:\n"
-                + graph.model_dump_json()[:16000]
+                + graph.model_dump_json()[:18000]
                 + "\n\n"
                 "platform_io_contract "
                 "(read-only, deterministic):\n"
@@ -7047,13 +7563,14 @@ async def _extract_requirement_graph_with_validator(
     ]
 
     try:
-        text = await complete_chat_once(
-            messages,
-            route.model,
-        )
-
-        data = parse_requirement_graph_result(
-            text
+        data = await _complete_creator_json_object_once(
+            messages=messages,
+            model=route.model,
+            phase=(
+                "requirement_graph_"
+                "responsibility_compilation"
+            ),
+            response_schema=response_schema,
         )
 
         patches = (
@@ -7071,7 +7588,7 @@ async def _extract_requirement_graph_with_validator(
         ):
             raise RequirementGraphValidationError(
                 (
-                    "Responsibility graph validator "
+                    "Responsibility graph compiler "
                     "must return compact patches list."
                 ),
                 code="validator_incomplete",
@@ -7079,8 +7596,19 @@ async def _extract_requirement_graph_with_validator(
 
         by_file = {
             item.target_file: item
-            for item
-            in graph.requirements
+            for item in graph.requirements
+        }
+
+        existing_file_paths = {
+            str(
+                file_spec.path
+                or ""
+            ).strip()
+            for file_spec in files_out
+            if str(
+                file_spec.path
+                or ""
+            ).strip()
         }
 
         allowed_fields = {
@@ -7142,6 +7670,8 @@ async def _extract_requirement_graph_with_validator(
             )
 
             if item is None:
+                # The compiler may only patch existing
+                # responsibility nodes.
                 continue
 
             patched_requirement = False
@@ -7194,6 +7724,33 @@ async def _extract_requirement_graph_with_validator(
                         },
                     )
 
+                if field_name == "depends_on":
+                    invalid_dependencies = [
+                        value
+                        for value in values
+                        if (
+                            value not in existing_file_paths
+                            or value == target
+                        )
+                    ]
+
+                    if invalid_dependencies:
+                        raise RequirementGraphValidationError(
+                            (
+                                "Requirement graph patch "
+                                "contains invalid responsibility "
+                                "dependencies."
+                            ),
+                            code="validator_incomplete",
+                            details={
+                                "index": index,
+                                "target_file": target,
+                                "dependencies": (
+                                    invalid_dependencies
+                                ),
+                            },
+                        )
+
                 existing = list(
                     getattr(
                         item,
@@ -7207,9 +7764,7 @@ async def _extract_requirement_graph_with_validator(
                             value
                         )
 
-                        patched_requirement = (
-                            True
-                        )
+                        patched_requirement = True
 
                 setattr(
                     item,
@@ -7224,7 +7779,11 @@ async def _extract_requirement_graph_with_validator(
 
         graph.requirement_graph_source = (
             "deterministic_file_contracts+"
-            "compact_patch"
+            "normalized_responsibility_compilation"
+        )
+
+        graph.requirement_graph_quality = (
+            "compiled_normalized_responsibility"
         )
 
         logger.info(
@@ -7234,7 +7793,8 @@ async def _extract_requirement_graph_with_validator(
             json.dumps(
                 {
                     "event": (
-                        "requirement_graph_patch_result"
+                        "requirement_graph_"
+                        "responsibility_compilation_result"
                     ),
                     "patch_count": len(
                         patches
@@ -7244,6 +7804,10 @@ async def _extract_requirement_graph_with_validator(
                             requirement_targets
                         )
                     ),
+                    "responsibility_source": (
+                        "normalized_file_contracts"
+                    ),
+                    "full_blueprint_visible": False,
                     "capability_source": (
                         "file_specs."
                         "required_capabilities"
@@ -7280,9 +7844,10 @@ async def _extract_requirement_graph_with_validator(
                     "requirement_graph"
                 ),
                 "message": (
-                    "Responsibility graph patch "
-                    "model failed; using deterministic "
-                    f"graph: {exc}"
+                    "Normalized responsibility "
+                    "compiler failed; using "
+                    "deterministic graph: "
+                    f"{exc}"
                 ),
             })
 
@@ -7293,7 +7858,8 @@ async def _extract_requirement_graph_with_validator(
             json.dumps(
                 {
                     "event": (
-                        "requirement_graph_patch_failed"
+                        "requirement_graph_"
+                        "responsibility_compilation_failed"
                     ),
                     "error": (
                         f"{type(exc).__name__}: "
@@ -7302,6 +7868,7 @@ async def _extract_requirement_graph_with_validator(
                     "fallback": (
                         "deterministic_file_contracts"
                     ),
+                    "full_blueprint_visible": False,
                 },
                 ensure_ascii=False,
                 default=str,

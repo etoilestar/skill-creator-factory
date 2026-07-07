@@ -7301,6 +7301,7 @@ async def _extract_requirement_graph_with_validator(
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
     workflow_allocation_summary: str = "",
+    semantic_handoffs: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
     """Compile compact per-file responsibilities from normalized file contracts.
 
@@ -7336,6 +7337,10 @@ async def _extract_requirement_graph_with_validator(
     # normalized by workflow allocation / file-contract processing.
     _ = blueprint_text
     semantic_handoff_summary = str(workflow_allocation_summary or "").strip()
+    normalized_semantic_handoffs = _normalize_semantic_handoffs(
+        semantic_handoffs or [],
+        files_out,
+    )
 
     graph = validate_requirement_graph_schema(
         build_default_requirement_graph(
@@ -7530,7 +7535,7 @@ async def _extract_requirement_graph_with_validator(
                 "3. 当前文件 dependencies / reference_files；\n"
                 "4. 当前文件 runtime_contract 的语义责任（不是字段名合同）；\n"
                 "5. 当前文件 artifact_contract 的语义交付责任（不得复制 stdout/artifact 字段名为 must_do）；\n"
-                "6. normalized semantic handoff summary 中的结构语义；\n"
+                "6. normalized_semantic_handoffs 中的结构语义；\n"
                 "7. 其他现有文件 normalized contracts 中"
                 "可以观察到的 producer / consumer handoff；\n"
                 "8. deterministic responsibility graph "
@@ -7548,7 +7553,7 @@ async def _extract_requirement_graph_with_validator(
                 "- 当 handoff 声明 cardinality=collection 且 consumption_mode=per_item 时，must_do 应包含 Consume the complete upstream semantic collection、Apply the current file's core action to each required semantic unit、Deliver the complete result collection；must_not_do 应包含 Do not collapse a required collection-processing responsibility into one representative item。\n"
                 "- 当 correspondence=preserve 时，must_do 应包含 Preserve sufficient correspondence between consumed semantic units and produced results for downstream consumption。\n"
                 "- 当 ordering=preserve 时，must_do 应包含 Preserve the semantic ordering required by downstream consumers。\n"
-                "只有 normalized semantic handoff summary 明确声明这些结构时才增加；不要默认所有 collection 都逐项处理，不要根据 role、文件名、字段名、capability 或 ToolPool 猜测。\n\n"
+                "只有 normalized_semantic_handoffs 明确声明这些结构时才增加；human-readable workflow_allocation_summary 只用于理解已有责任背景，不得从 summary 自行创造 cardinality、consumption_mode、correspondence 或 ordering。不要默认所有 collection 都逐项处理，不要根据 role、文件名、字段名、capability 或 ToolPool 猜测。\n\n"
 
                 "## must_do 编译规则\n\n"
 
@@ -7680,8 +7685,11 @@ async def _extract_requirement_graph_with_validator(
                 "required_script_targets (must equal returned patch target_file set):\n"
                 + json.dumps(required_script_targets, ensure_ascii=False)
                 + "\n\n"
-                "normalized_semantic_handoff_summary:\n"
-                + semantic_handoff_summary[:12000]
+                "workflow_allocation_summary (human-readable background only):\n"
+                + semantic_handoff_summary[:6000]
+                + "\n\n"
+                "normalized_semantic_handoffs (only source for structure facts):\n"
+                + json.dumps(normalized_semantic_handoffs, ensure_ascii=False, default=str)[:12000]
                 + "\n\n"
                 "platform_io_contract "
                 "(read-only, deterministic):\n"
@@ -7690,17 +7698,36 @@ async def _extract_requirement_graph_with_validator(
         },
     ]
 
-    try:
-        data = await _complete_creator_json_object_once(
-            messages=messages,
-            model=route.model,
-            phase=(
-                "requirement_graph_"
-                "responsibility_compilation"
-            ),
-            response_schema=response_schema,
+    last_error: RequirementGraphValidationError | None = None
+    last_diagnostics: dict[str, Any] = {}
+    compiler_attempts = 0
+    previous_response: Any = None
+
+    def _diagnostic_error(
+        message: str,
+        *,
+        returned_patch_targets: list[str] | None = None,
+        compiled_patch_targets: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> RequirementGraphValidationError:
+        returned = sorted(returned_patch_targets or [])
+        compiled = sorted(compiled_patch_targets or [])
+        details = {
+            "required_script_targets": required_script_targets,
+            "returned_patch_targets": returned,
+            "compiled_patch_targets": compiled,
+            "missing_compiled_targets": sorted(set(required_script_targets) - set(compiled)),
+            "compiler_attempts": compiler_attempts,
+        }
+        if extra:
+            details.update(extra)
+        return RequirementGraphValidationError(
+            message,
+            code="validator_incomplete",
+            details=details,
         )
 
+    def _apply_compiler_patches(data: dict[str, Any]) -> RequirementGraph:
         patches = (
             data.get("patches")
             if isinstance(
@@ -7714,17 +7741,20 @@ async def _extract_requirement_graph_with_validator(
             patches,
             list,
         ):
-            raise RequirementGraphValidationError(
-                (
-                    "Responsibility graph compiler "
-                    "must return compact patches list."
-                ),
-                code="validator_incomplete",
+            raise _diagnostic_error(
+                "Responsibility graph compiler must return compact patches list.",
             )
+
+        attempt_graph = validate_requirement_graph_schema(
+            build_default_requirement_graph(
+                files_out
+            ),
+            files_out,
+        )
 
         by_file = {
             item.target_file: item
-            for item in graph.requirements
+            for item in attempt_graph.requirements
         }
 
         existing_file_paths = {
@@ -7746,199 +7776,134 @@ async def _extract_requirement_graph_with_validator(
             "depends_on",
         }
 
-        requirement_targets: list[
-            str
-        ] = []
+        requirement_targets: list[str] = []
         returned_patch_targets: list[str] = []
+        compiled_patch_targets: list[str] = []
 
-        for index, patch in enumerate(
-            patches
-        ):
-            if not isinstance(
-                patch,
-                dict,
-            ):
-                raise RequirementGraphValidationError(
-                    (
-                        "Responsibility graph patch "
-                        "item must be an object."
-                    ),
-                    code="validator_incomplete",
-                    details={
-                        "index": index,
-                    },
+        for index, patch in enumerate(patches):
+            if not isinstance(patch, dict):
+                raise _diagnostic_error(
+                    "Responsibility graph patch item must be an object.",
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index},
                 )
 
-            unknown_fields = (
-                set(patch)
-                - allowed_fields
-            )
-
+            unknown_fields = set(patch) - allowed_fields
             if unknown_fields:
-                raise RequirementGraphValidationError(
-                    (
-                        "Requirement graph patch "
-                        "contains unsupported fields."
-                    ),
-                    code="validator_incomplete",
-                    details={
-                        "index": index,
-                        "fields": sorted(
-                            unknown_fields
-                        ),
-                    },
+                raise _diagnostic_error(
+                    "Requirement graph patch contains unsupported fields.",
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "fields": sorted(unknown_fields)},
                 )
 
-            target = str(
-                patch.get("target_file")
-                or ""
-            ).strip()
-
+            target = str(patch.get("target_file") or "").strip()
             if not target or target not in required_script_targets:
-                raise RequirementGraphValidationError(
+                raise _diagnostic_error(
                     "Requirement graph patch target is not an expected required script.",
-                    code="validator_incomplete",
-                    details={"index": index, "target_file": target},
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "target_file": target},
                 )
 
             if target in returned_patch_targets:
-                raise RequirementGraphValidationError(
+                raise _diagnostic_error(
                     "Requirement graph patch contains duplicate target.",
-                    code="validator_incomplete",
-                    details={"index": index, "target_file": target},
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "target_file": target},
                 )
             returned_patch_targets.append(target)
 
-            item = by_file.get(
-                target
-            )
-
+            item = by_file.get(target)
             if item is None:
-                raise RequirementGraphValidationError(
+                raise _diagnostic_error(
                     "Requirement graph patch target has no requirement node.",
-                    code="validator_incomplete",
-                    details={"index": index, "target_file": target},
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "target_file": target},
                 )
 
-            patched_requirement = False
-
-            for field_name in (
-                "must_do",
-                "must_not_do",
-                "depends_on",
-            ):
-                values = (
-                    RequirementItem
-                    ._coerce_string_list(
-                        patch.get(
-                            field_name
-                        )
-                    )
+            raw_must_do = patch.get("must_do")
+            raw_must_not_do = patch.get("must_not_do")
+            raw_depends_on = patch.get("depends_on")
+            if not isinstance(raw_must_do, list) or not isinstance(raw_must_not_do, list) or not isinstance(raw_depends_on, list):
+                raise _diagnostic_error(
+                    "Requirement graph patch fields must be lists.",
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "target_file": target},
                 )
 
-                if not values:
-                    continue
+            must_do_values = RequirementItem._coerce_string_list(raw_must_do)
+            if not must_do_values:
+                raise _diagnostic_error(
+                    "Requirement graph patch must include non-empty must_do responsibility statements.",
+                    returned_patch_targets=returned_patch_targets,
+                    compiled_patch_targets=compiled_patch_targets,
+                    extra={"index": index, "target_file": target},
+                )
+
+            for field_name in ("must_do", "must_not_do", "depends_on"):
+                values = RequirementItem._coerce_string_list(patch.get(field_name))
 
                 if len(values) > 8:
-                    raise RequirementGraphValidationError(
-                        (
-                            "Requirement graph patch "
-                            "contains too many items."
-                        ),
-                        code="validator_incomplete",
-                        details={
-                            "index": index,
-                            "field": field_name,
-                            "count": len(values),
-                        },
+                    raise _diagnostic_error(
+                        "Requirement graph patch contains too many items.",
+                        returned_patch_targets=returned_patch_targets,
+                        compiled_patch_targets=compiled_patch_targets,
+                        extra={"index": index, "target_file": target, "field": field_name, "count": len(values)},
                     )
 
-                if any(
-                    len(value) > 800
-                    for value in values
-                ):
-                    raise RequirementGraphValidationError(
-                        (
-                            "Requirement graph patch "
-                            "contains an oversized "
-                            "responsibility item."
-                        ),
-                        code="validator_incomplete",
-                        details={
-                            "index": index,
-                            "field": field_name,
-                        },
+                if any(len(value) > 800 for value in values):
+                    raise _diagnostic_error(
+                        "Requirement graph patch contains an oversized responsibility item.",
+                        returned_patch_targets=returned_patch_targets,
+                        compiled_patch_targets=compiled_patch_targets,
+                        extra={"index": index, "target_file": target, "field": field_name},
                     )
 
                 if field_name == "depends_on":
                     invalid_dependencies = [
                         value
                         for value in values
-                        if (
-                            value not in existing_file_paths
-                            or value == target
-                        )
+                        if value not in existing_file_paths or value == target
                     ]
-
                     if invalid_dependencies:
-                        raise RequirementGraphValidationError(
-                            (
-                                "Requirement graph patch "
-                                "contains invalid responsibility "
-                                "dependencies."
-                            ),
-                            code="validator_incomplete",
-                            details={
-                                "index": index,
-                                "target_file": target,
-                                "dependencies": (
-                                    invalid_dependencies
-                                ),
-                            },
+                        raise _diagnostic_error(
+                            "Requirement graph patch contains invalid responsibility dependencies.",
+                            returned_patch_targets=returned_patch_targets,
+                            compiled_patch_targets=compiled_patch_targets,
+                            extra={"index": index, "target_file": target, "dependencies": invalid_dependencies},
                         )
 
-                existing = list(
-                    getattr(
-                        item,
-                        field_name,
-                    )
-                )
-
+                existing = list(getattr(item, field_name))
                 for value in values:
                     if value not in existing:
-                        existing.append(
-                            value
-                        )
+                        existing.append(value)
+                setattr(item, field_name, existing)
 
-                        patched_requirement = True
+            compiled_patch_targets.append(target)
+            requirement_targets.append(target)
 
-                setattr(
-                    item,
-                    field_name,
-                    existing,
-                )
-
-            if patched_requirement:
-                requirement_targets.append(
-                    target
-                )
-
-        if set(returned_patch_targets) != set(required_script_targets):
-            raise RequirementGraphValidationError(
-                "Requirement graph compiler did not cover every required script target.",
-                code="validator_incomplete",
-                details={
-                    "required_script_targets": required_script_targets,
-                    "returned_patch_targets": sorted(returned_patch_targets),
-                },
+        if set(returned_patch_targets) != set(required_script_targets) or set(compiled_patch_targets) != set(required_script_targets):
+            raise _diagnostic_error(
+                "Requirement graph compiler did not complete every required script target.",
+                returned_patch_targets=returned_patch_targets,
+                compiled_patch_targets=compiled_patch_targets,
             )
 
-        graph.requirement_graph_source = (
+        _append_structured_handoff_requirements(
+            attempt_graph,
+            normalized_semantic_handoffs,
+        )
+
+        attempt_graph.requirement_graph_source = (
             "deterministic_file_contracts+"
             "normalized_responsibility_compilation"
         )
-
-        graph.requirement_graph_quality = (
+        attempt_graph.requirement_graph_quality = (
             "compiled_normalized_responsibility"
         )
 
@@ -7948,26 +7913,15 @@ async def _extract_requirement_graph_with_validator(
             "[result] %s",
             json.dumps(
                 {
-                    "event": (
-                        "requirement_graph_"
-                        "responsibility_compilation_result"
-                    ),
-                    "patch_count": len(
-                        patches
-                    ),
-                    "requirement_targets": sorted(
-                        set(
-                            requirement_targets
-                        )
-                    ),
-                    "responsibility_source": (
-                        "normalized_file_contracts"
-                    ),
+                    "event": "requirement_graph_responsibility_compilation_result",
+                    "patch_count": len(patches),
+                    "requirement_targets": sorted(set(requirement_targets)),
+                    "returned_patch_targets": sorted(returned_patch_targets),
+                    "compiled_patch_targets": sorted(compiled_patch_targets),
+                    "semantic_handoff_count": len(normalized_semantic_handoffs),
+                    "responsibility_source": "normalized_file_contracts",
                     "full_blueprint_visible": False,
-                    "capability_source": (
-                        "file_specs."
-                        "required_capabilities"
-                    ),
+                    "capability_source": "file_specs.required_capabilities",
                 },
                 ensure_ascii=False,
                 default=str,
@@ -7975,9 +7929,44 @@ async def _extract_requirement_graph_with_validator(
         )
 
         return validate_requirement_graph_schema(
-            graph,
+            attempt_graph,
             files_out,
         )
+
+    try:
+        for attempt in range(2):
+            compiler_attempts = attempt + 1
+            attempt_messages = list(messages)
+            if last_error is not None:
+                attempt_messages.append({
+                    "role": "user",
+                    "content": (
+                        "上一轮结果未覆盖完整 required responsibility compilation。"
+                        "不要重新规划 Skill，不要修改 target topology，不要修改 inputs/outputs/capabilities。"
+                        "请重新返回完整 patches[]。每个 required_script_target 必须恰好出现一次，"
+                        "每个 patch 必须有非空 must_do。\n\n"
+                        "validator_error_details:\n"
+                        + json.dumps(last_diagnostics, ensure_ascii=False, default=str)[:6000]
+                        + "\n\nprevious_compiler_response:\n"
+                        + json.dumps(previous_response, ensure_ascii=False, default=str)[:6000]
+                    ),
+                })
+
+            data = await _complete_creator_json_object_once(
+                messages=attempt_messages,
+                model=route.model,
+                phase="requirement_graph_responsibility_compilation",
+                response_schema=response_schema,
+            )
+            previous_response = data
+            try:
+                return _apply_compiler_patches(data)
+            except RequirementGraphValidationError as exc:
+                last_error = exc
+                last_diagnostics = dict(exc.details or {})
+                if attempt == 0:
+                    continue
+                raise
 
     except Exception as exc:
         if warnings is not None:
@@ -8005,6 +7994,11 @@ async def _extract_requirement_graph_with_validator(
                     "deterministic graph: "
                     f"{exc}"
                 ),
+                "details": {
+                    **(getattr(exc, "details", None) or {}),
+                    "compiler_attempts": compiler_attempts,
+                    "last_validator_code": str(code),
+                },
             })
 
         logger.info(
@@ -8024,6 +8018,10 @@ async def _extract_requirement_graph_with_validator(
                     "fallback": (
                         "deterministic_file_contracts"
                     ),
+                    "diagnostics": {
+                        **(getattr(exc, "details", None) or {}),
+                        "compiler_attempts": compiler_attempts,
+                    },
                     "full_blueprint_visible": False,
                 },
                 ensure_ascii=False,
@@ -8047,6 +8045,15 @@ def _persist_workflow_allocation_summary(skill_name: str, summary: str) -> None:
     metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     (metadata_dir / "workflow_allocation_summary.txt").write_text(str(summary or "").strip(), encoding="utf-8")
+
+
+def _persist_workflow_semantic_handoffs(skill_name: str, semantic_handoffs: list[dict[str, str]]) -> None:
+    metadata_dir = settings.skills_path / _validate_skill_name(skill_name) / ".creator"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    (metadata_dir / "workflow_semantic_handoffs.json").write_text(
+        json.dumps(semantic_handoffs or [], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _load_workflow_allocation_summary(skill_name: str) -> str:
@@ -8285,6 +8292,143 @@ def _normalize_file_plan_for_requirement_coverage(
         ),
     )
 
+
+_SEMANTIC_HANDOFF_CARDINALITY = {"single", "collection", "unknown"}
+_SEMANTIC_HANDOFF_CONSUMPTION_MODE = {"passthrough", "per_item", "aggregate", "whole_collection", "unknown"}
+_SEMANTIC_HANDOFF_CORRESPONDENCE = {"preserve", "not_required", "unknown"}
+_SEMANTIC_HANDOFF_ORDERING = {"preserve", "not_required", "unknown"}
+
+
+def _normalize_semantic_handoffs(
+    raw_handoffs: Any,
+    files_out: list[FileSpecOut],
+) -> list[dict[str, str]]:
+    """Normalize model-declared cross-script semantic handoffs.
+
+    This helper validates structure only. It intentionally does not infer
+    cardinality, consumption mode, correspondence, or ordering from field names,
+    file names, roles, capabilities, suffixes, or business keywords.
+    """
+
+    script_paths = {
+        str(getattr(file_spec, "path", "") or "").strip()
+        for file_spec in files_out or []
+        if str(getattr(file_spec, "path", "") or "").strip().startswith("scripts/")
+    }
+
+    if not isinstance(raw_handoffs, list):
+        return []
+
+    normalized_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+
+    def _enum(value: Any, allowed: set[str]) -> str:
+        text = str(value or "").strip()
+        return text if text in allowed else "unknown"
+
+    for raw in raw_handoffs:
+        if not isinstance(raw, dict):
+            continue
+
+        producer = str(raw.get("producer") or "").strip()
+        consumer = str(raw.get("consumer") or "").strip()
+        semantic_product = str(raw.get("semantic_product") or "").strip()
+
+        if (
+            not producer
+            or not consumer
+            or not semantic_product
+            or producer == consumer
+            or producer not in script_paths
+            or consumer not in script_paths
+        ):
+            continue
+
+        item = {
+            "producer": producer,
+            "consumer": consumer,
+            "semantic_product": semantic_product,
+            "cardinality": _enum(raw.get("cardinality"), _SEMANTIC_HANDOFF_CARDINALITY),
+            "consumption_mode": _enum(raw.get("consumption_mode"), _SEMANTIC_HANDOFF_CONSUMPTION_MODE),
+            "correspondence": _enum(raw.get("correspondence"), _SEMANTIC_HANDOFF_CORRESPONDENCE),
+            "ordering": _enum(raw.get("ordering"), _SEMANTIC_HANDOFF_ORDERING),
+        }
+
+        key = (
+            producer,
+            consumer,
+            semantic_product,
+        )
+        existing = normalized_by_key.get(key)
+        if existing is None:
+            normalized_by_key[key] = item
+            continue
+
+        for field_name in (
+            "cardinality",
+            "consumption_mode",
+            "correspondence",
+            "ordering",
+        ):
+            if existing.get(field_name) != item.get(field_name):
+                existing[field_name] = "unknown"
+
+    return list(normalized_by_key.values())
+
+
+def _append_structured_handoff_requirements(
+    graph: RequirementGraph,
+    semantic_handoffs: list[dict[str, str]],
+) -> None:
+    """Compile explicit handoff structure into existing RequirementItem text.
+
+    This is append-only and consumes only normalized structure emitted by the
+    workflow allocator. It performs no semantic inference.
+    """
+
+    by_file = {
+        item.target_file: item
+        for item in graph.requirements
+    }
+
+    for handoff in semantic_handoffs or []:
+        consumer = str(handoff.get("consumer") or "").strip()
+        item = by_file.get(consumer)
+        if item is None:
+            continue
+
+        cardinality = str(handoff.get("cardinality") or "unknown")
+        consumption_mode = str(handoff.get("consumption_mode") or "unknown")
+        correspondence = str(handoff.get("correspondence") or "unknown")
+        ordering = str(handoff.get("ordering") or "unknown")
+
+        must_do = list(item.must_do or [])
+        must_not_do = list(item.must_not_do or [])
+
+        def _add(target: list[str], statement: str) -> None:
+            if statement not in target:
+                target.append(statement)
+
+        if cardinality == "collection" and consumption_mode == "per_item":
+            _add(must_do, "Consume the complete upstream semantic collection.")
+            _add(must_do, "Apply the current file's owned core action to each required semantic unit.")
+            _add(must_do, "Deliver the complete result collection.")
+            _add(must_not_do, "Do not collapse a required collection-processing responsibility into one representative item.")
+        elif cardinality == "collection" and consumption_mode == "whole_collection":
+            _add(must_do, "Consume the complete upstream semantic collection in the current core processing path.")
+        elif consumption_mode == "aggregate":
+            _add(must_do, "Consume the complete required upstream semantic set and produce the declared aggregate semantic result.")
+        elif consumption_mode == "passthrough":
+            _add(must_do, "Preserve the upstream semantic product needed by the downstream responsibility.")
+
+        if correspondence == "preserve":
+            _add(must_do, "Preserve sufficient correspondence between consumed semantic units and produced results for downstream consumption.")
+
+        if ordering == "preserve":
+            _add(must_do, "Preserve the semantic ordering required by downstream consumers.")
+
+        item.must_do = must_do
+        item.must_not_do = must_not_do
+
 async def _allocate_workflow_script_responsibilities(
     *,
     blueprint_text: str,
@@ -8295,6 +8439,7 @@ async def _allocate_workflow_script_responsibilities(
     str,
     set[str],
     bool,
+    list[dict[str, str]],
 ]:
     """Reconcile responsibilities only across multiple executable scripts.
 
@@ -8329,6 +8474,7 @@ async def _allocate_workflow_script_responsibilities(
             "",
             set(),
             True,
+            [],
         )
 
     if len(targets) == 1:
@@ -8386,6 +8532,7 @@ async def _allocate_workflow_script_responsibilities(
                 target.path,
             },
             True,
+            [],
         )
 
     route = route_model(
@@ -8496,7 +8643,7 @@ async def _allocate_workflow_script_responsibilities(
                 "- 基础 inputs / outputs。\n\n"
 
                 "你只负责多脚本之间的 executable "
-                "handoff reconciliation。\n\n"
+                "handoff reconciliation 和已有 producer/consumer responsibility 之间的 semantic handoff structure 编译。\n\n"
 
                 "只检查：\n"
                 "1. 上游 script outputs 是否能够作为"
@@ -8509,7 +8656,7 @@ async def _allocate_workflow_script_responsibilities(
 
                 "禁止：\n"
                 "- 重新解释用户业务；\n"
-                "- 修改 required_capabilities；\n"
+                "- 修改 target_file、inputs、outputs、required_capabilities、forbidden_capabilities、dependencies；\n"
                 "- 新增或删除文件；\n"
                 "- 因内部 for/loop/map 行为改变 script "
                 "boundary cardinality；\n"
@@ -8517,8 +8664,7 @@ async def _allocate_workflow_script_responsibilities(
                 "string input 改成 list input；\n"
                 "- 因脚本内部生成多个中间 artifact，"
                 "就把最终单 artifact output 改成 list；\n"
-                "- 根据 role 名、文件名、单复数机械"
-                "推断字段类型。\n\n"
+                "- 根据 role 名、文件名、字段名、capability 名、单复数、suffix 或业务词表机械推断 handoff structure。\n\n"
 
                 "只有存在明确跨 script contract evidence "
                 "时，才能修改 inputs / outputs。\n"
@@ -8533,9 +8679,15 @@ async def _allocate_workflow_script_responsibilities(
                 "purpose、inputs、outputs 必须描述同一个"
                 "最终跨脚本 handoff contract。\n\n"
 
+                "必须返回 semantic_handoffs。每条 handoff 只能基于现有 normalized FileSpecs、script purpose、semantic inputs、semantic outputs、dependencies 和 normalized workflow responsibility/allocation context。\n"
+                "semantic_product 是上游责任产生并由下游消费的语义结果描述，不是 exact stdout key、argv key、dict key 或变量名。\n"
+                "对每条 producer→consumer handoff 判断：producer 交付 single/collection/unknown；consumer 以 passthrough/per_item/aggregate/whole_collection/unknown 消费；是否 preserve correspondence；是否 preserve ordering。\n"
+                "collection != per_item；collection 可以被 per_item、aggregate、whole_collection 或 passthrough 消费。禁止默认 cardinality=collection => per_item；禁止默认多个 outputs => collection；不确定时返回 unknown。\n\n"
+
                 "返回：\n"
                 "{"
-                "\"workflow_allocation_summary\":\"...\","
+                "\"workflow_allocation_summary\":\"human readable summary...\","
+                "\"semantic_handoffs\":[{\"producer\":\"scripts/a.py\",\"consumer\":\"scripts/b.py\",\"semantic_product\":\"semantic result consumed by downstream responsibility\",\"cardinality\":\"single|collection|unknown\",\"consumption_mode\":\"passthrough|per_item|aggregate|whole_collection|unknown\",\"correspondence\":\"preserve|not_required|unknown\",\"ordering\":\"preserve|not_required|unknown\"}],"
                 "\"patches\":["
                 "{"
                 "\"target_file\":\"scripts/x.py\","
@@ -8614,6 +8766,7 @@ async def _allocate_workflow_script_responsibilities(
         ] = []
 
         summary = ""
+        semantic_handoffs: list[dict[str, str]] = []
 
         for attempt in range(2):
             attempt_messages = list(
@@ -8657,6 +8810,11 @@ async def _allocate_workflow_script_responsibilities(
                 )
                 or ""
             ).strip()
+
+            semantic_handoffs = _normalize_semantic_handoffs(
+                data.get("semantic_handoffs") if isinstance(data, dict) else [],
+                files_out,
+            )
 
             if not isinstance(
                 patches_candidate,
@@ -8971,6 +9129,8 @@ async def _allocate_workflow_script_responsibilities(
 
                     "summary": summary,
 
+                    "semantic_handoffs": semantic_handoffs,
+
                     "allocation_scope": (
                         "cross_script_only"
                     ),
@@ -8984,6 +9144,7 @@ async def _allocate_workflow_script_responsibilities(
             summary,
             set(applied),
             allocation_resolved,
+            semantic_handoffs,
         )
 
     except Exception as exc:
@@ -9037,6 +9198,7 @@ async def _allocate_workflow_script_responsibilities(
             "",
             set(),
             False,
+            [],
         )
 
 def _looks_like_semantic_short_contract(text: str) -> bool:
@@ -10776,7 +10938,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         final_outputs=getattr(plan, "final_outputs", []),
         warnings=warnings,
     )
-    workflow_allocation_summary, allocation_patched_targets, workflow_allocation_resolved = await _allocate_workflow_script_responsibilities(
+    workflow_allocation_summary, allocation_patched_targets, workflow_allocation_resolved, semantic_handoffs = await _allocate_workflow_script_responsibilities(
         blueprint_text=blueprint_text,
         files_out=files_out,
         requested_model=request.model,
@@ -10840,6 +11002,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             requested_model=request.model,
             warnings=warnings,
             workflow_allocation_summary=workflow_allocation_summary,
+            semantic_handoffs=semantic_handoffs,
         )
     except RequirementGraphValidationError as exc:
         requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
@@ -10858,6 +11021,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         file_spec.requirements = list(requirements_by_file.get(file_spec.path, []))
     _persist_requirement_graph(plan.skill_name, requirement_graph)
     _persist_workflow_allocation_summary(plan.skill_name, workflow_allocation_summary)
+    _persist_workflow_semantic_handoffs(plan.skill_name, semantic_handoffs)
 
     asset_requirements = [
         AssetRequirementOut(

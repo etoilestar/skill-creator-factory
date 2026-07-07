@@ -507,7 +507,7 @@ def test_preflight_missing_skill_plan_message_includes_path():
     assert "references/test-missing-preflight.md" in issue["message"]
 
 @pytest.mark.asyncio
-async def test_blueprint_planner_prompt_preserves_workflow_structure_responsibility(monkeypatch):
+async def test_blueprint_planner_prompt_includes_constraints_serialization_contract(monkeypatch):
     captured = []
 
     async def fake_complete(messages, model):
@@ -518,10 +518,8 @@ async def test_blueprint_planner_prompt_preserves_workflow_structure_responsibil
     await api._generate_internal_blueprint_or_questions(_request())
 
     prompt = captured[0]["content"]
-    assert "workflow structure responsibility" in prompt
-    assert "SkillPlan responsibility contract" in prompt
-    assert "不得在 SkillPlan responsibility contract 中将其压缩" in prompt
-    assert "collection、per-unit、correspondence、ordering" in prompt
-    assert "不得要求 exact argv key、stdout key、dict key 或变量名" in prompt
-    assert "不得根据字段名" not in prompt[prompt.index("## responsibility structure alignment"):prompt.index("## 内部处理与脚本拆分")]
-    assert "role 映射" not in prompt[prompt.index("## responsibility structure alignment"):prompt.index("## 内部处理与脚本拆分")]
+    section = prompt[prompt.index("## responsibility constraints"):prompt.index("## 内部处理与脚本拆分")]
+    assert "将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段" in section
+    assert "constraints 必须是单行合法 JSON array" in section
+    assert "不要限制 constraint 类型" in section
+    assert "不要广播到所有 scripts" in section

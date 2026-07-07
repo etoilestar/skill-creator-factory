@@ -288,6 +288,7 @@ class SkillPlanEntry:
     side_effects: list[str] = field(default_factory=list)
     runtime_contract: dict[str, object] = field(default_factory=dict)
     artifact_contract: dict[str, object] = field(default_factory=dict)
+    constraints: list[dict[str, object]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     required: bool = True
     can_skip: bool = False
@@ -563,7 +564,7 @@ _FIELD_AMBIGUOUS_RE = re.compile(
     r"(?:[|/+&]|\b(?:or|alias|aka|alternative|alternatives)\b|或|或者|别名|候选|可选)",
     re.I,
 )
-_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|side_effects|required_tool_slots|language|runtime"
+_FIELD_LIST_NAMES_RE = r"role|inputs|outputs|dependencies|constraints|required_capabilities|optional_capabilities|allowed_capabilities|business_forbidden_capabilities|forbidden_capabilities|side_effects|required_tool_slots|language|runtime"
 
 
 def _clean_concrete_field_name(raw_item: str) -> tuple[str | None, bool]:
@@ -640,6 +641,26 @@ def _explicit_list_field(field_name: str, *, file_path: str, purpose: str = "", 
     )
     return values
 
+
+
+def _explicit_constraints_field(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[dict[str, object]]:
+    """Read an inline JSON array `constraints: [...]` from the current file block.
+
+    Creator transport preserves dict items only and does not interpret any
+    constraint names, kinds, values, comparators, or units.
+    """
+    segment = _segment_for_file(file_path, purpose, blueprint_summary)
+    match = re.search(r"(?:^|\s)constraints\s*[：:=]\s*", segment, re.I)
+    if not match:
+        return []
+    raw = segment[match.end():].lstrip()
+    try:
+        value, _end = json.JSONDecoder().raw_decode(raw)
+    except Exception:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 def skill_plan_field_declaration_warnings(*, file_path: str, purpose: str = "", blueprint_summary: str = "") -> list[str]:
     """Return user-visible warnings for invalid SkillPlan field declarations."""
@@ -873,6 +894,12 @@ def build_skill_plan_entry(
             blueprint_summary=blueprint_summary,
         )
         or []
+    )
+
+    explicit_constraints = _explicit_constraints_field(
+        file_path=file_path,
+        purpose=purpose,
+        blueprint_summary=blueprint_summary,
     )
 
     role = classification.role
@@ -1242,6 +1269,7 @@ def build_skill_plan_entry(
             if file_type == "script"
             else {}
         ),
+        constraints=explicit_constraints,
 
         layer=(
             "business_skill"

@@ -6450,6 +6450,8 @@ constraint 是开放语义数据。
 
 Planner 负责把 constraint 放到拥有该责任的 script。
 不要广播到所有 scripts。
+将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段；
+constraints 必须是单行合法 JSON array。
 
 ## 内部处理与脚本拆分
 

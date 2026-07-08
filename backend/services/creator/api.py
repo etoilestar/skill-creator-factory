@@ -6405,6 +6405,49 @@ A reference cannot own or execute a core action.
 
 A reference cannot be the producer of a required final result.
 
+## ResponsibilityEdge semantics
+
+A ResponsibilityEdge describes how one executable responsibility result
+is consumed by the next executable responsibility.
+
+FunctionItem owns target-local script responsibility.
+
+ResponsibilityEdge owns cross-FunctionItem responsibility transport.
+
+ResponsibilityGraph nodes are only:
+
+- platform_input_node
+- scripts/**
+- platform_output_node
+
+SKILL.md, references/**, and assets/** are not ResponsibilityGraph nodes.
+
+References and assets may be used by scripts, but cannot become FunctionItems
+and cannot become ResponsibilityEdge endpoints.
+
+Ready Blueprint must include a top-level ResponsibilityEdges field.
+ResponsibilityEdges must be a single-line valid JSON array.
+Each edge may contain only from_node, from_output, to_node, to_input, purpose, and constraints.
+Do not add semantic fields such as cardinality, granularity, source_granularity, target_granularity, mechanism, iteration, aggregation, correspondence, ordering, single, collection, or per_item.
+If those ideas affect workflow correctness, express them as model-owned objects inside edge.constraints.
+constraints is a JSON array of objects. Legal empty constraints: []. Illegal: constraints: ["..."].
+Example constraint object: {"name":"custom_requirement","kind":"workflow_requirement","value":"arbitrary model-owned semantic requirement","comparator":"describes","required":true}.
+
+ResponsibilityEdges: [{"from_node":"platform_input_node","from_output":"semantic input name","to_node":"scripts/a.py","to_input":"semantic input name","purpose":"Describe why this result is transported to the downstream responsibility.","constraints":[]},{"from_node":"scripts/a.py","from_output":"semantic result name","to_node":"scripts/b.py","to_input":"semantic input name","purpose":"Describe the cross-responsibility handoff.","constraints":[]}]
+
+## responsibility graph replay
+
+Before returning status=ready, internally start from platform_input_node and replay the complete workflow in execution order.
+For each workflow responsibility: identify the owning script FunctionItem; identify what semantic results it needs; identify the upstream node providing each cross-boundary result; create the ResponsibilityEdge; preserve any correctness-affecting cross-responsibility requirement in the edge constraints; identify the results produced by the FunctionItem; continue to downstream FunctionItems.
+Finally trace every required final result to platform_output_node.
+
+Do not only verify that every script has a purpose.
+Verify that the connected FunctionItems and ResponsibilityEdges can represent the complete executable workflow.
+If the workflow contains a cross-script requirement, do not leave it only in workflow prose. It must enter the owning FunctionItem or ResponsibilityEdge constraints.
+script-local requirement → FunctionItem.constraints
+cross-responsibility requirement → ResponsibilityEdge.constraints
+Do not build a fixed requirement classifier; use full workflow understanding.
+
 ## core action fidelity
 
 规划 workflow 和 script responsibilities 时，
@@ -7569,6 +7612,7 @@ async def _extract_requirement_graph_with_validator(
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
     workflow_allocation_summary: str = "",
+    responsibility_edges: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
     """Build the deterministic RequirementGraph from normalized FileSpecs.
 
@@ -7579,7 +7623,7 @@ async def _extract_requirement_graph_with_validator(
     """
     _ = (blueprint_text, requested_model, warnings, workflow_allocation_summary)
     return validate_requirement_graph_schema(
-        build_default_requirement_graph(files_out),
+        build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges),
         files_out,
     )
 
@@ -9691,7 +9735,10 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         ),
     })
-    fallback_requirement_graph = build_default_requirement_graph(files_out)
+    fallback_requirement_graph = build_default_requirement_graph(
+        files_out,
+        responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
+    )
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
             blueprint_text=blueprint_text,
@@ -9699,6 +9746,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             requested_model=request.model,
             warnings=warnings,
             workflow_allocation_summary=workflow_allocation_summary,
+            responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
         )
     except RequirementGraphValidationError as exc:
         requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
@@ -11209,6 +11257,7 @@ async def generate_file(request: GenerateFileRequest):
                     requirements=(
                         entry_requirements
                     ),
+                    responsibility_graph=request.requirement_graph,
                 )
             )
             prompt_variant = "standard"
@@ -11496,6 +11545,7 @@ async def generate_file(request: GenerateFileRequest):
                                     if hasattr(last_file_binding, "model_dump")
                                     else last_file_binding
                                 ),
+                                "requirement_graph": request.requirement_graph,
                             },
                         )
                         original_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0

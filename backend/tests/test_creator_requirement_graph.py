@@ -1658,3 +1658,74 @@ def test_requirement_graph_persistence_helpers_round_trip(monkeypatch, tmp_path)
     assert loaded_graph is not None
     assert loaded_graph.requirements[0].target_file == "scripts/main.py"
     assert loaded_summary == "preserved constraints"
+
+
+def test_responsibility_edges_parse_open_constraints():
+    from backend.services.skill_plan import parse_responsibility_edges
+
+    constraint = {
+        "name": "alpha",
+        "kind": "custom",
+        "value": {"x": 1},
+        "comparator": "describes",
+        "required": True,
+    }
+    text = (
+        'ResponsibilityEdges: '
+        '[{"from_node":"scripts/a.py","from_output":"out","to_node":"scripts/b.py",'
+        '"to_input":"inp","purpose":"handoff","constraints":['
+        + __import__('json').dumps(constraint)
+        + ']}]'
+    )
+
+    edges = parse_responsibility_edges(text)
+
+    assert edges[0]["constraints"] == [constraint]
+
+
+def test_responsibility_graph_preserves_planner_edges():
+    specs = [
+        _file_spec("scripts/a.py", inputs=["user_request"], outputs=["a_result"]),
+        _file_spec("scripts/b.py", inputs=["a_result"], outputs=["final_response"]),
+    ]
+    edges = [
+        {"from_node": "platform_input_node", "from_output": "user_request", "to_node": "scripts/a.py", "to_input": "user_request", "purpose": "input handoff", "constraints": []},
+        {"from_node": "scripts/a.py", "from_output": "a_result", "to_node": "scripts/b.py", "to_input": "a_result", "purpose": "script handoff", "constraints": [{"name": "alpha", "kind": "custom", "value": {"x": 1}, "comparator": "describes", "required": True}]},
+        {"from_node": "scripts/b.py", "from_output": "final_response", "to_node": "platform_output_node", "to_input": "final_response", "purpose": "final delivery", "constraints": []},
+    ]
+
+    graph = build_default_requirement_graph(specs, responsibility_edges=edges)
+
+    assert graph.dataflow_edges == edges
+
+
+def test_responsibility_graph_does_not_infer_edges_from_matching_io_names():
+    specs = [
+        _file_spec("scripts/a.py", outputs=["result"]),
+        _file_spec("scripts/b.py", inputs=["result"]),
+    ]
+
+    graph = build_default_requirement_graph(specs)
+
+    assert graph.dataflow_edges == []
+
+
+def test_producer_and_judge_receive_same_function_item_graph_context():
+    from backend.services.creator.common import function_item_graph_context
+
+    specs = [
+        _file_spec("scripts/a.py", inputs=["user_request"], outputs=["a_result"], constraints=[{"name": "local", "kind": "custom", "value": "keep", "comparator": "describes"}]),
+        _file_spec("scripts/b.py", inputs=["a_result"], outputs=["final_response"]),
+    ]
+    edge_constraint = {"name": "alpha", "kind": "custom", "value": {"x": 1}, "comparator": "describes", "required": True}
+    graph = build_default_requirement_graph(specs, responsibility_edges=[
+        {"from_node": "scripts/a.py", "from_output": "a_result", "to_node": "scripts/b.py", "to_input": "a_result", "purpose": "handoff", "constraints": [edge_constraint]},
+    ])
+
+    producer_payload = function_item_graph_context(graph, "scripts/b.py")
+    judge_payload = function_item_graph_context(graph, "scripts/b.py")
+
+    assert producer_payload == judge_payload
+    assert set(producer_payload) == {"function_item", "incoming_edges", "outgoing_edges"}
+    assert producer_payload["function_item"]
+    assert producer_payload["incoming_edges"][0]["constraints"] == [edge_constraint]

@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings
+from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings, parse_responsibility_edges
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -1417,13 +1417,13 @@ def build_skill_plan_from_files(
                 "不会自动启用图片生成/PDF 生成等高影响能力。"
             )
 
-    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings))
+    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, responsibility_edges=parse_responsibility_edges(blueprint_text)))
     semantic_issues = validate_file_plan_semantics(normalized)
     # SkillPlan static I/O consumption is an internal workflow dataflow hint, not
     # a blueprint-stage user-visible warning.  First-round Creator validation
     # only reports platform/file-boundary issues; real script-to-script field
     # availability is checked by second-round E2E execution.
-    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues])
+    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues], responsibility_edges=list(normalized.responsibility_edges or []))
 
 
 def parse_blueprint(

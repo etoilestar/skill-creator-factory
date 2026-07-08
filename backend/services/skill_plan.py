@@ -304,7 +304,40 @@ class SkillPlan:
     skill_name: str
     files: list[SkillPlanEntry] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    responsibility_edges: list[dict[str, object]] = field(default_factory=list)
 
+
+
+def parse_responsibility_edges(blueprint_text: str) -> list[dict[str, object]]:
+    """Parse top-level ResponsibilityEdges as model-owned graph data.
+
+    This parser only transports an explicit JSON array. It does not infer,
+    repair, or synthesize edges from FunctionItem IO, filenames, roles, or
+    workflow prose. Constraint semantics are preserved as opaque dict objects.
+    """
+    text = str(blueprint_text or "")
+    match = re.search(r"(?im)^\s*ResponsibilityEdges\s*[：:=]\s*", text)
+    if not match:
+        return []
+    raw = text[match.end():].lstrip()
+    try:
+        value, _end = json.JSONDecoder().raw_decode(raw)
+    except Exception:
+        return []
+    if not isinstance(value, list):
+        return []
+    edges: list[dict[str, object]] = []
+    allowed = {"from_node", "from_output", "to_node", "to_input", "purpose", "constraints"}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        edge = {key: item.get(key) for key in allowed if key in item}
+        constraints = edge.get("constraints", [])
+        if not isinstance(constraints, list):
+            constraints = []
+        edge["constraints"] = [dict(c) for c in constraints if isinstance(c, dict)]
+        edges.append(edge)
+    return edges
 
 def file_type_for_path(path: str) -> FileType:
     if path == "SKILL.md":
@@ -1899,6 +1932,7 @@ def normalize_skill_plan(
         files=entries,
 
         warnings=warnings,
+        responsibility_edges=list(plan.responsibility_edges or []),
     )
 
 

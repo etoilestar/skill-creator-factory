@@ -829,12 +829,26 @@ def normalize_responsibility_graph(data: dict[str, Any] | ResponsibilityGraph) -
 
 def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list[Any]) -> ResponsibilityGraph:
     graph = normalize_responsibility_graph(graph)
+    script_targets = {
+        str(getattr(file_spec, "path", "") or "").strip()
+        for file_spec in files or []
+        if str(
+            getattr(file_spec, "path", "") or ""
+        ).strip().startswith("scripts/")
+    }
     target_counts: dict[str, int] = {}
     for item in graph.function_items:
         path = str(item.target_file or "").strip()
         if not path.startswith("scripts/"):
             raise ResponsibilityGraphValidationError(
                 "ResponsibilityGraph FunctionItems must target scripts/** only.",
+                code="validator_incomplete",
+                details={"target_file": path},
+            )
+        if path not in script_targets:
+            raise ResponsibilityGraphValidationError(
+                "FunctionItem target_file must reference "
+                "an existing script FileSpec.",
                 code="validator_incomplete",
                 details={"target_file": path},
             )

@@ -124,6 +124,18 @@ def test_non_script_function_item_is_validator_incomplete():
     assert exc.value.code == "validator_incomplete"
 
 
+def test_unknown_script_function_item_is_validator_incomplete():
+    graph = ResponsibilityGraph(requirements=[
+        FunctionItem(target_file="scripts/a.py", purpose="known script responsibility"),
+        FunctionItem(target_file="scripts/ghost.py", purpose="unknown script responsibility"),
+    ])
+
+    with pytest.raises(RequirementGraphValidationError) as exc:
+        validate_requirement_graph_schema(graph, [_file_spec("scripts/a.py")])
+
+    assert exc.value.code == "validator_incomplete"
+
+
 def test_script_constraints_project_to_function_item_but_reference_constraints_do_not():
     graph = build_default_requirement_graph([
         _file_spec("scripts/a.py", constraints=[{"name": "script_rule", "kind": "constraint", "value": "apply"}]),

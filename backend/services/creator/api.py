@@ -6483,8 +6483,19 @@ Only output strict JSON object. Do not output Markdown or explanation.
         invalid_transport_fields.append("clarifying_questions")
     if not isinstance(data.get("review_summary"), dict):
         invalid_transport_fields.append("review_summary")
-    if not isinstance(data.get("internal_blueprint_text"), str):
-        invalid_transport_fields.append("internal_blueprint_text")
+    if (
+        not isinstance(
+            data.get("internal_blueprint_text"),
+            str,
+        )
+        or not str(
+            data.get("internal_blueprint_text")
+            or ""
+        ).strip()
+    ):
+        invalid_transport_fields.append(
+            "internal_blueprint_text"
+        )
     if not isinstance(data.get("skill_name"), str):
         invalid_transport_fields.append("skill_name")
     if not isinstance(data.get("blockers"), list):

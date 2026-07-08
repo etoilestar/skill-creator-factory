@@ -928,3 +928,21 @@ async def test_planner_convergence_invalid_transport_shape_keeps_draft(monkeypat
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result["internal_blueprint_text"] == "draft"
     assert result["responsibility_edges"] == [draft_edge]
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_empty_blueprint_keeps_draft(monkeypatch):
+    import json
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"good draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"   ","skill_name":"demo","blockers":[],"responsibility_edges":[]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result["internal_blueprint_text"] == "good draft"
+    assert result["responsibility_edges"] == [draft_edge]

@@ -199,8 +199,8 @@ class SkillMdBlueprintReviewResponse(BaseModel):
     repair_suggestions: str = ""
     fixed_content: Optional[str] = None
 
-class RequirementGraphValidationError(ValueError):
-    """Requirement graph parser/schema failure that must not be treated as a business-file error."""
+class ResponsibilityGraphValidationError(ValueError):
+    """Responsibility graph parser/schema failure that must not be treated as a business-file error."""
 
     def __init__(self, message: str, *, code: str = "validator_error", details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -219,12 +219,17 @@ class RequirementConstraint(BaseModel):
     evidence_policy: dict[str, Any] = Field(default_factory=dict)
 
 
-class RequirementItem(BaseModel):
-    """Compact per-file responsibility item.
+class FunctionItem(BaseModel):
+    """Compact per-script executable function item.
 
-    The persisted/API shape intentionally keeps only file responsibility fields.
-    Legacy properties remain available for first-round/E2E reviewers that still
-    use RequirementItem as their internal contract.
+    FunctionItem models one scripts/** file's complete executable
+    responsibility closure: one script, one executable responsibility closure,
+    one FunctionItem.  It is not a generic FileSpec responsibility
+    description for SKILL.md, references/**, or assets/**.
+
+    The persisted/API shape intentionally keeps the legacy transport fields.
+    Compatibility aliases remain available for callers that still use
+    RequirementItem as their internal contract name.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -322,14 +327,14 @@ class RequirementItem(BaseModel):
 
 
 
-def requirement_item_prompt_payload(item: Any) -> dict[str, Any]:
-    """Serialize one RequirementItem for Producer/Judge prompts.
+def function_item_prompt_payload(item: Any) -> dict[str, Any]:
+    """Serialize one FunctionItem for Producer/Judge prompts.
 
-    RequirementItem.constraints is excluded from the default model dump, so this
+    FunctionItem.constraints is excluded from the default model dump, so this
     helper explicitly transports the same constraints payload to every model
     consumer without interpreting constraint semantics.
     """
-    requirement = item if isinstance(item, RequirementItem) else RequirementItem(**item) if isinstance(item, dict) else None
+    requirement = item if isinstance(item, FunctionItem) else FunctionItem(**item) if isinstance(item, dict) else None
     if requirement is None:
         return {"value": str(item)}
     payload = requirement.model_dump(mode="json")
@@ -339,11 +344,16 @@ def requirement_item_prompt_payload(item: Any) -> dict[str, Any]:
     ]
     return payload
 
-class RequirementGraph(BaseModel):
-    # RequirementGraph inputs/outputs are recommended shared vocabulary for SKILL.md
+class ResponsibilityGraph(BaseModel):
+    # ResponsibilityGraph inputs/outputs are recommended shared vocabulary for SKILL.md
     # and scripts to converge on field names. They are not a field-level hard
     # validation contract; real closure is verified by E2E execution.
-    requirements: list[RequirementItem] = Field(default_factory=list)
+    # External wire shape still serializes function items under requirements.
+    requirements: list[FunctionItem] = Field(default_factory=list)
+
+    @property
+    def function_items(self) -> list[FunctionItem]:
+        return self.requirements
     platform_io_contract: dict[str, Any] = Field(default_factory=build_platform_io_contract)
     platform_input_node: dict[str, Any] = Field(default_factory=dict)
     platform_output_node: dict[str, Any] = Field(default_factory=dict)
@@ -406,7 +416,7 @@ def _normalize_dataflow_edges(raw_edges: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def _validate_requirement_graph_edges(graph: RequirementGraph, files: list[Any]) -> None:
+def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list[Any]) -> None:
     platform_input = graph.platform_input_node or {}
     platform_output = graph.platform_output_node or {}
     platform_input_id = str(platform_input.get("node_id") or "platform_input_node")
@@ -447,13 +457,13 @@ def _validate_requirement_graph_edges(graph: RequirementGraph, files: list[Any])
 
         if from_node == platform_input_id:
             if from_field not in platform_input_fields:
-                raise RequirementGraphValidationError(
+                raise ResponsibilityGraphValidationError(
                     "Dataflow edge references an undefined platform input field.",
                     code="dataflow_edge_invalid",
                     details={"index": idx, "from_field": from_field},
                 )
             if to_node not in script_nodes:
-                raise RequirementGraphValidationError(
+                raise ResponsibilityGraphValidationError(
                     "Platform input edge must target an existing script node.",
                     code="dataflow_edge_invalid",
                     details={"index": idx, "to_node": to_node},
@@ -462,13 +472,13 @@ def _validate_requirement_graph_edges(graph: RequirementGraph, files: list[Any])
 
         if to_node == platform_output_id:
             if from_node not in script_nodes:
-                raise RequirementGraphValidationError(
+                raise ResponsibilityGraphValidationError(
                     "Platform output edge must originate from an existing script node.",
                     code="dataflow_edge_invalid",
                     details={"index": idx, "from_node": from_node},
                 )
             if to_field not in platform_output_fields:
-                raise RequirementGraphValidationError(
+                raise ResponsibilityGraphValidationError(
                     "Dataflow edge references an undefined platform output field.",
                     code="dataflow_edge_invalid",
                     details={"index": idx, "to_field": to_field},
@@ -476,20 +486,20 @@ def _validate_requirement_graph_edges(graph: RequirementGraph, files: list[Any])
             continue
 
         if from_node in {platform_output_id} or to_node in {platform_input_id}:
-            raise RequirementGraphValidationError(
+            raise ResponsibilityGraphValidationError(
                 "Dataflow edge uses a platform boundary node in an invalid direction.",
                 code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
 
         if from_node not in script_nodes or to_node not in script_nodes:
-            raise RequirementGraphValidationError(
+            raise ResponsibilityGraphValidationError(
                 "Script-to-script dataflow edge references a missing script node.",
                 code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
         if from_field not in outputs_by_script.get(from_node, set()):
-            raise RequirementGraphValidationError(
+            raise ResponsibilityGraphValidationError(
                 "Script-to-script dataflow edge references a field not declared by the source script outputs.",
                 code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "from_field": from_field},
@@ -507,15 +517,15 @@ def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
     )
 
 
-def build_default_requirement_graph(
+def build_default_responsibility_graph(
     files: list[Any],
-) -> RequirementGraph:
+) -> ResponsibilityGraph:
     """Build the deterministic responsibility graph from normalized file contracts.
 
     Capability source:
 
         FileSpecOut.required_capabilities
-        -> RequirementItem.required_tools
+        -> FunctionItem.required_tools
 
     No model performs capability extraction in this function.
 
@@ -528,7 +538,7 @@ def build_default_requirement_graph(
     """
 
     items: list[
-        RequirementItem
+        FunctionItem
     ] = []
 
     for file_spec in (
@@ -543,13 +553,7 @@ def build_default_requirement_graph(
             or ""
         ).strip()
 
-        if (
-            not path
-            or path == "SKILL.md"
-            or path.startswith(
-                "assets/"
-            )
-        ):
+        if not path.startswith("scripts/"):
             continue
 
         purpose = str(
@@ -650,7 +654,7 @@ def build_default_requirement_graph(
             continue
 
         items.append(
-            RequirementItem(
+            FunctionItem(
                 target_file=path,
 
                 role=str(
@@ -745,7 +749,7 @@ def build_default_requirement_graph(
         platform_output_node,
     ) = _platform_boundary_nodes()
 
-    return RequirementGraph(
+    return ResponsibilityGraph(
         requirements=items,
 
         platform_io_contract=(
@@ -772,7 +776,7 @@ def build_default_requirement_graph(
     )
 
 
-def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]:
+def parse_responsibility_graph_result(text: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(text, dict):
         return text
     raw = str(text or "").strip()
@@ -781,15 +785,15 @@ def parse_requirement_graph_result(text: str | dict[str, Any]) -> dict[str, Any]
     try:
         data = json.loads(raw)
     except Exception as exc:
-        raise RequirementGraphValidationError("Requirement graph validator did not return valid JSON.", code="validator_error", details={"error": str(exc), "raw": raw[:1000]}) from exc
+        raise ResponsibilityGraphValidationError("Requirement graph validator did not return valid JSON.", code="validator_error", details={"error": str(exc), "raw": raw[:1000]}) from exc
     if not isinstance(data, dict):
-        raise RequirementGraphValidationError("Requirement graph JSON must be an object.", code="validator_incomplete", details={"type": type(data).__name__})
+        raise ResponsibilityGraphValidationError("Requirement graph JSON must be an object.", code="validator_incomplete", details={"type": type(data).__name__})
     return data
 
 
-def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> RequirementGraph:
+def normalize_responsibility_graph(data: dict[str, Any] | ResponsibilityGraph) -> ResponsibilityGraph:
     platform_input_node, platform_output_node = _platform_boundary_nodes()
-    if isinstance(data, RequirementGraph):
+    if isinstance(data, ResponsibilityGraph):
         return data.model_copy(update={
             "platform_io_contract": build_platform_io_contract(),
             "platform_input_node": platform_input_node,
@@ -798,21 +802,21 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
         })
     raw_items = data.get("requirements", data.get("items", [])) if isinstance(data, dict) else []
     if not isinstance(raw_items, list):
-        raise RequirementGraphValidationError("Responsibility graph requirements must be a list.", code="validator_incomplete")
-    items: list[RequirementItem] = []
+        raise ResponsibilityGraphValidationError("Responsibility graph requirements must be a list.", code="validator_incomplete")
+    items: list[FunctionItem] = []
     for idx, raw in enumerate(raw_items):
         if not isinstance(raw, dict):
-            raise RequirementGraphValidationError("Responsibility item must be an object.", code="validator_incomplete", details={"index": idx})
+            raise ResponsibilityGraphValidationError("Responsibility item must be an object.", code="validator_incomplete", details={"index": idx})
         try:
-            item = RequirementItem(**raw)
+            item = FunctionItem(**raw)
         except Exception as exc:
-            raise RequirementGraphValidationError("Responsibility item schema is incomplete.", code="validator_incomplete", details={"index": idx, "error": str(exc)}) from exc
+            raise ResponsibilityGraphValidationError("Responsibility item schema is incomplete.", code="validator_incomplete", details={"index": idx, "error": str(exc)}) from exc
         if not item.target_file.strip() or not item.purpose.strip():
-            raise RequirementGraphValidationError("Responsibility item misses target_file or purpose.", code="validator_incomplete", details={"index": idx, "item": raw})
+            raise ResponsibilityGraphValidationError("Responsibility item misses target_file or purpose.", code="validator_incomplete", details={"index": idx, "item": raw})
         items.append(item)
     source = str(data.get("requirement_graph_source") or data.get("source") or "validator") if isinstance(data, dict) else "validator"
     quality = str(data.get("requirement_graph_quality") or data.get("quality") or "responsibility") if isinstance(data, dict) else "responsibility"
-    return RequirementGraph(
+    return ResponsibilityGraph(
         requirements=items,
         platform_io_contract=build_platform_io_contract(),
         platform_input_node=platform_input_node,
@@ -823,11 +827,42 @@ def normalize_requirement_graph(data: dict[str, Any] | RequirementGraph) -> Requ
     )
 
 
-def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any]) -> RequirementGraph:
-    graph = normalize_requirement_graph(graph)
-    _validate_requirement_graph_edges(graph, files)
-    required_by_file: dict[str, list[RequirementItem]] = {}
-    for item in graph.requirements:
+def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list[Any]) -> ResponsibilityGraph:
+    graph = normalize_responsibility_graph(graph)
+    script_targets = {
+        str(getattr(file_spec, "path", "") or "").strip()
+        for file_spec in files or []
+        if str(
+            getattr(file_spec, "path", "") or ""
+        ).strip().startswith("scripts/")
+    }
+    target_counts: dict[str, int] = {}
+    for item in graph.function_items:
+        path = str(item.target_file or "").strip()
+        if not path.startswith("scripts/"):
+            raise ResponsibilityGraphValidationError(
+                "ResponsibilityGraph FunctionItems must target scripts/** only.",
+                code="validator_incomplete",
+                details={"target_file": path},
+            )
+        if path not in script_targets:
+            raise ResponsibilityGraphValidationError(
+                "FunctionItem target_file must reference "
+                "an existing script FileSpec.",
+                code="validator_incomplete",
+                details={"target_file": path},
+            )
+        target_counts[path] = target_counts.get(path, 0) + 1
+    duplicates = sorted(path for path, count in target_counts.items() if count > 1)
+    if duplicates:
+        raise ResponsibilityGraphValidationError(
+            "Each script must map to exactly one FunctionItem.",
+            code="validator_incomplete",
+            details={"duplicates": duplicates},
+        )
+    _validate_responsibility_graph_edges(graph, files)
+    required_by_file: dict[str, list[FunctionItem]] = {}
+    for item in graph.function_items:
         if item.required:
             required_by_file.setdefault(item.target_file, []).append(item)
     for file_spec in files or []:
@@ -835,12 +870,25 @@ def validate_requirement_graph_schema(graph: RequirementGraph, files: list[Any])
         if not path.startswith("scripts/"):
             continue
         if _file_spec_has_substantive_responsibility(file_spec) and not required_by_file.get(path):
-            raise RequirementGraphValidationError(
+            raise ResponsibilityGraphValidationError(
                 f"Required script {path} has substantive responsibilities but no required requirement.",
                 code="validator_incomplete",
                 details={"path": path},
             )
     return graph
+
+
+# Temporary compatibility aliases. External/API wire keys and legacy imports still
+# use requirement_graph / requirements until a separate protocol migration.
+RequirementItem = FunctionItem
+RequirementGraph = ResponsibilityGraph
+RequirementGraphValidationError = ResponsibilityGraphValidationError
+requirement_item_prompt_payload = function_item_prompt_payload
+build_default_requirement_graph = build_default_responsibility_graph
+parse_requirement_graph_result = parse_responsibility_graph_result
+normalize_requirement_graph = normalize_responsibility_graph
+validate_requirement_graph_schema = validate_responsibility_graph_schema
+
 
 
 class FileSpecOut(BaseModel):
@@ -880,7 +928,7 @@ class FileSpecOut(BaseModel):
     reason: str = ""
     heuristic_signals: list[str] = Field(default_factory=list)
     asset_source: str = ""
-    requirements: list[RequirementItem] = Field(default_factory=list)
+    requirements: list[FunctionItem] = Field(default_factory=list)
 
 
 
@@ -942,7 +990,7 @@ class AnalyzeBlueprintResponse(BaseModel):
     missing_tool_configs: list[dict[str, Any]] = Field(default_factory=list)
     tool_requirements: list[dict[str, Any]] = Field(default_factory=list)
     creation_blockers: list[dict[str, Any]] = Field(default_factory=list)
-    requirement_graph: RequirementGraph = Field(default_factory=RequirementGraph)
+    requirement_graph: ResponsibilityGraph = Field(default_factory=ResponsibilityGraph)
 
     # 这是展示给用户确认的最终蓝图文本。
     # 注意：前端应该展示这个字段，而不是展示 LLM 第一次生成的原始蓝图。
@@ -2700,15 +2748,15 @@ def _complete_chat_once_sync_for_e2e(messages: list[dict[str, str]], model: str)
 __all__ = [name for name in globals() if not name.startswith("__")]
 
 
-def coerce_requirement_items(requirements: Any) -> list[RequirementItem]:
+def coerce_requirement_items(requirements: Any) -> list[FunctionItem]:
     """Best-effort requirement coercion shared by validator layers."""
-    items: list[RequirementItem] = []
+    items: list[FunctionItem] = []
     for raw in requirements or []:
         try:
-            if isinstance(raw, RequirementItem):
+            if isinstance(raw, FunctionItem):
                 items.append(raw)
             elif isinstance(raw, dict):
-                items.append(RequirementItem(**raw))
+                items.append(FunctionItem(**raw))
         except Exception:
             continue
     return items

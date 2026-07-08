@@ -2,6 +2,8 @@ import pytest
 
 from backend.services.creator.common import (
     FileSpecOut,
+    FunctionItem,
+    ResponsibilityGraph,
     RequirementGraphValidationError,
     build_default_requirement_graph,
     parse_requirement_graph_result,
@@ -33,6 +35,129 @@ def _script_spec(**kwargs):
     )
     data.update(kwargs)
     return FileSpecOut(**data)
+
+
+def _file_spec(path: str, **kwargs):
+    data = dict(
+        path=path,
+        purpose=f"Executable or supporting responsibility for {path}.",
+        required=True,
+        can_skip=False,
+        file_type="script" if path.startswith("scripts/") else "resource",
+        file_kind="script" if path.startswith("scripts/") else "reference",
+        inputs=["source input"],
+        outputs=["declared output"],
+        constraints=[{"name": f"constraint_{path.replace('/', '_')}", "kind": "constraint", "value": "preserve", "comparator": "describes"}],
+        required_capabilities=["declared_capability"],
+    )
+    if path.startswith("assets/"):
+        data["file_kind"] = "asset"
+    if path == "SKILL.md":
+        data["file_kind"] = "skill_overview"
+    data.update(kwargs)
+    return FileSpecOut(**data)
+
+
+def test_responsibility_graph_contains_script_function_items_only():
+    specs = [
+        _file_spec("SKILL.md"),
+        _file_spec("scripts/a.py"),
+        _file_spec("scripts/b.py"),
+        _file_spec("references/guide.md"),
+        _file_spec("assets/template.bin"),
+    ]
+
+    graph = build_default_requirement_graph(specs)
+
+    assert {item.target_file for item in graph.function_items} == {
+        "scripts/a.py",
+        "scripts/b.py",
+    }
+
+
+def test_reference_with_substantive_contract_never_becomes_function_item():
+    graph = build_default_requirement_graph([
+        _file_spec(
+            "references/guide.md",
+            purpose="Substantive supporting guide with declared output.",
+            inputs=["brief"],
+            outputs=["guide"],
+            constraints=[{"name": "guide_rule", "kind": "constraint", "value": "follow"}],
+            required_capabilities=["reference_authoring"],
+        ),
+        _file_spec("scripts/a.py"),
+    ])
+
+    assert [item.target_file for item in graph.function_items] == ["scripts/a.py"]
+
+
+def test_one_script_maps_to_exactly_one_function_item():
+    graph = validate_requirement_graph_schema(
+        build_default_requirement_graph([_file_spec("scripts/a.py")]),
+        [_file_spec("scripts/a.py")],
+    )
+
+    assert len(graph.function_items) == 1
+    assert graph.function_items[0].target_file == "scripts/a.py"
+
+
+def test_duplicate_function_item_target_is_validator_incomplete():
+    graph = ResponsibilityGraph(requirements=[
+        FunctionItem(target_file="scripts/a.py", purpose="first"),
+        FunctionItem(target_file="scripts/a.py", purpose="second"),
+    ])
+
+    with pytest.raises(RequirementGraphValidationError) as exc:
+        validate_requirement_graph_schema(graph, [_file_spec("scripts/a.py")])
+
+    assert exc.value.code == "validator_incomplete"
+
+
+def test_non_script_function_item_is_validator_incomplete():
+    graph = ResponsibilityGraph(requirements=[
+        FunctionItem(target_file="references/guide.md", purpose="cannot execute"),
+    ])
+
+    with pytest.raises(RequirementGraphValidationError) as exc:
+        validate_requirement_graph_schema(graph, [_file_spec("references/guide.md")])
+
+    assert exc.value.code == "validator_incomplete"
+
+
+def test_unknown_script_function_item_is_validator_incomplete():
+    graph = ResponsibilityGraph(requirements=[
+        FunctionItem(target_file="scripts/a.py", purpose="known script responsibility"),
+        FunctionItem(target_file="scripts/ghost.py", purpose="unknown script responsibility"),
+    ])
+
+    with pytest.raises(RequirementGraphValidationError) as exc:
+        validate_requirement_graph_schema(graph, [_file_spec("scripts/a.py")])
+
+    assert exc.value.code == "validator_incomplete"
+
+
+def test_script_constraints_project_to_function_item_but_reference_constraints_do_not():
+    graph = build_default_requirement_graph([
+        _file_spec("scripts/a.py", constraints=[{"name": "script_rule", "kind": "constraint", "value": "apply"}]),
+        _file_spec("references/guide.md", constraints=[{"name": "reference_rule", "kind": "constraint", "value": "resource"}]),
+    ])
+
+    assert [item.target_file for item in graph.function_items] == ["scripts/a.py"]
+    assert [constraint.name for constraint in graph.function_items[0].constraints] == ["script_rule"]
+
+
+def test_legacy_requirement_graph_wire_shape_still_round_trips():
+    payload = parse_requirement_graph_result({
+        "requirements": [
+            {"target_file": "scripts/a.py", "purpose": "execute action", "outputs": ["result"]}
+        ]
+    })
+
+    graph = normalize_requirement_graph(payload)
+
+    assert graph.requirements[0].target_file == "scripts/a.py"
+    assert graph.function_items[0].outputs == ["result"]
+    assert "function_items" not in graph.model_dump(mode="json")
 
 
 def test_requirement_graph_generates_and_attaches_to_file_plan():

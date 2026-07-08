@@ -4887,7 +4887,7 @@ async def _run_script_responsibility_review(
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
     req_payload = [
-        requirement_item_prompt_payload(item)
+        function_item_prompt_payload(item)
         for item in req_items
     ]
 
@@ -4900,15 +4900,16 @@ async def _run_script_responsibility_review(
                 "你只判断当前 scripts/** 源码是否覆盖自身负责的语义任务；也就是只判断当前脚本是否完成自身职责、是否完成 purpose 短合同表达的职责。"
                 "不要判断其它文件、workflow、字段名、审美或充分性细节；不要求固定字段名。\n\n"
 
-                "语义职责槽位参考：purpose、requirements、workflow_allocation_summary 只用于判断当前脚本自身职责是否完成。\n\n"
+                "语义职责槽位参考：purpose、requirements、workflow_allocation_summary 只用于判断当前脚本自身职责是否完成。\n"
+                "Judge checks whether the current script implements its FunctionItem. Reference files may only serve as dependency/resource evidence for the current FunctionItem; SKILL.md, references/**, and assets/** do not own executable workflow responsibilities.\n\n"
                 "核心原则（图谱式可观察边界）：\n"
-                "- 当前脚本的语义职责以 purpose、requirements.must_do、requirements.must_not_do 和 requirements.constraints 为准；inputs/outputs 只是接口提示。\n"
+                "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs/outputs 只是接口提示。\n"
                 "- requirements.constraints 是当前文件拥有的开放责任约束。\n"
                 "- 所有 required=true constraints 都必须检查实现证据。\n"
                 "- 根据完整 constraint object 理解约束语义。\n"
                 "- 不存在固定 constraint vocabulary。\n"
                 "- 不得忽略不认识的 constraint。\n"
-                "- 不得重新创造 RequirementItem 中不存在的 constraint。\n"
+                "- 不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
                 "- 只有 scripts/*.py 或平台真实 runtime 能力可以承担运行链路闭环；SKILL.md、references/*.md、assets/** 只能提供说明、规范或资源上下文，不能承担运行时字段转换或产物生成。\n"
                 "- 不写脚本类型词表，不按 role 名称、文件名、字段名或固定业务词表判责。\n"
                 "- 一个脚本只能被要求完成或验证它能从输入、依赖、工具和声明能力中实际完成/验证的职责。\n"
@@ -4990,12 +4991,12 @@ async def _run_script_responsibility_review(
                 f"{_numbered_source(script_content)[-16000:]}\n\n"
 
                 "审查要求：\n"
-                "1. 只判断当前脚本是否完成 purpose 短合同和 RequirementItem 中声明的当前文件责任。\n"
+                "1. 只判断当前脚本是否完成 purpose 短合同和 current script FunctionItem。\n"
                 "2. 不要判断其它非职责问题，不要按字段名/变量名/固定函数名/脚本类型词表判错。\n"
-                "3. 检查脚本是否保持自己可观察的输入关系，并交付当前 RequirementItem 要求的输出/产物。\n"
+                "3. 检查脚本是否保持自己可观察的输入关系，并交付 current script FunctionItem 要求的输出/产物。\n"
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息。\n"
                 "5. requirements.constraints 是开放责任约束；所有 required=true constraints 都必须检查实现证据。\n"
-                "6. 不得忽略不认识的 constraint，也不得重新创造 RequirementItem 中不存在的 constraint。\n"
+                "6. 不得忽略不认识的 constraint，也不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
                 "7. 工具/helper/custom_tools 绑定问题不属于职责审查阻断项；runtime_import_guard 已通过时，不得要求删除 runtime_tools helper（例如 read_docx_text）或声称 helper forbidden。\n"
             ),
         },

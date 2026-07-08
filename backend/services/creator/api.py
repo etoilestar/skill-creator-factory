@@ -17,7 +17,8 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..skill_plan import normalize_structured_responsibility_edges
+from ..skill_plan import normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
+
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
     save_tool_pool,
@@ -37,6 +38,12 @@ from .tool_pool_models import (
 from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
+
+
+class PreparePlanProtocolError(ValueError):
+    """Planner prepare-plan structured transport failed validation."""
+
+
 
 _NOT_SUPPORTED_MARKERS = (
     "not supported in current implementation",
@@ -6344,6 +6351,7 @@ async def _converge_ready_executable_plan(
     request: PreparePlanRequest,
     current_planner_result: dict[str, Any],
     planner_model: str,
+    draft_transport_error: str = "",
 ) -> dict[str, Any]:
     """Run one same-Planner revision over an already-ready executable plan.
 
@@ -6360,6 +6368,17 @@ async def _converge_ready_executable_plan(
             "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
             "draft_edge_count": len(draft_edges),
             "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges),
+        }, ensure_ascii=False, default=str),
+    )
+    logger.info(
+        "[Creator][planner_convergence][draft_transport] %s",
+        json.dumps({
+            "event": "creator_planner_convergence_draft_transport",
+            "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
+            "draft_edge_count": len(draft_edges),
+            "draft_transport_valid": not bool(draft_transport_error),
+            "draft_transport_error": draft_transport_error,
+            "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges) if not draft_transport_error else [],
         }, ensure_ascii=False, default=str),
     )
 
@@ -6384,6 +6403,69 @@ Do not reconsider tool availability.
 Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
 
 Your only task is to make the emitted executable plan internally consistent.
+
+ResponsibilityEdge transport schema is exact.
+
+Every responsibility_edges item must be a JSON object
+with exactly these transport fields:
+
+{
+  "from_node": "...",
+  "from_output": "...",
+  "to_node": "...",
+  "to_input": "...",
+  "purpose": "...",
+  "constraints": []
+}
+
+Allowed fields are only:
+
+- from_node
+- from_output
+- to_node
+- to_input
+- purpose
+- constraints
+
+Do not use aliases or alternate graph dialects.
+
+For example, do not use:
+
+- from
+- to
+- source
+- target
+- description
+
+Use purpose rather than description.
+
+Use from_node and to_node for graph endpoints.
+
+constraints must be a JSON array of objects.
+
+Use [] when there is no explicit cross-responsibility constraint.
+
+Use platform_io_contract as an exact immutable boundary contract.
+
+For every edge whose from_node is platform_input_node:
+
+from_output must be an actual platform input source slot
+listed by platform_io_contract.
+
+For every edge whose to_node is platform_output_node:
+
+to_input must be an actual platform final output terminal slot
+listed by platform_io_contract.
+
+A script-local semantic input name is not automatically
+a platform input source slot.
+
+Do not copy a script-local field name into from_output
+unless that exact platform slot exists.
+
+Revise the ResponsibilityEdge yourself.
+
+Creator backend will not infer the mapping.
 
 Replay the exact workflow, SkillPlan script responsibilities, and responsibility_edges in the current draft.
 Revise the draft itself before returning.
@@ -6428,6 +6510,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
     payload = {
         "task": "prepare_plan_convergence",
         "current_planner_result": current_planner_result,
+        "draft_transport_error": draft_transport_error,
         "platform_io_contract": platform_io_contract_prompt_text(),
         "confirmed_decision_context": {
             "conversation_history": request.conversation_history,
@@ -6509,7 +6592,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         )
     if str(data.get("status") or "") != "ready":
         raise ValueError("Planner convergence must return a complete ready plan")
-    normalized_edges = normalize_structured_responsibility_edges(
+    normalized_edges = validate_structured_responsibility_edge_transport(
         data.get("responsibility_edges"),
         source="planner",
     )
@@ -7442,44 +7525,74 @@ Blueprint Planner 只规划业务责任。
         None,
     )
 
-    if data.get("responsibility_edges") is None:
-        if str(data.get("status") or "") == "needs_clarification":
+    status = str(data.get("status") or "").strip()
+    normalized_ready_draft: dict[str, Any] | None = None
+    draft_edge_error: Exception | None = None
+
+    if status == "needs_clarification":
+        if data.get("responsibility_edges") is None:
             data["responsibility_edges"] = []
-        elif str(data.get("status") or "") == "ready":
-            raise ValueError("prepare-plan ready response must include structured responsibility_edges")
-    else:
         normalized_edges = normalize_structured_responsibility_edges(
             data.get("responsibility_edges"),
             source="planner",
         )
         data["responsibility_edges"] = normalized_edges
-        logger.info(
-            "[Creator][responsibility_edges][planner_result] %s",
-            json.dumps({
-                "event": "creator_responsibility_edges_planner_result",
-                "skill_name": str(data.get("skill_name") or request.skill_name or ""),
-                "edge_count": len(normalized_edges),
-                "endpoint_pairs": [
-                    [edge.get("from_node"), edge.get("to_node")]
-                    for edge in normalized_edges
-                ],
-                "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
-            }, ensure_ascii=False, default=str),
-        )
+    elif status == "ready":
+        try:
+            normalized_edges = validate_structured_responsibility_edge_transport(
+                data.get("responsibility_edges"),
+                source="planner",
+            )
+            normalized_ready_draft = dict(data)
+            normalized_ready_draft["responsibility_edges"] = normalized_edges
+            logger.info(
+                "[Creator][responsibility_edges][planner_result] %s",
+                json.dumps({
+                    "event": "creator_responsibility_edges_planner_result",
+                    "skill_name": str(data.get("skill_name") or request.skill_name or ""),
+                    "edge_count": len(normalized_edges),
+                    "endpoint_pairs": [
+                        [edge.get("from_node"), edge.get("to_node")]
+                        for edge in normalized_edges
+                    ],
+                    "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
+                }, ensure_ascii=False, default=str),
+            )
+        except Exception as exc:
+            draft_edge_error = exc
 
-    if str(data.get("status") or "") == "ready":
+        convergence_input = (
+            normalized_ready_draft
+            if normalized_ready_draft is not None
+            else data
+        )
         try:
             data = await _converge_ready_executable_plan(
                 request=request,
-                current_planner_result=data,
+                current_planner_result=convergence_input,
                 planner_model=route.model,
+                draft_transport_error=(
+                    str(draft_edge_error)
+                    if draft_edge_error is not None
+                    else ""
+                ),
             )
         except Exception as exc:
-            logger.warning(
-                "[Creator][planner_convergence_failed] skill=%s error=%s",
-                str(data.get("skill_name") or request.skill_name or ""),
-                f"{type(exc).__name__}: {exc}",
-            )
+            if normalized_ready_draft is not None:
+                data = normalized_ready_draft
+                logger.warning(
+                    "[Creator][planner_convergence_failed] skill=%s error=%s",
+                    str(data.get("skill_name") or request.skill_name or ""),
+                    f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                raise PreparePlanProtocolError(
+                    "Planner ready responsibility_edges were invalid and "
+                    "same-Planner convergence did not produce a valid "
+                    "canonical plan; "
+                    f"draft_error={draft_edge_error}; "
+                    f"convergence_error={exc}"
+                ) from exc
 
     return data
 
@@ -8760,6 +8873,23 @@ async def prepare_plan(
                 await _generate_internal_blueprint_or_questions(
                     request
                 )
+            )
+
+        except PreparePlanProtocolError as exc:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=PreparePlanReviewSummary(),
+                blueprint_text=previous_blueprint_text,
+                skill_name=skill_name,
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        "planner_structured_graph_protocol_failed",
+                        str(exc),
+                        field="responsibility_edges",
+                    )
+                ],
             )
 
         except Exception as exc:

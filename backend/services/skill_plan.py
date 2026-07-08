@@ -15,6 +15,7 @@ import re
 from typing import Literal
 from .creator_tool_registry import get_role_pattern, get_script_roles, get_tool_capability, is_resource_role, is_script_role
 from .skill_dataflow import parse_schema_input_item
+from .platform_io_contract import build_platform_io_contract
 
 
 FileKind = Literal["script", "skill_doc", "reference", "asset", "config"]
@@ -356,6 +357,92 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
     if invalid:
         raise ValueError(f"{source}.responsibility_edges contains invalid edge items: {invalid}")
     return normalized
+
+
+def validate_structured_responsibility_edge_transport(
+    raw_edges: object,
+    *,
+    source: str = "planner",
+) -> list[dict[str, object]]:
+    """Validate canonical ResponsibilityEdge transport and platform boundary.
+
+    This helper intentionally validates only Creator-owned transport protocol:
+    exact structured edge shape plus immutable platform boundary slots and
+    direction. It does not validate script-local semantic IO or infer mappings.
+    """
+    if raw_edges is None:
+        raise ValueError(
+            f"{source}.responsibility_edges must not be null"
+        )
+
+    normalized_edges = normalize_structured_responsibility_edges(
+        raw_edges,
+        source=source,
+    )
+
+    contract = build_platform_io_contract()
+    boundary = (
+        contract.get("platform_skill_boundary")
+        if isinstance(contract, dict)
+        else {}
+    )
+    if not isinstance(boundary, dict):
+        boundary = {}
+
+    input_fields = {
+        str(value)
+        for value in (
+            boundary.get("input_envelope_fields")
+            or []
+        )
+        if str(value or "").strip()
+    }
+    output_fields = {
+        str(value)
+        for value in (
+            boundary.get("final_output_fields")
+            or []
+        )
+        if str(value or "").strip()
+    }
+
+    for index, edge in enumerate(normalized_edges):
+        from_node = str(edge.get("from_node") or "")
+        from_output = str(edge.get("from_output") or "")
+        to_node = str(edge.get("to_node") or "")
+        to_input = str(edge.get("to_input") or "")
+
+        if from_node == "platform_output_node":
+            raise ValueError(
+                f"{source}.responsibility_edges uses platform_output_node "
+                "as an edge source; "
+                f"index={index}"
+            )
+
+        if to_node == "platform_input_node":
+            raise ValueError(
+                f"{source}.responsibility_edges uses platform_input_node "
+                "as an edge target; "
+                f"index={index}"
+            )
+
+        if from_node == "platform_input_node" and from_output not in input_fields:
+            raise ValueError(
+                f"{source}.responsibility_edges references undefined "
+                "platform input field; "
+                f"index={index}; "
+                f"from_output={from_output}"
+            )
+
+        if to_node == "platform_output_node" and to_input not in output_fields:
+            raise ValueError(
+                f"{source}.responsibility_edges references undefined "
+                "platform output field; "
+                f"index={index}; "
+                f"to_input={to_input}"
+            )
+
+    return normalized_edges
 
 
 def parse_responsibility_edges(blueprint_text: str) -> list[dict[str, object]]:

@@ -623,3 +623,97 @@ async def test_planner_requires_responsibility_edges_and_graph_replay(monkeypatc
         "platform_output_node",
     ]:
         assert term in prompt
+
+
+def test_planner_structured_responsibility_edges_are_skillplan_source_of_truth():
+    from backend.services.blueprint_parser import build_skill_plan_from_files, FileSpec
+    text = 'ResponsibilityEdges: [{"from_node":"scripts/wrong.py","from_output":"x","to_node":"scripts/other.py","to_input":"y","purpose":"wrong","constraints":[]}]'
+    edge = {"from_node":"platform_input_node","from_output":"input","to_node":"scripts/a.py","to_input":"source","purpose":"structured","constraints":[]}
+    plan = build_skill_plan_from_files(skill_name='demo', files=[FileSpec(path='scripts/a.py', purpose='Process input', required=True)], blueprint_text=text, responsibility_edges=[edge])
+    assert plan.responsibility_edges == [edge]
+
+
+def test_legacy_blueprint_edge_parser_is_fallback_only():
+    from backend.services.blueprint_parser import build_skill_plan_from_files, FileSpec
+    text = 'ResponsibilityEdges: [{"from_node":"platform_input_node","from_output":"input","to_node":"scripts/a.py","to_input":"source","purpose":"legacy","constraints":[]}]'
+    structured = {"from_node":"scripts/a.py","from_output":"result","to_node":"platform_output_node","to_input":"final_output","purpose":"structured","constraints":[]}
+    plan = build_skill_plan_from_files(skill_name='demo', files=[FileSpec(path='scripts/a.py', purpose='Process input', required=True)], blueprint_text=text, responsibility_edges=[structured])
+    assert plan.responsibility_edges == [structured]
+    fallback = build_skill_plan_from_files(skill_name='demo', files=[FileSpec(path='scripts/a.py', purpose='Process input', required=True)], blueprint_text=text)
+    assert fallback.responsibility_edges and fallback.responsibility_edges[0]['purpose'] == 'legacy'
+
+
+def test_planner_replay_distinguishes_local_intermediate_from_cross_function_input():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    assert 'local intermediate is not a cross-FunctionItem input' in source
+    assert 'FunctionItem' in source and 'ResponsibilityEdge' in source
+
+
+def test_planner_replay_requires_function_item_and_edge_result_convergence():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    assert 'outgoing ResponsibilityEdge' in source
+    assert 'source FunctionItem actually owns and produces' in source
+    assert 'revise the FunctionItem or the edge before returning ready' in source
+
+
+def test_planner_receives_read_only_platform_io_contract_for_graph_edges():
+    import inspect
+    from backend.services.creator import api
+    from backend.services.platform_io_contract import platform_io_contract_prompt_text
+    source = inspect.getsource(api._generate_internal_blueprint_or_questions)
+    assert 'platform_io_contract_prompt_text()' in source
+    assert 'read-only platform boundary contract' in source
+    assert platform_io_contract_prompt_text().splitlines()[0]
+
+
+def test_arbitrary_edge_constraint_survives_structured_planner_transport():
+    from backend.services.blueprint_parser import build_skill_plan_from_files, FileSpec
+    from backend.services.creator.common import build_default_requirement_graph, function_item_graph_context
+    constraint = {"name":"alpha","kind":"completely_custom","value":{"foo":7,"bar":["x","y"]},"comparator":"describes","required":True}
+    edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"scripts/b.py","to_input":"beta","purpose":"handoff","constraints":[constraint]}
+    files=[FileSpec(path='scripts/a.py', purpose='Produce alpha', required=True), FileSpec(path='scripts/b.py', purpose='Consume beta', required=True)]
+    plan = build_skill_plan_from_files(skill_name='demo', files=files, responsibility_edges=[edge])
+    graph = build_default_requirement_graph(plan.files, responsibility_edges=plan.responsibility_edges)
+    ctx = function_item_graph_context(graph, 'scripts/b.py')
+    assert ctx['incoming_edges'][0]['constraints'][0]['value'] == {"foo":7,"bar":["x","y"]}
+
+
+def test_final_tool_selector_receives_responsibility_graph():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._plan_final_tool_pool)
+    assert 'normalized_script_contracts' in source
+    assert 'responsibility_graph' in source
+    assert 'candidate_tool_catalog' in source
+    assert 'blueprint_text' not in source
+
+
+def test_final_tool_selector_replays_selected_tools_against_function_items_and_edges():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._plan_final_tool_pool)
+    for text in ['FunctionItem','incoming ResponsibilityEdges','outgoing ResponsibilityEdges','callable means','replay','revise decisions']:
+        assert text in source
+    for forbidden in ['image','PDF','story']:
+        assert forbidden not in source
+
+
+def test_purpose_short_contract_requires_exact_existing_target_path():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._normalize_script_purpose_short_contracts)
+    assert 'target_file must be copied exactly from one provided script path' in source
+    assert 'scripts/x.py' not in source
+
+
+def test_purpose_short_contract_is_semantic_preserving_compression_only():
+    import inspect
+    from backend.services.creator import api
+    source = inspect.getsource(api._normalize_script_purpose_short_contracts)
+    assert 'must not remove a core action' in source
+    assert 'must not change incoming/outgoing ResponsibilityEdge obligations' in source
+    assert 'must not change required capability ownership' in source

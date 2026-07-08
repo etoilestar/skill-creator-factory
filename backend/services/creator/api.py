@@ -17,6 +17,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
+from ..skill_plan import normalize_structured_responsibility_edges
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
     save_tool_pool,
@@ -3120,7 +3121,8 @@ async def _plan_final_tool_pool(
     *,
     skill_name: str,
     file_specs: list[dict[str, Any]],
-    requested_model: str | None,
+    responsibility_graph: dict[str, Any] | None = None,
+    requested_model: str | None = None,
 ) -> dict[str, Any]:
     """Select the final Skill-wide ToolPool from Plan capability recall.
 
@@ -3417,7 +3419,7 @@ async def _plan_final_tool_pool(
 ToolPool 是当前 Skill 允许代码生成模型优先使用的真实工具候选池 / 白名单。
 加入 ToolPool 只表示该工具可用、推荐候选；不表示任何 scripts/*.py 必须调用该工具。
 
-Plan 和 script_contracts 提供任务责任与能力线索，但不是封闭的工具使用清单。
+normalized script contracts and ResponsibilityGraph provide the connected executable responsibility context. Full Blueprint text is intentionally unavailable.
 
 candidate_tool_catalog 已经是 embedding/exact recall 得到的有限候选；不要重新搜索完整 Registry。
 
@@ -3434,7 +3436,8 @@ candidate_tool_catalog 已经是 embedding/exact recall 得到的有限候选；
 - tool function artifact_outputs。
 - tool function side_effects。
 - tool/function required_capabilities。
-- script purpose / inputs / outputs / required_capabilities / artifact_contract。
+- normalized script contracts: purpose / inputs / outputs / required_capabilities / artifact_contract。
+- ResponsibilityGraph FunctionItem context, incoming ResponsibilityEdges, and outgoing ResponsibilityEdges。
 
 true：
 该工具的真实 function contract 与任一 script 的真实责任具有合理直接相关性，可能帮助该 script 完成当前责任。即使 Plan.required_capabilities 没有逐字声明该工具对应 capability，也可以设为 true。
@@ -3451,6 +3454,20 @@ false：
 - 不要生成代码。
 - 不要输出解释、reason、tool card 或代码。
 
+## executable tool replay
+
+Before outputting decisions:
+1. Read every FunctionItem.
+2. Read its incoming ResponsibilityEdges and outgoing ResponsibilityEdges.
+3. Understand the actual owned actions and results the FunctionItem must be capable of implementing.
+4. Inspect the real callable function contracts of bounded candidate tools.
+5. Select candidate tools that may directly help implement those owned actions.
+6. After drafting decisions, replay every FunctionItem through the connected ResponsibilityGraph.
+7. Ask whether any FunctionItem would lose all reasonable callable means for an explicit owned action or outgoing result that requires an external/platform tool capability. Judge reasonable callable means from the FunctionItem, edge obligations, tool function contracts, and deterministic stdlib implementation possibility.
+8. If yes, revise decisions before returning.
+
+ToolPool is optional candidate pool / whitelist. selected=true does not force a script to call the tool. Tool availability does not grant responsibility ownership.
+
 响应由 JSON Schema 强制。
 只填写 boolean decisions。
 """.strip()
@@ -3463,8 +3480,12 @@ false：
 
             "skill_name": skill_name,
 
-            "script_contracts": (
+            "normalized_script_contracts": (
                 script_contracts
+            ),
+
+            "responsibility_graph": (
+                responsibility_graph or {}
             ),
 
             "current_allowed_tool_ids": (
@@ -3817,6 +3838,22 @@ false：
             ensure_ascii=False,
             default=str,
         ),
+    )
+
+    graph_edges_for_log = []
+    graph_items_for_log = []
+    if isinstance(responsibility_graph, dict):
+        graph_edges_for_log = list(responsibility_graph.get("dataflow_edges") or [])
+        graph_items_for_log = list(responsibility_graph.get("requirements") or responsibility_graph.get("items") or [])
+    logger.info(
+        "[Creator][final_tool_selection][graph_replay] %s",
+        json.dumps({
+            "event": "creator_final_tool_selection_graph_replay",
+            "function_item_count": len(graph_items_for_log),
+            "edge_count": len(graph_edges_for_log),
+            "selected_tool_ids": sorted(desired_tool_ids),
+            "candidate_tool_ids": ordered_candidate_tool_ids,
+        }, ensure_ascii=False, default=str),
     )
 
     return {
@@ -4492,6 +4529,7 @@ class PreparePlanRequest(BaseModel):
     human_feedback: str = ""
     prepare_action: Literal["none", "confirm", "request_supplement", "submit_supplement"] = "none"
     model: str | None = None
+    responsibility_edges: list[dict[str, Any]] | None = None
 
 
 class PreparePlanReviewSummary(BaseModel):
@@ -4536,6 +4574,7 @@ class PreparePlanResponse(BaseModel):
 
     blueprint_text: str = ""
     skill_name: str = ""
+    responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
 
     files: list[FileSpecOut] = Field(
         default_factory=list
@@ -6227,7 +6266,9 @@ async def _generate_internal_blueprint_or_questions(
 3. 信息足够时生成 provisional internal_blueprint_text；
 4. 在 provisional blueprint 中确定合理的 script topology 和文件职责边界。
 
-internal_blueprint_text 是完整业务蓝图事实源。
+internal_blueprint_text is display/review text. The shared executable plan source of truth is the same structured response: SkillPlan FunctionItems in internal_blueprint_text plus top-level responsibility_edges.
+
+Top-level responsibility_edges is Creator-owned graph transport and must be emitted as structured JSON, not recovered from internal_blueprint_text.
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。
@@ -6425,15 +6466,24 @@ SKILL.md, references/**, and assets/** are not ResponsibilityGraph nodes.
 References and assets may be used by scripts, but cannot become FunctionItems
 and cannot become ResponsibilityEdge endpoints.
 
-Ready Blueprint must include a top-level ResponsibilityEdges field.
-ResponsibilityEdges must be a single-line valid JSON array.
+Ready Planner JSON must include a top-level responsibility_edges field.
+When status=ready, responsibility_edges must be a JSON array of objects.
+When status=needs_clarification, responsibility_edges must be [].
+internal_blueprint_text may also display a ### ResponsibilityEdges section for human review, but that display text is not the graph transport source of truth.
 Each edge may contain only from_node, from_output, to_node, to_input, purpose, and constraints.
 Do not add semantic fields such as cardinality, granularity, source_granularity, target_granularity, mechanism, iteration, aggregation, correspondence, ordering, single, collection, or per_item.
 If those ideas affect workflow correctness, express them as model-owned objects inside edge.constraints.
 constraints is a JSON array of objects. Legal empty constraints: []. Illegal: constraints: ["..."].
 Example constraint object: {"name":"custom_requirement","kind":"workflow_requirement","value":"arbitrary model-owned semantic requirement","comparator":"describes","required":true}.
 
-ResponsibilityEdges: [{"from_node":"platform_input_node","from_output":"semantic input name","to_node":"scripts/a.py","to_input":"semantic input name","purpose":"Describe why this result is transported to the downstream responsibility.","constraints":[]},{"from_node":"scripts/a.py","from_output":"semantic result name","to_node":"scripts/b.py","to_input":"semantic input name","purpose":"Describe the cross-responsibility handoff.","constraints":[]}]
+Top-level responsibility_edges: [{"from_node":"platform_input_node","from_output":"semantic input name","to_node":"scripts/a.py","to_input":"semantic input name","purpose":"Describe why this result is transported to the downstream responsibility.","constraints":[]},{"from_node":"scripts/a.py","from_output":"semantic result name","to_node":"scripts/b.py","to_input":"semantic input name","purpose":"Describe the cross-responsibility handoff.","constraints":[]}]
+
+## read-only platform boundary contract
+
+Use the provided platform_io_contract as read-only planning context.
+platform_input_node.from_output must use an existing platform input slot from that contract.
+platform_output_node.to_input must use an existing platform output slot from that contract.
+For script → script edges, exact semantic field-name matching is not required.
 
 ## responsibility graph replay
 
@@ -6712,6 +6762,30 @@ workflow 最终交付描述和 SkillPlan script outputs
 
 不得依赖后续 global contract 或 E2E 猜测补齐。
 
+## final executable-plan convergence
+
+Before returning status=ready, replay the exact FunctionItems and ResponsibilityEdges that will be emitted in the current response.
+Do not replay an imagined workflow that differs from the emitted plan.
+For each FunctionItem check:
+1. What core actions does this FunctionItem actually own?
+2. Do required_capabilities describe these actual owned actions?
+3. Are declared semantic inputs truly results crossing a responsibility boundary into this script?
+4. A semantic value produced and consumed entirely inside one FunctionItem is a local intermediate. A local intermediate is not a cross-FunctionItem input and does not require a ResponsibilityEdge. Do not declare a local intermediate as an external FunctionItem input unless another graph node actually provides it.
+5. What cross-boundary results does this FunctionItem actually produce?
+6. Does every outgoing ResponsibilityEdge.from_output describe a result the source FunctionItem actually owns and produces?
+7. Does every incoming ResponsibilityEdge provide an upstream result needed by the target FunctionItem responsibility?
+8. Does each workflow requirement affecting cross-responsibility correctness appear in relevant ResponsibilityEdge.constraints?
+9. Does each workflow requirement affecting only one script appear in the owning FunctionItem.constraints?
+10. Does every final result reach platform_output_node along ResponsibilityEdges?
+
+For every declared FunctionItem semantic input, either it is provided by an incoming ResponsibilityEdge, or it is a local/default/config/resource concern explicitly handled inside the FunctionItem contract. Do not invent an upstream business result that has no producer. Static resource use continues through dependencies, references, or assets, not ResponsibilityEdge nodes.
+
+An outgoing ResponsibilityEdge must transport a semantic result that the source FunctionItem actually owns and produces.
+An incoming ResponsibilityEdge must transport a result that the target FunctionItem actually consumes in its owned responsibility.
+If graph replay discovers that an edge requires a different result than the current FunctionItem contract declares, revise the FunctionItem or the edge before returning ready.
+Do not leave the mismatch for downstream Creator normalization.
+This is semantic self-consistency, not a Python field gate; judge same semantic result, same owned action, same executable plan.
+
 ## ready consistency self-check
 
 返回 status=ready 前，
@@ -6769,7 +6843,8 @@ E. final delivery closure
   },
   "internal_blueprint_text": "status=ready 时填写 provisional Skill 架构蓝图",
   "skill_name": "可选",
-  "blockers": []
+  "blockers": [],
+  "responsibility_edges": []
 }
 
 ## confirmed decision preservation
@@ -7014,6 +7089,8 @@ Blueprint Planner 只规划业务责任。
                 request
             )
         ),
+
+        "platform_io_contract": platform_io_contract_prompt_text(),
     }
 
     route = route_model(
@@ -7061,6 +7138,29 @@ Blueprint Planner 只规划业务责任。
         "required_tool_slots",
         None,
     )
+
+    if data.get("responsibility_edges") is None:
+        if str(data.get("status") or "") == "needs_clarification":
+            data["responsibility_edges"] = []
+    else:
+        normalized_edges = normalize_structured_responsibility_edges(
+            data.get("responsibility_edges"),
+            source="planner",
+        )
+        data["responsibility_edges"] = normalized_edges
+        logger.info(
+            "[Creator][responsibility_edges][planner_result] %s",
+            json.dumps({
+                "event": "creator_responsibility_edges_planner_result",
+                "skill_name": str(data.get("skill_name") or request.skill_name or ""),
+                "edge_count": len(normalized_edges),
+                "endpoint_pairs": [
+                    [edge.get("from_node"), edge.get("to_node")]
+                    for edge in normalized_edges
+                ],
+                "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
+            }, ensure_ascii=False, default=str),
+        )
 
     return data
 
@@ -8016,6 +8116,7 @@ async def _normalize_script_purpose_short_contracts(
     blueprint_text: str,
     files_out: list[FileSpecOut],
     workflow_allocation_summary: str = "",
+    responsibility_edges: list[dict[str, Any]] | None = None,
     skip_targets: set[str] | None = None,
     requested_model: str | None = None,
     warnings: list[dict[str, Any]] | None = None,
@@ -8033,6 +8134,21 @@ async def _normalize_script_purpose_short_contracts(
     ]
     if not targets:
         return
+    edge_contexts = {
+        item.path: {
+            "FunctionItem": {
+                "path": item.path,
+                "purpose": item.purpose,
+                "inputs": item.inputs,
+                "outputs": item.outputs,
+                "required_capabilities": item.required_capabilities,
+                "constraints": item.constraints,
+            },
+            "incoming ResponsibilityEdges": [edge for edge in (responsibility_edges or []) if str(edge.get("to_node") or "") == item.path],
+            "outgoing ResponsibilityEdges": [edge for edge in (responsibility_edges or []) if str(edge.get("from_node") or "") == item.path],
+        }
+        for item in targets
+    }
     logger.info("[Creator][purpose_short_contract][start] %s", json.dumps({
         "event": "purpose_short_contract_start",
         "targets": [item.path for item in targets],
@@ -8044,11 +8160,12 @@ async def _normalize_script_purpose_short_contracts(
             "为每个 required script 生成简短 purpose；不要新增结构字段，不复制蓝图长文。\n"
             "格式必须是：来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\n"
             "来源/动作/交付/约束要来自蓝图语义；inputs/outputs 只是接口提示。\n"
-            "必须同时读取 workflow_allocation_summary：如果其中已表达完整交付、批量处理、聚合交付、顺序映射、结构映射或集合边界要求，normalizer 不得把 purpose 重新压窄为单项局部职责。"
+            "This phase compresses wording only. It must not add a core action; must not remove a core action; must not replace an owned action with consumption of an already-produced result; must not change required capability ownership; must not change incoming/outgoing ResponsibilityEdge obligations; must not change FunctionItem constraints; must not move responsibility to another script. target_file must be copied exactly from one provided script path. Do not invent, abbreviate, normalize, or replace the path. Unknown targets are ignored by exact match only; no fuzzy match."
         )},
         {"role": "user", "content": (
             "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
             "workflow_allocation_summary:\n" + (workflow_allocation_summary or "")[:6000] + "\n\n"
+            "compact_context_by_target:\n" + json.dumps(edge_contexts, ensure_ascii=False, default=str)[:16000] + "\n\n"
             "scripts:\n" + json.dumps([
                 {
                     "path": item.path,
@@ -8060,7 +8177,7 @@ async def _normalize_script_purpose_short_contracts(
                 }
                 for item in targets
             ], ensure_ascii=False, default=str)[:16000] + "\n\n"
-            "返回：{\"patches\":[{\"target_file\":\"scripts/x.py\",\"purpose\":\"来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\"}]}"
+            "返回 JSON object：{\"patches\":[{\"target_file\":\"<copy one exact provided script path>\",\"purpose\":\"来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\"}]}"
         )},
     ]
     try:
@@ -8199,6 +8316,15 @@ async def prepare_plan(
             skill_name=(
                 current_skill_name
             ),
+
+            responsibility_edges=(
+                normalize_structured_responsibility_edges(
+                    (current_prepared or {}).get("responsibility_edges"),
+                    source="planner",
+                )
+                if isinstance(current_prepared, dict) and current_prepared.get("responsibility_edges") is not None
+                else []
+            ),
         )
 
     if (
@@ -8287,6 +8413,12 @@ async def prepare_plan(
             ),
 
             "skill_name": skill_name,
+
+            "responsibility_edges": (
+                request.responsibility_edges
+                if request.responsibility_edges is not None
+                else None
+            ),
         }
 
         blueprint_text = (
@@ -8789,6 +8921,12 @@ async def prepare_plan(
 
                     strict=True,
 
+                    responsibility_edges=(
+                        prepared.get("responsibility_edges")
+                        if isinstance(prepared, dict)
+                        else None
+                    ),
+
                     # Confirmed full blueprint is frozen.
                     refine_contract=False,
 
@@ -9138,6 +9276,10 @@ async def prepare_plan(
                 file_specs_payload
             ),
 
+            responsibility_graph=(
+                graph_payload
+            ),
+
             requested_model=(
                 request.model
             ),
@@ -9416,6 +9558,12 @@ async def prepare_plan(
 
         skill_name=plan.skill_name,
 
+        responsibility_edges=(
+            list(getattr(plan, "responsibility_edges", []) or [])
+            if hasattr(plan, "responsibility_edges")
+            else []
+        ),
+
         files=plan.files,
 
         warnings=[
@@ -9477,7 +9625,7 @@ async def prepare_plan(
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     try:
-        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict)
+        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict, responsibility_edges=request.responsibility_edges)
     except BlueprintShapeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -9689,6 +9837,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         blueprint_text=blueprint_text,
         files_out=files_out,
         workflow_allocation_summary=workflow_allocation_summary,
+        responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
         skip_targets=allocation_patched_targets,
         requested_model=request.model,
         warnings=warnings,
@@ -9735,7 +9884,9 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         ),
     })
+    structured_planner_edges = list(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else [])
     fallback_requirement_graph = build_default_requirement_graph(files_out)
+    graph_fallback_used = False
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
             blueprint_text=blueprint_text,
@@ -9746,6 +9897,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
         )
     except RequirementGraphValidationError as exc:
+        graph_fallback_used = True
         requirement_graph = validate_requirement_graph_schema(fallback_requirement_graph, files_out)
         warnings.append({
             "severity": "validator_warning",
@@ -9756,6 +9908,34 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             "message": f"Responsibility graph patch failed; using deterministic graph: {exc}",
         })
     requirements_by_file: dict[str, list[RequirementItem]] = {}
+    edge_list_for_log = list(getattr(requirement_graph, "dataflow_edges", []) or [])
+    logger.info(
+        "[Creator][responsibility_graph][resolved] %s",
+        json.dumps({
+            "event": "creator_responsibility_graph_resolved",
+            "function_item_count": len(getattr(requirement_graph, "function_items", []) or []),
+            "edge_count": len(edge_list_for_log),
+            "fallback_used": graph_fallback_used,
+            "incoming_edge_count_by_script": {
+                item.target_file: sum(1 for edge in edge_list_for_log if str(edge.get("to_node") or "") == item.target_file)
+                for item in getattr(requirement_graph, "function_items", []) or []
+            },
+            "outgoing_edge_count_by_script": {
+                item.target_file: sum(1 for edge in edge_list_for_log if str(edge.get("from_node") or "") == item.target_file)
+                for item in getattr(requirement_graph, "function_items", []) or []
+            },
+        }, ensure_ascii=False, default=str),
+    )
+    logger.info(
+        "[Creator][responsibility_graph_transport] %s",
+        json.dumps({
+            "event": "creator_responsibility_graph_transport",
+            "planner_edge_count": len(structured_planner_edges),
+            "normalized_edge_count": len(structured_planner_edges),
+            "graph_edge_count": len(edge_list_for_log),
+            "graph_fallback_used": graph_fallback_used,
+        }, ensure_ascii=False, default=str),
+    )
     for req in requirement_graph.requirements:
         requirements_by_file.setdefault(req.target_file, []).append(req)
     for file_spec in files_out:
@@ -9847,6 +10027,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         tool_requirements=tool_requirements,
         creation_blockers=creation_blockers,
         requirement_graph=requirement_graph,
+        responsibility_edges=list(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
         blueprint_text=blueprint_text,
         blueprint_refined=False,
     )

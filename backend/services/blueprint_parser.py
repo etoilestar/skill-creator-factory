@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings, parse_responsibility_edges
+from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings, parse_responsibility_edges, normalize_structured_responsibility_edges
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -1336,6 +1336,7 @@ def build_skill_plan_from_files(
     files: list[FileSpec],
     warnings: list[str] | None = None,
     blueprint_text: str = "",
+    responsibility_edges: object = None,
 ) -> SkillPlan:
     """Build the role/contract plan used by Creator generation and validation.
 
@@ -1417,7 +1418,13 @@ def build_skill_plan_from_files(
                 "不会自动启用图片生成/PDF 生成等高影响能力。"
             )
 
-    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, responsibility_edges=parse_responsibility_edges(blueprint_text)))
+    structured_edges_present = responsibility_edges is not None
+    edges = (
+        normalize_structured_responsibility_edges(responsibility_edges, source="planner")
+        if structured_edges_present
+        else parse_responsibility_edges(blueprint_text)
+    )
+    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, responsibility_edges=edges))
     semantic_issues = validate_file_plan_semantics(normalized)
     # SkillPlan static I/O consumption is an internal workflow dataflow hint, not
     # a blueprint-stage user-visible warning.  First-round Creator validation
@@ -1430,6 +1437,7 @@ def parse_blueprint(
     messages: list[dict],
     *,
     strict: bool = False,
+    responsibility_edges: object = None,
 ) -> BlueprintPlan:
     """Parse a Skill blueprint from conversation history.
 
@@ -1579,6 +1587,7 @@ def parse_blueprint(
             blueprint_text=(
                 blueprint_text
             ),
+            responsibility_edges=responsibility_edges,
         )
     )
 

@@ -308,6 +308,56 @@ class SkillPlan:
 
 
 
+_ALLOWED_RESPONSIBILITY_EDGE_FIELDS = {"from_node", "from_output", "to_node", "to_input", "purpose", "constraints"}
+
+
+def normalize_structured_responsibility_edges(raw_edges: object, *, source: str = "planner") -> list[dict[str, object]]:
+    """Normalize structured planner ResponsibilityEdges without semantic repair.
+
+    This path is used for Creator-owned transport of the planner JSON field.
+    Non-empty invalid payloads are protocol errors instead of silently becoming
+    an empty graph. Legacy markdown parsing remains best-effort separately.
+    """
+    if raw_edges is None:
+        return []
+    if not isinstance(raw_edges, list):
+        raise ValueError(f"{source}.responsibility_edges must be a list")
+    normalized: list[dict[str, object]] = []
+    invalid: list[dict[str, object]] = []
+    for index, item in enumerate(raw_edges):
+        if not isinstance(item, dict):
+            invalid.append({"index": index, "type": type(item).__name__})
+            continue
+        unknown = sorted(str(key) for key in item.keys() if key not in _ALLOWED_RESPONSIBILITY_EDGE_FIELDS)
+        if unknown:
+            invalid.append({"index": index, "unknown_fields": unknown})
+            continue
+        edge = {key: item.get(key) for key in _ALLOWED_RESPONSIBILITY_EDGE_FIELDS if key in item}
+        missing_required = [key for key in ("from_node", "from_output", "to_node", "to_input", "purpose", "constraints") if key not in edge]
+        if missing_required:
+            invalid.append({"index": index, "missing_fields": missing_required})
+            continue
+        empty_endpoint_fields = [
+            key
+            for key in ("from_node", "from_output", "to_node", "to_input")
+            if not str(edge.get(key) or "").strip()
+        ]
+        if empty_endpoint_fields:
+            invalid.append({"index": index, "empty_endpoint_fields": empty_endpoint_fields})
+            continue
+        constraints = edge.get("constraints", [])
+        if constraints is None:
+            constraints = []
+        if not isinstance(constraints, list) or not all(isinstance(c, dict) for c in constraints):
+            invalid.append({"index": index, "field": "constraints"})
+            continue
+        edge["constraints"] = [dict(c) for c in constraints]
+        normalized.append(edge)
+    if invalid:
+        raise ValueError(f"{source}.responsibility_edges contains invalid edge items: {invalid}")
+    return normalized
+
+
 def parse_responsibility_edges(blueprint_text: str) -> list[dict[str, object]]:
     """Parse top-level ResponsibilityEdges as model-owned graph data.
 
@@ -327,7 +377,7 @@ def parse_responsibility_edges(blueprint_text: str) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     edges: list[dict[str, object]] = []
-    allowed = {"from_node", "from_output", "to_node", "to_input", "purpose", "constraints"}
+    allowed = _ALLOWED_RESPONSIBILITY_EDGE_FIELDS
     for item in value:
         if not isinstance(item, dict):
             continue

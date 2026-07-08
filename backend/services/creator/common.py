@@ -184,6 +184,7 @@ class AnalyzeBlueprintRequest(BaseModel):
 
     # Phase2 展示前最多修几轮。确认后 refine_contract=False 时不会使用。
     refine_rounds: int = 3
+    responsibility_edges: list[dict[str, Any]] | None = None
 
 class SkillMdBlueprintReviewRequest(BaseModel):
     skill_name: str
@@ -1023,6 +1024,7 @@ class AnalyzeBlueprintResponse(BaseModel):
     tool_requirements: list[dict[str, Any]] = Field(default_factory=list)
     creation_blockers: list[dict[str, Any]] = Field(default_factory=list)
     requirement_graph: ResponsibilityGraph = Field(default_factory=ResponsibilityGraph)
+    responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
 
     # 这是展示给用户确认的最终蓝图文本。
     # 注意：前端应该展示这个字段，而不是展示 LLM 第一次生成的原始蓝图。

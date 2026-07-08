@@ -499,12 +499,6 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
                     code="dataflow_edge_invalid",
                     details={"index": idx, "to_node": to_node},
                 )
-            if to_field not in inputs_by_script.get(to_node, set()):
-                raise ResponsibilityGraphValidationError(
-                    "Platform input edge references a field not declared by the target script inputs.",
-                    code="dataflow_edge_invalid",
-                    details={"index": idx, "to_node": to_node, "to_input": to_field},
-                )
             continue
 
         if to_node == platform_output_id:

@@ -4886,10 +4886,16 @@ async def _run_script_responsibility_review(
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
-    req_payload = [
-        function_item_prompt_payload(item)
-        for item in req_items
-    ]
+    graph_context = (
+        function_item_graph_context(review_context.get("requirement_graph"), file_path)
+        if isinstance(review_context, dict) and review_context.get("requirement_graph") is not None
+        else {
+            "function_item": function_item_prompt_payload(req_items[0]) if req_items else {},
+            "incoming_edges": [],
+            "outgoing_edges": [],
+        }
+    )
+    req_payload = [graph_context.get("function_item") or function_item_prompt_payload(item) for item in req_items]
 
     messages = [
         {
@@ -4904,6 +4910,7 @@ async def _run_script_responsibility_review(
                 "Judge checks whether the current script implements its FunctionItem. Reference files may only serve as dependency/resource evidence for the current FunctionItem; SKILL.md, references/**, and assets/** do not own executable workflow responsibilities.\n\n"
                 "核心原则（图谱式可观察边界）：\n"
                 "- 当前脚本的语义职责以 current script FunctionItem（通过现有 requirements/responsibility_requirements payload 传输）的 purpose、must_do、must_not_do 和 constraints 为准；inputs/outputs 只是接口提示。\n"
+                "- FunctionItem describes what the current script owns. Incoming ResponsibilityEdges describe what upstream responsibilities must provide to the current script. Outgoing ResponsibilityEdges describe what the current script must make available to downstream responsibilities. Required edge constraints must be checked against the current FunctionItem implementation.\n"
                 "- requirements.constraints 是当前文件拥有的开放责任约束。\n"
                 "- 所有 required=true constraints 都必须检查实现证据。\n"
                 "- 根据完整 constraint object 理解约束语义。\n"
@@ -4970,6 +4977,9 @@ async def _run_script_responsibility_review(
 
                 "SkillPlanEntry：\n"
                 f"{json.dumps({k: getattr(skill_plan_entry, k, '') for k in ('path', 'purpose', 'role', 'component_hint')}, ensure_ascii=False, default=str)[:8000]}\n\n"
+
+                "当前文件 FunctionItem graph context（Producer/Judge shared payload）：\n"
+                f"{json.dumps(graph_context, ensure_ascii=False, default=str)[:8000]}\n\n"
 
                 "当前文件 requirements / must_do：\n"
 

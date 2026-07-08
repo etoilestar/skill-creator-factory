@@ -402,18 +402,39 @@ def _normalize_dataflow_edges(raw_edges: Any) -> list[dict[str, Any]]:
     for raw in raw_edges:
         if not isinstance(raw, dict):
             continue
+        raw_constraints = raw.get("constraints", [])
+        constraints: list[dict[str, Any]] = []
+        if isinstance(raw_constraints, list):
+            constraints = [dict(item) for item in raw_constraints if isinstance(item, dict)]
         edge = {
             "from_node": str(raw.get("from_node") or "").strip(),
-            "from_field": str(raw.get("from_field") or "").strip(),
+            "from_output": str(raw.get("from_output") or raw.get("from_field") or "").strip(),
             "to_node": str(raw.get("to_node") or "").strip(),
-            "to_field": str(raw.get("to_field") or "").strip(),
-            "value_template": str(raw.get("value_template") or "").strip(),
-            "source_kind": str(raw.get("source_kind") or "").strip(),
-            "value_type": str(raw.get("value_type") or "").strip(),
+            "to_input": str(raw.get("to_input") or raw.get("to_field") or "").strip(),
+            "purpose": str(raw.get("purpose") or "").strip(),
+            "constraints": constraints,
         }
-        if edge["from_node"] and edge["from_field"] and edge["to_node"] and edge["to_field"]:
+        if edge["from_node"] and edge["from_output"] and edge["to_node"] and edge["to_input"]:
             normalized.append(edge)
     return normalized
+
+
+def function_item_graph_context(graph: Any, target_file: str) -> dict[str, Any]:
+    """Return the shared local ResponsibilityGraph context for one script."""
+    normalized = normalize_responsibility_graph(graph) if not isinstance(graph, ResponsibilityGraph) else normalize_responsibility_graph(graph)
+    target = str(target_file or "").strip()
+    function_item = None
+    for item in normalized.function_items:
+        if str(item.target_file or "").strip() == target:
+            function_item = function_item_prompt_payload(item)
+            break
+    incoming = [dict(edge) for edge in normalized.dataflow_edges or [] if str(edge.get("to_node") or "") == target]
+    outgoing = [dict(edge) for edge in normalized.dataflow_edges or [] if str(edge.get("from_node") or "") == target]
+    return {
+        "function_item": function_item or {},
+        "incoming_edges": incoming,
+        "outgoing_edges": outgoing,
+    }
 
 
 def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list[Any]) -> None:
@@ -439,6 +460,11 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
         for item in graph.requirements
         if str(item.target_file or "").startswith("scripts/")
     }
+    inputs_by_script: dict[str, set[str]] = {
+        str(item.target_file): {str(field) for field in (item.inputs or []) if str(field or "").strip()}
+        for item in graph.requirements
+        if str(item.target_file or "").startswith("scripts/")
+    }
     for file_spec in files or []:
         path = str(getattr(file_spec, "path", "") or "")
         if not path.startswith("scripts/"):
@@ -448,19 +474,24 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
             for field in (getattr(file_spec, "outputs", []) or [])
             if str(field or "").strip()
         )
+        inputs_by_script.setdefault(path, set()).update(
+            str(field).strip()
+            for field in (getattr(file_spec, "inputs", []) or [])
+            if str(field or "").strip()
+        )
 
     for idx, edge in enumerate(graph.dataflow_edges or []):
         from_node = str(edge.get("from_node") or "")
-        from_field = str(edge.get("from_field") or "")
+        from_field = str(edge.get("from_output") or edge.get("from_field") or "")
         to_node = str(edge.get("to_node") or "")
-        to_field = str(edge.get("to_field") or "")
+        to_field = str(edge.get("to_input") or edge.get("to_field") or "")
 
         if from_node == platform_input_id:
             if from_field not in platform_input_fields:
                 raise ResponsibilityGraphValidationError(
                     "Dataflow edge references an undefined platform input field.",
                     code="dataflow_edge_invalid",
-                    details={"index": idx, "from_field": from_field},
+                    details={"index": idx, "from_output": from_field},
                 )
             if to_node not in script_nodes:
                 raise ResponsibilityGraphValidationError(
@@ -481,7 +512,7 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
                 raise ResponsibilityGraphValidationError(
                     "Dataflow edge references an undefined platform output field.",
                     code="dataflow_edge_invalid",
-                    details={"index": idx, "to_field": to_field},
+                    details={"index": idx, "to_input": to_field},
                 )
             continue
 
@@ -498,11 +529,11 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
                 code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
-        if from_field not in outputs_by_script.get(from_node, set()):
+        if not all(isinstance(c, dict) for c in (edge.get("constraints") or [])):
             raise ResponsibilityGraphValidationError(
-                "Script-to-script dataflow edge references a field not declared by the source script outputs.",
+                "Dataflow edge constraints must be structured constraint objects.",
                 code="dataflow_edge_invalid",
-                details={"index": idx, "from_node": from_node, "from_field": from_field},
+                details={"index": idx},
             )
 
 
@@ -519,6 +550,7 @@ def _file_spec_has_substantive_responsibility(file_spec: Any) -> bool:
 
 def build_default_responsibility_graph(
     files: list[Any],
+    responsibility_edges: list[dict[str, Any]] | None = None,
 ) -> ResponsibilityGraph:
     """Build the deterministic responsibility graph from normalized file contracts.
 
@@ -764,7 +796,7 @@ def build_default_responsibility_graph(
             platform_output_node
         ),
 
-        dataflow_edges=[],
+        dataflow_edges=_normalize_dataflow_edges(responsibility_edges),
 
         requirement_graph_source=(
             "deterministic_file_contracts"

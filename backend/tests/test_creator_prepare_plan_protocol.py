@@ -600,3 +600,26 @@ async def test_blueprint_planner_defines_script_only_responsibility_graph(monkey
     assert "references/**" in section and "not FunctionItems" in section
     assert "A reference cannot own or execute a core action" in section
     assert "A reference cannot be the producer of a required final result" in section
+
+
+@pytest.mark.asyncio
+async def test_planner_requires_responsibility_edges_and_graph_replay(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+    prompt = captured[0]["content"]
+
+    for term in [
+        "FunctionItem",
+        "ResponsibilityEdge",
+        "complete workflow",
+        "graph replay",
+        "platform_input_node",
+        "platform_output_node",
+    ]:
+        assert term in prompt

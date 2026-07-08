@@ -963,6 +963,7 @@ def _script_local_contract_payload(
     plan_entry: SkillPlanEntry,
     stdout_schema: dict[str, Any],
     requirements: Any = None,
+    responsibility_graph: Any = None,
 ) -> dict[str, Any]:
     """Build one code model's local script contract.
 
@@ -983,6 +984,15 @@ def _script_local_contract_payload(
             file_path=file_path,
             requirements=requirements,
         )
+    )
+    local_graph_context = (
+        function_item_graph_context(responsibility_graph, file_path)
+        if responsibility_graph is not None
+        else {
+            "function_item": responsibility_requirements[0] if responsibility_requirements else {},
+            "incoming_edges": [],
+            "outgoing_edges": [],
+        }
     )
 
     implementation_resolution = (
@@ -1096,6 +1106,7 @@ def _script_local_contract_payload(
         "responsibility_requirements": (
             responsibility_requirements
         ),
+        "function_item_graph_context": local_graph_context,
         "available_tools": available_tools,
         "tool_function_cards": (
             tool_function_cards
@@ -1455,6 +1466,7 @@ def _build_script_generate_file_prompt_variant(
     role: str | None,
     skill_plan_entry: dict[str, Any] | None,
     requirements: Any = None,
+    responsibility_graph: Any = None,
     variant: str,
 ) -> list[dict]:
     """Build script-only prompts using progressively smaller local contracts.
@@ -1511,6 +1523,7 @@ def _build_script_generate_file_prompt_variant(
             plan_entry=plan_entry,
             stdout_schema=stdout_schema,
             requirements=requirements,
+            responsibility_graph=responsibility_graph,
         )
     )
 
@@ -1883,6 +1896,8 @@ def _build_script_generate_file_prompt_variant(
             "runtime_envelope、rules。"
         ),
         (
+            "function_item_graph_context 是当前脚本的共享局部责任图上下文，Producer 和 Judge 使用同一 payload。"
+            "FunctionItem describes what the current script owns. Incoming ResponsibilityEdges describe what upstream responsibilities must provide to the current script. Outgoing ResponsibilityEdges describe what the current script must make available to downstream responsibilities. Required edge constraints must be preserved when implementing the current FunctionItem."
             "responsibility_requirements 是当前文件已经编译完成的职责合同，"
             "也是后续单文件职责审查所依据的责任事实。"
             "实现当前脚本时必须完成其中 must_do，遵守 must_not_do；"
@@ -2067,6 +2082,7 @@ def _build_generate_file_prompt(
     role: str | None = None,
     skill_plan_entry: dict[str, Any] | None = None,
     requirements: Any = None,
+    responsibility_graph: Any = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file."""
 
@@ -2085,6 +2101,7 @@ def _build_generate_file_prompt(
                     skill_plan_entry
                 ),
                 requirements=requirements,
+                responsibility_graph=responsibility_graph,
                 variant="standard",
             )
         )

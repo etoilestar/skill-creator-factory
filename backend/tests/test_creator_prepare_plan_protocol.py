@@ -752,3 +752,20 @@ def test_frontend_persists_and_returns_responsibility_edges():
     assert 'responsibility_edges:' in source
     assert 'pendingResponsibilityEdges.value = plan.responsibility_edges' in source
     assert 'creationPlan.value?.responsibility_edges' in source
+
+
+def test_purpose_short_contract_payload_uses_only_compact_graph_context():
+    import inspect
+    source = inspect.getsource(api._normalize_script_purpose_short_contracts)
+    assert 'compact_context_by_target' in source
+    assert 'exact_provided_script_paths' in source
+    assert '"blueprint_text:\\n"' not in source
+    assert '"workflow_allocation_summary:\\n"' not in source
+    assert '"scripts:\\n"' not in source
+
+
+def test_frontend_clear_chat_clears_pending_responsibility_edges():
+    from pathlib import Path
+    source = Path('frontend/src/views/CreatorView.vue').read_text(encoding='utf-8')
+    clear_source = source[source.index('function clearChat()'):source.index('</script>')]
+    assert 'pendingResponsibilityEdges.value = []' in clear_source

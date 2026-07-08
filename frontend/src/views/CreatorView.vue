@@ -789,6 +789,8 @@ function clearChat() {
 
   pendingBlueprintText.value = ''
 
+  pendingResponsibilityEdges.value = []
+
   rootUserRequest.value = ''
 
   pendingSupplementQuestion.value = ''

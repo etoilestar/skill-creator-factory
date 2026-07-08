@@ -8161,20 +8161,12 @@ async def _normalize_script_purpose_short_contracts(
             "This phase compresses wording only. It must not add a core action; must not remove a core action; must not replace an owned action with consumption of an already-produced result; must not change required capability ownership; must not change incoming/outgoing ResponsibilityEdge obligations; must not change FunctionItem constraints; must not move responsibility to another script. target_file must be copied exactly from one provided script path. Do not invent, abbreviate, normalize, or replace the path. Unknown targets are ignored by exact match only; no fuzzy match."
         )},
         {"role": "user", "content": (
-            "blueprint_text:\n" + (blueprint_text or "")[:12000] + "\n\n"
-            "workflow_allocation_summary:\n" + (workflow_allocation_summary or "")[:6000] + "\n\n"
-            "compact_context_by_target:\n" + json.dumps(edge_contexts, ensure_ascii=False, default=str)[:16000] + "\n\n"
-            "scripts:\n" + json.dumps([
-                {
-                    "path": item.path,
-                    "purpose": item.purpose,
-                    "role": item.role,
-                    "inputs": item.inputs,
-                    "outputs": item.outputs,
-                    "dependencies": item.dependencies,
-                }
-                for item in targets
-            ], ensure_ascii=False, default=str)[:16000] + "\n\n"
+            "compact_context_by_target:\n"
+            + json.dumps(edge_contexts, ensure_ascii=False, default=str)[:16000]
+            + "\n\n"
+            "exact_provided_script_paths:\n"
+            + json.dumps([item.path for item in targets], ensure_ascii=False, default=str)
+            + "\n\n"
             "返回 JSON object：{\"patches\":[{\"target_file\":\"<copy one exact provided script path>\",\"purpose\":\"来源：... | 动作：... | 交付：... | 约束：...\\n说明：...\"}]}"
         )},
     ]

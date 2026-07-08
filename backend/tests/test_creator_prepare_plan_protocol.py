@@ -523,3 +523,58 @@ async def test_blueprint_planner_prompt_includes_constraints_serialization_contr
     assert "constraints 必须是单行合法 JSON array" in section
     assert "不要限制 constraint 类型" in section
     assert "不要广播到所有 scripts" in section
+
+
+@pytest.mark.asyncio
+async def test_blueprint_planner_prompt_preserves_confirmed_decision_contract(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+
+    prompt = captured[0]["content"]
+    assert "confirmed decision" in prompt
+    assert "不得返回 status=ready" in prompt and "core action" in prompt
+    assert "clarification answer 不是参考意见" in prompt
+    assert "Blueprint planning 输入契约" in prompt
+    assert "不得通过修改 Blueprint 业务目标来规避工具缺失" in prompt
+
+
+@pytest.mark.asyncio
+async def test_blueprint_planner_prompt_requires_explicit_constraints_field(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+
+    prompt = captured[0]["content"]
+    section = prompt[prompt.index("## responsibility constraints"):prompt.index("## 内部处理与脚本拆分")]
+    assert "每个 SkillPlan entry 都必须显式输出 constraints 字段" in section
+    assert "constraints: []" in section
+
+
+@pytest.mark.asyncio
+async def test_blueprint_planner_prompt_requires_final_delivery_closure(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+
+    prompt = captured[0]["content"]
+    section = prompt[prompt.index("## final delivery closure"):prompt.index("## 返回格式")]
+    assert "每一个 required final result" in section
+    assert "producer" in section
+    assert "生成 status=ready 前" in section
+    assert "final delivery closure" in section

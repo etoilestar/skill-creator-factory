@@ -6387,6 +6387,45 @@ composite_generator 或 generic_script。
 
 必须结合整个工作流判断。
 
+## core action fidelity
+
+规划 workflow 和 script responsibilities 时，
+必须区分：
+
+- core action
+- action preparation
+- action description
+- final delivery
+
+如果用户要求或已确认的是某个 core action，
+Blueprint 中必须存在真正拥有并执行该 action 的 responsibility。
+
+仅生成该 action 的：
+
+- description
+- prompt
+- instruction
+- metadata
+- plan
+- placeholder
+- recommendation
+
+不能视为已经执行 core action。
+
+除非用户明确要求的本来就是这些准备结果。
+
+对每一个已确认 core action，
+必须回答：
+
+1. 哪个 script responsibility 真正执行该 action？
+2. 该 script 的 purpose 是否明确声明该 action？
+3. required_capabilities 是否描述该 script 实际执行的抽象能力？
+4. 该 action 的真实结果是否进入后续 workflow 或最终交付？
+
+如果四项中任何一项无法回答，
+当前 Blueprint 尚未形成责任闭包，
+不得返回 status=ready。
+
 ## 多脚本责任所有权规则
 
 每个 script 必须具有一个清晰的主要业务职责。
@@ -6453,6 +6492,23 @@ Planner 负责把 constraint 放到拥有该责任的 script。
 将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段；
 constraints 必须是单行合法 JSON array。
 
+每个 SkillPlan entry 都必须显式输出 constraints 字段。
+
+没有额外 responsibility constraint 时：
+
+constraints: []
+
+不得省略该字段。
+
+不得把应该进入 constraints 的明确 requirement
+仅留在 workflow prose、说明段或 review_summary 中。
+
+如果一个明确 requirement 会影响当前 script
+实现是否正确或结果是否完整，
+但 purpose / inputs / outputs / capabilities
+不能完整表达它，
+必须写入当前 target file 的 constraints。
+
 ## 内部处理与脚本拆分
 
 当前平台没有显式 loop/map/foreach runtime node。
@@ -6509,6 +6565,107 @@ required_capabilities 只属于
 
 不得填写具体 Registry tool_id。
 
+Blueprint planning 不得根据当前 Registry、
+ToolPool、helper、SDK 或已知实现便利性
+反向修改用户业务要求。
+
+正确顺序：
+
+user requirement
+↓
+confirmed decisions
+↓
+workflow responsibilities
+↓
+script responsibilities
+↓
+abstract required_capabilities
+↓
+后续 Tool planning
+
+错误顺序：
+
+available tools
+↓
+选择容易实现的动作
+↓
+降低 Blueprint 业务目标
+
+Planner 可以声明抽象 capability。
+
+具体工具选择仍由后续 Final Tool Selector 完成。
+
+## final delivery closure
+
+Blueprint 顶层 I/O 契约、review_summary.output、
+workflow 最终交付描述和 SkillPlan script outputs
+必须形成语义闭环。
+
+对于顶层声明的每一个 required final result：
+
+必须能找到一个 required script responsibility
+明确生产或最终交付该结果。
+
+不得出现：
+
+- 顶层 output 声明结果 A；
+- workflow 声明最终返回 A；
+- 但所有 required script outputs 都没有 A。
+
+也不得出现：
+
+- script purpose 声明交付 A；
+- SkillPlan outputs 却遗漏 A。
+
+字段名不要求逐字相同，
+但业务结果必须语义可追踪。
+
+生成 status=ready 前，
+逐项检查所有 final results 的 producer。
+
+无法找到 producer 时，
+必须先修订 Blueprint，
+不得依赖后续 global contract 或 E2E 猜测补齐。
+
+## ready consistency self-check
+
+返回 status=ready 前，
+在内部逐项完成以下检查：
+
+A. confirmed decisions
+- 原始用户要求中的核心业务动作是否仍存在？
+- 每个已回答 clarification 的明确 decision 是否仍存在？
+- 是否把任何执行动作弱化为描述、提示或占位结果？
+
+B. responsibility ownership
+- 每个 core action 是否存在明确 owning script responsibility？
+- 是否有两个 scripts 重复拥有同一 core action？
+- 是否有 core action 只存在于 workflow prose，
+  但没有进入任何 script purpose？
+
+C. capability alignment
+- 每个 script required_capabilities
+  是否来自该 script 实际执行动作？
+- 是否遗漏了 script 明确执行的抽象能力？
+- 是否为了迎合当前已知 tools 而删除业务 capability？
+
+D. constraint preservation
+- 每个 SkillPlan entry 是否显式包含 constraints？
+- 无 constraint 时是否为 []？
+- 明确 implementation requirement
+  是否只存在于 prose 而没有进入 owning script constraint？
+
+E. final delivery closure
+- 每个 required final result 是否存在 producer？
+- 顶层 output、workflow final delivery、
+  script purpose 和 script outputs 是否语义一致？
+
+如果任一项失败：
+
+先修改 Blueprint。
+
+不得输出 status=ready。
+
 ## 返回格式
 
 {
@@ -6529,6 +6686,39 @@ required_capabilities 只属于
   "blockers": []
 }
 
+## confirmed decision preservation
+
+conversation_history、human_feedback 和 previous_blueprint_text
+中已经明确回答或确认的业务选择，
+属于当前 Blueprint planning 的已确认 decision。
+
+已确认 decision 的优先级高于 Planner 自行选择的默认方案。
+
+生成新的 ready Blueprint 时，
+必须逐项保留这些 decision 的原始业务动作方向和交付含义。
+
+不得：
+
+- 删除已确认 decision；
+- 将已确认动作替换为较弱的准备动作；
+- 将执行动作替换为描述、建议、提示词或占位信息；
+- 将生成、处理、转换、调用、构建等已确认动作
+  改写为仅描述相关内容；
+- 因为实现更简单而降低用户已经确认的业务目标；
+- 因 ToolPool、Registry 或当前已知 helper 信息不足
+  提前删除业务责任。
+
+Blueprint Planner 只规划业务责任。
+
+具体 Registry tool 是否存在，
+由后续 Creator Tool planning 判断。
+
+如果一个已确认 decision 无法实现，
+必须保留该业务 responsibility，
+后续由 tool readiness / creation blocker 处理。
+
+不得通过修改 Blueprint 业务目标来规避工具缺失。
+
 ## 规划约束
 
 - status=ready 前先判断需求成熟度。
@@ -6544,9 +6734,26 @@ required_capabilities 只属于
 
 - 每轮只能问一个业务问题。
 
-- 后续问题必须结合
-  conversation_history 与 human_feedback
-  中已有回答。
+- 后续规划必须读取完整 conversation_history 与 human_feedback。
+
+- 对于每个 clarification question：
+
+  - 找到用户已经给出的最终回答；
+  - 提取其中确定的业务 decision；
+  - 在新的 workflow、SkillPlan purpose、
+    required_capabilities 和最终交付中保持一致。
+
+- clarification answer 不是参考意见，
+  而是 Blueprint planning 输入契约的一部分。
+
+- 当 previous_blueprint_text 与最新 human_feedback 冲突时，
+  以最新明确 human_feedback 为准。
+
+- 当 Planner 输出 ready Blueprint 前，
+  必须检查新的 Blueprint 是否仍然表达所有已确认 decision。
+
+- 不得因为重新生成 full blueprint
+  而遗忘前一轮 clarification decision。
 
 - 已经回答过的问题不得重复询问。
 

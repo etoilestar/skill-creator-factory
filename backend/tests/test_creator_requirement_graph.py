@@ -1729,3 +1729,48 @@ def test_producer_and_judge_receive_same_function_item_graph_context():
     assert set(producer_payload) == {"function_item", "incoming_edges", "outgoing_edges"}
     assert producer_payload["function_item"]
     assert producer_payload["incoming_edges"][0]["constraints"] == [edge_constraint]
+
+
+def test_producer_prompt_includes_real_local_edge_context():
+    from backend.services.creator.generation import _build_generate_file_prompt
+
+    specs = [
+        _file_spec("scripts/a.py", outputs=["planner result"]),
+        _file_spec("scripts/b.py", inputs=["consumed planner input"], outputs=["final_response"]),
+    ]
+    edge_constraint = {
+        "name": "alpha",
+        "kind": "custom",
+        "value": {"x": 1},
+        "comparator": "describes",
+        "required": True,
+    }
+    graph = build_default_requirement_graph(specs, responsibility_edges=[
+        {
+            "from_node": "scripts/a.py",
+            "from_output": "planner result",
+            "to_node": "scripts/b.py",
+            "to_input": "consumed planner input",
+            "purpose": "carry upstream result with model-owned meaning",
+            "constraints": [edge_constraint],
+        }
+    ])
+
+    messages = _build_generate_file_prompt(
+        "scripts/b.py",
+        "demo-skill",
+        "consume upstream result",
+        "blueprint",
+        [],
+        role="generic_script",
+        skill_plan_entry=specs[1].model_dump(mode="json"),
+        requirements=graph.requirements,
+        responsibility_graph=graph,
+    )
+    prompt_text = "\n".join(str(message.get("content") or "") for message in messages)
+
+    assert "function_item_graph_context" in prompt_text
+    assert "incoming_edges" in prompt_text
+    assert "outgoing_edges" in prompt_text
+    assert "carry upstream result with model-owned meaning" in prompt_text
+    assert "alpha" in prompt_text

@@ -9735,10 +9735,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             )
         ),
     })
-    fallback_requirement_graph = build_default_requirement_graph(
-        files_out,
-        responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
-    )
+    fallback_requirement_graph = build_default_requirement_graph(files_out)
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
             blueprint_text=blueprint_text,

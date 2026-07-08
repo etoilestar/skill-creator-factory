@@ -535,18 +535,6 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
                 code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
-        if from_field not in outputs_by_script.get(from_node, set()):
-            raise ResponsibilityGraphValidationError(
-                "Script-to-script dataflow edge references a field not declared by the source script outputs.",
-                code="dataflow_edge_invalid",
-                details={"index": idx, "from_node": from_node, "from_output": from_field},
-            )
-        if to_field not in inputs_by_script.get(to_node, set()):
-            raise ResponsibilityGraphValidationError(
-                "Script-to-script dataflow edge references a field not declared by the target script inputs.",
-                code="dataflow_edge_invalid",
-                details={"index": idx, "to_node": to_node, "to_input": to_field},
-            )
         if not all(isinstance(c, dict) for c in (edge.get("constraints") or [])):
             raise ResponsibilityGraphValidationError(
                 "Dataflow edge constraints must be structured constraint objects.",

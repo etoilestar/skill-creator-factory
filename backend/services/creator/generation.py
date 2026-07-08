@@ -1523,6 +1523,7 @@ def _build_script_generate_file_prompt_variant(
             plan_entry=plan_entry,
             stdout_schema=stdout_schema,
             requirements=requirements,
+            responsibility_graph=responsibility_graph,
         )
     )
 

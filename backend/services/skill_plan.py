@@ -337,6 +337,14 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
         if missing_required:
             invalid.append({"index": index, "missing_fields": missing_required})
             continue
+        empty_endpoint_fields = [
+            key
+            for key in ("from_node", "from_output", "to_node", "to_input")
+            if not str(edge.get(key) or "").strip()
+        ]
+        if empty_endpoint_fields:
+            invalid.append({"index": index, "empty_endpoint_fields": empty_endpoint_fields})
+            continue
         constraints = edge.get("constraints", [])
         if constraints is None:
             constraints = []

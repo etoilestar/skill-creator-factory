@@ -7142,6 +7142,8 @@ Blueprint Planner 只规划业务责任。
     if data.get("responsibility_edges") is None:
         if str(data.get("status") or "") == "needs_clarification":
             data["responsibility_edges"] = []
+        elif str(data.get("status") or "") == "ready":
+            raise ValueError("prepare-plan ready response must include structured responsibility_edges")
     else:
         normalized_edges = normalize_structured_responsibility_edges(
             data.get("responsibility_edges"),
@@ -8134,19 +8136,15 @@ async def _normalize_script_purpose_short_contracts(
     ]
     if not targets:
         return
+    purpose_graph = build_default_requirement_graph(
+        files_out,
+        responsibility_edges=responsibility_edges,
+    )
     edge_contexts = {
-        item.path: {
-            "FunctionItem": {
-                "path": item.path,
-                "purpose": item.purpose,
-                "inputs": item.inputs,
-                "outputs": item.outputs,
-                "required_capabilities": item.required_capabilities,
-                "constraints": item.constraints,
-            },
-            "incoming ResponsibilityEdges": [edge for edge in (responsibility_edges or []) if str(edge.get("to_node") or "") == item.path],
-            "outgoing ResponsibilityEdges": [edge for edge in (responsibility_edges or []) if str(edge.get("from_node") or "") == item.path],
-        }
+        item.path: function_item_graph_context(
+            purpose_graph,
+            item.path,
+        )
         for item in targets
     }
     logger.info("[Creator][purpose_short_contract][start] %s", json.dumps({
@@ -8401,6 +8399,23 @@ async def prepare_plan(
                         field=(
                             "previous_blueprint_text"
                         ),
+                    )
+                ],
+            )
+
+        if request.responsibility_edges is None:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=PreparePlanReviewSummary(),
+                blueprint_text=previous_blueprint_text,
+                skill_name=skill_name,
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        "missing_structured_responsibility_edges",
+                        "用户确认创建要点时缺少 structured responsibility_edges；Creator 不允许从 blueprint text legacy fallback 恢复 ready graph。",
+                        field="responsibility_edges",
                     )
                 ],
             )

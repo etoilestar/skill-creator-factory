@@ -717,3 +717,38 @@ def test_purpose_short_contract_is_semantic_preserving_compression_only():
     assert 'must not remove a core action' in source
     assert 'must not change incoming/outgoing ResponsibilityEdge obligations' in source
     assert 'must not change required capability ownership' in source
+
+
+def test_structured_edge_empty_endpoint_fails_fast():
+    from backend.services.skill_plan import normalize_structured_responsibility_edges
+    import pytest
+    edge = {"from_node":"platform_input_node","from_output":"","to_node":"scripts/a.py","to_input":"source","purpose":"bad","constraints":[]}
+    with pytest.raises(ValueError):
+        normalize_structured_responsibility_edges([edge], source='planner')
+
+
+def test_ready_planner_response_requires_structured_responsibility_edges(monkeypatch):
+    import pytest
+    async def fake_complete(messages, model):
+        return '{"status":"ready","internal_blueprint_text":"## 📋 Skill 架构蓝图","skill_name":"demo-skill","blockers":[]}'
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    with pytest.raises(ValueError, match='responsibility_edges'):
+        import asyncio
+        asyncio.run(api._generate_internal_blueprint_or_questions(_request()))
+
+
+def test_purpose_short_contract_uses_canonical_function_item_graph_context():
+    import inspect
+    source = inspect.getsource(api._normalize_script_purpose_short_contracts)
+    assert 'function_item_graph_context' in source
+    assert 'build_default_requirement_graph' in source
+    assert 'incoming ResponsibilityEdges": [edge for edge' not in source
+
+
+def test_frontend_persists_and_returns_responsibility_edges():
+    from pathlib import Path
+    source = Path('frontend/src/views/CreatorView.vue').read_text(encoding='utf-8')
+    assert 'const pendingResponsibilityEdges = ref([])' in source
+    assert 'responsibility_edges:' in source
+    assert 'pendingResponsibilityEdges.value = plan.responsibility_edges' in source
+    assert 'creationPlan.value?.responsibility_edges' in source

@@ -6387,6 +6387,24 @@ composite_generator 或 generic_script。
 
 必须结合整个工作流判断。
 
+## ResponsibilityGraph and FunctionItem semantics
+
+ResponsibilityGraph is the executable responsibility chain of scripts/** only.
+
+A FunctionItem is the complete target-local executable responsibility owned by one script.
+
+One script responsibility equals one FunctionItem.
+
+SKILL.md, references/** and assets/** are not FunctionItems.
+
+references/** may support a script as reference material.
+
+A reference may influence how a script performs its FunctionItem.
+
+A reference cannot own or execute a core action.
+
+A reference cannot be the producer of a required final result.
+
 ## core action fidelity
 
 规划 workflow 和 script responsibilities 时，
@@ -6417,7 +6435,7 @@ Blueprint 中必须存在真正拥有并执行该 action 的 responsibility。
 对每一个已确认 core action，
 必须回答：
 
-1. 哪个 script responsibility 真正执行该 action？
+1. Which script FunctionItem owns and executes this action? owner 必须是 scripts/**。
 2. 该 script 的 purpose 是否明确声明该 action？
 3. required_capabilities 是否描述该 script 实际执行的抽象能力？
 4. 该 action 的真实结果是否进入后续 workflow 或最终交付？
@@ -6487,8 +6505,30 @@ constraint 是开放语义数据。
 不要限制 constraint 类型。
 不要创造用户或 workflow 未要求的新属性。
 
-Planner 负责把 constraint 放到拥有该责任的 script。
+constraints is generic file-local constraint data.
+
+对于 scripts/**：
+
+script constraints
+→ owning FunctionItem.constraints
+
+对于 SKILL.md、references/** 和 assets/**：
+constraints remain file-local planning/generation constraints.
+
+这些 non-script constraints 不得：
+
+- create FunctionItem
+- enter ResponsibilityGraph
+- own core action
+- own final delivery
+
+Constraint transport is generic.
+
+FunctionItem projection is script-only.
+
+Planner 负责把 constraint 放到拥有该责任的 SkillPlan entry。
 不要广播到所有 scripts。
+不要广播到所有 entries。
 将每个 target-local constraint 写入对应 SkillPlan entry 的 constraints 字段；
 constraints 必须是单行合法 JSON array。
 
@@ -6603,7 +6643,7 @@ workflow 最终交付描述和 SkillPlan script outputs
 
 对于顶层声明的每一个 required final result：
 
-必须能找到一个 required script responsibility
+必须能找到一个 required script FunctionItem producer
 明确生产或最终交付该结果。
 
 不得出现：
@@ -6625,6 +6665,8 @@ workflow 最终交付描述和 SkillPlan script outputs
 
 无法找到 producer 时，
 必须先修订 Blueprint，
+不得由 SKILL.md、reference、asset、workflow prose 或 review_summary 充当 producer。
+
 不得依赖后续 global contract 或 E2E 猜测补齐。
 
 ## ready consistency self-check
@@ -6637,11 +6679,12 @@ A. confirmed decisions
 - 每个已回答 clarification 的明确 decision 是否仍存在？
 - 是否把任何执行动作弱化为描述、提示或占位结果？
 
-B. responsibility ownership
-- 每个 core action 是否存在明确 owning script responsibility？
-- 是否有两个 scripts 重复拥有同一 core action？
-- 是否有 core action 只存在于 workflow prose，
-  但没有进入任何 script purpose？
+B. FunctionItem ownership
+- 每个 core action 是否有 owning script FunctionItem？
+- 每个 required script 是否形成一个完整 FunctionItem？
+- 是否两个 FunctionItems 重复拥有同一 core action？
+- 是否有 core action 只存在于 workflow prose/reference 中，
+  但没有进入任何 script FunctionItem purpose？
 
 C. capability alignment
 - 每个 script required_capabilities

@@ -675,9 +675,11 @@ def _script_responsibility_requirements_payload(
     file_path: str,
     requirements: Any = None,
 ) -> list[dict[str, Any]]:
-    """Project current-file RequirementItem objects into prompt-visible payload.
+    """Project the current script FunctionItem into prompt-visible payload.
 
-    No business semantics are inferred here.
+    FunctionItem is the current script's complete executable responsibility
+    closure. The existing responsibility_requirements payload key transports
+    this FunctionItem for compatibility. No business semantics are inferred here.
 
     The function only filters the already-compiled responsibility contract by
     target_file and serializes it for the script production model.
@@ -689,7 +691,7 @@ def _script_responsibility_requirements_payload(
         try:
             if isinstance(
                 raw,
-                RequirementItem,
+                FunctionItem,
             ):
                 item = raw
 
@@ -697,7 +699,7 @@ def _script_responsibility_requirements_payload(
                 raw,
                 dict,
             ):
-                item = RequirementItem(
+                item = FunctionItem(
                     **raw
                 )
 
@@ -716,7 +718,7 @@ def _script_responsibility_requirements_payload(
         ):
             continue
 
-        serialized = requirement_item_prompt_payload(item)
+        serialized = function_item_prompt_payload(item)
 
         if str(
             item.id or ""
@@ -1303,7 +1305,7 @@ def _existing_script_argv_context_for_skill_md(
     """Collect strict_json_argv_guard schemas from already generated scripts.
 
     This is advisory context for SKILL.md command block generation.
-    It does not infer business argv names from SkillPlan/RequirementGraph.
+    It does not infer business argv names from SkillPlan/ResponsibilityGraph.
     """
     try:
         skill_dir = settings.skills_path / skill_name
@@ -1830,7 +1832,7 @@ def _build_script_generate_file_prompt_variant(
         ),
         (
             "脚本第一轮可以选择清晰、稳定的 argv key；"
-            "SkillPlan/RequirementGraph/workflow allocation/"
+            "SkillPlan/ResponsibilityGraph/workflow allocation/"
             "local_contract 中的 inputs 只提供语义输入提示和 "
             "SKILL.md block 参考，不是 argv key 白名单。"
         ),

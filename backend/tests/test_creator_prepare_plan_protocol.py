@@ -578,3 +578,25 @@ async def test_blueprint_planner_prompt_requires_final_delivery_closure(monkeypa
     assert "producer" in section
     assert "生成 status=ready 前" in section
     assert "final delivery closure" in section
+
+
+@pytest.mark.asyncio
+async def test_blueprint_planner_defines_script_only_responsibility_graph(monkeypatch):
+    captured = []
+
+    async def fake_complete(messages, model):
+        captured.extend(messages)
+        return '{"status":"needs_clarification","clarifying_questions":["输入来源？A. 粘贴 B. 上传"],"blockers":[]}'
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    await api._generate_internal_blueprint_or_questions(_request())
+
+    prompt = captured[0]["content"]
+    section = prompt[prompt.index("## ResponsibilityGraph and FunctionItem semantics"):prompt.index("## core action fidelity")]
+    assert "ResponsibilityGraph" in section
+    assert "FunctionItem" in section
+    assert "scripts/** only" in section
+    assert "One script responsibility equals one FunctionItem" in section
+    assert "references/**" in section and "not FunctionItems" in section
+    assert "A reference cannot own or execute a core action" in section
+    assert "A reference cannot be the producer of a required final result" in section

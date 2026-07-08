@@ -17,7 +17,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..skill_plan import normalize_structured_responsibility_edges
+from ..skill_plan import normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -6592,7 +6592,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         )
     if str(data.get("status") or "") != "ready":
         raise ValueError("Planner convergence must return a complete ready plan")
-    normalized_edges = normalize_structured_responsibility_edges(
+    normalized_edges = validate_structured_responsibility_edge_transport(
         data.get("responsibility_edges"),
         source="planner",
     )
@@ -7538,12 +7538,8 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
-        if data.get("responsibility_edges") is None:
-            raise ValueError(
-                "prepare-plan ready response must include structured responsibility_edges"
-            )
         try:
-            normalized_edges = normalize_structured_responsibility_edges(
+            normalized_edges = validate_structured_responsibility_edge_transport(
                 data.get("responsibility_edges"),
                 source="planner",
             )

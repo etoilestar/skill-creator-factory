@@ -636,7 +636,7 @@ def test_planner_structured_responsibility_edges_are_skillplan_source_of_truth()
 def test_legacy_blueprint_edge_parser_is_fallback_only():
     from backend.services.blueprint_parser import build_skill_plan_from_files, FileSpec
     text = 'ResponsibilityEdges: [{"from_node":"platform_input_node","from_output":"input","to_node":"scripts/a.py","to_input":"source","purpose":"legacy","constraints":[]}]'
-    structured = {"from_node":"scripts/a.py","from_output":"result","to_node":"platform_output_node","to_input":"final_output","purpose":"structured","constraints":[]}
+    structured = {"from_node":"scripts/a.py","from_output":"result","to_node":"platform_output_node","to_input":"file_outputs","purpose":"structured","constraints":[]}
     plan = build_skill_plan_from_files(skill_name='demo', files=[FileSpec(path='scripts/a.py', purpose='Process input', required=True)], blueprint_text=text, responsibility_edges=[structured])
     assert plan.responsibility_edges == [structured]
     fallback = build_skill_plan_from_files(skill_name='demo', files=[FileSpec(path='scripts/a.py', purpose='Process input', required=True)], blueprint_text=text)
@@ -773,7 +773,7 @@ def test_frontend_clear_chat_clears_pending_responsibility_edges():
 @pytest.mark.asyncio
 async def test_ready_planner_result_runs_one_convergence_revision(monkeypatch):
     calls = []
-    edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
 
     async def fake_complete(messages, model):
         calls.append(messages)
@@ -860,7 +860,7 @@ def test_planner_and_tool_convergence_do_not_loop():
 @pytest.mark.asyncio
 async def test_planner_convergence_missing_responsibility_edges_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[]},
@@ -878,8 +878,8 @@ async def test_planner_convergence_missing_responsibility_edges_keeps_draft(monk
 @pytest.mark.asyncio
 async def test_planner_convergence_incomplete_transport_fields_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
-    revised_edge = {"from_node":"scripts/a.py","from_output":"result_beta","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
+    revised_edge = {"from_node":"scripts/a.py","from_output":"result_beta","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":[],"internal_blueprint_text":"incomplete","skill_name":"demo","blockers":[],"responsibility_edges":[revised_edge]},
@@ -897,7 +897,7 @@ async def test_planner_convergence_incomplete_transport_fields_keeps_draft(monke
 @pytest.mark.asyncio
 async def test_planner_convergence_null_responsibility_edges_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"null edges","skill_name":"demo","blockers":[],"responsibility_edges":None},
@@ -915,7 +915,7 @@ async def test_planner_convergence_null_responsibility_edges_keeps_draft(monkeyp
 @pytest.mark.asyncio
 async def test_planner_convergence_invalid_transport_shape_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":"not-a-list","review_summary":[],"internal_blueprint_text":"bad shape","skill_name":"demo","blockers":{},"responsibility_edges":[]},
@@ -933,7 +933,7 @@ async def test_planner_convergence_invalid_transport_shape_keeps_draft(monkeypat
 @pytest.mark.asyncio
 async def test_planner_convergence_empty_blueprint_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"good draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"   ","skill_name":"demo","blockers":[],"responsibility_edges":[]},
@@ -1026,8 +1026,8 @@ async def test_invalid_ready_edge_shape_and_failed_convergence_never_keeps_raw_d
 @pytest.mark.asyncio
 async def test_valid_ready_edge_shape_and_failed_convergence_keeps_draft(monkeypatch):
     import json
-    draft_edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"final_output","purpose":"deliver","constraints":[]}
-    bad_edge = {"from":"scripts/a.py","from_output":"alpha","to":"platform_output_node","to_input":"final_output","description":"deliver"}
+    draft_edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
+    bad_edge = {"from":"scripts/a.py","from_output":"alpha","to":"platform_output_node","to_input":"file_outputs","description":"deliver"}
     responses = [
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[draft_edge]},
         {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"bad","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
@@ -1058,3 +1058,134 @@ def test_planner_convergence_prompt_declares_exact_edge_transport_schema():
         "do not use aliases",
     ]:
         assert text in source
+
+@pytest.mark.asyncio
+async def test_ready_draft_invalid_platform_input_boundary_runs_same_planner_convergence(monkeypatch):
+    import json
+    calls = []
+    first_edge = {"from_node":"platform_input_node","from_output":"semantic_alpha","to_node":"scripts/a.py","to_input":"semantic_alpha","purpose":"deliver","constraints":[]}
+    second_edge = {"from_node":"platform_input_node","from_output":"user_request","to_node":"scripts/a.py","to_input":"semantic_alpha","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[first_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 2
+    convergence_payload = json.loads(calls[1][1]["content"])
+    assert "undefined platform input field" in convergence_payload["draft_transport_error"]
+    assert "from_output=semantic_alpha" in convergence_payload["draft_transport_error"]
+    assert result["internal_blueprint_text"] == "revised"
+    assert result["responsibility_edges"][0]["from_output"] == "user_request"
+
+
+@pytest.mark.asyncio
+async def test_ready_draft_invalid_platform_output_boundary_runs_same_planner_convergence(monkeypatch):
+    import json
+    calls = []
+    first_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"final_result_alpha","purpose":"deliver","constraints":[]}
+    second_edge = {"from_node":"scripts/a.py","from_output":"result_alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[first_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 2
+    assert result["internal_blueprint_text"] == "revised"
+    assert result["responsibility_edges"][0]["to_input"] == "file_outputs"
+
+
+@pytest.mark.asyncio
+async def test_invalid_platform_boundary_after_convergence_is_protocol_blocked(monkeypatch):
+    import json
+    bad_edge = {"from_node":"platform_input_node","from_output":"semantic_alpha","to_node":"scripts/a.py","to_input":"semantic_alpha","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"still bad","skill_name":"demo","blockers":[],"responsibility_edges":[bad_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    response = await api.prepare_plan(_request())
+    assert response.status == "blocked"
+    assert response.prepare_stage == "blueprint_protocol_failed"
+    assert response.creation_blockers[0]["field"] == "responsibility_edges"
+
+
+@pytest.mark.asyncio
+async def test_ready_draft_missing_responsibility_edges_runs_same_planner_convergence(monkeypatch):
+    import json
+    calls = []
+    second_edge = {"from_node":"platform_input_node","from_output":"user_request","to_node":"scripts/a.py","to_input":"semantic_alpha","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[]},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 2
+    assert result["responsibility_edges"] == [second_edge]
+
+
+@pytest.mark.asyncio
+async def test_ready_draft_null_responsibility_edges_runs_same_planner_convergence(monkeypatch):
+    import json
+    calls = []
+    second_edge = {"from_node":"platform_input_node","from_output":"user_request","to_node":"scripts/a.py","to_input":"semantic_alpha","purpose":"deliver","constraints":[]}
+    responses = [
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"draft","skill_name":"demo","blockers":[],"responsibility_edges":None},
+        {"status":"ready","clarifying_questions":[],"review_summary":{},"internal_blueprint_text":"revised","skill_name":"demo","blockers":[],"responsibility_edges":[second_edge]},
+    ]
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps(responses.pop(0))
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert len(calls) == 2
+    assert result["responsibility_edges"] == [second_edge]
+
+
+def test_validate_structured_responsibility_edge_transport_contract():
+    from backend.services.skill_plan import validate_structured_responsibility_edge_transport
+    script_edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"scripts/b.py","to_input":"beta","purpose":"handoff","constraints":[]}
+    platform_input_edge = {"from_node":"platform_input_node","from_output":"user_request","to_node":"scripts/a.py","to_input":"alpha","purpose":"deliver","constraints":[]}
+    platform_output_edge = {"from_node":"scripts/a.py","from_output":"alpha","to_node":"platform_output_node","to_input":"file_outputs","purpose":"deliver","constraints":[]}
+
+    assert validate_structured_responsibility_edge_transport([script_edge], source="planner") == [script_edge]
+    assert validate_structured_responsibility_edge_transport([platform_input_edge], source="planner") == [platform_input_edge]
+    assert validate_structured_responsibility_edge_transport([platform_output_edge], source="planner") == [platform_output_edge]
+
+    invalid_edges = [
+        {**platform_input_edge, "from_output": "semantic_alpha"},
+        {**platform_output_edge, "to_input": "semantic_alpha"},
+        {**script_edge, "from_node": "platform_output_node"},
+        {**script_edge, "to_node": "platform_input_node"},
+        {"from":"scripts/a.py","to":"scripts/b.py","from_output":"alpha","to_input":"beta","description":"handoff"},
+        None,
+    ]
+    for invalid in invalid_edges:
+        with pytest.raises(ValueError):
+            validate_structured_responsibility_edge_transport(
+                None if invalid is None else [invalid],
+                source="planner",
+            )

@@ -271,7 +271,7 @@
 
 <script setup>
 import { ref, computed, nextTick } from 'vue'
-import { prepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
+import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
 import ThinkingPanel from '../components/ThinkingPanel.vue'
@@ -302,6 +302,7 @@ function formatList(value) {
 const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
+const pendingRequiredCapabilities = ref([])
 const rootUserRequest = ref('')
 const messages = ref([])
 const input = ref('')
@@ -374,19 +375,20 @@ const planningEdges = computed(() => (
 const requiredCapabilityRows = computed(() => {
   const seen = new Set()
   const rows = []
-  for (const item of planningNodes.value) {
-    for (const capability of item.required_capabilities || []) {
-      const name = String(capability || '').trim()
-      if (!name || seen.has(name)) continue
-      seen.add(name)
-      rows.push({
-        name,
-        capability: name,
-        statusText: '正在匹配工具…',
-        statusClass: 'pending',
-        blocking: false,
-      })
-    }
+  const capabilities = pendingRequiredCapabilities.value.length
+    ? pendingRequiredCapabilities.value
+    : planningNodes.value.flatMap(item => item.required_capabilities || [])
+  for (const capability of capabilities) {
+    const name = String(capability || '').trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    rows.push({
+      name,
+      capability: name,
+      statusText: '正在匹配工具…',
+      statusClass: 'pending',
+      blocking: false,
+    })
   }
   return rows
 })
@@ -589,6 +591,8 @@ async function handleQuickAction(value) {
   if (!action.value || streaming.value) return
   // Clear previous quick actions
   quickActions.value = []
+
+  pendingRequiredCapabilities.value = []
   pendingPrepareAction.value = action.prepareAction || 'none'
   if (action.prepareAction === 'request_supplement') {
     input.value = action.value
@@ -738,8 +742,38 @@ async function send() {
       model: null,
     }
 
-    const plan = await prepareCreationPlan(
-      payload
+    const plan = await streamPrepareCreationPlan(
+      payload,
+      event => {
+        if (
+          event.event === 'planner_draft' ||
+          event.event === 'planner_converged'
+        ) {
+          pendingFunctionItems.value = Array.isArray(event.function_items)
+            ? event.function_items
+            : []
+          pendingResponsibilityEdges.value = Array.isArray(event.responsibility_edges)
+            ? event.responsibility_edges
+            : []
+          return
+        }
+        if (event.event === 'graph_resolved') {
+          currentStatus.value = { message: '责任图谱已校验' }
+          return
+        }
+        if (event.event === 'tool_planning') {
+          pendingRequiredCapabilities.value = Array.isArray(event.required_capabilities)
+            ? event.required_capabilities
+            : []
+          return
+        }
+        if (event.event === 'tool_pool_ready') {
+          creationPlan.value = {
+            ...(creationPlan.value || {}),
+            tool_pool_summary: event.tool_pool_summary || {},
+          }
+        }
+      },
     )
 
     if (
@@ -1012,6 +1046,8 @@ function clearChat() {
   pendingFunctionItems.value = []
 
   pendingResponsibilityEdges.value = []
+
+  pendingRequiredCapabilities.value = []
 
   rootUserRequest.value = ''
 

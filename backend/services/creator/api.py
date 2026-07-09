@@ -1,5 +1,6 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
+import asyncio
 import hashlib
 import json
 import math
@@ -8,8 +9,10 @@ import shutil
 import traceback
 
 import httpx
+from fastapi.encoders import jsonable_encoder
+from starlette.responses import StreamingResponse
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from .common import *  # noqa: F403
 from .common import _file_spec_has_substantive_responsibility
@@ -6596,6 +6599,11 @@ constraints must be a JSON array of objects.
 
 Use [] when there is no explicit cross-responsibility constraint.
 
+ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only.
+Every non-platform from_node and to_node must exactly equal one current FunctionItem.target_file.
+References, assets, SKILL.md, configs, and other FilePlan resources are not ResponsibilityGraph nodes.
+Resource usage remains in FilePlan dependencies/references/resource metadata.
+
 Use platform_io_contract as an exact immutable boundary contract.
 
 For every edge whose from_node is platform_input_node:
@@ -6756,12 +6764,13 @@ Only output strict JSON object. Do not output Markdown or explanation.
         )
     if str(data.get("status") or "") != "ready":
         raise ValueError("Planner convergence must return a complete ready plan")
-    normalized_edges = validate_structured_responsibility_edge_transport(
-        data.get("responsibility_edges"),
-        source="planner",
-    )
     normalized_function_items = normalize_structured_function_items(
         data.get("function_items"),
+        source="planner",
+    )
+    normalized_edges = validate_structured_responsibility_edge_transport(
+        data.get("responsibility_edges"),
+        function_items=normalized_function_items,
         source="planner",
     )
     data["function_items"] = normalized_function_items
@@ -6784,6 +6793,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
 
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
+    event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Judge business requirement maturity and produce the provisional blueprint.
 
@@ -7019,13 +7029,17 @@ ResponsibilityEdge owns cross-FunctionItem responsibility transport.
 ResponsibilityGraph nodes are only:
 
 - platform_input_node
-- scripts/**
+- current FunctionItem.target_file values
 - platform_output_node
 
-SKILL.md, references/**, and assets/** are not ResponsibilityGraph nodes.
+ResponsibilityEdges connect FunctionItems and immutable platform boundary nodes only.
+
+References, assets, SKILL.md, configs, and other FilePlan resources are not ResponsibilityGraph nodes.
 
 References and assets may be used by scripts, but cannot become FunctionItems
 and cannot become ResponsibilityEdge endpoints.
+
+Resource usage remains in FilePlan dependencies/references/resource metadata.
 
 Ready Planner JSON must include a top-level responsibility_edges field.
 Ready Planner JSON must include a top-level function_items field.
@@ -7758,12 +7772,19 @@ Blueprint Planner 只规划业务责任。
         try:
             normalized_edges = validate_structured_responsibility_edge_transport(
                 data.get("responsibility_edges"),
+                function_items=normalized_function_items,
                 source="planner",
             )
             if normalized_function_items is not None:
                 normalized_ready_draft = dict(data)
                 normalized_ready_draft["function_items"] = normalized_function_items
                 normalized_ready_draft["responsibility_edges"] = normalized_edges
+                if event_emitter is not None:
+                    await event_emitter({
+                        "event": "planner_draft",
+                        "function_items": normalized_function_items,
+                        "responsibility_edges": normalized_edges,
+                    })
             logger.info(
                 "[Creator][structured_plan][planner_draft] %s",
                 json.dumps({
@@ -7802,6 +7823,12 @@ Blueprint Planner 只规划业务责任。
                     )
                 ),
             )
+            if event_emitter is not None:
+                await event_emitter({
+                    "event": "planner_converged",
+                    "function_items": data.get("function_items") or [],
+                    "responsibility_edges": data.get("responsibility_edges") or [],
+                })
         except Exception as exc:
             if normalized_ready_draft is not None:
                 data = normalized_ready_draft
@@ -8861,13 +8888,10 @@ async def _normalize_script_purpose_short_contracts(
             })
 
 
-@router.post(
-    "/prepare-plan",
-    response_model=PreparePlanResponse,
-)
-async def prepare_plan(
+async def _prepare_plan_impl(
     request: PreparePlanRequest,
-):
+    event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> PreparePlanResponse:
     prepare_action = str(
         request.prepare_action
         or "none"
@@ -9142,8 +9166,15 @@ async def prepare_plan(
     else:
         try:
             prepared = (
-                await _generate_internal_blueprint_or_questions(
-                    request
+                await (
+                    _generate_internal_blueprint_or_questions(
+                        request,
+                        event_emitter=event_emitter,
+                    )
+                    if event_emitter is not None
+                    else _generate_internal_blueprint_or_questions(
+                        request
+                    )
                 )
             )
 
@@ -9618,6 +9649,46 @@ async def prepare_plan(
             ),
         )
 
+    try:
+        if isinstance(prepared, dict) and prepared.get("responsibility_edges") is not None:
+            normalized_function_items = normalize_structured_function_items(
+                prepared.get("function_items"),
+                source="planner",
+            )
+            prepared["function_items"] = normalized_function_items
+            prepared["responsibility_edges"] = validate_structured_responsibility_edge_transport(
+                prepared.get("responsibility_edges"),
+                function_items=normalized_function_items,
+                source="planner",
+            )
+    except Exception as exc:
+        summary = await project_summary(
+            blueprint_text,
+            prepared,
+        )
+        return PreparePlanResponse(
+            status="blocked",
+            prepare_stage="blueprint_protocol_failed",
+            clarifying_questions=[],
+            review_summary=(
+                _strip_prepare_summary_risks(
+                    summary
+                )
+            ),
+            blueprint_text=blueprint_text,
+            skill_name=skill_name,
+            creation_blockers=[
+                _prepare_protocol_issue(
+                    "planner_structured_graph_protocol_failed",
+                    (
+                        "已确认 structured ResponsibilityEdges "
+                        f"违反 endpoint topology protocol：{exc}"
+                    ),
+                    field="responsibility_edges",
+                )
+            ],
+        )
+
     plan = None
 
     analyze_errors: list[
@@ -9939,6 +10010,12 @@ async def prepare_plan(
         )
     )
 
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "graph_resolved",
+            "requirement_graph": graph_payload,
+        })
+
     file_specs_payload = [
         (
             file_spec.model_dump(
@@ -9999,6 +10076,32 @@ async def prepare_plan(
         parents=True,
         exist_ok=True,
     )
+
+    required_capabilities = []
+    seen_required_capabilities = set()
+    for item in (
+        list(getattr(plan, "function_items", []) or [])
+        if hasattr(plan, "function_items")
+        else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
+    ):
+        raw_item = (
+            item.model_dump(mode="json")
+            if hasattr(item, "model_dump")
+            else dict(item)
+            if isinstance(item, dict)
+            else {}
+        )
+        for capability in raw_item.get("required_capabilities") or []:
+            capability_text = str(capability or "").strip()
+            if capability_text and capability_text not in seen_required_capabilities:
+                seen_required_capabilities.add(capability_text)
+                required_capabilities.append(capability_text)
+
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "tool_planning",
+            "required_capabilities": required_capabilities,
+        })
 
     tool_planning = (
         await _plan_final_tool_pool(
@@ -10277,6 +10380,12 @@ async def prepare_plan(
         ],
     }
 
+    if event_emitter is not None:
+        await event_emitter({
+            "event": "tool_pool_ready",
+            "tool_pool_summary": tool_pool_summary,
+        })
+
     return PreparePlanResponse(
         status="ready",
 
@@ -10357,6 +10466,64 @@ async def prepare_plan(
         unselected_uploaded_files=(
             unselected_uploaded_files
         ),
+    )
+
+
+@router.post(
+    "/prepare-plan",
+    response_model=PreparePlanResponse,
+)
+async def prepare_plan(
+    request: PreparePlanRequest,
+):
+    return await _prepare_plan_impl(request)
+
+
+@router.post("/prepare-plan/stream")
+async def prepare_plan_stream(
+    request: PreparePlanRequest,
+):
+    async def emit_ndjson():
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        async def event_emitter(event: dict[str, Any]) -> None:
+            await queue.put(event)
+
+        async def run_prepare() -> None:
+            try:
+                plan = await _prepare_plan_impl(
+                    request,
+                    event_emitter=event_emitter,
+                )
+                await queue.put({
+                    "event": "complete",
+                    "plan": plan,
+                })
+            except Exception as exc:
+                await queue.put({
+                    "event": "error",
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                })
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run_prepare())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield json.dumps(jsonable_encoder(event), ensure_ascii=False) + "\n"
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        emit_ndjson(),
+        media_type="application/x-ndjson",
     )
 
 

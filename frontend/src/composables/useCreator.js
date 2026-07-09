@@ -88,6 +88,51 @@ export async function prepareCreationPlan(payload) {
   return resp.json()
 }
 
+export async function streamPrepareCreationPlan(payload, onEvent) {
+  const resp = await fetch('/api/creator/prepare-plan/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!resp.ok || !resp.body) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }))
+    throw new Error(err.detail || '创建计划准备失败')
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finalPlan = null
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      const event = JSON.parse(line)
+      if (event.event === 'error') {
+        throw new Error(event.error?.message || '创建计划准备失败')
+      }
+      if (event.event === 'complete') {
+        finalPlan = event.plan
+      }
+      if (typeof onEvent === 'function') onEvent(event)
+    }
+  }
+  if (buffer.trim()) {
+    const event = JSON.parse(buffer)
+    if (event.event === 'error') {
+      throw new Error(event.error?.message || '创建计划准备失败')
+    }
+    if (event.event === 'complete') finalPlan = event.plan
+    if (typeof onEvent === 'function') onEvent(event)
+  }
+  if (!finalPlan) throw new Error('创建计划流式响应未返回完整计划')
+  return finalPlan
+}
+
 
 export async function uploadCreatorContextFile({ file, sessionId }) {
   const form = new FormData()

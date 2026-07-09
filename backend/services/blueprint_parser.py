@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings, parse_responsibility_edges, normalize_structured_responsibility_edges
+from .skill_plan import RESOURCE_ROLES, SCRIPT_ROLES, SkillPlan, SkillPlanEntry, build_skill_plan_entry, is_business_capability, is_runtime_artifact_semantic, dependency_is_output_semantic, normalize_skill_plan, validate_file_plan_semantics, skill_plan_field_declaration_warnings, parse_responsibility_edges, normalize_structured_responsibility_edges, normalize_structured_function_items
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -1336,6 +1336,7 @@ def build_skill_plan_from_files(
     files: list[FileSpec],
     warnings: list[str] | None = None,
     blueprint_text: str = "",
+    function_items: object = None,
     responsibility_edges: object = None,
 ) -> SkillPlan:
     """Build the role/contract plan used by Creator generation and validation.
@@ -1355,6 +1356,16 @@ def build_skill_plan_from_files(
                 warning = f"已从 dependencies 移除输出/动态路径 {dep}；dependencies 只能表示输入依赖。"
                 if warning not in plan_warnings:
                     plan_warnings.append(warning)
+
+    structured_function_items = (
+        normalize_structured_function_items(function_items, source="planner")
+        if function_items is not None
+        else None
+    )
+    function_items_by_target = {
+        str(item.get("target_file") or ""): item
+        for item in (structured_function_items or [])
+    }
 
     for file in files:
         if _is_probable_prompt_leaked_script(
@@ -1385,6 +1396,19 @@ def build_skill_plan_from_files(
             blueprint_summary=blueprint_text,
             reference_files=refs_for_file,
         )
+        structured_item = function_items_by_target.get(file.path)
+        if structured_item is not None and file.path.startswith("scripts/"):
+            entry = SkillPlanEntry(
+                **{
+                    **entry.__dict__,
+                    "role": entry.role,
+                    "purpose": str(structured_item.get("purpose") or ""),
+                    "inputs": list(structured_item.get("inputs") or []),
+                    "outputs": list(structured_item.get("outputs") or []),
+                    "required_capabilities": list(structured_item.get("required_capabilities") or []),
+                    "constraints": list(structured_item.get("constraints") or []),
+                }
+            )
 
         # If role classification still says low-confidence generic_script and the
         # filename is placeholder-like, remove it instead of entering repair loops.
@@ -1424,19 +1448,20 @@ def build_skill_plan_from_files(
         if structured_edges_present
         else parse_responsibility_edges(blueprint_text)
     )
-    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, responsibility_edges=edges))
+    normalized = normalize_skill_plan(SkillPlan(skill_name=skill_name, files=entries, warnings=plan_warnings, function_items=list(structured_function_items or []), responsibility_edges=edges))
     semantic_issues = validate_file_plan_semantics(normalized)
     # SkillPlan static I/O consumption is an internal workflow dataflow hint, not
     # a blueprint-stage user-visible warning.  First-round Creator validation
     # only reports platform/file-boundary issues; real script-to-script field
     # availability is checked by second-round E2E execution.
-    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues], responsibility_edges=list(normalized.responsibility_edges or []))
+    return SkillPlan(skill_name=normalized.skill_name, files=normalized.files, warnings=[*normalized.warnings, *semantic_issues], function_items=list(normalized.function_items or []), responsibility_edges=list(normalized.responsibility_edges or []))
 
 
 def parse_blueprint(
     messages: list[dict],
     *,
     strict: bool = False,
+    function_items: object = None,
     responsibility_edges: object = None,
 ) -> BlueprintPlan:
     """Parse a Skill blueprint from conversation history.
@@ -1588,6 +1613,7 @@ def parse_blueprint(
                 blueprint_text
             ),
             responsibility_edges=responsibility_edges,
+            function_items=function_items,
         )
     )
 

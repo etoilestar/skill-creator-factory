@@ -1189,3 +1189,103 @@ def test_validate_structured_responsibility_edge_transport_contract():
                 None if invalid is None else [invalid],
                 source="planner",
             )
+
+
+def _abstract_function_item(target='scripts/a.py', purpose='produce semantic result'):
+    return {
+        'target_file': target,
+        'role': 'worker',
+        'purpose': purpose,
+        'inputs': ['semantic_input'],
+        'outputs': ['semantic_result'],
+        'required_capabilities': ['semantic_capability'],
+        'constraints': [{'name': 'constraint', 'kind': 'generic', 'value': 'concrete_result', 'comparator': 'describes', 'required': True}],
+    }
+
+
+def test_structured_function_items_reject_unknown_fields():
+    from backend.services.skill_plan import normalize_structured_function_items
+    item = _abstract_function_item()
+    item['action_type'] = 'forbidden'
+    with pytest.raises(ValueError, match='unknown_fields'):
+        normalize_structured_function_items([item], source='planner')
+
+
+def test_structured_function_items_reject_duplicate_targets():
+    from backend.services.skill_plan import normalize_structured_function_items
+    with pytest.raises(ValueError, match='duplicate'):
+        normalize_structured_function_items([_abstract_function_item('scripts/a.py'), _abstract_function_item('scripts/a.py')], source='planner')
+
+
+def test_structured_function_items_reject_non_script_targets():
+    from backend.services.skill_plan import normalize_structured_function_items
+    with pytest.raises(ValueError, match='must_start_with_scripts'):
+        normalize_structured_function_items([_abstract_function_item('references/a.md')], source='planner')
+
+
+def test_structured_function_items_require_structured_constraints():
+    from backend.services.skill_plan import normalize_structured_function_items
+    item = _abstract_function_item()
+    item['constraints'] = ['not structured']
+    with pytest.raises(ValueError, match='constraints'):
+        normalize_structured_function_items([item], source='planner')
+
+
+@pytest.mark.asyncio
+async def test_planner_convergence_revises_function_items_and_edges_together(monkeypatch):
+    first_item = _abstract_function_item('scripts/a.py', 'produce semantic result')
+    second_items = [
+        _abstract_function_item('scripts/a.py', 'produce semantic result'),
+        _abstract_function_item('scripts/b.py', 'consume semantic result and produce concrete result'),
+    ]
+    first_edge = {'from_node':'scripts/a.py','from_output':'semantic_result','to_node':'platform_output_node','to_input':'text','purpose':'deliver semantic result','constraints':[]}
+    second_edges = [
+        {'from_node':'scripts/a.py','from_output':'semantic_result','to_node':'scripts/b.py','to_input':'semantic_input','purpose':'handoff semantic result','constraints':[]},
+        {'from_node':'scripts/b.py','from_output':'semantic_result','to_node':'platform_output_node','to_input':'text','purpose':'deliver concrete result','constraints':[]},
+    ]
+    responses = iter([
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'draft','skill_name':'demo','blockers':[],'function_items':[first_item],'responsibility_edges':[first_edge]},
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'revised','skill_name':'demo','blockers':[],'function_items':second_items,'responsibility_edges':second_edges},
+    ])
+    async def fake_complete(*args, **kwargs):
+        import json
+        return json.dumps(next(responses))
+    monkeypatch.setattr(api, 'complete_chat_once', fake_complete)
+    monkeypatch.setattr(api, 'route_model', lambda *a, **k: type('R', (), {'model':'planner'})())
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result['function_items'] == second_items
+    assert result['responsibility_edges'] == second_edges
+
+
+@pytest.mark.asyncio
+async def test_ready_planner_requires_structured_function_items(monkeypatch):
+    edge = {'from_node':'scripts/a.py','from_output':'semantic_result','to_node':'platform_output_node','to_input':'text','purpose':'deliver','constraints':[]}
+    revised_item = _abstract_function_item('scripts/a.py')
+    responses = iter([
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'draft','skill_name':'demo','blockers':[],'responsibility_edges':[edge]},
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'revised','skill_name':'demo','blockers':[],'function_items':[revised_item],'responsibility_edges':[edge]},
+    ])
+    async def fake_complete(*args, **kwargs):
+        import json
+        return json.dumps(next(responses))
+    monkeypatch.setattr(api, 'complete_chat_once', fake_complete)
+    monkeypatch.setattr(api, 'route_model', lambda *a, **k: type('R', (), {'model':'planner'})())
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result['function_items'] == [revised_item]
+
+
+@pytest.mark.asyncio
+async def test_ready_planner_null_function_items_runs_same_convergence(monkeypatch):
+    edge = {'from_node':'scripts/a.py','from_output':'semantic_result','to_node':'platform_output_node','to_input':'text','purpose':'deliver','constraints':[]}
+    revised_item = _abstract_function_item('scripts/a.py')
+    responses = iter([
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'draft','skill_name':'demo','blockers':[],'function_items':None,'responsibility_edges':[edge]},
+        {'status':'ready','clarifying_questions':[],'review_summary':{},'internal_blueprint_text':'revised','skill_name':'demo','blockers':[],'function_items':[revised_item],'responsibility_edges':[edge]},
+    ])
+    async def fake_complete(*args, **kwargs):
+        import json
+        return json.dumps(next(responses))
+    monkeypatch.setattr(api, 'complete_chat_once', fake_complete)
+    monkeypatch.setattr(api, 'route_model', lambda *a, **k: type('R', (), {'model':'planner'})())
+    result = await api._generate_internal_blueprint_or_questions(_request())
+    assert result['function_items'] == [revised_item]

@@ -1774,3 +1774,47 @@ def test_producer_prompt_includes_real_local_edge_context():
     assert "outgoing_edges" in prompt_text
     assert "carry upstream result with model-owned meaning" in prompt_text
     assert "alpha" in prompt_text
+
+
+def test_structured_function_items_override_blueprint_script_responsibility_text():
+    from backend.services.blueprint_parser import FileSpec, build_skill_plan_from_files
+    structured = [{
+        'target_file': 'scripts/a.py',
+        'role': 'structured_role',
+        'purpose': 'structured purpose',
+        'inputs': ['semantic_input'],
+        'outputs': ['semantic_result'],
+        'required_capabilities': ['semantic_capability'],
+        'constraints': [{'name': 'c', 'kind': 'generic', 'value': 'concrete_result', 'comparator': 'describes', 'required': True}],
+    }]
+    plan = build_skill_plan_from_files(
+        skill_name='demo',
+        files=[FileSpec(path='scripts/a.py', purpose='markdown purpose')],
+        blueprint_text='purpose: markdown purpose\ninputs: [stale]\noutputs: [stale]',
+        function_items=structured,
+        responsibility_edges=[],
+    )
+    entry = next(item for item in plan.files if item.path == 'scripts/a.py')
+    assert entry.purpose == 'structured purpose'
+    assert entry.inputs == ['semantic_input']
+    assert entry.outputs == ['semantic_result']
+    assert entry.required_capabilities == ['semantic_capability']
+    assert entry.constraints == structured[0]['constraints']
+
+
+def test_responsibility_graph_uses_structured_function_items_directly():
+    structured = [{
+        'target_file': 'scripts/a.py',
+        'role': 'structured_role',
+        'purpose': 'structured purpose',
+        'inputs': ['semantic_input'],
+        'outputs': ['semantic_result'],
+        'required_capabilities': ['semantic_capability'],
+        'constraints': [],
+    }]
+    graph = build_default_requirement_graph([_script_spec(path='scripts/a.py', purpose='file purpose')], responsibility_edges=[], function_items=structured)
+    item = graph.function_items[0]
+    assert item.purpose == 'structured purpose'
+    assert item.inputs == ['semantic_input']
+    assert item.outputs == ['semantic_result']
+    assert item.required_tools == ['semantic_capability']

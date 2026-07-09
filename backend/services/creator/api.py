@@ -6458,7 +6458,7 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
         if path in script_items_by_target:
             rendered_blocks.append(overlay_function_item_fields(block, script_items_by_target[path]))
             emitted.add(path)
-        else:
+        elif not path.startswith("scripts/"):
             rendered_blocks.append(block)
     for target, item in script_items_by_target.items():
         if target not in emitted:

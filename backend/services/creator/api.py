@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 import shutil
 import traceback
 
@@ -17,7 +18,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..skill_plan import normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
+from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
 from .tool_pool_store import (
@@ -4641,6 +4642,7 @@ class PreparePlanRequest(BaseModel):
     prepare_action: Literal["none", "confirm", "request_supplement", "submit_supplement"] = "none"
     model: str | None = None
     responsibility_edges: list[dict[str, Any]] | None = None
+    function_items: list[dict[str, Any]] | None = None
 
 
 class PreparePlanReviewSummary(BaseModel):
@@ -4685,6 +4687,7 @@ class PreparePlanResponse(BaseModel):
 
     blueprint_text: str = ""
     skill_name: str = ""
+    function_items: list[dict[str, Any]] = Field(default_factory=list)
     responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
 
     files: list[FileSpecOut] = Field(
@@ -6346,6 +6349,103 @@ def _responsibility_edge_endpoint_pairs(edges: object) -> list[list[object]]:
     return pairs
 
 
+def _render_structured_responsibility_view(blueprint_text: str, function_items: list[dict[str, Any]], responsibility_edges: list[dict[str, Any]]) -> str:
+    if not function_items:
+        return blueprint_text
+    text = str(blueprint_text or "").rstrip()
+    targets = [str(item.get("target_file") or "").strip() for item in function_items if str(item.get("target_file") or "").strip()]
+    target_set = set(targets)
+    before: dict[str, set[str]] = {target: set() for target in targets}
+    for edge in responsibility_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        from_node = str(edge.get("from_node") or "").strip()
+        to_node = str(edge.get("to_node") or "").strip()
+        if from_node in target_set and to_node in target_set and from_node != to_node:
+            before[to_node].add(from_node)
+
+    item_by_target = {str(item.get("target_file") or "").strip(): item for item in function_items}
+    ordered_targets: list[str] = []
+    ready = [target for target in targets if not before.get(target)]
+    while ready:
+        target = ready.pop(0)
+        if target in ordered_targets:
+            continue
+        ordered_targets.append(target)
+        for downstream in targets:
+            if target in before.get(downstream, set()):
+                before[downstream].discard(target)
+                if not before[downstream] and downstream not in ordered_targets and downstream not in ready:
+                    ready.append(downstream)
+    ordered_targets.extend(target for target in targets if target not in ordered_targets)
+    ordered_function_items = [item_by_target[target] for target in ordered_targets if target in item_by_target]
+
+    workflow_lines = ["### 工作流逻辑"]
+    for index, item in enumerate(ordered_function_items, start=1):
+        workflow_lines.append(f"{index}. {str(item.get('purpose') or '').strip()}")
+
+    script_blocks_by_target: dict[str, list[str]] = {}
+    for item in ordered_function_items:
+        target = str(item.get("target_file") or "").strip()
+        if not target:
+            continue
+        script_blocks_by_target[target] = [
+            f"- path: `{target}`",
+            f"  role: {str(item.get('role') or '').strip()}",
+            f"  purpose: {str(item.get('purpose') or '').strip()}",
+            "  inputs: " + json.dumps(item.get("inputs") or [], ensure_ascii=False),
+            "  outputs: " + json.dumps(item.get("outputs") or [], ensure_ascii=False),
+            "  required_capabilities: " + json.dumps(item.get("required_capabilities") or [], ensure_ascii=False),
+            "  constraints: " + json.dumps(item.get("constraints") or [], ensure_ascii=False, default=str),
+        ]
+
+    def replace_section(source: str, heading: str, replacement_lines: list[str]) -> str:
+        pattern = re.compile(rf"(?ms)^### {re.escape(heading)}\s*$.*?(?=^### |\Z)")
+        replacement = "\n".join(replacement_lines).rstrip() + "\n"
+        if pattern.search(source):
+            return pattern.sub(replacement, source, count=1)
+        return source.rstrip() + "\n" + replacement
+
+    text = replace_section(text, "工作流逻辑", workflow_lines)
+
+    skillplan_pattern = re.compile(r"(?ms)^### SkillPlan / 文件职责计划\s*$.*?(?=^### |\Z)")
+    skillplan_match = skillplan_pattern.search(text)
+    existing_blocks: list[tuple[str, str]] = []
+    if skillplan_match:
+        body = skillplan_match.group(0).split("\n", 1)[1] if "\n" in skillplan_match.group(0) else ""
+        for block_match in re.finditer(r"(?ms)^- path:\s*`?([^`\n]+)`?.*?(?=^- path:|\Z)", body):
+            path = str(block_match.group(1) or "").strip()
+            block = block_match.group(0).rstrip()
+            if path:
+                existing_blocks.append((path, block))
+
+    rendered_blocks: list[str] = []
+    emitted: set[str] = set()
+    for path, block in existing_blocks:
+        if path in script_blocks_by_target:
+            rendered_blocks.append("\n".join(script_blocks_by_target[path]))
+            emitted.add(path)
+        elif not path.startswith("scripts/"):
+            rendered_blocks.append(block)
+    for target, block_lines in script_blocks_by_target.items():
+        if target not in emitted:
+            rendered_blocks.append("\n".join(block_lines))
+
+    skillplan_lines = ["### SkillPlan / 文件职责计划", *rendered_blocks]
+    text = replace_section(text, "SkillPlan / 文件职责计划", skillplan_lines)
+    return text.rstrip() + "\n"
+
+
+def _structured_plan_review_summary(prepared: dict[str, Any], fallback: PreparePlanReviewSummary | None = None) -> PreparePlanReviewSummary:
+    function_items = list(prepared.get("function_items") or [])
+    if not function_items:
+        return fallback or _coerce_prepare_summary(prepared.get("review_summary"))
+    base = fallback or _coerce_prepare_summary(prepared.get("review_summary"))
+    base.workflow = [str(item.get("purpose") or "") for item in function_items if str(item.get("purpose") or "").strip()]
+    base.files_to_create_or_update = [str(item.get("target_file") or "") for item in function_items if str(item.get("target_file") or "").strip()]
+    return base
+
+
 async def _converge_ready_executable_plan(
     *,
     request: PreparePlanRequest,
@@ -6361,12 +6461,15 @@ async def _converge_ready_executable_plan(
     """
 
     draft_edges = list(current_planner_result.get("responsibility_edges") or [])
+    draft_function_items = list(current_planner_result.get("function_items") or [])
     logger.info(
         "[Creator][planner_convergence][draft] %s",
         json.dumps({
             "event": "creator_planner_convergence_draft",
             "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
             "draft_edge_count": len(draft_edges),
+            "draft_function_item_count": len(draft_function_items),
+            "draft_targets": [item.get("target_file") for item in draft_function_items if isinstance(item, dict)],
             "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges),
         }, ensure_ascii=False, default=str),
     )
@@ -6376,6 +6479,7 @@ async def _converge_ready_executable_plan(
             "event": "creator_planner_convergence_draft_transport",
             "skill_name": str(current_planner_result.get("skill_name") or request.skill_name or ""),
             "draft_edge_count": len(draft_edges),
+            "draft_function_item_count": len(draft_function_items),
             "draft_transport_valid": not bool(draft_transport_error),
             "draft_transport_error": draft_transport_error,
             "draft_endpoint_pairs": _responsibility_edge_endpoint_pairs(draft_edges) if not draft_transport_error else [],
@@ -6394,7 +6498,6 @@ Preserve:
 - user goal;
 - required final outputs;
 - confirmed core actions;
-- chosen workflow intent.
 
 Do not add a new business requirement.
 Do not remove a confirmed business requirement.
@@ -6402,9 +6505,24 @@ Do not simplify the goal to fit tools.
 Do not reconsider tool availability.
 Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
 
-Your only task is to make the emitted executable plan internally consistent.
+Your first task is requirement fidelity: keep the executable plan aligned with the exact user request and confirmed decisions.
+Your second task is internal consistency: make FunctionItems, ResponsibilityEdges, and Blueprint view describe the same plan.
+Planner-derived FunctionItems, workflow, topology, and edges may be changed when required for requirement fidelity or consistency.
 
 ResponsibilityEdge transport schema is exact.
+
+FunctionItems and ResponsibilityEdges are two parts of one executable responsibility plan.
+Do not revise FunctionItems and ResponsibilityEdges independently.
+First finalize the FunctionItem set.
+Then replay ResponsibilityEdges against those exact FunctionItems.
+If a responsibility is missing, revise function_items and responsibility_edges together.
+If a FunctionItem is added, removed, or changed, revise affected ResponsibilityEdges in the same response.
+Return one complete revised executable plan.
+
+Every function_items item must be a JSON object with exactly:
+target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
+target_file must be scripts/**. inputs, outputs, required_capabilities must be string arrays.
+constraints must be a JSON array of objects.
 
 Every responsibility_edges item must be a JSON object
 with exactly these transport fields:
@@ -6492,7 +6610,7 @@ If the emitted plan declares that execution requires no business input, do not i
 If a script uses a default or internal configuration value, do not model that default as a semantic result transported from an unrelated platform input slot.
 
 Do not merely describe a detected inconsistency.
-Revise internal_blueprint_text and responsibility_edges so the returned plan is internally consistent.
+Revise function_items, responsibility_edges, and internal_blueprint_text so the returned plan is internally consistent.
 
 Return the complete Planner response with the same schema:
 {
@@ -6502,6 +6620,7 @@ Return the complete Planner response with the same schema:
   "internal_blueprint_text": "...",
   "skill_name": "...",
   "blockers": [],
+  "function_items": [...],
   "responsibility_edges": [...]
 }
 Only output strict JSON object. Do not output Markdown or explanation.
@@ -6514,6 +6633,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "platform_io_contract": platform_io_contract_prompt_text(),
         "confirmed_decision_context": {
             "conversation_history": request.conversation_history,
+            "user_request": request.user_request,
             "human_feedback": request.human_feedback,
             "previous_blueprint_text": request.previous_blueprint_text,
             "skill_name": request.skill_name,
@@ -6538,11 +6658,20 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "internal_blueprint_text",
         "skill_name",
         "blockers",
+        "function_items",
         "responsibility_edges",
     }
+    if "function_items" not in data:
+        raise ValueError(
+            "Planner convergence ready response must explicitly include function_items"
+        )
     if "responsibility_edges" not in data:
         raise ValueError(
             "Planner convergence ready response must explicitly include responsibility_edges"
+        )
+    if data.get("function_items") is None:
+        raise ValueError(
+            "Planner convergence ready response function_items must not be null"
         )
     if data.get("responsibility_edges") is None:
         raise ValueError(
@@ -6583,6 +6712,8 @@ Only output strict JSON object. Do not output Markdown or explanation.
         invalid_transport_fields.append("skill_name")
     if not isinstance(data.get("blockers"), list):
         invalid_transport_fields.append("blockers")
+    if not isinstance(data.get("function_items"), list):
+        invalid_transport_fields.append("function_items")
     if not isinstance(data.get("responsibility_edges"), list):
         invalid_transport_fields.append("responsibility_edges")
     if invalid_transport_fields:
@@ -6596,6 +6727,11 @@ Only output strict JSON object. Do not output Markdown or explanation.
         data.get("responsibility_edges"),
         source="planner",
     )
+    normalized_function_items = normalize_structured_function_items(
+        data.get("function_items"),
+        source="planner",
+    )
+    data["function_items"] = normalized_function_items
     data["responsibility_edges"] = normalized_edges
     logger.info(
         "[Creator][planner_convergence][result] %s",
@@ -6603,6 +6739,10 @@ Only output strict JSON object. Do not output Markdown or explanation.
             "event": "creator_planner_convergence_result",
             "skill_name": str(data.get("skill_name") or request.skill_name or ""),
             "final_edge_count": len(normalized_edges),
+            "draft_function_item_count": len(draft_function_items),
+            "final_function_item_count": len(normalized_function_items),
+            "draft_targets": [item.get("target_file") for item in draft_function_items if isinstance(item, dict)],
+            "final_targets": [item.get("target_file") for item in normalized_function_items],
             "final_endpoint_pairs": _responsibility_edge_endpoint_pairs(normalized_edges),
             "constraint_count": sum(len(edge.get("constraints") or []) for edge in normalized_edges),
         }, ensure_ascii=False, default=str),
@@ -6649,12 +6789,14 @@ async def _generate_internal_blueprint_or_questions(
 
 1. 判断业务需求是否已经足够明确；
 2. 信息不足时提出一个真正阻塞创建计划的业务问题；
-3. 信息足够时生成 provisional internal_blueprint_text；
-4. 在 provisional blueprint 中确定合理的 script topology 和文件职责边界。
+3. 信息足够时先生成 structured executable plan；
+4. 在同一次 Planner response 中同步输出 function_items、responsibility_edges 与 internal_blueprint_text。
 
-internal_blueprint_text is display/review text. The shared executable plan source of truth is the same structured response: SkillPlan FunctionItems in internal_blueprint_text plus top-level responsibility_edges.
+Top-level function_items and responsibility_edges together are the structured executable plan source of truth.
+internal_blueprint_text is the human-readable Blueprint view of that same structured executable plan.
+The Blueprint must not define a second independent script-responsibility model.
 
-Top-level responsibility_edges is Creator-owned graph transport and must be emitted as structured JSON, not recovered from internal_blueprint_text.
+Top-level function_items and responsibility_edges are Creator-owned graph transport and must be emitted as structured JSON, not recovered from internal_blueprint_text.
 
 review_summary 只是同一响应中的临时展示摘要。
 后端不会使用 review_summary 重建蓝图。
@@ -6853,6 +6995,9 @@ References and assets may be used by scripts, but cannot become FunctionItems
 and cannot become ResponsibilityEdge endpoints.
 
 Ready Planner JSON must include a top-level responsibility_edges field.
+Ready Planner JSON must include a top-level function_items field.
+When status=ready, function_items must be a JSON array of objects.
+When status=needs_clarification, function_items must be [].
 When status=ready, responsibility_edges must be a JSON array of objects.
 When status=needs_clarification, responsibility_edges must be [].
 internal_blueprint_text may also display a ### ResponsibilityEdges section for human review, but that display text is not the graph transport source of truth.
@@ -6863,6 +7008,25 @@ constraints is a JSON array of objects. Legal empty constraints: []. Illegal: co
 Example constraint object: {"name":"custom_requirement","kind":"workflow_requirement","value":"arbitrary model-owned semantic requirement","comparator":"describes","required":true}.
 
 Top-level responsibility_edges: [{"from_node":"platform_input_node","from_output":"semantic input name","to_node":"scripts/a.py","to_input":"semantic input name","purpose":"Describe why this result is transported to the downstream responsibility.","constraints":[]},{"from_node":"scripts/a.py","from_output":"semantic result name","to_node":"scripts/b.py","to_input":"semantic input name","purpose":"Describe the cross-responsibility handoff.","constraints":[]}]
+
+Top-level function_items: [{"target_file":"scripts/a.py","role":"...","purpose":"...","inputs":[],"outputs":[],"required_capabilities":[],"constraints":[]}]
+
+function_items and responsibility_edges are two parts of one executable responsibility plan.
+You must plan them together in the same response.
+Do not first produce a Blueprint and later infer FunctionItems.
+Do not plan ResponsibilityEdges as an independent graph.
+FunctionItems are the responsibility nodes.
+ResponsibilityEdges connect results produced and consumed by those exact FunctionItems.
+
+Planning order:
+1. Understand the confirmed requirement.
+2. Identify the concrete results that must actually exist.
+3. Identify executable responsibility closures.
+4. Emit the FunctionItems that own those responsibilities.
+5. Define each FunctionItem's inputs, produced results, required capabilities, and constraints.
+6. Connect those exact FunctionItems using ResponsibilityEdges.
+7. Trace the required final result to platform_output_node.
+8. Render the Blueprint view from that same plan.
 
 ## read-only platform boundary contract
 
@@ -7230,6 +7394,7 @@ E. final delivery closure
   "internal_blueprint_text": "status=ready 时填写 provisional Skill 架构蓝图",
   "skill_name": "可选",
   "blockers": [],
+  "function_items": [],
   "responsibility_edges": []
 }
 
@@ -7528,8 +7693,15 @@ Blueprint Planner 只规划业务责任。
     status = str(data.get("status") or "").strip()
     normalized_ready_draft: dict[str, Any] | None = None
     draft_edge_error: Exception | None = None
+    draft_function_item_error: Exception | None = None
 
     if status == "needs_clarification":
+        if data.get("function_items") is None:
+            data["function_items"] = []
+        data["function_items"] = normalize_structured_function_items(
+            data.get("function_items"),
+            source="planner",
+        )
         if data.get("responsibility_edges") is None:
             data["responsibility_edges"] = []
         normalized_edges = normalize_structured_responsibility_edges(
@@ -7538,18 +7710,34 @@ Blueprint Planner 只规划业务责任。
         )
         data["responsibility_edges"] = normalized_edges
     elif status == "ready":
+        normalized_function_items = None
+        try:
+            if "function_items" not in data:
+                raise ValueError("planner.function_items must be explicitly present")
+            if data.get("function_items") is None:
+                raise ValueError("planner.function_items must not be null")
+            normalized_function_items = normalize_structured_function_items(
+                data.get("function_items"),
+                source="planner",
+            )
+        except Exception as exc:
+            draft_function_item_error = exc
         try:
             normalized_edges = validate_structured_responsibility_edge_transport(
                 data.get("responsibility_edges"),
                 source="planner",
             )
-            normalized_ready_draft = dict(data)
-            normalized_ready_draft["responsibility_edges"] = normalized_edges
+            if normalized_function_items is not None:
+                normalized_ready_draft = dict(data)
+                normalized_ready_draft["function_items"] = normalized_function_items
+                normalized_ready_draft["responsibility_edges"] = normalized_edges
             logger.info(
-                "[Creator][responsibility_edges][planner_result] %s",
+                "[Creator][structured_plan][planner_draft] %s",
                 json.dumps({
-                    "event": "creator_responsibility_edges_planner_result",
+                    "event": "creator_structured_plan_planner_draft",
                     "skill_name": str(data.get("skill_name") or request.skill_name or ""),
+                    "function_item_count": len(normalized_function_items or []),
+                    "function_item_targets": [item.get("target_file") for item in (normalized_function_items or [])],
                     "edge_count": len(normalized_edges),
                     "endpoint_pairs": [
                         [edge.get("from_node"), edge.get("to_node")]
@@ -7572,9 +7760,13 @@ Blueprint Planner 只规划业务责任。
                 current_planner_result=convergence_input,
                 planner_model=route.model,
                 draft_transport_error=(
-                    str(draft_edge_error)
-                    if draft_edge_error is not None
-                    else ""
+                    "; ".join(
+                        part for part in [
+                            f"function_items: {draft_function_item_error}" if draft_function_item_error is not None else "",
+                            f"responsibility_edges: {draft_edge_error}" if draft_edge_error is not None else "",
+                        ]
+                        if part
+                    )
                 ),
             )
         except Exception as exc:
@@ -8145,6 +8337,7 @@ async def _extract_requirement_graph_with_validator(
     warnings: list[dict[str, Any]] | None = None,
     workflow_allocation_summary: str = "",
     responsibility_edges: list[dict[str, Any]] | None = None,
+    function_items: list[dict[str, Any]] | None = None,
 ) -> RequirementGraph:
     """Build the deterministic RequirementGraph from normalized FileSpecs.
 
@@ -8155,7 +8348,7 @@ async def _extract_requirement_graph_with_validator(
     """
     _ = (blueprint_text, requested_model, warnings, workflow_allocation_summary)
     return validate_requirement_graph_schema(
-        build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges),
+        build_default_requirement_graph(files_out, responsibility_edges=responsibility_edges, function_items=function_items),
         files_out,
     )
 
@@ -8713,6 +8906,28 @@ async def prepare_plan(
             current_blueprint_text,
             current_prepared,
         )
+        function_items = (
+            normalize_structured_function_items((current_prepared or {}).get("function_items"), source="planner")
+            if isinstance(current_prepared, dict) and current_prepared.get("function_items") is not None
+            else []
+        )
+        responsibility_edges = (
+            normalize_structured_responsibility_edges(
+                (current_prepared or {}).get("responsibility_edges"),
+                source="planner",
+            )
+            if isinstance(current_prepared, dict) and current_prepared.get("responsibility_edges") is not None
+            else []
+        )
+        projected = _structured_plan_review_summary(
+            {"function_items": function_items, "review_summary": (current_prepared or {}).get("review_summary") if isinstance(current_prepared, dict) else {}},
+            projected,
+        )
+        current_blueprint_text = _render_structured_responsibility_view(
+            current_blueprint_text,
+            function_items,
+            responsibility_edges,
+        )
 
         return PreparePlanResponse(
             status="needs_clarification",
@@ -8737,13 +8952,9 @@ async def prepare_plan(
                 current_skill_name
             ),
 
+            function_items=function_items,
             responsibility_edges=(
-                normalize_structured_responsibility_edges(
-                    (current_prepared or {}).get("responsibility_edges"),
-                    source="planner",
-                )
-                if isinstance(current_prepared, dict) and current_prepared.get("responsibility_edges") is not None
-                else []
+                responsibility_edges
             ),
         )
 
@@ -8779,6 +8990,16 @@ async def prepare_plan(
 
             skill_name=(
                 skill_name
+            ),
+
+            function_items=(
+                request.function_items
+                or []
+            ),
+
+            responsibility_edges=(
+                request.responsibility_edges
+                or []
             ),
         )
 
@@ -8825,6 +9046,23 @@ async def prepare_plan(
                 ],
             )
 
+        if request.function_items is None:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=PreparePlanReviewSummary(),
+                blueprint_text=previous_blueprint_text,
+                skill_name=skill_name,
+                creation_blockers=[
+                    _prepare_protocol_issue(
+                        "missing_structured_function_items",
+                        "用户确认创建要点时缺少 structured function_items；Creator 不允许从 blueprint text legacy fallback 恢复 ready graph。",
+                        field="function_items",
+                    )
+                ],
+            )
+
         if request.responsibility_edges is None:
             return PreparePlanResponse(
                 status="blocked",
@@ -8850,6 +9088,7 @@ async def prepare_plan(
             ),
 
             "skill_name": skill_name,
+            "function_items": request.function_items,
 
             "responsibility_edges": (
                 request.responsibility_edges
@@ -10012,6 +10251,12 @@ async def prepare_plan(
 
         skill_name=plan.skill_name,
 
+        function_items=(
+            list(getattr(plan, "function_items", []) or [])
+            if hasattr(plan, "function_items")
+            else list(getattr(getattr(plan, "skill_plan", None), "function_items", []) or [])
+        ),
+
         responsibility_edges=(
             list(getattr(plan, "responsibility_edges", []) or [])
             if hasattr(plan, "responsibility_edges")
@@ -10079,7 +10324,7 @@ async def prepare_plan(
 @router.post("/analyze-blueprint", response_model=AnalyzeBlueprintResponse)
 async def analyze_blueprint(request: AnalyzeBlueprintRequest):
     try:
-        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict, responsibility_edges=request.responsibility_edges)
+        plan: BlueprintPlan = parse_blueprint(request.messages, strict=request.strict, function_items=request.function_items, responsibility_edges=request.responsibility_edges)
     except BlueprintShapeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -10339,7 +10584,12 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         ),
     })
     structured_planner_edges = list(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else [])
-    fallback_requirement_graph = build_default_requirement_graph(files_out)
+    structured_planner_function_items = list(getattr(plan.skill_plan, "function_items", []) if plan.skill_plan else [])
+    fallback_requirement_graph = build_default_requirement_graph(
+        files_out,
+        responsibility_edges=structured_planner_edges,
+        function_items=structured_planner_function_items or None,
+    )
     graph_fallback_used = False
     try:
         requirement_graph = await _extract_requirement_graph_with_validator(
@@ -10349,6 +10599,7 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
             warnings=warnings,
             workflow_allocation_summary=workflow_allocation_summary,
             responsibility_edges=(getattr(plan.skill_plan, "responsibility_edges", []) if plan.skill_plan else []),
+            function_items=structured_planner_function_items or None,
         )
     except RequirementGraphValidationError as exc:
         graph_fallback_used = True
@@ -10368,6 +10619,8 @@ async def analyze_blueprint(request: AnalyzeBlueprintRequest):
         json.dumps({
             "event": "creator_responsibility_graph_resolved",
             "function_item_count": len(getattr(requirement_graph, "function_items", []) or []),
+            "structured_function_item_count": len(structured_planner_function_items),
+            "graph_function_item_count": len(getattr(requirement_graph, "function_items", []) or []),
             "edge_count": len(edge_list_for_log),
             "fallback_used": graph_fallback_used,
             "incoming_edge_count_by_script": {

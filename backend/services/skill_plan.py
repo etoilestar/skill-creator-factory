@@ -305,7 +305,92 @@ class SkillPlan:
     skill_name: str
     files: list[SkillPlanEntry] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    function_items: list[dict[str, object]] = field(default_factory=list)
     responsibility_edges: list[dict[str, object]] = field(default_factory=list)
+
+
+_ALLOWED_FUNCTION_ITEM_FIELDS = {
+    "target_file",
+    "role",
+    "purpose",
+    "inputs",
+    "outputs",
+    "required_capabilities",
+    "constraints",
+}
+
+
+def _normalize_string_array(value: object, *, source: str, index: int, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{source}.function_items[{index}].{field} must be a string array")
+    return [item for item in value]
+
+
+def normalize_structured_function_items(raw_items: object, *, source: str = "planner") -> list[dict[str, object]]:
+    """Normalize structured planner FunctionItems without semantic repair."""
+    if not isinstance(raw_items, list):
+        raise ValueError(f"{source}.function_items must be a list")
+    normalized: list[dict[str, object]] = []
+    seen_targets: set[str] = set()
+    invalid: list[dict[str, object]] = []
+    required = set(_ALLOWED_FUNCTION_ITEM_FIELDS)
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            invalid.append({"index": index, "type": type(item).__name__})
+            continue
+        unknown = sorted(str(key) for key in item.keys() if key not in _ALLOWED_FUNCTION_ITEM_FIELDS)
+        missing = sorted(required - set(item.keys()))
+        if unknown or missing:
+            issue: dict[str, object] = {"index": index}
+            if unknown:
+                issue["unknown_fields"] = unknown
+            if missing:
+                issue["missing_fields"] = missing
+            invalid.append(issue)
+            continue
+        target_file = item.get("target_file")
+        role = item.get("role")
+        purpose = item.get("purpose")
+        if not isinstance(target_file, str) or not target_file.strip():
+            invalid.append({"index": index, "field": "target_file"})
+            continue
+        target = target_file.strip()
+        if not target.startswith("scripts/"):
+            invalid.append({"index": index, "field": "target_file", "target_file": target, "reason": "must_start_with_scripts/"})
+            continue
+        if target in seen_targets:
+            invalid.append({"index": index, "field": "target_file", "target_file": target, "reason": "duplicate"})
+            continue
+        if not isinstance(role, str):
+            invalid.append({"index": index, "field": "role"})
+            continue
+        if not isinstance(purpose, str) or not purpose.strip():
+            invalid.append({"index": index, "field": "purpose"})
+            continue
+        try:
+            inputs = _normalize_string_array(item.get("inputs"), source=source, index=index, field="inputs")
+            outputs = _normalize_string_array(item.get("outputs"), source=source, index=index, field="outputs")
+            required_capabilities = _normalize_string_array(item.get("required_capabilities"), source=source, index=index, field="required_capabilities")
+        except ValueError as exc:
+            invalid.append({"index": index, "error": str(exc)})
+            continue
+        constraints = item.get("constraints")
+        if not isinstance(constraints, list) or not all(isinstance(constraint, dict) for constraint in constraints):
+            invalid.append({"index": index, "field": "constraints"})
+            continue
+        seen_targets.add(target)
+        normalized.append({
+            "target_file": target,
+            "role": role,
+            "purpose": purpose.strip(),
+            "inputs": inputs,
+            "outputs": outputs,
+            "required_capabilities": required_capabilities,
+            "constraints": [dict(constraint) for constraint in constraints],
+        })
+    if invalid:
+        raise ValueError(f"{source}.function_items contains invalid function items: {invalid}")
+    return normalized
 
 
 
@@ -2069,6 +2154,7 @@ def normalize_skill_plan(
         files=entries,
 
         warnings=warnings,
+        function_items=list(plan.function_items or []),
         responsibility_edges=list(plan.responsibility_edges or []),
     )
 

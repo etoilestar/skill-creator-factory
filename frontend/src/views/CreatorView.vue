@@ -229,6 +229,7 @@ function actionLabel(action) {
 }
 
 const pendingBlueprintText = ref('')
+const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
 const rootUserRequest = ref('')
 const messages = ref([])
@@ -513,6 +514,12 @@ async function send() {
         []
       ),
 
+      function_items: (
+        creationPlan.value?.function_items ||
+        pendingFunctionItems.value ||
+        []
+      ),
+
       human_feedback: (
         humanFeedback
       ),
@@ -543,6 +550,10 @@ async function send() {
 
     if (Array.isArray(plan.responsibility_edges)) {
       pendingResponsibilityEdges.value = plan.responsibility_edges
+    }
+
+    if (Array.isArray(plan.function_items)) {
+      pendingFunctionItems.value = plan.function_items
     }
 
     if (plan.skill_name) {
@@ -701,6 +712,12 @@ async function send() {
         : pendingResponsibilityEdges.value
     )
 
+    pendingFunctionItems.value = (
+      Array.isArray(plan.function_items)
+        ? plan.function_items
+        : pendingFunctionItems.value
+    )
+
     skillName.value = (
       plan.skill_name ||
       currentSkillName
@@ -788,6 +805,8 @@ function clearChat() {
   selectedExistingSkillName.value = ''
 
   pendingBlueprintText.value = ''
+
+  pendingFunctionItems.value = []
 
   pendingResponsibilityEdges.value = []
 

@@ -8991,6 +8991,16 @@ async def prepare_plan(
             skill_name=(
                 skill_name
             ),
+
+            function_items=(
+                request.function_items
+                or []
+            ),
+
+            responsibility_edges=(
+                request.responsibility_edges
+                or []
+            ),
         )
 
     if confirmed_prepare:

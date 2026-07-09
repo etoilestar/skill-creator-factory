@@ -328,10 +328,19 @@ async def test_prepare_action_request_supplement_ignores_a_text_and_skips_analyz
         raise AssertionError("model should not run while waiting for supplement text")
     monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
     feedback = "问题：以上创建要点是否还需要补充？A. 没有，按这些要点继续 B. 有，我补充说明\n选择：B. 有，我补充说明"
-    resp = await api.prepare_plan(_request(human_feedback=feedback, prepare_action="request_supplement"))
+    function_items = [_abstract_function_item("scripts/a.py")]
+    responsibility_edges = [{"from_node":"scripts/a.py","from_output":"semantic_result","to_node":"platform_output_node","to_input":"text","purpose":"deliver","constraints":[]}]
+    resp = await api.prepare_plan(_request(
+        human_feedback=feedback,
+        prepare_action="request_supplement",
+        function_items=function_items,
+        responsibility_edges=responsibility_edges,
+    ))
     assert resp.status == "needs_clarification"
     assert "请补充你的其他要求" in resp.clarifying_questions[0]
     assert resp.files == []
+    assert resp.function_items == function_items
+    assert resp.responsibility_edges == responsibility_edges
 
 
 @pytest.mark.asyncio

@@ -836,6 +836,10 @@ Phase 2 的任务是：
 """
         combined_content = phase2_instruction + combined_content
 
+    resource_manifest_section = ""
+    if phase != "prepare_plan":
+        resource_manifest_section = "\n\n---\n\n" + _compose_resource_manifest(skill)
+
     return (
         "你处于 Skill Creator 模式。\n\n"
         "请严格按照下面 SKILL.md 中的流程和要求执行。\n"
@@ -850,9 +854,8 @@ Phase 2 的任务是：
         "## Loaded SKILL.md\n\n"
         f"{combined_content}\n\n"
         "---\n\n"
-        f"{_compose_child_skill_manifest(skill)}\n\n"
-        "---\n\n"
-        f"{_compose_resource_manifest(skill)}"
+        f"{_compose_child_skill_manifest(skill)}"
+        f"{resource_manifest_section}"
     )
 
 

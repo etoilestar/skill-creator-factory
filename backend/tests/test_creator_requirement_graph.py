@@ -1795,6 +1795,7 @@ def test_structured_function_items_override_blueprint_script_responsibility_text
         responsibility_edges=[],
     )
     entry = next(item for item in plan.files if item.path == 'scripts/a.py')
+    assert entry.role == 'structured_role'
     assert entry.purpose == 'structured purpose'
     assert entry.inputs == ['semantic_input']
     assert entry.outputs == ['semantic_result']

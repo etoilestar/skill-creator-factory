@@ -1401,7 +1401,7 @@ def build_skill_plan_from_files(
             entry = SkillPlanEntry(
                 **{
                     **entry.__dict__,
-                    "role": entry.role,
+                    "role": str(structured_item.get("role") or ""),
                     "purpose": str(structured_item.get("purpose") or ""),
                     "inputs": list(structured_item.get("inputs") or []),
                     "outputs": list(structured_item.get("outputs") or []),

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 import shutil
 import traceback
 
@@ -6351,25 +6352,88 @@ def _responsibility_edge_endpoint_pairs(edges: object) -> list[list[object]]:
 def _render_structured_responsibility_view(blueprint_text: str, function_items: list[dict[str, Any]], responsibility_edges: list[dict[str, Any]]) -> str:
     if not function_items:
         return blueprint_text
-    lines = [
-        "",
-        "### Structured FunctionItems View",
-    ]
-    for item in function_items:
-        lines.extend([
-            f"- target_file: {item.get('target_file')}",
-            f"  role: {item.get('role')}",
-            f"  purpose: {item.get('purpose')}",
+    text = str(blueprint_text or "").rstrip()
+    targets = [str(item.get("target_file") or "").strip() for item in function_items if str(item.get("target_file") or "").strip()]
+    target_set = set(targets)
+    before: dict[str, set[str]] = {target: set() for target in targets}
+    for edge in responsibility_edges or []:
+        if not isinstance(edge, dict):
+            continue
+        from_node = str(edge.get("from_node") or "").strip()
+        to_node = str(edge.get("to_node") or "").strip()
+        if from_node in target_set and to_node in target_set and from_node != to_node:
+            before[to_node].add(from_node)
+
+    item_by_target = {str(item.get("target_file") or "").strip(): item for item in function_items}
+    ordered_targets: list[str] = []
+    ready = [target for target in targets if not before.get(target)]
+    while ready:
+        target = ready.pop(0)
+        if target in ordered_targets:
+            continue
+        ordered_targets.append(target)
+        for downstream in targets:
+            if target in before.get(downstream, set()):
+                before[downstream].discard(target)
+                if not before[downstream] and downstream not in ordered_targets and downstream not in ready:
+                    ready.append(downstream)
+    ordered_targets.extend(target for target in targets if target not in ordered_targets)
+    ordered_function_items = [item_by_target[target] for target in ordered_targets if target in item_by_target]
+
+    workflow_lines = ["### 工作流逻辑"]
+    for index, item in enumerate(ordered_function_items, start=1):
+        workflow_lines.append(f"{index}. {str(item.get('purpose') or '').strip()}")
+
+    script_blocks_by_target: dict[str, list[str]] = {}
+    for item in ordered_function_items:
+        target = str(item.get("target_file") or "").strip()
+        if not target:
+            continue
+        script_blocks_by_target[target] = [
+            f"- path: `{target}`",
+            f"  role: {str(item.get('role') or '').strip()}",
+            f"  purpose: {str(item.get('purpose') or '').strip()}",
             "  inputs: " + json.dumps(item.get("inputs") or [], ensure_ascii=False),
             "  outputs: " + json.dumps(item.get("outputs") or [], ensure_ascii=False),
             "  required_capabilities: " + json.dumps(item.get("required_capabilities") or [], ensure_ascii=False),
-            "  constraints: " + json.dumps(item.get("constraints") or [], ensure_ascii=False),
-        ])
-    lines.append("### Structured Workflow View")
-    for item in function_items:
-        lines.append(f"- {item.get('purpose')}")
-    lines.append("ResponsibilityEdges: " + json.dumps(responsibility_edges or [], ensure_ascii=False, default=str))
-    return str(blueprint_text or "").rstrip() + "\n" + "\n".join(lines) + "\n"
+            "  constraints: " + json.dumps(item.get("constraints") or [], ensure_ascii=False, default=str),
+        ]
+
+    def replace_section(source: str, heading: str, replacement_lines: list[str]) -> str:
+        pattern = re.compile(rf"(?ms)^### {re.escape(heading)}\s*$.*?(?=^### |\Z)")
+        replacement = "\n".join(replacement_lines).rstrip() + "\n"
+        if pattern.search(source):
+            return pattern.sub(replacement, source, count=1)
+        return source.rstrip() + "\n" + replacement
+
+    text = replace_section(text, "工作流逻辑", workflow_lines)
+
+    skillplan_pattern = re.compile(r"(?ms)^### SkillPlan / 文件职责计划\s*$.*?(?=^### |\Z)")
+    skillplan_match = skillplan_pattern.search(text)
+    existing_blocks: list[tuple[str, str]] = []
+    if skillplan_match:
+        body = skillplan_match.group(0).split("\n", 1)[1] if "\n" in skillplan_match.group(0) else ""
+        for block_match in re.finditer(r"(?ms)^- path:\s*`?([^`\n]+)`?.*?(?=^- path:|\Z)", body):
+            path = str(block_match.group(1) or "").strip()
+            block = block_match.group(0).rstrip()
+            if path:
+                existing_blocks.append((path, block))
+
+    rendered_blocks: list[str] = []
+    emitted: set[str] = set()
+    for path, block in existing_blocks:
+        if path in script_blocks_by_target:
+            rendered_blocks.append("\n".join(script_blocks_by_target[path]))
+            emitted.add(path)
+        elif not path.startswith("scripts/"):
+            rendered_blocks.append(block)
+    for target, block_lines in script_blocks_by_target.items():
+        if target not in emitted:
+            rendered_blocks.append("\n".join(block_lines))
+
+    skillplan_lines = ["### SkillPlan / 文件职责计划", *rendered_blocks]
+    text = replace_section(text, "SkillPlan / 文件职责计划", skillplan_lines)
+    return text.rstrip() + "\n"
 
 
 def _structured_plan_review_summary(prepared: dict[str, Any], fallback: PreparePlanReviewSummary | None = None) -> PreparePlanReviewSummary:
@@ -6434,7 +6498,6 @@ Preserve:
 - user goal;
 - required final outputs;
 - confirmed core actions;
-- chosen workflow intent.
 
 Do not add a new business requirement.
 Do not remove a confirmed business requirement.
@@ -6442,7 +6505,9 @@ Do not simplify the goal to fit tools.
 Do not reconsider tool availability.
 Do not use Tool Registry, ToolPool, candidate tools, or implementation convenience.
 
-Your only task is to make the emitted executable plan internally consistent.
+Your first task is requirement fidelity: keep the executable plan aligned with the exact user request and confirmed decisions.
+Your second task is internal consistency: make FunctionItems, ResponsibilityEdges, and Blueprint view describe the same plan.
+Planner-derived FunctionItems, workflow, topology, and edges may be changed when required for requirement fidelity or consistency.
 
 ResponsibilityEdge transport schema is exact.
 
@@ -6568,6 +6633,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "platform_io_contract": platform_io_contract_prompt_text(),
         "confirmed_decision_context": {
             "conversation_history": request.conversation_history,
+            "user_request": request.user_request,
             "human_feedback": request.human_feedback,
             "previous_blueprint_text": request.previous_blueprint_text,
             "skill_name": request.skill_name,
@@ -6723,8 +6789,8 @@ async def _generate_internal_blueprint_or_questions(
 
 1. 判断业务需求是否已经足够明确；
 2. 信息不足时提出一个真正阻塞创建计划的业务问题；
-3. 信息足够时生成 provisional internal_blueprint_text；
-4. 在 provisional blueprint 中确定合理的 script topology 和文件职责边界。
+3. 信息足够时先生成 structured executable plan；
+4. 在同一次 Planner response 中同步输出 function_items、responsibility_edges 与 internal_blueprint_text。
 
 Top-level function_items and responsibility_edges together are the structured executable plan source of truth.
 internal_blueprint_text is the human-readable Blueprint view of that same structured executable plan.

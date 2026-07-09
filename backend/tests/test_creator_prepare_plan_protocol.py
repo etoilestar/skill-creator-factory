@@ -1289,3 +1289,21 @@ async def test_ready_planner_null_function_items_runs_same_convergence(monkeypat
     monkeypatch.setattr(api, 'route_model', lambda *a, **k: type('R', (), {'model':'planner'})())
     result = await api._generate_internal_blueprint_or_questions(_request())
     assert result['function_items'] == [revised_item]
+
+
+def test_render_structured_responsibility_view_replaces_blueprint_sections():
+    blueprint = _ready_blueprint("- path: `SKILL.md`\n  role: skill_overview\n- path: `scripts/a.py`\n  role: stale\n  purpose: stale")
+    items = [
+        _abstract_function_item('scripts/b.py', 'second structured purpose'),
+        _abstract_function_item('scripts/a.py', 'structured purpose'),
+    ]
+    edges = [{'from_node':'scripts/a.py','from_output':'semantic_result','to_node':'scripts/b.py','to_input':'semantic_input','purpose':'handoff','constraints':[]}]
+    rendered = api._render_structured_responsibility_view(blueprint, items, edges)
+    assert '### Structured FunctionItems View' not in rendered
+    assert rendered.count('### 工作流逻辑') == 1
+    assert '1. structured purpose' in rendered
+    assert rendered.index('1. structured purpose') < rendered.index('2. second structured purpose')
+    assert '- path: `scripts/a.py`' in rendered
+    assert 'role: worker' in rendered
+    assert 'purpose: structured purpose' in rendered
+    assert 'purpose: stale' not in rendered

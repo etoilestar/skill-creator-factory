@@ -447,13 +447,16 @@ def normalize_structured_responsibility_edges(raw_edges: object, *, source: str 
 def validate_structured_responsibility_edge_transport(
     raw_edges: object,
     *,
+    function_items: object | None = None,
     source: str = "planner",
 ) -> list[dict[str, object]]:
-    """Validate canonical ResponsibilityEdge transport and platform boundary.
+    """Validate canonical ResponsibilityEdge transport topology.
 
     This helper intentionally validates only Creator-owned transport protocol:
-    exact structured edge shape plus immutable platform boundary slots and
-    direction. It does not validate script-local semantic IO or infer mappings.
+    exact structured edge shape, immutable platform boundary slots/direction,
+    and the shared endpoint domain invariant used by ResponsibilityGraph.
+    Non-platform endpoints must be current FunctionItem targets. It does not
+    validate script-local semantic IO or infer mappings.
     """
     if raw_edges is None:
         raise ValueError(
@@ -491,6 +494,18 @@ def validate_structured_responsibility_edge_transport(
         if str(value or "").strip()
     }
 
+    function_item_targets: set[str] | None = None
+    if function_items is not None:
+        normalized_function_items = normalize_structured_function_items(
+            function_items,
+            source=source,
+        )
+        function_item_targets = {
+            str(item.get("target_file") or "").strip()
+            for item in normalized_function_items
+            if str(item.get("target_file") or "").strip()
+        }
+
     for index, edge in enumerate(normalized_edges):
         from_node = str(edge.get("from_node") or "")
         from_output = str(edge.get("from_output") or "")
@@ -511,6 +526,13 @@ def validate_structured_responsibility_edge_transport(
                 f"index={index}"
             )
 
+        if from_node == "platform_input_node" and to_node == "platform_output_node":
+            raise ValueError(
+                f"{source}.responsibility_edges uses direct platform_input_node "
+                "to platform_output_node edge; "
+                f"index={index}"
+            )
+
         if from_node == "platform_input_node" and from_output not in input_fields:
             raise ValueError(
                 f"{source}.responsibility_edges references undefined "
@@ -525,6 +547,30 @@ def validate_structured_responsibility_edge_transport(
                 "platform output field; "
                 f"index={index}; "
                 f"to_input={to_input}"
+            )
+
+        if (
+            function_item_targets is not None
+            and from_node != "platform_input_node"
+            and from_node not in function_item_targets
+        ):
+            raise ValueError(
+                f"{source}.responsibility_edges references non-FunctionItem "
+                "source endpoint; "
+                f"index={index}; "
+                f"from_node={from_node}"
+            )
+
+        if (
+            function_item_targets is not None
+            and to_node != "platform_output_node"
+            and to_node not in function_item_targets
+        ):
+            raise ValueError(
+                f"{source}.responsibility_edges references non-FunctionItem "
+                "target endpoint; "
+                f"index={index}; "
+                f"to_node={to_node}"
             )
 
     return normalized_edges

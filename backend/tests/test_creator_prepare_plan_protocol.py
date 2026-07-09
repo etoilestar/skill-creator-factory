@@ -1189,6 +1189,7 @@ def test_validate_structured_responsibility_edge_transport_contract():
         {**platform_output_edge, "to_input": "semantic_alpha"},
         {**script_edge, "from_node": "platform_output_node"},
         {**script_edge, "to_node": "platform_input_node"},
+        {"from_node":"platform_input_node","from_output":"user_request","to_node":"platform_output_node","to_input":"file_outputs","purpose":"invalid direct boundary edge","constraints":[]},
         {"from":"scripts/a.py","to":"scripts/b.py","from_output":"alpha","to_input":"beta","description":"handoff"},
         None,
     ]
@@ -1316,3 +1317,71 @@ def test_render_structured_responsibility_view_replaces_blueprint_sections():
     assert 'role: worker' in rendered
     assert 'purpose: structured purpose' in rendered
     assert 'purpose: stale' not in rendered
+
+
+def test_validate_structured_responsibility_edge_transport_rejects_non_function_item_endpoint():
+    from backend.services.skill_plan import validate_structured_responsibility_edge_transport
+
+    function_items = [{
+        "target_file": "scripts/a.py",
+        "role": "script",
+        "purpose": "Do A",
+        "inputs": [],
+        "outputs": ["result"],
+        "required_capabilities": [],
+        "constraints": [],
+    }]
+    invalid_edge = {
+        "from_node": "references/spec.md",
+        "from_output": "rules",
+        "to_node": "scripts/a.py",
+        "to_input": "rules",
+        "purpose": "invalid resource endpoint",
+        "constraints": [],
+    }
+
+    with pytest.raises(ValueError, match="non-FunctionItem source endpoint"):
+        validate_structured_responsibility_edge_transport(
+            [invalid_edge],
+            function_items=function_items,
+            source="planner",
+        )
+
+
+def test_validate_structured_responsibility_edge_transport_accepts_function_item_endpoint():
+    from backend.services.skill_plan import validate_structured_responsibility_edge_transport
+
+    function_items = [
+        {
+            "target_file": "scripts/a.py",
+            "role": "script",
+            "purpose": "Do A",
+            "inputs": [],
+            "outputs": ["result"],
+            "required_capabilities": [],
+            "constraints": [],
+        },
+        {
+            "target_file": "scripts/b.py",
+            "role": "script",
+            "purpose": "Do B",
+            "inputs": ["result"],
+            "outputs": [],
+            "required_capabilities": [],
+            "constraints": [],
+        },
+    ]
+    edge = {
+        "from_node": "scripts/a.py",
+        "from_output": "result",
+        "to_node": "scripts/b.py",
+        "to_input": "result",
+        "purpose": "valid function-item handoff",
+        "constraints": [],
+    }
+
+    assert validate_structured_responsibility_edge_transport(
+        [edge],
+        function_items=function_items,
+        source="planner",
+    ) == [edge]

@@ -123,9 +123,23 @@
                   <span v-if="row.capability && row.capability !== row.name" class="tool-capability">{{ row.capability }}</span>
                   <span class="tool-status" :class="row.statusClass">{{ row.statusText }}</span>
                   <span v-if="row.blocking" class="tool-blocking">blocking</span>
+                  <span v-if="row.score !== ''" class="tool-score">score: {{ row.score }}</span>
+                  <span v-if="row.targetFiles?.length" class="tool-files">targets: {{ row.targetFiles.join('、') }}</span>
+                  <span v-if="row.matchedFeatures?.length" class="tool-features">matched: {{ row.matchedFeatures.join('、') }}</span>
                 </div>
               </div>
-              <p v-else class="planning-muted">等待能力需求…</p>
+              <div v-if="selectedPrimaryToolBindings.length" class="primary-tool-bindings">
+                <div
+                  v-for="binding in selectedPrimaryToolBindings"
+                  :key="binding.targetFile"
+                  class="primary-tool-binding"
+                >
+                  <span class="binding-target">{{ binding.targetFile }}</span>
+                  <span class="edge-arrow">→</span>
+                  <span class="binding-tools">{{ binding.primaryToolIds.join('、') }}</span>
+                </div>
+              </div>
+              <p v-if="!toolPlanningRows.length" class="planning-muted">等待能力需求…</p>
             </section>
           </div>
 
@@ -391,39 +405,47 @@ function normalizeToolStatusClass(statusText) {
 }
 
 function toolRowFromRecord(record) {
+  const toolId = String(record?.tool_id || '').trim()
   const capability = String(record?.capability || record?.name || '').trim()
-  const name = String(record?.tool_name || record?.tool_id || record?.display_name || record?.name || capability || '').trim()
-  let statusSource = record?.status || record?.readiness || ''
-  if (!statusSource) {
-    if (record?.creator_available === false) {
-      statusSource = 'disabled'
-    } else if (record?.configured === false) {
-      statusSource = 'missing'
-    } else if (record?.creator_available === true || record?.configured === true) {
-      statusSource = 'ready'
-    }
-  }
+  const name = String(record?.tool_name || toolId || record?.display_name || record?.name || capability || '').trim()
+  const statusSource = record?.status || record?.readiness || ''
   const statusText = normalizeToolStatusText(statusSource)
   return {
+    toolId,
     name,
     capability,
     statusText,
     statusClass: normalizeToolStatusClass(statusText),
     blocking: Boolean(record?.blocking),
+    score: record?.score ?? '',
+    targetFiles: Array.isArray(record?.target_files) ? record.target_files : [],
+    matchedFeatures: Array.isArray(record?.matched_features) ? record.matched_features : [],
   }
 }
 
+const selectedPrimaryToolBindings = computed(() => {
+  const selectedPrimaryTools = creationPlan.value?.tool_pool_summary?.selected_primary_tools
+  if (!selectedPrimaryTools || typeof selectedPrimaryTools !== 'object' || Array.isArray(selectedPrimaryTools)) {
+    return []
+  }
+  return Object.entries(selectedPrimaryTools)
+    .map(([targetFile, toolIds]) => ({
+      targetFile: String(targetFile || '').trim(),
+      primaryToolIds: Array.isArray(toolIds)
+        ? toolIds.map(toolId => String(toolId || '').trim()).filter(Boolean)
+        : [],
+    }))
+    .filter(binding => binding.targetFile && binding.primaryToolIds.length)
+})
+
 const finalToolRows = computed(() => {
-  const toolRequirements = Array.isArray(creationPlan.value?.tool_requirements)
-    ? creationPlan.value.tool_requirements
+  const toolPoolTools = Array.isArray(creationPlan.value?.tool_pool_summary?.tools)
+    ? creationPlan.value.tool_pool_summary.tools
     : []
-  const availableTools = Array.isArray(creationPlan.value?.available_tools)
-    ? creationPlan.value.available_tools
-    : []
-  const source = toolRequirements.length
-    ? [...toolRequirements, ...availableTools]
-    : availableTools
-  return source
+
+  if (!toolPoolTools.length) return []
+
+  return toolPoolTools
     .filter(item => item && typeof item === 'object')
     .map(toolRowFromRecord)
     .filter(row => row.name || row.capability)
@@ -1511,6 +1533,37 @@ function clearChat() {
 .tool-blocking {
   color: #991b1b;
   font-weight: 600;
+}
+
+.tool-score,
+.tool-files,
+.tool-features {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.primary-tool-bindings {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.primary-tool-binding {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface2, #f8fafc);
+  font-size: 12px;
+}
+
+.binding-target,
+.binding-tools {
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  word-break: break-all;
 }
 
 .asset-decision-modal {

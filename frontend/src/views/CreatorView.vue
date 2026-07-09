@@ -77,6 +77,72 @@
             </details>
           </div>
 
+          <div v-if="showPlanningProcessCard" class="planning-process-card">
+            <div class="planning-process-header">
+              <h3>规划过程</h3>
+              <span v-if="streaming" class="planning-process-badge">更新中</span>
+            </div>
+
+            <section class="planning-section">
+              <h4>责任图谱</h4>
+              <div v-if="planningNodes.length || planningEdges.length" class="responsibility-flow">
+                <div
+                  v-for="node in planningNodes"
+                  :key="node.target_file"
+                  class="responsibility-node"
+                >
+                  <div class="node-title">{{ node.target_file }}</div>
+                  <div v-if="node.role" class="node-meta">role: {{ node.role }}</div>
+                  <div v-if="node.purpose" class="node-purpose">{{ node.purpose }}</div>
+                  <div v-if="node.inputs?.length" class="node-list">inputs: {{ formatList(node.inputs) }}</div>
+                  <div v-if="node.outputs?.length" class="node-list">outputs: {{ formatList(node.outputs) }}</div>
+                  <div v-if="node.required_capabilities?.length" class="node-list">required_capabilities: {{ formatList(node.required_capabilities) }}</div>
+                </div>
+                <div
+                  v-for="(edge, index) in planningEdges"
+                  :key="`${edge.from_node || 'from'}-${edge.to_node || 'to'}-${index}`"
+                  class="responsibility-edge"
+                >
+                  <span>{{ edge.from_node }}{{ edge.from_output ? `.${edge.from_output}` : '' }}</span>
+                  <span class="edge-arrow">→</span>
+                  <span>{{ edge.to_node }}{{ edge.to_input ? `.${edge.to_input}` : '' }}</span>
+                </div>
+              </div>
+              <p v-else class="planning-muted">等待结构化责任图谱…</p>
+            </section>
+
+            <section class="planning-section">
+              <h4>能力 / 工具匹配</h4>
+              <div v-if="toolPlanningRows.length" class="tool-planning-list">
+                <div
+                  v-for="(row, index) in toolPlanningRows"
+                  :key="`${row.name}-${row.capability}-${index}`"
+                  class="tool-planning-row"
+                >
+                  <span class="tool-name">{{ row.name }}</span>
+                  <span v-if="row.capability && row.capability !== row.name" class="tool-capability">{{ row.capability }}</span>
+                  <span class="tool-status" :class="row.statusClass">{{ row.statusText }}</span>
+                  <span v-if="row.blocking" class="tool-blocking">blocking</span>
+                  <span v-if="row.score !== ''" class="tool-score">score: {{ row.score }}</span>
+                  <span v-if="row.targetFiles?.length" class="tool-files">targets: {{ row.targetFiles.join('、') }}</span>
+                  <span v-if="row.matchedFeatures?.length" class="tool-features">matched: {{ row.matchedFeatures.join('、') }}</span>
+                </div>
+              </div>
+              <div v-if="selectedPrimaryToolBindings.length" class="primary-tool-bindings">
+                <div
+                  v-for="binding in selectedPrimaryToolBindings"
+                  :key="binding.targetFile"
+                  class="primary-tool-binding"
+                >
+                  <span class="binding-target">{{ binding.targetFile }}</span>
+                  <span class="edge-arrow">→</span>
+                  <span class="binding-tools">{{ binding.primaryToolIds.join('、') }}</span>
+                </div>
+              </div>
+              <p v-if="!toolPlanningRows.length" class="planning-muted">等待能力需求…</p>
+            </section>
+          </div>
+
           <!-- Skill creation panel (shown after prepare-plan is ready) -->
           <SkillCreationPanel
             v-if="showCreationPanel && creationPlan"
@@ -228,6 +294,11 @@ function actionLabel(action) {
   return ACTION_LABELS[action] || action
 }
 
+function formatList(value) {
+  if (!Array.isArray(value)) return '[]'
+  return JSON.stringify(value)
+}
+
 const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
@@ -267,6 +338,136 @@ const reviewSummaryTitle = computed(() => {
   if (reviewSummaryStage.value === 'supplement_confirmation') return '已根据补充内容更新的创建要点'
   return '已整理的创建要点'
 })
+
+const planningNodes = computed(() => (
+  Array.isArray(pendingFunctionItems.value)
+    ? pendingFunctionItems.value
+        .filter(item => item && typeof item === 'object')
+        .map(item => ({
+          target_file: String(item.target_file || '').trim(),
+          role: String(item.role || '').trim(),
+          purpose: String(item.purpose || '').trim(),
+          inputs: Array.isArray(item.inputs) ? item.inputs : [],
+          outputs: Array.isArray(item.outputs) ? item.outputs : [],
+          required_capabilities: Array.isArray(item.required_capabilities)
+            ? item.required_capabilities
+            : [],
+        }))
+        .filter(item => item.target_file)
+    : []
+))
+
+const planningEdges = computed(() => (
+  Array.isArray(pendingResponsibilityEdges.value)
+    ? pendingResponsibilityEdges.value
+        .filter(edge => edge && typeof edge === 'object')
+        .map(edge => ({
+          from_node: String(edge.from_node || '').trim(),
+          from_output: String(edge.from_output || '').trim(),
+          to_node: String(edge.to_node || '').trim(),
+          to_input: String(edge.to_input || '').trim(),
+        }))
+        .filter(edge => edge.from_node || edge.to_node)
+    : []
+))
+
+const requiredCapabilityRows = computed(() => {
+  const seen = new Set()
+  const rows = []
+  for (const item of planningNodes.value) {
+    for (const capability of item.required_capabilities || []) {
+      const name = String(capability || '').trim()
+      if (!name || seen.has(name)) continue
+      seen.add(name)
+      rows.push({
+        name,
+        capability: name,
+        statusText: '正在匹配工具…',
+        statusClass: 'pending',
+        blocking: false,
+      })
+    }
+  }
+  return rows
+})
+
+function normalizeToolStatusText(status) {
+  const normalized = String(status || '').trim()
+  if (['ready', 'allowed'].includes(normalized)) return '已匹配'
+  if (['not_authorized', 'disabled', 'missing'].includes(normalized)) return '未就绪'
+  return normalized || '正在匹配…'
+}
+
+function normalizeToolStatusClass(statusText) {
+  if (statusText === '已匹配') return 'ready'
+  if (statusText === '未就绪') return 'blocked'
+  return 'pending'
+}
+
+function toolRowFromRecord(record) {
+  const toolId = String(record?.tool_id || '').trim()
+  const capability = String(record?.capability || record?.name || '').trim()
+  const name = String(record?.tool_name || toolId || record?.display_name || record?.name || capability || '').trim()
+  const statusSource = record?.status || record?.readiness || ''
+  const statusText = normalizeToolStatusText(statusSource)
+  return {
+    toolId,
+    name,
+    capability,
+    statusText,
+    statusClass: normalizeToolStatusClass(statusText),
+    blocking: Boolean(record?.blocking),
+    score: record?.score ?? '',
+    targetFiles: Array.isArray(record?.target_files) ? record.target_files : [],
+    matchedFeatures: Array.isArray(record?.matched_features) ? record.matched_features : [],
+  }
+}
+
+const selectedPrimaryToolBindings = computed(() => {
+  const selectedPrimaryTools = creationPlan.value?.tool_pool_summary?.selected_primary_tools
+  if (!selectedPrimaryTools || typeof selectedPrimaryTools !== 'object' || Array.isArray(selectedPrimaryTools)) {
+    return []
+  }
+  return Object.entries(selectedPrimaryTools)
+    .map(([targetFile, toolIds]) => ({
+      targetFile: String(targetFile || '').trim(),
+      primaryToolIds: Array.isArray(toolIds)
+        ? toolIds.map(toolId => String(toolId || '').trim()).filter(Boolean)
+        : [],
+    }))
+    .filter(binding => binding.targetFile && binding.primaryToolIds.length)
+})
+
+const finalToolRows = computed(() => {
+  const toolPoolTools = Array.isArray(creationPlan.value?.tool_pool_summary?.tools)
+    ? creationPlan.value.tool_pool_summary.tools
+    : []
+
+  if (!toolPoolTools.length) return []
+
+  return toolPoolTools
+    .filter(item => item && typeof item === 'object')
+    .map(toolRowFromRecord)
+    .filter(row => row.name || row.capability)
+})
+
+const toolPlanningRows = computed(() => (
+  !streaming.value && finalToolRows.value.length
+    ? finalToolRows.value
+    : requiredCapabilityRows.value
+))
+
+const showPlanningProcessCard = computed(() => (
+  planningNodes.value.length > 0 ||
+  planningEdges.value.length > 0 ||
+  (
+    streaming.value &&
+    (
+      pendingFunctionItems.value.length > 0 ||
+      pendingResponsibilityEdges.value.length > 0
+    )
+  )
+))
 
 // The raw blueprint text extracted from the latest blueprint assistant message
 const blueprintText = computed(() => {
@@ -468,7 +669,9 @@ async function send() {
 
   currentStatus.value = {
     message: (
-      '正在解析需求并准备创建计划…'
+      pendingFunctionItems.value.length > 0
+        ? '正在校验责任图谱并匹配可用工具…'
+        : '正在解析需求并准备创建计划…'
     ),
   }
 
@@ -1184,6 +1387,183 @@ function clearChat() {
   padding: 12px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
+}
+
+.planning-process-card {
+  margin: 12px 0 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.planning-process-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.planning-process-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.planning-process-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.planning-section + .planning-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.planning-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.responsibility-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.responsibility-node {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface2, #f8fafc);
+  font-size: 12px;
+}
+
+.node-title {
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-weight: 700;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.node-meta,
+.node-list,
+.planning-muted,
+.tool-capability {
+  color: var(--text-muted);
+}
+
+.node-purpose {
+  margin-top: 4px;
+}
+
+.node-list {
+  margin-top: 3px;
+  word-break: break-word;
+}
+
+.responsibility-edge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.edge-arrow {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.tool-planning-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tool-planning-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  background: var(--surface2, #f8fafc);
+}
+
+.tool-name {
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.tool-status {
+  justify-self: start;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  color: #374151;
+}
+
+.tool-status.ready {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.tool-status.blocked {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.tool-status.pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.tool-blocking {
+  color: #991b1b;
+  font-weight: 600;
+}
+
+.tool-score,
+.tool-files,
+.tool-features {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.primary-tool-bindings {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.primary-tool-binding {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface2, #f8fafc);
+  font-size: 12px;
+}
+
+.binding-target,
+.binding-tools {
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  word-break: break-all;
 }
 
 .asset-decision-modal {

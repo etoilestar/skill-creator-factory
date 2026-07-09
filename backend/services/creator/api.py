@@ -6384,20 +6384,53 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     for index, item in enumerate(ordered_function_items, start=1):
         workflow_lines.append(f"{index}. {str(item.get('purpose') or '').strip()}")
 
-    script_blocks_by_target: dict[str, list[str]] = {}
-    for item in ordered_function_items:
-        target = str(item.get("target_file") or "").strip()
-        if not target:
-            continue
-        script_blocks_by_target[target] = [
+    function_item_owned_fields = (
+        "role",
+        "purpose",
+        "inputs",
+        "outputs",
+        "required_capabilities",
+        "constraints",
+    )
+
+    def render_owned_field(field: str, item: dict[str, Any]) -> str:
+        if field in {"inputs", "outputs", "required_capabilities"}:
+            value = json.dumps(item.get(field) or [], ensure_ascii=False)
+        elif field == "constraints":
+            value = json.dumps(item.get(field) or [], ensure_ascii=False, default=str)
+        else:
+            value = str(item.get(field) or "").strip()
+        return f"  {field}: {value}"
+
+    def render_new_script_block(target: str, item: dict[str, Any]) -> str:
+        return "\n".join([
             f"- path: `{target}`",
-            f"  role: {str(item.get('role') or '').strip()}",
-            f"  purpose: {str(item.get('purpose') or '').strip()}",
-            "  inputs: " + json.dumps(item.get("inputs") or [], ensure_ascii=False),
-            "  outputs: " + json.dumps(item.get("outputs") or [], ensure_ascii=False),
-            "  required_capabilities: " + json.dumps(item.get("required_capabilities") or [], ensure_ascii=False),
-            "  constraints: " + json.dumps(item.get("constraints") or [], ensure_ascii=False, default=str),
-        ]
+            *(render_owned_field(field, item) for field in function_item_owned_fields),
+        ])
+
+    def overlay_function_item_fields(block: str, item: dict[str, Any]) -> str:
+        lines = block.splitlines()
+        seen: set[str] = set()
+        updated: list[str] = []
+        for line in lines:
+            field_match = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*):", line)
+            field = field_match.group(2) if field_match else ""
+            if field in function_item_owned_fields:
+                if field not in seen:
+                    updated.append(render_owned_field(field, item))
+                    seen.add(field)
+                continue
+            updated.append(line)
+        for field in function_item_owned_fields:
+            if field not in seen:
+                updated.append(render_owned_field(field, item))
+        return "\n".join(updated).rstrip()
+
+    script_items_by_target = {
+        str(item.get("target_file") or "").strip(): item
+        for item in ordered_function_items
+        if str(item.get("target_file") or "").strip()
+    }
 
     def replace_section(source: str, heading: str, replacement_lines: list[str]) -> str:
         pattern = re.compile(rf"(?ms)^### {re.escape(heading)}\s*$.*?(?=^### |\Z)")
@@ -6422,14 +6455,14 @@ def _render_structured_responsibility_view(blueprint_text: str, function_items: 
     rendered_blocks: list[str] = []
     emitted: set[str] = set()
     for path, block in existing_blocks:
-        if path in script_blocks_by_target:
-            rendered_blocks.append("\n".join(script_blocks_by_target[path]))
+        if path in script_items_by_target:
+            rendered_blocks.append(overlay_function_item_fields(block, script_items_by_target[path]))
             emitted.add(path)
         elif not path.startswith("scripts/"):
             rendered_blocks.append(block)
-    for target, block_lines in script_blocks_by_target.items():
+    for target, item in script_items_by_target.items():
         if target not in emitted:
-            rendered_blocks.append("\n".join(block_lines))
+            rendered_blocks.append(render_new_script_block(target, item))
 
     skillplan_lines = ["### SkillPlan / 文件职责计划", *rendered_blocks]
     text = replace_section(text, "SkillPlan / 文件职责计划", skillplan_lines)
@@ -9616,6 +9649,12 @@ async def prepare_plan(
 
                     responsibility_edges=(
                         prepared.get("responsibility_edges")
+                        if isinstance(prepared, dict)
+                        else None
+                    ),
+
+                    function_items=(
+                        prepared.get("function_items")
                         if isinstance(prepared, dict)
                         else None
                     ),

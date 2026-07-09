@@ -526,6 +526,13 @@ def validate_structured_responsibility_edge_transport(
                 f"index={index}"
             )
 
+        if from_node == "platform_input_node" and to_node == "platform_output_node":
+            raise ValueError(
+                f"{source}.responsibility_edges uses direct platform_input_node "
+                "to platform_output_node edge; "
+                f"index={index}"
+            )
+
         if from_node == "platform_input_node" and from_output not in input_fields:
             raise ValueError(
                 f"{source}.responsibility_edges references undefined "

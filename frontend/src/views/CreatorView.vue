@@ -454,7 +454,7 @@ const finalToolRows = computed(() => {
 })
 
 const toolPlanningRows = computed(() => (
-  !streaming.value && finalToolRows.value.length
+  finalToolRows.value.length
     ? finalToolRows.value
     : requiredCapabilityRows.value
 ))

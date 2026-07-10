@@ -12339,6 +12339,30 @@ async def generate_file(request: GenerateFileRequest):
                         error_type="tool_not_ready",
                     )
                     return
+            function_execution_context: dict[str, Any] | None = None
+            if request.file_path.startswith("scripts/"):
+                context_entry = _skill_plan_entry_for_file(
+                    file_path=request.file_path,
+                    purpose=request.purpose,
+                    blueprint_text=request.blueprint_text,
+                    role=request.role,
+                    skill_plan_entry=effective_skill_plan_entry,
+                )
+                context_binding: dict[str, Any] = {}
+                if isinstance(getattr(context_entry, "runtime_contract", None), dict):
+                    raw_context_binding = context_entry.runtime_contract.get("tool_binding_summary")
+                    if isinstance(raw_context_binding, dict):
+                        context_binding = dict(raw_context_binding)
+                if isinstance(effective_skill_plan_entry, dict) and isinstance(effective_skill_plan_entry.get("tool_binding_summary"), dict):
+                    context_binding = dict(effective_skill_plan_entry.get("tool_binding_summary") or {})
+                context_binding = _ensure_python_script_core_binding(context_binding, context_entry)
+                function_execution_context = build_function_execution_context(
+                    graph=request.requirement_graph,
+                    target_file=request.file_path,
+                    current_file_tool_binding=context_binding,
+                    fallback_function_item=(function_item_prompt_payload(entry_requirements[0]) if entry_requirements else {}),
+                )
+
             prompt_messages = (
                 _build_generate_file_prompt(
                     request.file_path,
@@ -12354,6 +12378,7 @@ async def generate_file(request: GenerateFileRequest):
                         entry_requirements
                     ),
                     responsibility_graph=request.requirement_graph,
+                    function_execution_context=function_execution_context,
                 )
             )
             prompt_variant = "standard"
@@ -12627,6 +12652,7 @@ async def generate_file(request: GenerateFileRequest):
                                     else last_file_binding
                                 ),
                                 "requirement_graph": request.requirement_graph,
+                                "function_execution_context": function_execution_context,
                             },
                         )
                         original_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
@@ -12891,6 +12917,7 @@ async def generate_file(request: GenerateFileRequest):
                             role=request.role,
                             skill_plan_entry=effective_skill_plan_entry,
                             requirements=entry_requirements,
+                            function_execution_context=function_execution_context,
                             variant=next_variant,
                         )
                         if request.file_path.startswith("scripts/")
@@ -13220,6 +13247,7 @@ async def generate_file(request: GenerateFileRequest):
                                 )
 
                                 tool_re_explore_count += 1
+                                function_execution_context = None
 
                             except Exception as planning_exc:
                                 logger.warning(

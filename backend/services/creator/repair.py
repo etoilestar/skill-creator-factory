@@ -4799,12 +4799,16 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
-    function_execution_context = build_function_execution_context(
-        graph=review_context.get("requirement_graph"),
-        target_file=file_path,
-        current_file_tool_binding=current_file_tool_binding,
-        fallback_function_item=(function_item_prompt_payload(req_items[0]) if req_items else {}),
-    )
+    provided_function_execution_context = review_context.get("function_execution_context")
+    if isinstance(provided_function_execution_context, dict):
+        function_execution_context = dict(provided_function_execution_context)
+    else:
+        function_execution_context = build_function_execution_context(
+            graph=review_context.get("requirement_graph"),
+            target_file=file_path,
+            current_file_tool_binding=current_file_tool_binding,
+            fallback_function_item=(function_item_prompt_payload(req_items[0]) if req_items else {}),
+        )
     authorized_tool_contracts = list(function_execution_context.get("authorized_tool_contracts") or [])
     if deterministic_issues:
         logger.info(

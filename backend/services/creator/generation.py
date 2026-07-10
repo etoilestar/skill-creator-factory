@@ -964,6 +964,7 @@ def _script_local_contract_payload(
     stdout_schema: dict[str, Any],
     requirements: Any = None,
     responsibility_graph: Any = None,
+    function_execution_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one code model's local script contract.
 
@@ -1030,12 +1031,15 @@ def _script_local_contract_payload(
         )
     )
 
-    function_execution_context = build_function_execution_context(
-        graph=responsibility_graph,
-        target_file=file_path,
-        current_file_tool_binding=tool_binding_summary,
-        fallback_function_item=(responsibility_requirements[0] if responsibility_requirements else {}),
-    )
+    if function_execution_context is None:
+        function_execution_context = build_function_execution_context(
+            graph=responsibility_graph,
+            target_file=file_path,
+            current_file_tool_binding=tool_binding_summary,
+            fallback_function_item=(responsibility_requirements[0] if responsibility_requirements else {}),
+        )
+    else:
+        function_execution_context = dict(function_execution_context)
 
     projection_gaps = (
         _bound_callable_tool_contract_projection_gaps(
@@ -1465,6 +1469,7 @@ def _build_script_generate_file_prompt_variant(
     skill_plan_entry: dict[str, Any] | None,
     requirements: Any = None,
     responsibility_graph: Any = None,
+    function_execution_context: dict[str, Any] | None = None,
     variant: str,
 ) -> list[dict]:
     """Build script-only prompts using progressively smaller local contracts.
@@ -1522,6 +1527,7 @@ def _build_script_generate_file_prompt_variant(
             stdout_schema=stdout_schema,
             requirements=requirements,
             responsibility_graph=responsibility_graph,
+            function_execution_context=function_execution_context,
         )
     )
 
@@ -1553,6 +1559,15 @@ def _build_script_generate_file_prompt_variant(
             )
             or []
         )
+
+        if function_execution_context is None:
+            local_contract["function_execution_context"] = build_function_execution_context(
+                graph=responsibility_graph,
+                target_file=file_path,
+                current_file_tool_binding=raw_binding,
+                fallback_function_item=(local_contract.get("responsibility_requirements") or [{}])[0],
+            )
+            local_contract["function_item_graph_context"] = local_contract["function_execution_context"]
 
     implementation_payload = (
         local_contract.get(
@@ -2081,6 +2096,7 @@ def _build_generate_file_prompt(
     skill_plan_entry: dict[str, Any] | None = None,
     requirements: Any = None,
     responsibility_graph: Any = None,
+    function_execution_context: dict[str, Any] | None = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file."""
 
@@ -2100,6 +2116,7 @@ def _build_generate_file_prompt(
                 ),
                 requirements=requirements,
                 responsibility_graph=responsibility_graph,
+                function_execution_context=function_execution_context,
                 variant="standard",
             )
         )
@@ -2210,6 +2227,7 @@ def _build_generate_file_prompt(
             purpose=purpose,
             plan_entry=plan_entry,
             stdout_schema=_script_stdout_schema_for_entry(plan_entry),
+            function_execution_context=function_execution_context,
         )
         instruction = (
             f'你正在为 Skill 包 "{skill_name}" 生成单个脚本文件：{file_path}。\n\n'

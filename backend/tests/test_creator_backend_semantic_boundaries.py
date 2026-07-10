@@ -328,3 +328,104 @@ def test_normalize_structured_function_items_is_python_only():
             assert "must_be_scripts_python" in str(exc)
         else:
             raise AssertionError(f"{bad} should not normalize as a FunctionItem")
+
+
+
+def test_writer_and_judge_reuse_provided_context_without_rebuilding(monkeypatch):
+    entry = _entry()
+    shared_context = {
+        "function_item": {"target_file": "scripts/main.py", "purpose": "shared"},
+        "incoming_edges": [],
+        "outgoing_edges": [],
+        "authorized_tool_contracts": [],
+    }
+    build_calls = {"writer": 0, "judge": 0}
+
+    def fail_writer_build(*args, **kwargs):
+        build_calls["writer"] += 1
+        raise AssertionError("writer should reuse provided function_execution_context")
+
+    def fail_judge_build(*args, **kwargs):
+        build_calls["judge"] += 1
+        raise AssertionError("judge should reuse provided function_execution_context")
+
+    monkeypatch.setattr("backend.services.creator.generation.build_function_execution_context", fail_writer_build)
+    monkeypatch.setattr(repair, "build_function_execution_context", fail_judge_build)
+
+    writer_payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose=entry.purpose,
+        plan_entry=entry,
+        stdout_schema={"type": "object"},
+        requirements=[_req()],
+        responsibility_graph={"function_items": [_req().model_dump()], "responsibility_edges": []},
+        function_execution_context=shared_context,
+    )
+    assert writer_payload["function_execution_context"] == shared_context
+
+    async def fake_complete(messages, model):
+        assert "shared" in messages[-1]["content"]
+        return json.dumps({"passed": True, "blocking_issues": [], "advisory_notes": []})
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+
+    import asyncio
+    result = asyncio.run(repair._run_script_responsibility_review(
+        file_path="scripts/main.py",
+        script_content="def run(payload):\n    return {'result': payload}\n",
+        skill_plan_entry=entry,
+        requirements=[],
+        review_context={"function_execution_context": shared_context},
+    ))
+    assert result["passed"] is True
+    assert build_calls == {"writer": 0, "judge": 0}
+
+
+def test_judge_rebuilds_context_when_toolpool_context_not_provided(monkeypatch):
+    calls = {"judge": 0}
+    rebuilt_context = {
+        "function_item": {"target_file": "scripts/main.py", "purpose": "rebuilt_after_toolpool_patch"},
+        "incoming_edges": [],
+        "outgoing_edges": [],
+        "authorized_tool_contracts": [{"tool_id": "new.tool", "functions": []}],
+    }
+
+    def fake_build(*args, **kwargs):
+        calls["judge"] += 1
+        return rebuilt_context
+
+    async def fake_complete(messages, model):
+        assert "rebuilt_after_toolpool_patch" in messages[-1]["content"]
+        assert "new.tool" in messages[-1]["content"]
+        return json.dumps({"passed": True, "blocking_issues": [], "advisory_notes": []})
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(repair, "build_function_execution_context", fake_build)
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+
+    import asyncio
+    result = asyncio.run(repair._run_script_responsibility_review(
+        file_path="scripts/main.py",
+        script_content="def run(payload):\n    return {'result': payload}\n",
+        skill_plan_entry=_entry(),
+        requirements=[],
+        review_context={"current_file_tool_binding": {"primary_tool_ids": ["new.tool"]}},
+    ))
+    assert result["passed"] is True
+    assert calls["judge"] == 1
+
+
+def test_is_python_function_item_target_single_implementation_source():
+    import inspect
+    import backend.services.skill_plan as skill_plan_module
+    import backend.services.creator.common as common_module
+
+    assert common_module.is_python_function_item_target is skill_plan_module.is_python_function_item_target
+    assert inspect.getsourcefile(common_module.is_python_function_item_target) == inspect.getsourcefile(skill_plan_module.is_python_function_item_target)

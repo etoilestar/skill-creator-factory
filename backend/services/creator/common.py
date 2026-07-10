@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ...config import settings
 from ..blueprint_parser import BlueprintPlan, BlueprintShapeError, clean_blueprint_body_text, parse_blueprint
-from ..skill_plan import SkillPlanEntry, ScriptRuntimeSpec, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan
+from ..skill_plan import SkillPlanEntry, ScriptRuntimeSpec, build_skill_plan_entry, capabilities_for_role, command_template_for_entry, default_io_for_file_kind, file_role_classifier, file_type_for_path, file_kind_for_path, language_for_path, runtime_for_language, normalize_required_capabilities, is_runtime_artifact_semantic, command_payload_placeholders, render_script_command_from_skill_plan, is_python_function_item_target
 from ..creator_tool_registry import get_tool_capability, list_tool_capabilities, tool_status, resolve_tools_for_skill_plan_entry, function_cards_for_tool, resolve_tool_snippets_for_context, tool_snippet_prompt
 from ..llm_proxy import complete_chat_once, stream_chat
 from ..model_router import VALIDATOR_TASK, route_creator_file_model, route_model
@@ -2827,12 +2827,6 @@ except Exception:
     pass
 
 
-def is_python_function_item_target(path: str) -> bool:
-    """Return whether a path may own an executable FunctionItem."""
-    normalized = str(path or "").strip().replace("\\", "/")
-    return normalized.startswith("scripts/") and normalized.endswith(".py")
-
-
 def build_function_execution_context(
     *,
     graph: Any = None,
@@ -2864,6 +2858,6 @@ def build_function_execution_context(
     return context
 
 try:
-    __all__.extend(["is_python_function_item_target", "build_function_execution_context"])
+    __all__.extend(["build_function_execution_context"])
 except Exception:
     pass

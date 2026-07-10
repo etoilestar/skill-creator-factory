@@ -28,7 +28,7 @@ defineProps({ data: { type: Object, required: true } })
 </script>
 
 <style scoped>
-.creator-responsibility-node { width: 250px; min-height: 150px; padding: 12px; border: 1px solid #bfdbfe; border-radius: 14px; background: #fff; box-shadow: 0 12px 30px rgba(37, 99, 235, .12); font-size: 12px; color: #0f172a; }
+.creator-responsibility-node { box-sizing: border-box; width: 250px; min-height: 150px; padding: 12px; border: 1px solid #bfdbfe; border-radius: 14px; background: #fff; box-shadow: 0 12px 30px rgba(37, 99, 235, .12); font-size: 12px; color: #0f172a; }
 .responsibility-node-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .responsibility-node-header strong { font-family: 'Fira Code', 'Cascadia Code', monospace; word-break: break-all; }
 .role-badge { padding: 2px 8px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; white-space: nowrap; font-size: 11px; }

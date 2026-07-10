@@ -197,7 +197,7 @@
         <div v-if="showThoughts" class="thinking-sidebar">
           <div class="thinking-sidebar-header">
             <span>执行过程</span>
-            <button class="btn-ghost btn-close-panel" @click="showThoughts = false">✕</button>
+            <button class="btn-ghost btn-close-panel" @click="closeExecutionPanel">✕</button>
           </div>
           <CreatorExecutionPanel
             v-model:active-tab="activeExecutionTab"
@@ -416,10 +416,17 @@ function toggleExecutionPanel() {
 }
 
 function markExecutionPanelUpdated(tab) {
-  executionPanelHasUpdate.value = true
   if (showThoughts.value) {
     activeExecutionTab.value = tab
+    executionPanelHasUpdate.value = false
+    return
   }
+  executionPanelHasUpdate.value = true
+}
+
+function closeExecutionPanel() {
+  showThoughts.value = false
+  executionPanelHasUpdate.value = false
 }
 
 // The raw blueprint text extracted from the latest blueprint assistant message

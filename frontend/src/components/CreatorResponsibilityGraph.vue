@@ -9,6 +9,7 @@
           :nodes-draggable="true"
           :nodes-connectable="false"
           :elements-selectable="true"
+          :delete-key-code="null"
           :zoom-on-scroll="true"
           :pan-on-drag="true"
           :fit-view-on-init="true"
@@ -40,7 +41,7 @@
 
 <script setup>
 import { computed, defineComponent, h, nextTick, ref, watch } from 'vue'
-import { VueFlow, Position, Handle, useVueFlow } from '@vue-flow/core'
+import { VueFlow, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
@@ -52,8 +53,6 @@ import '@vue-flow/minimap/dist/style.css'
 import CreatorResponsibilityNode from './CreatorResponsibilityNode.vue'
 import CreatorPlatformBoundaryNode from './CreatorPlatformBoundaryNode.vue'
 
-void Position
-void Handle
 
 const props = defineProps({
   nodes: { type: Array, default: () => [] },
@@ -109,8 +108,8 @@ function mapEdges() {
 function layoutGraph(nodes, edges) {
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
-  graph.setGraph({ rankdir: nodes.length >= 6 ? 'LR' : 'TB', ranksep: 90, nodesep: 50, marginx: 24, marginy: 24 })
-  const nodeWidth = 250; const nodeHeight = 150
+  graph.setGraph({ rankdir: 'TB', ranksep: 110, nodesep: 60, marginx: 24, marginy: 24 })
+  const nodeWidth = 250; const nodeHeight = 210
   nodes.forEach(node => graph.setNode(node.id, { width: nodeWidth, height: nodeHeight }))
   edges.forEach(edge => graph.setEdge(edge.source, edge.target))
   dagre.layout(graph)

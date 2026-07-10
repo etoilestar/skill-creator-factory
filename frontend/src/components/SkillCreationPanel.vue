@@ -820,13 +820,7 @@ async function generateOneFile(idx) {
       workflowAllocationSummary: props.workflowAllocationSummary || '',
       finalOutputs: props.finalOutputs || [],
     })) {
-      if (typeof chunk === 'string') {
-        file.generatedContent += chunk
-      } else if (typeof chunk?.content === 'string') {
-        file.generatedContent += chunk.content
-      } else if (typeof chunk?.delta === 'string') {
-        file.generatedContent += chunk.delta
-      } else if (chunk?.fileDone) {
+      if (chunk?.fileDone) {
         if (typeof chunk.content === 'string' && chunk.content) {
           file.generatedContent = chunk.content
         }
@@ -872,6 +866,12 @@ async function generateOneFile(idx) {
           return
         }
         throw new Error(chunk.error)
+      } else if (typeof chunk === 'string') {
+        file.generatedContent += chunk
+      } else if (typeof chunk?.content === 'string') {
+        file.generatedContent += chunk.content
+      } else if (typeof chunk?.delta === 'string') {
+        file.generatedContent += chunk.delta
       }
     }
 

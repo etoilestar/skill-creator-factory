@@ -4780,19 +4780,12 @@ async def _run_script_responsibility_review(
     - 具体输入输出变量名；
     - 最终 E2E 闭环。
 
-    允许阻断的无效内容仅限非常明确的空内容、空集合、纯占位符、
-    明显默认模板、或与当前脚本职责明显无关的内容。
+    Backend 在 Model Judge 前只保留客观工具合同事实检查；
+    pass/空壳/变量名/AST 结构是否完成职责交给 Model Judge。
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
     deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-    deterministic_issues += detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
-    deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
-    # Detect empty-shell functions and branches; stub implementations are a hard
-    # responsibility failure regardless of other checks.
-    stub_issues = _detect_stub_implementations(script_content, skill_plan_entry)
-    if stub_issues:
-        deterministic_issues += stub_issues
     review_context = review_context if isinstance(review_context, dict) else {}
     current_file_tool_binding = (
         review_context.get(
@@ -5063,7 +5056,6 @@ async def _run_script_responsibility_review(
             if review_attempt < 2:
                 continue
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 return {
                     "passed": False,
@@ -5097,7 +5089,6 @@ async def _run_script_responsibility_review(
             if not parsed_review.get("passed"):
                 if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
                     static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-                    static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
                     if static_blockers:
                         logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                             "event": "script_responsibility_failed",
@@ -5122,7 +5113,6 @@ async def _run_script_responsibility_review(
                 }, ensure_ascii=False, default=str))
                 return parsed_review
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                     "event": "script_responsibility_failed",

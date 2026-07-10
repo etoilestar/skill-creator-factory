@@ -12971,11 +12971,6 @@ async def generate_file(request: GenerateFileRequest):
                                 static_entry,
                                 entry_requirements,
                             )
-                            static_blockers += _detect_script_responsibility_static_blockers(
-                                candidate or "",
-                                static_entry,
-                                entry_requirements,
-                            )
                         except Exception:
                             static_blockers = []
                     if not static_blockers:

@@ -2739,6 +2739,7 @@ async def _repair_generated_file_with_feedback(
     import_guard_result: dict[str, Any] | None = None,
     current_file_binding: dict[str, Any] | None = None,
     tool_pool_summary: dict[str, Any] | None = None,
+    function_execution_context: dict[str, Any] | None = None,
     patch_retry_limit: int = 3,
 ) -> str:
     """First-round single-file repair using local patch.
@@ -2935,6 +2936,8 @@ async def _repair_generated_file_with_feedback(
             f"{json.dumps(tool_pool_summary or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
             "Runtime Import Guard Result（如果存在，必须先修复该硬错误；不要把 forbidden helper 替换成另一个未绑定 helper；需要平台 helper 时请求 tool_pool_patch.add_tool_requests；若任务可由标准库/允许依赖完成，则改为本地实现，不导入 runtime_tools）：\n"
             f"{json.dumps(import_guard_result or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+            "Canonical Function Execution Context（Writer/Judge/Repair 共享，优先来自当前真实 ToolPool file binding）：\n"
+            f"{json.dumps(function_execution_context or {}, ensure_ascii=False, default=str)[:12000]}\n\n"
             "Tool Registry / Snippet 上下文：\n"
             f"{tool_context}\n\n"
             + (
@@ -2981,9 +2984,15 @@ async def _repair_generated_file_with_feedback(
         )
         extra_context = ""
 
+    prompt_context_summary = (
+        "已省略原始 Writer prompt 中可能过期的工具上下文；本轮以 Canonical Function Execution Context 和 Current File Tool Binding 为准。"
+        if is_script and isinstance(function_execution_context, dict)
+        else _compact_messages_for_repair_context(prompt_messages)
+    )
+
     task_context = "\n".join([
         "原始生成上下文摘要：",
-        _compact_messages_for_repair_context(prompt_messages),
+        prompt_context_summary,
         "",
         "后端定向修复提示：",
         targeted_repair or "无",

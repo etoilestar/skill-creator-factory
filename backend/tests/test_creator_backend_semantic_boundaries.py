@@ -451,3 +451,44 @@ def test_toolpool_augmentation_rebuilds_function_execution_context_immediately()
     block = source[start:source.index("except Exception as planning_exc", start)]
     assert "function_execution_context = _build_current_function_execution_context()" in block
     assert "function_execution_context = None" not in block
+
+
+@pytest.mark.asyncio
+async def test_repair_model_uses_new_canonical_context_instead_of_old_writer_tool_context(monkeypatch):
+    captured = {}
+
+    async def fake_request_and_apply(**kwargs):
+        captured["task_context"] = kwargs["task_context"]
+        return ({}, kwargs["current_content"].replace("old_call", "new_call"), {"changed_lines": 1})
+
+    monkeypatch.setattr(repair, "_request_and_apply_repair_patch", fake_request_and_apply)
+    monkeypatch.setattr(repair, "_apply_deterministic_micro_patch_if_safe", lambda **kwargs: None)
+    monkeypatch.setattr(repair, "_creator_tool_context_for_script", lambda **kwargs: "fresh_tool_context")
+    monkeypatch.setattr(repair, "resolve_tool_snippets_for_context", lambda **kwargs: [])
+    monkeypatch.setattr(repair, "tool_snippet_prompt", lambda snippets: "")
+
+    old_prompt_messages = [{"role": "user", "content": "old_writer_tool_context should not leak"}]
+    new_context = {
+        "function_item": {"target_file": "scripts/main.py", "purpose": "new canonical"},
+        "incoming_edges": [],
+        "outgoing_edges": [],
+        "authorized_tool_contracts": [{"tool_id": "fresh.tool", "functions": []}],
+    }
+
+    result = await repair._repair_generated_file_with_feedback(
+        prompt_messages=old_prompt_messages,
+        model="unit-test-model",
+        file_path="scripts/main.py",
+        previous_content="def run():\n    old_call()\n",
+        validation_error="script_requirement_failed",
+        targeted_repair="use new tool",
+        skill_plan_entry={"path": "scripts/main.py", "role": "generic_script"},
+        current_file_binding={"primary_tool_ids": ["fresh.tool"]},
+        tool_pool_summary={"bindings": ["fresh.tool"]},
+        function_execution_context=new_context,
+    )
+
+    assert "new_call" in result
+    assert "fresh.tool" in captured["task_context"]
+    assert "new canonical" in captured["task_context"]
+    assert "old_writer_tool_context" not in captured["task_context"]

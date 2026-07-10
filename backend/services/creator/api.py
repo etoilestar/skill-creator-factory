@@ -13344,6 +13344,7 @@ async def generate_file(request: GenerateFileRequest):
                         import_guard_result=repair_import_guard_result,
                         current_file_binding=repair_current_file_binding,
                         tool_pool_summary=repair_tool_pool_summary,
+                        function_execution_context=function_execution_context,
                     )
                     repaired_candidate = _canonicalize_generated_candidate(
                         file_path=request.file_path,
@@ -13496,6 +13497,7 @@ async def generate_file(request: GenerateFileRequest):
                         import_guard_result=repair_import_guard_result if 'repair_import_guard_result' in locals() else {},
                         current_file_binding=repair_current_file_binding if 'repair_current_file_binding' in locals() else {},
                         tool_pool_summary=repair_tool_pool_summary if 'repair_tool_pool_summary' in locals() else {},
+                        function_execution_context=function_execution_context,
                     )
                     repaired_candidate = _canonicalize_generated_candidate(
                         file_path=request.file_path,

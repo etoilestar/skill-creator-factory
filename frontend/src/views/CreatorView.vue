@@ -9,10 +9,12 @@
       <button
         class="btn-ghost btn-thoughts"
         :class="{ active: showThoughts }"
-        @click="showThoughts = !showThoughts"
+        @click="toggleExecutionPanel"
         title="显示/隐藏执行过程面板"
       >
-        🔍 执行过程{{ thoughts.length ? ` (${thoughts.length})` : '' }}
+        🔍 执行过程
+        <span v-if="executionActivityCount" class="execution-count">{{ executionActivityCount }}</span>
+        <span v-if="executionPanelHasUpdate && !showThoughts" class="execution-update-dot" />
       </button>
     </div>
 
@@ -77,71 +79,6 @@
             </details>
           </div>
 
-          <div v-if="showPlanningProcessCard" class="planning-process-card">
-            <div class="planning-process-header">
-              <h3>规划过程</h3>
-              <span v-if="streaming" class="planning-process-badge">更新中</span>
-            </div>
-
-            <section class="planning-section">
-              <h4>责任图谱</h4>
-              <div v-if="planningNodes.length || planningEdges.length" class="responsibility-flow">
-                <div
-                  v-for="node in planningNodes"
-                  :key="node.target_file"
-                  class="responsibility-node"
-                >
-                  <div class="node-title">{{ node.target_file }}</div>
-                  <div v-if="node.role" class="node-meta">role: {{ node.role }}</div>
-                  <div v-if="node.purpose" class="node-purpose">{{ node.purpose }}</div>
-                  <div v-if="node.inputs?.length" class="node-list">inputs: {{ formatList(node.inputs) }}</div>
-                  <div v-if="node.outputs?.length" class="node-list">outputs: {{ formatList(node.outputs) }}</div>
-                  <div v-if="node.required_capabilities?.length" class="node-list">required_capabilities: {{ formatList(node.required_capabilities) }}</div>
-                </div>
-                <div
-                  v-for="(edge, index) in planningEdges"
-                  :key="`${edge.from_node || 'from'}-${edge.to_node || 'to'}-${index}`"
-                  class="responsibility-edge"
-                >
-                  <span>{{ edge.from_node }}{{ edge.from_output ? `.${edge.from_output}` : '' }}</span>
-                  <span class="edge-arrow">→</span>
-                  <span>{{ edge.to_node }}{{ edge.to_input ? `.${edge.to_input}` : '' }}</span>
-                </div>
-              </div>
-              <p v-else class="planning-muted">等待结构化责任图谱…</p>
-            </section>
-
-            <section class="planning-section">
-              <h4>能力 / 工具匹配</h4>
-              <div v-if="toolPlanningRows.length" class="tool-planning-list">
-                <div
-                  v-for="(row, index) in toolPlanningRows"
-                  :key="`${row.name}-${row.capability}-${index}`"
-                  class="tool-planning-row"
-                >
-                  <span class="tool-name">{{ row.name }}</span>
-                  <span v-if="row.capability && row.capability !== row.name" class="tool-capability">{{ row.capability }}</span>
-                  <span class="tool-status" :class="row.statusClass">{{ row.statusText }}</span>
-                  <span v-if="row.blocking" class="tool-blocking">blocking</span>
-                  <span v-if="row.score !== ''" class="tool-score">score: {{ row.score }}</span>
-                  <span v-if="row.targetFiles?.length" class="tool-files">targets: {{ row.targetFiles.join('、') }}</span>
-                  <span v-if="row.matchedFeatures?.length" class="tool-features">matched: {{ row.matchedFeatures.join('、') }}</span>
-                </div>
-              </div>
-              <div v-if="selectedPrimaryToolBindings.length" class="primary-tool-bindings">
-                <div
-                  v-for="binding in selectedPrimaryToolBindings"
-                  :key="binding.targetFile"
-                  class="primary-tool-binding"
-                >
-                  <span class="binding-target">{{ binding.targetFile }}</span>
-                  <span class="edge-arrow">→</span>
-                  <span class="binding-tools">{{ binding.primaryToolIds.join('、') }}</span>
-                </div>
-              </div>
-              <p v-if="!toolPlanningRows.length" class="planning-muted">等待能力需求…</p>
-            </section>
-          </div>
 
           <!-- Skill creation panel (shown after prepare-plan is ready) -->
           <SkillCreationPanel
@@ -260,9 +197,18 @@
         <div v-if="showThoughts" class="thinking-sidebar">
           <div class="thinking-sidebar-header">
             <span>执行过程</span>
-            <button class="btn-ghost btn-close-panel" @click="showThoughts = false">✕</button>
+            <button class="btn-ghost btn-close-panel" @click="closeExecutionPanel">✕</button>
           </div>
-          <ThinkingPanel :thoughts="thoughts" />
+          <CreatorExecutionPanel
+            v-model:active-tab="activeExecutionTab"
+            :thoughts="thoughts"
+            :nodes="planningNodes"
+            :edges="planningEdges"
+            :tool-rows="toolPlanningRows"
+            :primary-tool-bindings="selectedPrimaryToolBindings"
+            :streaming="streaming"
+            :current-status="currentStatus"
+          />
         </div>
       </transition>
     </div>
@@ -274,7 +220,7 @@ import { ref, computed, nextTick } from 'vue'
 import { streamPrepareCreationPlan, buildClarificationQuickActions, uploadCreatorContextFile } from '../composables/useCreator.js'
 import ChatBubble from '../components/ChatBubble.vue'
 import SkillCreationPanel from '../components/SkillCreationPanel.vue'
-import ThinkingPanel from '../components/ThinkingPanel.vue'
+import CreatorExecutionPanel from '../components/CreatorExecutionPanel.vue'
 
 // ---------------------------------------------------------------------------
 // State
@@ -292,11 +238,6 @@ const ACTION_LABELS = {
 
 function actionLabel(action) {
   return ACTION_LABELS[action] || action
-}
-
-function formatList(value) {
-  if (!Array.isArray(value)) return '[]'
-  return JSON.stringify(value)
 }
 
 const pendingBlueprintText = ref('')
@@ -323,6 +264,8 @@ const quickActions = ref([])
 // Thinking panel state
 const thoughts = ref([])
 const showThoughts = ref(false)
+const activeExecutionTab = ref('process')
+const executionPanelHasUpdate = ref(false)
 
 // Creation panel state
 const showCreationPanel = ref(false)
@@ -459,17 +402,32 @@ const toolPlanningRows = computed(() => (
     : requiredCapabilityRows.value
 ))
 
-const showPlanningProcessCard = computed(() => (
-  planningNodes.value.length > 0 ||
-  planningEdges.value.length > 0 ||
-  (
-    streaming.value &&
-    (
-      pendingFunctionItems.value.length > 0 ||
-      pendingResponsibilityEdges.value.length > 0
-    )
-  )
+const executionActivityCount = computed(() => (
+  thoughts.value.length +
+  planningNodes.value.length +
+  toolPlanningRows.value.length
 ))
+
+function toggleExecutionPanel() {
+  showThoughts.value = !showThoughts.value
+  if (showThoughts.value) {
+    executionPanelHasUpdate.value = false
+  }
+}
+
+function markExecutionPanelUpdated(tab) {
+  if (showThoughts.value) {
+    activeExecutionTab.value = tab
+    executionPanelHasUpdate.value = false
+    return
+  }
+  executionPanelHasUpdate.value = true
+}
+
+function closeExecutionPanel() {
+  showThoughts.value = false
+  executionPanelHasUpdate.value = false
+}
 
 // The raw blueprint text extracted from the latest blueprint assistant message
 const blueprintText = computed(() => {
@@ -755,20 +713,24 @@ async function send() {
           pendingResponsibilityEdges.value = Array.isArray(event.responsibility_edges)
             ? event.responsibility_edges
             : []
+          markExecutionPanelUpdated('graph')
           return
         }
         if (event.event === 'file_plan_ready') {
           currentStatus.value = { message: '文件规划已完成，正在绑定责任图谱…' }
+          if (showThoughts.value) activeExecutionTab.value = 'process'
           return
         }
         if (event.event === 'graph_resolved') {
           currentStatus.value = { message: '责任图谱已校验' }
+          markExecutionPanelUpdated('graph')
           return
         }
         if (event.event === 'tool_planning') {
           pendingRequiredCapabilities.value = Array.isArray(event.required_capabilities)
             ? event.required_capabilities
             : []
+          markExecutionPanelUpdated('tools')
           return
         }
         if (event.event === 'tool_pool_ready') {
@@ -776,6 +738,7 @@ async function send() {
             ...(creationPlan.value || {}),
             tool_pool_summary: event.tool_pool_summary || {},
           }
+          markExecutionPanelUpdated('tools')
         }
       },
     )
@@ -1031,6 +994,10 @@ function clearChat() {
 
   showThoughts.value = false
 
+  activeExecutionTab.value = 'process'
+
+  executionPanelHasUpdate.value = false
+
   showCreationPanel.value = false
 
   creationPlan.value = null
@@ -1070,8 +1037,8 @@ function clearChat() {
 
 <style scoped>
 .creator {
-  --thinking-sidebar-width: 320px;
-  --thinking-sidebar-mobile-height: 280px;
+  --thinking-sidebar-width: clamp(460px, 42vw, 720px);
+  --thinking-sidebar-mobile-height: 65vh;
   --thinking-breakpoint: 900px;
 
   display: flex;
@@ -1103,12 +1070,35 @@ function clearChat() {
 }
 
 .btn-thoughts {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   margin-left: auto;
   font-size: 13px;
   padding: 5px 12px;
   border-radius: 6px;
   color: var(--text);
   transition: background 0.15s, color 0.15s;
+}
+.execution-count {
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.execution-update-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 2px var(--surface);
 }
 .btn-thoughts.active {
   background: #eff6ff;
@@ -1427,183 +1417,6 @@ function clearChat() {
   padding: 12px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
-}
-
-.planning-process-card {
-  margin: 12px 0 16px;
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface, #fff);
-}
-
-.planning-process-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.planning-process-header h3 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.planning-process-badge {
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 12px;
-  color: #1d4ed8;
-  background: #dbeafe;
-}
-
-.planning-section + .planning-section {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-
-.planning-section h4 {
-  margin: 0 0 8px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.responsibility-flow {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.responsibility-node {
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface2, #f8fafc);
-  font-size: 12px;
-}
-
-.node-title {
-  font-family: 'Fira Code', 'Cascadia Code', monospace;
-  font-weight: 700;
-  color: var(--text);
-  word-break: break-all;
-}
-
-.node-meta,
-.node-list,
-.planning-muted,
-.tool-capability {
-  color: var(--text-muted);
-}
-
-.node-purpose {
-  margin-top: 4px;
-}
-
-.node-list {
-  margin-top: 3px;
-  word-break: break-word;
-}
-
-.responsibility-edge {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  font-family: 'Fira Code', 'Cascadia Code', monospace;
-  font-size: 12px;
-  color: var(--text-muted);
-  word-break: break-all;
-}
-
-.edge-arrow {
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.tool-planning-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.tool-planning-row {
-  display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(120px, 1fr) auto auto;
-  gap: 8px;
-  align-items: center;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 12px;
-  background: var(--surface2, #f8fafc);
-}
-
-.tool-name {
-  font-family: 'Fira Code', 'Cascadia Code', monospace;
-  font-weight: 600;
-  word-break: break-all;
-}
-
-.tool-status {
-  justify-self: start;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: #e5e7eb;
-  color: #374151;
-}
-
-.tool-status.ready {
-  background: #dcfce7;
-  color: #166534;
-}
-
-.tool-status.blocked {
-  background: #fee2e2;
-  color: #991b1b;
-}
-
-.tool-status.pending {
-  background: #fef3c7;
-  color: #92400e;
-}
-
-.tool-blocking {
-  color: #991b1b;
-  font-weight: 600;
-}
-
-.tool-score,
-.tool-files,
-.tool-features {
-  grid-column: 1 / -1;
-  color: var(--text-muted);
-  word-break: break-word;
-}
-
-.primary-tool-bindings {
-  margin-top: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.primary-tool-binding {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  background: var(--surface2, #f8fafc);
-  font-size: 12px;
-}
-
-.binding-target,
-.binding-tools {
-  font-family: 'Fira Code', 'Cascadia Code', monospace;
-  word-break: break-all;
 }
 
 .asset-decision-modal {

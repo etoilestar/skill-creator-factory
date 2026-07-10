@@ -12339,8 +12339,9 @@ async def generate_file(request: GenerateFileRequest):
                         error_type="tool_not_ready",
                     )
                     return
-            function_execution_context: dict[str, Any] | None = None
-            if request.file_path.startswith("scripts/"):
+            def _build_current_function_execution_context() -> dict[str, Any] | None:
+                if not request.file_path.startswith("scripts/"):
+                    return None
                 context_entry = _skill_plan_entry_for_file(
                     file_path=request.file_path,
                     purpose=request.purpose,
@@ -12348,20 +12349,31 @@ async def generate_file(request: GenerateFileRequest):
                     role=request.role,
                     skill_plan_entry=effective_skill_plan_entry,
                 )
-                context_binding: dict[str, Any] = {}
-                if isinstance(getattr(context_entry, "runtime_contract", None), dict):
-                    raw_context_binding = context_entry.runtime_contract.get("tool_binding_summary")
-                    if isinstance(raw_context_binding, dict):
-                        context_binding = dict(raw_context_binding)
-                if isinstance(effective_skill_plan_entry, dict) and isinstance(effective_skill_plan_entry.get("tool_binding_summary"), dict):
-                    context_binding = dict(effective_skill_plan_entry.get("tool_binding_summary") or {})
+                context_binding: Any = None
+                try:
+                    context_tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                    context_binding = get_file_binding(context_tool_pool, request.file_path)
+                    if hasattr(context_binding, "model_dump"):
+                        context_binding = context_binding.model_dump(mode="json")
+                except Exception:
+                    context_binding = None
+                if not isinstance(context_binding, dict):
+                    context_binding = {}
+                    if isinstance(getattr(context_entry, "runtime_contract", None), dict):
+                        raw_context_binding = context_entry.runtime_contract.get("tool_binding_summary")
+                        if isinstance(raw_context_binding, dict):
+                            context_binding = dict(raw_context_binding)
+                    if isinstance(effective_skill_plan_entry, dict) and isinstance(effective_skill_plan_entry.get("tool_binding_summary"), dict):
+                        context_binding = dict(effective_skill_plan_entry.get("tool_binding_summary") or {})
                 context_binding = _ensure_python_script_core_binding(context_binding, context_entry)
-                function_execution_context = build_function_execution_context(
+                return build_function_execution_context(
                     graph=request.requirement_graph,
                     target_file=request.file_path,
                     current_file_tool_binding=context_binding,
                     fallback_function_item=(function_item_prompt_payload(entry_requirements[0]) if entry_requirements else {}),
                 )
+
+            function_execution_context: dict[str, Any] | None = _build_current_function_execution_context()
 
             prompt_messages = (
                 _build_generate_file_prompt(
@@ -13247,7 +13259,7 @@ async def generate_file(request: GenerateFileRequest):
                                 )
 
                                 tool_re_explore_count += 1
-                                function_execution_context = None
+                                function_execution_context = _build_current_function_execution_context()
 
                             except Exception as planning_exc:
                                 logger.warning(

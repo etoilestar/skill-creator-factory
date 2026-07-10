@@ -429,3 +429,25 @@ def test_is_python_function_item_target_single_implementation_source():
 
     assert common_module.is_python_function_item_target is skill_plan_module.is_python_function_item_target
     assert inspect.getsourcefile(common_module.is_python_function_item_target) == inspect.getsourcefile(skill_plan_module.is_python_function_item_target)
+
+
+def test_initial_function_execution_context_prefers_real_toolpool_binding():
+    import inspect
+    source = inspect.getsource(generate_file)
+    helper_start = source.index("def _build_current_function_execution_context")
+    helper_end = source.index("function_execution_context: dict[str, Any] | None = _build_current_function_execution_context()", helper_start)
+    helper_source = source[helper_start:helper_end]
+    assert "load_tool_pool(settings.skills_path / skill_name)" in helper_source
+    assert "get_file_binding(context_tool_pool, request.file_path)" in helper_source
+    assert helper_source.index("load_tool_pool(settings.skills_path / skill_name)") < helper_source.index("runtime_contract")
+    assert helper_source.index("get_file_binding(context_tool_pool, request.file_path)") < helper_source.index("effective_skill_plan_entry.get(\"tool_binding_summary\")")
+
+
+def test_toolpool_augmentation_rebuilds_function_execution_context_immediately():
+    import inspect
+    source = inspect.getsource(generate_file)
+    marker = "tool_re_explore_count += 1"
+    start = source.index(marker)
+    block = source[start:source.index("except Exception as planning_exc", start)]
+    assert "function_execution_context = _build_current_function_execution_context()" in block
+    assert "function_execution_context = None" not in block

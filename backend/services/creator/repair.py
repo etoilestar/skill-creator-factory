@@ -4799,11 +4799,13 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
-    authorized_tool_contracts = (
-        tool_contracts_from_binding(
-            current_file_tool_binding
-        )
+    function_execution_context = build_function_execution_context(
+        graph=review_context.get("requirement_graph"),
+        target_file=file_path,
+        current_file_tool_binding=current_file_tool_binding,
+        fallback_function_item=(function_item_prompt_payload(req_items[0]) if req_items else {}),
     )
+    authorized_tool_contracts = list(function_execution_context.get("authorized_tool_contracts") or [])
     if deterministic_issues:
         logger.info(
             "[Creator]"
@@ -4879,15 +4881,7 @@ async def _run_script_responsibility_review(
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
-    graph_context = (
-        function_item_graph_context(review_context.get("requirement_graph"), file_path)
-        if isinstance(review_context, dict) and review_context.get("requirement_graph") is not None
-        else {
-            "function_item": function_item_prompt_payload(req_items[0]) if req_items else {},
-            "incoming_edges": [],
-            "outgoing_edges": [],
-        }
-    )
+    graph_context = function_execution_context
     req_payload = [graph_context.get("function_item") or function_item_prompt_payload(item) for item in req_items]
 
     messages = [
@@ -5200,6 +5194,94 @@ async def _run_script_responsibility_review(
         "repair_instructions": "",
         "model": route.model,
         "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
+    }
+
+async def _run_reference_semantic_review(
+    *,
+    file_path: str,
+    content: str,
+    purpose: str = "",
+    blueprint_context: str = "",
+    dependent_context: Any = None,
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    """Model-owned semantic review for references/*.md.
+
+    Backend format checks must run before this helper. This helper never uses
+    lexical overlap, body length, keyword lists, CJK bigrams, or static backend
+    heuristics to decide semantic success.
+    """
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=f"creator first-round reference semantic review: {file_path}",
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator 第一轮 reference 语义审查模型，只输出严格 JSON object。\n"
+                "Backend 已经完成 Markdown/frontmatter/fence/single-file 格式检查；你只判断语义职责。\n"
+                "不要使用 token overlap、长度阈值、关键词词表、CJK bigram、字段名匹配或固定章节名作为裁决依据。\n"
+                "只判断当前 references/*.md 是否完成自己的参考资料职责、是否跑题、是否只是空话/TODO/placeholder、"
+                "是否错误写成 Creator 创建流程、是否错误承担 executable script 职责。\n"
+                "不要判断 workflow 字段名、argv/stdout 字段、工具选择或 E2E 运行。\n"
+                "返回 JSON object: {\"passed\": true|false, \"issues\": [], \"repair_instructions\": \"...\"}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标 reference：{file_path}\n\n"
+                f"当前 FilePlan purpose / file-local responsibility：\n{purpose[:4000]}\n\n"
+                f"Blueprint 中相关上下文：\n{(blueprint_context or '')[:8000]}\n\n"
+                "引用/依赖当前 reference 的文件职责摘要（如有）：\n"
+                f"{json.dumps(dependent_context or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "当前 reference content：\n<<<REFERENCE\n"
+                f"{(content or '')[:16000]}\n"
+                "REFERENCE\n"
+            ),
+        },
+    ]
+    last_text = ""
+    for attempt in range(3):
+        active_messages = messages if attempt == 0 else [
+            *messages,
+            {"role": "user", "content": f"上一轮不是合法 JSON，请只返回约定 JSON object。上一轮：{last_text[:1000]}"},
+        ]
+        text = await complete_chat_once(active_messages, route.model)
+        last_text = str(text or "")
+        data = _parse_validator_json_object(last_text)
+        if isinstance(data, dict) and data:
+            passed = bool(data.get("passed"))
+            issues = data.get("issues") if isinstance(data.get("issues"), list) else data.get("blocking_issues")
+            issues = issues if isinstance(issues, list) else []
+            if not passed and not issues:
+                issues = [{
+                    "id": "reference_semantic.failed",
+                    "failed_file": file_path,
+                    "reason": str(data.get("reason") or data.get("problem") or "Reference semantic judge failed this file."),
+                    "minimal_edit": str(data.get("repair_instructions") or "Patch only this reference's semantic content."),
+                }]
+            return {
+                "passed": passed,
+                "issues": issues,
+                "repair_instructions": str(data.get("repair_instructions") or ""),
+                "model": route.model,
+                "raw_review": data,
+            }
+    return {
+        "passed": False,
+        "issues": [{
+            "id": "reference_semantic.validator_incomplete",
+            "failed_file": file_path,
+            "reason": "Reference semantic judge did not return valid JSON.",
+            "minimal_edit": "Retry semantic review; do not treat backend as semantic authority.",
+        }],
+        "repair_instructions": "Reference semantic judge unavailable/incomplete.",
+        "failure_type": "reference_semantic_validator_incomplete",
+        "model": route.model,
+        "raw_review": last_text[:1000],
     }
 
 __all__ = [name for name in globals() if not name.startswith("__")]

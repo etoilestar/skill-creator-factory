@@ -985,16 +985,6 @@ def _script_local_contract_payload(
             requirements=requirements,
         )
     )
-    local_graph_context = (
-        function_item_graph_context(responsibility_graph, file_path)
-        if responsibility_graph is not None
-        else {
-            "function_item": responsibility_requirements[0] if responsibility_requirements else {},
-            "incoming_edges": [],
-            "outgoing_edges": [],
-        }
-    )
-
     implementation_resolution = (
         resolve_implementation(
             plan_entry,
@@ -1038,6 +1028,13 @@ def _script_local_contract_payload(
             tool_binding_summary,
             plan_entry,
         )
+    )
+
+    function_execution_context = build_function_execution_context(
+        graph=responsibility_graph,
+        target_file=file_path,
+        current_file_tool_binding=tool_binding_summary,
+        fallback_function_item=(responsibility_requirements[0] if responsibility_requirements else {}),
     )
 
     projection_gaps = (
@@ -1106,7 +1103,8 @@ def _script_local_contract_payload(
         "responsibility_requirements": (
             responsibility_requirements
         ),
-        "function_item_graph_context": local_graph_context,
+        "function_item_graph_context": function_execution_context,
+        "function_execution_context": function_execution_context,
         "available_tools": available_tools,
         "tool_function_cards": (
             tool_function_cards

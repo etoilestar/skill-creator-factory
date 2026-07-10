@@ -450,17 +450,17 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
     script_nodes = {
         str(item.target_file)
         for item in graph.requirements
-        if str(item.target_file or "").startswith("scripts/")
+        if is_python_function_item_target(str(item.target_file or ""))
     }
     outputs_by_script: dict[str, set[str]] = {
         str(item.target_file): {str(field) for field in (item.outputs or []) if str(field or "").strip()}
         for item in graph.requirements
-        if str(item.target_file or "").startswith("scripts/")
+        if is_python_function_item_target(str(item.target_file or ""))
     }
     inputs_by_script: dict[str, set[str]] = {
         str(item.target_file): {str(field) for field in (item.inputs or []) if str(field or "").strip()}
         for item in graph.requirements
-        if str(item.target_file or "").startswith("scripts/")
+        if is_python_function_item_target(str(item.target_file or ""))
     }
     for file_spec in files or []:
         path = str(getattr(file_spec, "path", "") or "")
@@ -611,7 +611,7 @@ def build_default_responsibility_graph(
             or ""
         ).strip()
 
-        if not path.startswith("scripts/"):
+        if not is_python_function_item_target(path):
             continue
 
         purpose = str(
@@ -892,14 +892,14 @@ def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list
         for file_spec in files or []
         if str(
             getattr(file_spec, "path", "") or ""
-        ).strip().startswith("scripts/")
+        ).strip().startswith("scripts/") and str(getattr(file_spec, "path", "") or "").strip().endswith(".py")
     }
     target_counts: dict[str, int] = {}
     for item in graph.function_items:
         path = str(item.target_file or "").strip()
-        if not path.startswith("scripts/"):
+        if not is_python_function_item_target(path):
             raise ResponsibilityGraphValidationError(
-                "ResponsibilityGraph FunctionItems must target scripts/** only.",
+                "ResponsibilityGraph FunctionItems must target scripts/**/*.py only.",
                 code="validator_incomplete",
                 details={"target_file": path},
             )
@@ -925,7 +925,7 @@ def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list
             required_by_file.setdefault(item.target_file, []).append(item)
     for file_spec in files or []:
         path = str(getattr(file_spec, "path", "") or "")
-        if not path.startswith("scripts/"):
+        if not is_python_function_item_target(path):
             continue
         if _file_spec_has_substantive_responsibility(file_spec) and not required_by_file.get(path):
             raise ResponsibilityGraphValidationError(
@@ -2823,5 +2823,47 @@ def coerce_requirement_items(requirements: Any) -> list[FunctionItem]:
 _coerce_requirement_items = coerce_requirement_items
 try:
     __all__.extend(["coerce_requirement_items", "_coerce_requirement_items"])
+except Exception:
+    pass
+
+
+def is_python_function_item_target(path: str) -> bool:
+    """Return whether a path may own an executable FunctionItem."""
+    normalized = str(path or "").strip().replace("\\", "/")
+    return normalized.startswith("scripts/") and normalized.endswith(".py")
+
+
+def build_function_execution_context(
+    *,
+    graph: Any = None,
+    target_file: str,
+    current_file_tool_binding: Any = None,
+    fallback_function_item: Any = None,
+) -> dict[str, Any]:
+    """Build the canonical Writer/Judge shared local execution context.
+
+    This is only a projection of existing facts: the local FunctionItem graph
+    context plus already-authorized Tool Registry function contracts. It does
+    not discover tools, choose tools, mutate ToolPool, or define a new schema.
+    """
+    if graph is not None:
+        context = function_item_graph_context(graph, target_file)
+    else:
+        if isinstance(fallback_function_item, FunctionItem):
+            function_item = function_item_prompt_payload(fallback_function_item)
+        elif isinstance(fallback_function_item, dict):
+            function_item = dict(fallback_function_item)
+        else:
+            function_item = {}
+        context = {
+            "function_item": function_item,
+            "incoming_edges": [],
+            "outgoing_edges": [],
+        }
+    context["authorized_tool_contracts"] = tool_contracts_from_binding(current_file_tool_binding or {})
+    return context
+
+try:
+    __all__.extend(["is_python_function_item_target", "build_function_execution_context"])
 except Exception:
     pass

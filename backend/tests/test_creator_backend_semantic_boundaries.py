@@ -181,3 +181,150 @@ async def test_writer_judge_shared_function_item_and_authorized_tool_contracts(m
     assert "当前文件 FunctionItem graph context" in prompt
     assert "当前文件已授权工具合同" in prompt
     assert "scripts/main.py" in prompt
+
+from types import SimpleNamespace
+
+from backend.services.creator.common import (
+    ResponsibilityGraph,
+    build_function_execution_context,
+    validate_responsibility_graph_schema,
+)
+from backend.services.creator.generation import _script_local_contract_payload
+from backend.services.creator.api import generate_file
+from backend.services.creator import api as creator_api
+from backend.services.creator import e2e as creator_e2e
+
+
+def test_skill_md_generate_file_source_no_early_success_return_before_format_gate():
+    import inspect
+    source = inspect.getsource(generate_file)
+    assert "skip SKILL.md static format/contract repair" not in source
+    assert "skill_md_generation_failed" not in source
+    assert source.index("_first_round_format_stage_error") < source.index("_validate_skill_md_blueprint_alignment")
+
+
+def test_reference_semantic_review_helper_exists_and_uses_validator_task():
+    import inspect
+    source = inspect.getsource(repair._run_reference_semantic_review)
+    assert "VALIDATOR_TASK" in source
+    assert "token overlap" in source
+    assert "passed" in source and "issues" in source and "repair_instructions" in source
+
+
+def test_markdown_format_failures_use_full_rewrite_not_region_rewrite_in_main_path():
+    import inspect
+    source = inspect.getsource(generate_file)
+    marker = 'prompt_variant="rewrite_markdown_full_format"'
+    start = source.rindex("if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):", 0, source.index(marker))
+    end = source.index("continue", source.index(marker))
+    block = source[start:end]
+    assert "format_full_rewrite" in block
+    assert "_build_markdown_format_full_rewrite_prompt" in block
+    assert "format_region_rewrite" not in block
+    assert "_build_markdown_region_rewrite_prompt" not in block
+
+
+def test_python_compile_failures_use_full_rewrite_prompt_not_semantic_patch():
+    import inspect
+    source = inspect.getsource(generate_file)
+    marker = "is_compile_rewrite_error ="
+    block = source[source.index(marker):source.index('if error_source == "model_empty_content"', source.index(marker))]
+    assert "_build_strict_compile_rewrite_prompt" in block
+    assert "strict_compile_rewrite" in block
+    assert "repair_mode" not in block
+
+
+def test_semantic_patch_path_continues_to_next_loop_for_format_then_semantic():
+    import inspect
+    source = inspect.getsource(generate_file)
+    repair_call = source.index("repaired_candidate = await _repair_generated_file_with_feedback")
+    next_continue = source.index("continue", repair_call)
+    next_format_gate = source.index("_first_round_format_stage_error")
+    next_semantic_gate = source.index("_run_script_responsibility_review")
+    assert next_continue > repair_call
+    assert next_format_gate < next_semantic_gate
+
+
+def test_writer_and_judge_use_json_equivalent_function_execution_context(monkeypatch):
+    entry = _entry()
+    binding = {"primary_tool_ids": ["script_argv_guard"]}
+    graph = {"function_items": [_req().model_dump()], "responsibility_edges": []}
+
+    writer_payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose=entry.purpose,
+        plan_entry=entry,
+        stdout_schema={"type": "object"},
+        requirements=[_req()],
+        responsibility_graph=graph,
+    )
+    writer_context = writer_payload["function_execution_context"]
+    judge_context = build_function_execution_context(
+        graph=graph,
+        target_file="scripts/main.py",
+        current_file_tool_binding=writer_payload["current_file_tool_binding"],
+        fallback_function_item=_req(),
+    )
+
+    assert writer_context["function_item"] == judge_context["function_item"]
+    assert writer_context["incoming_edges"] == judge_context["incoming_edges"]
+    assert writer_context["outgoing_edges"] == judge_context["outgoing_edges"]
+    assert writer_context["authorized_tool_contracts"] == judge_context["authorized_tool_contracts"]
+
+
+def test_responsibility_graph_rejects_non_python_scripts_and_accepts_python():
+    files = [SimpleNamespace(path="scripts/main.py", purpose="do x")]
+    graph = ResponsibilityGraph(requirements=[_req()])
+    assert validate_responsibility_graph_schema(graph, files).function_items
+
+    for bad in ("scripts/main.js", "scripts/run.sh"):
+        bad_graph = ResponsibilityGraph(requirements=[RequirementItem(target_file=bad, purpose="bad")])
+        try:
+            validate_responsibility_graph_schema(bad_graph, [SimpleNamespace(path=bad, purpose="bad")])
+        except Exception as exc:
+            assert "scripts/**/*.py" in str(exc)
+        else:
+            raise AssertionError(f"{bad} should not be a FunctionItem target")
+
+
+def test_scriptless_responsibility_graph_still_valid():
+    graph = ResponsibilityGraph(requirements=[])
+    assert validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")]).function_items == []
+
+
+def test_e2e_source_does_not_call_semantic_judge_or_toolpool_planning():
+    import inspect
+    source = inspect.getsource(creator_e2e)
+    forbidden = [
+        "_run_script_responsibility_review(",
+        "_run_reference_semantic_review(",
+        "_plan_tool_pool_patch_from_responsibility_feedback(",
+        "explore_tool_pool(",
+        "rediscover_for_repair=True",
+    ]
+    for token in forbidden:
+        assert token not in source
+
+from backend.services.skill_plan import normalize_structured_function_items
+
+
+def _structured_function_item(path):
+    return {
+        "target_file": path,
+        "role": "generic_script",
+        "purpose": "do work",
+        "inputs": [],
+        "outputs": [],
+        "required_capabilities": [],
+        "constraints": [],
+    }
+
+def test_normalize_structured_function_items_is_python_only():
+    assert normalize_structured_function_items([_structured_function_item("scripts/main.py")])[0]["target_file"] == "scripts/main.py"
+    for bad in ("scripts/main.js", "scripts/run.sh", "references/ref.md"):
+        try:
+            normalize_structured_function_items([_structured_function_item(bad)])
+        except ValueError as exc:
+            assert "must_be_scripts_python" in str(exc)
+        else:
+            raise AssertionError(f"{bad} should not normalize as a FunctionItem")

@@ -12472,34 +12472,6 @@ async def generate_file(request: GenerateFileRequest):
                             detail=json.dumps(first_violation, ensure_ascii=False, default=str),
                         )
 
-                if request.file_path == "SKILL.md":
-                    logger.info(
-                        "[Creator][generate_file] skip SKILL.md static format/contract repair; E2E validates runtime commands file=%s content_chars=%d",
-                        request.file_path,
-                        len(content),
-                    )
-                    yield _sse({
-                        "type": "file_content",
-                        "status": "success",
-                        "success": True,
-                        "file_path": request.file_path,
-                        "role": request.role,
-                        "content": content,
-                        "editable": True,
-                        "disabled": False,
-                    })
-                    yield _sse({
-                        "type": "file_done",
-                        "status": "success",
-                        "success": True,
-                        "file_path": request.file_path,
-                        "role": request.role,
-                        "done": True,
-                        "editable": True,
-                        "disabled": False,
-                    })
-                    return
-
                 format_stage_error = _first_round_format_stage_error(
                     file_path=request.file_path,
                     content=content,
@@ -12580,19 +12552,32 @@ async def generate_file(request: GenerateFileRequest):
                             blueprint_text=request.blueprint_text,
                             skill_plan_entry=reference_entry,
                         )
-                        if any((not result.passed and result.id == "reference.no_placeholder_phrases") for result in reference_results):
-                            patched_reference = _sanitize_reference_placeholders(content)
-                            if patched_reference != content:
-                                patched_results = validate_file_contract(
-                                    file_path=request.file_path,
-                                    content=patched_reference,
-                                    blueprint_text=request.blueprint_text,
-                                    skill_plan_entry=reference_entry,
-                                )
-                                if not any(not result.passed for result in patched_results):
-                                    content = patched_reference
-                                    reference_results = patched_results
                         _raise_file_contract_failures(reference_results)
+
+                        reference_review = await _run_reference_semantic_review(
+                            file_path=request.file_path,
+                            content=content,
+                            purpose=request.purpose or str(reference_entry.get("purpose") or ""),
+                            blueprint_context=request.blueprint_text,
+                            dependent_context={
+                                "workflow_allocation_summary": request.workflow_allocation_summary,
+                                "requirement_graph": request.requirement_graph,
+                                "final_outputs": request.final_outputs,
+                            },
+                            requested_model=request.model or route.model,
+                        )
+                        if not reference_review.get("passed"):
+                            issues = reference_review.get("issues") if isinstance(reference_review.get("issues"), list) else []
+                            raise FileGenerationStageError(
+                                source="reference_semantic_failed",
+                                layer="semantic",
+                                detail=json.dumps({
+                                    "issues": issues,
+                                    "repair_instructions": reference_review.get("repair_instructions") or "Patch only this reference's semantic content.",
+                                    "review": reference_review,
+                                }, ensure_ascii=False, default=str),
+                                original=ScriptFunctionalValidationError(issues, layer="reference_semantic"),
+                            )
 
                     elif request.file_path.startswith("scripts/"):
                         pass
@@ -12741,19 +12726,6 @@ async def generate_file(request: GenerateFileRequest):
                     else _stage_error_from_exception("content_review", exc, default_layer="content_review")
                 )
                 deterministic_error = str(stage_error)
-                if request.file_path == "SKILL.md":
-                    yield _file_done_error_sse(
-                        file_path=request.file_path,
-                        role=request.role,
-                        error=(
-                            "SKILL.md 生成失败；Creator 不再对 SKILL.md 做 frontmatter/Markdown 静态格式 hard gate 或 LLM repair。"
-                            f"原始错误：{deterministic_error}"
-                        ),
-                        error_type="skill_md_generation_failed",
-                        content=candidate or "",
-                        recoverable=True,
-                    )
-                    return
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
                 if (
@@ -13017,7 +12989,7 @@ async def generate_file(request: GenerateFileRequest):
                             file_path=request.file_path,
                             role=request.role,
                             error=(
-                                f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
+                                f"Markdown 格式重写失败：已完整重写 {layer_limit} 轮仍未通过。"
                                 f"最后错误：{deterministic_error}"
                             ),
                             error_type=_markdown_warning_error_type(request.file_path),
@@ -13028,14 +13000,14 @@ async def generate_file(request: GenerateFileRequest):
 
                     yield _sse({
                         "type": "validation",
-                        "status": "format_region_rewrite",
+                        "status": "format_full_rewrite",
                         "success": False,
                         "file_path": request.file_path,
                         "role": request.role,
                         "editable": True,
                         "disabled": False,
                         "validation": {
-                            "status": "format_region_rewrite",
+                            "status": "format_full_rewrite",
                             "attempt": markdown_format_retry_count,
                             "markdown_format_retry_count": markdown_format_retry_count,
                             "business_repair_count": business_repair_count,
@@ -13045,25 +13017,22 @@ async def generate_file(request: GenerateFileRequest):
                         },
                     })
 
-                    failed_region = markdown_failure_region(deterministic_error)
-                    rewrite_messages = _build_markdown_region_rewrite_prompt(
+                    rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                         file_path=request.file_path,
                         skill_name=skill_name,
                         blueprint_text=request.blueprint_text,
                         deterministic_error=deterministic_error,
                         current_content=candidate or "",
-                        region=failed_region,
                     )
 
-                    rewritten_region = await _complete_creator_file_generation(
+                    candidate = await _complete_creator_file_generation(
                         messages=rewrite_messages,
                         model=route.model,
                         skill_name=skill_name,
                         file_path=request.file_path,
-                        prompt_variant=f"rewrite_markdown_{failed_region}",
+                        prompt_variant="rewrite_markdown_full_format",
                         retry_index=markdown_format_retry_count - 1,
                     )
-                    candidate = _merge_markdown_region_rewrite(candidate or "", rewritten_region, failed_region)
                     continue
                 layer_limit = _first_round_repair_limit(error_source)
                 if repair_counts_by_layer[error_layer] > layer_limit:
@@ -13099,11 +13068,9 @@ async def generate_file(request: GenerateFileRequest):
 
                 if request.file_path.startswith("references/"):
                     targeted_repair += (
-                        "\n\n额外修复目标：references/*.md 必须是一份正式 Markdown 参考资料文档。"
-                        "必须包含 YAML frontmatter，且 title/description 非空；"
-                        "frontmatter 顶层只允许 title、description、source、license、metadata。"
-                        "frontmatter 后必须有 Markdown 正文，正文必须包含标题，并提供可复用参考内容。"
-                        "不要输出聊天式澄清问题、确认选项、状态说明或计划询问。"
+                        "\n\n额外修复目标：references/*.md 语义错误只做局部内容 patch；"
+                        "保持已通过的 YAML frontmatter 和 Markdown 格式；"
+                        "按 reference semantic judge 的 issues 修正当前参考资料职责。"
                     )
 
                 contract_text = _build_generated_file_contract_text(
@@ -13380,7 +13347,7 @@ async def generate_file(request: GenerateFileRequest):
                                 file_path=request.file_path,
                                 role=request.role,
                                 error=(
-                                    f"Markdown 格式修复失败：已区域重写 {layer_limit} 轮仍未通过。"
+                                    f"Markdown 格式重写失败：已完整重写 {layer_limit} 轮仍未通过。"
                                     f"最后错误：{deterministic_error}"
                                 ),
                                 error_type=_markdown_warning_error_type(request.file_path),
@@ -13390,14 +13357,14 @@ async def generate_file(request: GenerateFileRequest):
                             return
                         yield _sse({
                             "type": "validation",
-                            "status": "format_region_rewrite",
+                            "status": "format_full_rewrite",
                             "success": False,
                             "file_path": request.file_path,
                             "role": request.role,
                             "editable": True,
                             "disabled": False,
                             "validation": {
-                                "status": "format_region_rewrite",
+                                "status": "format_full_rewrite",
                                 "attempt": markdown_format_retry_count,
                                 "markdown_format_retry_count": markdown_format_retry_count,
                                 "business_repair_count": business_repair_count,
@@ -13406,24 +13373,21 @@ async def generate_file(request: GenerateFileRequest):
                                 "error": deterministic_error,
                             },
                         })
-                        failed_region = markdown_failure_region(deterministic_error)
-                        rewrite_messages = _build_markdown_region_rewrite_prompt(
+                        rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                             file_path=request.file_path,
                             skill_name=skill_name,
                             blueprint_text=request.blueprint_text,
                             deterministic_error=deterministic_error,
                             current_content=candidate or "",
-                            region=failed_region,
                         )
-                        rewritten_region = await _complete_creator_file_generation(
+                        candidate = await _complete_creator_file_generation(
                             messages=rewrite_messages,
                             model=route.model,
                             skill_name=skill_name,
                             file_path=request.file_path,
-                            prompt_variant=f"rewrite_markdown_{failed_region}",
+                            prompt_variant="rewrite_markdown_full_format",
                             retry_index=markdown_format_retry_count - 1,
                         )
-                        candidate = _merge_markdown_region_rewrite(candidate or "", rewritten_region, failed_region)
                         continue
                     logger.exception(
                         "[Creator][generate_file][repair_failed] file=%s source=%s layer=%s attempt=%d",

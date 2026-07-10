@@ -320,6 +320,12 @@ _ALLOWED_FUNCTION_ITEM_FIELDS = {
 }
 
 
+
+
+def is_python_function_item_target(path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/")
+    return normalized.startswith("scripts/") and normalized.endswith(".py")
+
 def _normalize_string_array(value: object, *, source: str, index: int, field: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{source}.function_items[{index}].{field} must be a string array")
@@ -355,8 +361,8 @@ def normalize_structured_function_items(raw_items: object, *, source: str = "pla
             invalid.append({"index": index, "field": "target_file"})
             continue
         target = target_file.strip()
-        if not target.startswith("scripts/"):
-            invalid.append({"index": index, "field": "target_file", "target_file": target, "reason": "must_start_with_scripts/"})
+        if not is_python_function_item_target(target):
+            invalid.append({"index": index, "field": "target_file", "target_file": target, "reason": "must_be_scripts_python"})
             continue
         if target in seen_targets:
             invalid.append({"index": index, "field": "target_file", "target_file": target, "reason": "duplicate"})

@@ -2739,6 +2739,7 @@ async def _repair_generated_file_with_feedback(
     import_guard_result: dict[str, Any] | None = None,
     current_file_binding: dict[str, Any] | None = None,
     tool_pool_summary: dict[str, Any] | None = None,
+    function_execution_context: dict[str, Any] | None = None,
     patch_retry_limit: int = 3,
 ) -> str:
     """First-round single-file repair using local patch.
@@ -2935,6 +2936,8 @@ async def _repair_generated_file_with_feedback(
             f"{json.dumps(tool_pool_summary or {}, ensure_ascii=False, default=str)[:10000]}\n\n"
             "Runtime Import Guard Result（如果存在，必须先修复该硬错误；不要把 forbidden helper 替换成另一个未绑定 helper；需要平台 helper 时请求 tool_pool_patch.add_tool_requests；若任务可由标准库/允许依赖完成，则改为本地实现，不导入 runtime_tools）：\n"
             f"{json.dumps(import_guard_result or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+            "Canonical Function Execution Context（Writer/Judge/Repair 共享，优先来自当前真实 ToolPool file binding）：\n"
+            f"{json.dumps(function_execution_context or {}, ensure_ascii=False, default=str)[:12000]}\n\n"
             "Tool Registry / Snippet 上下文：\n"
             f"{tool_context}\n\n"
             + (
@@ -2981,9 +2984,15 @@ async def _repair_generated_file_with_feedback(
         )
         extra_context = ""
 
+    prompt_context_summary = (
+        "已省略原始 Writer prompt 中可能过期的工具上下文；本轮以 Canonical Function Execution Context 和 Current File Tool Binding 为准。"
+        if is_script and isinstance(function_execution_context, dict)
+        else _compact_messages_for_repair_context(prompt_messages)
+    )
+
     task_context = "\n".join([
         "原始生成上下文摘要：",
-        _compact_messages_for_repair_context(prompt_messages),
+        prompt_context_summary,
         "",
         "后端定向修复提示：",
         targeted_repair or "无",
@@ -4780,19 +4789,12 @@ async def _run_script_responsibility_review(
     - 具体输入输出变量名；
     - 最终 E2E 闭环。
 
-    允许阻断的无效内容仅限非常明确的空内容、空集合、纯占位符、
-    明显默认模板、或与当前脚本职责明显无关的内容。
+    Backend 在 Model Judge 前只保留客观工具合同事实检查；
+    pass/空壳/变量名/AST 结构是否完成职责交给 Model Judge。
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
     deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-    deterministic_issues += detect_requirement_evidence_static(script_content, req_items, getattr(skill_plan_entry, "outputs", []))
-    deterministic_issues += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
-    # Detect empty-shell functions and branches; stub implementations are a hard
-    # responsibility failure regardless of other checks.
-    stub_issues = _detect_stub_implementations(script_content, skill_plan_entry)
-    if stub_issues:
-        deterministic_issues += stub_issues
     review_context = review_context if isinstance(review_context, dict) else {}
     current_file_tool_binding = (
         review_context.get(
@@ -4806,11 +4808,17 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
-    authorized_tool_contracts = (
-        tool_contracts_from_binding(
-            current_file_tool_binding
+    provided_function_execution_context = review_context.get("function_execution_context")
+    if isinstance(provided_function_execution_context, dict):
+        function_execution_context = dict(provided_function_execution_context)
+    else:
+        function_execution_context = build_function_execution_context(
+            graph=review_context.get("requirement_graph"),
+            target_file=file_path,
+            current_file_tool_binding=current_file_tool_binding,
+            fallback_function_item=(function_item_prompt_payload(req_items[0]) if req_items else {}),
         )
-    )
+    authorized_tool_contracts = list(function_execution_context.get("authorized_tool_contracts") or [])
     if deterministic_issues:
         logger.info(
             "[Creator]"
@@ -4886,15 +4894,7 @@ async def _run_script_responsibility_review(
     workflow_allocation_summary = str(review_context.get("workflow_allocation_summary") or "").strip()
     trial_stdout = review_context.get("trial_stdout_json", review_context.get("trial_stdout", ""))
     artifact_info = review_context.get("artifact_info", review_context.get("artifact_paths", []))
-    graph_context = (
-        function_item_graph_context(review_context.get("requirement_graph"), file_path)
-        if isinstance(review_context, dict) and review_context.get("requirement_graph") is not None
-        else {
-            "function_item": function_item_prompt_payload(req_items[0]) if req_items else {},
-            "incoming_edges": [],
-            "outgoing_edges": [],
-        }
-    )
+    graph_context = function_execution_context
     req_payload = [graph_context.get("function_item") or function_item_prompt_payload(item) for item in req_items]
 
     messages = [
@@ -5063,7 +5063,6 @@ async def _run_script_responsibility_review(
             if review_attempt < 2:
                 continue
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 return {
                     "passed": False,
@@ -5097,7 +5096,6 @@ async def _run_script_responsibility_review(
             if not parsed_review.get("passed"):
                 if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
                     static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-                    static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
                     if static_blockers:
                         logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                             "event": "script_responsibility_failed",
@@ -5122,7 +5120,6 @@ async def _run_script_responsibility_review(
                 }, ensure_ascii=False, default=str))
                 return parsed_review
             static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            static_blockers += _detect_script_responsibility_static_blockers(script_content, skill_plan_entry, req_items)
             if static_blockers:
                 logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
                     "event": "script_responsibility_failed",
@@ -5210,6 +5207,94 @@ async def _run_script_responsibility_review(
         "repair_instructions": "",
         "model": route.model,
         "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
+    }
+
+async def _run_reference_semantic_review(
+    *,
+    file_path: str,
+    content: str,
+    purpose: str = "",
+    blueprint_context: str = "",
+    dependent_context: Any = None,
+    requested_model: str | None = None,
+) -> dict[str, Any]:
+    """Model-owned semantic review for references/*.md.
+
+    Backend format checks must run before this helper. This helper never uses
+    lexical overlap, body length, keyword lists, CJK bigrams, or static backend
+    heuristics to decide semantic success.
+    """
+    route = route_model(
+        VALIDATOR_TASK,
+        requested_model=requested_model,
+        reason=f"creator first-round reference semantic review: {file_path}",
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Creator 第一轮 reference 语义审查模型，只输出严格 JSON object。\n"
+                "Backend 已经完成 Markdown/frontmatter/fence/single-file 格式检查；你只判断语义职责。\n"
+                "不要使用 token overlap、长度阈值、关键词词表、CJK bigram、字段名匹配或固定章节名作为裁决依据。\n"
+                "只判断当前 references/*.md 是否完成自己的参考资料职责、是否跑题、是否只是空话/TODO/placeholder、"
+                "是否错误写成 Creator 创建流程、是否错误承担 executable script 职责。\n"
+                "不要判断 workflow 字段名、argv/stdout 字段、工具选择或 E2E 运行。\n"
+                "返回 JSON object: {\"passed\": true|false, \"issues\": [], \"repair_instructions\": \"...\"}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"目标 reference：{file_path}\n\n"
+                f"当前 FilePlan purpose / file-local responsibility：\n{purpose[:4000]}\n\n"
+                f"Blueprint 中相关上下文：\n{(blueprint_context or '')[:8000]}\n\n"
+                "引用/依赖当前 reference 的文件职责摘要（如有）：\n"
+                f"{json.dumps(dependent_context or {}, ensure_ascii=False, default=str)[:8000]}\n\n"
+                "当前 reference content：\n<<<REFERENCE\n"
+                f"{(content or '')[:16000]}\n"
+                "REFERENCE\n"
+            ),
+        },
+    ]
+    last_text = ""
+    for attempt in range(3):
+        active_messages = messages if attempt == 0 else [
+            *messages,
+            {"role": "user", "content": f"上一轮不是合法 JSON，请只返回约定 JSON object。上一轮：{last_text[:1000]}"},
+        ]
+        text = await complete_chat_once(active_messages, route.model)
+        last_text = str(text or "")
+        data = _parse_validator_json_object(last_text)
+        if isinstance(data, dict) and data:
+            passed = bool(data.get("passed"))
+            issues = data.get("issues") if isinstance(data.get("issues"), list) else data.get("blocking_issues")
+            issues = issues if isinstance(issues, list) else []
+            if not passed and not issues:
+                issues = [{
+                    "id": "reference_semantic.failed",
+                    "failed_file": file_path,
+                    "reason": str(data.get("reason") or data.get("problem") or "Reference semantic judge failed this file."),
+                    "minimal_edit": str(data.get("repair_instructions") or "Patch only this reference's semantic content."),
+                }]
+            return {
+                "passed": passed,
+                "issues": issues,
+                "repair_instructions": str(data.get("repair_instructions") or ""),
+                "model": route.model,
+                "raw_review": data,
+            }
+    return {
+        "passed": False,
+        "issues": [{
+            "id": "reference_semantic.validator_incomplete",
+            "failed_file": file_path,
+            "reason": "Reference semantic judge did not return valid JSON.",
+            "minimal_edit": "Retry semantic review; do not treat backend as semantic authority.",
+        }],
+        "repair_instructions": "Reference semantic judge unavailable/incomplete.",
+        "failure_type": "reference_semantic_validator_incomplete",
+        "model": route.model,
+        "raw_review": last_text[:1000],
     }
 
 __all__ = [name for name in globals() if not name.startswith("__")]

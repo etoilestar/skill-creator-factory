@@ -21,7 +21,7 @@ from .e2e import *  # noqa: F403
 from .repair import *  # noqa: F403
 from .generation import *  # noqa: F403
 from ..kernel_loader import load_kernel_creator_for_phase
-from ..blueprint_parser import exact_file_plan_paths_from_strict_skillplan, parse_blueprint
+from ..blueprint_parser import BlueprintShapeError, exact_file_plan_paths_from_strict_skillplan, parse_blueprint, validate_blueprint_shape_for_creator
 from ..skill_plan import normalize_structured_function_items, normalize_structured_responsibility_edges, validate_structured_responsibility_edge_transport
 
 from .upload_context import save_creator_context_upload, UPLOAD_ROOT, sanitize_session_id
@@ -7662,31 +7662,96 @@ Blueprint Planner 只规划业务责任。
             "function_items": [],
             "responsibility_edges": [],
         }
+        protocol_errors = []
         try:
-            allowed_function_item_targets = (
-                _resolve_allowed_function_item_targets_from_blueprint(
-                    frozen_blueprint_text
+            validate_blueprint_shape_for_creator(
+                frozen_blueprint_text
+            )
+        except BlueprintShapeError as exc:
+            protocol_errors.append(
+                _prepare_protocol_issue(
+                    "invalid_strict_blueprint_shape",
+                    str(exc),
+                    field="internal_blueprint_text",
                 )
             )
-            if event_emitter is not None:
-                await event_emitter({
-                    "event": "file_plan_ready",
-                    "allowed_function_item_targets": allowed_function_item_targets,
-                })
+        protocol_errors.extend(
+            _preflight_prepare_blueprint_text(
+                frozen_blueprint_text
+            )
+        )
+        if protocol_errors:
+            try:
+                repaired_blueprint_text = await _repair_prepare_blueprint_protocol(
+                    request=request,
+                    blueprint_text=frozen_blueprint_text,
+                    protocol_errors=protocol_errors,
+                )
+            except Exception as exc:
+                raise PreparePlanProtocolError(
+                    "Planner ready Blueprint FilePlan protocol "
+                    "repair failed before executable target freeze; "
+                    f"error={type(exc).__name__}: {exc}"
+                ) from exc
+
+            repaired_errors = []
+            try:
+                validate_blueprint_shape_for_creator(
+                    repaired_blueprint_text
+                )
+            except BlueprintShapeError as exc:
+                repaired_errors.append(
+                    _prepare_protocol_issue(
+                        "invalid_strict_blueprint_shape",
+                        str(exc),
+                        field="internal_blueprint_text",
+                    )
+                )
+            repaired_errors.extend(
+                _preflight_prepare_blueprint_text(
+                    repaired_blueprint_text
+                )
+            )
+            if repaired_errors:
+                raise PreparePlanProtocolError(
+                    "Planner ready Blueprint failed strict FilePlan "
+                    "preflight before executable target freeze; "
+                    f"errors={repaired_errors}"
+                )
+            frozen_blueprint_text = repaired_blueprint_text
+            first_planner_result = {
+                **first_planner_result,
+                "internal_blueprint_text": frozen_blueprint_text,
+            }
+            data = dict(first_planner_result)
+
+        allowed_function_item_targets = (
+            _resolve_allowed_function_item_targets_from_blueprint(
+                frozen_blueprint_text
+            )
+        )
+        if event_emitter is not None:
+            await event_emitter({
+                "event": "file_plan_ready",
+                "allowed_function_item_targets": allowed_function_item_targets,
+            })
+
+        try:
             binding_data = await _bind_executable_responsibility_plan(
                 request=request,
                 current_planner_result=first_planner_result,
                 planner_model=route.model,
                 allowed_function_item_targets=allowed_function_item_targets,
             )
-            normalized_function_items = normalize_structured_function_items(
+            candidate_function_items = normalize_structured_function_items(
                 binding_data.get("function_items"),
                 source="planner",
             )
             _validate_function_item_targets_in_allowed_domain(
-                normalized_function_items,
+                candidate_function_items,
                 allowed_function_item_targets,
             )
+            normalized_function_items = candidate_function_items
         except Exception as exc:
             draft_function_item_error = exc
         try:

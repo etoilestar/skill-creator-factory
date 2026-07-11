@@ -1160,6 +1160,28 @@ def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, 
     return {"requirements": requirements}
 
 
+
+def _skill_md_reviewer_schema_error(data: Any) -> str:
+    if not isinstance(data, dict) or not data:
+        return "SKILL.md semantic reviewer did not return a JSON object."
+    if "passed" not in data:
+        return "SKILL.md semantic reviewer JSON missing required bool field passed."
+    if not isinstance(data.get("passed"), bool):
+        return "SKILL.md semantic reviewer JSON field passed must be bool."
+    if "required_script_paths" in data and not isinstance(data.get("required_script_paths"), list):
+        return "SKILL.md semantic reviewer JSON field required_script_paths must be list when present."
+    if "required_reference_paths" in data and not isinstance(data.get("required_reference_paths"), list):
+        return "SKILL.md semantic reviewer JSON field required_reference_paths must be list when present."
+    if "required_asset_paths" in data and not isinstance(data.get("required_asset_paths"), list):
+        return "SKILL.md semantic reviewer JSON field required_asset_paths must be list when present."
+    if "reviewers" in data and not isinstance(data.get("reviewers"), dict):
+        return "SKILL.md semantic reviewer JSON field reviewers must be object when present."
+    if "issues" in data and not isinstance(data.get("issues"), list):
+        return "SKILL.md semantic reviewer JSON field issues must be list when present."
+    if "repair_suggestions" in data and not isinstance(data.get("repair_suggestions"), str):
+        return "SKILL.md semantic reviewer JSON field repair_suggestions must be string when present."
+    return ""
+
 async def _review_skill_md_blueprint_intent_with_model(
     *,
     skill_name: str,
@@ -1325,13 +1347,17 @@ async def _review_skill_md_blueprint_intent_with_model(
         ]
         raw = await complete_chat_once(active_messages, route.model)
         parsed = _json_loads_loose_object(raw)
-        if isinstance(parsed, dict) and parsed:
+        schema_error = _skill_md_reviewer_schema_error(parsed)
+        if not schema_error:
             data = parsed
             break
+        if review_attempt < 2:
+            raw = json.dumps({"schema_error": schema_error, "raw": parsed if isinstance(parsed, dict) else str(raw or "")[:1200]}, ensure_ascii=False, default=str)
+            continue
 
     if not isinstance(data, dict) or not data:
         raise CreatorValidatorReviewError(
-            "蓝图一致性审查模型连续 3 次未返回有效 JSON object；这是 validator failure，不应进入 SKILL.md 内容返修。",
+            "蓝图一致性审查模型连续 3 次未返回有效 JSON object/schema；这是 validator failure，不应进入 SKILL.md 内容返修。",
             raw_excerpt=str(raw or "")[:1000],
         )
 
@@ -1342,17 +1368,6 @@ async def _review_skill_md_blueprint_intent_with_model(
     data.setdefault("reviewers", {})
     data.setdefault("issues", [])
     data.setdefault("repair_suggestions", "")
-
-    if not isinstance(data["required_script_paths"], list):
-        data["required_script_paths"] = []
-    if not isinstance(data["required_reference_paths"], list):
-        data["required_reference_paths"] = []
-    if not isinstance(data["required_asset_paths"], list):
-        data["required_asset_paths"] = []
-    if not isinstance(data["reviewers"], dict):
-        data["reviewers"] = {}
-    if not isinstance(data["issues"], list):
-        data["issues"] = []
 
     if not data["issues"]:
         reviewer_issues: list[dict[str, Any]] = []

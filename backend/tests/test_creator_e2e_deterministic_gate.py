@@ -1,5 +1,3 @@
-import pytest
-
 from backend.services.creator.api import (
     PreparePlanReviewSummary,
     _normalize_file_plan_for_requirement_coverage,
@@ -80,7 +78,6 @@ def test_single_script_gets_full_coverage_contract_without_io_pollution():
     assert any(item["code"] == "single_script_full_coverage_contract" for item in warnings)
 
 
-@pytest.mark.xfail(reason="requirement_coverage_incomplete warning is produced by normalization outside this PR scope", strict=False)
 def test_coverage_normalization_does_not_add_bridge_script():
     files = [_script_spec("scripts/parse_document.py", "parse uploaded file"), _script_spec("scripts/render_output.py", "render markdown")]
     warnings = []

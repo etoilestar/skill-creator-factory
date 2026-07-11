@@ -3913,8 +3913,11 @@ def _normalize_responsibility_review_issues(
             or "只修改当前脚本中未完成内容职责的业务逻辑区域。"
         ).strip()
 
+        raw_issue_id = str(raw.get("id") or raw.get("issue_id") or "").strip()
+        normalized_issue_id = raw_issue_id if raw_issue_id in {"tool_contract_mismatch", "tool_support_insufficient"} else "script_functional.responsibility"
+
         normalized.append({
-            "id": "script_functional.responsibility",
+            "id": normalized_issue_id,
             "failed_file": file_path,
             "failed_function": str(
                 raw.get("function")
@@ -4036,6 +4039,10 @@ def _parse_requirement_review_result(data: dict[str, Any], *, requirements: list
     if not isinstance(data, dict):
         return {"passed": True, "failure_type": "script_requirement_validator_error", "issues": [], "advisory_notes": [{"id": "script_requirement_validator_error", "failed_file": file_path, "reason": "review JSON is not an object", "allowed_scope": "do not repair business files"}]}
     advisory_notes = list(data.get("advisory_notes") or []) if isinstance(data.get("advisory_notes"), list) else []
+    if data.get("passed") is False and (isinstance(data.get("blocking_issues"), list) or isinstance(data.get("issues"), list)):
+        direct_issues = _normalize_responsibility_review_issues(data, file_path=file_path)
+        if direct_issues:
+            return {"passed": False, "failure_type": "script_requirement_failed", "issues": direct_issues, "checks": [], "advisory_notes": advisory_notes, "repair_instructions": str(data.get("repair_instructions") or ""), "raw_review": data}
     checks = data.get("checks")
     required_ids = {r.id for r in requirements if r.required}
     if not isinstance(checks, list):
@@ -4782,7 +4789,7 @@ async def _run_script_responsibility_review(
     """
 
     req_items = _coerce_requirement_items(requirements) or _coerce_requirement_items(getattr(skill_plan_entry, "requirements", []))
-    deterministic_issues = (deterministic_issues or []) + _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
+    deterministic_issues = deterministic_issues or []
     review_context = review_context if isinstance(review_context, dict) else {}
     current_file_tool_binding = (
         review_context.get(
@@ -4922,9 +4929,11 @@ async def _run_script_responsibility_review(
                 "- 工具合同只用于理解源码语义和判断当前职责是否真实使用已有能力；不得借此新增工具、授权工具或要求 ToolPool 外工具。\n"
                 "- 如果当前源码没有调用某个已授权工具，不得因为工具已授权就假定其效果已经发生。\n"
                 "- 如果源码调用工具，但返回值没有进入当前职责要求的结果或 artifact，不得仅凭存在 tool call 判定职责完成。\n\n"
-                "工具绑定边界：工具/helper/custom_tools 是否允许，已经由 runtime_import_guard 和 Current File Tool Binding 负责。"
-                "你不得因为 runtime_tools/helper 导入判 failed；如怀疑工具绑定问题，只能设置 delegate_to_backend_contract=true 并放入 advisory_notes。"
-                "没有 deterministic runtime_import_guard failure 时，不得声称\"后端确定性检查判定禁止\"。\n\n"
+                "工具合同判断规则：你必须根据 Current File ToolPool contracts 与完整源码判断工具使用事实。"
+                "如果源码调用的平台工具不在当前 ToolPool 合同中，输出 blocking issue id=tool_contract_mismatch。"
+                "如果当前 ToolPool 缺少完成 FunctionItem 所需能力，输出 blocking issue id=tool_support_insufficient。"
+                "如果工具已提供但源码没有正确使用导致职责未完成，输出普通 semantic blocking issue。"
+                "Backend 只确认工具事实是否真实，不根据模块名、函数名、角色或 capability 映射替你判断工具语义。\n\n"
 
                 "返回 JSON object：\n"
                 "{\n"
@@ -4995,7 +5004,7 @@ async def _run_script_responsibility_review(
                 "4. 不要要求当前脚本验证无法从输入、依赖、工具或声明能力中观察的信息。\n"
                 "5. requirements.constraints 是开放责任约束；所有 required=true constraints 都必须检查实现证据。\n"
                 "6. 不得忽略不认识的 constraint，也不得重新创造 current script FunctionItem 中不存在的 constraint。\n"
-                "7. 工具/helper/custom_tools 绑定问题不属于职责审查阻断项；runtime_import_guard 已通过时，不得要求删除 runtime_tools helper（例如 read_docx_text）或声称 helper forbidden。\n"
+                "7. 检查源码调用的平台工具是否存在于 Current File ToolPool contracts；ToolPool 外工具使用输出 tool_contract_mismatch，工具不足输出 tool_support_insufficient。不得要求删除工具调用并改成本地假实现。\n"
             ),
         },
     ]

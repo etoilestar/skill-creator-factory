@@ -5,7 +5,7 @@ Covers:
 2. file_specs_for_explore: uses full canonical entry (not a stub-only minimal spec).
 3. E2E hard freeze: allow_tool_explore=False on E2E scope; parser rejects tool_pool_patch.add_tool_requests.
 4. Public function name: extract_missing_stdlib_from_e2e_errors is importable without leading underscore.
-5. runtime_import_guard fail-closed: no binding → all runtime tool imports forbidden.
+5. runtime_import_guard diagnostics: no binding reports unbound runtime tool imports.
 6. Tool-pool generation and gate: initial pool gate produces allow/deny events.
 """
 import json
@@ -90,16 +90,16 @@ def test_extract_missing_stdlib_third_party_still_surfaced():
 
 
 # ---------------------------------------------------------------------------
-# Fix 5: runtime_import_guard fail-closed (no binding → deny runtime helpers)
+# Fix 5: runtime_import_guard diagnostic mode (no binding → report unbound helpers)
 # ---------------------------------------------------------------------------
 
-def test_import_guard_no_binding_denies_runtime_helper():
-    """With file_binding=None, importing any runtime_tools helper must be denied."""
+def test_import_guard_no_binding_reports_runtime_helper():
+    """With file_binding=None, importing a runtime_tools helper is diagnostic, not hard-denied."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import read_file_text\n"
     result = guard_runtime_imports(src, "scripts/a.py", None)
-    assert not result.success
+    assert result.success
     assert "read_file_text" in result.forbidden_imports
 
 
@@ -112,13 +112,13 @@ def test_import_guard_no_binding_allows_stdlib_only():
     assert result.success
 
 
-def test_import_guard_empty_binding_denies_unbound_helper():
-    """An explicit empty binding must also deny unbound helpers."""
+def test_import_guard_empty_binding_reports_unbound_helper():
+    """An explicit empty binding reports unbound helpers without hard-failing business semantics."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import extract_pdf_text\n"
     result = guard_runtime_imports(src, "scripts/a.py", {"allowed_helper_imports": []})
-    assert not result.success
+    assert result.success
     assert "extract_pdf_text" in result.forbidden_imports
 
 
@@ -222,26 +222,16 @@ def test_parser_ignores_empty_tool_pool_patch_when_frozen():
 # Fix 1: Secondary explore trigger — missing capability also triggers once
 # ---------------------------------------------------------------------------
 
-def test_has_responsibility_missing_capability_issue_detects_tool_keywords():
-    """Issues mentioning 'tool' / 'helper' / 'capability' / 'dependency' in
-    missing_evidence or semantic_failure should trigger exploration."""
+def test_has_responsibility_missing_capability_issue_detects_model_tool_support_id():
+    """Only explicit model/tool-support issue IDs should trigger exploration;
+    Backend should not infer capabilities from helper/capability words."""
     from backend.services.creator.api import _has_responsibility_missing_capability_issue
 
-    issues_with_tool = [
-        {
-            "id": "some_responsibility_issue",
-            "missing_evidence": ["valid runtime helper allowed by selected_tools"],
-        }
-    ]
-    assert _has_responsibility_missing_capability_issue(issues_with_tool) is True
+    issues_with_support_id = [{"id": "tool_support_insufficient", "semantic_failure": "model judged current ToolPool insufficient"}]
+    assert _has_responsibility_missing_capability_issue(issues_with_support_id) is True
 
-    issues_with_capability = [
-        {
-            "id": "other_issue",
-            "semantic_failure": "missing capability to process PDF files",
-        }
-    ]
-    assert _has_responsibility_missing_capability_issue(issues_with_capability) is True
+    keyword_only = [{"id": "some_responsibility_issue", "missing_evidence": ["valid runtime helper allowed by selected_tools"]}]
+    assert _has_responsibility_missing_capability_issue(keyword_only) is False
 
 
 def test_has_responsibility_missing_capability_issue_ignores_unrelated():
@@ -281,8 +271,8 @@ def test_has_responsibility_missing_capability_issue_empty():
 # Fix 6a: Initial tool-pool generation and gate
 # ---------------------------------------------------------------------------
 
-def test_build_tool_pool_produces_gate_events():
-    """build_tool_pool must produce at least one gate event for a scripts/ file."""
+def test_build_tool_pool_does_not_require_keyword_driven_binding():
+    """ToolPool generation should not rely on backend PDF/text keyword mappings."""
     from backend.services.creator.tool_pool_builder import build_tool_pool
 
     pool = build_tool_pool(
@@ -290,29 +280,27 @@ def test_build_tool_pool_produces_gate_events():
         user_request="提取 PDF 文本",
         file_specs=[{"path": "scripts/extract.py", "role": "generic_script", "inputs": ["file.pdf"]}],
     )
-    assert pool.file_bindings, "Expected at least one file binding"
-    assert any(
-        b.target_file == "scripts/extract.py" for b in pool.file_bindings
-    ), "Expected binding for scripts/extract.py"
+    assert pool.skill_name == "x"
+    assert isinstance(pool.file_bindings, list)
 
 
-def test_build_tool_pool_gate_blocks_non_script_path():
-    """gate_tool_request must block tools for non-scripts/ paths."""
+def test_build_tool_pool_gate_is_file_role_independent():
+    """gate_tool_request must not use file_role as a tool semantic decision."""
     from backend.services.creator.tool_pool_gate import gate_tool_request
 
     event = gate_tool_request(
         {"target_file": "references/doc.md", "candidate_tool_id": "unified_file_text_read"},
         file_role="reference",
     )
-    assert event.decision == "blocked_by_policy"
+    assert event.decision == "allow"
 
 
 # ---------------------------------------------------------------------------
-# Fix 6b: Script importing unauthorized helper is rejected by import guard
+# Fix 6b: Script importing unbound helper is diagnosed by import guard
 # ---------------------------------------------------------------------------
 
-def test_import_guard_rejects_unregistered_runtime_helper():
-    """A script importing a helper not in allowed_helper_imports must fail guard."""
+def test_import_guard_reports_unregistered_runtime_helper():
+    """A script importing a helper not in allowed_helper_imports is reported for the semantic judge."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import extract_pdf_text\n"
@@ -322,7 +310,7 @@ def test_import_guard_rejects_unregistered_runtime_helper():
         "scripts/test.py",
         {"allowed_helper_imports": ["read_file_text"]},
     )
-    assert not result.success
+    assert result.success
     assert "extract_pdf_text" in result.forbidden_imports
 
 

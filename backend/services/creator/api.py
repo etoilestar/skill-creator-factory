@@ -2727,6 +2727,7 @@ def _has_responsibility_missing_capability_issue(
         "responsibility_tool_binding_failed",
         "missing_tool_binding",
         "missing_required_tool",
+        "tool_support_insufficient",
     }
 
     registry_identities: set[str] = set()
@@ -8172,6 +8173,15 @@ def _normalize_file_plan_for_requirement_coverage(
                 "contains only explicit capability "
                 "and reference contracts."
             ),
+        })
+    else:
+        warnings.append({
+            "severity": "info",
+            "code": "requirement_coverage_incomplete",
+            "source": "analyze_blueprint",
+            "path": "scripts",
+            "field": "runtime_contract.coverage_requirements",
+            "message": "Multiple required scripts keep per-file coverage metadata only; no bridge script is synthesized.",
         })
 
     logger.info(

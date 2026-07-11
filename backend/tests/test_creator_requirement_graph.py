@@ -456,7 +456,7 @@ async def test_validator_incomplete_twice_static_blocker_repairs_script(monkeypa
     req = build_default_requirement_graph([spec]).requirements[0]
 
     async def fake_complete(*args, **kwargs):
-        return '{"passed": true, "advisory_notes": []}'
+        return '{"passed": true, "blocking_issues": [], "advisory_notes": []}'
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
     review = await _run_script_responsibility_review(
@@ -474,7 +474,7 @@ async def test_validator_incomplete_twice_without_static_blocker_stays_incomplet
     req = build_default_requirement_graph([spec]).requirements[0]
 
     async def fake_complete(*args, **kwargs):
-        return '{"passed": true, "advisory_notes": []}'
+        return '{"passed": true, "blocking_issues": [], "advisory_notes": []}'
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
     script = """
@@ -499,7 +499,7 @@ async def test_responsibility_review_invalid_json_is_rewritten_before_validating
     req = build_default_requirement_graph([spec]).requirements[0]
     calls = iter([
         "not json",
-        '{"passed": true, "checks": [{"requirement_id": "' + req.id + '", "status": "passed", "severity": "advisory", "evidence_level": "strong", "missing_evidence": []}], "advisory_notes": []}',
+        '{"passed": true, "blocking_issues": [], "advisory_notes": []}',
     ])
 
     async def fake_complete(*args, **kwargs):
@@ -546,7 +546,54 @@ def run(payload):
     )
     assert review["passed"] is False
     assert review["failure_type"] == "script_requirement_validator_incomplete"
-    assert review["issues"][0]["id"] == "script_responsibility.validator_format_rewrite_exhausted"
+    assert review["issues"][0]["id"] == "script_responsibility.validator_schema_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"advisory_notes": []},
+    {"passed": "false", "blocking_issues": []},
+    {"passed": True, "blocking_issues": "bad"},
+])
+async def test_responsibility_review_schema_invalid_never_passes(monkeypatch, payload):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return json.dumps(payload)
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'artifact': payload}\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is False
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
+    assert review["issues"][0]["id"] == "script_responsibility.validator_schema_invalid"
+
+
+@pytest.mark.asyncio
+async def test_responsibility_review_three_schema_invalid_returns_validator_failure(monkeypatch):
+    spec = _script_spec(inputs=["customer brief"], outputs=["report path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+    calls = {"count": 0}
+
+    async def fake_complete(*args, **kwargs):
+        calls["count"] += 1
+        return json.dumps({"passed": True, "blocking_issues": "bad"})
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'artifact': payload}\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert calls["count"] == 3
+    assert review["passed"] is False
+    assert review["failure_type"] == "script_requirement_validator_incomplete"
 
 
 @pytest.mark.asyncio
@@ -627,6 +674,71 @@ def test_script_requirement_failed_uses_localized_patch_mode():
         file_path="scripts/generic.py",
         attempt=1,
     ) == "localized_patch"
+
+
+@pytest.mark.asyncio
+async def test_generate_file_empty_image_semantic_fail_enters_localized_patch(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    spec = _script_spec(path="scripts/main.py", purpose="根据输入生成真实图片 artifact。")
+    reviews = iter([
+        {
+            "passed": False,
+            "failure_type": "script_requirement_failed",
+            "issues": [{
+                "id": "script_functional.responsibility",
+                "failed_file": "scripts/main.py",
+                "reason": "current script only creates an empty file path and does not perform its core responsibility",
+                "minimal_edit": "generate the artifact instead of touching an empty file",
+            }],
+            "repair_instructions": "patch current script generation logic",
+        },
+        {"passed": True, "issues": []},
+    ])
+    repair_modes = []
+
+    async def fake_complete_creator_file_generation(**_kwargs):
+        return "def run(payload):\n    path = str(payload.get('name', 'out')) + '.png'\n    open(path, 'wb').close()\n    return {'image_path': path}\n"
+
+    async def fake_responsibility_review(**_kwargs):
+        return next(reviews)
+
+    async def fake_repair_generated_file_with_feedback(**kwargs):
+        repair_modes.append(kwargs.get("repair_mode"))
+        assert "current script only creates an empty file path" in kwargs.get("validation_error", "")
+        return "def run(payload):\n    return {'image_path': 'generated.png'}\n"
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
+    monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
+    async def fake_generated_file_validator_round(**_kwargs):
+        return {"passed": False, "issues": []}
+
+    monkeypatch.setattr(api, "_run_generated_file_validator_round", fake_generated_file_validator_round)
+    monkeypatch.setattr(api, "_check_script_content_review_contract", lambda *args, **kwargs: [])
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="scripts/main.py",
+        purpose="generate image",
+        blueprint_text="scripts/main.py",
+        conversation_history=[],
+        role="generic_script",
+        skill_plan_entry=spec.model_dump(mode="json"),
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert repair_modes == ["localized_patch"], body
+    assert "file_done" in body
 
 
 def test_markdown_format_rewrite_detection_uses_structured_contract_not_message_text():
@@ -785,7 +897,7 @@ async def test_responsibility_prompt_omits_non_responsibility_counterexamples(mo
 
     async def fake_complete(messages, model):
         captured_messages.extend(messages)
-        return '{"passed": true, "advisory_notes": []}'
+        return '{"passed": true, "blocking_issues": [], "advisory_notes": []}'
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
 
@@ -949,32 +1061,12 @@ async def test_generate_file_validator_incomplete_uses_entry_requirements_static
     async def fake_responsibility_review(**_kwargs):
         return next(reviews)
 
-    seen_static_requirements = []
-
-    def fake_static_blockers(script_content, skill_plan_entry, requirements):
-        seen_static_requirements.extend(requirements or [])
-        if requirements:
-            return [{
-                "id": "script_requirement_failed",
-                "requirement_id": req.id,
-                "failed_file": "scripts/main.py",
-                "reason": "required input is not in the constructed output",
-                "missing_evidence": ["required input -> output"],
-                "minimal_edit": "patch current script",
-                "allowed_scope": "current script only",
-            }]
-        return []
-
-    repair_modes = []
-
     async def fake_repair_generated_file_with_feedback(**kwargs):
-        repair_modes.append(kwargs.get("repair_mode"))
-        return "def run(payload):\n    brief = payload.get('customer brief')\n    return {'path': brief}\n"
+        raise AssertionError("validator protocol failure must not repair Python script")
 
     monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
     monkeypatch.setattr(api, "_run_script_responsibility_review", fake_responsibility_review)
     monkeypatch.setattr(api, "_load_persisted_requirement_graph", lambda _skill_name: None)
-    monkeypatch.setattr(api, "_detect_script_responsibility_static_blockers", fake_static_blockers)
     monkeypatch.setattr(api, "_skill_plan_entry_for_file", lambda **_kwargs: spec)
     monkeypatch.setattr(api, "_repair_generated_file_with_feedback", fake_repair_generated_file_with_feedback)
     async def fake_generated_file_validator_round(**_kwargs):
@@ -997,10 +1089,8 @@ async def test_generate_file_validator_incomplete_uses_entry_requirements_static
         chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
     body = "".join(chunks)
 
-    assert seen_static_requirements, body
-    assert repair_modes, body
-    assert "script_requirement_failed" in body
-    assert "script_requirement_validator_incomplete" not in body
+    assert "script_requirement_validator_incomplete" in body
+    assert "file_done" in body
 
 
 @pytest.mark.asyncio
@@ -1064,17 +1154,16 @@ async def test_generate_file_tool_contract_mismatch_enters_repair_not_error(monk
     assert "repairing" in body
     assert "script_requirement_validator_incomplete" not in body
 
-def test_validator_error_stage_enters_repair_instead_of_frontend_error():
+def test_validator_error_stage_returns_frontend_error_not_script_repair():
     from backend.services.creator import api
 
-    # Contract-level assertion: single-file production validator failures are
-    # converted into current-file repair issues instead of terminal SSE errors.
     import inspect
     source = inspect.getsource(api.generate_file)
     assert "script_requirement_validator_error" in source
-    assert "single_file_production_validation" in source
-    assert "auto-repair the current file instead of returning directly to the frontend" in source
-    assert "no localized business blocker was identified" not in source
+    assert "script_requirement_validator_incomplete" in source
+    assert "_file_done_error_sse" in source
+    assert "single_file_production_validation" not in source
+    assert "auto-repair the current file instead of returning directly to the frontend" not in source
 
 
 def test_validator_graph_source_quality_marked(monkeypatch):

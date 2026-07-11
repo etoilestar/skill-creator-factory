@@ -4708,6 +4708,52 @@ def detect_requirement_evidence_static(script_content: str, requirements: list[R
     issues.extend(detect_error_stdout_bypass(script_content, requirements, expected_outputs))
     return issues
 
+
+def _script_responsibility_schema_error(data: Any, *, file_path: str) -> str:
+    if not isinstance(data, dict) or not data:
+        return "职责审查模型未返回 JSON object。"
+    if "passed" not in data:
+        return "职责审查模型 JSON 缺少 required bool 字段 passed。"
+    if not isinstance(data.get("passed"), bool):
+        return "职责审查模型 JSON 字段 passed 必须是 bool。"
+    if "blocking_issues" not in data:
+        return "职责审查模型 JSON 缺少 required list 字段 blocking_issues。"
+    if not isinstance(data.get("blocking_issues"), list):
+        return "职责审查模型 JSON 字段 blocking_issues 必须是 list。"
+    if "advisory_notes" in data and not isinstance(data.get("advisory_notes"), list):
+        return "职责审查模型 JSON 字段 advisory_notes 必须是 list。"
+    if "repair_instructions" in data and not isinstance(data.get("repair_instructions"), str):
+        return "职责审查模型 JSON 字段 repair_instructions 必须是 string。"
+    if data.get("passed") is True and data.get("blocking_issues"):
+        return "职责审查模型返回 passed=true 但 blocking_issues 非空。"
+    return ""
+
+
+def _script_responsibility_validator_failure(
+    *,
+    file_path: str,
+    reason: str,
+    raw: Any,
+    model: str,
+) -> dict[str, Any]:
+    return {
+        "passed": False,
+        "issues": [{
+            "id": "script_responsibility.validator_schema_invalid",
+            "failed_file": file_path,
+            "failed_function": "responsibility_review",
+            "code_region": "review",
+            "reason": reason or "职责审查模型输出 schema invalid。",
+            "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+            "allowed_scope": "do not repair business files for validator response format",
+            "details": {"raw": str(raw or "")[:1000]},
+        }],
+        "advisory_notes": [],
+        "repair_instructions": "职责审查模型输出格式/协议连续失败，不能放行当前脚本。",
+        "failure_type": "script_requirement_validator_incomplete",
+        "model": model,
+    }
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
@@ -5000,82 +5046,26 @@ async def _run_script_responsibility_review(
             }
 
         data = _parse_validator_json_object(last_text)
-        if isinstance(data, dict) and data.get("passed") is True:
-            blocking = data.get("blocking_issues")
-            if isinstance(blocking, list) and blocking:
-                if review_attempt < 2:
-                    last_text = json.dumps(data, ensure_ascii=False, default=str)
-                    continue
-                return {
-                    "passed": False,
-                    "issues": [{
-                        "id": "script_responsibility.validator_schema_contradiction",
-                        "failed_file": file_path,
-                        "failed_function": "responsibility_review",
-                        "code_region": "review",
-                        "reason": "职责审查模型返回 passed=true 但 blocking_issues 非空。",
-                        "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                        "details": {"raw_review": data},
-                    }],
-                    "repair_instructions": "职责审查模型输出协议矛盾，不能放行当前脚本。",
-                    "failure_type": "script_requirement_validator_incomplete",
-                    "model": route.model,
-                    "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
-                }
-        if not isinstance(data, dict) or not data:
+        schema_error = _script_responsibility_schema_error(data, file_path=file_path)
+        if schema_error:
             if review_attempt < 2:
+                last_text = json.dumps({"schema_error": schema_error, "raw": data if isinstance(data, dict) else last_text}, ensure_ascii=False, default=str)
                 continue
-            static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            if static_blockers:
-                return {
-                    "passed": False,
-                    "issues": static_blockers,
-                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
-                    "failure_type": "script_requirement_failed",
-                    "model": "deterministic",
-                }
-            return {
-                "passed": False,
-                "issues": [{
-                    "id": "script_responsibility.validator_format_rewrite_exhausted",
-                    "failed_file": file_path,
-                    "failed_function": "responsibility_review",
-                    "code_region": "review",
-                    "reason": "职责审查模型连续返回非 JSON；本轮未得到可用职责审查结论。",
-                    "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                    "allowed_scope": "do not repair business files for validator response format",
-                    "details": {"raw": last_text[:1000]},
-                }],
-                "advisory_notes": [],
-                "repair_instructions": "职责审查模型输出格式连续失败，不能放行当前脚本。",
-                "failure_type": "script_requirement_validator_incomplete",
-                "model": route.model,
-            }
+            return _script_responsibility_validator_failure(
+                file_path=file_path,
+                reason=schema_error,
+                raw=data if isinstance(data, dict) else last_text,
+                model=route.model,
+            )
 
+        data.setdefault("advisory_notes", [])
+        data.setdefault("repair_instructions", "")
         break
 
     data = data if isinstance(data, dict) else {}
 
     blocking = data.get("blocking_issues")
     blocking_issues = blocking if isinstance(blocking, list) else []
-
-    if data.get("passed") is True and blocking_issues:
-        return {
-            "passed": False,
-            "issues": [{
-                "id": "script_responsibility.validator_schema_contradiction",
-                "failed_file": file_path,
-                "failed_function": "responsibility_review",
-                "code_region": "review",
-                "reason": "职责审查模型返回 passed=true 但 blocking_issues 非空。",
-                "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
-                "details": {"raw_review": data},
-            }],
-            "repair_instructions": "职责审查模型输出协议矛盾，不能放行当前脚本。",
-            "failure_type": "script_requirement_validator_incomplete",
-            "model": route.model,
-            "advisory_notes": data.get("advisory_notes") if isinstance(data.get("advisory_notes"), list) else [],
-        }
 
     if data.get("passed") is False:
         issues = _normalize_responsibility_review_issues(data, file_path=file_path)

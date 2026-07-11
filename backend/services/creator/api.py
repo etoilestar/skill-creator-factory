@@ -12962,62 +12962,15 @@ async def generate_file(request: GenerateFileRequest):
                     prompt_variant = next_variant
                     continue
                 if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                    static_blockers: list[dict[str, Any]] = []
-                    if request.file_path.startswith("scripts/"):
-                        try:
-                            static_skill_md = (
-                                (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
-                                if (settings.skills_path / skill_name / "SKILL.md").is_file()
-                                else ""
-                            )
-                            static_entry = _skill_plan_entry_for_file(
-                                file_path=request.file_path,
-                                blueprint_text=static_skill_md,
-                                role=request.role,
-                                skill_plan_entry=effective_skill_plan_entry,
-                            )
-                            static_blockers = _runtime_tool_contract_static_blockers(
-                                candidate or "",
-                                static_entry,
-                                entry_requirements,
-                            )
-                        except Exception:
-                            static_blockers = []
-                    if not static_blockers:
-                        # Single-file production validation failures must still enter
-                        # the patch repair loop.  A validator error/incomplete review
-                        # is not a reason to return a terminal error to the frontend;
-                        # repair should make the current script's responsibility path
-                        # explicit enough for the next validation round.
-                        static_blockers = [{
-                            "id": error_source,
-                            "failed_file": request.file_path,
-                            "failed_function": "single_file_production_validation",
-                            "code_region": "current file responsibility implementation",
-                            "reason": (
-                                "Single-file production validator failed or returned incomplete checks; "
-                                "auto-repair the current file instead of returning directly to the frontend."
-                            ),
-                            "missing_evidence": [
-                                "validator-readable current-file responsibility evidence",
-                                "input/tool result participates in constructed output",
-                            ],
-                            "minimal_edit": (
-                                "只修改当前文件职责实现区域，让职责证据更明确。"
-                            ),
-                            "allowed_scope": "current file responsibility implementation",
-                            "details": {"validator_error": deterministic_error},
-                        }]
-                    stage_error = FileGenerationStageError(
-                        source="script_requirement_failed",
-                        layer="responsibility",
-                        detail=json.dumps({"issues": static_blockers}, ensure_ascii=False, default=str),
-                        original=ScriptFunctionalValidationError(static_blockers, layer="responsibility"),
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=deterministic_error,
+                        error_type=error_source,
+                        content=candidate or "",
+                        recoverable=True,
                     )
-                    deterministic_error = str(stage_error)
-                    error_source = stage_error.source
-                    error_layer = f"{stage_error.source}:{stage_error.layer}"
-                    repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+                    return
 
                 if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
                     layer_limit = _first_round_repair_limit(error_source)
@@ -13460,9 +13413,6 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                     if repair_mode == "strict_patch":
-                        if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                            candidate = repaired_candidate
-                            continue
                         yield _file_done_error_sse(
                             file_path=request.file_path,
                             role=request.role,

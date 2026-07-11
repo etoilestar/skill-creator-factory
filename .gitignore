@@ -15,3 +15,5 @@ skills/*/
 .DS_Store
 backend/config.py
 bge-large-zh-v1.5
+
+logs/

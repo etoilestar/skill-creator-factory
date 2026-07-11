@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from backend.services.creator.common import (
@@ -542,9 +544,79 @@ def run(payload):
         skill_plan_entry=spec,
         requirements=[req],
     )
-    assert review["passed"] is True
+    assert review["passed"] is False
     assert review["failure_type"] == "script_requirement_validator_incomplete"
-    assert review["issues"] == []
+    assert review["issues"][0]["id"] == "script_responsibility.validator_format_rewrite_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_requirement_items_use_judge_schema_without_checks_parser(monkeypatch):
+    spec = _script_spec(inputs=["prompt"], outputs=["image path"])
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [{
+                "issue_type": "semantic_action_incomplete",
+                "semantic_failure": "current script does not perform its core responsibility",
+            }],
+            "advisory_notes": [],
+            "repair_instructions": "implement the current script responsibility",
+        })
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content="def run(payload):\n    return {'image_path': 'out.png'}\n",
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is False
+    assert review.get("failure_type") != "script_requirement_validator_incomplete"
+    assert review["issues"][0]["details"]["issue_type"] == "semantic_action_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_image_artifact_empty_file_semantic_fail_enters_script_patch(monkeypatch):
+    spec = _script_spec(
+        inputs=["image prompt"],
+        outputs=["real image artifact"],
+        purpose="根据输入生成真实图片 artifact。",
+    )
+    req = build_default_requirement_graph([spec]).requirements[0]
+
+    async def fake_complete(*args, **kwargs):
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [{
+                "issue_type": "semantic_action_incomplete",
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "failed_file": spec.path,
+                "semantic_failure": "current script only creates an empty file path and does not perform its core responsibility",
+                "problem": "no real artifact generation occurs",
+                "minimal_edit": "generate the artifact instead of touching an empty file",
+            }],
+            "advisory_notes": [],
+            "repair_instructions": "patch the current script generation logic",
+        })
+
+    monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
+    script = """
+def run(payload):
+    path = str(payload.get('name', 'out')) + '.png'
+    open(path, 'wb').close()
+    return {'image_path': path}
+"""
+    review = await _run_script_responsibility_review(
+        file_path=spec.path,
+        script_content=script,
+        skill_plan_entry=spec,
+        requirements=[req],
+    )
+    assert review["passed"] is False
+    assert review["issues"][0]["minimal_edit"] == "generate the artifact instead of touching an empty file"
 
 
 def test_script_requirement_failed_uses_localized_patch_mode():

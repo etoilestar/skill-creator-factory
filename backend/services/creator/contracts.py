@@ -1297,24 +1297,41 @@ async def _review_skill_md_blueprint_intent_with_model(
         f"{(content or '')[-22000:]}\n"
     )
 
-    raw = await complete_chat_once(
-        [
+    base_messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是严格 JSON 输出的第一轮 SKILL.md 语义覆盖审查器。"
+                "只输出 JSON object，不要输出 Markdown。"
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    raw = ""
+    data: dict[str, Any] | None = None
+    for review_attempt in range(3):
+        active_messages = base_messages if review_attempt == 0 else [
+            *base_messages,
             {
-                "role": "system",
+                "role": "user",
                 "content": (
-                    "你是严格 JSON 输出的第一轮 SKILL.md 语义覆盖审查器。"
-                    "只输出 JSON object，不要输出 Markdown。"
+                    "上一轮结论只做 JSON schema 格式重写，不重新审查 SKILL.md，不修改语义结论。\n"
+                    "SKILL.md content 不变，blueprint 不变；请严格按当前 reviewer 已定义的 JSON schema 返回 JSON object，"
+                    "不要输出 Markdown 或解释。\n"
+                    f"上一轮 raw output excerpt：{str(raw or '')[:1200]}"
                 ),
             },
-            {"role": "user", "content": prompt},
-        ],
-        route.model,
-    )
+        ]
+        raw = await complete_chat_once(active_messages, route.model)
+        parsed = _json_loads_loose_object(raw)
+        if isinstance(parsed, dict) and parsed:
+            data = parsed
+            break
 
-    data = _json_loads_loose_object(raw)
     if not isinstance(data, dict) or not data:
         raise CreatorValidatorReviewError(
-            "蓝图一致性审查模型未返回有效 JSON object；这是 validator failure，不应进入 SKILL.md 内容返修。",
+            "蓝图一致性审查模型连续 3 次未返回有效 JSON object；这是 validator failure，不应进入 SKILL.md 内容返修。",
             raw_excerpt=str(raw or "")[:1000],
         )
 

@@ -11046,6 +11046,14 @@ def _stage_error_from_exception(source: str, exc: Exception, *, default_layer: s
     if isinstance(exc, FileGenerationStageError):
         return exc
 
+    if isinstance(exc, CreatorValidatorReviewError):
+        return FileGenerationStageError(
+            source="skill_md_semantic_validator_error",
+            layer="skill_md_semantic_validator_error",
+            detail=str(exc),
+            original=exc,
+        )
+
     if isinstance(exc, ContractValidationError):
         layer = _contract_failure_layer(exc.results) or default_layer
 
@@ -12667,25 +12675,6 @@ async def generate_file(request: GenerateFileRequest):
                                 "function_execution_context": function_execution_context,
                             },
                         )
-                        original_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
-                        responsibility_review = _filter_responsibility_tool_binding_false_positives(
-                            responsibility_review,
-                            (
-                                last_import_guard_result.model_dump(mode="json")
-                                if hasattr(last_import_guard_result, "model_dump")
-                                else last_import_guard_result
-                            ),
-                        )
-                        remaining_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
-                        logger.info("[Creator][script_responsibility][tool_binding_filter] %s", json.dumps({
-                            "event": "script_responsibility_tool_binding_filter",
-                            "file_path": request.file_path,
-                            "import_guard_success": bool(getattr(last_import_guard_result, "success", False)),
-                            "original_responsibility_issue_count": original_issue_count,
-                            "filtered_tool_binding_false_positive_count": max(original_issue_count - remaining_issue_count, 0),
-                            "remaining_issue_count": remaining_issue_count,
-                        }, ensure_ascii=False, default=str))
-
                         if not responsibility_review.get("passed"):
                             failure_type = str(responsibility_review.get("failure_type") or "script_requirement_failed")
                             if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
@@ -12766,6 +12755,16 @@ async def generate_file(request: GenerateFileRequest):
                 deterministic_error = str(stage_error)
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
+                if error_source == "skill_md_semantic_validator_error":
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=deterministic_error,
+                        error_type="skill_md_semantic_validator_error",
+                        content=candidate or "",
+                        recoverable=True,
+                    )
+                    return
                 if (
                     is_generation_format_error(stage_error)
                     or stage_error.source == "python_compile"

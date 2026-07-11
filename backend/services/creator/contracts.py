@@ -1180,6 +1180,13 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
         return "SKILL.md semantic reviewer JSON field issues must be list when present."
     if "repair_suggestions" in data and not isinstance(data.get("repair_suggestions"), str):
         return "SKILL.md semantic reviewer JSON field repair_suggestions must be string when present."
+    if data.get("passed") is True:
+        for issue in data.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            severity = str(issue.get("severity") or "").strip().lower()
+            if issue.get("blocking") is True or (severity == "error" and issue.get("blocking") is not False):
+                return "SKILL.md semantic reviewer protocol contradiction: passed=true with blocking/error issue."
     return ""
 
 async def _review_skill_md_blueprint_intent_with_model(
@@ -1247,19 +1254,15 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
         "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
         "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs，也不要要求 placeholder 逐字等于 graph.outputs。\n"
-        "- 对每个 command JSON argv，判断 key/value 是否语义可追踪到用户输入、上游脚本 stdout、当前脚本配置或蓝图明确常量。\n"
-        "- 如果字段名不确定，允许使用通用 user_request/input/payload；字段级精确对齐交给第二轮 E2E。\n"
-        "- 如果某个参数没有可靠来源，应省略并由脚本内部默认化或 payload 解析；不得为了让命令看起来完整而编造字面值。\n"
-        "- 如果 command 明显是示例调用、无来源占位、下游输入被写成无来源字面值、或完全脱离图谱 IO 语义，应判为 error；这是命令模板语义错误，不是 Markdown hard_format。\n"
-        "- 输出这类 issue 时 category 使用 command_template_source_proof，field 使用 workflow，minimal_edit 必须要求只修改对应 bash command block 的 JSON argv，不改 metadata，不重写整篇文档。\n"
-        "- 这类 issue 的通用 message 使用：SKILL.md bash command block 的 JSON argv 包含缺少来源证明的字面值；命令块应是运行模板。\n"
-        "- 这类 issue 的 expected 使用：将缺少来源证明的字面值替换为平台输入 placeholder、上游 output placeholder 或通用 user_request/input/payload；无可靠来源的可选字段应省略。\n\n"
+        "- 第一轮只做机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
+        "- 不审查 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
+        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
         "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
-        "- category 可选；命令模板参数来源证明问题必须填写 command_template_source_proof。\n"
+        "- category 可选；不得把跨步骤精确字段来源证明作为 blocking repair。\n"
         "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件和资源角色判断原则：\n"
@@ -1287,7 +1290,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "command_template_source_proof|null",\n'
+        '      "category": "null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1309,7 +1312,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "【解析器提取路径，供参考；不是最终裁决】\n"
         f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
 
-        "【compact requirement_graph 上下文，仅用于判断上游 outputs placeholder 来源；不得改写 purpose/inputs/outputs，不得重新划分职责】\n"
+        "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
 
         "【蓝图原文】\n"
@@ -1400,7 +1403,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         data["issues"] = reviewer_issues
 
     data["issues"] = _dedupe_review_issues(data["issues"])
-    if any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
+    if data.get("passed") is not True and any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
         data["passed"] = False
 
     # 如果顶层 passed=false 但没有 issues，补一个可返修错误，避免只报空失败。
@@ -1647,7 +1650,7 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
         return False
 
     if _review_issue_is_command_template_source_proof_error(issue):
-        return True
+        return False
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False
@@ -4644,13 +4647,8 @@ def _schema_placeholder_reasons(tree: ast.AST) -> list[str]:
             reasons.append("schema dict uses ellipsis placeholder")
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set" and any(isinstance(arg, ast.Constant) and arg.value is Ellipsis for arg in value.args):
             reasons.append("schema assignment uses set(...) placeholder")
-        if isinstance(value, ast.Constant) and isinstance(value.value, str) and re.search(r"(?i)\b(todo|placeholder|example)\b", value.value):
-            reasons.append("schema assignment uses TODO/example placeholder")
-        source_keys = _literal_string_set(value)
-        if source_keys == {"input_text"}:
-            reasons.append("schema still contains input_text example placeholder")
-        if isinstance(value, ast.Dict) and set((_literal_expected_types(value) or {}).keys()) == {"input_text"}:
-            reasons.append("schema still contains input_text example placeholder")
+        # Field names and string values are skill-internal business vocabulary;
+        # do not reject names such as input_text/example/todo/placeholder here.
     return sorted(set(reasons))
 
 
@@ -4820,10 +4818,6 @@ def _python_strict_argv_guard_spec_placeholder_reasons(tree: ast.AST) -> list[st
         spec = node.args[1]
         if isinstance(spec, ast.Dict):
             for key in spec.keys:
-                if isinstance(key, ast.Constant) and key.value == "input_text":
-                    reasons.append("strict_json_argv_guard spec still contains input_text example placeholder")
-                if isinstance(key, ast.Constant) and isinstance(key.value, str) and re.search(r"(?i)example|todo|placeholder", key.value):
-                    reasons.append("strict_json_argv_guard spec contains example/TODO placeholder key")
                 if isinstance(key, ast.Constant) and key.value is Ellipsis:
                     reasons.append("strict_json_argv_guard spec contains ellipsis placeholder")
             if any(isinstance(value, ast.Constant) and value.value is Ellipsis for value in spec.values):
@@ -4867,14 +4861,6 @@ def _python_has_strict_argv_runtime_guard(content: str) -> tuple[bool, list[str]
     lowered = content.lower()
     reasons: list[str] = []
     schema = extract_python_strict_argv_schema(content)
-    required_key_set = set(schema.get("required_keys") or [])
-    default_lines = _python_required_key_get_default_violations(tree, required_key_set)
-    if default_lines:
-        reasons.append(
-            "required argv keys must not be read through .get(..., default) / .get(...) or default "
-            f"(lines: {', '.join(map(str, default_lines[:8]))})"
-        )
-
     placeholder_reasons = list(schema.get("placeholder_reasons") or [])
     if placeholder_reasons:
         reasons.extend(placeholder_reasons)

@@ -2640,8 +2640,8 @@ def _classify_argv_schema_failure(
     required_set = set(str(key) for key in (required or []) if str(key or "").strip())
     run_required_set = set(run_required_keys)
     run_reads_guard_undeclared = bool(allowed is not None and run_required_set - allowed_set)
-    guard_required_unconsumed = bool(required_set and not required_set.issubset(run_required_set | set(run_optional_keys)))
-    guard_run_mismatch = run_reads_guard_undeclared or guard_required_unconsumed or run_reads_sys_argv or not has_guard
+    guard_required_unconsumed = False
+    guard_run_mismatch = run_reads_guard_undeclared or run_reads_sys_argv or not has_guard
 
     script_reasons: list[str] = []
     if not has_guard:
@@ -2650,8 +2650,6 @@ def _classify_argv_schema_failure(
         script_reasons.append("run(args) reads sys.argv/json argv internally")
     if run_reads_guard_undeclared:
         script_reasons.append("run(args) reads keys that strict_json_argv_guard did not declare")
-    if guard_required_unconsumed:
-        script_reasons.append("strict_json_argv_guard required keys are not consumed by run(args)")
 
     default_skill_md_kinds = {"unknown_key", "missing_required", "invalid_type", "empty_required", "non_object_argv", "missing_json_argv"}
     primary_target = "SKILL.md" if kind in default_skill_md_kinds else "SKILL.md"
@@ -2978,11 +2976,12 @@ def _validate_e2e_script_static_preflight(
             "但脚本未按 runtime 读取 JSON argv。"
         )
 
-    if entry.runtime == "python":
+    if entry.runtime == "python" and json_argv_commands:
         try:
             from backend.services.runtime_tools import (
                 strict_json_argv_guard as _strict_json_argv_guard,
             )
+            _ = _strict_json_argv_guard
         except Exception as exc:
             raise ValueError(
                 "mandatory_guard_import_error: "
@@ -2990,14 +2989,41 @@ def _validate_e2e_script_static_preflight(
                 "当前 E2E 环境无法执行标准 JSON argv 入口。"
             ) from exc
 
-    guard_failure = _strict_argv_guard_failure_message(
-        file_path,
-        content,
-        entry.runtime,
-    )
+        try:
+            tree = ast.parse(content)
+        except SyntaxError as exc:
+            raise ValueError(
+                f"{file_path} 不是合法 Python 源码: {exc.msg}"
+            ) from exc
 
-    if json_argv_commands and guard_failure:
-        raise ValueError(guard_failure)
+        imports_guard = any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "backend.services.runtime_tools"
+            and any(alias.name == "strict_json_argv_guard" for alias in node.names)
+            for node in ast.walk(tree)
+        )
+        calls_guard = any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "strict_json_argv_guard")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "strict_json_argv_guard")
+            )
+            for node in ast.walk(tree)
+        )
+        if not imports_guard:
+            raise ValueError(
+                f"{file_path} 缺少 strict_json_argv_guard import。"
+            )
+        if not calls_guard:
+            raise ValueError(
+                f"{file_path} 缺少 strict_json_argv_guard call。"
+            )
+        schema = extract_python_strict_argv_schema(content)
+        if schema.get("placeholder_reasons"):
+            raise ValueError(
+                f"{file_path} strict_json_argv_guard spec 结构不可解析: "
+                + "; ".join(str(x) for x in schema.get("placeholder_reasons") or [])
+            )
 
 def _validate_e2e_command_static(
     *,
@@ -3243,6 +3269,8 @@ def _run_skill_workflow_e2e_once(
 
                 should_install_deps = e2e_session is None or e2e_session.installed_deps_signature != deps_signature
                 if should_install_deps:
+                    session_packages: list[str] = []
+                    seen_session_packages: set[str] = set()
                     for command in commands:
                         if not command.script_path.endswith(".py"):
                             continue
@@ -3252,10 +3280,17 @@ def _run_skill_workflow_e2e_once(
                             blueprint_text=trial_skill_md,
                         ), requirements_by_file.get(command.script_path, []))
 
-                        _install_capability_dependencies(
-                            venv_python,
-                            entry.required_capabilities,
-                        )
+                        for capability_name in entry.required_capabilities or []:
+                            capability = get_tool_capability(capability_name)
+                            if capability is None:
+                                continue
+                            for dependency in capability.dependencies or []:
+                                package = str(dependency.get("package") or dependency.get("name") or "") if isinstance(dependency, dict) else str(dependency or "")
+                                package = package.strip()
+                                normalized = package.lower().replace("_", "-")
+                                if package and normalized not in seen_session_packages:
+                                    seen_session_packages.add(normalized)
+                                    session_packages.append(package)
 
                         refined_contract, resolution = _contract_resolution_for_trial(
                             command.script_path,
@@ -3264,12 +3299,18 @@ def _run_skill_workflow_e2e_once(
                             None,
                         )
 
-                        _install_declared_dependency_packages(
-                            venv_python,
-                            list(refined_contract.declared_dependencies or [])
-                            + list(resolution.declared_dependencies or []),
-                            source_label="implementation_resolution",
-                        )
+                        for package in list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []):
+                            package = str(package or "").strip()
+                            normalized = package.lower().replace("_", "-")
+                            if package and normalized not in seen_session_packages:
+                                seen_session_packages.add(normalized)
+                                session_packages.append(package)
+
+                    _install_declared_dependency_packages(
+                        venv_python,
+                        session_packages,
+                        source_label="e2e_session",
+                    )
                     if e2e_session is not None:
                         e2e_session.installed_deps_signature = deps_signature
                         e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_prepared", "reused_venv": False})

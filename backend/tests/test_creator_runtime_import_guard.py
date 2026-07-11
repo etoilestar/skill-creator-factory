@@ -6,7 +6,7 @@ def test_import_guard_blocks_invented_helpers():
     assert not result.success
     assert result.error_type == 'generated_unknown_runtime_tool_import'
     assert 'read_pdf_text' in result.missing_imports
-    assert 'extract_pdf_text' in result.suggested_replacements
+    assert result.suggested_replacements == []
 
 
 def test_import_guard_blocks_star_and_pool_forbidden():
@@ -115,11 +115,32 @@ def read_docx(path):
     assert result.success
 
 
-def test_forbidden_runtime_helper_repair_instruction_mentions_stdlib_fallback():
+def test_forbidden_runtime_helper_repair_instruction_reports_binding_fact_only():
     result = guard_runtime_imports(
         'from backend.services.runtime_tools import read_file_text\n',
         'scripts/a.py',
         {'allowed_helper_imports': []},
     )
-    assert 'standard library' in result.repair_instruction
-    assert 'tool_pool_patch' in result.repair_instruction
+    assert 'Current File Tool Binding' in result.repair_instruction
+    assert 'standard library' not in result.repair_instruction
+    assert 'tool_pool_patch' not in result.repair_instruction
+
+
+def test_import_guard_allows_any_bound_import_path_and_function_name():
+    src = 'from backend.services.skill_runtime import arbitrary_callable\n'
+    result = guard_runtime_imports(
+        src,
+        'scripts/a.py',
+        {
+            'allowed_import_paths': ['backend.services.skill_runtime'],
+            'allowed_function_imports': ['arbitrary_callable'],
+        },
+    )
+    assert result.success
+
+
+def test_import_guard_has_no_business_helper_whitelist_or_replacement_table():
+    import backend.services.creator.runtime_import_guard as module
+
+    assert not hasattr(module, '_ALLOWED_SKILL_RUNTIME_HELPERS')
+    assert not hasattr(module, 'SUGGESTED_REPLACEMENTS')

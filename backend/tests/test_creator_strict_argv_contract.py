@@ -121,19 +121,16 @@ def test_run_reparse_or_direct_payload_use_fails_first_round():
         _validate(direct_payload)
 
 
-def test_spec_placeholders_fail_first_round():
-    for bad_key in ["input_text", "example", "TODO"]:
-        code = STRICT_OK.replace('"text": {"type": str, "required": True}', f'"{bad_key}": {{"type": str, "required": True}}')
-        with pytest.raises(ValueError):
-            _validate(code)
+def test_internal_argv_field_names_are_not_rejected_first_round():
+    for key in ["input_text", "example", "todo", "story_sections", "chapter_text", "image_paths", "content", "result"]:
+        code = STRICT_OK.replace('"text": {"type": str, "required": True}', f'"{key}": {{"type": str, "required": True}}')
+        _validate(code)
 
 
-def test_required_get_default_still_fails_when_schema_declares_required_key():
+def test_required_get_default_is_not_a_first_round_hard_gate():
     code = STRICT_OK.replace('return {"result": args["text"] + args["style"]}', 'return {"result": args.get("text", "fallback")}')
-    # Compatibility AST extraction can still catch schema-like required declarations when present.
     schema_code = 'REQUIRED_KEYS = {"text"}\n' + code
-    with pytest.raises(ValueError, match="required argv keys"):
-        _validate(schema_code)
+    _validate(schema_code)
 
 
 def test_extract_schema_supports_arg_schema_and_defaults_for_attribution():
@@ -161,9 +158,8 @@ def test_argv_schema_attribution_targets():
     assert _argv_details("ValueError: unknown argv keys: ['extra']", inputs=["text"], rendered={"text": "ok", "extra": "x"})["primary_target"] == "SKILL.md"
     assert _argv_details("ValueError: unknown argv keys: ['text']", inputs=["text"], rendered={"text": "ok"}, allowed='ALLOWED_KEYS = set()')["primary_target"] == "SKILL.md"
     missing = _argv_details("ValueError: missing required argv keys: ['extra']", inputs=["text"], rendered={"text": "ok"}, required='REQUIRED_KEYS = {"text", "extra"}')
-    assert missing["primary_target"] == "scripts/main.py"
-    assert missing["candidate_targets"] == ["scripts/main.py"]
-    assert "required keys are not consumed" in missing["target_reason"]
+    assert missing["primary_target"] == "SKILL.md"
+    assert missing["candidate_targets"] == ["SKILL.md"]
     uncertain = _argv_details("ValueError: unknown argv schema error", inputs=[], rendered={"mystery": "ok"}, allowed='ALLOWED_KEYS = {"other"}')
     assert uncertain["primary_target"] == "SKILL.md"
     assert uncertain["candidate_targets"] == ["SKILL.md"]
@@ -235,8 +231,8 @@ def test_argv_schema_repair_instruction_treats_guard_as_probe():
 def test_e2e_script_target_rule_contains_coverage_guardrail():
     source = e2e._repair_existing_file_for_e2e_failure.__code__.co_consts
     joined = "\n".join(str(item) for item in source if isinstance(item, str))
-    assert "strict_json_argv_guard 是接口不对齐探针" in joined
-    assert "不能通过删除参数降低功能覆盖面" in joined
+    assert "真实 workflow 执行证据" in joined
+    assert "不得检查 ToolPool" in joined
 
 
 def test_argv_schema_noop_guardrail_source_contains_two_noop_block():

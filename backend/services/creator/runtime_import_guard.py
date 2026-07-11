@@ -5,8 +5,6 @@ from typing import Any
 from backend.services.runtime_tools import __all__ as RUNTIME_TOOLS_ALL
 from .tool_pool_models import RuntimeImportGuardResult, ToolPoolFileBinding
 
-SUGGESTED_REPLACEMENTS = {'read_pdf_text': 'extract_pdf_text','read_xlsx_text': 'read_spreadsheet','read_excel_text': 'read_spreadsheet','read_txt_text': 'read_file_text'}
-_ALLOWED_SKILL_RUNTIME_HELPERS = {'generate_text_with_llm'}
 _CUSTOM_PREFIX = 'backend.services.runtime_tools.custom_tools'
 
 def _binding_values(binding: ToolPoolFileBinding | dict[str, Any] | None, key: str, default: list[str] | None = None) -> list[str]:
@@ -35,9 +33,6 @@ def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolF
                     if name == '*': forbidden.append('*')
                     elif name not in runtime_all: missing.append(name)
                     elif name not in allowed_helpers: forbidden.append(name)
-            elif module == 'backend.services.skill_runtime':
-                for alias in node.names:
-                    if alias.name not in _ALLOWED_SKILL_RUNTIME_HELPERS: forbidden.append(f'skill_runtime.{alias.name}')
             elif module.startswith(_CUSTOM_PREFIX) or module in allowed_paths:
                 if module not in allowed_paths:
                     custom_forbidden.append(module)
@@ -72,6 +67,5 @@ def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolF
         return RuntimeImportGuardResult(success=False, error_type='generated_pool_forbidden_custom_tool_import', target_file=target_file, forbidden_imports=custom_forbidden, allowed_helper_imports=sorted(allowed_helpers), repair_instruction='Custom tool imports must match Current File Tool Binding allowed_import_paths and allowed_function_imports.')
     if missing or forbidden:
         err = 'generated_unknown_runtime_tool_import' if missing else 'generated_pool_forbidden_import'
-        suggestions = sorted({SUGGESTED_REPLACEMENTS[x] for x in missing + forbidden if x in SUGGESTED_REPLACEMENTS})
-        return RuntimeImportGuardResult(success=False, error_type=err, target_file=target_file, missing_imports=missing, forbidden_imports=forbidden, allowed_helper_imports=sorted(allowed_helpers), suggested_replacements=suggestions, repair_instruction='Do not import unbound backend.services.runtime_tools helpers. Either request a tool_pool_patch for the missing platform helper, or implement the task with Python standard library / allowed third-party dependencies without importing runtime_tools.', warnings=warnings)
+        return RuntimeImportGuardResult(success=False, error_type=err, target_file=target_file, missing_imports=missing, forbidden_imports=forbidden, allowed_helper_imports=sorted(allowed_helpers), suggested_replacements=[], repair_instruction='Current import is not authorized by the Current File Tool Binding. Use only the listed allowed_helper_imports, allowed_import_paths, and allowed_function_imports. If the callable required by this FunctionItem is absent from the binding, report tool support insufficient; first-round ToolPool augmentation owns adding tools, and second-round repair must not search for or add tools. Do not bypass this with empty files, placeholders, fixed paths/strings, fake artifacts, or swallowed exceptions.', warnings=warnings)
     return RuntimeImportGuardResult(success=True, target_file=target_file, allowed_helper_imports=sorted(allowed_helpers), warnings=warnings)

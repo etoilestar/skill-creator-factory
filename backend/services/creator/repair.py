@@ -3884,8 +3884,6 @@ def _normalize_responsibility_review_issues(
             continue
         if failure_layer and failure_layer not in {"responsibility", "semantic_responsibility"}:
             continue
-        if issue_type and issue_type not in {"responsibility_not_met", "content_responsibility", "semantic_responsibility", "responsibility", "responsibility_weakened", "collection_boundary_lost", "aggregation_boundary_lost"}:
-            continue
         if not semantic_failure:
             continue
 
@@ -3947,62 +3945,6 @@ def _normalize_responsibility_review_issues(
         })
 
     return normalized
-
-
-def _filter_responsibility_tool_binding_false_positives(
-    review: dict[str, Any],
-    import_guard_result: Any,
-) -> dict[str, Any]:
-    """Drop responsibility-review tool-binding blockers when deterministic import guard passed."""
-    if not isinstance(review, dict):
-        return review
-    guard = import_guard_result.model_dump(mode="json") if hasattr(import_guard_result, "model_dump") else import_guard_result
-    if not (isinstance(guard, dict) and guard.get("success") is True):
-        return review
-
-    issues = review.get("issues") if isinstance(review.get("issues"), list) else []
-    patterns = (
-        "forbidden helper",
-        "未绑定 helper",
-        "unbound helper",
-        "runtime_tools import",
-        "runtime_tools",
-        "删除 read_docx_text",
-        "delete read_docx_text",
-        "read_docx_text forbidden",
-        "forbidden import",
-        "后端确定性检查判定禁止",
-    )
-    kept: list[Any] = []
-    filtered: list[Any] = []
-    for issue in issues:
-        text = json.dumps(issue, ensure_ascii=False, default=str).lower() if isinstance(issue, dict) else str(issue).lower()
-        if any(pattern.lower() in text for pattern in patterns):
-            filtered.append(issue)
-        else:
-            kept.append(issue)
-    if not filtered:
-        return review
-    updated = dict(review)
-    updated["issues"] = kept
-    notes = updated.get("advisory_notes") if isinstance(updated.get("advisory_notes"), list) else []
-    updated["advisory_notes"] = [
-        *notes,
-        *[
-            {
-                "id": "responsibility_tool_binding_false_positive_filtered",
-                "severity": "warning",
-                "reason": "runtime_import_guard passed; responsibility validator may not block on helper/tool binding.",
-                "original_issue": issue,
-            }
-            for issue in filtered
-        ],
-    ]
-    updated["filtered_tool_binding_false_positive_count"] = len(filtered)
-    if not kept:
-        updated["passed"] = True
-        updated["repair_instructions"] = ""
-    return updated
 
 
 _CURRENT_FILE_SCOPE_VALUES = {"current_file", "current_file_only", "current file", "current-file"}
@@ -4766,6 +4708,52 @@ def detect_requirement_evidence_static(script_content: str, requirements: list[R
     issues.extend(detect_error_stdout_bypass(script_content, requirements, expected_outputs))
     return issues
 
+
+def _script_responsibility_schema_error(data: Any, *, file_path: str) -> str:
+    if not isinstance(data, dict) or not data:
+        return "职责审查模型未返回 JSON object。"
+    if "passed" not in data:
+        return "职责审查模型 JSON 缺少 required bool 字段 passed。"
+    if not isinstance(data.get("passed"), bool):
+        return "职责审查模型 JSON 字段 passed 必须是 bool。"
+    if "blocking_issues" not in data:
+        return "职责审查模型 JSON 缺少 required list 字段 blocking_issues。"
+    if not isinstance(data.get("blocking_issues"), list):
+        return "职责审查模型 JSON 字段 blocking_issues 必须是 list。"
+    if "advisory_notes" in data and not isinstance(data.get("advisory_notes"), list):
+        return "职责审查模型 JSON 字段 advisory_notes 必须是 list。"
+    if "repair_instructions" in data and not isinstance(data.get("repair_instructions"), str):
+        return "职责审查模型 JSON 字段 repair_instructions 必须是 string。"
+    if data.get("passed") is True and data.get("blocking_issues"):
+        return "职责审查模型返回 passed=true 但 blocking_issues 非空。"
+    return ""
+
+
+def _script_responsibility_validator_failure(
+    *,
+    file_path: str,
+    reason: str,
+    raw: Any,
+    model: str,
+) -> dict[str, Any]:
+    return {
+        "passed": False,
+        "issues": [{
+            "id": "script_responsibility.validator_schema_invalid",
+            "failed_file": file_path,
+            "failed_function": "responsibility_review",
+            "code_region": "review",
+            "reason": reason or "职责审查模型输出 schema invalid。",
+            "minimal_edit": "不是脚本内容错误；请重试或切换 validator 模型。",
+            "allowed_scope": "do not repair business files for validator response format",
+            "details": {"raw": str(raw or "")[:1000]},
+        }],
+        "advisory_notes": [],
+        "repair_instructions": "职责审查模型输出格式/协议连续失败，不能放行当前脚本。",
+        "failure_type": "script_requirement_validator_incomplete",
+        "model": model,
+    }
+
 async def _run_script_responsibility_review(
     *,
     file_path: str,
@@ -5019,7 +5007,6 @@ async def _run_script_responsibility_review(
     }, ensure_ascii=False, default=str))
 
     last_text = ""
-    last_parsed: dict[str, Any] | None = None
     for review_attempt in range(3):
         try:
             active_messages = messages if review_attempt == 0 else [
@@ -5059,89 +5046,20 @@ async def _run_script_responsibility_review(
             }
 
         data = _parse_validator_json_object(last_text)
-        if not isinstance(data, dict) or not data:
+        schema_error = _script_responsibility_schema_error(data, file_path=file_path)
+        if schema_error:
             if review_attempt < 2:
+                last_text = json.dumps({"schema_error": schema_error, "raw": data if isinstance(data, dict) else last_text}, ensure_ascii=False, default=str)
                 continue
-            static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            if static_blockers:
-                return {
-                    "passed": False,
-                    "issues": static_blockers,
-                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
-                    "failure_type": "script_requirement_failed",
-                    "model": "deterministic",
-                }
-            return {
-                "passed": True,
-                "issues": [],
-                "checks": [],
-                "advisory_notes": [{
-                    "id": "script_responsibility.validator_format_rewrite_exhausted",
-                    "failed_file": file_path,
-                    "reason": "职责审查模型连续返回非 JSON；本轮未得到可用职责审查结论。",
-                    "allowed_scope": "do not repair business files for validator response format",
-                    "details": {"raw": last_text[:1000]},
-                }],
-                "repair_instructions": "",
-                "failure_type": "script_requirement_validator_incomplete",
-                "model": route.model,
-            }
+            return _script_responsibility_validator_failure(
+                file_path=file_path,
+                reason=schema_error,
+                raw=data if isinstance(data, dict) else last_text,
+                model=route.model,
+            )
 
-        if req_items:
-            parsed_review = _parse_requirement_review_result(data, requirements=req_items, file_path=file_path)
-            parsed_review["model"] = route.model
-            last_parsed = parsed_review
-            if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"} and review_attempt == 0:
-                continue
-            if not parsed_review.get("passed"):
-                if parsed_review.get("failure_type") in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                    static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-                    if static_blockers:
-                        logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
-                            "event": "script_responsibility_failed",
-                            "file_path": file_path,
-                            "model": "deterministic",
-                            "issue_count": len(static_blockers),
-                        }, ensure_ascii=False, default=str))
-                        return {
-                            "passed": False,
-                            "issues": static_blockers,
-                            "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
-                            "failure_type": "script_requirement_failed",
-                            "model": "deterministic",
-                            "raw_review": parsed_review.get("raw_review"),
-                        }
-                logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
-                    "event": "script_responsibility_failed",
-                    "file_path": file_path,
-                    "model": route.model,
-                    "issue_count": len(parsed_review.get("issues") or []),
-                    "failure_type": parsed_review.get("failure_type"),
-                }, ensure_ascii=False, default=str))
-                return parsed_review
-            static_blockers = _runtime_tool_contract_static_blockers(script_content, skill_plan_entry, req_items)
-            if static_blockers:
-                logger.info("[Creator][script_responsibility][failed] %s", json.dumps({
-                    "event": "script_responsibility_failed",
-                    "file_path": file_path,
-                    "model": "deterministic",
-                    "issue_count": len(static_blockers),
-                }, ensure_ascii=False, default=str))
-                return {
-                    "passed": False,
-                    "issues": static_blockers,
-                    "repair_instructions": "按确定性工具合同/功能责任检查结果修复当前脚本源码。",
-                    "failure_type": "script_requirement_failed",
-                    "model": "deterministic",
-                    "raw_review": parsed_review.get("raw_review"),
-                }
-            logger.info("[Creator][script_responsibility][result] %s", json.dumps({
-                "event": "script_responsibility_result",
-                "file_path": file_path,
-                "model": route.model,
-                "passed": True,
-            }, ensure_ascii=False, default=str))
-            return parsed_review
+        data.setdefault("advisory_notes", [])
+        data.setdefault("repair_instructions", "")
         break
 
     data = data if isinstance(data, dict) else {}

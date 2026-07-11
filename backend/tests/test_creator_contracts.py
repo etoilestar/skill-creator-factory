@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from backend.services.creator_contracts import (
     compile_canonical_file_contract,
     resolve_implementation,
@@ -437,3 +441,213 @@ def test_reviewer_dedupe_ignores_changing_evidence():
         {"severity": "error", "field": "file_plan", "message": "same", "expected": "same expected", "evidence": "new evidence"},
     ]
     assert len(_dedupe_review_issues(issues)) == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_invalid_json_retries_and_keeps_candidate(monkeypatch):
+    from backend.services.creator import contracts
+
+    calls = []
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        assert "只做 JSON schema 格式重写" in messages[-1]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content="original SKILL.md candidate",
+        blueprint_text="blueprint",
+        skill_plan_entry={},
+    )
+    assert result["passed"] is True
+    assert len(calls) == 2
+    assert "original SKILL.md candidate" in calls[1][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_invalid_json_then_passed_false_enters_semantic_failure(monkeypatch):
+    from backend.services.creator import contracts
+
+    calls = []
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        return json.dumps({
+            "passed": False,
+            "issues": [{
+                "severity": "error",
+                "blocking": True,
+                "field": "workflow",
+                "message": "missing real script path",
+                "expected": "mention scripts/run.py",
+                "contract_impact": {"execution_closure": True},
+            }],
+            "repair_suggestions": "patch workflow only",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content="candidate",
+        blueprint_text="blueprint",
+        skill_plan_entry={},
+    )
+    assert result["passed"] is False
+    assert result["issues"][0]["message"] == "missing real script path"
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_three_invalid_json_raises_validator_error(monkeypatch):
+    from backend.services.creator import contracts
+    from backend.services.creator.contracts import CreatorValidatorReviewError
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    calls = {"count": 0}
+
+    async def fake_complete(messages, model):
+        calls["count"] += 1
+        return "not json"
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(CreatorValidatorReviewError):
+        await contracts._review_skill_md_blueprint_intent_with_model(
+            skill_name="demo",
+            content="candidate",
+            blueprint_text="blueprint",
+            skill_plan_entry={},
+        )
+    assert calls["count"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"passed": "false"},
+    {"foo": "bar"},
+    {"passed": True, "issues": "bad"},
+])
+async def test_skill_md_reviewer_schema_invalid_never_passes(monkeypatch, payload):
+    from backend.services.creator import contracts
+    from backend.services.creator.contracts import CreatorValidatorReviewError
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        return json.dumps(payload)
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(CreatorValidatorReviewError):
+        await contracts._review_skill_md_blueprint_intent_with_model(
+            skill_name="demo",
+            content="candidate",
+            blueprint_text="blueprint",
+            skill_plan_entry={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_invalid_schema_then_valid_pass(monkeypatch):
+    from backend.services.creator import contracts
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    calls = iter([json.dumps({"passed": "false"}), json.dumps({"passed": True, "issues": []})])
+
+    async def fake_complete(messages, model):
+        return next(calls)
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content="candidate",
+        blueprint_text="blueprint",
+        skill_plan_entry={},
+    )
+    assert result["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_invalid_schema_then_valid_semantic_fail(monkeypatch):
+    from backend.services.creator import contracts
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    calls = iter([
+        json.dumps({"passed": True, "issues": "bad"}),
+        json.dumps({
+            "passed": False,
+            "issues": [{
+                "severity": "error",
+                "blocking": True,
+                "field": "workflow",
+                "message": "missing real script path",
+                "expected": "mention scripts/run.py",
+                "contract_impact": {"execution_closure": True},
+            }],
+            "repair_suggestions": "patch workflow only",
+        }),
+    ])
+
+    async def fake_complete(messages, model):
+        return next(calls)
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content="candidate",
+        blueprint_text="blueprint",
+        skill_plan_entry={},
+    )
+    assert result["passed"] is False
+    assert result["issues"][0]["message"] == "missing real script path"
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_three_invalid_schema_raises_validator_error(monkeypatch):
+    from backend.services.creator import contracts
+    from backend.services.creator.contracts import CreatorValidatorReviewError
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    calls = {"count": 0}
+
+    async def fake_complete(messages, model):
+        calls["count"] += 1
+        return json.dumps({"passed": True, "issues": "bad"})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(CreatorValidatorReviewError):
+        await contracts._review_skill_md_blueprint_intent_with_model(
+            skill_name="demo",
+            content="candidate",
+            blueprint_text="blueprint",
+            skill_plan_entry={},
+        )
+    assert calls["count"] == 3

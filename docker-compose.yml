@@ -17,6 +17,7 @@ services:
       - ./kernel:/app/kernel:ro   # skill-creator kernel (read-only)
       - ./skills:/app/skills       # user skill library (read-write)
       - ./backend:/app/backend 
+      - ./logs:/app/logs
     environment:
       # Point to the LLM running on the host machine.
       # Ollama default : http://host.docker.internal:11434
@@ -38,6 +39,7 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - MODEL_ROUTING_JSON=${MODEL_ROUTING_JSON:-}
       - MODEL_ACK_STRICT=${MODEL_ACK_STRICT:-false}
+      - LOG_DIR=/app/logs
       - TEMPERATURE=${TEMPERATURE:-0.7}
       - MAX_TOKENS=${MAX_TOKENS:-4096}
 # Makes host.docker.internal resolve to the host on Linux as well

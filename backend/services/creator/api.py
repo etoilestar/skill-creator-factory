@@ -11046,6 +11046,14 @@ def _stage_error_from_exception(source: str, exc: Exception, *, default_layer: s
     if isinstance(exc, FileGenerationStageError):
         return exc
 
+    if isinstance(exc, CreatorValidatorReviewError):
+        return FileGenerationStageError(
+            source="skill_md_semantic_validator_error",
+            layer="skill_md_semantic_validator_error",
+            detail=str(exc),
+            original=exc,
+        )
+
     if isinstance(exc, ContractValidationError):
         layer = _contract_failure_layer(exc.results) or default_layer
 
@@ -12667,25 +12675,6 @@ async def generate_file(request: GenerateFileRequest):
                                 "function_execution_context": function_execution_context,
                             },
                         )
-                        original_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
-                        responsibility_review = _filter_responsibility_tool_binding_false_positives(
-                            responsibility_review,
-                            (
-                                last_import_guard_result.model_dump(mode="json")
-                                if hasattr(last_import_guard_result, "model_dump")
-                                else last_import_guard_result
-                            ),
-                        )
-                        remaining_issue_count = len(responsibility_review.get("issues") or []) if isinstance(responsibility_review, dict) else 0
-                        logger.info("[Creator][script_responsibility][tool_binding_filter] %s", json.dumps({
-                            "event": "script_responsibility_tool_binding_filter",
-                            "file_path": request.file_path,
-                            "import_guard_success": bool(getattr(last_import_guard_result, "success", False)),
-                            "original_responsibility_issue_count": original_issue_count,
-                            "filtered_tool_binding_false_positive_count": max(original_issue_count - remaining_issue_count, 0),
-                            "remaining_issue_count": remaining_issue_count,
-                        }, ensure_ascii=False, default=str))
-
                         if not responsibility_review.get("passed"):
                             failure_type = str(responsibility_review.get("failure_type") or "script_requirement_failed")
                             if failure_type in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
@@ -12766,6 +12755,16 @@ async def generate_file(request: GenerateFileRequest):
                 deterministic_error = str(stage_error)
                 error_source = stage_error.source
                 error_layer = f"{stage_error.source}:{stage_error.layer}"
+                if error_source == "skill_md_semantic_validator_error":
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=deterministic_error,
+                        error_type="skill_md_semantic_validator_error",
+                        content=candidate or "",
+                        recoverable=True,
+                    )
+                    return
                 if (
                     is_generation_format_error(stage_error)
                     or stage_error.source == "python_compile"
@@ -12963,62 +12962,15 @@ async def generate_file(request: GenerateFileRequest):
                     prompt_variant = next_variant
                     continue
                 if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                    static_blockers: list[dict[str, Any]] = []
-                    if request.file_path.startswith("scripts/"):
-                        try:
-                            static_skill_md = (
-                                (settings.skills_path / skill_name / "SKILL.md").read_text(encoding="utf-8")
-                                if (settings.skills_path / skill_name / "SKILL.md").is_file()
-                                else ""
-                            )
-                            static_entry = _skill_plan_entry_for_file(
-                                file_path=request.file_path,
-                                blueprint_text=static_skill_md,
-                                role=request.role,
-                                skill_plan_entry=effective_skill_plan_entry,
-                            )
-                            static_blockers = _runtime_tool_contract_static_blockers(
-                                candidate or "",
-                                static_entry,
-                                entry_requirements,
-                            )
-                        except Exception:
-                            static_blockers = []
-                    if not static_blockers:
-                        # Single-file production validation failures must still enter
-                        # the patch repair loop.  A validator error/incomplete review
-                        # is not a reason to return a terminal error to the frontend;
-                        # repair should make the current script's responsibility path
-                        # explicit enough for the next validation round.
-                        static_blockers = [{
-                            "id": error_source,
-                            "failed_file": request.file_path,
-                            "failed_function": "single_file_production_validation",
-                            "code_region": "current file responsibility implementation",
-                            "reason": (
-                                "Single-file production validator failed or returned incomplete checks; "
-                                "auto-repair the current file instead of returning directly to the frontend."
-                            ),
-                            "missing_evidence": [
-                                "validator-readable current-file responsibility evidence",
-                                "input/tool result participates in constructed output",
-                            ],
-                            "minimal_edit": (
-                                "只修改当前文件职责实现区域，让职责证据更明确。"
-                            ),
-                            "allowed_scope": "current file responsibility implementation",
-                            "details": {"validator_error": deterministic_error},
-                        }]
-                    stage_error = FileGenerationStageError(
-                        source="script_requirement_failed",
-                        layer="responsibility",
-                        detail=json.dumps({"issues": static_blockers}, ensure_ascii=False, default=str),
-                        original=ScriptFunctionalValidationError(static_blockers, layer="responsibility"),
+                    yield _file_done_error_sse(
+                        file_path=request.file_path,
+                        role=request.role,
+                        error=deterministic_error,
+                        error_type=error_source,
+                        content=candidate or "",
+                        recoverable=True,
                     )
-                    deterministic_error = str(stage_error)
-                    error_source = stage_error.source
-                    error_layer = f"{stage_error.source}:{stage_error.layer}"
-                    repair_counts_by_layer[error_layer] = repair_counts_by_layer.get(error_layer, 0) + 1
+                    return
 
                 if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
                     layer_limit = _first_round_repair_limit(error_source)
@@ -13461,9 +13413,6 @@ async def generate_file(request: GenerateFileRequest):
                     )
 
                     if repair_mode == "strict_patch":
-                        if error_source in {"script_requirement_validator_error", "script_requirement_validator_incomplete"}:
-                            candidate = repaired_candidate
-                            continue
                         yield _file_done_error_sse(
                             file_path=request.file_path,
                             role=request.role,

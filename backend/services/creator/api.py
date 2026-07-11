@@ -3168,84 +3168,6 @@ async def _plan_final_tool_pool(
         skill_dir
     )
 
-    script_contracts: list[
-        dict[str, Any]
-    ] = []
-
-    for spec in (
-        file_specs or []
-    ):
-        if not isinstance(
-            spec,
-            dict,
-        ):
-            continue
-
-        path = _normalize_skill_path(
-            str(
-                spec.get("path")
-                or spec.get(
-                    "target_file"
-                )
-                or ""
-            )
-        )
-
-        if not path.startswith(
-            "scripts/"
-        ):
-            continue
-
-        if spec.get("required") is False:
-            continue
-
-        script_contracts.append({
-            "path": path,
-
-            "purpose": str(
-                spec.get("purpose")
-                or ""
-            ).strip(),
-
-            "inputs": list(
-                spec.get("inputs")
-                or []
-            ),
-
-            "outputs": list(
-                spec.get("outputs")
-                or []
-            ),
-
-            "required_capabilities": list(
-                spec.get(
-                    "required_capabilities"
-                )
-                or []
-            ),
-
-            "forbidden_capabilities": list(
-                spec.get(
-                    "forbidden_capabilities"
-                )
-                or []
-            ),
-
-            "side_effects": list(
-                spec.get(
-                    "side_effects"
-                )
-                or []
-            ),
-
-            "artifact_contract": (
-                spec.get(
-                    "artifact_contract"
-                )
-                or {}
-            ),
-        })
-
     current_allowed_ids = {
         str(
             tool.tool_id
@@ -3256,27 +3178,6 @@ async def _plan_final_tool_pool(
         )
         if (
             tool.status == "allowed"
-            and str(
-                tool.tool_id
-                or ""
-            ).strip()
-        )
-    }
-
-    protected_tool_ids = {
-        str(
-            tool.tool_id
-            or ""
-        ).strip()
-        for tool in (
-            current_pool.tools or []
-        )
-        if (
-            tool.status == "allowed"
-            and tool.source in {
-                "manual_admin",
-                "system_required",
-            }
             and str(
                 tool.tool_id
                 or ""
@@ -3353,10 +3254,6 @@ async def _plan_final_tool_pool(
                 tool_id
             )
 
-    candidate_tool_ids = set(
-        ordered_candidate_tool_ids
-    )
-
     candidate_by_tool_id = {
         str(
             item.get("tool_id")
@@ -3428,9 +3325,9 @@ async def _plan_final_tool_pool(
                     "reason": (
                         "Registry candidate was recalled "
                         "from the normalized FunctionItem "
-                        "capability contracts and passed "
-                        "Backend factual authorization "
-                        "checks."
+                        "capability contracts and "
+                        "submitted to Backend factual "
+                        "authorization."
                     ),
                 }
                 for tool_id
@@ -3484,6 +3381,25 @@ async def _plan_final_tool_pool(
         skill_dir
     )
 
+    authorized_tool_ids = sorted(
+        tool_id
+        for tool_id
+        in desired_tool_ids
+        if any(
+            tool.tool_id == tool_id
+            and tool.status == "allowed"
+            for tool
+            in updated_pool.tools
+        )
+    )
+
+    unavailable_tool_ids = sorted(
+        desired_tool_ids
+        - set(
+            authorized_tool_ids
+        )
+    )
+
     normalized_selector_output = {
         "decisions": (
             selector_output.get(
@@ -3514,6 +3430,14 @@ async def _plan_final_tool_pool(
 
         "selection_mode": (
             "recall_union_no_llm"
+        ),
+
+        "authorized_tool_ids": (
+            authorized_tool_ids
+        ),
+
+        "unavailable_tool_ids": (
+            unavailable_tool_ids
         ),
     }
 
@@ -3546,6 +3470,14 @@ async def _plan_final_tool_pool(
                     sorted(
                         desired_tool_ids
                     )
+                ),
+
+                "authorized_tool_ids": (
+                    authorized_tool_ids
+                ),
+
+                "unavailable_tool_ids": (
+                    unavailable_tool_ids
                 ),
 
                 "add_tool_ids": (
@@ -3581,6 +3513,14 @@ async def _plan_final_tool_pool(
             sorted(
                 desired_tool_ids
             )
+        ),
+
+        "authorized_tool_ids": (
+            authorized_tool_ids
+        ),
+
+        "unavailable_tool_ids": (
+            unavailable_tool_ids
         ),
 
         "tool_pool": (

@@ -205,11 +205,46 @@ def test_backend_gate_still_rejects_unusable_tools(tmp_path, monkeypatch):
     assert result["denied_new"] >= 1
 
 
+@pytest.mark.asyncio
+async def test_gate_denied_recalled_candidate_remains_desired_but_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(
+        api,
+        "_recall_creator_tool_candidates",
+        lambda file_specs, top_k: (
+            [
+                {"tool_id": "system_text_generation", "recalled_for_capabilities": ["text"]},
+                {"tool_id": "definitely_not_registered_tool", "recalled_for_capabilities": ["missing"]},
+            ],
+            "test",
+        ),
+    )
+
+    result = await api._plan_final_tool_pool(
+        skill_name="demo",
+        file_specs=[{"path": "scripts/a.py", "required": True}],
+    )
+
+    assert result["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
+    assert result["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
+    assert result["planner_output"]["desired_tool_ids"] == ["definitely_not_registered_tool", "system_text_generation"]
+    assert result["planner_output"]["authorized_tool_ids"] == ["system_text_generation"]
+    assert result["planner_output"]["unavailable_tool_ids"] == ["definitely_not_registered_tool"]
+
+    pool = load_tool_pool(tmp_path / "demo")
+    allowed = {tool.tool_id for tool in pool.tools if tool.status == "allowed"}
+    denied = {item.tool_id for item in pool.denied_requests}
+    assert allowed == {"system_text_generation"}
+    assert "definitely_not_registered_tool" in denied
+
+
 def test_final_tool_pool_computed_patch_uses_recall_union_wording():
     source = inspect.getsource(api._plan_final_tool_pool)
 
+    assert "passed Backend factual authorization checks" not in source
     assert "Final Tool Selector marked this Registry candidate" not in source
-    assert "Registry candidate was recalled" in source
+    assert "submitted to Backend factual" in source
     assert "no post-recall semantic" in source
     assert "recall_union_no_llm" in source
 

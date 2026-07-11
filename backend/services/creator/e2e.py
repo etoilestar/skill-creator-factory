@@ -987,8 +987,6 @@ def _materialize_e2e_sample_value(
                 script_content=script_content,
                 max_count=3,
             )
-            if len(kinds) == 1:
-                kinds = [kinds[0], kinds[0]]
             return [
                 _e2e_sample_file(skill_dir, spec.name, index + 1, kind=kind)
                 for index, kind in enumerate(kinds)
@@ -1786,7 +1784,6 @@ async def _request_full_file_rewrite_for_e2e(
     previous_content: str,
     rewrite_context: str,
     rewrite_target_rule: str,
-    task_context: str | None = None,
 ) -> str:
     """Ask the model for a complete replacement file for repeated E2E failures.
 
@@ -4155,7 +4152,7 @@ async def _repair_existing_file_for_e2e_failure(
         max_candidate_attempts + 1,
     ):
         current_content = working_content
-        use_full_rewrite = candidate_attempt > 2 and target_path.startswith("scripts/")
+        use_full_rewrite = False
 
         effective_skill_md = (
             current_content
@@ -4281,7 +4278,6 @@ async def _repair_existing_file_for_e2e_failure(
                             before_repair_snapshot
                         ),
                         rewrite_context=rewrite_context,
-                        task_context=rewrite_context,
                         rewrite_target_rule=(
                             _full_file_rewrite_target_rule_for_e2e(
                                 target_path
@@ -4577,7 +4573,7 @@ async def _repair_existing_file_for_e2e_failure(
                 ),
                 "patch_mode": "exact_replace",
                 "repair_key": repair_key,
-                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
+                "repair_mode": "localized_patch",
                 "fallback_type": (
                     diff_stats.get(
                         "applied"

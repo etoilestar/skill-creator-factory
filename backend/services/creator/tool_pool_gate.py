@@ -6,8 +6,6 @@ from backend.services.creator_tool_registry import get_tool_capability
 from backend.services.runtime_tools import __all__ as RUNTIME_TOOLS_ALL
 from .tool_pool_models import ToolPoolAddToolRequest, ToolPoolGateEvent
 
-RESOURCE_ROLES = {'reference','asset','skill_overview'}
-SUGGESTED = {'read_pdf_text':'extract_pdf_text','read_xlsx_text':'read_spreadsheet','read_txt_text':'read_file_text','read_excel_text':'read_spreadsheet'}
 
 def _missing_deps(deps: list[Any]) -> list[str]:
     missing=[]
@@ -43,57 +41,6 @@ def _check_function_imports(cap: Any) -> tuple[list[str], list[str], list[str], 
             continue
         allowed_paths.append(import_path); allowed_functions.append(function_name)
     return allowed_paths, allowed_functions, checked_paths, checked_functions, messages
-
-def _declared_tool_ids(file_spec: dict[str, Any] | None) -> set[str]:
-    """Return concrete tool IDs explicitly requested by the file spec.
-
-    Tool selection should be driven by tool IDs such as:
-    - required_tools: ["unified_file_text_read", "text_generation"]
-    - selected_tools: ["create_pdf_document"]
-    - required_tool_slots: [{"tool_id": "..."}]
-
-    File role remains only a coarse file/resource category and must not be used
-    to reject a concrete tool candidate for scripts/**.
-    """
-    spec = file_spec if isinstance(file_spec, dict) else {}
-    ids: set[str] = set()
-
-    for key in (
-        "required_tools",
-        "selected_tools",
-        "tool_ids",
-        "selected_tool_ids",
-        "allowed_tools",
-        "required_capabilities",
-    ):
-        value = spec.get(key)
-        if isinstance(value, list):
-            for item in value:
-                text = str(item or "").strip()
-                if text:
-                    ids.add(text)
-        elif isinstance(value, str) and value.strip():
-            ids.add(value.strip())
-
-    slots = spec.get("required_tool_slots")
-    if isinstance(slots, list):
-        for item in slots:
-            if isinstance(item, dict):
-                tool_id = (
-                    item.get("tool_id")
-                    or item.get("candidate_tool_id")
-                    or item.get("capability")
-                    or item.get("capability_id")
-                    or item.get("name")
-                )
-                if tool_id:
-                    ids.add(str(tool_id).strip())
-            else:
-                text = str(item or "").strip()
-                if text:
-                    ids.add(text)
-
-    return {item for item in ids if item}
 
 def gate_tool_request(
     request: ToolPoolAddToolRequest | dict[str, Any],
@@ -148,9 +95,7 @@ def gate_tool_request(
             messages=[
                 "tool_id is not registered"
             ],
-            suggested_replacements=list(
-                SUGGESTED.values()
-            ),
+            suggested_replacements=[],
             score=req.score,
             matched_features=list(
                 req.matched_features or []
@@ -211,11 +156,7 @@ def gate_tool_request(
                     "by backend.services.runtime_tools.__all__"
                 )
             ],
-            suggested_replacements=[
-                SUGGESTED[helper]
-                for helper in denied_helpers
-                if helper in SUGGESTED
-            ],
+            suggested_replacements=[],
             score=req.score,
             matched_features=list(
                 req.matched_features or []

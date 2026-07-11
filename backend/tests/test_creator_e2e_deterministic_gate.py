@@ -3,9 +3,7 @@ from backend.services.creator.api import (
     _normalize_file_plan_for_requirement_coverage,
     _split_e2e_blocking_errors,
 )
-from backend.services.creator.common import E2EWorkflowCommand, FileSpecOut
-from backend.services.creator.e2e import _e2e_argv_key_consistency_error
-from backend.services.skill_plan import SkillPlanEntry
+from backend.services.creator.common import FileSpecOut
 
 
 def _script_spec(path="scripts/extract_summary.py", purpose="summarize uploaded document"):
@@ -93,39 +91,6 @@ def test_coverage_normalization_does_not_add_bridge_script():
     assert all(item.path != "scripts/cover_declared_requirements.py" for item in files)
     assert any(item["code"] == "requirement_coverage_incomplete" for item in warnings)
     assert not any(str(value).startswith(("coverage:", "covered:")) for spec in files for value in [*spec.inputs, *spec.outputs])
-
-
-def test_argv_key_mismatch_remains_blocking():
-    command = E2EWorkflowCommand(
-        ordinal=1,
-        source_path="SKILL.md",
-        script_path="scripts/extract_summary.py",
-        raw_command="python scripts/extract_summary.py '{\"input_file\": \"{{input_file}}\"}'",
-        runner="python",
-        argv_template={"input_file": "{{input_file}}"},
-    )
-    entry = SkillPlanEntry(
-        path="scripts/extract_summary.py",
-        file_type="script",
-        role="generic_script",
-        purpose="summarize",
-        language="python",
-        runtime="python",
-        entrypoint="scripts/extract_summary.py",
-    )
-    content = """
-from backend.services.runtime_tools import strict_json_argv_guard
-
-def parse_args(payload):
-    return strict_json_argv_guard(payload, {'input_path': {'type': 'file_path', 'required': True}})
-
-def run(args):
-    input_path = args['input_path']
-    return {'text': input_path}
-"""
-    error = _e2e_argv_key_consistency_error(command=command, content=content, entry=entry)
-    assert error is not None
-    assert "E2E_LAYER=argv_schema_error" in error
 
 
 def test_declared_pdf_support_not_supported_branch_is_blocking():

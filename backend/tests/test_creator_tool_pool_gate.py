@@ -19,11 +19,16 @@ def test_gate_rejects_missing_tool():
     assert event.decision == 'not_found'
 
 
-def test_gate_rejects_reference_runtime_tool():
-    event = gate_tool_request({'target_file': 'references/a.md', 'candidate_tool_id': 'unified_file_text_read'}, file_role='reference')
-    assert event.decision == 'blocked_by_policy'
+def test_gate_file_role_does_not_change_tool_decision():
+    script_event = gate_tool_request({'target_file': 'scripts/a.py', 'candidate_tool_id': 'unified_file_text_read'}, file_role='generic_script')
+    reference_event = gate_tool_request({'target_file': 'references/a.md', 'candidate_tool_id': 'unified_file_text_read'}, file_role='reference')
+    image_event = gate_tool_request({'target_file': 'scripts/a.py', 'candidate_tool_id': 'unified_file_text_read'}, file_role='image_generator')
+    assert script_event.decision == reference_event.decision == image_event.decision == 'allow'
 
 
-def test_gate_role_mismatch_for_custom_tool():
-    event = gate_tool_request({'target_file': 'scripts/a.py', 'candidate_tool_id': 'pdf_to_md_mineru'}, file_role='image_generator')
-    assert event.decision == 'role_mismatch'
+def test_gate_has_no_helper_replacement_or_role_hardcoding_tables():
+    import backend.services.creator.tool_pool_gate as module
+
+    assert not hasattr(module, 'SUGGESTED')
+    assert not hasattr(module, 'RESOURCE_ROLES')
+    assert not hasattr(module, '_declared_tool_ids')

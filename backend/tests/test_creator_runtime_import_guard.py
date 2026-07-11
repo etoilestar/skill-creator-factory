@@ -6,7 +6,7 @@ def test_import_guard_blocks_invented_helpers():
     assert not result.success
     assert result.error_type == 'generated_unknown_runtime_tool_import'
     assert 'read_pdf_text' in result.missing_imports
-    assert 'extract_pdf_text' in result.suggested_replacements
+    assert result.suggested_replacements == []
 
 
 def test_import_guard_blocks_star_and_pool_forbidden():
@@ -37,7 +37,7 @@ def test_import_guard_allows_bound_custom_tool():
     assert result.success
 
 
-def test_import_guard_allows_custom_tool_full_function_path_but_blocks_same_module_unbound_function():
+def test_import_guard_allows_custom_tool_full_function_path_and_diagnoses_same_module_unbound_function():
     allowed = 'backend.services.runtime_tools.custom_tools.lookup.lookup_value'
     ok = guard_runtime_imports(
         'from backend.services.runtime_tools.custom_tools.lookup import lookup_value\n',
@@ -57,37 +57,37 @@ def test_import_guard_allows_custom_tool_full_function_path_but_blocks_same_modu
             'allowed_function_imports': [allowed],
         },
     )
-    assert not bad.success
-    assert bad.error_type == 'generated_pool_forbidden_custom_tool_import'
+    assert bad.success
     assert 'backend.services.runtime_tools.custom_tools.lookup.other_value' in bad.forbidden_imports
+    assert any('observed import not present' in warning for warning in bad.warnings)
 
 
-def test_import_guard_blocks_unbound_custom_tool_and_wildcard():
+def test_import_guard_diagnoses_unbound_custom_tool_but_blocks_wildcard():
     src = 'from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import pdf_to_md_mineru\n'
     result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': [], 'allowed_function_imports': []})
-    assert not result.success
-    assert result.error_type == 'generated_pool_forbidden_custom_tool_import'
+    assert result.success
+    assert 'backend.services.runtime_tools.custom_tools.pdf_to_md_mineru.pdf_to_md_mineru' in result.forbidden_imports
     wildcard = guard_runtime_imports('from backend.services.runtime_tools.custom_tools.pdf_to_md_mineru import *\n', 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
     assert not wildcard.success
     assert wildcard.error_type == 'generated_custom_tool_wildcard_import'
 
 
-def test_import_guard_blocks_pool_external_custom_tool():
+def test_import_guard_reports_pool_external_custom_tool_as_diagnostic():
     src = 'from backend.services.runtime_tools.custom_tools.https_google_serper_dev_search import https_google_serper_dev_search\n'
     result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': ['backend.services.runtime_tools.custom_tools.pdf_to_md_mineru'], 'allowed_function_imports': ['pdf_to_md_mineru']})
-    assert not result.success
-    assert result.error_type == 'generated_pool_forbidden_custom_tool_import'
+    assert result.success
+    assert 'backend.services.runtime_tools.custom_tools.https_google_serper_dev_search.https_google_serper_dev_search' in result.forbidden_imports
 
 
-def test_import_guard_blocks_unbound_read_file_text():
+def test_import_guard_reports_unbound_read_file_text_without_hard_failure():
     result = guard_runtime_imports(
         'from backend.services.runtime_tools import read_file_text\n',
         'scripts/a.py',
         {'allowed_helper_imports': []},
     )
-    assert not result.success
-    assert result.error_type == 'generated_pool_forbidden_import'
+    assert result.success
     assert 'read_file_text' in result.forbidden_imports
+    assert any('observed import not present' in warning for warning in result.warnings)
 
 
 def test_import_guard_allows_open_for_txt_without_bound_helper():
@@ -115,11 +115,40 @@ def read_docx(path):
     assert result.success
 
 
-def test_forbidden_runtime_helper_repair_instruction_mentions_stdlib_fallback():
+def test_unbound_runtime_helper_is_diagnostic_not_business_failure():
     result = guard_runtime_imports(
         'from backend.services.runtime_tools import read_file_text\n',
         'scripts/a.py',
         {'allowed_helper_imports': []},
     )
-    assert 'standard library' in result.repair_instruction
-    assert 'tool_pool_patch' in result.repair_instruction
+    assert result.success
+    assert result.error_type == ''
+    assert 'read_file_text' in result.forbidden_imports
+    assert any('observed import not present in Current File ToolPool contract' in warning for warning in result.warnings)
+
+
+def test_import_guard_allows_any_bound_import_path_and_function_name():
+    src = 'from backend.services.skill_runtime import arbitrary_callable\n'
+    result = guard_runtime_imports(
+        src,
+        'scripts/a.py',
+        {
+            'allowed_import_paths': ['backend.services.skill_runtime'],
+            'allowed_function_imports': ['arbitrary_callable'],
+        },
+    )
+    assert result.success
+
+
+def test_import_guard_has_no_business_helper_whitelist_or_replacement_table():
+    import backend.services.creator.runtime_import_guard as module
+
+    assert not hasattr(module, '_ALLOWED_SKILL_RUNTIME_HELPERS')
+    assert not hasattr(module, 'SUGGESTED_REPLACEMENTS')
+
+
+def test_arbitrary_platform_import_not_hard_killed_by_business_name():
+    src = 'from backend.services.skill_runtime import arbitrary_callable\n'
+    result = guard_runtime_imports(src, 'scripts/a.py', {'allowed_import_paths': [], 'allowed_function_imports': []})
+    assert result.success
+    assert result.error_type == ''

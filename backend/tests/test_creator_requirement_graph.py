@@ -370,21 +370,33 @@ def run(payload):
 
 
 @pytest.mark.asyncio
-async def test_tool_contract_mismatch_preempts_validator_and_enters_patchable_failure(monkeypatch):
+async def test_tool_contract_mismatch_is_model_judged_and_enters_patchable_failure(monkeypatch):
     spec = _script_spec(selected_tools=[], required_capabilities=[])
     req = build_default_requirement_graph([spec]).requirements[0]
 
     async def fake_complete(*args, **kwargs):
-        raise AssertionError("deterministic tool contract should run before validator")
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [{
+                "id": "tool_contract_mismatch",
+                "severity": "error",
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "failed_file": spec.path,
+                "problem": "Source calls a platform tool absent from the Current File ToolPool contracts.",
+                "evidence": "from backend.services.skill_runtime import arbitrary_callable",
+                "minimal_edit": "Use a tool from the current contract or request tool support.",
+            }],
+        })
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
     review = await _run_script_responsibility_review(
         file_path=spec.path,
-        script_content="from backend.services.runtime_tools import missing_runtime_helper\n\ndef run(payload):\n    return missing_runtime_helper(payload)\n",
+        script_content="from backend.services.skill_runtime import arbitrary_callable\n\ndef run(payload):\n    return arbitrary_callable(payload)\n",
         skill_plan_entry=spec,
         requirements=[req],
     )
-    assert review["failure_type"] == "script_requirement_failed"
+    assert review["passed"] is False
     assert review["issues"][0]["id"] == "tool_contract_mismatch"
 
 
@@ -413,22 +425,34 @@ def run(payload):
 
 
 @pytest.mark.asyncio
-async def test_validator_blocking_without_checks_tool_mismatch_becomes_patchable(monkeypatch):
+async def test_tool_support_insufficient_is_model_judged_for_toolpool_augmentation(monkeypatch):
     spec = _script_spec(selected_tools=[], required_capabilities=[])
     req = build_default_requirement_graph([spec]).requirements[0]
 
     async def fake_complete(*args, **kwargs):
-        return '{"passed": false, "blocking_issues": [{"problem": "bad helper"}]}'
+        return json.dumps({
+            "passed": False,
+            "blocking_issues": [{
+                "id": "tool_support_insufficient",
+                "severity": "error",
+                "scope": "current_file_only",
+                "failure_layer": "responsibility",
+                "failed_file": spec.path,
+                "problem": "Current ToolPool lacks the callable needed to complete this FunctionItem.",
+                "evidence": "authorized_tool_contracts is empty",
+                "minimal_edit": "Request first-round ToolPool augmentation instead of changing E2E.",
+            }],
+        })
 
     monkeypatch.setattr("backend.services.creator.repair.complete_chat_once", fake_complete)
     review = await _run_script_responsibility_review(
         file_path=spec.path,
-        script_content="from backend.services.runtime_tools import missing_runtime_helper\n\ndef run(payload):\n    return missing_runtime_helper(payload)\n",
+        script_content="def run(payload):\n    return {'text': ''}\n",
         skill_plan_entry=spec,
         requirements=[req],
     )
-    assert review["failure_type"] == "script_requirement_failed"
-    assert review["issues"][0]["id"] == "tool_contract_mismatch"
+    assert review["passed"] is False
+    assert review["issues"][0]["id"] == "tool_support_insufficient"
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,8 @@ Covers:
 """
 import json
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Fix 4: public function name for extract_missing_stdlib_from_e2e_errors
@@ -335,3 +337,111 @@ def test_e2e_missing_stdlib_surfaced_not_tool_exploration():
     assert reqs, "Expected at least one stdlib request"
     assert reqs[0]["package"] == "pandas"
     assert reqs[0]["source"] == "e2e_missing_stdlib"
+
+
+@pytest.mark.asyncio
+async def test_tool_support_insufficient_recall_candidates_still_pass_backend_gate(monkeypatch, tmp_path):
+    """Supplemental recall proposals must flow through gate_tool_request before ToolPool writes."""
+    from backend.services.creator import api
+    from backend.services.creator.tool_pool_store import load_tool_pool
+
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+
+    def fake_recall(*args, **kwargs):
+        return (
+            [
+                {"tool_id": "system_text_generation", "recalled_for_capabilities": ["structured_id"]},
+                {"tool_id": "definitely_not_registered_tool", "recalled_for_capabilities": ["structured_id"]},
+            ],
+            "test_recall_union",
+        )
+
+    async def fake_complete(messages, model):
+        return json.dumps({
+            "gap_type": "capability_gap",
+            "reason": "structured issue requested missing tool support",
+            "tool_pool_patch": {
+                "add_tool_requests": [
+                    {"candidate_tool_id": "system_text_generation", "requested_capability": "text"},
+                    {"candidate_tool_id": "definitely_not_registered_tool", "requested_capability": "missing"},
+                ],
+                "remove_tool_requests": [],
+                "reason": "candidate recall must still use Backend Gate",
+                "affected_files": ["scripts/a.py"],
+            },
+        })
+
+    monkeypatch.setattr(api, "_recall_creator_tool_candidates", fake_recall)
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+
+    result = await api._plan_tool_pool_patch_from_responsibility_feedback(
+        skill_name="demo",
+        target_file="scripts/a.py",
+        file_spec={"path": "scripts/a.py", "required": True},
+        responsibility_issues=[{"id": "tool_support_insufficient"}],
+        script_content="def run(args):\n    return {'text': ''}\n",
+        requested_model=None,
+    )
+
+    pool = load_tool_pool(tmp_path / "demo")
+    allowed_ids = {tool.tool_id for tool in pool.tools if tool.status == "allowed"}
+    denied_ids = {item.tool_id for item in pool.denied_requests}
+    gate_ids = {event.tool_id for event in pool.gate_events}
+
+    assert result["allowed_new"] == 1
+    assert result["denied_new"] == 1
+    assert "system_text_generation" in allowed_ids
+    assert "definitely_not_registered_tool" not in allowed_ids
+    assert "definitely_not_registered_tool" in denied_ids
+    assert {"system_text_generation", "definitely_not_registered_tool"} <= gate_ids
+
+
+def test_tool_contract_mismatch_does_not_trigger_missing_capability_recall():
+    from backend.services.creator.api import _has_responsibility_missing_capability_issue
+
+    assert _has_responsibility_missing_capability_issue([
+        {"id": "tool_contract_mismatch", "reason": "platform import not in current ToolPool"}
+    ]) is False
+
+
+def test_plain_responsibility_issue_with_real_function_name_does_not_trigger_recall():
+    from backend.services.creator.api import _has_responsibility_missing_capability_issue
+
+    assert _has_responsibility_missing_capability_issue([
+        {
+            "id": "script_functional.responsibility",
+            "reason": "The implementation mentions read_file_text but still returns a fixed string.",
+            "minimal_edit": "Use the current inputs to produce a non-empty output.",
+        }
+    ]) is False
+
+
+def test_supplemental_tool_pool_patch_source_keeps_gate_as_authorization_boundary():
+    import inspect
+    from backend.services.creator import api
+
+    source = inspect.getsource(api._apply_planner_tool_pool_patch)
+    gate_index = source.index("gate_tool_request(")
+    append_index = source.index("pool.tools.append(")
+    assert gate_index < append_index
+    assert "if gate_event.decision == \"allow\":" in source
+
+
+def test_first_round_responsibility_recall_trigger_requires_structured_missing_tool_id():
+    import inspect
+    from backend.services.creator import api
+
+    source = inspect.getsource(api.generate_file)
+    assert "_has_responsibility_missing_capability_issue(" in source
+    assert "_plan_tool_pool_patch_from_responsibility_feedback(" in source
+
+
+def test_second_round_e2e_does_not_recall_or_modify_toolpool():
+    import inspect
+    from backend.services.creator import e2e
+
+    source = inspect.getsource(e2e)
+    assert "_plan_tool_pool_patch_from_responsibility_feedback" not in source
+    assert "_recall_creator_tool_candidates" not in source
+    assert "gate_tool_request(" not in source
+    assert "save_tool_pool(" not in source

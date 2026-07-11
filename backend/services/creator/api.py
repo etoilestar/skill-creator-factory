@@ -2711,17 +2711,13 @@ _VALIDATOR_ONLY_LAYERS = {
     "validator_invalid_json",
 }
 
-_MISSING_CAPABILITY_KEYWORDS = {"tool", "helper", "capability", "dependency", "runtime"}
-
-
 def _has_responsibility_missing_capability_issue(
     issues: list[Any],
 ) -> bool:
-    """Detect responsibility failures that reference a real registry capability.
+    """Return true only for structured missing-tool responsibility issue IDs.
 
-    This uses structured issue IDs and exact registry capability/helper
-    identities. It does not classify arbitrary prose by generic words such as
-    "tool" or "helper".
+    This must not infer missing capabilities from prose, registry function names,
+    helper names, capability names, reasons, evidence, or repair instructions.
     """
     explicit_issue_ids = {
         "responsibility_tool_binding_failed",
@@ -2730,68 +2726,6 @@ def _has_responsibility_missing_capability_issue(
         "tool_support_insufficient",
     }
 
-    registry_identities: set[str] = set()
-
-    for cap in list_tool_capabilities():
-        capability_id = str(getattr(cap, "name", "") or "").strip()
-        if capability_id:
-            registry_identities.add(capability_id)
-
-        for fn in getattr(cap, "functions", []) or []:
-            function_name = str(
-                getattr(fn, "function_name", "") or ""
-            ).strip()
-            if not function_name:
-                continue
-
-            registry_identities.add(function_name)
-
-            if capability_id:
-                registry_identities.add(
-                    f"{capability_id}.{function_name}"
-                )
-
-    def _iter_issue_text(value: Any) -> list[str]:
-        if value is None:
-            return []
-
-        if isinstance(value, str):
-            text = value.strip()
-            return [text] if text else []
-
-        if isinstance(value, dict):
-            out: list[str] = []
-            for key, item in value.items():
-                out.extend(_iter_issue_text(key))
-                out.extend(_iter_issue_text(item))
-            return out
-
-        if isinstance(value, (list, tuple, set)):
-            out: list[str] = []
-            for item in value:
-                out.extend(_iter_issue_text(item))
-            return out
-
-        return [str(value)]
-
-    def _contains_registry_identity(text: str) -> bool:
-        lowered = str(text or "").lower()
-
-        for identity in registry_identities:
-            token = identity.lower()
-            if not token:
-                continue
-
-            if re.search(
-                rf"(?<![A-Za-z0-9_])"
-                rf"{re.escape(token)}"
-                rf"(?![A-Za-z0-9_])",
-                lowered,
-            ):
-                return True
-
-        return False
-
     for issue in issues or []:
         if not isinstance(issue, dict):
             continue
@@ -2799,38 +2733,6 @@ def _has_responsibility_missing_capability_issue(
         issue_id = str(issue.get("id") or "").strip()
         if issue_id in explicit_issue_ids:
             return True
-
-        structured_tool_fields = (
-            "tool_id",
-            "candidate_tool_id",
-            "capability",
-            "capability_id",
-            "required_tool",
-            "missing_tool",
-            "helper",
-            "helper_name",
-        )
-
-        for field_name in structured_tool_fields:
-            field_value = issue.get(field_name)
-            for text in _iter_issue_text(field_value):
-                if _contains_registry_identity(text):
-                    return True
-
-        review_fields = (
-            "missing_evidence",
-            "semantic_failure",
-            "reason",
-            "minimal_edit",
-            "repair_instruction",
-            "repair_instructions",
-            "details",
-        )
-
-        for field_name in review_fields:
-            for text in _iter_issue_text(issue.get(field_name)):
-                if _contains_registry_identity(text):
-                    return True
 
     return False
 
@@ -12690,6 +12592,9 @@ async def generate_file(request: GenerateFileRequest):
                         if (
                                 tool_re_explore_count < 1
                                 and request.file_path.startswith("scripts/")
+                                and _has_responsibility_missing_capability_issue(
+                                    responsibility_issues
+                                )
                         ):
                             try:
                                 if (

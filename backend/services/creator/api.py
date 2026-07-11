@@ -3145,7 +3145,6 @@ async def _plan_final_tool_pool(
         final file_specs.required_capabilities
         -> per-capability embedding recall
         -> candidate union
-        -> boolean Final Tool Selector
         -> deterministic Backend diff
         -> Backend Gate
         -> shared Skill ToolPool
@@ -3378,446 +3377,27 @@ async def _plan_final_tool_pool(
         )
     }
 
-    desired_tool_ids: set[str] = set()
+    desired_tool_ids: set[str] = set(
+        ordered_candidate_tool_ids
+    )
 
     selector_output: dict[
         str,
         Any,
     ] = {
-        "decisions": {},
+        "decisions": {
+            tool_id: True
+            for tool_id
+            in ordered_candidate_tool_ids
+        },
     }
-
-    if ordered_candidate_tool_ids:
-        decision_properties = {
-            tool_id: {
-                "type": "boolean",
-            }
-            for tool_id
-            in ordered_candidate_tool_ids
-        }
-
-        response_schema: dict[
-            str,
-            Any,
-        ] = {
-            "type": "object",
-
-            "properties": {
-                "decisions": {
-                    "type": "object",
-
-                    "properties": (
-                        decision_properties
-                    ),
-
-                    "required": (
-                        ordered_candidate_tool_ids
-                    ),
-
-                    "additionalProperties": False,
-                },
-            },
-
-            "required": [
-                "decisions",
-            ],
-
-            "additionalProperties": False,
-        }
-
-        prompt = """
-你是 Creator Final Tool Selector。
-
-ToolPool 是当前 Skill 允许代码生成模型优先使用的真实工具候选池 / 白名单。
-加入 ToolPool 只表示该工具可用、推荐候选；不表示任何 scripts/*.py 必须调用该工具。
-
-normalized script contracts and ResponsibilityGraph provide the connected executable responsibility context. Full Blueprint text is intentionally unavailable.
-
-candidate_tool_catalog 已经是 embedding/exact recall 得到的有限候选；不要重新搜索完整 Registry。
-
-你的任务只有一个：
-
-逐项判断 candidate_tool_catalog 中的候选工具，是否应该作为可选候选加入整个 Skill 的共享 ToolPool。
-
-对 decisions 中每个 tool_id 填 true 或 false。
-
-判断依据：
-- tool function description / when_to_use。
-- tool function input_schema。
-- tool function output_schema。
-- tool function artifact_outputs。
-- tool function side_effects。
-- tool/function required_capabilities。
-- normalized script contracts: purpose / inputs / outputs / required_capabilities / artifact_contract。
-- ResponsibilityGraph FunctionItem context, incoming ResponsibilityEdges, and outgoing ResponsibilityEdges。
-
-true：
-该工具的真实 function contract 与任一 script 的真实责任具有合理直接相关性，可能帮助该 script 完成当前责任。即使 Plan.required_capabilities 没有逐字声明该工具对应 capability，也可以设为 true。
-
-false：
-该工具只是 embedding 表面相似，但函数能力与 script responsibility 没有实际关系。
-
-特别注意：
-
-- selected=true 只表示将真实工具加入 Skill ToolPool，供代码生成模型选择；不表示脚本必须调用该工具。
-- 最终某个 scripts/*.py 是否调用工具、调用哪个工具，由代码生成模型根据当前文件 responsibility、tool function cards、input/output contract 自主决定。
-- 不要重新设计 Skill。
-- 不要修改 Plan。
-- 不要生成代码。
-- 不要输出解释、reason、tool card 或代码。
-
-## executable tool replay
-
-Before outputting decisions:
-1. Read every FunctionItem.
-2. Read its incoming ResponsibilityEdges and outgoing ResponsibilityEdges.
-3. Understand the actual owned actions and results the FunctionItem must be capable of implementing.
-4. Inspect the real callable function contracts of bounded candidate tools.
-5. Select candidate tools that may directly help implement those owned actions.
-6. After drafting decisions, replay every FunctionItem through the connected ResponsibilityGraph.
-7. Ask whether any FunctionItem would lose all reasonable callable means for an explicit owned action or outgoing result that requires an external/platform tool capability. Judge reasonable callable means from the FunctionItem, edge obligations, tool function contracts, and deterministic stdlib implementation possibility.
-8. If yes, revise decisions before returning.
-
-ToolPool is optional candidate pool / whitelist. selected=true does not force a script to call the tool. Tool availability does not grant responsibility ownership.
-
-响应由 JSON Schema 强制。
-只填写 boolean decisions。
-""".strip()
-
-        payload = {
-            "task": (
-                "select_tools_for_"
-                "planned_capabilities"
-            ),
-
-            "skill_name": skill_name,
-
-            "normalized_script_contracts": (
-                script_contracts
-            ),
-
-            "responsibility_graph": (
-                responsibility_graph or {}
-            ),
-
-            "current_allowed_tool_ids": (
-                sorted(
-                    current_allowed_ids
-                )
-            ),
-
-            "candidate_tool_catalog": (
-                candidate_catalog
-            ),
-        }
-
-        route = route_model(
-            "creator_prepare_plan",
-            requested_model=(
-                requested_model
-            ),
-            reason=(
-                "creator final capability "
-                "tool selection"
-            ),
-        )
-
-        try:
-            selector_output = (
-                await _complete_creator_json_object_once(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                                default=str,
-                            ),
-                        },
-                    ],
-
-                    model=route.model,
-
-                    phase=(
-                        "final_tool_selection"
-                    ),
-
-                    response_schema=(
-                        response_schema
-                    ),
-                )
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "[Creator]"
-                "[final_tool_selection]"
-                "[structured_protocol_failed] "
-                "skill=%s "
-                "error=%s",
-                skill_name,
-                (
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                ),
-            )
-
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": (
-                        "final_tool_selector_"
-                        "structured_protocol_failed"
-                    ),
-
-                    "message": (
-                        "Final Tool Selector failed "
-                        "the boolean decision protocol."
-                    ),
-
-                    "error": (
-                        f"{type(exc).__name__}: "
-                        f"{exc}"
-                    ),
-                },
-            ) from exc
-
-        raw_decisions = (
-            selector_output.get(
-                "decisions"
-            )
-        )
-
-        if not isinstance(
-            raw_decisions,
-            dict,
-        ):
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": (
-                        "final_tool_selector_"
-                        "invalid_shape"
-                    ),
-
-                    "message": (
-                        "Final Tool Selector must "
-                        "return decisions object."
-                    ),
-
-                    "selector_output": (
-                        selector_output
-                    ),
-                },
-            )
-
-        missing_decisions = [
-            tool_id
-            for tool_id
-            in ordered_candidate_tool_ids
-            if tool_id
-            not in raw_decisions
-        ]
-
-        extra_decisions = [
-            str(tool_id)
-            for tool_id
-            in raw_decisions
-            if str(tool_id)
-            not in candidate_tool_ids
-        ]
-
-        invalid_decisions = [
-            tool_id
-            for tool_id, value
-            in raw_decisions.items()
-            if not isinstance(
-                value,
-                bool,
-            )
-        ]
-
-        if (
-            missing_decisions
-            or extra_decisions
-            or invalid_decisions
-        ):
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "code": (
-                        "final_tool_selector_"
-                        "invalid_decisions"
-                    ),
-
-                    "message": (
-                        "Final Tool Selector returned "
-                        "an invalid decision table."
-                    ),
-
-                    "missing_decisions": (
-                        missing_decisions
-                    ),
-
-                    "extra_decisions": (
-                        extra_decisions
-                    ),
-
-                    "invalid_decisions": (
-                        invalid_decisions
-                    ),
-
-                    "selector_output": (
-                        selector_output
-                    ),
-                },
-            )
-
-        draft_decisions = {
-            tool_id: raw_decisions.get(tool_id) is True
-            for tool_id
-            in ordered_candidate_tool_ids
-        }
-
-        convergence_prompt = """
-You are the same Creator Final Tool Selector that just emitted these draft ToolPool decisions.
-
-You are revising your own draft ToolPool decisions.
-This is not a Tool Judge, Tool Gate, repair model, or separate semantic authority.
-
-The candidate set is fixed.
-Do not add tools outside candidate_tool_catalog.
-Do not remove candidate ids from the decisions object.
-Do not re-run recall.
-Do not search the Registry.
-Only revise boolean decisions for existing candidate ids.
-
-Replay the connected ResponsibilityGraph using the exact draft decisions.
-
-For each FunctionItem:
-1. Identify the actual actions owned by the FunctionItem.
-2. Identify the outgoing semantic results the FunctionItem must actually produce.
-3. Inspect the selected=true callable tool contracts.
-4. Consider deterministic stdlib implementation where appropriate.
-5. Determine whether the FunctionItem still has reasonable implementation means for every explicit owned action that cannot reasonably be implemented by deterministic local code alone.
-6. If a draft false decision removes all reasonable callable means for such an owned action, revise the decisions.
-7. Do not select unrelated tools merely because they are available.
-8. Do not grant responsibility ownership based on tool availability.
-
-Return only the existing schema: {"decisions": {"tool_id": true_or_false}}.
-No reasons, coverage reports, violations, or explanations.
-""".strip()
-
-        convergence_payload = {
-            "task": "final_tool_selection_convergence",
-            "normalized_script_contracts": script_contracts,
-            "responsibility_graph": responsibility_graph or {},
-            "candidate_tool_catalog": candidate_catalog,
-            "draft_decisions": draft_decisions,
-        }
-
-        final_raw_decisions = raw_decisions
-        try:
-            converged_selector_output = await _complete_creator_json_object_once(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": convergence_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            convergence_payload,
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                    },
-                ],
-                model=route.model,
-                phase="final_tool_selection_convergence",
-                response_schema=response_schema,
-            )
-            converged_decisions = converged_selector_output.get("decisions")
-            if not isinstance(converged_decisions, dict):
-                raise ValueError("Tool convergence response must include decisions object")
-            missing_converged = [
-                tool_id
-                for tool_id
-                in ordered_candidate_tool_ids
-                if tool_id not in converged_decisions
-            ]
-            extra_converged = [
-                str(tool_id)
-                for tool_id
-                in converged_decisions
-                if str(tool_id) not in candidate_tool_ids
-            ]
-            invalid_converged = [
-                tool_id
-                for tool_id, value
-                in converged_decisions.items()
-                if not isinstance(value, bool)
-            ]
-            if missing_converged or extra_converged or invalid_converged:
-                raise ValueError(
-                    "Tool convergence returned invalid decisions: "
-                    f"missing={missing_converged} extra={extra_converged} invalid={invalid_converged}"
-                )
-            selector_output = converged_selector_output
-            final_raw_decisions = converged_decisions
-        except Exception as exc:
-            logger.warning(
-                "[Creator][tool_selection_convergence_failed] skill=%s error=%s",
-                skill_name,
-                f"{type(exc).__name__}: {exc}",
-            )
-
-        desired_tool_ids = {
-            tool_id
-            for tool_id
-            in ordered_candidate_tool_ids
-            if final_raw_decisions.get(tool_id) is True
-        }
-
-        graph_edges_for_log = []
-        graph_items_for_log = []
-        if isinstance(responsibility_graph, dict):
-            graph_edges_for_log = list(responsibility_graph.get("dataflow_edges") or [])
-            graph_items_for_log = list(responsibility_graph.get("requirements") or responsibility_graph.get("items") or [])
-        draft_selected_tool_ids = sorted(
-            tool_id
-            for tool_id, selected
-            in draft_decisions.items()
-            if selected is True
-        )
-        final_selected_tool_ids = sorted(desired_tool_ids)
-        logger.info(
-            "[Creator][final_tool_selection][convergence] %s",
-            json.dumps({
-                "event": "creator_final_tool_selection_convergence",
-                "draft_selected_tool_ids": draft_selected_tool_ids,
-                "final_selected_tool_ids": final_selected_tool_ids,
-                "added_by_convergence": sorted(set(final_selected_tool_ids) - set(draft_selected_tool_ids)),
-                "removed_by_convergence": sorted(set(draft_selected_tool_ids) - set(final_selected_tool_ids)),
-                "function_item_count": len(graph_items_for_log),
-                "edge_count": len(graph_edges_for_log),
-            }, ensure_ascii=False, default=str),
-        )
 
     add_tool_ids = sorted(
         desired_tool_ids
         - current_allowed_ids
     )
 
-    remove_tool_ids = sorted(
-        current_allowed_ids
-        - desired_tool_ids
-        - protected_tool_ids
-    )
+    remove_tool_ids: list[str] = []
 
     computed_patch = {
         "tool_pool_patch": {
@@ -3846,10 +3426,11 @@ No reasons, coverage reports, violations, or explanations.
                     ),
 
                     "reason": (
-                        "Final Tool Selector marked "
-                        "this Registry candidate as "
-                        "required by the normalized "
-                        "Skill Plan capabilities."
+                        "Registry candidate was recalled "
+                        "from the normalized FunctionItem "
+                        "capability contracts and passed "
+                        "Backend factual authorization "
+                        "checks."
                     ),
                 }
                 for tool_id
@@ -3873,9 +3454,10 @@ No reasons, coverage reports, violations, or explanations.
             "update_file_bindings": [],
 
             "reason": (
-                "Backend diff from capability-level "
-                "embedding recall and boolean Final "
-                "Tool Selector."
+                "Backend diff from exact capability "
+                "recall and embedding top-k recall "
+                "union; no post-recall semantic "
+                "tool pruning."
             ),
 
             "affected_files": [],
@@ -3894,7 +3476,7 @@ No reasons, coverage reports, violations, or explanations.
                 "final_contract_tool_planning"
             ),
 
-            allow_remove=True,
+            allow_remove=False,
         )
     )
 
@@ -3929,6 +3511,10 @@ No reasons, coverage reports, violations, or explanations.
         "recall_source": (
             recall_source
         ),
+
+        "selection_mode": (
+            "recall_union_no_llm"
+        ),
     }
 
     logger.info(
@@ -3948,6 +3534,10 @@ No reasons, coverage reports, violations, or explanations.
                     recall_source
                 ),
 
+                "selection_mode": (
+                    "recall_union_no_llm"
+                ),
+
                 "candidate_tool_ids": (
                     ordered_candidate_tool_ids
                 ),
@@ -3965,6 +3555,8 @@ No reasons, coverage reports, violations, or explanations.
                 "remove_tool_ids": (
                     remove_tool_ids
                 ),
+
+                "llm_selector_used": False,
             },
             ensure_ascii=False,
             default=str,

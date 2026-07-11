@@ -231,6 +231,8 @@ def test_argv_schema_repair_instruction_treats_guard_as_probe():
 def test_e2e_script_target_rule_contains_coverage_guardrail():
     source = e2e._repair_existing_file_for_e2e_failure.__code__.co_consts
     joined = "\n".join(str(item) for item in source if isinstance(item, str))
+    assert "strict_json_argv_guard 是接口不对齐探针" in joined
+    assert "不能通过删除参数降低功能覆盖面" in joined
     assert "真实 workflow 执行证据" in joined
     assert "不得检查 ToolPool" in joined
 

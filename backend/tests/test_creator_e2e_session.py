@@ -1,6 +1,8 @@
 from pathlib import Path
+import json
 from types import SimpleNamespace
 import subprocess
+import sys
 
 import pytest
 
@@ -59,7 +61,7 @@ def test_e2e_session_reuses_workspace_venv_and_dependency_signature(tmp_path, mo
     assert session.workspace_dir == first_workspace
     assert session.venv_path == first_venv
     assert session.installed_deps_signature == "deps-v1"
-    assert len(install_calls) == 1  # dependency packages are deduped into one install pass; second E2E run reuses deps
+    assert len(install_calls) == 2  # one install pass for two commands; second E2E run reuses deps
     assert any(event["event"] == "dependencies_reused" for event in session.events)
 
 
@@ -482,7 +484,7 @@ def test_e2e_fields_fallback_normalizes_bracket_placeholder(tmp_path):
 
     payload = e2e._seed_initial_e2e_payload([command], skill_dir=skill_dir)
 
-    assert len(payload["fields"][dynamic_key]) >= 1
+    assert len(payload["fields"][dynamic_key]) == 2
     assert all(Path(path).is_file() for path in payload["fields"][dynamic_key])
 
 
@@ -545,13 +547,68 @@ async def test_e2e_repair_escalates_to_full_file_rewrite_after_two_localized_fai
     )
 
     assert result["status"] == "repaired"
-    assert len(patch_calls) >= 2
-    assert len(full_calls) <= 1
+    assert len(patch_calls) == 2
+    assert len(full_calls) == 1
     assert len(gate_calls) == 3
-    if full_calls:
-        assert full_calls[0]["previous_content"] == "print({})\n"
-        assert "runtime_contract" in full_calls[0]["task_context"]
-        assert "coverage_requirements" in full_calls[0]["task_context"]
-        assert any(event.get("repair_mode") == "full_file_rewrite" and event.get("rerun_status") == "passed" for event in events)
-    else:
-        assert any(event.get("repair_mode") == "localized_patch" and event.get("rerun_status") == "passed" for event in events)
+    assert full_calls[0]["previous_content"] == "print({})\n"
+    assert "runtime_contract" in full_calls[0]["task_context"]
+    assert "coverage_requirements" in full_calls[0]["task_context"]
+    assert any(event.get("repair_mode") == "full_file_rewrite" and event.get("rerun_status") == "passed" for event in events)
+
+
+def test_input_text_list_guard_preflight_reaches_subprocess(tmp_path, monkeypatch):
+    skill_dir = tmp_path / "input-text-list"
+    (skill_dir / "scripts").mkdir(parents=True)
+    script = (
+        "import json, sys\n"
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def run(args):\n"
+        "    return {'text': ','.join(args['input_text'])}\n"
+        "def main():\n"
+        "    payload = json.loads(sys.argv[1])\n"
+        "    args = strict_json_argv_guard(payload, {'input_text': {'type': list, 'required': True}, 'num_images': {'type': int, 'required': False, 'default': 3}})\n"
+        "    print(json.dumps(run(args)))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+    script_path = skill_dir / "scripts" / "run.py"
+    script_path.write_text(script, encoding="utf-8")
+    skill_md = "# Demo\n```bash\npython scripts/run.py '{\"input_text\":[\"a\",\"b\"]}'\n```\n"
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/run.py", "python scripts/run.py '{\"input_text\":[\"a\",\"b\"]}'", "python", {"input_text": ["a", "b"]})
+
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", lambda **kwargs: SimpleNamespace(runtime="python", language="python", role="generic_script", path="scripts/run.py", inputs=["input_text"], outputs=["text"], required_capabilities=[]))
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    assert entry.runtime == "python"
+
+    result = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload={"input_text": ["a", "b"]}, venv_python=Path(sys.executable))
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"text": "a,b"}
+    assert script_path.read_text(encoding="utf-8") == script
+
+
+def test_argv_schema_failure_targets_skill_md_for_command_key_error_and_script_for_undeclared_run_key():
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/main.py", "python scripts/main.py '{}'", "python", {"title": "wrong"})
+    entry = SimpleNamespace(runtime="python", inputs=["input_text"])
+    self_consistent = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv.get("input_text")}\n'
+    details = e2e._classify_argv_schema_failure(
+        command=command,
+        content=self_consistent,
+        entry=entry,
+        rendered_payload={"title": "wrong"},
+        stdout="",
+        stderr="ValueError: missing required argv keys: ['input_text']",
+    )
+    assert details["primary_target"] == "SKILL.md"
+
+    mismatched = 'ALLOWED_KEYS = {"input_text"}\nREQUIRED_KEYS = {"input_text"}\ndef run(argv):\n    return {"text": argv["title"]}\n'
+    details = e2e._classify_argv_schema_failure(
+        command=command,
+        content=mismatched,
+        entry=entry,
+        rendered_payload={"title": "wrong"},
+        stdout="",
+        stderr="ValueError: missing required argv keys: ['input_text']",
+    )
+    assert details["primary_target"] == "scripts/main.py"
+    assert details["script_guard_run_mismatch"] is True

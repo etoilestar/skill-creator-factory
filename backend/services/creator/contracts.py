@@ -1161,6 +1161,13 @@ def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, 
 
 
 
+def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
+    if not isinstance(issue, dict):
+        return False
+    severity = str(issue.get("severity") or "").strip().lower()
+    return issue.get("blocking") is True or (severity == "error" and issue.get("blocking") is not False)
+
+
 def _skill_md_reviewer_schema_error(data: Any) -> str:
     if not isinstance(data, dict) or not data:
         return "SKILL.md semantic reviewer did not return a JSON object."
@@ -1182,11 +1189,18 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
         return "SKILL.md semantic reviewer JSON field repair_suggestions must be string when present."
     if data.get("passed") is True:
         for issue in data.get("issues") or []:
-            if not isinstance(issue, dict):
-                continue
-            severity = str(issue.get("severity") or "").strip().lower()
-            if issue.get("blocking") is True or (severity == "error" and issue.get("blocking") is not False):
+            if _skill_md_reviewer_issue_contradicts_passed_true(issue):
                 return "SKILL.md semantic reviewer protocol contradiction: passed=true with blocking/error issue."
+        reviewers = data.get("reviewers") or {}
+        if isinstance(reviewers, dict):
+            for reviewer_name, reviewer_result in reviewers.items():
+                if not isinstance(reviewer_result, dict):
+                    continue
+                if reviewer_result.get("passed") is False:
+                    return f"SKILL.md semantic reviewer protocol contradiction: passed=true with nested reviewer passed=false: {reviewer_name}."
+                for issue in reviewer_result.get("issues") or []:
+                    if _skill_md_reviewer_issue_contradicts_passed_true(issue):
+                        return "SKILL.md semantic reviewer protocol contradiction: passed=true with nested blocking/error issue."
     return ""
 
 async def _review_skill_md_blueprint_intent_with_model(
@@ -1254,15 +1268,17 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
         "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
         "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs，也不要要求 placeholder 逐字等于 graph.outputs。\n"
-        "- 第一轮只做机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
-        "- 不审查 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
-        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n\n"
+        "- 第一轮保留平台边界接口证明：平台 source slots 到第一个可执行 command 仍属于接口契约，第一个 command 不得用固定字面值完全替代平台动态输入。\n"
+        "- 第一轮只做命令块机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
+        "- 不审查内部脚本间 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
+        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n"
+        "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
         "- contract_impact 可选 object；只用布尔字段表达是否影响 execution_closure/resource_role/platform_io/final_artifact/user_requirement_transfer。\n"
         "- resource_role 仅在资源职责问题时填写 reference|asset，否则可省略。\n"
         "- claim_type 仅在资源职责问题时填写 forbid_read|execution_step|artifact|asset_material|model_generated|modifiable|write_asset 之一。\n"
-        "- category 可选；不得把跨步骤精确字段来源证明作为 blocking repair。\n"
+        "- category 可选；平台边界来源证明问题可使用 command_template_source_proof；内部脚本间精确字段来源证明不得作为 blocking repair。\n"
         "- repair_ops 可选；只有可确定的机械修复才填写，op 只能是 replace/delete/append_after/append_before，必须带 anchor/evidence，不能把自然语言 minimal_edit 当 repair_ops。\n\n"
 
         "真实文件和资源角色判断原则：\n"
@@ -1290,7 +1306,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "null",\n'
+        '      "category": "command_template_source_proof|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1650,7 +1666,8 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
         return False
 
     if _review_issue_is_command_template_source_proof_error(issue):
-        return False
+        impact = issue.get("contract_impact") or issue.get("impact")
+        return bool(isinstance(impact, dict) and impact.get("platform_io") is True)
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False

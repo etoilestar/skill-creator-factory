@@ -987,6 +987,8 @@ def _materialize_e2e_sample_value(
                 script_content=script_content,
                 max_count=3,
             )
+            if len(kinds) == 1:
+                kinds = [kinds[0], kinds[0]]
             return [
                 _e2e_sample_file(skill_dir, spec.name, index + 1, kind=kind)
                 for index, kind in enumerate(kinds)
@@ -1784,6 +1786,7 @@ async def _request_full_file_rewrite_for_e2e(
     previous_content: str,
     rewrite_context: str,
     rewrite_target_rule: str,
+    task_context: str | None = None,
 ) -> str:
     """Ask the model for a complete replacement file for repeated E2E failures.
 
@@ -3269,8 +3272,6 @@ def _run_skill_workflow_e2e_once(
 
                 should_install_deps = e2e_session is None or e2e_session.installed_deps_signature != deps_signature
                 if should_install_deps:
-                    session_packages: list[str] = []
-                    seen_session_packages: set[str] = set()
                     for command in commands:
                         if not command.script_path.endswith(".py"):
                             continue
@@ -3280,17 +3281,10 @@ def _run_skill_workflow_e2e_once(
                             blueprint_text=trial_skill_md,
                         ), requirements_by_file.get(command.script_path, []))
 
-                        for capability_name in entry.required_capabilities or []:
-                            capability = get_tool_capability(capability_name)
-                            if capability is None:
-                                continue
-                            for dependency in capability.dependencies or []:
-                                package = str(dependency.get("package") or dependency.get("name") or "") if isinstance(dependency, dict) else str(dependency or "")
-                                package = package.strip()
-                                normalized = package.lower().replace("_", "-")
-                                if package and normalized not in seen_session_packages:
-                                    seen_session_packages.add(normalized)
-                                    session_packages.append(package)
+                        _install_capability_dependencies(
+                            venv_python,
+                            entry.required_capabilities,
+                        )
 
                         refined_contract, resolution = _contract_resolution_for_trial(
                             command.script_path,
@@ -3299,18 +3293,12 @@ def _run_skill_workflow_e2e_once(
                             None,
                         )
 
-                        for package in list(refined_contract.declared_dependencies or []) + list(resolution.declared_dependencies or []):
-                            package = str(package or "").strip()
-                            normalized = package.lower().replace("_", "-")
-                            if package and normalized not in seen_session_packages:
-                                seen_session_packages.add(normalized)
-                                session_packages.append(package)
-
-                    _install_declared_dependency_packages(
-                        venv_python,
-                        session_packages,
-                        source_label="e2e_session",
-                    )
+                        _install_declared_dependency_packages(
+                            venv_python,
+                            list(refined_contract.declared_dependencies or [])
+                            + list(resolution.declared_dependencies or []),
+                            source_label="implementation_resolution",
+                        )
                     if e2e_session is not None:
                         e2e_session.installed_deps_signature = deps_signature
                         e2e_session.events.append({**e2e_session.to_event_base(), "event": "dependencies_prepared", "reused_venv": False})
@@ -4065,6 +4053,7 @@ async def _repair_existing_file_for_e2e_failure(
             "修复范围必须直接对应真实失败证据。\n"
             "如果是 argv_schema_error，只核对当前 command JSON argv、"
             "strict_json_argv_guard schema 和 run(args) 实际读取关系。\n"
+            "strict_json_argv_guard 是接口不对齐探针，不能通过删除参数降低功能覆盖面。\n"
             "如果是 script_exit，以 raw stderr traceback、异常类型和报错源码行为主；"
             "ImportError 或 ModuleNotFoundError 可以修改直接相关 import，"
             "其它异常只修改 traceback 直接涉及的执行区域。\n"
@@ -4166,7 +4155,7 @@ async def _repair_existing_file_for_e2e_failure(
         max_candidate_attempts + 1,
     ):
         current_content = working_content
-        use_full_rewrite = False
+        use_full_rewrite = candidate_attempt > 2 and target_path.startswith("scripts/")
 
         effective_skill_md = (
             current_content
@@ -4292,6 +4281,7 @@ async def _repair_existing_file_for_e2e_failure(
                             before_repair_snapshot
                         ),
                         rewrite_context=rewrite_context,
+                        task_context=rewrite_context,
                         rewrite_target_rule=(
                             _full_file_rewrite_target_rule_for_e2e(
                                 target_path
@@ -4587,7 +4577,7 @@ async def _repair_existing_file_for_e2e_failure(
                 ),
                 "patch_mode": "exact_replace",
                 "repair_key": repair_key,
-                "repair_mode": "localized_patch",
+                "repair_mode": "full_file_rewrite" if use_full_rewrite else "localized_patch",
                 "fallback_type": (
                     diff_stats.get(
                         "applied"

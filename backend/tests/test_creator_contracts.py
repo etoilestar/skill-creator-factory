@@ -651,3 +651,75 @@ async def test_skill_md_reviewer_three_invalid_schema_raises_validator_error(mon
             skill_plan_entry={},
         )
     assert calls["count"] == 3
+
+
+def test_command_template_source_proof_blocks_only_platform_io():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    internal_review = {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "field": "workflow",
+            "category": "command_template_source_proof",
+            "message": "internal stdout placeholder source not proven",
+            "contract_impact": {"execution_closure": True, "platform_io": False},
+        }],
+    }
+    assert _skill_md_blueprint_review_to_contract_results(internal_review) == []
+
+    platform_review = {
+        "passed": False,
+        "issues": [{
+            "severity": "error",
+            "field": "workflow",
+            "category": "command_template_source_proof",
+            "message": "platform input envelope to first command is fixed literal",
+            "contract_impact": {"execution_closure": True, "platform_io": True},
+        }],
+    }
+    assert _skill_md_blueprint_review_to_contract_results(platform_review)
+
+
+@pytest.mark.parametrize("payload", [
+    {"passed": True, "issues": [{"severity": "error", "blocking": True}]},
+    {"passed": True, "reviewers": {"workflow_reviewer": {"passed": False, "issues": []}}, "issues": []},
+    {"passed": True, "reviewers": {"workflow_reviewer": {"passed": True, "issues": [{"severity": "error", "blocking": True}]}}},
+])
+def test_skill_md_reviewer_passed_true_protocol_contradictions_are_schema_errors(payload):
+    from backend.services.creator.contracts import _skill_md_reviewer_schema_error
+
+    assert "protocol contradiction" in _skill_md_reviewer_schema_error(payload)
+
+
+def test_skill_md_reviewer_passed_true_warning_blocking_false_is_allowed():
+    from backend.services.creator.contracts import _skill_md_reviewer_schema_error
+
+    payload = {"passed": True, "issues": [{"severity": "warning", "blocking": False}], "reviewers": {"workflow_reviewer": {"passed": True, "issues": [{"severity": "warning", "blocking": False}]}}}
+    assert _skill_md_reviewer_schema_error(payload) == ""
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_three_protocol_contradictions_raise_validator_error(monkeypatch):
+    from backend.services.creator import contracts
+    from backend.services.creator.contracts import CreatorValidatorReviewError
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    calls = {"count": 0}
+
+    async def fake_complete(messages, model):
+        calls["count"] += 1
+        return json.dumps({"passed": True, "issues": [{"severity": "error", "blocking": True}]})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(CreatorValidatorReviewError):
+        await contracts._review_skill_md_blueprint_intent_with_model(
+            skill_name="demo",
+            content="candidate",
+            blueprint_text="blueprint",
+            skill_plan_entry={},
+        )
+    assert calls["count"] == 3

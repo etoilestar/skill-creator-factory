@@ -1080,6 +1080,7 @@ class GenerateFileRequest(BaseModel):
     role: Optional[str] = None
     skill_plan_entry: Optional[dict[str, Any]] = None
     requirement_graph: dict[str, Any] | None = None
+    responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
     workflow_allocation_summary: str = ""
     final_outputs: list[Any] = Field(default_factory=list)
 
@@ -2859,5 +2860,64 @@ def build_function_execution_context(
 
 try:
     __all__.extend(["build_function_execution_context"])
+except Exception:
+    pass
+
+
+def responsibility_edges_by_to_node(responsibility_edges: Any) -> dict[str, list[dict[str, str]]]:
+    """Group existing ResponsibilityEdges by to_node without inferring semantics.
+
+    This is a read-only binding context for SKILL.md command argv value sources.
+    It deliberately preserves only transport fields and does not mutate or
+    validate the ResponsibilityGraph schema.
+    """
+    grouped: dict[str, list[dict[str, str]]] = {}
+    if isinstance(responsibility_edges, dict):
+        responsibility_edges = responsibility_edges.get("responsibility_edges") or responsibility_edges.get("edges") or []
+    if not isinstance(responsibility_edges, list):
+        return grouped
+    for edge in responsibility_edges:
+        if not isinstance(edge, dict):
+            continue
+        to_node = str(edge.get("to_node") or "").strip()
+        if not to_node:
+            continue
+        item = {
+            "from_node": str(edge.get("from_node") or "").strip(),
+            "from_output": str(edge.get("from_output") or "").strip(),
+            "to_node": to_node,
+            "to_input": str(edge.get("to_input") or "").strip(),
+        }
+        grouped.setdefault(to_node, []).append(item)
+    return grouped
+
+
+def responsibility_binding_context_from_graph(graph: Any) -> dict[str, list[dict[str, str]]]:
+    """Build a to_node-indexed binding context from an existing graph payload."""
+    if hasattr(graph, "model_dump"):
+        try:
+            graph = graph.model_dump(mode="json")
+        except Exception:
+            pass
+    edges: Any = graph
+    if isinstance(graph, dict):
+        edges = graph.get("responsibility_edges") or graph.get("edges") or []
+    return responsibility_edges_by_to_node(edges)
+
+
+def skill_md_binding_context_text(binding_context: Any) -> str:
+    """Render binding context compactly for SKILL.md writer/judge prompts."""
+    if not binding_context:
+        return "{}"
+    try:
+        return json.dumps(binding_context, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(binding_context)
+try:
+    __all__.extend([
+        "responsibility_edges_by_to_node",
+        "responsibility_binding_context_from_graph",
+        "skill_md_binding_context_text",
+    ])
 except Exception:
     pass

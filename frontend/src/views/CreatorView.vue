@@ -439,9 +439,8 @@ function toggleExecutionPanel() {
   }
 }
 
-function markExecutionPanelUpdated(tab) {
+function markExecutionPanelUpdated() {
   if (showThoughts.value) {
-    activeExecutionTab.value = tab
     executionPanelHasUpdate.value = false
     return
   }
@@ -697,12 +696,6 @@ async function send() {
     content: text,
   })
 
-  appendExecutionBlock({
-    step: 'user_input',
-    label: '用户输入',
-    detail: text.slice(0, 80),
-    content: text,
-  })
 
   input.value = ''
 
@@ -829,7 +822,6 @@ async function send() {
         if (event.event === 'file_plan_ready') {
           currentStatus.value = { message: '文件规划已完成，正在绑定责任图谱…' }
           appendExecutionBlock({ step: 'file_plan_ready', label: '文件计划完成', detail: '文件拓扑已准备', content: [] })
-          if (showThoughts.value) activeExecutionTab.value = 'process'
           return
         }
         if (event.event === 'graph_resolved') {

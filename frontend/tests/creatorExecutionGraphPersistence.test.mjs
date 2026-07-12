@@ -16,6 +16,9 @@ function createHarness() {
   let resolvedResponsibilityEdges = null
   let graphPlanningActive = false
   const thoughts = []
+  let activeExecutionTab = 'process'
+  let showThoughts = true
+  let executionPanelHasUpdate = false
 
   const saveResolvedGraphSnapshot = ({ functionItems, responsibilityEdges } = {}) => {
     if (Array.isArray(functionItems)) resolvedFunctionItems = functionItems
@@ -37,10 +40,22 @@ function createHarness() {
     }
     graphPlanningActive = false
   }
+  const markExecutionPanelUpdated = () => {
+    if (showThoughts) {
+      executionPanelHasUpdate = false
+      return
+    }
+    executionPanelHasUpdate = true
+  }
   const appendExecutionBlock = ({ step, label, detail = '', content = '' } = {}) => {
     const safeContent = Array.isArray(content) ? content.filter(item => typeof item === 'string').slice(0, 20) : (typeof content === 'string' ? content : '')
     thoughts.push({ step: String(step || 'execution'), label: String(label || '执行步骤'), detail: String(detail || ''), content: safeContent })
+    markExecutionPanelUpdated()
   }
+  const receiveExecutionEvent = (step) => appendExecutionBlock({ step, label: step })
+  const clickTab = (tab) => { activeExecutionTab = tab }
+  const closePanel = () => { showThoughts = false; executionPanelHasUpdate = false }
+  const openPanel = () => { showThoughts = true; executionPanelHasUpdate = false }
   const onStreamEvent = (event) => {
     if (event.event === 'planner_convergence_review') {
       appendExecutionBlock({
@@ -62,6 +77,9 @@ function createHarness() {
     resolvedFunctionItems = null
     resolvedResponsibilityEdges = null
     thoughts.length = 0
+    activeExecutionTab = 'process'
+    showThoughts = false
+    executionPanelHasUpdate = false
   }
   return {
     get pendingFunctionItems() { return pendingFunctionItems },
@@ -70,6 +88,12 @@ function createHarness() {
     get resolvedResponsibilityEdges() { return resolvedResponsibilityEdges },
     get graphPlanningActive() { return graphPlanningActive },
     thoughts,
+    get activeExecutionTab() { return activeExecutionTab },
+    get executionPanelHasUpdate() { return executionPanelHasUpdate },
+    clickTab,
+    closePanel,
+    openPanel,
+    receiveExecutionEvent,
     onPlanner,
     onStreamEvent,
     onPlan,
@@ -116,10 +140,23 @@ describe('CreatorView graph persistence and execution process', () => {
     assert.equal(h.resolvedResponsibilityEdges, null)
   })
 
-  it('starts execution process with the user input block', () => {
+  it('does not add user_input cards to execution process', () => {
+    assert.equal(creatorSource.includes("step: 'user_input'"), false)
+  })
+
+  it('keeps graph tab active across execution updates and closed panel badge state', () => {
     const h = createHarness()
-    h.appendExecutionBlock({ step: 'user_input', label: '用户输入', content: '创建一个 Skill' })
-    assert.equal(h.thoughts[0].step, 'user_input')
+    h.clickTab('graph')
+    for (const step of ['file_generation_start', 'validate_start', 'repair_start', 'e2e_start', 'package_start']) {
+      h.receiveExecutionEvent(step)
+      assert.equal(h.activeExecutionTab, 'graph')
+    }
+    assert.equal(h.thoughts.length, 5)
+    h.closePanel()
+    h.receiveExecutionEvent('file_generation_done')
+    assert.equal(h.executionPanelHasUpdate, true)
+    h.openPanel()
+    assert.equal(h.activeExecutionTab, 'graph')
   })
 
   it('shows pending draft during revise while retaining the previous resolved snapshot', () => {

@@ -3997,7 +3997,7 @@ async def _repair_existing_file_for_e2e_failure(
             "修复 command_json_parse/missing_placeholder/argv_schema_error 时，"
             "只依据本轮真实结构化失败中的 failed_command、rendered_payload、"
             "当前 payload keys、placeholder 来源、前序 stdout trace、"
-            "当前脚本 strict_json_argv_guard schema 和 run(args) 实际读取关系判断。\n"
+            "当前脚本 strict_json_argv_guard schema、run(args) 实际读取关系、对应 ResponsibilityEdge、前序成功 stdout keys/shapes、当前 payload 字段和类型判断。\n"
             "RequirementGraph / SkillPlanEntry 的 inputs/outputs 只是第一轮语义规划信息，"
             "不得在第二轮作为字段名或字段类型 hard contract。\n"
             "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；"
@@ -5830,3 +5830,45 @@ __all__ = [name for name in globals() if not name.startswith("__")]
 
 
 E2E_TOOL_POOL_RULES = """Before running generated scripts, Creator must run runtime_import_guard against the current tool_pool file binding; guard failures skip run_script and enter repair/tool_pool_patch + gate."""
+
+
+def skill_md_command_value_source_mismatches(
+    commands: list[E2EWorkflowCommand],
+    binding_context: dict[str, list[dict[str, str]]] | None,
+) -> list[dict[str, Any]]:
+    """Check SKILL.md argv values against incoming ResponsibilityEdges.
+
+    The check is schema-neutral: argv keys still come from the actual script
+    interface.  When an argv key has an incoming edge for the target script, its
+    value must point at that edge's from_output via a previous-stdout placeholder.
+    Platform input/file sentinels remain valid only for platform-origin edges.
+    """
+    grouped = binding_context or {}
+    mismatches: list[dict[str, Any]] = []
+    file_sentinels = {"FILE", "FILES", "__RUNTIME_INPUT_FILE__", "__RUNTIME_INPUT_FILES__"}
+    for command in commands or []:
+        argv = command.argv_template if isinstance(command.argv_template, dict) else {}
+        edges = grouped.get(command.script_path) or []
+        for edge in edges:
+            key = str(edge.get("to_input") or "").strip()
+            from_output = str(edge.get("from_output") or "").strip()
+            from_node = str(edge.get("from_node") or "").strip()
+            if not key or key not in argv or not from_output:
+                continue
+            current_value = argv.get(key)
+            root = _placeholder_root_name(current_value) if isinstance(current_value, str) else None
+            platform_edge = from_node.startswith("platform_") or from_node in {"platform_input_node", "user_input"}
+            if root == from_output:
+                continue
+            if platform_edge and isinstance(current_value, str) and current_value in file_sentinels:
+                continue
+            mismatches.append({
+                "issue_type": "command_value_source_mismatch",
+                "target_script": command.script_path,
+                "argv_key": key,
+                "current_value": current_value,
+                "from_node": from_node,
+                "from_output": from_output,
+                "repair_instruction": f"只局部修改 SKILL.md 中 {command.script_path} 命令 argv.{key} 的 value 为 {{{{{from_output}}}}}；不要修改 argv key、Python 脚本、strict_json_argv_guard、FunctionItems、ResponsibilityEdges 或其他命令。",
+            })
+    return mismatches

@@ -12098,6 +12098,7 @@ async def generate_file(request: GenerateFileRequest):
                             blueprint_text=request.blueprint_text,
                             skill_plan_entry=effective_skill_plan_entry,
                             requirement_graph=request.requirement_graph,
+                            responsibility_binding_context=skill_md_binding_context,
                             model=request.model or route.model,
                         )
 

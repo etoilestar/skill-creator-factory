@@ -209,6 +209,7 @@ export async function initSkill(skillName, { confirmedUploadedAssets = [] } = {}
  *   role?: string|null,
  *   skillPlanEntry?: object|null,
  *   requirementGraph?: object|null,
+ *   responsibilityEdges?: Array,
  *   workflowAllocationSummary?: string,
  *   finalOutputs?: Array
  * }} params
@@ -224,6 +225,7 @@ export async function* generateFileStream({
   role = null,
   skillPlanEntry = null,
   requirementGraph = null,
+  responsibilityEdges = [],
   workflowAllocationSummary = '',
   finalOutputs = [],
 }) {
@@ -240,6 +242,7 @@ export async function* generateFileStream({
       role,
       skill_plan_entry: skillPlanEntry,
       requirement_graph: requirementGraph,
+      responsibility_edges: responsibilityEdges,
       workflow_allocation_summary: workflowAllocationSummary,
       final_outputs: finalOutputs,
     }),

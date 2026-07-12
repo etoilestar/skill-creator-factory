@@ -92,6 +92,7 @@
             :asset-requirements="creationPlan.asset_requirements || []"
             :final-outputs="creationPlan.final_outputs || []"
             :requirement-graph="creationPlan.requirement_graph || null"
+            :responsibility-edges="creationPlan.responsibility_edges || []"
             :workflow-allocation-summary="creationPlan.workflow_allocation_summary || ''"
             :tool-requirements="creationPlan.tool_requirements || []"
             :creation-blockers="creationPlan.creation_blockers || []"

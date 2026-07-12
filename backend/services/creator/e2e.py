@@ -3253,6 +3253,7 @@ def _run_skill_workflow_e2e_once(
             skill_plan_entries=skill_plan_entries,
             skill_dir=trial_skill_dir,
         )
+        e2e_binding_context = responsibility_binding_context_from_graph({"dataflow_edges": getattr(requirement_graph, "dataflow_edges", []) or []})
         traces: list[E2EStepTrace] = []
 
         venv_python: Path | None = None
@@ -3548,8 +3549,16 @@ def _run_skill_workflow_e2e_once(
                         "rendered_payload_summary": json.dumps(_json_object_shape(structured.get("rendered_payload") or {}), ensure_ascii=False, sort_keys=True),
                         "trace_summary": _format_e2e_trace(traces)[-2000:],
                     })
+                repair_context = _e2e_repair_binding_context_summary(
+                    command=command,
+                    binding_context=e2e_binding_context,
+                    traces=traces,
+                    payload=payload,
+                )
                 if "已成功执行的前序边界 trace" not in message and "已成功执行的前序步骤" not in message:
                     message += "\n\n已成功执行的前序边界 trace：\n" + _format_e2e_trace(traces)
+                if "E2E_REPAIR_BINDING_CONTEXT" not in message:
+                    message += "\n\nE2E_REPAIR_BINDING_CONTEXT=" + repair_context
                 errors.append(message)
                 break
 
@@ -3559,6 +3568,33 @@ def _run_skill_workflow_e2e_once(
 
     return errors
 
+
+
+
+def _e2e_repair_binding_context_summary(
+    *,
+    command: E2EWorkflowCommand,
+    binding_context: dict[str, list[dict[str, str]]] | None,
+    traces: list[E2EStepTrace],
+    payload: dict[str, Any],
+) -> str:
+    edges = (binding_context or {}).get(command.script_path) or []
+    summary = {
+        "failed_script": command.script_path,
+        "current_command_argv_template": command.argv_template,
+        "incoming_edges": edges,
+        "previous_stdout_keys_shapes": [
+            {
+                "script_path": trace.script_path,
+                "stdout_keys": trace.stdout_keys,
+                "stdout_shape": trace.stdout_shape,
+                "new_keys": trace.new_keys,
+            }
+            for trace in traces
+        ],
+        "current_payload_shapes": _json_object_shape(payload),
+    }
+    return json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str)
 
 def _placeholder_root_name(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -5836,39 +5872,4 @@ def skill_md_command_value_source_mismatches(
     commands: list[E2EWorkflowCommand],
     binding_context: dict[str, list[dict[str, str]]] | None,
 ) -> list[dict[str, Any]]:
-    """Check SKILL.md argv values against incoming ResponsibilityEdges.
-
-    The check is schema-neutral: argv keys still come from the actual script
-    interface.  When an argv key has an incoming edge for the target script, its
-    value must point at that edge's from_output via a previous-stdout placeholder.
-    Platform input/file sentinels remain valid only for platform-origin edges.
-    """
-    grouped = binding_context or {}
-    mismatches: list[dict[str, Any]] = []
-    file_sentinels = {"FILE", "FILES", "__RUNTIME_INPUT_FILE__", "__RUNTIME_INPUT_FILES__"}
-    for command in commands or []:
-        argv = command.argv_template if isinstance(command.argv_template, dict) else {}
-        edges = grouped.get(command.script_path) or []
-        for edge in edges:
-            key = str(edge.get("to_input") or "").strip()
-            from_output = str(edge.get("from_output") or "").strip()
-            from_node = str(edge.get("from_node") or "").strip()
-            if not key or key not in argv or not from_output:
-                continue
-            current_value = argv.get(key)
-            root = _placeholder_root_name(current_value) if isinstance(current_value, str) else None
-            platform_edge = from_node.startswith("platform_") or from_node in {"platform_input_node", "user_input"}
-            if root == from_output:
-                continue
-            if platform_edge and isinstance(current_value, str) and current_value in file_sentinels:
-                continue
-            mismatches.append({
-                "issue_type": "command_value_source_mismatch",
-                "target_script": command.script_path,
-                "argv_key": key,
-                "current_value": current_value,
-                "from_node": from_node,
-                "from_output": from_output,
-                "repair_instruction": f"只局部修改 SKILL.md 中 {command.script_path} 命令 argv.{key} 的 value 为 {{{{{from_output}}}}}；不要修改 argv key、Python 脚本、strict_json_argv_guard、FunctionItems、ResponsibilityEdges 或其他命令。",
-            })
-    return mismatches
+    return skill_md_command_value_source_mismatches_for_commands(commands, binding_context)

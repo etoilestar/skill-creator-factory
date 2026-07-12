@@ -492,3 +492,148 @@ async def test_repair_model_uses_new_canonical_context_instead_of_old_writer_too
     assert "fresh.tool" in captured["task_context"]
     assert "new canonical" in captured["task_context"]
     assert "old_writer_tool_context" not in captured["task_context"]
+
+from backend.services.creator import contracts, generation
+from backend.services.creator.contracts import ContractValidationError
+
+
+def test_skill_md_generation_prompt_contains_dataflow_alignment_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(generation.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "generic"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "alpha.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def run(argv):\n"
+        "    strict_json_argv_guard(argv, {'opaque_in': {'required': True, 'type': 'string'}})\n"
+        "    return {'opaque_out': argv['opaque_in']}\n",
+        encoding="utf-8",
+    )
+    graph = {"requirements": [{"target_file": "scripts/alpha.py", "outputs": ["opaque_out"]}], "dataflow_edges": [
+        {"from_node": "platform_input", "from_output": "opaque_seed", "to_node": "scripts/alpha.py", "to_input": "opaque_in", "purpose": "transport", "constraints": ["none"]}
+    ]}
+
+    messages = generation._build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="generic",
+        purpose="generic",
+        blueprint_text="files: scripts/alpha.py",
+        conversation_history=[],
+        responsibility_graph=graph,
+    )
+
+    prompt = "\n".join(message["content"] for message in messages)
+    assert "统一 SKILL.md dataflow alignment context" in prompt
+    assert "dataflow_edges" in prompt
+    assert "strict_json_argv_guard_probe" in prompt
+    assert "declared_stdout_fields" in prompt
+    assert "runtime_stdout_protocol" in prompt
+    assert "不得根据 key 名相似度" in prompt
+
+
+@pytest.mark.asyncio
+async def test_skill_md_dataflow_validator_reports_model_alignment_issue(monkeypatch, tmp_path):
+    monkeypatch.setattr(contracts.settings, "skills_path", tmp_path)
+
+    class Route:
+        model = "unit-test-model"
+
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(contracts, "_log_creator_model_usage", lambda **kwargs: None)
+
+    async def fake_complete(messages, model):
+        prompt = messages[-1]["content"]
+        assert "dataflow_edges" in prompt
+        assert "current_skill_md_commands" in prompt
+        return json.dumps({
+            "passed": False,
+            "issues": [{
+                "code": "skill_md_command_value_misaligned",
+                "script_path": "scripts/b.py",
+                "argv_key": "opaque_in",
+                "current_value": "{{wrong}}",
+                "source_edge": {"from_node": "node_a", "from_output": "opaque_out", "to_node": "scripts/b.py", "to_input": "opaque_in"},
+                "reason": "validator model found graph/probe mismatch",
+                "repair_scope": "command_argv_value_only",
+                "repair_instruction": "only replace argv value for opaque_in",
+                "evidence": "edge + argv/stdout probe",
+            }],
+            "repair_suggestions": "repair value only",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+
+    with pytest.raises(ContractValidationError) as exc:
+        await contracts._validate_skill_md_dataflow_alignment(
+            skill_name="generic",
+            content="```bash\npython scripts/b.py '{\"opaque_in\":\"{{wrong}}\"}'\n```\n",
+            blueprint_text="files: scripts/b.py",
+            requirement_graph={"dataflow_edges": [{"from_node": "node_a", "from_output": "opaque_out", "to_node": "scripts/b.py", "to_input": "opaque_in"}]},
+            model="unit-test-model",
+        )
+
+    result = exc.value.results[0]
+    assert result.id == "skill_md_command_value_misaligned"
+    assert result.details["repair_scope"] == "command_argv_value_only"
+    assert "后端不得直接重写 argv value" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_skill_md_dataflow_validation_can_be_called_again_after_repair(monkeypatch, tmp_path):
+    monkeypatch.setattr(contracts.settings, "skills_path", tmp_path)
+
+    class Route:
+        model = "unit-test-model"
+
+    calls = {"count": 0}
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(contracts, "_log_creator_model_usage", lambda **kwargs: None)
+
+    async def fake_complete(messages, model):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return json.dumps({"passed": False, "issues": [{
+                "code": "skill_md_command_value_unresolved",
+                "script_path": "scripts/r.py",
+                "argv_key": "k",
+                "current_value": "{{unknown}}",
+                "source_edge": {},
+                "reason": "insufficient evidence",
+                "repair_scope": "command_argv_value_only",
+                "repair_instruction": "do not guess; repair with evidence",
+                "evidence": "missing stdout probe",
+            }]})
+        return json.dumps({"passed": True, "issues": [], "repair_suggestions": ""})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    kwargs = dict(skill_name="generic", content="```bash\npython scripts/r.py '{\"k\":\"{{unknown}}\"}'\n```\n", blueprint_text="scripts/r.py", requirement_graph={}, model="unit-test-model")
+    with pytest.raises(ContractValidationError):
+        await contracts._validate_skill_md_dataflow_alignment(**kwargs)
+    passed = await contracts._validate_skill_md_dataflow_alignment(**kwargs)
+    assert passed["passed"] is True
+    assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_skill_md_value_repair_prompt_carries_value_only_constraints(monkeypatch):
+    captured = {}
+
+    async def fake_request_and_apply_repair_patch(**kwargs):
+        captured.update(kwargs)
+        return None, kwargs["current_content"], {"changed_line_count": 0, "applied": []}
+
+    monkeypatch.setattr(repair, "_request_and_apply_repair_patch", fake_request_and_apply_repair_patch)
+
+    content = "---\nname: S\ndescription: D\n---\n```bash\npython scripts/r.py '{\"k\":\"{{bad}}\"}'\n```\n"
+    await repair._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "user", "content": "unified dataflow alignment context with dataflow_edges and strict_json_argv_guard_probe"}],
+        model="unit-test-model",
+        file_path="SKILL.md",
+        previous_content=content,
+        validation_error="skill_md_command_value_misaligned",
+        failed_checks_text=json.dumps({"failures": [{"id": "skill_md_command_value_misaligned", "script_path": "scripts/r.py", "argv_key": "k"}]}),
+    )
+
+    assert "只允许修改指定 command JSON argv 中指定 key 的 value" in captured["target_rule"]
+    assert "不得修改 argv key" in captured["target_rule"]
+    assert "完整 responsibility_graph/dataflow_edges" in captured["task_context"]
+    assert "validator issue" in captured["task_context"]

@@ -1116,49 +1116,179 @@ def _deterministic_skill_md_blueprint_alignment_checks(
 
 
 def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, Any]:
-    """Keep only source-proof context needed by the SKILL.md semantic reviewer."""
+    """Keep source-proof requirement graph context for SKILL.md review."""
+    return _normalize_requirement_graph_for_skill_md_dataflow(raw_graph)
+
+
+def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[str, Any]:
+    """Serialize responsibility graph facts for SKILL.md dataflow alignment.
+
+    This normalizes field names only.  It never compiles an edge into a command
+    placeholder and never decides argv value mappings.
+    """
     if raw_graph is None:
-        return {"requirements": []}
+        return {
+            "requirements": [],
+            "dataflow_edges": [],
+            "platform_input_node": "platform_input",
+            "platform_output_node": "platform_output",
+        }
     if hasattr(raw_graph, "model_dump"):
         raw_graph = raw_graph.model_dump(mode="json")
     if not isinstance(raw_graph, dict):
-        return {"requirements": []}
+        return {
+            "requirements": [],
+            "dataflow_edges": [],
+            "platform_input_node": "platform_input",
+            "platform_output_node": "platform_output",
+        }
 
-    def trunc(value: Any, limit: int = 300) -> str:
+    def trunc(value: Any, limit: int = 500) -> str:
         return str(value or "").strip()[:limit]
 
     def string_list(value: Any) -> list[str]:
         if isinstance(value, (list, tuple)):
-            raw_items = list(value)
+            items = list(value)
         elif value in (None, ""):
-            raw_items = []
+            items = []
         else:
-            raw_items = [value]
-        return [text for text in (trunc(item) for item in raw_items) if text][:50]
+            items = [value]
+        return [text for text in (trunc(item) for item in items) if text][:50]
 
     requirements: list[dict[str, Any]] = []
     raw_requirements = raw_graph.get("requirements")
     if not isinstance(raw_requirements, list):
         raw_requirements = []
-    for item in raw_requirements[:50]:
+    for item in raw_requirements[:80]:
         if hasattr(item, "model_dump"):
             item = item.model_dump(mode="json")
         if not isinstance(item, dict):
             continue
-        target_file = trunc(item.get("target_file"))
-        if not target_file:
-            continue
         requirements.append({
-            "target_file": target_file,
+            "target_file": trunc(item.get("target_file")),
             "role": trunc(item.get("role")),
             "runtime": trunc(item.get("runtime")),
             "purpose": trunc(item.get("purpose")),
             "inputs": string_list(item.get("inputs")),
             "outputs": string_list(item.get("outputs")),
             "depends_on": string_list(item.get("depends_on")),
+            "must_do": string_list(item.get("must_do")),
+            "must_not_do": string_list(item.get("must_not_do")),
         })
-    return {"requirements": requirements}
 
+    edges: list[dict[str, Any]] = []
+    raw_edges = raw_graph.get("dataflow_edges") or raw_graph.get("edges") or []
+    if not isinstance(raw_edges, list):
+        raw_edges = []
+    for edge in raw_edges[:120]:
+        if hasattr(edge, "model_dump"):
+            edge = edge.model_dump(mode="json")
+        if not isinstance(edge, dict):
+            continue
+        from_output = edge.get("from_output") if edge.get("from_output") not in (None, "") else edge.get("from_field")
+        to_input = edge.get("to_input") if edge.get("to_input") not in (None, "") else edge.get("to_field")
+        edges.append({
+            "from_node": trunc(edge.get("from_node")),
+            "from_output": trunc(from_output),
+            "to_node": trunc(edge.get("to_node")),
+            "to_input": trunc(to_input),
+            "purpose": trunc(edge.get("purpose")),
+            "constraints": edge.get("constraints") if isinstance(edge.get("constraints"), (dict, list)) else string_list(edge.get("constraints")),
+        })
+
+    return {
+        "requirements": requirements,
+        "dataflow_edges": edges,
+        "platform_input_node": trunc(raw_graph.get("platform_input_node") or "platform_input"),
+        "platform_output_node": trunc(raw_graph.get("platform_output_node") or "platform_output"),
+    }
+
+
+def _skill_md_command_summaries(content: str) -> list[dict[str, Any]]:
+    try:
+        from .command_normalizer import parse_skill_md_bash_command_blocks
+    except Exception:
+        return []
+    summaries: list[dict[str, Any]] = []
+    for block in parse_skill_md_bash_command_blocks(content or ""):
+        sig = _command_signature(block.content, block.script_path or "") if block.script_path else None
+        summaries.append({
+            "script_path": block.script_path,
+            "command": block.content,
+            "argv_keys": sorted(sig["keys"]) if sig else [],
+            "argv_values": sig.get("placeholders", {}) if sig else {},
+        })
+    return summaries
+
+
+def _build_skill_md_dataflow_alignment_context(
+    *,
+    skill_name: str,
+    skill_md: str = "",
+    blueprint_text: str = "",
+    skill_plan_entry: dict[str, Any] | None = None,
+    requirement_graph: Any | None = None,
+) -> dict[str, Any]:
+    """Build shared SKILL.md dataflow-alignment facts for generation/review/repair.
+
+    The context is intentionally factual.  It does not decide which argv value
+    should be used for a key and does not synthesize placeholders.
+    """
+    graph = _normalize_requirement_graph_for_skill_md_dataflow(requirement_graph)
+    declared_paths = sorted(set(_extract_declared_skill_paths(blueprint_text)) | {str((skill_plan_entry or {}).get("path") or "").strip()})
+    scripts: list[dict[str, Any]] = []
+    try:
+        skill_dir = settings.skills_path / skill_name
+    except Exception:
+        skill_dir = None
+    for raw_path in declared_paths:
+        script_path = str(raw_path or "").replace("\\", "/").strip()
+        if not script_path.startswith("scripts/") or not script_path.endswith(".py"):
+            continue
+        source = ""
+        if skill_dir is not None:
+            abs_path = skill_dir / script_path
+            if abs_path.is_file():
+                try:
+                    source = abs_path.read_text(encoding="utf-8")
+                except Exception:
+                    source = ""
+        guard_schema: dict[str, Any] = {}
+        run_analysis: dict[str, Any] = {}
+        if source:
+            try:
+                guard_schema = extract_python_strict_argv_schema(source)
+            except Exception as exc:
+                guard_schema = {"error": f"{type(exc).__name__}: {exc}"}
+            try:
+                run_analysis = _python_run_args_analysis(source)
+            except Exception:
+                run_analysis = {}
+        entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
+        stdout_fields = [str(item).strip() for item in (getattr(entry, "outputs", []) or []) if str(item).strip()]
+        incoming = [edge for edge in graph["dataflow_edges"] if edge.get("to_node") == script_path]
+        outgoing = [edge for edge in graph["dataflow_edges"] if edge.get("from_node") == script_path]
+        scripts.append({
+            "script_path": script_path,
+            "strict_json_argv_guard_probe": guard_schema,
+            "allowed_argv_keys": guard_schema.get("allowed_keys") if isinstance(guard_schema, dict) else None,
+            "required_argv_keys": guard_schema.get("required_keys") if isinstance(guard_schema, dict) else None,
+            "run_args_analysis": run_analysis,
+            "declared_stdout_fields": stdout_fields,
+            "incoming_edges": incoming,
+            "outgoing_edges": outgoing,
+        })
+    return {
+        "responsibility_graph": graph,
+        "scripts": scripts,
+        "platform_boundaries": {
+            "input_node": graph.get("platform_input_node"),
+            "output_node": graph.get("platform_output_node"),
+            "placeholder_syntax": "{{source.field}} for previous stdout/platform fields; runtime input files use __RUNTIME_INPUT_FILE__ sentinels after sanitization; references/** and assets/** are static relative paths; TEXT_MODEL is a runtime text-model constant.",
+            "runtime_stdout_protocol": "Each script prints a JSON object to stdout. The runtime merges a successful step stdout into later-step context under that script/upstream node; downstream command argv values must reference real upstream stdout fields or valid platform/static/runtime sources.",
+        },
+        "current_skill_md_commands": _skill_md_command_summaries(skill_md),
+    }
 
 
 def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
@@ -1766,6 +1896,95 @@ def _format_skill_md_intent_review_failure(review: dict[str, Any]) -> str:
         )
 
 
+
+
+def _skill_md_dataflow_issue_to_contract_result(issue: dict[str, Any]) -> ContractCheckResult:
+    code = str(issue.get("code") or issue.get("id") or "skill_md_command_value_misaligned")
+    if code not in {"skill_md_command_value_misaligned", "skill_md_command_value_unresolved"}:
+        code = "skill_md_command_value_misaligned"
+    script_path = str(issue.get("script_path") or "SKILL.md")
+    argv_key = str(issue.get("argv_key") or "")
+    target = f"{script_path}:{argv_key}" if argv_key else script_path
+    details = dict(issue)
+    details.setdefault("repair_scope", "command_argv_value_only")
+    return ContractCheckResult(
+        id=code,
+        passed=False,
+        target=target,
+        message=str(issue.get("reason") or issue.get("message") or "SKILL.md command argv value 与责任图谱数据流不一致。"),
+        expected=str(issue.get("source_edge") or issue.get("expected") or "argv value 来源应由责任图、脚本 argv/stdout probe 与平台协议共同支持。"),
+        minimal_edit=str(issue.get("repair_instruction") or issue.get("minimal_edit") or "只修改指定 command JSON argv 中指定 key 的 value。"),
+        details=details,
+        layer="skill_md_dataflow_alignment",
+    )
+
+
+async def _validate_skill_md_dataflow_alignment(
+    *,
+    skill_name: str,
+    content: str,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+    requirement_graph: dict[str, Any] | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Ask the validator model to judge SKILL.md command argv value alignment."""
+    context = _build_skill_md_dataflow_alignment_context(
+        skill_name=skill_name,
+        skill_md=content,
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+        requirement_graph=requirement_graph,
+    )
+    route = route_model(VALIDATOR_TASK, requested_model=model, reason=f"creator SKILL.md command dataflow alignment review: {skill_name}")
+    _log_creator_model_usage(phase="skill_md.dataflow_alignment_review.route", file_path="SKILL.md", route=route, model=model, skill_name=skill_name)
+    prompt = (
+        "你是 SKILL.md command JSON argv value 数据流校验器，只输出严格 JSON object。\n\n"
+        "唯一审查范围：fenced bash command 中 JSON argv 的 value 来源是否与 ResponsibilityGraph、脚本 argv/stdout probe 和平台运行协议一致。\n"
+        "不要重新审查整体业务设计；不要修改责任图谱或脚本；不要根据字段名相似度、脚本名、purpose 或业务词猜测。\n"
+        "如果证据不足，返回 skill_md_command_value_unresolved，不要猜一个 value。\n\n"
+        "issue code 只能使用 skill_md_command_value_misaligned 或 skill_md_command_value_unresolved。\n"
+        "每个 issue 至少包含 script_path, argv_key, current_value, source_edge, reason, repair_scope, repair_instruction, evidence。\n"
+        "repair_scope 必须是 command_argv_value_only；只允许修改指定 command JSON argv 中指定 key 的 value；不得改 key、脚本路径、其他 command、正文、frontmatter、fence、责任图或脚本。\n\n"
+        "返回 JSON schema：{\"passed\": true|false, \"issues\": [...], \"repair_suggestions\": \"...\"}\n\n"
+        "【统一 SKILL.md dataflow alignment context】\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)[:22000]}\n\n"
+        "【蓝图原文】\n"
+        f"{(blueprint_text or '')[-12000:]}\n\n"
+        "【当前 SKILL.md】\n"
+        f"{(content or '')[-22000:]}"
+    )
+    raw = ""
+    data: dict[str, Any] | None = None
+    for attempt in range(3):
+        messages = [
+            {"role": "system", "content": "只输出 JSON object，不要输出 Markdown。"},
+            {"role": "user", "content": prompt if attempt == 0 else prompt + f"\n\n上一轮输出不是有效 schema，请只修 JSON 格式：{raw[:1200]}"},
+        ]
+        raw = await complete_chat_once(messages, route.model)
+        parsed = _json_loads_loose_object(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("passed"), bool) and isinstance(parsed.get("issues", []), list):
+            data = parsed
+            break
+    if not isinstance(data, dict):
+        raise CreatorValidatorReviewError("SKILL.md dataflow alignment reviewer did not return valid JSON object.", raw_excerpt=str(raw or "")[:1000])
+    data.setdefault("issues", [])
+    data.setdefault("repair_suggestions", "")
+    if data.get("passed") is not True:
+        results = [_skill_md_dataflow_issue_to_contract_result(issue) for issue in data.get("issues") or [] if isinstance(issue, dict)]
+        if results:
+            message = (
+                "SKILL.md command JSON argv value 与责任图谱/脚本 probe/平台协议不一致。\n"
+                "该失败必须进入现有局部 repair；后端不得直接重写 argv value。\n"
+                "统一对齐上下文：\n"
+                f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+                + _format_contract_failures_safe(results)
+            )
+            raise ContractValidationError(message, results)
+        data["passed"] = True
+    return data
+
+
 async def _validate_skill_md_blueprint_alignment(
     *,
     skill_name: str,
@@ -1924,6 +2143,16 @@ async def _validate_skill_md_blueprint_alignment(
         )
         raise ContractValidationError(message, fenced_results)
 
+    dataflow_review = await _validate_skill_md_dataflow_alignment(
+        skill_name=skill_name,
+        content=content,
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+        requirement_graph=requirement_graph,
+        model=model,
+    )
+
+    review["dataflow_alignment_review"] = dataflow_review
     review["passed"] = True
     review["fenced_check_passed"] = True
     review["fenced_check_failed"] = []

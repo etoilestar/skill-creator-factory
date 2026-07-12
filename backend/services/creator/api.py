@@ -11507,7 +11507,32 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
         if compact["target_file"]:
             requirements.append(compact)
 
-    compact_graph = {"requirements": requirements}
+    dataflow_edges: list[dict[str, Any]] = []
+    raw_edges = raw_graph.get("dataflow_edges") or raw_graph.get("edges") or []
+    if not isinstance(raw_edges, list):
+        raw_edges = []
+    for edge in raw_edges[:120]:
+        if hasattr(edge, "model_dump"):
+            edge = edge.model_dump(mode="json")
+        if not isinstance(edge, dict):
+            continue
+        from_output = edge.get("from_output") if edge.get("from_output") not in (None, "") else edge.get("from_field")
+        to_input = edge.get("to_input") if edge.get("to_input") not in (None, "") else edge.get("to_field")
+        dataflow_edges.append({
+            "from_node": trunc(edge.get("from_node")),
+            "from_output": trunc(from_output),
+            "to_node": trunc(edge.get("to_node")),
+            "to_input": trunc(to_input),
+            "purpose": trunc(edge.get("purpose")),
+            "constraints": edge.get("constraints") if isinstance(edge.get("constraints"), (dict, list)) else string_list(edge.get("constraints")),
+        })
+
+    compact_graph = {
+        "requirements": requirements,
+        "dataflow_edges": dataflow_edges,
+        "platform_input_node": trunc(raw_graph.get("platform_input_node") or "platform_input"),
+        "platform_output_node": trunc(raw_graph.get("platform_output_node") or "platform_output"),
+    }
     serialized = json.dumps(compact_graph, ensure_ascii=False, default=str)
     if len(serialized) <= 14000:
         return compact_graph
@@ -11517,7 +11542,12 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
         if len(json.dumps({"requirements": trimmed}, ensure_ascii=False, default=str)) > 14000:
             trimmed.pop()
             break
-    return {"requirements": trimmed}
+    return {
+        "requirements": trimmed,
+        "dataflow_edges": dataflow_edges,
+        "platform_input_node": compact_graph.get("platform_input_node"),
+        "platform_output_node": compact_graph.get("platform_output_node"),
+    }
 
 
 def _build_markdown_initial_region_prompt(

@@ -11893,6 +11893,10 @@ async def generate_file(request: GenerateFileRequest):
 
             function_execution_context: dict[str, Any] | None = _build_current_function_execution_context()
 
+            skill_md_binding_context = responsibility_binding_context_from_graph(
+                {"responsibility_edges": request.responsibility_edges} if request.responsibility_edges else request.requirement_graph
+            )
+
             prompt_messages = (
                 _build_generate_file_prompt(
                     request.file_path,
@@ -11909,6 +11913,7 @@ async def generate_file(request: GenerateFileRequest):
                     ),
                     responsibility_graph=request.requirement_graph,
                     function_execution_context=function_execution_context,
+                    responsibility_binding_context=skill_md_binding_context,
                 )
             )
             prompt_variant = "standard"
@@ -12093,6 +12098,7 @@ async def generate_file(request: GenerateFileRequest):
                             blueprint_text=request.blueprint_text,
                             skill_plan_entry=effective_skill_plan_entry,
                             requirement_graph=request.requirement_graph,
+                            responsibility_binding_context=skill_md_binding_context,
                             model=request.model or route.model,
                         )
 

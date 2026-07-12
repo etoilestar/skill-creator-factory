@@ -26,7 +26,7 @@ import subprocess
 import tempfile
 import yaml
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Mapping
 import shutil
 
 from fastapi import APIRouter, HTTPException, File, Form, UploadFile
@@ -118,7 +118,7 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 禁止在 ```bash block 内直接写 JSON 配置对象、runner/script/argv 伪命令对象、说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。
 - 机器可读 JSON 示例、配置、stdout 示例如果需要展示，必须使用 ```json fenced code block，不得伪装成 ```bash。
 - 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
-- 参数映射用普通 Markdown 列表说明通用来源：命令示例应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值。第一轮 SKILL.md 只约束可解析命令形态，不要求证明后续 placeholder 来自前序 stdout。
+- 参数映射用普通 Markdown 列表说明通用来源：命令示例应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值；若当前 argv key 存在 incoming ResponsibilityEdge，value 必须服从该 edge 的 from_output。
 - 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。
 - assistant 不得假装脚本已经执行；必须等待宿主返回 stdout/stderr/observation 后，再基于 observation 生成最终回答。
@@ -1080,6 +1080,7 @@ class GenerateFileRequest(BaseModel):
     role: Optional[str] = None
     skill_plan_entry: Optional[dict[str, Any]] = None
     requirement_graph: dict[str, Any] | None = None
+    responsibility_edges: list[dict[str, Any]] = Field(default_factory=list)
     workflow_allocation_summary: str = ""
     final_outputs: list[Any] = Field(default_factory=list)
 
@@ -2859,5 +2860,142 @@ def build_function_execution_context(
 
 try:
     __all__.extend(["build_function_execution_context"])
+except Exception:
+    pass
+
+
+def responsibility_edges_by_to_node(responsibility_edges: Any) -> dict[str, list[dict[str, str]]]:
+    """Group existing ResponsibilityEdges by to_node without inferring semantics.
+
+    This is a read-only binding context for SKILL.md command argv value sources.
+    It deliberately preserves only transport fields and does not mutate or
+    validate the ResponsibilityGraph schema.
+    """
+    grouped: dict[str, list[dict[str, str]]] = {}
+    if isinstance(responsibility_edges, dict):
+        responsibility_edges = responsibility_edges.get("responsibility_edges") or responsibility_edges.get("dataflow_edges") or []
+    if not isinstance(responsibility_edges, list):
+        return grouped
+    for edge in responsibility_edges:
+        if not isinstance(edge, dict):
+            continue
+        to_node = str(edge.get("to_node") or "").strip()
+        if not to_node:
+            continue
+        item = {
+            "from_node": str(edge.get("from_node") or "").strip(),
+            "from_output": str(edge.get("from_output") or "").strip(),
+            "to_node": to_node,
+            "to_input": str(edge.get("to_input") or "").strip(),
+        }
+        grouped.setdefault(to_node, []).append(item)
+    return grouped
+
+
+def responsibility_binding_context_from_graph(graph: Any) -> dict[str, list[dict[str, str]]]:
+    """Build a to_node-indexed binding context from an existing graph payload."""
+    if hasattr(graph, "model_dump"):
+        try:
+            graph = graph.model_dump(mode="json")
+        except Exception:
+            pass
+    edges: Any = graph
+    if isinstance(graph, dict):
+        edges = graph.get("responsibility_edges") or graph.get("dataflow_edges") or []
+    elif hasattr(graph, "dataflow_edges"):
+        edges = getattr(graph, "dataflow_edges") or []
+    return responsibility_edges_by_to_node(edges)
+
+
+def skill_md_binding_context_text(binding_context: Any) -> str:
+    """Render binding context compactly for SKILL.md writer/judge prompts."""
+    if not binding_context:
+        return "{}"
+    try:
+        return json.dumps(binding_context, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return str(binding_context)
+try:
+    __all__.extend([
+        "responsibility_edges_by_to_node",
+        "responsibility_binding_context_from_graph",
+        "skill_md_binding_context_text",
+        "skill_md_command_value_source_mismatches_for_commands",
+        "skill_md_command_value_source_mismatches_from_content",
+    ])
+except Exception:
+    pass
+
+_RUNTIME_FILE_SENTINELS: frozenset[str] = frozenset({"__RUNTIME_INPUT_FILE__", "__RUNTIME_INPUT_FILES__"})
+_PLATFORM_FILE_FROM_OUTPUTS: frozenset[str] = frozenset({"input_files", "files", "resources"})
+
+def _creator_placeholder_root_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*\{\{\s*([^{}]+?)\s*\}\}\s*", value)
+    if not match:
+        return None
+    expr = match.group(1).strip()
+    return re.split(r"[.\[]", expr, maxsplit=1)[0].strip() or None
+
+
+def _is_platform_node_name(node: str) -> bool:
+    return str(node or "").strip() in {"platform_input_node", "platform_input", "user_input"} or str(node or "").strip().startswith("platform_")
+
+
+def _is_platform_file_input_edge(edge: Mapping[str, Any]) -> bool:
+    if not _is_platform_node_name(str(edge.get("from_node") or "")):
+        return False
+    return str(edge.get("from_output") or "").strip() in _PLATFORM_FILE_FROM_OUTPUTS
+
+
+def skill_md_command_value_source_mismatches_for_commands(
+    commands: list[E2EWorkflowCommand],
+    binding_context: dict[str, list[dict[str, str]]] | None,
+) -> list[dict[str, Any]]:
+    grouped = binding_context or {}
+    mismatches: list[dict[str, Any]] = []
+    for command in commands or []:
+        argv = command.argv_template if isinstance(command.argv_template, dict) else {}
+        edges = grouped.get(command.script_path) or []
+        for edge in edges:
+            key = str(edge.get("to_input") or "").strip()
+            from_output = str(edge.get("from_output") or "").strip()
+            from_node = str(edge.get("from_node") or "").strip()
+            if not key or key not in argv or not from_output:
+                continue
+            current_value = argv.get(key)
+            root = _creator_placeholder_root_name(current_value)
+            if root == from_output:
+                continue
+            if isinstance(current_value, str) and current_value.strip() in _RUNTIME_FILE_SENTINELS and _is_platform_file_input_edge(edge):
+                continue
+            mismatches.append({
+                "issue_type": "command_value_source_mismatch",
+                "target_script": command.script_path,
+                "argv_key": key,
+                "current_value": current_value,
+                "from_node": from_node,
+                "from_output": from_output,
+                "repair_instruction": f"只局部修改 SKILL.md 中 {command.script_path} 命令 argv.{key} 的 value 为 {{{{{from_output}}}}}；不要修改 argv key、Python 脚本、strict_json_argv_guard、FunctionItems、ResponsibilityEdges 或其他命令。",
+            })
+    return mismatches
+
+
+def skill_md_command_value_source_mismatches_from_content(
+    *,
+    content: str,
+    binding_context: dict[str, list[dict[str, str]]] | None,
+) -> list[dict[str, Any]]:
+    try:
+        commands = _extract_e2e_workflow_commands(Path("."), content or "")
+    except Exception:
+        return []
+    return skill_md_command_value_source_mismatches_for_commands(commands, binding_context)
+try:
+    __all__.extend([
+        "skill_md_command_value_source_mismatches_for_commands",
+        "skill_md_command_value_source_mismatches_from_content",
+    ])
 except Exception:
     pass

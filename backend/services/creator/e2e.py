@@ -3253,6 +3253,7 @@ def _run_skill_workflow_e2e_once(
             skill_plan_entries=skill_plan_entries,
             skill_dir=trial_skill_dir,
         )
+        e2e_binding_context = responsibility_binding_context_from_graph({"dataflow_edges": getattr(requirement_graph, "dataflow_edges", []) or []})
         traces: list[E2EStepTrace] = []
 
         venv_python: Path | None = None
@@ -3548,8 +3549,16 @@ def _run_skill_workflow_e2e_once(
                         "rendered_payload_summary": json.dumps(_json_object_shape(structured.get("rendered_payload") or {}), ensure_ascii=False, sort_keys=True),
                         "trace_summary": _format_e2e_trace(traces)[-2000:],
                     })
+                repair_context = _e2e_repair_binding_context_summary(
+                    command=command,
+                    binding_context=e2e_binding_context,
+                    traces=traces,
+                    payload=payload,
+                )
                 if "已成功执行的前序边界 trace" not in message and "已成功执行的前序步骤" not in message:
                     message += "\n\n已成功执行的前序边界 trace：\n" + _format_e2e_trace(traces)
+                if "E2E_REPAIR_BINDING_CONTEXT" not in message:
+                    message += "\n\nE2E_REPAIR_BINDING_CONTEXT=" + repair_context
                 errors.append(message)
                 break
 
@@ -3559,6 +3568,33 @@ def _run_skill_workflow_e2e_once(
 
     return errors
 
+
+
+
+def _e2e_repair_binding_context_summary(
+    *,
+    command: E2EWorkflowCommand,
+    binding_context: dict[str, list[dict[str, str]]] | None,
+    traces: list[E2EStepTrace],
+    payload: dict[str, Any],
+) -> str:
+    edges = (binding_context or {}).get(command.script_path) or []
+    summary = {
+        "failed_script": command.script_path,
+        "current_command_argv_template": command.argv_template,
+        "incoming_edges": edges,
+        "previous_stdout_keys_shapes": [
+            {
+                "script_path": trace.script_path,
+                "stdout_keys": trace.stdout_keys,
+                "stdout_shape": trace.stdout_shape,
+                "new_keys": trace.new_keys,
+            }
+            for trace in traces
+        ],
+        "current_payload_shapes": _json_object_shape(payload),
+    }
+    return json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str)
 
 def _placeholder_root_name(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -3997,7 +4033,7 @@ async def _repair_existing_file_for_e2e_failure(
             "修复 command_json_parse/missing_placeholder/argv_schema_error 时，"
             "只依据本轮真实结构化失败中的 failed_command、rendered_payload、"
             "当前 payload keys、placeholder 来源、前序 stdout trace、"
-            "当前脚本 strict_json_argv_guard schema 和 run(args) 实际读取关系判断。\n"
+            "当前脚本 strict_json_argv_guard schema、run(args) 实际读取关系、对应 ResponsibilityEdge、前序成功 stdout keys/shapes、当前 payload 字段和类型判断。\n"
             "RequirementGraph / SkillPlanEntry 的 inputs/outputs 只是第一轮语义规划信息，"
             "不得在第二轮作为字段名或字段类型 hard contract。\n"
             "不要因为 placeholder missing 就同时改 argv key 和 placeholder root；"
@@ -5830,3 +5866,10 @@ __all__ = [name for name in globals() if not name.startswith("__")]
 
 
 E2E_TOOL_POOL_RULES = """Before running generated scripts, Creator must run runtime_import_guard against the current tool_pool file binding; guard failures skip run_script and enter repair/tool_pool_patch + gate."""
+
+
+def skill_md_command_value_source_mismatches(
+    commands: list[E2EWorkflowCommand],
+    binding_context: dict[str, list[dict[str, str]]] | None,
+) -> list[dict[str, Any]]:
+    return skill_md_command_value_source_mismatches_for_commands(commands, binding_context)

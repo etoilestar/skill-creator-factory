@@ -2963,6 +2963,7 @@ async def _repair_generated_file_with_feedback(
             "不要把 proposal JSON 转义写进目标文件。\n"
             "不要在这里做第二轮 E2E 跨模块字段推断；那属于 workflow E2E。\n"
             "平台 IO 与 sandbox 模式对齐，由后续验证执行判断。\n"
+            + skill_md_command_protocol_text() + "\n"
             + (
                 "本次失败是 command argv value dataflow alignment：只允许修改指定 command JSON argv 中指定 key 的 value；"
                 "不得修改 argv key、不得新增或删除 key、不得修改脚本路径、不得修改其他 command、不得修改正文/frontmatter/fence、不得修改责任图谱或脚本。\n"
@@ -3195,11 +3196,8 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
         ):
             return (
                 "按严格 Markdown 执行规范修复 SKILL.md："
-                "蓝图真实规划的每个 scripts/ 文件必须有一个标准、独立、无缩进的 ```bash fenced code block；"
-                "每个 block 内只放一条命令；命令必须直接调用 scripts/ 路径；"
-                "脚本路径后必须传入 json.loads 可解析的 JSON object argv；"
-                "所有动态占位符必须作为 JSON 字符串值出现。"
-                "不要使用 '''bash；不要只写行内 scripts/*.py；不要把示例/反例路径当成真实脚本。"
+                + skill_md_command_protocol_text()
+                + "不要使用 '''bash；不要只写行内 scripts/*.py；不要把示例/反例路径当成真实脚本。"
             )
 
         if "frontmatter" in error_text:

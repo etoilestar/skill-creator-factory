@@ -11364,7 +11364,8 @@ def _build_markdown_format_full_rewrite_prompt(
                 "5. frontmatter 必须完整闭合。\n"
                 "6. 所有 fenced block 必须成对闭合。\n"
                 "7. 不要把 repair proposal JSON 嵌进 Markdown。\n"
-                "8. 不要混入 command argv / 字段对齐 / workflow dataflow 的局部修复；格式合法后由后续校验处理。\n\n"
+                "8. 不要混入 command argv / 字段对齐 / workflow dataflow 的局部修复；格式合法后由后续校验处理。\n"
+                f"{skill_md_command_protocol_text()}\n\n"
                 "蓝图上下文：\n"
                 f"{(blueprint_text or '')[:8000]}\n\n"
                 "当前文件内容：\n"
@@ -11622,6 +11623,7 @@ def _build_markdown_initial_region_prompt(
         body_rules = (
             f"{_SKILL_MD_BODY_FORMAT_REQUIREMENTS}\n\n"
             f"{_SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES}\n\n"
+            f"{skill_md_command_protocol_text()}\n\n"
             "SKILL.md body 必须基于 blueprint_text、compact requirement_graph、workflow_allocation_summary、"
             "final_outputs 以及 references/assets 路径写最终用户说明。\n"
             "应包含：Skill 用途；用户需要提供什么；高层执行流程；每个真实脚本的自然语言职责说明；"

@@ -1,3 +1,4 @@
+import inspect
 import json
 
 import pytest
@@ -788,3 +789,36 @@ Outro text stays.
     assert "python scripts/second.py" in repaired
     assert '"opaque_in"' in repaired and '"mode":"keep"' in repaired
     assert "{{bad_value}}" not in repaired
+
+
+def test_skill_md_generation_rewrite_and_repair_share_command_protocol_prompt(monkeypatch, tmp_path):
+    from backend.services.creator.common import skill_md_command_protocol_text
+
+    protocol = skill_md_command_protocol_text()
+    monkeypatch.setattr(generation.settings, "skills_path", tmp_path)
+    generation_messages = generation._build_generate_file_prompt(
+        file_path="SKILL.md",
+        skill_name="generic",
+        purpose="generic",
+        blueprint_text="files: scripts/run.py",
+        conversation_history=[],
+    )
+    generation_prompt = "\n".join(message["content"] for message in generation_messages)
+
+    rewrite_messages = creator_api._build_markdown_format_full_rewrite_prompt(
+        file_path="SKILL.md",
+        skill_name="generic",
+        blueprint_text="files: scripts/run.py",
+        deterministic_error="fence error",
+        current_content="---\nname: S\ndescription: D\n---\n",
+    )
+    rewrite_prompt = "\n".join(message["content"] for message in rewrite_messages)
+
+    repair_source = inspect.getsource(repair._repair_generated_file_with_feedback)
+
+    assert protocol in generation_prompt
+    assert protocol in rewrite_prompt
+    assert "skill_md_command_protocol_text()" in repair_source
+    assert "脚本路径后只允许一个参数" in protocol
+    assert "经过 shell quoting 的 JSON object argv" in protocol
+    assert "动态 {{placeholder}} 必须作为完整 JSON 字符串值" in protocol

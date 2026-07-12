@@ -15,28 +15,44 @@ function createHarness() {
   let resolvedFunctionItems = null
   let resolvedResponsibilityEdges = null
   let graphPlanningActive = false
+  let resolvedGraphReceivedForCurrentPlan = false
   const thoughts = []
   let activeExecutionTab = 'process'
   let showThoughts = true
   let executionPanelHasUpdate = false
 
-  const saveResolvedGraphSnapshot = ({ functionItems, responsibilityEdges } = {}) => {
+  const saveResolvedGraphSnapshot = ({ functionItems, responsibilityEdges, markReceived = false } = {}) => {
     if (Array.isArray(functionItems)) resolvedFunctionItems = functionItems
     if (Array.isArray(responsibilityEdges)) resolvedResponsibilityEdges = responsibilityEdges
+    if (markReceived && (Array.isArray(functionItems) || Array.isArray(responsibilityEdges))) resolvedGraphReceivedForCurrentPlan = true
     if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) graphPlanningActive = false
+  }
+  const planHasPythonScript = (plan) => (Array.isArray(plan?.files) ? plan.files : []).some(file => String(file?.path || file || '').replace(/\\/g, '/').startsWith('scripts/') && String(file?.path || file || '').endsWith('.py'))
+  const graphCandidateFromReadyPlan = (plan) => {
+    const graph = plan?.requirement_graph && typeof plan.requirement_graph === 'object' ? plan.requirement_graph : {}
+    return {
+      functionItems: Array.isArray(plan?.function_items) ? plan.function_items : (Array.isArray(graph.function_items) ? graph.function_items : null),
+      responsibilityEdges: Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : (Array.isArray(graph.responsibility_edges) ? graph.responsibility_edges : null),
+    }
+  }
+  const saveReadyPlanGraphSnapshot = (plan) => {
+    if (resolvedGraphReceivedForCurrentPlan) return
+    const { functionItems, responsibilityEdges } = graphCandidateFromReadyPlan(plan)
+    if (!planHasPythonScript(plan)) return saveResolvedGraphSnapshot({ functionItems: functionItems || [], responsibilityEdges: responsibilityEdges || [] })
+    if (Array.isArray(functionItems) && functionItems.length > 0) saveResolvedGraphSnapshot({ functionItems, responsibilityEdges: Array.isArray(responsibilityEdges) ? responsibilityEdges : [] })
   }
   const onPlanner = (event) => {
     if (Array.isArray(event.function_items)) pendingFunctionItems = event.function_items
     if (Array.isArray(event.responsibility_edges)) pendingResponsibilityEdges = event.responsibility_edges
     if (event.event === 'planner_converged' || event.event === 'graph_resolved') {
-      saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges })
+      saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges, markReceived: true })
     }
   }
   const onPlan = (plan) => {
     if (plan.status === 'ready') {
       if (Array.isArray(plan.function_items)) pendingFunctionItems = plan.function_items
       if (Array.isArray(plan.responsibility_edges)) pendingResponsibilityEdges = plan.responsibility_edges
-      saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
+      saveReadyPlanGraphSnapshot(plan)
     }
     graphPlanningActive = false
   }
@@ -68,14 +84,15 @@ function createHarness() {
     }
     onPlanner(event)
   }
-  const startRevise = () => { graphPlanningActive = true }
-  const displayedFunctionItems = () => graphPlanningActive ? pendingFunctionItems : (Array.isArray(resolvedFunctionItems) ? resolvedFunctionItems : pendingFunctionItems)
+  const startRevise = () => { graphPlanningActive = true; resolvedGraphReceivedForCurrentPlan = false }
+  const displayedFunctionItems = () => (graphPlanningActive && Array.isArray(pendingFunctionItems) && pendingFunctionItems.length > 0) ? pendingFunctionItems : (Array.isArray(resolvedFunctionItems) ? resolvedFunctionItems : pendingFunctionItems)
   const clearChat = () => {
     pendingFunctionItems = []
     pendingResponsibilityEdges = []
     graphPlanningActive = false
     resolvedFunctionItems = null
     resolvedResponsibilityEdges = null
+    resolvedGraphReceivedForCurrentPlan = false
     thoughts.length = 0
     activeExecutionTab = 'process'
     showThoughts = false
@@ -123,7 +140,7 @@ describe('CreatorView graph persistence and execution process', () => {
 
   it('keeps resolved graph through file generation and creation-complete events', () => {
     const h = createHarness()
-    h.onPlan({ status: 'ready', function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/a.py' }], function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
     h.appendExecutionBlock({ step: 'file_generation_start', label: '文件开始生成' })
     h.appendExecutionBlock({ step: 'creation_complete', label: '创建完成' })
     assert.equal(h.resolvedFunctionItems.length, 1)
@@ -132,7 +149,7 @@ describe('CreatorView graph persistence and execution process', () => {
 
   it('only clearChat clears graph state', () => {
     const h = createHarness()
-    h.onPlan({ status: 'ready', function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/a.py' }], function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
     h.clearChat()
     assert.deepEqual(h.pendingFunctionItems, [])
     assert.deepEqual(h.pendingResponsibilityEdges, [])
@@ -163,7 +180,7 @@ describe('CreatorView graph persistence and execution process', () => {
     const h = createHarness()
     const oldResolved = [{ target_file: 'scripts/old.py' }]
     const newDraft = [{ target_file: 'scripts/new.py' }]
-    h.onPlan({ status: 'ready', function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/old.py' }], function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
     h.startRevise()
     h.onPlanner({ event: 'planner_draft', function_items: newDraft })
     assert.deepEqual(h.displayedFunctionItems(), newDraft)
@@ -173,7 +190,7 @@ describe('CreatorView graph persistence and execution process', () => {
   it('keeps previous resolved graph when revise final plan still needs clarification with empty arrays', () => {
     const h = createHarness()
     const oldResolved = [{ target_file: 'scripts/old.py' }]
-    h.onPlan({ status: 'ready', function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/old.py' }], function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
     h.startRevise()
     h.onPlan({ status: 'needs_clarification', function_items: [], responsibility_edges: [] })
     assert.deepEqual(h.resolvedFunctionItems, oldResolved)
@@ -234,5 +251,41 @@ describe('CreatorView graph persistence and execution process', () => {
     for (const forbidden of ['raw', 'payload', 'plan:', 'function_items', 'responsibility_edges', 'tool_pool_summary']) {
       assert.equal(body.includes(forbidden), false, `${forbidden} must not be stored by appendExecutionBlock`)
     }
+  })
+})
+
+describe('CreatorView current planning graph snapshot rules', () => {
+  it('keeps resolved graph visible when send starts and pending is empty', () => {
+    const h = createHarness()
+    const resolved = [{ target_file: 'scripts/stable.py' }]
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/stable.py' }], function_items: resolved, responsibility_edges: [] })
+    h.startRevise()
+    h.onPlanner({ event: 'planner_draft', function_items: [], responsibility_edges: [] })
+    assert.deepEqual(h.displayedFunctionItems(), resolved)
+  })
+
+  it('graph_resolved snapshot is not overwritten by empty ready top-level arrays', () => {
+    const h = createHarness()
+    const resolved = [{ target_file: 'scripts/new.py' }]
+    h.startRevise()
+    h.onPlanner({ event: 'graph_resolved', function_items: resolved, responsibility_edges: [] })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/new.py' }], function_items: [], responsibility_edges: [] })
+    assert.deepEqual(h.resolvedFunctionItems, resolved)
+  })
+
+  it('ready plan can backfill from requirement_graph when no resolved event arrived', () => {
+    const h = createHarness()
+    h.startRevise()
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/fallback.py' }], requirement_graph: { function_items: [{ target_file: 'scripts/fallback.py' }], responsibility_edges: [] } })
+    assert.deepEqual(h.resolvedFunctionItems, [{ target_file: 'scripts/fallback.py' }])
+  })
+
+  it('ready plan with scripts and empty candidate preserves existing resolved graph', () => {
+    const h = createHarness()
+    const oldResolved = [{ target_file: 'scripts/old.py' }]
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/old.py' }], function_items: oldResolved, responsibility_edges: [] })
+    h.startRevise()
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/new.py' }], function_items: [], responsibility_edges: [] })
+    assert.deepEqual(h.resolvedFunctionItems, oldResolved)
   })
 })

@@ -492,3 +492,23 @@ async def test_repair_model_uses_new_canonical_context_instead_of_old_writer_too
     assert "fresh.tool" in captured["task_context"]
     assert "new canonical" in captured["task_context"]
     assert "old_writer_tool_context" not in captured["task_context"]
+
+
+def test_markdown_full_rewrite_context_preserves_keys_bindings_and_has_no_business_example():
+    from backend.services.creator import api
+    current = '---\nname: x\ndescription: y\n---\n\n```bash\npython scripts/build.py \'{"real_key":"{{source.root}}"}\'\n```\n'
+    blueprint = '- path: scripts/build.py\n- path: references/rules.md\n- argv_key: real_key\n- value_template: {{source.root}}\n'
+    messages = api._build_markdown_format_full_rewrite_prompt(
+        file_path='SKILL.md',
+        skill_name='x',
+        blueprint_text=blueprint,
+        deterministic_error='format failed',
+        current_content=current,
+    )
+    prompt = messages[1]['content']
+    assert '"real_key"' in prompt
+    assert 'argv_key: real_key' in prompt
+    assert 'references/rules.md' in prompt
+    assert 'some_key' not in prompt
+    assert 'payload/user_request/fields/options/input_files' not in prompt
+    assert '保持 scripts/references/assets 路径集合不变' in prompt

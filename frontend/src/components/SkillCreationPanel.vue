@@ -334,7 +334,6 @@ const props = defineProps({
   assetRequirements: { type: Array, default: () => [] },
   finalOutputs: { type: Array, default: () => [] },
   requirementGraph: { type: Object, default: null },
-  responsibilityEdges: { type: Array, default: () => [] },
   workflowAllocationSummary: { type: String, default: '' },
   toolRequirements: { type: Array, default: () => [] },
   creationBlockers: { type: Array, default: () => [] },
@@ -830,7 +829,6 @@ async function generateOneFile(idx) {
       role: file.role || null,
       skillPlanEntry: file,
       requirementGraph: props.requirementGraph,
-      responsibilityEdges: props.responsibilityEdges,
       workflowAllocationSummary: props.workflowAllocationSummary || '',
       finalOutputs: props.finalOutputs || [],
     })) {

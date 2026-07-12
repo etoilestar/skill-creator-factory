@@ -3192,7 +3192,7 @@ def _targeted_generated_file_repair_instructions(*, file_path: str, deterministi
 
         if "蓝图意图不一致" in error_text or "intent" in error_text or "workflow" in error_text or "file_plan" in error_text:
             return (
-                "按模型审查意见最小修复 SKILL.md：必须覆盖蓝图真实规划任务、真实 scripts、真实 references、真实 assets、workflow 顺序和最终产物类型；格式校验只检查 Markdown、shell、JSON；SKILL.md Writer 必须遵守 ResponsibilityEdge 的 argv value 来源，Semantic Judge 负责检查来源是否正确；"
+                "按模型审查意见最小修复 SKILL.md：必须覆盖蓝图真实规划任务、真实 scripts、真实 references、真实 assets、workflow 顺序和最终产物类型；第一轮不要证明内部 stdout/placeholder 闭环；"
                 "真实脚本必须使用 ```bash fenced code block；"
                 "JSON 配置或 stdout 示例必须使用 ```json fenced code block；"
                 "不要把示例/反例路径当成真实文件。"

@@ -376,7 +376,7 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 禁止在 ```bash block 内写说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。",
         "",
         "D. workflow / 平台边界:",
-        "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但incoming edge 存在时必须证明 argv value 来自对应 from_output。",
+        "- SKILL.md 应说明 Skill 用途、真实脚本调用顺序（如有）和最终产物类型，但第一轮不要求证明内部 stdout/placeholder 闭环。",
         "- 用户输入要区分必需项和可选项：依据蓝图语义中的可选、建议、若不指定、可以提供、默认等表达判断，不写固定业务字段词表。",
         "- 第一条 workflow command 不能引用平台输入 envelope 中不存在的 placeholder；只能引用 guaranteed input envelope 字段，或传入通用 user_request/input payload/envelope 由入口脚本解析。",
         "- 蓝图可选用户参数若平台 payload 没有同名字段，不应写成必填 placeholder；应由入口脚本内部提供默认值，或从 fields/options/payload 中存在则读取、不存在则默认。",
@@ -428,7 +428,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 允许写入图谱/schema 明确声明为静态配置的 literal 常量；不得用 literal 冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
         "- 后续命令只能引用由前序 stdout 字段和图谱边派生的占位符；不得写 literal 充当前序 stdout。",
-        "- 不要固定平台词表为内部字段；incoming edge 存在时，argv value 必须服从 ResponsibilityEdge 的 from_output；没有 incoming edge 的 required/optional 参数都可以使用显式 literal/default。",
+        "- 第一轮不要证明后续 placeholder 来自前序 stdout；不要固定平台词表为内部字段；内部流转交给第二轮 E2E 执行验证。",
         "",
         "B. 资源边界:",
         "- references/ 是只读参考资料：可按需读取用于格式/模板/规则，但不替代主流程命令块，不作为产物或上传素材。",
@@ -1210,7 +1210,6 @@ async def _review_skill_md_blueprint_intent_with_model(
     blueprint_text: str,
     skill_plan_entry: dict[str, Any] | None,
     requirement_graph: dict[str, Any] | None = None,
-    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     """Model review for first-round SKILL.md semantic coverage.
@@ -1223,11 +1222,6 @@ async def _review_skill_md_blueprint_intent_with_model(
         skill_plan_entry=skill_plan_entry,
     )
     graph_context = _compact_requirement_graph_for_skill_md_review(requirement_graph)
-    binding_context = responsibility_binding_context or responsibility_binding_context_from_graph(requirement_graph)
-    deterministic_value_source_issues = skill_md_command_value_source_mismatches_from_content(
-        content=content,
-        binding_context=binding_context,
-    )
 
     route = route_model(
         VALIDATOR_TASK,
@@ -1273,14 +1267,11 @@ async def _review_skill_md_blueprint_intent_with_model(
         "SKILL.md bash command block 语义审查规则：\n"
         "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
         "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
-        "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs。\n"
-        "- 同一份 ResponsibilityEdge binding context 是 argv value 来源硬约束：某个 argv key 存在 incoming edge 时，value 必须来自该 edge 的 from_output。\n"
-        "- script-to-script 数据必须使用前序 stdout placeholder；__RUNTIME_INPUT_FILE__/__RUNTIME_INPUT_FILES__ 只表示平台上传文件槽，不能代替前序 stdout 或 user_request/input/text。\n"
-        "- 没有 incoming edge 的 required 和 optional 参数都允许使用显式 literal/default。\n"
+        "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs，也不要要求 placeholder 逐字等于 graph.outputs。\n"
         "- 第一轮保留平台边界接口证明：平台 source slots 到第一个可执行 command 仍属于接口契约，第一个 command 不得用固定字面值完全替代平台动态输入。\n"
-        "- 第一轮检查命令块格式和 ResponsibilityEdge argv value 来源：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析、edge value 来源正确。\n"
-        "- 审查 incoming ResponsibilityEdge 约束的 argv value 是否来自对应 from_output；不要求 argv key 等于 FunctionItem input；不审查 list/string/file_path 的运行时序列化细节。\n"
-        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；incoming ResponsibilityEdge 的 value 来源由本轮语义审查约束；E2E 只真实执行并修运行失败。\n"
+        "- 第一轮只做命令块机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
+        "- 不审查内部脚本间 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
+        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n"
         "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
@@ -1337,14 +1328,8 @@ async def _review_skill_md_blueprint_intent_with_model(
         "【解析器提取路径，供参考；不是最终裁决】\n"
         f"{json.dumps(parser_paths, ensure_ascii=False, indent=2, default=str)}\n\n"
 
-        "【compact requirement_graph 上下文，仅用于大致理解流程】\n"
+        "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
-
-        "【ResponsibilityEdge binding context，SKILL.md command argv value 来源硬约束】\n"
-        f"{json.dumps(binding_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
-
-        "【确定性 command_value_source_mismatch 预检查；如非空，Semantic Judge 必须返回这些 error】\n"
-        f"{json.dumps(deterministic_value_source_issues, ensure_ascii=False, indent=2, default=str)[:8000]}\n\n"
 
         "【蓝图原文】\n"
         f"{(blueprint_text or '')[-18000:]}\n\n"
@@ -1432,7 +1417,6 @@ async def _review_skill_md_blueprint_intent_with_model(
                             "minimal_edit": "只修改 SKILL.md 中相关区域。",
                         })
         data["issues"] = reviewer_issues
-
 
     data["issues"] = _dedupe_review_issues(data["issues"])
     if data.get("passed") is not True and any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
@@ -1681,9 +1665,6 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     if issue.get("blocking") is False:
         return False
 
-    if str(issue.get("category") or issue.get("issue_type") or "").strip().lower() == "command_value_source_mismatch":
-        return True
-
     if _review_issue_is_command_template_source_proof_error(issue):
         impact = issue.get("contract_impact") or issue.get("impact")
         return bool(isinstance(impact, dict) and impact.get("platform_io") is True)
@@ -1792,7 +1773,6 @@ async def _validate_skill_md_blueprint_alignment(
     blueprint_text: str,
     skill_plan_entry: dict[str, Any] | None = None,
     requirement_graph: dict[str, Any] | None = None,
-    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
     """Validate SKILL.md against blueprint as a first-round hard repair gate.
@@ -1856,7 +1836,6 @@ async def _validate_skill_md_blueprint_alignment(
             blueprint_text=blueprint_text,
             skill_plan_entry=skill_plan_entry,
             requirement_graph=requirement_graph,
-            responsibility_binding_context=responsibility_binding_context,
             model=model,
         )
     except CreatorValidatorReviewError:
@@ -1882,7 +1861,6 @@ async def _validate_skill_md_blueprint_alignment(
         )
 
     review = model_review
-
 
     if review.get("passed") is not True:
         results = _skill_md_blueprint_review_to_contract_results(review)

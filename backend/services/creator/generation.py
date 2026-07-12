@@ -2097,7 +2097,6 @@ def _build_generate_file_prompt(
     requirements: Any = None,
     responsibility_graph: Any = None,
     function_execution_context: dict[str, Any] | None = None,
-    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
 ) -> list[dict]:
     """Build a minimal generation prompt for a single Skill file."""
 
@@ -2158,8 +2157,6 @@ def _build_generate_file_prompt(
         else ""
     )
 
-    responsibility_binding_text = skill_md_binding_context_text(responsibility_binding_context) if file_path == "SKILL.md" else ""
-
     script_skeleton_text = (
         _script_generation_skeleton(
             file_path,
@@ -2190,11 +2187,11 @@ def _build_generate_file_prompt(
             "6b. command JSON argv key 应优先参考已生成脚本的 strict_json_argv_guard schema；如果没有脚本 guard schema，再参考脚本计划、command_argv_contract 和语义输入提示。\n"
             "6c. command JSON argv key 是脚本入口接口字段，不是平台字段白名单；argv value 才负责绑定平台输入、前序 stdout、reference/assets、literal/default 或 runtime constant。\n"
             "6d. 不要为同一语义输入同时编造多个别名字段；选定一个 argv key 后，command block、argv JSON contract 和正文说明要一致。\n"
-            "6e. 第一轮只做 Markdown、shell、JSON 静态格式校验；SKILL.md Writer 必须遵守 ResponsibilityEdge 的 argv value 来源，后续 Semantic Judge 负责检查来源是否正确。\n"
+            "6e. 第一轮只需尽量让 SKILL.md command JSON argv 与脚本入口字段对齐；最终运行映射由第二轮 E2E 真实执行验证和修复。\n"
             "7. 第一条脚本命令的动态 placeholder 应优先来自 platform input envelope 中确定存在的字段：user_request、input、text、payload、fields、options、input_files、files、resources；也可以使用 literal/default、reference/assets 路径、runtime constants。\n"
             "8. 如果 Skill 需要业务字段，命令可把 user_request/input/text 或 fields 传给脚本，由脚本自行解析；第一轮不固定中间 stdout 字段名。\n"
-            "9. 某个 argv key 存在 incoming ResponsibilityEdge 时，argv value 必须来自该 edge 的 from_output；script-to-script 数据必须使用前序 stdout placeholder（例如 {{from_output}}）。\n"
-            "10. JSON argv 必须是标准 JSON；动态值必须作为 JSON 字符串值出现。__RUNTIME_INPUT_FILE__ / __RUNTIME_INPUT_FILES__ 只表示平台上传文件；不得用文件 sentinel 代替前序 stdout。\n"
+            "9. 第一轮只要求命令 JSON argv 静态可解析，并优先引用 external envelope 或显式结构化来源；不要要求证明后续 placeholder 来自前序 stdout。\n"
+            "10. JSON argv 必须是标准 JSON；动态值必须作为 JSON 字符串值出现。运行时输入文件可使用安全 sentinel，reference/assets 文件使用普通相对路径字符串，模型名使用运行时常量字符串。\n"
             "10a. 每个核心执行命令附近必须写 **argv JSON contract**；这是提示词级映射说明，不是硬校验 schema。对每个 argv.<key> 说明 type、source_kind、source、required、default（如有）。\n"
             "10b. source_kind 只能用通用类别：platform_input、previous_stdout、reference_file、asset_file、literal_default、runtime_constant、script_default。\n"
             "10c. argv key 可以是脚本接口字段；argv value 如果是动态值，应能从平台 input envelope 或前序 stdout 解析；argv value 如果是 literal/default/reference/assets/runtime constant，不需要来自平台字段。\n"
@@ -2206,19 +2203,17 @@ def _build_generate_file_prompt(
             "16. 禁止只写隐式执行描述；必须写明可执行 fenced block。\n"
             "17. 禁止复制 Creator 界面流程、确认清单、点击开始创建/开始生成、系统将自动创建文件等平台创建流程文案。\n"
             "18. 以下宿主 Markdown 执行说明是内部写作约束，只能转化为面向使用者的 Skill 说明，不要逐字复制这些约束或标题。\n"
-            "19. 命令中 JSON key 由当前脚本真实接口决定；argv value 由 ResponsibilityEdge/source_kind 决定。没有 incoming edge 的 required 和 optional 参数都允许使用显式 literal/default。\n"
-            "20. 不要把 __RUNTIME_INPUT_FILE__ / __RUNTIME_INPUT_FILES__ 用作前序 stdout 的替代来源；下游脚本 incoming edge 必须绑定对应 from_output placeholder。\n"
+            "19. 命令中 JSON key 是当前脚本读取的 argv 字段；placeholder 优先来自 external envelope 或显式 fields/defaults/input binding。内部上游 stdout 字段闭环只在第二轮 E2E 验证。\n"
+            "20. 不要在第一轮为下游脚本固定无来源中间字段名；placeholder 来源和修复交给第二轮 E2E。\n"
             "21. 第一轮不要求声明最终 stdout 字段闭环；脚本 stdout 与平台标准输出字段由第二轮 E2E 真实执行验证。\n"
             "22. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本路径、资源使用、脚本调用顺序（如有）和最终产物类型；不要固定特定中间字段。\n"
             "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
             "24. 如果蓝图在禁止隐式执行、示例、反例、例如、比如等语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
             "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
-            "ResponsibilityEdge argv value 绑定上下文（按 to_node 分组，只读，不修改图谱；若当前脚本 key 命中 incoming edge，value 必须来自 from_output）：\n"
-            f"{responsibility_binding_text}\n\n"
             "已生成脚本入口参数上下文：\n"
             f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按静态作者指南生成第一版 command，后续由 E2E 对齐。'}\n\n"
-            "以下 SKILL.md first-round static authoring guide 约束静态格式、平台边界和 ResponsibilityEdge value 来源：\n"
+            "以下 SKILL.md first-round static authoring guide 只约束静态格式和平台边界；内部脚本流转交给第二轮 E2E 验证：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"
             f"{skill_md_contract_text}\n\n"

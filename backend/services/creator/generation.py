@@ -2157,6 +2157,18 @@ def _build_generate_file_prompt(
         else ""
     )
 
+    skill_md_dataflow_alignment_context = (
+        _build_skill_md_dataflow_alignment_context(
+            skill_name=skill_name,
+            skill_md="",
+            blueprint_text=blueprint_text,
+            skill_plan_entry=skill_plan_entry,
+            requirement_graph=responsibility_graph,
+        )
+        if file_path == "SKILL.md"
+        else {}
+    )
+
     script_skeleton_text = (
         _script_generation_skeleton(
             file_path,
@@ -2207,12 +2219,17 @@ def _build_generate_file_prompt(
             "20. 不要在第一轮为下游脚本固定无来源中间字段名；placeholder 来源和修复交给第二轮 E2E。\n"
             "21. 第一轮不要求声明最终 stdout 字段闭环；脚本 stdout 与平台标准输出字段由第二轮 E2E 真实执行验证。\n"
             "22. SKILL.md 必须覆盖蓝图真实规划的任务、真实脚本路径、资源使用、脚本调用顺序（如有）和最终产物类型；不要固定特定中间字段。\n"
-            "23. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
-            "24. 如果蓝图在禁止隐式执行、示例、反例、例如、比如等语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
-            "25. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
+            "23. command JSON argv key 必须服从脚本真实 strict_json_argv_guard 探针；不得为了匹配图谱修改脚本 argv key。\n"
+            "24. command JSON argv value 的来源必须服从 ResponsibilityGraph dataflow_edges、脚本 stdout 探针和平台运行协议；内部脚本传输必须引用真正上游 stdout 输出。\n"
+            "25. 不得根据 key 名相似度、脚本名称或 purpose 猜测来源；不得创造图谱中不存在的上游输出；不确定时在说明中显式标出问题，不要臆造映射。\n"
+            "26. 真实文件计划需要结合蓝图语境判断：目录结构、SkillPlan path、dependencies、references 字段通常是真实文件计划。\n"
+            "27. 如果蓝图在禁止隐式执行、示例、反例、例如、比如等语境中提到某个 scripts/*.py、references/*.md 或 assets/*，它只是解释性示例，不应进入最终 SKILL.md，除非它同时出现在目录结构或 SkillPlan path 中。\n"
+            "28. 不要为了满足格式而新增蓝图外脚本；只为蓝图真实规划脚本提供命令块。\n"
             f"{_SKILL_MD_MARKDOWN_EXECUTION_GUIDE}\n\n"
+            "统一 SKILL.md dataflow alignment context（事实，不是可机械复制的 argv JSON；生成模型需结合蓝图、图谱、脚本 argv/stdout 探针和平台协议决定 value 映射）：\n"
+            f"{json.dumps(skill_md_dataflow_alignment_context, ensure_ascii=False, indent=2, default=str)[:18000]}\n\n"
             "已生成脚本入口参数上下文：\n"
-            f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按静态作者指南生成第一版 command，后续由 E2E 对齐。'}\n\n"
+            f"{script_argv_context or '当前未读取到已生成脚本的 strict_json_argv_guard schema；按静态作者指南生成第一版 command，后续由校验模型和局部 repair 对齐。'}\n\n"
             "以下 SKILL.md first-round static authoring guide 只约束静态格式和平台边界；内部脚本流转交给第二轮 E2E 验证：\n"
             f"{skill_md_e2e_authoring_guide}\n\n"
             "生成前请先隐式检查以下合同，最终输出必须逐项满足；如果合同要求内部 ```bash block，必须在 SKILL.md 正文中写出该 block：\n"

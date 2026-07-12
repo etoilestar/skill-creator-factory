@@ -2196,7 +2196,7 @@ def _build_generate_file_prompt(
             "3. frontmatter 闭合后，输出 Skill 的核心执行说明（普通 Markdown 正文）。\n"
             "4. SKILL.md 第一轮只生成静态可解析的使用说明、资源说明和脚本命令块；内部脚本流转由第二轮 E2E 真实执行验证。\n"
             "5. 如果蓝图包含 scripts/ 资源，SKILL.md 正文必须为每个真实 scripts/ 路径提供一个标准、独立、无缩进的 ```bash fenced code block。\n"
-            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径，并在脚本路径后直接传入一个完整、shell-quoted 的输入 JSON object。该输入 JSON 是脚本路径后的第一个位置参数，对应 Python 脚本中的 `sys.argv[1]`。\n"
+            "6. 每个 bash fenced code block 内只能有一条脚本命令；命令必须直接调用 scripts/ 路径。脚本路径后必须紧跟一个完整的输入 JSON object，并使用一对 ASCII 单引号包裹整个 JSON object，使其在 shell 中作为单个位置参数传入；JSON object 内部的字段名和字符串值必须继续使用标准 JSON 双引号。该输入 JSON 对应 Python 脚本中的 `sys.argv[1]`。\n"
             "6a. 每个 scripts/*.py command block 附近必须写普通 Markdown action schema 声明：role、inputs、outputs；这些是使用说明，不是运行时 hard schema。\n"
             "6b. 输入字段应优先参考已生成脚本的 strict_json_argv_guard schema；如果没有脚本 guard schema，再参考脚本计划和语义输入提示。\n"
             "6c. 输入字段是脚本入口接口字段，不是平台字段白名单；输入值负责绑定平台输入、前序 stdout、reference/assets、literal/default 或 runtime constant。\n"

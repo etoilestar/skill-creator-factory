@@ -24,7 +24,10 @@
         </div>
 
         <div v-if="expanded[idx]" class="thought-body">
-          <pre class="thought-data">{{ JSON.stringify(thought.data, null, 2) }}</pre>
+          <pre v-if="typeof thought.content === 'string'" class="thought-data">{{ thought.content }}</pre>
+          <ul v-else-if="Array.isArray(thought.content)" class="thought-data thought-list">
+            <li v-for="(line, lineIdx) in thought.content" :key="lineIdx">{{ line }}</li>
+          </ul>
         </div>
       </div>
     </div>
@@ -66,6 +69,23 @@ const STEP_ICONS = {
   instruction_analysis: '🧠',
   planner_output: '📋',
   sop_generated: '📑',
+  user_input: '💬',
+  intent_analysis: '🔍',
+  file_plan_ready: '📁',
+  planner_adjusted: '✅',
+  graph_resolved: '🕸️',
+  tool_pool_ready: '🧰',
+  file_generation_start: '📝',
+  file_validation_feedback: '🔧',
+  file_local_repair_start: '🩹',
+  file_write_complete: '💾',
+  e2e_start: '🧪',
+  e2e_success: '✅',
+  e2e_failed: '❌',
+  package_start: '📦',
+  package_complete: '📦',
+  package_failed: '❌',
+  creation_complete: '🎉',
   action_start: '▶️',
   action_result: null, // dynamic — see stepIcon()
   final_answer: '💬',
@@ -202,5 +222,9 @@ function stepIcon(step, data) {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
+}
+.thought-list {
+  list-style: disc;
+  padding-left: 28px;
 }
 </style>

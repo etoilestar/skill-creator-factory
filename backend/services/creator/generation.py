@@ -1364,8 +1364,8 @@ def _existing_script_argv_context_for_skill_md(
             "function_execution_context": function_execution_context,
             "note": (
                 "Advisory for SKILL.md command JSON argv generation. "
-                "Use the script's actual guard/run keys and combine values with incoming_edges/outgoing_edges "
-                "and platform runtime context facts. Do not rename or mechanically rewrite script argv keys here; "
+                "Use the script's actual guard/run keys and bind argv values from incoming_edges "
+                "and platform runtime context facts; outgoing_edges only describe this script's outputs. Do not rename or mechanically rewrite script argv keys here; "
                 "E2E will validate and repair uncertain mappings."
             ),
         })

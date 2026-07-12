@@ -1205,66 +1205,6 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
 
 
 
-def _skill_md_review_python_run_args_analysis(content: str) -> dict[str, Any]:
-    """Return factual run(args) argv reads for the SKILL.md review prompt only."""
-    result: dict[str, Any] = {
-        "required_read_keys": [],
-        "optional_read_keys": [],
-        "reads_sys_argv": False,
-    }
-    try:
-        tree = ast.parse(content or "")
-    except SyntaxError:
-        return result
-
-    run_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
-            run_node = node
-            break
-    if run_node is None or not run_node.args.args:
-        return result
-
-    arg_names = {run_node.args.args[0].arg}
-    for node in ast.walk(run_node):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    arg_names.add(target.id)
-
-    required: set[str] = set()
-    optional: set[str] = set()
-    reads_sys_argv = False
-    for node in ast.walk(run_node):
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr == "argv"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "sys"
-        ):
-            reads_sys_argv = True
-        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
-            key_node = node.slice
-            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
-                required.add(key_node.value)
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "get"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in arg_names
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            optional.add(node.args[0].value)
-
-    result["required_read_keys"] = sorted(required)
-    result["optional_read_keys"] = sorted(optional)
-    result["reads_sys_argv"] = reads_sys_argv
-    return result
-
-
 def _skill_md_script_interface_context_for_review(
     *,
     skill_name: str,
@@ -1307,7 +1247,7 @@ def _skill_md_script_interface_context_for_review(
             schema = {"error": f"{type(exc).__name__}: {exc}"}
 
         try:
-            run_analysis = _skill_md_review_python_run_args_analysis(content)
+            run_analysis = _python_run_args_analysis(content)
         except Exception:
             run_analysis = {}
 

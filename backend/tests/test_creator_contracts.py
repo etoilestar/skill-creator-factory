@@ -723,3 +723,91 @@ async def test_skill_md_reviewer_three_protocol_contradictions_raise_validator_e
             skill_plan_entry={},
         )
     assert calls["count"] == 3
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_prompt_includes_script_interface_and_incoming_edges(monkeypatch, tmp_path):
+    from backend.services.creator import contracts
+
+    skill_dir = tmp_path / "demo"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "main.py").write_text(
+        """
+ALLOWED_KEYS = {"source_text", "style"}
+REQUIRED_KEYS = {"source_text"}
+OPTIONAL_KEYS = {"style"}
+
+def run(args):
+    text = args["source_text"]
+    style = args.get("style", "plain")
+    return {"normalized_text": f"{style}:{text}"}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class Route:
+        model = "unit-test-model"
+
+    captured = {}
+    monkeypatch.setattr(contracts.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        captured["prompt"] = messages[1]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="demo",
+        content="""---
+name: demo
+description: demo
+---
+Run:
+```bash
+python scripts/main.py '{"source_text":"${user_text}","style":"plain"}'
+```
+""",
+        blueprint_text="""目录结构：
+- scripts/main.py
+用户输入 user_text，经 scripts/main.py 输出 normalized_text。
+""",
+        skill_plan_entry={},
+        requirement_graph={
+            "requirements": [
+                {
+                    "target_file": "scripts/main.py",
+                    "role": "processor",
+                    "runtime": "python",
+                    "purpose": "Normalize user text.",
+                    "inputs": ["source_text"],
+                    "outputs": ["normalized_text"],
+                }
+            ],
+            "platform_input_node": {
+                "node_id": "platform_input_node",
+                "node_type": "platform_input",
+                "outputs": ["user_text"],
+            },
+            "dataflow_edges": [
+                {
+                    "from_node": "platform_input_node",
+                    "from_output": "user_text",
+                    "to_node": "scripts/main.py",
+                    "to_input": "source_text",
+                    "purpose": "Platform text feeds the script source_text argv value.",
+                }
+            ],
+        },
+    )
+
+    assert result["passed"] is True
+    prompt = captured["prompt"]
+    assert '"strict_json_argv_schema"' in prompt
+    assert '"required_keys"' in prompt
+    assert '"source_text"' in prompt
+    assert '"run_args_analysis"' in prompt
+    assert '"required_read_keys"' in prompt
+    assert '"incoming_edges"' in prompt
+    assert '"from_output": "user_text"' in prompt

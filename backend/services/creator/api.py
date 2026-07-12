@@ -6390,6 +6390,49 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "responsibility_edges": data.get("responsibility_edges") or [],
     }
 
+def _planner_feedback_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    review_summary = result.get("review_summary")
+    if not isinstance(review_summary, dict):
+        review_summary = {}
+
+    items: list[str] = []
+    for key in ("changes", "risks"):
+        values = review_summary.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+            elif isinstance(value, dict):
+                text = str(
+                    value.get("message")
+                    or value.get("summary")
+                    or value.get("title")
+                    or ""
+                ).strip()
+            else:
+                text = str(value or "").strip()
+            if text:
+                items.append(text)
+            if len(items) >= 6:
+                break
+        if len(items) >= 6:
+            break
+
+    summary = "反馈检查完成"
+    if items:
+        summary = f"反馈检查完成，整理出 {len(items)} 条结论或建议"
+    elif str(result.get("status") or "") == "ready":
+        summary = "反馈检查完成，规划已收敛"
+
+    return {
+        "event": "planner_feedback",
+        "title": "反馈模型检查规划",
+        "summary": summary,
+        "items": items,
+    }
+
+
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
     event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -7286,6 +7329,7 @@ Blueprint Planner 只规划业务责任。
                 normalized_converged_edges,
             )
             if event_emitter is not None:
+                await event_emitter(_planner_feedback_event_from_result(convergence_result))
                 await event_emitter({
                     "event": "planner_converged",
                     "function_items": data.get("function_items") or [],

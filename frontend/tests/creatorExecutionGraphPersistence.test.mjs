@@ -13,11 +13,13 @@ function createHarness() {
   let pendingResponsibilityEdges = [{ from_node: 'platform_input_node', to_node: 'scripts/a.py' }]
   let resolvedFunctionItems = null
   let resolvedResponsibilityEdges = null
+  let graphPlanningActive = false
   const thoughts = []
 
   const saveResolvedGraphSnapshot = ({ functionItems, responsibilityEdges } = {}) => {
     if (Array.isArray(functionItems)) resolvedFunctionItems = functionItems
     if (Array.isArray(responsibilityEdges)) resolvedResponsibilityEdges = responsibilityEdges
+    if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) graphPlanningActive = false
   }
   const onPlanner = (event) => {
     if (Array.isArray(event.function_items)) pendingFunctionItems = event.function_items
@@ -32,11 +34,27 @@ function createHarness() {
     saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
   }
   const appendExecutionBlock = ({ step, label, detail = '', content = '' } = {}) => {
-    thoughts.push({ step: String(step || 'execution'), label: String(label || '执行步骤'), detail: String(detail || ''), content })
+    const safeContent = Array.isArray(content) ? content.filter(item => typeof item === 'string').slice(0, 20) : (typeof content === 'string' ? content : '')
+    thoughts.push({ step: String(step || 'execution'), label: String(label || '执行步骤'), detail: String(detail || ''), content: safeContent })
   }
+  const onStreamEvent = (event) => {
+    if (event.event === 'planner_feedback') {
+      appendExecutionBlock({
+        step: 'planner_feedback',
+        label: '反馈模型检查规划',
+        detail: event.summary || '反馈检查完成',
+        content: Array.isArray(event.items) ? event.items : [],
+      })
+      return
+    }
+    onPlanner(event)
+  }
+  const startRevise = () => { graphPlanningActive = true }
+  const displayedFunctionItems = () => graphPlanningActive ? pendingFunctionItems : (Array.isArray(resolvedFunctionItems) ? resolvedFunctionItems : pendingFunctionItems)
   const clearChat = () => {
     pendingFunctionItems = []
     pendingResponsibilityEdges = []
+    graphPlanningActive = false
     resolvedFunctionItems = null
     resolvedResponsibilityEdges = null
     thoughts.length = 0
@@ -46,10 +64,14 @@ function createHarness() {
     get pendingResponsibilityEdges() { return pendingResponsibilityEdges },
     get resolvedFunctionItems() { return resolvedFunctionItems },
     get resolvedResponsibilityEdges() { return resolvedResponsibilityEdges },
+    get graphPlanningActive() { return graphPlanningActive },
     thoughts,
     onPlanner,
+    onStreamEvent,
     onPlan,
     appendExecutionBlock,
+    startRevise,
+    displayedFunctionItems,
     clearChat,
   }
 }
@@ -94,6 +116,39 @@ describe('CreatorView graph persistence and execution process', () => {
     const h = createHarness()
     h.appendExecutionBlock({ step: 'user_input', label: '用户输入', content: '创建一个 Skill' })
     assert.equal(h.thoughts[0].step, 'user_input')
+  })
+
+  it('shows pending draft during revise while retaining the previous resolved snapshot', () => {
+    const h = createHarness()
+    const oldResolved = [{ target_file: 'scripts/old.py' }]
+    const newDraft = [{ target_file: 'scripts/new.py' }]
+    h.onPlan({ function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.startRevise()
+    h.onPlanner({ event: 'planner_draft', function_items: newDraft })
+    assert.deepEqual(h.displayedFunctionItems(), newDraft)
+    assert.deepEqual(h.resolvedFunctionItems, oldResolved)
+  })
+
+  it('adds sanitized planner feedback cards without saving raw responses or full plans', () => {
+    const h = createHarness()
+    h.onStreamEvent({
+      event: 'planner_feedback',
+      summary: '发现 1 个需调整点',
+      items: ['补齐输出交付说明'],
+      raw: { hidden: true },
+      response: { full: true },
+      plan: { full: true },
+    })
+    assert.equal(h.thoughts.length, 1)
+    assert.equal(h.thoughts[0].step, 'planner_feedback')
+    assert.deepEqual(h.thoughts[0], {
+      step: 'planner_feedback',
+      label: '反馈模型检查规划',
+      detail: '发现 1 个需调整点',
+      content: ['补齐输出交付说明'],
+    })
+    assert.equal(JSON.stringify(h.thoughts).includes('hidden'), false)
+    assert.equal(JSON.stringify(h.thoughts).includes('full'), false)
   })
 
   it('ThinkingPanel no longer stringifies thought.data', () => {

@@ -11484,23 +11484,6 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
                 out.append(text)
         return out[:50]
 
-    def platform_node(value: Any, default_id: str) -> dict[str, Any]:
-        if hasattr(value, "model_dump"):
-            value = value.model_dump(mode="json")
-        if isinstance(value, dict):
-            node = {"id": trunc(value.get("id") or value.get("node_id") or value.get("name") or default_id)}
-            for key in ("type", "label", "description", "fields", "outputs", "inputs"):
-                item = value.get(key)
-                if isinstance(item, (str, int, float, bool)) and str(item).strip():
-                    node[key] = trunc(item)
-                elif isinstance(item, (list, tuple)):
-                    node[key] = string_list(item)
-                elif isinstance(item, dict):
-                    node[key] = {str(k)[:80]: trunc(v) for k, v in list(item.items())[:40]}
-            return node
-        text = trunc(value or default_id)
-        return {"id": text or default_id}
-
     requirements: list[dict[str, Any]] = []
     raw_requirements = raw_graph.get("requirements")
     if not isinstance(raw_requirements, list):
@@ -11524,32 +11507,7 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
         if compact["target_file"]:
             requirements.append(compact)
 
-    dataflow_edges: list[dict[str, Any]] = []
-    raw_edges = raw_graph.get("dataflow_edges") or raw_graph.get("edges") or []
-    if not isinstance(raw_edges, list):
-        raw_edges = []
-    for edge in raw_edges[:120]:
-        if hasattr(edge, "model_dump"):
-            edge = edge.model_dump(mode="json")
-        if not isinstance(edge, dict):
-            continue
-        from_output = edge.get("from_output") if edge.get("from_output") not in (None, "") else edge.get("from_field")
-        to_input = edge.get("to_input") if edge.get("to_input") not in (None, "") else edge.get("to_field")
-        dataflow_edges.append({
-            "from_node": trunc(edge.get("from_node")),
-            "from_output": trunc(from_output),
-            "to_node": trunc(edge.get("to_node")),
-            "to_input": trunc(to_input),
-            "purpose": trunc(edge.get("purpose")),
-            "constraints": edge.get("constraints") if isinstance(edge.get("constraints"), (dict, list)) else string_list(edge.get("constraints")),
-        })
-
-    compact_graph = {
-        "requirements": requirements,
-        "dataflow_edges": dataflow_edges,
-        "platform_input_node": platform_node(raw_graph.get("platform_input_node"), "platform_input"),
-        "platform_output_node": platform_node(raw_graph.get("platform_output_node"), "platform_output"),
-    }
+    compact_graph = {"requirements": requirements}
     serialized = json.dumps(compact_graph, ensure_ascii=False, default=str)
     if len(serialized) <= 14000:
         return compact_graph
@@ -11559,12 +11517,7 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
         if len(json.dumps({"requirements": trimmed}, ensure_ascii=False, default=str)) > 14000:
             trimmed.pop()
             break
-    return {
-        "requirements": trimmed,
-        "dataflow_edges": dataflow_edges,
-        "platform_input_node": compact_graph.get("platform_input_node"),
-        "platform_output_node": compact_graph.get("platform_output_node"),
-    }
+    return {"requirements": trimmed}
 
 
 def _build_markdown_initial_region_prompt(

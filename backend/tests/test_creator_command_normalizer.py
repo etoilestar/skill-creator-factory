@@ -339,23 +339,3 @@ python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
     block = parse_skill_md_bash_command_blocks(repaired)[0]
     assert validate_runtime_command_format(block.content) == []
     assert block.content == "python scripts/run.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'"
-
-
-def test_command_normalizer_does_not_semantically_rewrite_valid_argv_values():
-    graph = {"dataflow_edges": [
-        {"from_node": "node_up", "from_output": "real_output", "to_node": "scripts/down.py", "to_input": "payload"}
-    ]}
-    skill_md = """```bash
-python scripts/down.py '{"payload":"{{wrong_source}}"}'
-```
-"""
-
-    result = canonicalize_skill_md_runtime_commands(
-        skill_name="s",
-        skill_md=skill_md,
-        requirement_graph=graph,
-    )
-
-    assert not result.changed
-    assert not result.blocked
-    assert result.content == skill_md

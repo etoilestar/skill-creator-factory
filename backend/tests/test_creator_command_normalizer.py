@@ -134,7 +134,7 @@ def test_normalizer_blocked_command_format_error_does_not_enter_llm_patch_route(
 
 def test_requirement_graph_from_to_field_edges_render_required_schema_command():
     graph = type("Graph", (), {"dataflow_edges": [
-        {"from_node": "upstream", "from_field": "source_value", "to_node": "runner", "to_field": "value"}
+        {"from_node": "upstream", "from_field": "source_value", "to_node": "scripts/run.py", "to_field": "value"}
     ]})()
     skill_md = """```bash
 python scripts/run.py '{"value": {{value | default("x")}}}'
@@ -183,7 +183,7 @@ python scripts/run.py '{"value": {{value | default("x")}}}'
 
 def test_from_to_field_edges_still_block_when_required_binding_missing():
     graph = type("Graph", (), {"dataflow_edges": [
-        {"from_node": "upstream", "from_field": "source_value", "to_node": "runner", "to_field": "other"}
+        {"from_node": "upstream", "from_field": "source_value", "to_node": "scripts/run.py", "to_field": "other"}
     ]})()
     skill_md = """```bash
 python scripts/run.py '{"value": {{value | default("x")}}}'
@@ -339,3 +339,153 @@ python scripts/run.py '{"input_file":"__RUNTIME_INPUT_FILE__"}'
     block = parse_skill_md_bash_command_blocks(repaired)[0]
     assert validate_runtime_command_format(block.content) == []
     assert block.content == "python scripts/run.py '{\"input_file\":\"__RUNTIME_INPUT_FILE__\"}'"
+
+
+def test_requirement_graph_from_output_to_input_edges_render_required_schema_command():
+    graph = {"dataflow_edges": [
+        {"from_node": "upstream", "from_output": "stdout_value", "to_node": "scripts/run.py", "to_input": "value"}
+    ]}
+    skill_md = """```bash
+python scripts/run.py '{"value": {{value | default("x")}}}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(
+        skill_name="s",
+        skill_md=skill_md,
+        runtime_specs={"scripts/run.py": RuntimeSpec(script_argv_schema={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]})},
+        requirement_graph=graph,
+    )
+    assert result.changed
+    assert not result.blocked
+    assert "{{upstream.stdout_value}}" in result.content
+
+
+def test_valid_command_wrong_value_is_aligned_from_requirement_graph():
+    graph = {"dataflow_edges": [
+        {"from_node": "extract", "from_output": "records", "to_node": "scripts/load.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/load.py '{"input":"{{input}}","mode":"fast"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert result.changed
+    assert not result.blocked
+    assert '"input":"{{extract.records}}"' in result.content
+    assert '"mode":"fast"' in result.content
+
+
+def test_valid_command_correct_value_is_not_rewritten():
+    graph = {"dataflow_edges": [
+        {"from_node": "extract", "from_output": "records", "to_node": "scripts/load.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/load.py '{"input":"{{extract.records}}","mode":"fast"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert not result.changed
+    assert not result.blocked
+    assert result.content == skill_md
+
+
+def test_requirement_graph_alignment_only_matches_exact_target_script():
+    graph = {"dataflow_edges": [
+        {"from_node": "scripts/a.py", "from_output": "out", "to_node": "scripts/other.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/load.py '{"input":"{{input}}"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert not result.changed
+    assert not result.blocked
+    assert result.content == skill_md
+
+
+def test_same_argv_key_on_multiple_scripts_is_aligned_independently():
+    graph = {"dataflow_edges": [
+        {"from_node": "a", "from_output": "out", "to_node": "scripts/one.py", "to_input": "input"},
+        {"from_node": "b", "from_output": "out", "to_node": "scripts/two.py", "to_input": "input"},
+    ]}
+    skill_md = """```bash
+python scripts/one.py '{"input":"{{input}}"}'
+```
+```bash
+python scripts/two.py '{"input":"{{input}}"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert result.changed
+    assert not result.blocked
+    assert 'python scripts/one.py' in result.content
+    assert '"input":"{{a.out}}"' in result.content
+    assert 'python scripts/two.py' in result.content
+    assert '"input":"{{b.out}}"' in result.content
+
+
+def test_missing_to_input_key_reports_structured_issue_without_adding_key():
+    graph = {"dataflow_edges": [
+        {"from_node": "scripts/a.py", "from_output": "out", "to_node": "scripts/run.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/run.py '{"other":"{{other}}"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert result.blocked
+    assert not result.changed
+    assert result.content == skill_md
+    issue = next(issue for issue in result.issues if issue.code == "command_value_binding_unresolved")
+    assert issue.detail == {
+        "script_path": "scripts/run.py",
+        "to_input": "input",
+        "existing_argv_keys": ["other"],
+        "from_node": "scripts/a.py",
+        "from_output": "out",
+    }
+
+
+def test_static_values_and_runtime_constants_are_preserved_during_alignment():
+    graph = {"dataflow_edges": [
+        {"from_node": "scripts/a.py", "from_output": "out", "to_node": "scripts/run.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/run.py '{"input":"{{input}}","ref":"references/rules.md","asset":"assets/icon.png","model":"TEXT_MODEL","file":"__RUNTIME_INPUT_FILE__"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    assert result.changed
+    assert '"input":"{{scripts/a.py.out}}"' in result.content
+    assert '"ref":"references/rules.md"' in result.content
+    assert '"asset":"assets/icon.png"' in result.content
+    assert '"model":"TEXT_MODEL"' in result.content
+    assert '"file":"__RUNTIME_INPUT_FILE__"' in result.content
+
+
+def test_valid_command_without_requirement_graph_remains_byte_for_byte_unchanged():
+    skill_md = """```bash
+python scripts/run.py '{"input":"{{input}}","mode":"fast"}'
+```
+"""
+    result = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md)
+    assert not result.changed
+    assert not result.blocked
+    assert result.content == skill_md
+
+
+def test_requirement_graph_value_alignment_is_idempotent():
+    graph = {"dataflow_edges": [
+        {"from_node": "scripts/a.py", "from_output": "out", "to_node": "scripts/run.py", "to_input": "input"}
+    ]}
+    skill_md = """```bash
+python scripts/run.py '{"input":"{{wrong}}","mode":"fast"}'
+```
+"""
+    first = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=skill_md, requirement_graph=graph)
+    second = canonicalize_skill_md_runtime_commands(skill_name="s", skill_md=first.content, requirement_graph=graph)
+    assert first.changed
+    assert not first.blocked
+    assert not second.changed
+    assert not second.blocked
+    assert second.content == first.content

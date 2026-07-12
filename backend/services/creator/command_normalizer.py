@@ -249,10 +249,13 @@ def _complex_template_paths(
                 + "}}"
             )
 
-            if not _PLATFORM_PLACEHOLDER_RE.fullmatch(
+            if _PLATFORM_PLACEHOLDER_RE.fullmatch(
                 token
             ):
-                found.append(path or "$")
+                continue
+            if re.fullmatch(r"[A-Za-z0-9_./-]+", match.group(1).strip()) and "." in match.group(1).strip():
+                continue
+            found.append(path or "$")
 
     return found
 
@@ -334,26 +337,108 @@ def _argv_contract_markdown(bindings: dict[str, Any]) -> str:
             lines.append(f"* `{key}`: 宿主注入的文本模型名称，占位值为 `{binding.get('placeholder')}`。")
     return "\n".join(lines) + "\n"
 
-def _explicit_bindings_from_requirement_graph(requirement_graph: Any) -> dict[str, str]:
+def _normalized_graph_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped.replace("\\", "/")
+
+
+def _explicit_bindings_from_requirement_graph(
+    requirement_graph: Any,
+    *,
+    script_path: str | None = None,
+) -> dict[str, str]:
     bindings: dict[str, str] = {}
     edges = _get(requirement_graph, "dataflow_edges", None) or _get(requirement_graph, "edges", None) or []
+    normalized_script_path = _normalized_graph_path(script_path)
     for edge in edges if isinstance(edges, list) else []:
-        to_field = _get(edge, "to_field")
-        from_field = _get(edge, "from_field")
-        from_node = _get(edge, "from_node")
-        if isinstance(to_field, str) and to_field.strip() and isinstance(from_field, str) and from_field.strip():
-            source = from_field.strip()
-            if isinstance(from_node, str) and from_node.strip():
-                source = f"{from_node.strip()}.{source}"
-            bindings[to_field.strip()] = source
+        to_node = _normalized_graph_path(_get(edge, "to_node"))
+        if normalized_script_path is not None and to_node != normalized_script_path:
             continue
 
-        target = _get(edge, "target") or _get(edge, "to") or _get(edge, "target_key")
-        source = _get(edge, "source") or _get(edge, "from") or _get(edge, "source_key")
-        if isinstance(target, str) and isinstance(source, str) and target:
-            bindings[target] = source
+        to_input = _get(edge, "to_input") or _get(edge, "to_field")
+        from_output = _get(edge, "from_output") or _get(edge, "from_field")
+        from_node = _get(edge, "from_node")
+        if (
+            isinstance(to_input, str)
+            and to_input.strip()
+            and isinstance(from_output, str)
+            and from_output.strip()
+            and isinstance(from_node, str)
+            and from_node.strip()
+            and to_node is not None
+        ):
+            bindings[to_input.strip()] = f"{from_node.strip()}.{from_output.strip()}"
     return bindings
 
+
+
+
+def _align_command_values_from_requirement_graph(
+    command: str,
+    *,
+    script_path: str | None,
+    requirement_graph: Any | None,
+) -> tuple[str, bool, list[CommandFormatIssue]]:
+    if requirement_graph is None or not script_path:
+        return command, False, []
+    bindings = _explicit_bindings_from_requirement_graph(
+        requirement_graph,
+        script_path=script_path,
+    )
+    if not bindings:
+        return command, False, []
+
+    lines = _effective_command_lines(command)
+    if len(lines) != 1:
+        return command, False, []
+    try:
+        parts = shlex.split(lines[0], posix=True)
+    except ValueError:
+        return command, False, []
+    if len(parts) != 3:
+        return command, False, []
+    parsed_script_path = parts[1].replace("\\", "/")
+    if parsed_script_path != script_path.replace("\\", "/"):
+        return command, False, []
+    try:
+        argv = json.loads(parts[2])
+    except json.JSONDecodeError:
+        return command, False, []
+    if not isinstance(argv, dict):
+        return command, False, []
+
+    issues: list[CommandFormatIssue] = []
+    changed = False
+    for to_input, source in bindings.items():
+        from_node, from_output = source.rsplit(".", 1)
+        if to_input not in argv:
+            issues.append(CommandFormatIssue(
+                "command_value_binding_unresolved",
+                "requirement graph target argv key is missing from command",
+                script_path,
+                {
+                    "script_path": script_path,
+                    "to_input": to_input,
+                    "existing_argv_keys": list(argv.keys()),
+                    "from_node": from_node,
+                    "from_output": from_output,
+                },
+            ))
+            continue
+        expected_value = "{{" + from_node + "." + from_output + "}}"
+        if argv[to_input] != expected_value:
+            argv[to_input] = expected_value
+            changed = True
+
+    if issues:
+        return command, False, issues
+    if not changed:
+        return command, False, []
+    return _format_command(script_path, argv), True, []
 
 def render_canonical_command_from_verified_contract(
     *,
@@ -384,7 +469,7 @@ def render_canonical_command_from_verified_contract(
         props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
         raw_required = schema.get("required", schema.get("required_keys", []))
         required = [str(key) for key in raw_required if isinstance(key, str)]
-        bindings = _explicit_bindings_from_requirement_graph(requirement_graph)
+        bindings = _explicit_bindings_from_requirement_graph(requirement_graph, script_path=script_path)
         missing = [key for key in required if key not in bindings]
         if missing:
             return None, [CommandFormatIssue("missing_command_arg_binding", "required argv keys have no explicit binding", script_path, {"missing_keys": missing, "available_contract_sources": sources + ["runtime_spec.script_argv_schema", "requirement_graph"]})]
@@ -421,9 +506,22 @@ def canonicalize_skill_md_runtime_commands(
         sanitized_command, sanitized_bindings = _sanitized_command_from_block(block.content)
         block_issues = validate_runtime_command_format(sanitized_command or block.content)
         if not block_issues:
-            if sanitized_command and sanitized_command.strip() != block.content.strip():
+            candidate_command = sanitized_command or block.content
+            script_path = block.script_path or _script_path_from_command(candidate_command)
+            aligned_command, aligned_changed, alignment_issues = _align_command_values_from_requirement_graph(
+                candidate_command,
+                script_path=script_path,
+                requirement_graph=requirement_graph,
+            )
+            if alignment_issues:
+                issues.extend(alignment_issues)
+                return CommandNormalizationResult(False, content, issues, True)
+            if (
+                (sanitized_command and sanitized_command.strip() != block.content.strip())
+                or aligned_changed
+            ):
                 contract = _argv_contract_markdown(sanitized_bindings)
-                replacements.append((block, sanitized_command + contract))
+                replacements.append((block, aligned_command + contract))
             continue
         issues.extend(block_issues)
         script_path = block.script_path or next((issue.script_path for issue in block_issues if issue.script_path), None)

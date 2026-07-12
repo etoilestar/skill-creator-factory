@@ -867,17 +867,6 @@ async function send() {
       )
     }
 
-    if (Array.isArray(plan.responsibility_edges)) {
-      pendingResponsibilityEdges.value = plan.responsibility_edges
-    }
-
-    if (Array.isArray(plan.function_items)) {
-      pendingFunctionItems.value = plan.function_items
-    }
-
-    saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
-    graphPlanningActive.value = false
-
     if (plan.skill_name) {
       skillName.value = plan.skill_name
     }
@@ -994,6 +983,8 @@ async function send() {
         )
       )
 
+      graphPlanningActive.value = false
+
       return
     }
 
@@ -1028,10 +1019,24 @@ async function send() {
             .join('\n'),
       })
 
+      graphPlanningActive.value = false
+
       return
     }
 
-    saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
+    if (plan.status === 'ready') {
+      if (Array.isArray(plan.function_items)) {
+        pendingFunctionItems.value = plan.function_items
+      }
+      if (Array.isArray(plan.responsibility_edges)) {
+        pendingResponsibilityEdges.value = plan.responsibility_edges
+      }
+
+      saveResolvedGraphSnapshot({
+        functionItems: plan.function_items,
+        responsibilityEdges: plan.responsibility_edges,
+      })
+    }
     graphPlanningActive.value = false
 
     appendExecutionBlock({ step: 'prepare_plan_ready', label: '文件计划完成', detail: `准备生成 ${Array.isArray(plan.files) ? plan.files.length : 0} 个文件`, content: summarizeFiles(plan.files) })
@@ -1043,17 +1048,6 @@ async function send() {
       pendingBlueprintText.value
     )
 
-    pendingResponsibilityEdges.value = (
-      Array.isArray(plan.responsibility_edges)
-        ? plan.responsibility_edges
-        : pendingResponsibilityEdges.value
-    )
-
-    pendingFunctionItems.value = (
-      Array.isArray(plan.function_items)
-        ? plan.function_items
-        : pendingFunctionItems.value
-    )
 
     skillName.value = (
       plan.skill_name ||

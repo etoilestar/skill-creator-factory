@@ -30,9 +30,12 @@ function createHarness() {
     }
   }
   const onPlan = (plan) => {
-    if (Array.isArray(plan.responsibility_edges)) pendingResponsibilityEdges = plan.responsibility_edges
-    if (Array.isArray(plan.function_items)) pendingFunctionItems = plan.function_items
-    saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
+    if (plan.status === 'ready') {
+      if (Array.isArray(plan.function_items)) pendingFunctionItems = plan.function_items
+      if (Array.isArray(plan.responsibility_edges)) pendingResponsibilityEdges = plan.responsibility_edges
+      saveResolvedGraphSnapshot({ functionItems: plan.function_items, responsibilityEdges: plan.responsibility_edges })
+    }
+    graphPlanningActive = false
   }
   const appendExecutionBlock = ({ step, label, detail = '', content = '' } = {}) => {
     const safeContent = Array.isArray(content) ? content.filter(item => typeof item === 'string').slice(0, 20) : (typeof content === 'string' ? content : '')
@@ -96,7 +99,7 @@ describe('CreatorView graph persistence and execution process', () => {
 
   it('keeps resolved graph through file generation and creation-complete events', () => {
     const h = createHarness()
-    h.onPlan({ function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
+    h.onPlan({ status: 'ready', function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
     h.appendExecutionBlock({ step: 'file_generation_start', label: '文件开始生成' })
     h.appendExecutionBlock({ step: 'creation_complete', label: '创建完成' })
     assert.equal(h.resolvedFunctionItems.length, 1)
@@ -105,7 +108,7 @@ describe('CreatorView graph persistence and execution process', () => {
 
   it('only clearChat clears graph state', () => {
     const h = createHarness()
-    h.onPlan({ function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
+    h.onPlan({ status: 'ready', function_items: [{ target_file: 'scripts/a.py' }], responsibility_edges: [{ from_node: 'scripts/a.py' }] })
     h.clearChat()
     assert.deepEqual(h.pendingFunctionItems, [])
     assert.deepEqual(h.pendingResponsibilityEdges, [])
@@ -123,11 +126,32 @@ describe('CreatorView graph persistence and execution process', () => {
     const h = createHarness()
     const oldResolved = [{ target_file: 'scripts/old.py' }]
     const newDraft = [{ target_file: 'scripts/new.py' }]
-    h.onPlan({ function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.onPlan({ status: 'ready', function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
     h.startRevise()
     h.onPlanner({ event: 'planner_draft', function_items: newDraft })
     assert.deepEqual(h.displayedFunctionItems(), newDraft)
     assert.deepEqual(h.resolvedFunctionItems, oldResolved)
+  })
+
+  it('keeps previous resolved graph when revise final plan still needs clarification with empty arrays', () => {
+    const h = createHarness()
+    const oldResolved = [{ target_file: 'scripts/old.py' }]
+    h.onPlan({ status: 'ready', function_items: oldResolved, responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.startRevise()
+    h.onPlan({ status: 'needs_clarification', function_items: [], responsibility_edges: [] })
+    assert.deepEqual(h.resolvedFunctionItems, oldResolved)
+    assert.equal(h.graphPlanningActive, false)
+    assert.deepEqual(h.displayedFunctionItems(), oldResolved)
+  })
+
+  it('saves explicit empty ready graph for scriptless skills', () => {
+    const h = createHarness()
+    h.onPlan({ status: 'ready', function_items: [{ target_file: 'scripts/old.py' }], responsibility_edges: [{ from_node: 'scripts/old.py' }] })
+    h.startRevise()
+    h.onPlan({ status: 'ready', function_items: [], responsibility_edges: [] })
+    assert.deepEqual(h.resolvedFunctionItems, [])
+    assert.deepEqual(h.resolvedResponsibilityEdges, [])
+    assert.deepEqual(h.displayedFunctionItems(), [])
   })
 
   it('adds sanitized planner convergence review cards without saving raw responses or full plans', () => {

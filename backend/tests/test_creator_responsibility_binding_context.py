@@ -40,7 +40,7 @@ def test_user_text_platform_input_cannot_use_file_sentinel():
 
 def test_platform_file_input_still_allows_official_file_sentinel():
     context = responsibility_edges_by_to_node([
-        {"from_node": "platform_input_node", "from_output": "uploaded_file", "to_node": "scripts/read_upload.py", "to_input": "input_file"},
+        {"from_node": "platform_input_node", "from_output": "input_files", "to_node": "scripts/read_upload.py", "to_input": "input_file"},
     ])
     commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/read_upload.py", "python scripts/read_upload.py '{}'", "python", {"input_file": "__RUNTIME_INPUT_FILES__"})]
     assert skill_md_command_value_source_mismatches(commands, context) == []
@@ -48,7 +48,17 @@ def test_platform_file_input_still_allows_official_file_sentinel():
 
 def test_bare_file_tokens_are_not_accepted_as_platform_sentinels():
     context = responsibility_edges_by_to_node([
-        {"from_node": "platform_input_node", "from_output": "uploaded_file", "to_node": "scripts/read_upload.py", "to_input": "input_file"},
+        {"from_node": "platform_input_node", "from_output": "input_files", "to_node": "scripts/read_upload.py", "to_input": "input_file"},
     ])
     commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/read_upload.py", "python scripts/read_upload.py '{}'", "python", {"input_file": "FILES"})]
     assert skill_md_command_value_source_mismatches(commands, context)
+
+
+def test_platform_payload_to_image_cannot_use_file_sentinel():
+    context = responsibility_edges_by_to_node([
+        {"from_node": "platform_input_node", "from_output": "payload", "to_node": "scripts/a.py", "to_input": "image"},
+    ])
+    commands = [E2EWorkflowCommand(1, "SKILL.md", "scripts/a.py", "python scripts/a.py '{}'", "python", {"image": "__RUNTIME_INPUT_FILE__"})]
+    issues = skill_md_command_value_source_mismatches(commands, context)
+    assert issues[0]["issue_type"] == "command_value_source_mismatch"
+    assert issues[0]["from_output"] == "payload"

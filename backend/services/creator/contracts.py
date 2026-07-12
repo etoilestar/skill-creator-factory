@@ -1434,20 +1434,6 @@ async def _review_skill_md_blueprint_intent_with_model(
         data["issues"] = reviewer_issues
 
 
-    if deterministic_value_source_issues:
-        data["issues"].extend({
-            "severity": "error",
-            "blocking": True,
-            "field": "workflow",
-            "category": "command_value_source_mismatch",
-            "contract_impact": {"execution_closure": True},
-            "message": "SKILL.md command argv value does not follow ResponsibilityEdge source.",
-            "expected": f"argv.{issue.get('argv_key')} must use {{{{{issue.get('from_output')}}}}}",
-            "minimal_edit": issue.get("repair_instruction") or "Only patch this argv value.",
-            **issue,
-        } for issue in deterministic_value_source_issues)
-        data["passed"] = False
-
     data["issues"] = _dedupe_review_issues(data["issues"])
     if data.get("passed") is not True and any(str(issue.get("severity") or "error").lower() in {"error", "blocking", "blocker"} for issue in data["issues"] if isinstance(issue, dict)):
         data["passed"] = False

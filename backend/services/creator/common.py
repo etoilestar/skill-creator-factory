@@ -2927,7 +2927,7 @@ except Exception:
     pass
 
 _RUNTIME_FILE_SENTINELS: frozenset[str] = frozenset({"__RUNTIME_INPUT_FILE__", "__RUNTIME_INPUT_FILES__"})
-_TEXT_PLATFORM_SLOTS: frozenset[str] = frozenset({"user_request", "input", "text"})
+_PLATFORM_FILE_FROM_OUTPUTS: frozenset[str] = frozenset({"input_files", "files", "resources"})
 
 def _creator_placeholder_root_name(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -2946,10 +2946,7 @@ def _is_platform_node_name(node: str) -> bool:
 def _is_platform_file_input_edge(edge: Mapping[str, Any]) -> bool:
     if not _is_platform_node_name(str(edge.get("from_node") or "")):
         return False
-    text = " ".join(str(edge.get(key) or "") for key in ("from_output", "to_input", "purpose", "constraints")).lower()
-    if any(slot in {str(edge.get("from_output") or "").lower(), str(edge.get("to_input") or "").lower()} for slot in _TEXT_PLATFORM_SLOTS):
-        return False
-    return any(token in text for token in ("file", "files", "upload", "uploaded", "asset", "image", "pdf", "document"))
+    return str(edge.get("from_output") or "").strip() in _PLATFORM_FILE_FROM_OUTPUTS
 
 
 def skill_md_command_value_source_mismatches_for_commands(

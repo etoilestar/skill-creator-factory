@@ -1205,6 +1205,62 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
 
 
 
+
+def _collect_skill_md_review_script_paths(
+    *,
+    blueprint_text: str,
+    skill_plan_entry: dict[str, Any] | None = None,
+    requirement_graph: Any = None,
+) -> list[str]:
+    """Collect true script paths from blueprint, SkillPlan-like payloads, and graph facts."""
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        path = str(value or "").replace("\\", "/").strip().strip("`")
+        if not path.startswith("scripts/") or not path.endswith(".py") or path in seen:
+            return
+        seen.add(path)
+        paths.append(path)
+
+    for path in _extract_declared_skill_paths(blueprint_text):
+        add(path)
+
+    def walk_skill_plan(value: Any) -> None:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            add(value.get("path") or value.get("target_file") or value.get("entrypoint"))
+            for key in ("files", "skill_plan", "dependencies", "scripts", "steps", "items", "requirements"):
+                child = value.get(key)
+                if isinstance(child, (dict, list, tuple)):
+                    walk_skill_plan(child)
+                elif isinstance(child, str):
+                    add(child)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                walk_skill_plan(item)
+        elif isinstance(value, str):
+            add(value)
+
+    walk_skill_plan(skill_plan_entry or {})
+
+    raw_graph = requirement_graph
+    if hasattr(raw_graph, "model_dump"):
+        raw_graph = raw_graph.model_dump(mode="json")
+    if isinstance(raw_graph, dict):
+        for item in raw_graph.get("requirements") or raw_graph.get("function_items") or []:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
+            if isinstance(item, dict):
+                add(item.get("target_file") or item.get("path"))
+        for edge in raw_graph.get("dataflow_edges") or []:
+            if isinstance(edge, dict):
+                add(edge.get("from_node"))
+                add(edge.get("to_node"))
+
+    return paths
+
 def _skill_md_script_interface_context_for_review(
     *,
     skill_name: str,
@@ -1302,9 +1358,14 @@ async def _review_skill_md_blueprint_intent_with_model(
     )
 
     parser_paths = _extract_declared_skill_paths(blueprint_text)
+    review_script_paths = _collect_skill_md_review_script_paths(
+        blueprint_text=blueprint_text,
+        skill_plan_entry=skill_plan_entry,
+        requirement_graph=requirement_graph,
+    )
     script_interface_context = _skill_md_script_interface_context_for_review(
         skill_name=skill_name,
-        script_paths=[path for path in parser_paths if str(path or "").startswith("scripts/")],
+        script_paths=review_script_paths,
         requirement_graph=requirement_graph,
     )
 
@@ -1342,6 +1403,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "- command JSON value 只在证据明确时检查来源：应与对应 incoming_edges.from_output、platform_input_node 输出字段、或平台运行上下文来源一致。\n"
         "- 证据明确时才输出 error：例如 command key 明显不在脚本 allowed/required key 中，或 required key 明确缺失，或 value 明确绑定到不存在的 incoming_edges.from_output/平台输入来源。\n"
         "- 证据不足、字段别名不明确、类型序列化/list-string/file_path 细节不明确、内部字段来源链不完整时，不要猜测、不要阻断，passed=true 或最多 warning，继续交给现有 E2E 暴露和局部修复。\n"
+        "- 对这种证据明确的 command mapping 错误，category 必须写 command_mapping_explicit_evidence，并在 evidence 中同时引用脚本探针字段（strict_json_argv_schema/run_args_analysis）和图谱边字段（incoming_edges.from_output 或 platform_input_node）。\n"
         "- 不要新增 validator/normalizer/repair/E2E/JSON 格式协议；这里只给现有 SKILL.md 审查模型做单点定位，repair_ops 仅限证据明确的 SKILL.md command block 最小替换。\n"
         "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
         "结构化 issue 字段规范：\n"
@@ -1377,7 +1439,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         '      "severity": "error|warning",\n'
         '      "blocking": true,\n'
         '      "contract_impact": {"execution_closure": false, "resource_role": false, "platform_io": false, "final_artifact": false, "user_requirement_transfer": false},\n'
-        '      "category": "command_template_source_proof|null",\n'
+        '      "category": "command_template_source_proof|command_mapping_explicit_evidence|null",\n'
         '      "field": "intent|file_plan|workflow|capabilities|resources|user_facing",\n'
         '      "message": "不一致点",\n'
         '      "evidence": "引用 SKILL.md 或蓝图中的证据",\n'
@@ -1694,6 +1756,44 @@ def _review_issue_is_detail_or_proof_request(issue: dict[str, Any]) -> bool:
     return any(term in text for term in _DETAIL_OR_PROOF_REVIEW_TERMS)
 
 
+
+def _review_issue_is_explicit_command_mapping_error(issue: dict[str, Any]) -> bool:
+    """Allow only evidence-backed command argv mapping errors to bypass proof filtering."""
+    category = str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
+    text = _review_issue_text(issue).lower()
+    if category != "command_mapping_explicit_evidence" and "command mapping" not in text and "argv" not in text:
+        return False
+
+    has_script_probe = any(token in text for token in (
+        "strict_json_argv_schema",
+        "run_args_analysis",
+        "allowed_keys",
+        "required_keys",
+        "required_read_keys",
+        "actual guard",
+        "actual run",
+        "脚本探针",
+    ))
+    has_graph_edge = any(token in text for token in (
+        "incoming_edges",
+        "from_output",
+        "to_input",
+        "platform_input_node",
+        "图谱边",
+        "入边",
+    ))
+    is_mapping_error = any(token in text for token in (
+        "command",
+        "json argv",
+        "argv key",
+        "argv value",
+        "placeholder",
+        "stdout",
+        "命令",
+        "参数映射",
+    ))
+    return has_script_probe and has_graph_edge and is_mapping_error
+
 def _review_issue_is_command_template_source_proof_error(issue: dict[str, Any]) -> bool:
     category = str(issue.get("category") or issue.get("claim_type") or "").strip().lower()
     field = str(issue.get("field") or "").strip().lower()
@@ -1742,6 +1842,9 @@ def _review_issue_is_blocking(issue: dict[str, Any]) -> bool:
     if _review_issue_is_command_template_source_proof_error(issue):
         impact = issue.get("contract_impact") or issue.get("impact")
         return bool(isinstance(impact, dict) and impact.get("platform_io") is True)
+
+    if _review_issue_is_explicit_command_mapping_error(issue):
+        return True
 
     if _review_issue_is_detail_or_proof_request(issue):
         return False

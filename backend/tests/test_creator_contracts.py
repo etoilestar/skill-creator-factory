@@ -769,11 +769,9 @@ Run:
 python scripts/main.py '{"source_text":"${user_text}","style":"plain"}'
 ```
 """,
-        blueprint_text="""目录结构：
-- scripts/main.py
-用户输入 user_text，经 scripts/main.py 输出 normalized_text。
+        blueprint_text="""用户输入 user_text，经真实规划脚本输出 normalized_text。
 """,
-        skill_plan_entry={},
+        skill_plan_entry={"files": [{"path": "scripts/main.py", "file_type": "script"}]},
         requirement_graph={
             "requirements": [
                 {
@@ -811,3 +809,32 @@ python scripts/main.py '{"source_text":"${user_text}","style":"plain"}'
     assert '"required_read_keys"' in prompt
     assert '"incoming_edges"' in prompt
     assert '"from_output": "user_text"' in prompt
+
+
+def test_skill_md_review_blocks_explicit_command_mapping_evidence():
+    from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
+
+    review = {
+        "passed": False,
+        "issues": [
+            {
+                "severity": "error",
+                "blocking": True,
+                "field": "workflow",
+                "category": "command_mapping_explicit_evidence",
+                "message": "command JSON argv value maps to the wrong stdout placeholder.",
+                "evidence": (
+                    "strict_json_argv_schema.required_keys contains source_text; "
+                    "run_args_analysis.required_read_keys contains source_text; "
+                    "incoming_edges.from_output is user_text, but the command uses placeholder old_stdout."
+                ),
+                "expected": "Bind source_text to incoming_edges.from_output user_text.",
+                "minimal_edit": "Replace only the source_text value in the scripts/main.py command block.",
+                "contract_impact": {"execution_closure": True},
+            }
+        ],
+    }
+
+    results = _skill_md_blueprint_review_to_contract_results(review)
+    assert len(results) == 1
+    assert results[0].id.startswith("skill_md.blueprint_alignment.workflow")

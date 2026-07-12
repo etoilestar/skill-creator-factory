@@ -7,6 +7,7 @@ import { dirname, resolve } from 'node:path'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const creatorSource = readFileSync(resolve(__dirname, '../src/views/CreatorView.vue'), 'utf8')
 const thinkingSource = readFileSync(resolve(__dirname, '../src/components/ThinkingPanel.vue'), 'utf8')
+const creatorExecutionPanelSource = readFileSync(resolve(__dirname, '../src/components/CreatorExecutionPanel.vue'), 'utf8')
 
 function createHarness() {
   let pendingFunctionItems = [{ target_file: 'scripts/a.py', purpose: 'A' }]
@@ -38,11 +39,11 @@ function createHarness() {
     thoughts.push({ step: String(step || 'execution'), label: String(label || '执行步骤'), detail: String(detail || ''), content: safeContent })
   }
   const onStreamEvent = (event) => {
-    if (event.event === 'planner_feedback') {
+    if (event.event === 'planner_convergence_review') {
       appendExecutionBlock({
-        step: 'planner_feedback',
-        label: '反馈模型检查规划',
-        detail: event.summary || '反馈检查完成',
+        step: 'planner_convergence_review',
+        label: '规划模型复核方案',
+        detail: event.summary || '规划复核完成',
         content: Array.isArray(event.items) ? event.items : [],
       })
       return
@@ -129,10 +130,10 @@ describe('CreatorView graph persistence and execution process', () => {
     assert.deepEqual(h.resolvedFunctionItems, oldResolved)
   })
 
-  it('adds sanitized planner feedback cards without saving raw responses or full plans', () => {
+  it('adds sanitized planner convergence review cards without saving raw responses or full plans', () => {
     const h = createHarness()
     h.onStreamEvent({
-      event: 'planner_feedback',
+      event: 'planner_convergence_review',
       summary: '发现 1 个需调整点',
       items: ['补齐输出交付说明'],
       raw: { hidden: true },
@@ -140,10 +141,10 @@ describe('CreatorView graph persistence and execution process', () => {
       plan: { full: true },
     })
     assert.equal(h.thoughts.length, 1)
-    assert.equal(h.thoughts[0].step, 'planner_feedback')
+    assert.equal(h.thoughts[0].step, 'planner_convergence_review')
     assert.deepEqual(h.thoughts[0], {
-      step: 'planner_feedback',
-      label: '反馈模型检查规划',
+      step: 'planner_convergence_review',
+      label: '规划模型复核方案',
       detail: '发现 1 个需调整点',
       content: ['补齐输出交付说明'],
     })
@@ -151,9 +152,18 @@ describe('CreatorView graph persistence and execution process', () => {
     assert.equal(JSON.stringify(h.thoughts).includes('full'), false)
   })
 
-  it('ThinkingPanel no longer stringifies thought.data', () => {
-    assert.equal(thinkingSource.includes('JSON.stringify(thought.data'), false)
-    assert.match(thinkingSource, /thought\.content/)
+  it('CreatorExecutionPanel passes content-only to ThinkingPanel', () => {
+    assert.match(creatorExecutionPanelSource, /<ThinkingPanel[^>]*:thoughts="thoughts"[^>]*content-only/)
+  })
+
+  it('ThinkingPanel hides thought.data fallback when contentOnly is true', () => {
+    assert.match(thinkingSource, /contentOnly/)
+    assert.match(thinkingSource, /v-else-if="!contentOnly"[^>]*>\{\{ JSON\.stringify\(thought\.data, null, 2\) \}\}/)
+  })
+
+  it('ThinkingPanel default mode still supports Sandbox thought.data fallback', () => {
+    assert.match(thinkingSource, /contentOnly:\s*\{[\s\S]*default:\s*false/)
+    assert.match(thinkingSource, /JSON\.stringify\(thought\.data, null, 2\)/)
   })
 
   it('execution blocks do not persist raw payloads, full plans, or full graph object fields', () => {

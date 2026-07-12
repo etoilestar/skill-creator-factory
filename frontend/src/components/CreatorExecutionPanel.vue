@@ -9,7 +9,7 @@
           <span class="status-spinner"></span>
           <span>{{ currentStatus.message }}</span>
         </div>
-        <ThinkingPanel :thoughts="thoughts" />
+        <ThinkingPanel :thoughts="thoughts" content-only />
       </section>
       <section v-else-if="localActiveTab === 'graph'" class="execution-tab-panel graph-panel">
         <CreatorResponsibilityGraph :nodes="nodes" :edges="edges" />

@@ -6390,7 +6390,7 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "responsibility_edges": data.get("responsibility_edges") or [],
     }
 
-def _planner_feedback_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
+def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
     review_summary = result.get("review_summary")
     if not isinstance(review_summary, dict):
         review_summary = {}
@@ -6419,15 +6419,15 @@ def _planner_feedback_event_from_result(result: dict[str, Any]) -> dict[str, Any
         if len(items) >= 6:
             break
 
-    summary = "反馈检查完成"
+    summary = "规划复核完成"
     if items:
-        summary = f"反馈检查完成，整理出 {len(items)} 条结论或建议"
+        summary = f"规划复核完成，整理出 {len(items)} 条结论或建议"
     elif str(result.get("status") or "") == "ready":
-        summary = "反馈检查完成，规划已收敛"
+        summary = "规划复核完成，方案已收敛"
 
     return {
-        "event": "planner_feedback",
-        "title": "反馈模型检查规划",
+        "event": "planner_convergence_review",
+        "title": "规划模型复核方案",
         "summary": summary,
         "items": items,
     }
@@ -7329,7 +7329,7 @@ Blueprint Planner 只规划业务责任。
                 normalized_converged_edges,
             )
             if event_emitter is not None:
-                await event_emitter(_planner_feedback_event_from_result(convergence_result))
+                await event_emitter(_planner_convergence_review_event_from_result(convergence_result))
                 await event_emitter({
                     "event": "planner_converged",
                     "function_items": data.get("function_items") or [],

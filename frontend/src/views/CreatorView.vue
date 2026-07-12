@@ -784,11 +784,11 @@ async function send() {
     const plan = await streamPrepareCreationPlan(
       payload,
       event => {
-        if (event.event === 'planner_feedback') {
+        if (event.event === 'planner_convergence_review') {
           appendExecutionBlock({
-            step: 'planner_feedback',
-            label: '反馈模型检查规划',
-            detail: event.summary || '反馈检查完成',
+            step: 'planner_convergence_review',
+            label: '规划模型复核方案',
+            detail: event.summary || '规划复核完成',
             content: Array.isArray(event.items) ? event.items : [],
           })
           return

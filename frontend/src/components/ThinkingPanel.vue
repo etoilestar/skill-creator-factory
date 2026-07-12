@@ -24,10 +24,13 @@
         </div>
 
         <div v-if="expanded[idx]" class="thought-body">
-          <pre v-if="typeof thought.content === 'string'" class="thought-data">{{ thought.content }}</pre>
-          <ul v-else-if="Array.isArray(thought.content)" class="thought-data thought-list">
-            <li v-for="(line, lineIdx) in thought.content" :key="lineIdx">{{ line }}</li>
-          </ul>
+          <template v-if="hasDisplayContent(thought)">
+            <pre v-if="typeof thought.content === 'string'" class="thought-data">{{ thought.content }}</pre>
+            <ul v-else-if="Array.isArray(thought.content)" class="thought-data thought-list">
+              <li v-for="(line, lineIdx) in thought.content" :key="lineIdx">{{ line }}</li>
+            </ul>
+          </template>
+          <pre v-else-if="!contentOnly" class="thought-data">{{ JSON.stringify(thought.data, null, 2) }}</pre>
         </div>
       </div>
     </div>
@@ -42,6 +45,10 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  contentOnly: {
+    type: Boolean,
+    default: false,
+  },
 })
 
 // Track which items are expanded; keyed by index.
@@ -49,6 +56,14 @@ const expanded = ref({})
 
 function toggle(idx) {
   expanded.value[idx] = !expanded.value[idx]
+}
+
+
+function hasDisplayContent(thought) {
+  return (
+    typeof thought?.content === 'string' ||
+    Array.isArray(thought?.content)
+  )
 }
 
 // Reset expansion state when thoughts list is replaced (new round).

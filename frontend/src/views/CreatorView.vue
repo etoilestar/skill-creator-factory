@@ -98,6 +98,7 @@
             :confirmed-uploaded-assets="creationPlan.confirmed_uploaded_assets || []"
             @creation-complete="onCreationComplete"
             @creation-error="onCreationError"
+            @execution-event="onCreationExecutionEvent"
           />
         </div>
 
@@ -243,6 +244,9 @@ function actionLabel(action) {
 const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
+const graphPlanningActive = ref(false)
+const resolvedFunctionItems = ref(null)
+const resolvedResponsibilityEdges = ref(null)
 const pendingRequiredCapabilities = ref([])
 const rootUserRequest = ref('')
 const messages = ref([])
@@ -283,9 +287,29 @@ const reviewSummaryTitle = computed(() => {
   return '已整理的创建要点'
 })
 
-const planningNodes = computed(() => (
-  Array.isArray(pendingFunctionItems.value)
+const displayFunctionItems = computed(() => (
+  graphPlanningActive.value
     ? pendingFunctionItems.value
+    : (
+        Array.isArray(resolvedFunctionItems.value)
+          ? resolvedFunctionItems.value
+          : pendingFunctionItems.value
+      )
+))
+
+const displayResponsibilityEdges = computed(() => (
+  graphPlanningActive.value
+    ? pendingResponsibilityEdges.value
+    : (
+        Array.isArray(resolvedResponsibilityEdges.value)
+          ? resolvedResponsibilityEdges.value
+          : pendingResponsibilityEdges.value
+      )
+))
+
+const planningNodes = computed(() => (
+  Array.isArray(displayFunctionItems.value)
+    ? displayFunctionItems.value
         .filter(item => item && typeof item === 'object')
         .map(item => ({
           target_file: String(item.target_file || '').trim(),
@@ -302,8 +326,8 @@ const planningNodes = computed(() => (
 ))
 
 const planningEdges = computed(() => (
-  Array.isArray(pendingResponsibilityEdges.value)
-    ? pendingResponsibilityEdges.value
+  Array.isArray(displayResponsibilityEdges.value)
+    ? displayResponsibilityEdges.value
         .filter(edge => edge && typeof edge === 'object')
         .map(edge => ({
           from_node: String(edge.from_node || '').trim(),
@@ -564,6 +588,54 @@ async function handleQuickAction(value) {
 }
 
 
+function safeExecutionContent(content) {
+  if (Array.isArray(content)) {
+    return content.filter(item => typeof item === 'string').slice(0, 20)
+  }
+  if (typeof content === 'string') return content
+  return ''
+}
+
+function appendExecutionBlock({ step, label, detail = '', content = '' } = {}) {
+  thoughts.value.push({
+    step: String(step || 'execution'),
+    label: String(label || '执行步骤'),
+    detail: String(detail || ''),
+    content: safeExecutionContent(content),
+  })
+  markExecutionPanelUpdated('process')
+}
+
+function summarizeFiles(files) {
+  return (Array.isArray(files) ? files : [])
+    .map(file => `${file.path || file.target_file || '文件'}：${file.purpose || file.role || '待生成'}`)
+    .slice(0, 8)
+}
+
+function summarizeFunctionItems(items) {
+  return (Array.isArray(items) ? items : [])
+    .map(item => `${item.target_file || '责任节点'}：${item.purpose || item.role || '已确认'}`)
+    .slice(0, 8)
+}
+
+function summarizeIntent(summary) {
+  if (!summary || typeof summary !== 'object') return []
+  const content = []
+  if (summary.goal) content.push(`目标：${summary.goal}`)
+  if (summary.input) content.push(`输入：${summary.input}`)
+  if (summary.output) content.push(`输出：${summary.output}`)
+  if (Array.isArray(summary.workflow) && summary.workflow.length) {
+    content.push(...summary.workflow.map((step, index) => `流程 ${index + 1}：${step}`))
+  }
+  return content.slice(0, 12)
+}
+
+function saveResolvedGraphSnapshot({ functionItems, responsibilityEdges } = {}) {
+  if (Array.isArray(functionItems)) resolvedFunctionItems.value = functionItems
+  if (Array.isArray(responsibilityEdges)) resolvedResponsibilityEdges.value = responsibilityEdges
+  if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) graphPlanningActive.value = false
+}
+
 // ---------------------------------------------------------------------------
 // Send
 // ---------------------------------------------------------------------------
@@ -618,8 +690,17 @@ async function send() {
 
   showCreationPanel.value = false
 
+  graphPlanningActive.value = true
+
   messages.value.push({
     role: 'user',
+    content: text,
+  })
+
+  appendExecutionBlock({
+    step: 'user_input',
+    label: '用户输入',
+    detail: text.slice(0, 80),
     content: text,
   })
 
@@ -703,26 +784,59 @@ async function send() {
     const plan = await streamPrepareCreationPlan(
       payload,
       event => {
+        if (event.event === 'planner_convergence_review') {
+          appendExecutionBlock({
+            step: 'planner_convergence_review',
+            label: '规划模型复核方案',
+            detail: event.summary || '规划复核完成',
+            content: Array.isArray(event.items) ? event.items : [],
+          })
+          return
+        }
         if (
           event.event === 'planner_draft' ||
           event.event === 'planner_converged'
         ) {
-          pendingFunctionItems.value = Array.isArray(event.function_items)
-            ? event.function_items
-            : []
-          pendingResponsibilityEdges.value = Array.isArray(event.responsibility_edges)
-            ? event.responsibility_edges
-            : []
+          if (Array.isArray(event.function_items)) {
+            pendingFunctionItems.value = event.function_items
+          }
+          if (Array.isArray(event.responsibility_edges)) {
+            pendingResponsibilityEdges.value = event.responsibility_edges
+          }
+          if (event.event === 'planner_converged') {
+            saveResolvedGraphSnapshot({
+              functionItems: event.function_items,
+              responsibilityEdges: event.responsibility_edges,
+            })
+            graphPlanningActive.value = false
+            appendExecutionBlock({
+              step: 'planner_adjusted',
+              label: 'Planner 调整完成',
+              detail: `确认 ${pendingFunctionItems.value.length} 个责任节点`,
+              content: summarizeFunctionItems(pendingFunctionItems.value),
+            })
+          } else {
+            appendExecutionBlock({
+              step: 'planner_output',
+              label: 'Planner 初步规划',
+              detail: `规划 ${pendingFunctionItems.value.length} 个责任节点`,
+              content: summarizeFunctionItems(pendingFunctionItems.value),
+            })
+          }
           markExecutionPanelUpdated('graph')
           return
         }
         if (event.event === 'file_plan_ready') {
           currentStatus.value = { message: '文件规划已完成，正在绑定责任图谱…' }
+          appendExecutionBlock({ step: 'file_plan_ready', label: '文件计划完成', detail: '文件拓扑已准备', content: [] })
           if (showThoughts.value) activeExecutionTab.value = 'process'
           return
         }
         if (event.event === 'graph_resolved') {
           currentStatus.value = { message: '责任图谱已校验' }
+          saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges })
+          graphPlanningActive.value = false
+          appendExecutionBlock({ step: 'graph_resolved', label: '责任图谱确认', detail: `确认 ${planningNodes.value.length} 个节点 / ${planningEdges.value.length} 条边`, content: summarizeFunctionItems(displayFunctionItems.value) })
           markExecutionPanelUpdated('graph')
           return
         }
@@ -738,6 +852,7 @@ async function send() {
             ...(creationPlan.value || {}),
             tool_pool_summary: event.tool_pool_summary || {},
           }
+          appendExecutionBlock({ step: 'tool_pool_ready', label: '工具池准备完成', detail: '工具匹配结果已准备', content: [] })
           markExecutionPanelUpdated('tools')
         }
       },
@@ -750,14 +865,6 @@ async function send() {
       pendingBlueprintText.value = (
         plan.blueprint_text.trim()
       )
-    }
-
-    if (Array.isArray(plan.responsibility_edges)) {
-      pendingResponsibilityEdges.value = plan.responsibility_edges
-    }
-
-    if (Array.isArray(plan.function_items)) {
-      pendingFunctionItems.value = plan.function_items
     }
 
     if (plan.skill_name) {
@@ -782,6 +889,16 @@ async function send() {
       plan.review_summary ||
       null
     )
+
+    const intentContent = summarizeIntent(summary)
+    if (intentContent.length) {
+      appendExecutionBlock({
+        step: 'intent_analysis',
+        label: '识别用户意图',
+        detail: summary.goal || '已整理用户意图',
+        content: intentContent,
+      })
+    }
 
     const question = (
       plan.clarifying_questions ||
@@ -866,6 +983,8 @@ async function send() {
         )
       )
 
+      graphPlanningActive.value = false
+
       return
     }
 
@@ -900,8 +1019,27 @@ async function send() {
             .join('\n'),
       })
 
+      graphPlanningActive.value = false
+
       return
     }
+
+    if (plan.status === 'ready') {
+      if (Array.isArray(plan.function_items)) {
+        pendingFunctionItems.value = plan.function_items
+      }
+      if (Array.isArray(plan.responsibility_edges)) {
+        pendingResponsibilityEdges.value = plan.responsibility_edges
+      }
+
+      saveResolvedGraphSnapshot({
+        functionItems: plan.function_items,
+        responsibilityEdges: plan.responsibility_edges,
+      })
+    }
+    graphPlanningActive.value = false
+
+    appendExecutionBlock({ step: 'prepare_plan_ready', label: '文件计划完成', detail: `准备生成 ${Array.isArray(plan.files) ? plan.files.length : 0} 个文件`, content: summarizeFiles(plan.files) })
 
     creationPlan.value = plan
 
@@ -910,17 +1048,6 @@ async function send() {
       pendingBlueprintText.value
     )
 
-    pendingResponsibilityEdges.value = (
-      Array.isArray(plan.responsibility_edges)
-        ? plan.responsibility_edges
-        : pendingResponsibilityEdges.value
-    )
-
-    pendingFunctionItems.value = (
-      Array.isArray(plan.function_items)
-        ? plan.function_items
-        : pendingFunctionItems.value
-    )
 
     skillName.value = (
       plan.skill_name ||
@@ -960,7 +1087,17 @@ async function send() {
 // Creation panel handlers
 // ---------------------------------------------------------------------------
 
+function onCreationExecutionEvent(event) {
+  appendExecutionBlock({
+    step: event?.phase || 'creation_event',
+    label: event?.label || '创建执行事件',
+    detail: event?.detail || event?.filePath || '',
+    content: event?.content || [],
+  })
+}
+
 function onCreationComplete({ skillName, validateResult, packageResult }) {
+  appendExecutionBlock({ step: 'creation_complete', label: '创建完成', detail: `Skill ${skillName} 已创建完成`, content: ['可在沙盒模式下测试'] })
   messages.value.push({
     role: 'assistant',
     content:
@@ -1017,6 +1154,12 @@ function clearChat() {
   pendingFunctionItems.value = []
 
   pendingResponsibilityEdges.value = []
+
+  graphPlanningActive.value = false
+
+  resolvedFunctionItems.value = null
+
+  resolvedResponsibilityEdges.value = null
 
   pendingRequiredCapabilities.value = []
 

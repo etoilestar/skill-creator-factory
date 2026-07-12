@@ -6317,6 +6317,8 @@ Do not add files.
 Do not remove files.
 Do not rename files.
 Do not reinterpret the user's goal.
+Preserve user-stated requirements by priority: latest explicit human_feedback, original user_request, confirmed supplements, historical requirements not overridden by later feedback, and only then planner inference. Latest feedback overrides only conflicting older requirements; keep all non-conflicting user goals, input modes, outputs/final artifacts, required steps/capabilities, and explicit prohibitions. Do not let previous summaries replace user wording.
+
 
 Your only task is to bind executable responsibilities and cross-responsibility transport onto the frozen FilePlan.
 
@@ -6387,6 +6389,49 @@ Only output strict JSON object. Do not output Markdown or explanation.
         "function_items": data.get("function_items") or [],
         "responsibility_edges": data.get("responsibility_edges") or [],
     }
+
+def _planner_convergence_review_event_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    review_summary = result.get("review_summary")
+    if not isinstance(review_summary, dict):
+        review_summary = {}
+
+    items: list[str] = []
+    for key in ("changes", "risks"):
+        values = review_summary.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+            elif isinstance(value, dict):
+                text = str(
+                    value.get("message")
+                    or value.get("summary")
+                    or value.get("title")
+                    or ""
+                ).strip()
+            else:
+                text = str(value or "").strip()
+            if text:
+                items.append(text)
+            if len(items) >= 6:
+                break
+        if len(items) >= 6:
+            break
+
+    summary = "规划复核完成"
+    if items:
+        summary = f"规划复核完成，整理出 {len(items)} 条结论或建议"
+    elif str(result.get("status") or "") == "ready":
+        summary = "规划复核完成，方案已收敛"
+
+    return {
+        "event": "planner_convergence_review",
+        "title": "规划模型复核方案",
+        "summary": summary,
+        "items": items,
+    }
+
 
 async def _generate_internal_blueprint_or_questions(
     request: PreparePlanRequest,
@@ -6461,6 +6506,26 @@ review_summary 只是同一响应中的临时展示摘要。
 
 required_capabilities 只表达当前 scripts/*.py
 真实执行责任所需要的抽象语义能力。
+
+## 用户真实要求保留优先级
+
+理解和修订需求时，必须按以下优先级合并信息：
+
+1. 用户最新明确反馈 human_feedback；
+2. 用户最初的 user_request 原话；
+3. 用户已经确认的补充内容；
+4. 仍未被后续反馈覆盖的历史要求；
+5. Planner 自己的推测只能作为最后补充。
+
+必须保留：用户目标、输入方式、输出和最终产物、明确要求的步骤或能力、用户明确禁止的内容。
+
+规则：
+
+- 最新反馈只覆盖与它冲突的旧要求；
+- 不冲突的旧要求不能丢；
+- 不得用 previous_blueprint_text、review_summary 或模型旧摘要覆盖 user_request / human_feedback 的用户原话；
+- 用户已经说清楚的内容不要重复追问；
+- 修订 Blueprint 时只能替换被最新反馈明确冲突覆盖的部分，其他已确认业务要求必须继续进入 workflow、FilePlan purpose、outputs、constraints 或 forbidden_capabilities。
 
 ## 业务动作方向必须保持
 
@@ -7264,6 +7329,7 @@ Blueprint Planner 只规划业务责任。
                 normalized_converged_edges,
             )
             if event_emitter is not None:
+                await event_emitter(_planner_convergence_review_event_from_result(convergence_result))
                 await event_emitter({
                     "event": "planner_converged",
                     "function_items": data.get("function_items") or [],

@@ -340,7 +340,18 @@ const props = defineProps({
   confirmedUploadedAssets: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['creation-complete', 'creation-error'])
+const emit = defineEmits(['creation-complete', 'creation-error', 'execution-event'])
+
+
+function emitExecutionEvent({ phase, label, detail = '', content = [], filePath = '' } = {}) {
+  emit('execution-event', {
+    phase,
+    label,
+    detail,
+    content: Array.isArray(content) ? content.filter(item => typeof item === 'string') : (typeof content === 'string' ? content : ''),
+    filePath,
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Reactive state
@@ -801,6 +812,7 @@ async function handleAssetUpload(fileItem, event) {
 async function generateOneFile(idx) {
   const file = localFiles.value[idx]
   file.status = 'generating'
+  emitExecutionEvent({ phase: 'file_generation_start', label: '文件开始生成', detail: file.path, filePath: file.path, content: [file.purpose || '生成文件内容'] })
   file.error = ''
   file.generatedContent = ''
   file.repairMessage = ''
@@ -855,6 +867,10 @@ async function generateOneFile(idx) {
                   ? '局部补丁失败'
                   : '自动修复中'
         file.repairMessage = `${statusText}（第 ${chunk.validation.attempt} 次）：${chunk.validation.error || ''}`
+        emitExecutionEvent({ phase: 'file_validation_feedback', label: '收到校验反馈', detail: file.repairMessage, filePath: file.path, content: [statusText] })
+        if (validationStatus && validationStatus !== 'failed') {
+          emitExecutionEvent({ phase: 'file_local_repair_start', label: '开始局部修复', detail: file.path, filePath: file.path, content: [statusText] })
+        }
       } else if (chunk?.error) {
         if (typeof chunk.content === 'string' && chunk.content.trim()) {
           file.generatedContent = chunk.content
@@ -913,6 +929,7 @@ async function writeOneFile(idx) {
     if (!result.success) throw new Error(result.message)
     file.status = 'done'
     file.bytesWritten = result.bytes || 0
+    emitExecutionEvent({ phase: 'file_write_complete', label: '文件写入完成', detail: `${file.path}（${file.bytesWritten} bytes）`, filePath: file.path, content: [file.path] })
   } catch (err) {
     file.status = 'error'
     file.error = err.message
@@ -936,6 +953,7 @@ async function ensureSkillInitialized() {
 async function startCreation() {
   if (nameError.value) return
   currentIndex.value = 0
+  emitExecutionEvent({ phase: 'file_generation_start', label: '文件开始生成', detail: `准备生成 ${localFiles.value.length} 个文件`, content: localFiles.value.map(file => file.path) })
   validateResult.value = null
   packageResult.value = null
   paused.value = false
@@ -1039,6 +1057,7 @@ async function runCreationFromCurrentIndex() {
 
 async function runPostValidationAndPackaging() {
   phase.value = 'validating'
+  emitExecutionEvent({ phase: 'e2e_start', label: 'E2E 开始', detail: '开始严格端到端校验', content: [] })
   packageResult.value = null
 
   try {
@@ -1056,12 +1075,16 @@ async function runPostValidationAndPackaging() {
   }
 
   if (!validateResult.value?.success) {
+    emitExecutionEvent({ phase: 'e2e_failed', label: 'E2E 失败', detail: validateResult.value?.message || '严格端到端校验失败', content: [] })
     phase.value = 'failed'
     emit('creation-error', validateResult.value?.message || '严格端到端校验失败，已停止打包。')
     return
   }
 
+  emitExecutionEvent({ phase: 'e2e_success', label: 'E2E 成功', detail: '严格端到端校验通过', content: [] })
+
   phase.value = 'packaging'
+  emitExecutionEvent({ phase: 'package_start', label: '开始打包', detail: localSkillName.value, content: [] })
   try {
     packageResult.value = await packageSkill(localSkillName.value, {
       model: props.model,
@@ -1076,10 +1099,13 @@ async function runPostValidationAndPackaging() {
   }
 
   if (!packageResult.value?.success) {
+    emitExecutionEvent({ phase: 'package_failed', label: '打包结果', detail: packageResult.value?.message || '打包失败', content: [] })
     phase.value = 'failed'
     emit('creation-error', packageResult.value?.message || '打包失败')
     return
   }
+
+  emitExecutionEvent({ phase: 'package_complete', label: '打包完成', detail: packageResult.value?.path || '打包完成', content: [] })
 
   phase.value = 'complete'
   emit('creation-complete', {

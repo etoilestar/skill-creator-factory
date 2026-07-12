@@ -1203,6 +1203,131 @@ def _skill_md_reviewer_schema_error(data: Any) -> str:
                         return "SKILL.md semantic reviewer protocol contradiction: passed=true with nested blocking/error issue."
     return ""
 
+
+
+def _skill_md_review_python_run_args_analysis(content: str) -> dict[str, Any]:
+    """Return factual run(args) argv reads for the SKILL.md review prompt only."""
+    result: dict[str, Any] = {
+        "required_read_keys": [],
+        "optional_read_keys": [],
+        "reads_sys_argv": False,
+    }
+    try:
+        tree = ast.parse(content or "")
+    except SyntaxError:
+        return result
+
+    run_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            run_node = node
+            break
+    if run_node is None or not run_node.args.args:
+        return result
+
+    arg_names = {run_node.args.args[0].arg}
+    for node in ast.walk(run_node):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    arg_names.add(target.id)
+
+    required: set[str] = set()
+    optional: set[str] = set()
+    reads_sys_argv = False
+    for node in ast.walk(run_node):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "argv"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sys"
+        ):
+            reads_sys_argv = True
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in arg_names:
+            key_node = node.slice
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                required.add(key_node.value)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in arg_names
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            optional.add(node.args[0].value)
+
+    result["required_read_keys"] = sorted(required)
+    result["optional_read_keys"] = sorted(optional)
+    result["reads_sys_argv"] = reads_sys_argv
+    return result
+
+
+def _skill_md_script_interface_context_for_review(
+    *,
+    skill_name: str,
+    script_paths: Iterable[str],
+    requirement_graph: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Project existing script argv contracts and local graph facts for SKILL.md review.
+
+    This is not a standalone validator and does not infer or rewrite command
+    argv mappings. It gives the existing SKILL.md review model the same factual
+    script interface + FunctionItem edge context used during generation, so it
+    can block only when the evidence is explicit.
+    """
+    try:
+        skill_dir = settings.skills_path / _validate_skill_name(skill_name)
+    except Exception:
+        return []
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in script_paths or []:
+        script_path = str(raw_path or "").replace("\\", "/").strip().strip("`")
+        if (
+            not script_path.startswith("scripts/")
+            or not script_path.endswith(".py")
+            or script_path in seen
+        ):
+            continue
+        seen.add(script_path)
+
+        abs_path = skill_dir / script_path
+        if not abs_path.is_file():
+            continue
+
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+            schema = extract_python_strict_argv_schema(content)
+        except Exception as exc:
+            content = ""
+            schema = {"error": f"{type(exc).__name__}: {exc}"}
+
+        try:
+            run_analysis = _skill_md_review_python_run_args_analysis(content)
+        except Exception:
+            run_analysis = {}
+
+        try:
+            function_execution_context = build_function_execution_context(
+                graph=requirement_graph,
+                target_file=script_path,
+            )
+        except Exception as exc:
+            function_execution_context = {"error": f"{type(exc).__name__}: {exc}"}
+
+        items.append({
+            "script_path": script_path,
+            "strict_json_argv_schema": schema,
+            "run_args_analysis": run_analysis,
+            "function_execution_context": function_execution_context,
+        })
+
+    return items
+
 async def _review_skill_md_blueprint_intent_with_model(
     *,
     skill_name: str,
@@ -1237,6 +1362,11 @@ async def _review_skill_md_blueprint_intent_with_model(
     )
 
     parser_paths = _extract_declared_skill_paths(blueprint_text)
+    script_interface_context = _skill_md_script_interface_context_for_review(
+        skill_name=skill_name,
+        script_paths=[path for path in parser_paths if str(path or "").startswith("scripts/")],
+        requirement_graph=requirement_graph,
+    )
 
     prompt = (
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
@@ -1267,11 +1397,12 @@ async def _review_skill_md_blueprint_intent_with_model(
         "SKILL.md bash command block 语义审查规则：\n"
         "- bash command block 是运行模板，不是示例调用；普通说明文字可以出现示例，但不要扫描普通说明文字里的示例。\n"
         "- 只检查 ```bash fenced command block 内部，不扫描普通 Markdown 说明文字。\n"
-        "- requirement_graph / workflow_allocation 的 inputs/outputs 是强语义参考，不是字段名硬合同；不要要求 argv key 逐字等于 graph.inputs，也不要要求 placeholder 逐字等于 graph.outputs。\n"
-        "- 第一轮保留平台边界接口证明：平台 source slots 到第一个可执行 command 仍属于接口契约，第一个 command 不得用固定字面值完全替代平台动态输入。\n"
-        "- 第一轮只做命令块机械格式检查：fenced block 合法、runner 合法、script path 真实、脚本路径后 exactly one JSON object argv、JSON 可解析。\n"
-        "- 不审查内部脚本间 placeholder 精确来自哪个 stdout、argv key 是否等于 FunctionItem input、placeholder 是否等于上游 output、list/string/file_path 序列化、内部字段来源链、optional/default 运行时行为。\n"
-        "- 不要建议把脚本间 stdout 字段改成平台原始输入 sentinel；内部流转由第二轮 E2E 真实执行验证。\n"
+        "- 复用下方【已生成脚本接口与局部图谱事实】：strict_json_argv_schema 是目标脚本实际 guard 接口，function_execution_context.function_item/incoming_edges/outgoing_edges 是同一份局部图谱事实。\n"
+        "- command JSON key 只允许按目标脚本实际 strict_json_argv_guard/run(args) 接口判断；不要要求 key 等于 FunctionItem inputs，也不要把平台字段名当 argv key 白名单。\n"
+        "- command JSON value 只在证据明确时检查来源：应与对应 incoming_edges.from_output、platform_input_node 输出字段、或平台运行上下文来源一致。\n"
+        "- 证据明确时才输出 error：例如 command key 明显不在脚本 allowed/required key 中，或 required key 明确缺失，或 value 明确绑定到不存在的 incoming_edges.from_output/平台输入来源。\n"
+        "- 证据不足、字段别名不明确、类型序列化/list-string/file_path 细节不明确、内部字段来源链不完整时，不要猜测、不要阻断，passed=true 或最多 warning，继续交给现有 E2E 暴露和局部修复。\n"
+        "- 不要新增 validator/normalizer/repair/E2E/JSON 格式协议；这里只给现有 SKILL.md 审查模型做单点定位，repair_ops 仅限证据明确的 SKILL.md command block 最小替换。\n"
         "- 最终平台输出契约仍保持不变；final stdout 到 platform output 的 platform_io 问题仍可阻断。\n\n"
         "结构化 issue 字段规范：\n"
         "- blocking 可选；若该问题不影响执行闭环/资源角色/平台 IO/最终产物契约/用户关键要求传递，必须明确 blocking=false。\n"
@@ -1330,6 +1461,9 @@ async def _review_skill_md_blueprint_intent_with_model(
 
         "【compact requirement_graph 上下文，仅用于大致理解流程；不得用于阻断跨步骤精确字段/placeholder 来源】\n"
         f"{json.dumps(graph_context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+
+        "【已生成脚本接口与局部图谱事实，仅供 command key/value 审查；不得猜测或改写】\n"
+        f"{json.dumps(script_interface_context, ensure_ascii=False, indent=2, default=str)[:16000]}\n\n"
 
         "【蓝图原文】\n"
         f"{(blueprint_text or '')[-18000:]}\n\n"

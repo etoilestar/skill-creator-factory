@@ -1314,11 +1314,13 @@ def _existing_script_argv_context_for_skill_md(
     *,
     skill_name: str,
     declared_paths: set[str] | list[str],
+    responsibility_graph: Any = None,
 ) -> str:
-    """Collect strict_json_argv_guard schemas from already generated scripts.
+    """Collect already generated script argv and local graph facts.
 
     This is advisory context for SKILL.md command block generation.
-    It does not infer business argv names from SkillPlan/ResponsibilityGraph.
+    It does not infer, rewrite, normalize, or repair business argv names from
+    SkillPlan/ResponsibilityGraph; it only transports existing structured facts.
     """
     try:
         skill_dir = settings.skills_path / skill_name
@@ -1347,13 +1349,24 @@ def _existing_script_argv_context_for_skill_md(
         except Exception:
             run_analysis = {}
 
+        try:
+            function_execution_context = build_function_execution_context(
+                graph=responsibility_graph,
+                target_file=script_path,
+            )
+        except Exception as exc:
+            function_execution_context = {"error": f"{type(exc).__name__}: {exc}"}
+
         items.append({
             "script_path": script_path,
             "strict_json_argv_schema": schema,
             "run_args_analysis": run_analysis,
+            "function_execution_context": function_execution_context,
             "note": (
                 "Advisory for SKILL.md command JSON argv generation. "
-                "Do not rename script argv keys here; E2E will validate and repair mapping."
+                "Use the script's actual guard/run keys and bind argv values from incoming_edges "
+                "and platform runtime context facts; outgoing_edges only describe this script's outputs. Do not rename or mechanically rewrite script argv keys here; "
+                "E2E will validate and repair uncertain mappings."
             ),
         })
 
@@ -1361,7 +1374,7 @@ def _existing_script_argv_context_for_skill_md(
         return ""
 
     return (
-        "已生成脚本入口参数事实（来自 strict_json_argv_guard / run(args) AST，仅供 SKILL.md command block 优先参考）：\n"
+        "已生成脚本入口参数事实（来自 strict_json_argv_guard / run(args) AST 和 FunctionItem 图谱局部上下文，仅供 SKILL.md command block 优先参考）：\n"
         + json.dumps(items, ensure_ascii=False, indent=2, default=str)
     )
 
@@ -2152,6 +2165,7 @@ def _build_generate_file_prompt(
         _existing_script_argv_context_for_skill_md(
             skill_name=skill_name,
             declared_paths=declared_paths,
+            responsibility_graph=responsibility_graph,
         )
         if file_path == "SKILL.md"
         else ""

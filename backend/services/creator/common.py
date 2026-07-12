@@ -2861,3 +2861,20 @@ try:
     __all__.extend(["build_function_execution_context"])
 except Exception:
     pass
+
+
+def skill_md_command_protocol_text() -> str:
+    """Shared SKILL.md command protocol text for generation, rewrite, and repair prompts."""
+    return (
+        "统一 SKILL.md command protocol：\n"
+        "- 每个脚本执行命令必须位于标准独立 ```bash fenced block 中，且 block 内只允许一条 shell 命令。\n"
+        "- 命令必须直接调用真实 scripts/ 路径。\n"
+        "- 脚本路径后只允许一个参数：经过 shell quoting 的 JSON object argv（例如单引号包住的 JSON object）。\n"
+        "- JSON argv 必须能被 json.loads 解析为 object。\n"
+        "- 动态 {{placeholder}} 必须作为完整 JSON 字符串值出现，例如 {\"key\":\"{{value}}\"}；不得裸露在 JSON 中，不得拼接成半个字符串。\n"
+        "- 后端只校验 Markdown/shell/JSON 结构；不得在格式修复中修改 argv key、placeholder 或数据流语义。"
+    )
+try:
+    __all__.extend(["skill_md_command_protocol_text"])
+except Exception:
+    pass

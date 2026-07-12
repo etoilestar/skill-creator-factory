@@ -637,3 +637,154 @@ async def test_skill_md_value_repair_prompt_carries_value_only_constraints(monke
     assert "不得修改 argv key" in captured["target_rule"]
     assert "完整 responsibility_graph/dataflow_edges" in captured["task_context"]
     assert "validator issue" in captured["task_context"]
+
+
+def test_skill_md_dataflow_context_preserves_platform_nodes_and_probe_sources(monkeypatch, tmp_path):
+    monkeypatch.setattr(contracts.settings, "skills_path", tmp_path)
+    skill_dir = tmp_path / "generic"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / "probe.py").write_text(
+        "from backend.services.runtime_tools import strict_json_argv_guard\n"
+        "def run(argv):\n"
+        "    strict_json_argv_guard(argv, {'opaque_in': {'required': True}})\n"
+        "    return {'static_out': argv['opaque_in']}\n",
+        encoding="utf-8",
+    )
+
+    context = contracts._build_skill_md_dataflow_alignment_context(
+        skill_name="generic",
+        skill_md="```bash\npython scripts/probe.py '{\"opaque_in\":\"{{input}}\"}'\n```\n",
+        blueprint_text="files: scripts/probe.py",
+        requirement_graph={
+            "platform_input_node": {"id": "pin", "fields": {"opaque_seed": "string"}},
+            "platform_output_node": {"id": "pout", "outputs": ["final"]},
+            "dataflow_edges": [{"from_node": "pin", "from_output": "opaque_seed", "to_node": "scripts/probe.py", "to_input": "opaque_in"}],
+        },
+    )
+
+    graph = context["responsibility_graph"]
+    assert graph["platform_input_node"] == {"id": "pin", "fields": {"opaque_seed": "string"}}
+    assert graph["platform_output_node"] == {"id": "pout", "outputs": ["final"]}
+    script = context["scripts"][0]
+    assert script["declared_stdout_fields"] == []
+    assert script["probed_stdout_fields"] == ["static_out"]
+    assert script["actual_stdout_fields"] == []
+    assert script["stdout_field_evidence"]["declared_stdout_fields_source"] == "SkillPlanEntry.outputs declared contract"
+    assert script["stdout_field_evidence"]["actual_stdout_fields_source"] == "not executed in this context"
+    protocol = context["platform_boundaries"]["runtime_stdout_protocol"]
+    assert "payload.update(stdout_json)" in protocol
+    assert "nested" not in protocol
+    assert "from_node" not in context["platform_boundaries"]["placeholder_syntax"]
+
+
+@pytest.mark.asyncio
+async def test_skill_md_dataflow_validator_retries_empty_false_issues_then_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(contracts.settings, "skills_path", tmp_path)
+
+    class Route:
+        model = "unit-test-model"
+
+    calls = {"count": 0}
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(contracts, "_log_creator_model_usage", lambda **kwargs: None)
+
+    async def fake_complete(messages, model):
+        calls["count"] += 1
+        assert "passed=false requires" in messages[-1]["content"] or calls["count"] == 1
+        return json.dumps({"passed": False, "issues": []})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+
+    with pytest.raises(contracts.CreatorValidatorReviewError):
+        await contracts._validate_skill_md_dataflow_alignment(
+            skill_name="generic",
+            content="```bash\npython scripts/a.py '{}'\n```\n",
+            blueprint_text="scripts/a.py",
+            requirement_graph={},
+            model="unit-test-model",
+        )
+    assert calls["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_skill_md_value_alignment_repair_closed_loop_revalidates_and_preserves_scope(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    validator_calls = {"count": 0}
+    repair_calls = {"count": 0}
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+    monkeypatch.setattr(contracts, "_log_creator_model_usage", lambda **kwargs: None)
+
+    async def fake_complete(messages, model):
+        validator_calls["count"] += 1
+        if validator_calls["count"] == 1:
+            return json.dumps({
+                "passed": False,
+                "issues": [{
+                    "code": "skill_md_command_value_misaligned",
+                    "script_path": "scripts/second.py",
+                    "argv_key": "opaque_in",
+                    "current_value": "{{bad_value}}",
+                    "source_edge": {"from_node": "up", "from_output": "opaque_out", "to_node": "scripts/second.py", "to_input": "opaque_in"},
+                    "reason": "value is not supported by graph and probe evidence",
+                    "repair_scope": "command_argv_value_only",
+                    "repair_instruction": "replace only opaque_in value in scripts/second.py command",
+                    "evidence": "edge plus command argv summary",
+                }],
+            })
+        return json.dumps({"passed": True, "issues": [], "repair_suggestions": ""})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+
+    original = """---
+name: S
+description: D
+---
+Intro text stays.
+```bash
+python scripts/first.py '{"seed":"{{input}}"}'
+```
+```bash
+python scripts/second.py '{"opaque_in":"{{bad_value}}","mode":"keep"}'
+```
+Outro text stays.
+"""
+    repaired_expected = original.replace('"opaque_in":"{{bad_value}}"', '"opaque_in":"{{opaque_out}}"')
+
+    async def fake_request_and_apply_repair_patch(**kwargs):
+        repair_calls["count"] += 1
+        assert "只允许修改指定 command JSON argv 中指定 key 的 value" in kwargs["target_rule"]
+        return None, repaired_expected, {"changed_line_count": 1, "applied": [{"fallback_type": "none"}]}
+
+    monkeypatch.setattr(repair, "_request_and_apply_repair_patch", fake_request_and_apply_repair_patch)
+
+    validate_kwargs = dict(
+        skill_name="generic",
+        blueprint_text="scripts/first.py scripts/second.py",
+        requirement_graph={"dataflow_edges": [{"from_node": "up", "from_output": "opaque_out", "to_node": "scripts/second.py", "to_input": "opaque_in"}]},
+        model="unit-test-model",
+    )
+    with pytest.raises(ContractValidationError) as exc:
+        await contracts._validate_skill_md_dataflow_alignment(content=original, **validate_kwargs)
+
+    repaired = await repair._repair_generated_file_with_feedback(
+        prompt_messages=[{"role": "user", "content": "unified dataflow alignment context with current command block, edge, script probe, platform protocol"}],
+        model="unit-test-model",
+        file_path="SKILL.md",
+        previous_content=original,
+        validation_error=str(exc.value),
+        failed_checks_text=json.dumps({"failures": [result.details for result in exc.value.results]}),
+    )
+
+    second = await contracts._validate_skill_md_dataflow_alignment(content=repaired, **validate_kwargs)
+    assert second["passed"] is True
+    assert validator_calls["count"] == 2
+    assert repair_calls["count"] == 1
+    assert repaired == repaired_expected
+    assert "name: S" in repaired and "description: D" in repaired
+    assert "Intro text stays." in repaired and "Outro text stays." in repaired
+    assert "python scripts/first.py" in repaired
+    assert "python scripts/second.py" in repaired
+    assert '"opaque_in"' in repaired and '"mode":"keep"' in repaired
+    assert "{{bad_value}}" not in repaired

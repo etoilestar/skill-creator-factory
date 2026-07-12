@@ -11484,6 +11484,23 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
                 out.append(text)
         return out[:50]
 
+    def platform_node(value: Any, default_id: str) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            node = {"id": trunc(value.get("id") or value.get("node_id") or value.get("name") or default_id)}
+            for key in ("type", "label", "description", "fields", "outputs", "inputs"):
+                item = value.get(key)
+                if isinstance(item, (str, int, float, bool)) and str(item).strip():
+                    node[key] = trunc(item)
+                elif isinstance(item, (list, tuple)):
+                    node[key] = string_list(item)
+                elif isinstance(item, dict):
+                    node[key] = {str(k)[:80]: trunc(v) for k, v in list(item.items())[:40]}
+            return node
+        text = trunc(value or default_id)
+        return {"id": text or default_id}
+
     requirements: list[dict[str, Any]] = []
     raw_requirements = raw_graph.get("requirements")
     if not isinstance(raw_requirements, list):
@@ -11530,8 +11547,8 @@ def _compact_requirement_graph_for_prompt(raw_graph: Any) -> dict[str, Any]:
     compact_graph = {
         "requirements": requirements,
         "dataflow_edges": dataflow_edges,
-        "platform_input_node": trunc(raw_graph.get("platform_input_node") or "platform_input"),
-        "platform_output_node": trunc(raw_graph.get("platform_output_node") or "platform_output"),
+        "platform_input_node": platform_node(raw_graph.get("platform_input_node"), "platform_input"),
+        "platform_output_node": platform_node(raw_graph.get("platform_output_node"), "platform_output"),
     }
     serialized = json.dumps(compact_graph, ensure_ascii=False, default=str)
     if len(serialized) <= 14000:

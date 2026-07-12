@@ -1120,6 +1120,28 @@ def _compact_requirement_graph_for_skill_md_review(raw_graph: Any) -> dict[str, 
     return _normalize_requirement_graph_for_skill_md_dataflow(raw_graph)
 
 
+
+def _compact_platform_node_for_skill_md_dataflow(value: Any, *, default_id: str) -> dict[str, Any]:
+    """Keep platform boundary nodes structured without stringifying dicts."""
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in ("id", "node_id", "name", "type", "kind", "role", "fields", "outputs", "inputs", "description"):
+            item = value.get(key)
+            if item in (None, "", [], {}):
+                continue
+            if isinstance(item, (dict, list)):
+                out[key] = item
+            else:
+                out[key] = str(item).strip()[:500]
+        out.setdefault("id", str(value.get("id") or value.get("node_id") or default_id).strip()[:500])
+        return out
+    if isinstance(value, str) and value.strip():
+        return {"id": value.strip()[:500]}
+    return {"id": default_id}
+
+
 def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[str, Any]:
     """Serialize responsibility graph facts for SKILL.md dataflow alignment.
 
@@ -1130,8 +1152,8 @@ def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[s
         return {
             "requirements": [],
             "dataflow_edges": [],
-            "platform_input_node": "platform_input",
-            "platform_output_node": "platform_output",
+            "platform_input_node": {"id": "platform_input"},
+            "platform_output_node": {"id": "platform_output"},
         }
     if hasattr(raw_graph, "model_dump"):
         raw_graph = raw_graph.model_dump(mode="json")
@@ -1139,8 +1161,8 @@ def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[s
         return {
             "requirements": [],
             "dataflow_edges": [],
-            "platform_input_node": "platform_input",
-            "platform_output_node": "platform_output",
+            "platform_input_node": {"id": "platform_input"},
+            "platform_output_node": {"id": "platform_output"},
         }
 
     def trunc(value: Any, limit: int = 500) -> str:
@@ -1154,6 +1176,25 @@ def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[s
         else:
             items = [value]
         return [text for text in (trunc(item) for item in items) if text][:50]
+
+    def platform_node(value: Any, default_id: str) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            node_id = trunc(value.get("id") or value.get("node_id") or value.get("name") or default_id)
+            node = {"id": node_id or default_id}
+            for key in ("type", "label", "description", "fields", "outputs", "inputs"):
+                item = value.get(key)
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    if item not in (None, ""):
+                        node[key] = trunc(item)
+                elif isinstance(item, (list, tuple)):
+                    node[key] = string_list(item)
+                elif isinstance(item, dict):
+                    node[key] = {str(k)[:80]: trunc(v) for k, v in list(item.items())[:40]}
+            return node
+        text = trunc(value or default_id)
+        return {"id": text or default_id}
 
     requirements: list[dict[str, Any]] = []
     raw_requirements = raw_graph.get("requirements")
@@ -1199,8 +1240,8 @@ def _normalize_requirement_graph_for_skill_md_dataflow(raw_graph: Any) -> dict[s
     return {
         "requirements": requirements,
         "dataflow_edges": edges,
-        "platform_input_node": trunc(raw_graph.get("platform_input_node") or "platform_input"),
-        "platform_output_node": trunc(raw_graph.get("platform_output_node") or "platform_output"),
+        "platform_input_node": platform_node(raw_graph.get("platform_input_node"), "platform_input"),
+        "platform_output_node": platform_node(raw_graph.get("platform_output_node"), "platform_output"),
     }
 
 
@@ -1219,6 +1260,72 @@ def _skill_md_command_summaries(content: str) -> list[dict[str, Any]]:
             "argv_values": sig.get("placeholders", {}) if sig else {},
         })
     return summaries
+
+
+
+
+def _extract_static_stdout_fields_from_python_source(source: str) -> list[str]:
+    """Best-effort static stdout field probe from literal dict returns/prints.
+
+    This is evidence about source shape, not a runtime execution result.
+    """
+    if not str(source or "").strip():
+        return []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    fields: set[str] = set()
+
+    def collect_dict_keys(node: ast.AST) -> None:
+        if not isinstance(node, ast.Dict):
+            return
+        for key in node.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.strip():
+                fields.add(key.value.strip())
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Return):
+            collect_dict_keys(node.value)
+        elif isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "dumps"
+                and len(node.args) >= 1
+            ):
+                collect_dict_keys(node.args[0])
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+                and len(node.args) >= 1
+            ):
+                collect_dict_keys(node.args[0])
+    return sorted(fields)
+
+
+def _stdout_fields_from_runtime_contract(value: Any) -> list[str]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if not isinstance(value, dict):
+        return []
+    candidates = [
+        value.get("stdout_fields"),
+        value.get("outputs"),
+        value.get("stdout_schema"),
+        value.get("output_schema"),
+    ]
+    fields: set[str] = set()
+    for candidate in candidates:
+        if isinstance(candidate, (list, tuple)):
+            fields.update(str(item).strip() for item in candidate if str(item).strip())
+        elif isinstance(candidate, dict):
+            required = candidate.get("required") or candidate.get("required_keys")
+            if isinstance(required, (list, tuple)):
+                fields.update(str(item).strip() for item in required if str(item).strip())
+            props = candidate.get("properties")
+            if isinstance(props, dict):
+                fields.update(str(item).strip() for item in props.keys() if str(item).strip())
+    return sorted(fields)
 
 
 def _build_skill_md_dataflow_alignment_context(
@@ -1265,7 +1372,20 @@ def _build_skill_md_dataflow_alignment_context(
             except Exception:
                 run_analysis = {}
         entry = _skill_plan_entry_for_file(file_path=script_path, blueprint_text=blueprint_text)
-        stdout_fields = [str(item).strip() for item in (getattr(entry, "outputs", []) or []) if str(item).strip()]
+        declared_stdout_fields = [str(item).strip() for item in (getattr(entry, "outputs", []) or []) if str(item).strip()]
+        runtime_contract_fields = _stdout_fields_from_runtime_contract(getattr(entry, "runtime_contract", None))
+        static_stdout_fields = _extract_static_stdout_fields_from_python_source(source)
+        probed_stdout_fields = sorted(set(runtime_contract_fields) | set(static_stdout_fields))
+        actual_stdout_fields: list[str] = []
+        stdout_field_evidence = {
+            "declared_stdout_fields_source": "SkillPlanEntry.outputs declared contract",
+            "probed_stdout_fields_source": (
+                "runtime contract/static source probe"
+                if probed_stdout_fields
+                else "no runtime/static stdout probe evidence"
+            ),
+            "actual_stdout_fields_source": "not executed in this context",
+        }
         incoming = [edge for edge in graph["dataflow_edges"] if edge.get("to_node") == script_path]
         outgoing = [edge for edge in graph["dataflow_edges"] if edge.get("from_node") == script_path]
         scripts.append({
@@ -1274,7 +1394,10 @@ def _build_skill_md_dataflow_alignment_context(
             "allowed_argv_keys": guard_schema.get("allowed_keys") if isinstance(guard_schema, dict) else None,
             "required_argv_keys": guard_schema.get("required_keys") if isinstance(guard_schema, dict) else None,
             "run_args_analysis": run_analysis,
-            "declared_stdout_fields": stdout_fields,
+            "declared_stdout_fields": declared_stdout_fields,
+            "probed_stdout_fields": probed_stdout_fields,
+            "actual_stdout_fields": actual_stdout_fields,
+            "stdout_field_evidence": stdout_field_evidence,
             "incoming_edges": incoming,
             "outgoing_edges": outgoing,
         })
@@ -1284,8 +1407,8 @@ def _build_skill_md_dataflow_alignment_context(
         "platform_boundaries": {
             "input_node": graph.get("platform_input_node"),
             "output_node": graph.get("platform_output_node"),
-            "placeholder_syntax": "{{source.field}} for previous stdout/platform fields; runtime input files use __RUNTIME_INPUT_FILE__ sentinels after sanitization; references/** and assets/** are static relative paths; TEXT_MODEL is a runtime text-model constant.",
-            "runtime_stdout_protocol": "Each script prints a JSON object to stdout. The runtime merges a successful step stdout into later-step context under that script/upstream node; downstream command argv values must reference real upstream stdout fields or valid platform/static/runtime sources.",
+            "placeholder_syntax": "Use platform-supported placeholders for fields available in the flattened payload, runtime input file sentinels after sanitization, static references/** and assets/** paths, and TEXT_MODEL runtime constants.",
+            "runtime_stdout_protocol": "Each script prints a JSON object to stdout. In E2E, successful upstream stdout_json is flattened into the later payload with payload.update(stdout_json). Downstream values should use fields available in that flattened payload or valid platform/static/runtime sources.",
         },
         "current_skill_md_commands": _skill_md_command_summaries(skill_md),
     }
@@ -1954,34 +2077,75 @@ async def _validate_skill_md_dataflow_alignment(
         "【当前 SKILL.md】\n"
         f"{(content or '')[-22000:]}"
     )
+    required_issue_fields = {
+        "script_path",
+        "argv_key",
+        "current_value",
+        "source_edge",
+        "reason",
+        "repair_scope",
+        "repair_instruction",
+        "evidence",
+    }
+
+    def schema_error(parsed: Any) -> str:
+        if not isinstance(parsed, dict):
+            return "reviewer output must be a JSON object"
+        if not isinstance(parsed.get("passed"), bool):
+            return "field passed must be bool"
+        issues = parsed.get("issues")
+        if not isinstance(issues, list):
+            return "field issues must be a list"
+        if parsed.get("passed") is False:
+            if not issues:
+                return "passed=false requires at least one structured issue"
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    return "each issue must be an object"
+                missing = sorted(required_issue_fields - set(issue.keys()))
+                if missing:
+                    return "issue missing required fields: " + ", ".join(missing)
+                if issue.get("repair_scope") != "command_argv_value_only":
+                    return "issue repair_scope must be command_argv_value_only"
+        return ""
+
     raw = ""
+    last_schema_error = ""
     data: dict[str, Any] | None = None
     for attempt in range(3):
+        retry_suffix = (
+            f"\n\n上一轮输出不是合法结构：{last_schema_error}。请在不改变审查结论的前提下重新输出合法 JSON。上一轮输出摘录：{raw[:1200]}"
+            if attempt > 0
+            else ""
+        )
         messages = [
             {"role": "system", "content": "只输出 JSON object，不要输出 Markdown。"},
-            {"role": "user", "content": prompt if attempt == 0 else prompt + f"\n\n上一轮输出不是有效 schema，请只修 JSON 格式：{raw[:1200]}"},
+            {"role": "user", "content": prompt + retry_suffix},
         ]
         raw = await complete_chat_once(messages, route.model)
         parsed = _json_loads_loose_object(raw)
-        if isinstance(parsed, dict) and isinstance(parsed.get("passed"), bool) and isinstance(parsed.get("issues", []), list):
+        last_schema_error = schema_error(parsed)
+        if not last_schema_error:
             data = parsed
             break
     if not isinstance(data, dict):
-        raise CreatorValidatorReviewError("SKILL.md dataflow alignment reviewer did not return valid JSON object.", raw_excerpt=str(raw or "")[:1000])
+        raise CreatorValidatorReviewError(
+            "SKILL.md dataflow alignment reviewer did not return valid JSON object/schema: "
+            + (last_schema_error or "unknown schema error"),
+            raw_excerpt=str(raw or "")[:1000],
+        )
     data.setdefault("issues", [])
     data.setdefault("repair_suggestions", "")
     if data.get("passed") is not True:
         results = [_skill_md_dataflow_issue_to_contract_result(issue) for issue in data.get("issues") or [] if isinstance(issue, dict)]
-        if results:
-            message = (
-                "SKILL.md command JSON argv value 与责任图谱/脚本 probe/平台协议不一致。\n"
-                "该失败必须进入现有局部 repair；后端不得直接重写 argv value。\n"
-                "统一对齐上下文：\n"
-                f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
-                + _format_contract_failures_safe(results)
-            )
-            raise ContractValidationError(message, results)
-        data["passed"] = True
+        message = (
+            "SKILL.md command JSON argv value 与责任图谱/脚本 probe/平台协议不一致。\n"
+            "该失败必须进入现有局部 repair；后端不得直接重写 argv value。\n"
+            "统一对齐上下文：\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+            + _format_contract_failures_safe(results)
+        )
+        raise ContractValidationError(message, results)
     return data
 
 

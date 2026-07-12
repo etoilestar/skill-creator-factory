@@ -11337,14 +11337,61 @@ def _first_round_format_stage_error(
 
 
 
-def _markdown_rewrite_structured_facts(*, current_content: str, blueprint_text: str) -> dict[str, Any]:
+def _script_argv_keys_from_context(script_argv_context: Any) -> dict[str, list[str]]:
+    if not script_argv_context:
+        return {}
+    data = script_argv_context
+    if isinstance(script_argv_context, str):
+        try:
+            start = script_argv_context.index("[")
+            data = json.loads(script_argv_context[start:])
+        except Exception:
+            return {}
+    if not isinstance(data, list):
+        return {}
+    result: dict[str, list[str]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        script_path = str(item.get("script_path") or "").strip()
+        schema = item.get("strict_json_argv_schema")
+        if not script_path or not isinstance(schema, dict):
+            continue
+        result[script_path] = sorted(str(key) for key in schema.keys() if str(key).strip() and key != "error")
+    return result
+
+
+def _markdown_failure_facts_for_compare(rewrite_facts: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    items = []
+    for item in (rewrite_facts or {}).get("commands") or []:
+        if not isinstance(item, dict):
+            continue
+        parser_facts = item.get("parser_facts") if isinstance(item.get("parser_facts"), dict) else {}
+        items.append({
+            "target_script": str(item.get("target_script") or ""),
+            "arg_mode": parser_facts.get("arg_mode"),
+            "args_count": parser_facts.get("args_count"),
+            "flag_tokens": sorted(str(token) for token in (parser_facts.get("flag_tokens") or [])),
+        })
+    return sorted(items, key=lambda item: (item["target_script"], str(item["arg_mode"]), str(item["args_count"]), ",".join(item["flag_tokens"])))
+
+
+def _markdown_rewrite_structured_facts(
+    *,
+    current_content: str,
+    blueprint_text: str,
+    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
+    script_argv_context: Any = None,
+) -> dict[str, Any]:
     scripts = sorted(_declared_skill_paths_from_blueprint(blueprint_text or '') or [])
     script_paths = [p for p in scripts if p.startswith('scripts/') and p.endswith('.py')]
+    known_argv_keys = _script_argv_keys_from_context(script_argv_context)
     commands = [m.group(1).strip() for m in re.finditer(r'(?ims)^```bash\s*\n(.*?)\n```', current_content or '')]
     command_items = []
     for command in commands:
         matched_script = next((p for p in script_paths if p in command), '')
         sig = _command_signature(command, matched_script) if matched_script else None
+        parsed_keys = sorted((sig or {}).get('keys') or [])
         command_items.append({
             'target_script': matched_script,
             'current_command': command,
@@ -11353,16 +11400,17 @@ def _markdown_rewrite_structured_facts(*, current_content: str, blueprint_text: 
                 'args_count': (sig or {}).get('args_count'),
                 'flag_tokens': (sig or {}).get('flag_tokens') or [],
             },
-            'script_argv_keys': sorted((sig or {}).get('keys') or []),
+            'script_argv_keys': known_argv_keys.get(matched_script) or parsed_keys,
         })
     return {
         'target_script': script_paths[0] if len(script_paths) == 1 else '',
         'current_command': command_items[0]['current_command'] if len(command_items) == 1 else '',
         'parser_facts': command_items[0]['parser_facts'] if len(command_items) == 1 else {},
-        'script_argv_keys': command_items[0]['script_argv_keys'] if len(command_items) == 1 else [],
-        'responsibility_bindings': re.findall(r'(?:from_output|to_input|argv_key|value_template)\s*[:=]\s*[^\n,}]+', blueprint_text or '')[:200],
+        'script_argv_keys': (known_argv_keys.get(script_paths[0]) if len(script_paths) == 1 else []) or (command_items[0]['script_argv_keys'] if len(command_items) == 1 else []),
+        'responsibility_bindings': responsibility_binding_context or {},
         'declared_file_paths': scripts,
         'commands': command_items,
+        'failure_facts': _markdown_failure_facts_for_compare({'commands': command_items}),
     }
 
 def _build_markdown_format_full_rewrite_prompt(
@@ -11372,16 +11420,18 @@ def _build_markdown_format_full_rewrite_prompt(
     blueprint_text: str,
     deterministic_error: str,
     current_content: str,
-    previous_failure_facts: dict[str, Any] | None = None,
+    previous_failure_facts: list[dict[str, Any]] | None = None,
+    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
+    script_argv_context: Any = None,
 ) -> list[dict[str, str]]:
-    rewrite_facts = _markdown_rewrite_structured_facts(current_content=current_content, blueprint_text=blueprint_text)
-    current_pf = rewrite_facts.get("parser_facts") if isinstance(rewrite_facts, dict) else {}
-    no_progress = bool(previous_failure_facts and {k: previous_failure_facts.get(k) for k in ("target_script", "arg_mode", "flag_tokens", "args_count")} == {
-        "target_script": rewrite_facts.get("target_script"),
-        "arg_mode": (current_pf or {}).get("arg_mode"),
-        "flag_tokens": (current_pf or {}).get("flag_tokens") or [],
-        "args_count": (current_pf or {}).get("args_count"),
-    })
+    rewrite_facts = _markdown_rewrite_structured_facts(
+        current_content=current_content,
+        blueprint_text=blueprint_text,
+        responsibility_binding_context=responsibility_binding_context,
+        script_argv_context=script_argv_context,
+    )
+    current_failure_facts = _markdown_failure_facts_for_compare(rewrite_facts)
+    no_progress = bool(previous_failure_facts and previous_failure_facts == current_failure_facts)
     no_progress_text = "上一轮未改变失败的命令参数结构。\n" if no_progress else ""
     return [
         {
@@ -11947,6 +11997,14 @@ async def generate_file(request: GenerateFileRequest):
             skill_md_binding_context = responsibility_binding_context_from_graph(
                 {"responsibility_edges": request.responsibility_edges} if request.responsibility_edges else request.requirement_graph
             )
+            skill_md_script_argv_context = (
+                _existing_script_argv_context_for_skill_md(
+                    skill_name=skill_name,
+                    declared_paths=_declared_skill_paths_from_blueprint(request.blueprint_text),
+                )
+                if request.file_path == "SKILL.md"
+                else ""
+            )
 
             prompt_messages = (
                 _build_generate_file_prompt(
@@ -11982,7 +12040,7 @@ async def generate_file(request: GenerateFileRequest):
         repair_counts_by_layer: dict[str, int] = {}
         format_retry_count = 0
         markdown_format_retry_count = 0
-        previous_markdown_failure_facts: dict[str, Any] | None = None
+        previous_markdown_failure_facts: list[dict[str, Any]] | None = None
         business_repair_count = 0
         repair_failure_signatures: dict[str, tuple[int, str]] = {}
         # Track how many tool re-explorations have been triggered for this file
@@ -12576,7 +12634,12 @@ async def generate_file(request: GenerateFileRequest):
                         },
                     })
 
-                    current_failure_facts = _markdown_rewrite_structured_facts(current_content=candidate or "", blueprint_text=request.blueprint_text)
+                    current_rewrite_facts = _markdown_rewrite_structured_facts(
+                        current_content=candidate or "",
+                        blueprint_text=request.blueprint_text,
+                        responsibility_binding_context=skill_md_binding_context,
+                        script_argv_context=skill_md_script_argv_context,
+                    )
                     rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                         file_path=request.file_path,
                         skill_name=skill_name,
@@ -12584,14 +12647,10 @@ async def generate_file(request: GenerateFileRequest):
                         deterministic_error=deterministic_error,
                         current_content=candidate or "",
                         previous_failure_facts=previous_markdown_failure_facts,
+                        responsibility_binding_context=skill_md_binding_context,
+                        script_argv_context=skill_md_script_argv_context,
                     )
-                    parser_facts = current_failure_facts.get("parser_facts") if isinstance(current_failure_facts, dict) else {}
-                    previous_markdown_failure_facts = {
-                        "target_script": current_failure_facts.get("target_script"),
-                        "arg_mode": (parser_facts or {}).get("arg_mode"),
-                        "flag_tokens": (parser_facts or {}).get("flag_tokens") or [],
-                        "args_count": (parser_facts or {}).get("args_count"),
-                    }
+                    previous_markdown_failure_facts = _markdown_failure_facts_for_compare(current_rewrite_facts)
 
                     candidate = await _complete_creator_file_generation(
                         messages=rewrite_messages,
@@ -12946,7 +13005,12 @@ async def generate_file(request: GenerateFileRequest):
                                 "error": deterministic_error,
                             },
                         })
-                        current_failure_facts = _markdown_rewrite_structured_facts(current_content=candidate or "", blueprint_text=request.blueprint_text)
+                        current_rewrite_facts = _markdown_rewrite_structured_facts(
+                            current_content=candidate or "",
+                            blueprint_text=request.blueprint_text,
+                            responsibility_binding_context=skill_md_binding_context,
+                            script_argv_context=skill_md_script_argv_context,
+                        )
                         rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                             file_path=request.file_path,
                             skill_name=skill_name,
@@ -12954,14 +13018,10 @@ async def generate_file(request: GenerateFileRequest):
                             deterministic_error=deterministic_error,
                             current_content=candidate or "",
                             previous_failure_facts=previous_markdown_failure_facts,
+                            responsibility_binding_context=skill_md_binding_context,
+                            script_argv_context=skill_md_script_argv_context,
                         )
-                        parser_facts = current_failure_facts.get("parser_facts") if isinstance(current_failure_facts, dict) else {}
-                        previous_markdown_failure_facts = {
-                            "target_script": current_failure_facts.get("target_script"),
-                            "arg_mode": (parser_facts or {}).get("arg_mode"),
-                            "flag_tokens": (parser_facts or {}).get("flag_tokens") or [],
-                            "args_count": (parser_facts or {}).get("args_count"),
-                        }
+                        previous_markdown_failure_facts = _markdown_failure_facts_for_compare(current_rewrite_facts)
                         candidate = await _complete_creator_file_generation(
                             messages=rewrite_messages,
                             model=route.model,

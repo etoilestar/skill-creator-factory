@@ -29,10 +29,14 @@ function createHarness() {
   }
   const planHasPythonScript = (plan) => (Array.isArray(plan?.files) ? plan.files : []).some(file => String(file?.path || file || '').replace(/\\/g, '/').startsWith('scripts/') && String(file?.path || file || '').endsWith('.py'))
   const graphCandidateFromReadyPlan = (plan) => {
+    const topFunctionItems = Array.isArray(plan?.function_items) && plan.function_items.length > 0 ? plan.function_items : null
+    const topEdges = Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : []
+    if (topFunctionItems) return { functionItems: topFunctionItems, responsibilityEdges: topEdges }
     const graph = plan?.requirement_graph && typeof plan.requirement_graph === 'object' ? plan.requirement_graph : {}
+    const graphRequirements = Array.isArray(graph.requirements) && graph.requirements.length > 0 ? graph.requirements : null
     return {
-      functionItems: Array.isArray(plan?.function_items) ? plan.function_items : (Array.isArray(graph.function_items) ? graph.function_items : null),
-      responsibilityEdges: Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : (Array.isArray(graph.responsibility_edges) ? graph.responsibility_edges : null),
+      functionItems: graphRequirements,
+      responsibilityEdges: Array.isArray(graph.dataflow_edges) ? graph.dataflow_edges : null,
     }
   }
   const saveReadyPlanGraphSnapshot = (plan) => {
@@ -276,8 +280,16 @@ describe('CreatorView current planning graph snapshot rules', () => {
   it('ready plan can backfill from requirement_graph when no resolved event arrived', () => {
     const h = createHarness()
     h.startRevise()
-    h.onPlan({ status: 'ready', files: [{ path: 'scripts/fallback.py' }], requirement_graph: { function_items: [{ target_file: 'scripts/fallback.py' }], responsibility_edges: [] } })
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/fallback.py' }], requirement_graph: { requirements: [{ target_file: 'scripts/fallback.py' }], dataflow_edges: [] } })
     assert.deepEqual(h.resolvedFunctionItems, [{ target_file: 'scripts/fallback.py' }])
+  })
+
+  it('empty top-level ready graph arrays do not block requirement_graph fallback', () => {
+    const h = createHarness()
+    h.startRevise()
+    h.onPlan({ status: 'ready', files: [{ path: 'scripts/fallback.py' }], function_items: [], responsibility_edges: [], requirement_graph: { requirements: [{ target_file: 'scripts/fallback.py' }], dataflow_edges: [{ from_node: 'platform_input_node', to_node: 'scripts/fallback.py' }] } })
+    assert.deepEqual(h.resolvedFunctionItems, [{ target_file: 'scripts/fallback.py' }])
+    assert.deepEqual(h.resolvedResponsibilityEdges, [{ from_node: 'platform_input_node', to_node: 'scripts/fallback.py' }])
   })
 
   it('ready plan with scripts and empty candidate preserves existing resolved graph', () => {

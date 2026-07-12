@@ -650,12 +650,21 @@ function planHasPythonScript(plan) {
 }
 
 function graphCandidateFromReadyPlan(plan) {
-  const topFunctionItems = Array.isArray(plan?.function_items) ? plan.function_items : null
-  const topEdges = Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : null
+  const topFunctionItems = Array.isArray(plan?.function_items) && plan.function_items.length > 0
+    ? plan.function_items
+    : null
+  const topEdges = Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : []
+  if (topFunctionItems) {
+    return { functionItems: topFunctionItems, responsibilityEdges: topEdges }
+  }
+
   const graph = plan?.requirement_graph && typeof plan.requirement_graph === 'object' ? plan.requirement_graph : {}
+  const graphRequirements = Array.isArray(graph.requirements) && graph.requirements.length > 0
+    ? graph.requirements
+    : null
   return {
-    functionItems: topFunctionItems || (Array.isArray(graph.function_items) ? graph.function_items : null),
-    responsibilityEdges: topEdges || (Array.isArray(graph.responsibility_edges) ? graph.responsibility_edges : null),
+    functionItems: graphRequirements,
+    responsibilityEdges: Array.isArray(graph.dataflow_edges) ? graph.dataflow_edges : null,
   }
 }
 

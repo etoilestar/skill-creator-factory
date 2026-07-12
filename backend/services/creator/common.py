@@ -112,12 +112,12 @@ _SKILL_MD_MARKDOWN_EXECUTION_GUIDE = """
 - 对纯文本即可完成的任务，明确写“直接回答”，不要要求运行脚本。
 - 如果确实需要运行 scripts/ 下的脚本，必须使用标准 Markdown fenced code block，且 info string 必须是 bash。
 - 每个 ```bash block 内只能有一条真实 shell 命令。
-- 脚本命令必须直接调用 scripts/ 下的真实脚本，例如 `python scripts/example.py ...`。
-- 命令参数形态必须由脚本真实接口决定：如果脚本读取 JSON argv，则传入一个 json.loads 可解析的 JSON object 字符串；如果脚本使用 argparse，则使用对应 flags；如果脚本无需参数，可以不传参数。
-- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。
+- 脚本命令必须直接调用 scripts/ 下的真实脚本。
+- Creator 生成脚本统一使用 positional JSON object argv：script path 后 exactly one shell argument，且该 argument 是 json.loads 可解析的 JSON object；外部其他 CLI 必须由包装入口适配。
+- 不得固定套用任何模板字段。
 - 禁止在 ```bash block 内直接写 JSON 配置对象、runner/script/argv 伪命令对象、说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。
 - 机器可读 JSON 示例、配置、stdout 示例如果需要展示，必须使用 ```json fenced code block，不得伪装成 ```bash。
-- 命令示例必须与脚本真实接口一致：脚本读 JSON argv 时，示例就传 JSON；脚本读 stdin 时，正文就说明 stdin 内容。禁止让运行时主模型根据脚本名临时猜 CLI flags。
+- 命令必须遵守 Creator positional JSON object argv 协议；禁止让运行时主模型根据脚本名临时猜 CLI flags。
 - 参数映射用普通 Markdown 列表说明通用来源：命令示例应从用户输入、显式字段、默认值、上传文件、前序 stdout 中选择当前脚本真正需要的值；若当前 argv key 存在 incoming ResponsibilityEdge，value 必须服从该 edge 的 from_output。
 - 只有 assistant 在 Sandbox 当轮回复中输出的 fenced code block 才会被宿主解析和执行；SKILL.md 中的 block 是运行说明/示例，不会在加载时自动执行。
 - 如果需要写文件，用普通 Markdown 说明 assistant 应输出 `写入文件：<path>` 或 `保存到：<path>`，并把完整文件内容放在紧随其后的 fenced code block。

@@ -246,7 +246,6 @@ const pendingBlueprintText = ref('')
 const pendingFunctionItems = ref([])
 const pendingResponsibilityEdges = ref([])
 const graphPlanningActive = ref(false)
-const resolvedGraphReceivedForCurrentPlan = ref(false)
 const resolvedFunctionItems = ref(null)
 const resolvedResponsibilityEdges = ref(null)
 const pendingRequiredCapabilities = ref([])
@@ -289,27 +288,23 @@ const reviewSummaryTitle = computed(() => {
   return '已整理的创建要点'
 })
 
-const hasPendingFunctionItems = computed(() => (
-  Array.isArray(pendingFunctionItems.value) && pendingFunctionItems.value.length > 0
-))
-
 const displayFunctionItems = computed(() => (
-  graphPlanningActive.value && hasPendingFunctionItems.value
+  graphPlanningActive.value
     ? pendingFunctionItems.value
     : (
         Array.isArray(resolvedFunctionItems.value)
           ? resolvedFunctionItems.value
-          : (Array.isArray(pendingFunctionItems.value) ? pendingFunctionItems.value : [])
+          : pendingFunctionItems.value
       )
 ))
 
 const displayResponsibilityEdges = computed(() => (
-  graphPlanningActive.value && hasPendingFunctionItems.value
-    ? (Array.isArray(pendingResponsibilityEdges.value) ? pendingResponsibilityEdges.value : [])
+  graphPlanningActive.value
+    ? pendingResponsibilityEdges.value
     : (
         Array.isArray(resolvedResponsibilityEdges.value)
           ? resolvedResponsibilityEdges.value
-          : (Array.isArray(pendingResponsibilityEdges.value) ? pendingResponsibilityEdges.value : [])
+          : pendingResponsibilityEdges.value
       )
 ))
 
@@ -635,50 +630,10 @@ function summarizeIntent(summary) {
   return content.slice(0, 12)
 }
 
-function saveResolvedGraphSnapshot({ functionItems, responsibilityEdges, markReceived = false } = {}) {
+function saveResolvedGraphSnapshot({ functionItems, responsibilityEdges } = {}) {
   if (Array.isArray(functionItems)) resolvedFunctionItems.value = functionItems
   if (Array.isArray(responsibilityEdges)) resolvedResponsibilityEdges.value = responsibilityEdges
-  if (markReceived && (Array.isArray(functionItems) || Array.isArray(responsibilityEdges))) {
-    resolvedGraphReceivedForCurrentPlan.value = true
-  }
   if (Array.isArray(functionItems) || Array.isArray(responsibilityEdges)) graphPlanningActive.value = false
-}
-
-function planHasPythonScript(plan) {
-  const files = Array.isArray(plan?.files) ? plan.files : []
-  return files.some(file => String(file?.path || file || '').replace(/\\/g, '/').startsWith('scripts/') && String(file?.path || file || '').endsWith('.py'))
-}
-
-function graphCandidateFromReadyPlan(plan) {
-  const topFunctionItems = Array.isArray(plan?.function_items) && plan.function_items.length > 0
-    ? plan.function_items
-    : null
-  const topEdges = Array.isArray(plan?.responsibility_edges) ? plan.responsibility_edges : []
-  if (topFunctionItems) {
-    return { functionItems: topFunctionItems, responsibilityEdges: topEdges }
-  }
-
-  const graph = plan?.requirement_graph && typeof plan.requirement_graph === 'object' ? plan.requirement_graph : {}
-  const graphRequirements = Array.isArray(graph.requirements) && graph.requirements.length > 0
-    ? graph.requirements
-    : null
-  return {
-    functionItems: graphRequirements,
-    responsibilityEdges: Array.isArray(graph.dataflow_edges) ? graph.dataflow_edges : null,
-  }
-}
-
-function saveReadyPlanGraphSnapshot(plan) {
-  if (resolvedGraphReceivedForCurrentPlan.value) return
-  const { functionItems, responsibilityEdges } = graphCandidateFromReadyPlan(plan)
-  const hasScripts = planHasPythonScript(plan)
-  if (!hasScripts) {
-    saveResolvedGraphSnapshot({ functionItems: functionItems || [], responsibilityEdges: responsibilityEdges || [] })
-    return
-  }
-  if (Array.isArray(functionItems) && functionItems.length > 0) {
-    saveResolvedGraphSnapshot({ functionItems, responsibilityEdges: Array.isArray(responsibilityEdges) ? responsibilityEdges : [] })
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +691,6 @@ async function send() {
   showCreationPanel.value = false
 
   graphPlanningActive.value = true
-  resolvedGraphReceivedForCurrentPlan.value = false
 
   messages.value.push({
     role: 'user',
@@ -847,7 +801,6 @@ async function send() {
             saveResolvedGraphSnapshot({
               functionItems: event.function_items,
               responsibilityEdges: event.responsibility_edges,
-              markReceived: true,
             })
             graphPlanningActive.value = false
             appendExecutionBlock({
@@ -874,7 +827,7 @@ async function send() {
         }
         if (event.event === 'graph_resolved') {
           currentStatus.value = { message: '责任图谱已校验' }
-          saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges, markReceived: true })
+          saveResolvedGraphSnapshot({ functionItems: event.function_items, responsibilityEdges: event.responsibility_edges })
           graphPlanningActive.value = false
           appendExecutionBlock({ step: 'graph_resolved', label: '责任图谱确认', detail: `确认 ${planningNodes.value.length} 个节点 / ${planningEdges.value.length} 条边`, content: summarizeFunctionItems(displayFunctionItems.value) })
           markExecutionPanelUpdated('graph')
@@ -1072,7 +1025,10 @@ async function send() {
         pendingResponsibilityEdges.value = plan.responsibility_edges
       }
 
-      saveReadyPlanGraphSnapshot(plan)
+      saveResolvedGraphSnapshot({
+        functionItems: plan.function_items,
+        responsibilityEdges: plan.responsibility_edges,
+      })
     }
     graphPlanningActive.value = false
 
@@ -1197,7 +1153,6 @@ function clearChat() {
   resolvedFunctionItems.value = null
 
   resolvedResponsibilityEdges.value = null
-  resolvedGraphReceivedForCurrentPlan.value = false
 
   pendingRequiredCapabilities.value = []
 

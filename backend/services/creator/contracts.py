@@ -122,42 +122,29 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         return None
 
     args = parts[2:]
-    flag_tokens = [str(arg) for arg in args if str(arg).startswith("-")]
 
     json_payload: dict[str, Any] | None = None
     arg_mode = "no_args"
-    argv_error_code = "json_argv_missing"
-    json_load_error = ""
 
     if len(args) == 1:
         arg0 = args[0].strip()
-        if flag_tokens:
-            arg_mode = "argparse_flags"
-            argv_error_code = "unexpected_cli_flag"
-        elif arg0.startswith("{") and arg0.endswith("}"):
+        if arg0.startswith("{") and arg0.endswith("}"):
             try:
                 parsed = _loads_templated_json_argv_object(arg0)
                 if isinstance(parsed, dict):
                     json_payload = parsed
                     arg_mode = "json_arg"
-                    argv_error_code = ""
                 else:
                     arg_mode = "invalid_json_arg"
-                    argv_error_code = "json_object_syntax_invalid"
-            except json.JSONDecodeError as exc:
+            except json.JSONDecodeError:
                 arg_mode = "invalid_json_arg"
-                argv_error_code = "json_object_syntax_invalid"
-                json_load_error = exc.msg
         elif arg0:
             arg_mode = "positional_args"
-            argv_error_code = "json_object_syntax_invalid"
     elif args:
-        if flag_tokens:
+        if any(str(arg).startswith("-") for arg in args):
             arg_mode = "argparse_flags"
-            argv_error_code = "unexpected_cli_flag"
         else:
             arg_mode = "positional_args"
-            argv_error_code = "json_argv_split_across_shell_args"
 
     placeholders: dict[str, str] = {}
     keys: set[str] = set()
@@ -175,11 +162,7 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         "runner": runner,
         "script_path": expected_script,
         "args": args,
-        "args_count": len(args),
-        "flag_tokens": flag_tokens,
         "arg_mode": arg_mode,
-        "argv_error_code": argv_error_code,
-        "json_load_error": json_load_error,
         "json_payload": json_payload,
         "keys": keys,
         "placeholders": placeholders,
@@ -339,44 +322,13 @@ def _check_command_block_contract(script_path: str, commands: list[str], entry: 
 
         keys = _command_payload_keys(command, script_path)
         json_ok = keys is not None
-        error_code = str(command_sig.get("argv_error_code") or "json_argv_missing")
-        if json_ok:
-            message = "命令块使用可解析 JSON argv。"
-            minimal_edit = "无需修改。"
-        elif error_code == "unexpected_cli_flag":
-            message = (
-                "unexpected_cli_flag: 当前 Creator 协议不接受 CLI flags；"
-                f"删除检测到的 flag {command_sig.get('flag_tokens') or []!r}；"
-                "script path 后必须直接跟一个 JSON object 参数；"
-                "不得修改 argv key 和 value 来源。"
-            )
-            minimal_edit = "只删除 CLI flag 并恢复为 script path + exactly one JSON object shell argument；不得重命名 argv key。"
-        elif error_code == "json_argv_split_across_shell_args":
-            message = (
-                "json_argv_split_across_shell_args: 当前 JSON object 没有组成一个 shell argument；"
-                "只重新处理 shell grouping / quoting；"
-                "不得修改 JSON 内部 key、placeholder 或 literal。"
-            )
-            minimal_edit = "只修 shell quoting/grouping，把完整 JSON object 保持为一个 shell token。"
-        elif error_code == "json_object_syntax_invalid":
-            message = "json_object_syntax_invalid: 单个 JSON argv 参数不是标准 JSON object 语法。"
-            minimal_edit = "只修 JSON object 语法；不得改变业务 key/value 来源。"
-        else:
-            message = "json_argv_missing: 脚本路径后缺少 exactly one JSON object argv。"
-            minimal_edit = "在 script path 后直接添加一个完整 JSON object 参数。"
         results.append(ContractCheckResult(
-            id=f"command_block.json_argv.{ 'parseable' if json_ok else error_code }",
+            id="command_block.json_argv.parseable",
             passed=json_ok,
             target=target,
-            message=message,
-            expected="runner 后跟真实 script path；script path 后 exactly one argument；该 argument 是完整 JSON object 且必须构成一个 shell token；JSON key 必须符合标准 JSON；禁止 CLI flags；禁止额外 positional arguments。",
-            minimal_edit=minimal_edit,
-            details={
-                "arg_mode": command_sig.get("arg_mode"),
-                "args_count": command_sig.get("args_count"),
-                "flag_tokens": command_sig.get("flag_tokens") or [],
-                "argv_error_code": error_code if not json_ok else "",
-            },
+            message="命令块使用可解析 JSON argv。" if json_ok else f"{script_path} 命令块必须在脚本路径后传入 JSON object argv。",
+            expected="脚本路径后跟一个 JSON object argv；JSON keys 可由 workflow envelope 自由定义。",
+            minimal_edit="确保 JSON 可解析；字段对齐由第二轮 E2E trace 定位。",
         ))
 
         # First-round file contracts stop at command syntax/runtime/JSON shape.
@@ -415,10 +367,10 @@ def _build_skill_md_contract_text(blueprint_text: str) -> str:
         "- 对蓝图真实规划的每个脚本，SKILL.md 应提供一个独立的 ```bash fenced code block。",
         "- 每个 ```bash block 内只能放一条真实 shell 命令。",
         "- 命令必须直接调用真实 scripts/*.py 路径。",
-        "- Creator 默认产物必须使用统一 JSON argv 协议：runner 后跟真实 script path；script path 后 exactly one argument；该 argument 是完整 JSON object；整个 JSON object 必须构成一个 shell token；JSON key 必须符合标准 JSON；禁止 CLI flags；禁止额外 positional arguments。",
+        "- Creator 默认产物必须使用统一 JSON argv 协议：脚本路径后跟一个 shell-quoted JSON object argv。",
         "- JSON argv 必须能被 json.loads 解析为 object；动态 placeholder 必须作为 JSON 字符串值出现。",
         "- 外部已有脚本若使用其它 CLI 风格，应先由包装脚本适配为 JSON argv，再在 SKILL.md 调用该包装入口。",
-        "- 不得固定套用任何模板字段。",
+        "- 不得固定套用 payload/user_request/fields/options/input_files 等模板字段。",
         "- 禁止在 ```bash block 内直接写 JSON 配置对象。",
         "- 禁止在 ```bash block 内写 runner/script/argv 伪命令对象。",
         "- 禁止在 ```bash block 内写说明文字、列表、多条命令或 `<真实参数>` 这类占位说明。",
@@ -471,7 +423,7 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
         "- 每个 fence 内只放一条命令；命令必须直接调用 scripts/ 路径。",
         "- 脚本路径后传入 json.loads 可解析的 JSON object argv；所有动态 {{placeholder}} 必须作为 JSON 字符串值出现。",
         "- 第一条命令只能引用平台 guaranteed input envelope 中存在的字段；结构化业务参数必须使用平台结构化输入 root 与图谱/schema 派生的目标字段组成整值占位符。",
-        "- 命令 placeholder 优先引用平台已声明 external envelope 字段或显式 input_binding；不得在 prompt 中复制固定业务字段示例。",
+        "- 命令 placeholder 优先引用 external envelope 字段：user_request、input、text、payload、input_files、files、resources、fields、options，或显式 input_binding。",
         "- 禁止在 command JSON argv 中写动态用户内容、前序产物内容、运行时文件路径或 E2E seed 值；这些动态数据只能由图谱边派生的占位符表达。",
         "- 允许写入图谱/schema 明确声明为静态配置的 literal 常量；不得用 literal 冒充用户输入、stdout 或产物路径。",
         "- 蓝图语义为可选/建议/若不指定/可以提供/默认的用户参数，不要写成必填 placeholder；入口脚本应存在则读，不存在则默认化。",
@@ -512,8 +464,10 @@ def _build_skill_md_e2e_authoring_guide(blueprint_text: str) -> str:
             f"{idx}. {script_path}",
             f"   role: {entry.role}",
             f"   suggested inputs: {', '.join(input_keys) if input_keys else '无显式输入字段'}",
-            "   command protocol（只说明语法，不给可复制业务参数示例）:",
-            "   runner 后跟真实 script path；script path 后 exactly one argument；该 argument 是完整 JSON object；整个 JSON object 必须构成一个 shell token；JSON key 必须符合标准 JSON；禁止 CLI flags；禁止额外 positional arguments。",
+            "   command shape（只说明形态，实际参数必须由脚本真实接口决定）:",
+            "```bash",
+            json_command if payload else "# 待 E2E dataflow binding 修复：缺少 graph edge / command_arg_bindings 时不要发明 argv。",
+            "```",
             "   Creator 默认生成只使用上述 JSON argv 命令形态；外部已有 CLI 应由包装入口适配。",
         ])
 

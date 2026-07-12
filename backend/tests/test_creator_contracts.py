@@ -723,34 +723,3 @@ async def test_skill_md_reviewer_three_protocol_contradictions_raise_validator_e
             skill_plan_entry={},
         )
     assert calls["count"] == 3
-
-
-def test_command_signature_classifies_json_argv_cases():
-    ok = _command_signature('python scripts/a.py \'{"text":"{{input.text}}"}\'', 'scripts/a.py')
-    assert ok["arg_mode"] == "json_arg"
-    assert ok["argv_error_code"] == ""
-    assert ok["keys"] == {"text"}
-
-    flag = _command_signature('python scripts/a.py --text value', 'scripts/a.py')
-    assert flag["arg_mode"] == "argparse_flags"
-    assert flag["argv_error_code"] == "unexpected_cli_flag"
-    assert flag["flag_tokens"] == ["--text"]
-
-    split = _command_signature('python scripts/a.py {"text": "{{input.text}}"}', 'scripts/a.py')
-    assert split["arg_mode"] == "positional_args"
-    assert split["argv_error_code"] == "json_argv_split_across_shell_args"
-
-    bad = _command_signature("python scripts/a.py '{bad}'", 'scripts/a.py')
-    assert bad["arg_mode"] == "invalid_json_arg"
-    assert bad["argv_error_code"] == "json_object_syntax_invalid"
-
-
-def test_command_block_contract_structured_cli_flag_feedback():
-    from backend.services.creator.contracts import _check_command_block_contract, SkillPlanEntry
-    entry = SkillPlanEntry(path='scripts/a.py', file_type='script', role='script', purpose='p', runtime='python')
-    results = _check_command_block_contract('scripts/a.py', ['python scripts/a.py --text value'], entry)
-    failed = [r for r in results if not r.passed]
-    assert any(r.id == 'command_block.json_argv.unexpected_cli_flag' for r in failed)
-    msg = '\n'.join(r.message for r in failed)
-    assert '当前 Creator 协议不接受 CLI flags' in msg
-    assert '不得修改 argv key 和 value 来源' in msg

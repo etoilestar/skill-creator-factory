@@ -11104,29 +11104,23 @@ _MARKDOWN_FORMAT_ERROR_TEXT_MARKERS = (
     "yaml",
 )
 
-_CREATOR_JSON_ARGV_COMMAND_PROTOCOL = """Creator JSON argv command protocol（只描述语法，不提供任何具体脚本名、字段名或 placeholder 示例）：
-- runner 后跟真实 script path；
-- script path 后 exactly one argument；
-- 该 argument 是完整 JSON object；
-- 整个 JSON object 必须构成一个 shell token；
-- JSON key 必须符合标准 JSON；
-- 禁止 CLI flags；
-- 禁止额外 positional arguments。"""
-
-_SKILL_MD_BODY_FORMAT_REQUIREMENTS = f"""SKILL.md body_region 格式硬要求：
+_SKILL_MD_BODY_FORMAT_REQUIREMENTS = """SKILL.md body_region 格式硬要求：
 1. 只输出 Markdown 正文，不输出 YAML frontmatter。
 2. 所有 fenced code block 必须完整闭合。
 3. 每个真实 scripts/*.py 必须有一个独立、无缩进的 ```bash fenced code block。
 4. 每个 ```bash block 内只能包含一条真实 shell 命令。
 5. ```bash block 内禁止出现多条命令、说明文字、列表、注释、JSON 配置对象或伪命令对象。
 6. 命令必须直接调用真实 scripts/*.py 路径。
-7. {_CREATOR_JSON_ARGV_COMMAND_PROTOCOL}
-8. 动态 placeholder 必须作为 JSON 字符串值出现。
-9. 禁止在 ```bash block 内放 runtime/entrypoint/argv JSON 对象。
-10. 禁止在 ```bash block 内放 runner/script/argv JSON 对象。
-11. compact_requirement_graph 只是职责上下文，不是命令块格式。
-12. 不得把 compact_requirement_graph 条目复制成 JSON block。
-13. 不得把 runtime、target_file、inputs、outputs 这些图谱字段原样写成 bash block 内容。"""
+7. 默认命令格式是：python scripts/<file>.py '<JSON object argv>'。
+8. JSON argv 必须是 shell-quoted 的 JSON object 字符串。
+9. 动态 placeholder 必须作为 JSON 字符串值出现。
+10. 禁止在 ```bash block 内放 runtime/entrypoint/argv JSON 对象。
+11. 禁止在 ```bash block 内放 runner/script/argv JSON 对象。
+12. 禁止使用 --argv，除非当前脚本源码明确实现了 --argv。
+13. Creator 默认脚本协议是 sys.argv[1] JSON object。
+14. compact_requirement_graph 只是职责上下文，不是命令块格式。
+15. 不得把 compact_requirement_graph 条目复制成 JSON block。
+16. 不得把 runtime、target_file、inputs、outputs 这些图谱字段原样写成 bash block 内容。"""
 
 _REFERENCE_MD_BODY_FORMAT_REQUIREMENTS = """references/*.md body_region 格式硬要求：
 references/*.md 是参考资料正文，不是执行步骤。
@@ -11144,8 +11138,8 @@ _SKILL_MD_COMMAND_TEMPLATE_SEMANTIC_RULES = """SKILL.md bash command block 语�
 5. 不得为了让命令看起来完整而编造无来源字面值或占位参数。
 6. 不得把示例调用、示例值或说明性样例写进 bash command block。
 7. 不得把下游脚本输入写成无来源字面值；应语义上来自上游 stdout，字段名可由第二轮 E2E 对齐。
-8. 不得把用户输入写成字面值；应引用平台输入 placeholder 或传入当前图谱/脚本接口已有 envelope。
-9. 如果不确定具体字段名，优先使用当前图谱/脚本接口已有 envelope，由脚本解析。
+8. 不得把用户输入写成字面值；应引用平台输入 placeholder 或传入通用 payload。
+9. 如果不确定具体字段名，优先使用通用 user_request/input/payload，由脚本解析。
 10. 第一轮只判断是否语义可追踪、是否明显示例调用、是否明显无来源占位、是否完全脱离图谱 IO 语义。
 11. 第一轮不得要求 argv key 必须逐字等于 graph.inputs，也不得要求 placeholder 必须逐字等于 graph.outputs。
 12. compact_requirement_graph 只是职责上下文，不是命令块 JSON schema；不得把条目机械复制成 JSON block。"""
@@ -11336,83 +11330,6 @@ def _first_round_format_stage_error(
     return None
 
 
-
-def _script_argv_keys_from_context(script_argv_context: Any) -> dict[str, list[str]]:
-    if not script_argv_context:
-        return {}
-    data = script_argv_context
-    if isinstance(script_argv_context, str):
-        try:
-            start = script_argv_context.index("[")
-            data = json.loads(script_argv_context[start:])
-        except Exception:
-            return {}
-    if not isinstance(data, list):
-        return {}
-    result: dict[str, list[str]] = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        script_path = str(item.get("script_path") or "").strip()
-        schema = item.get("strict_json_argv_schema")
-        if not script_path or not isinstance(schema, dict):
-            continue
-        result[script_path] = sorted(str(key) for key in schema.keys() if str(key).strip() and key != "error")
-    return result
-
-
-def _markdown_failure_facts_for_compare(rewrite_facts: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    items = []
-    for item in (rewrite_facts or {}).get("commands") or []:
-        if not isinstance(item, dict):
-            continue
-        parser_facts = item.get("parser_facts") if isinstance(item.get("parser_facts"), dict) else {}
-        items.append({
-            "target_script": str(item.get("target_script") or ""),
-            "arg_mode": parser_facts.get("arg_mode"),
-            "args_count": parser_facts.get("args_count"),
-            "flag_tokens": sorted(str(token) for token in (parser_facts.get("flag_tokens") or [])),
-        })
-    return sorted(items, key=lambda item: (item["target_script"], str(item["arg_mode"]), str(item["args_count"]), ",".join(item["flag_tokens"])))
-
-
-def _markdown_rewrite_structured_facts(
-    *,
-    current_content: str,
-    blueprint_text: str,
-    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
-    script_argv_context: Any = None,
-) -> dict[str, Any]:
-    scripts = sorted(_declared_skill_paths_from_blueprint(blueprint_text or '') or [])
-    script_paths = [p for p in scripts if p.startswith('scripts/') and p.endswith('.py')]
-    known_argv_keys = _script_argv_keys_from_context(script_argv_context)
-    commands = [m.group(1).strip() for m in re.finditer(r'(?ims)^```bash\s*\n(.*?)\n```', current_content or '')]
-    command_items = []
-    for command in commands:
-        matched_script = next((p for p in script_paths if p in command), '')
-        sig = _command_signature(command, matched_script) if matched_script else None
-        parsed_keys = sorted((sig or {}).get('keys') or [])
-        command_items.append({
-            'target_script': matched_script,
-            'current_command': command,
-            'parser_facts': {
-                'arg_mode': (sig or {}).get('arg_mode'),
-                'args_count': (sig or {}).get('args_count'),
-                'flag_tokens': (sig or {}).get('flag_tokens') or [],
-            },
-            'script_argv_keys': known_argv_keys.get(matched_script) or parsed_keys,
-        })
-    return {
-        'target_script': script_paths[0] if len(script_paths) == 1 else '',
-        'current_command': command_items[0]['current_command'] if len(command_items) == 1 else '',
-        'parser_facts': command_items[0]['parser_facts'] if len(command_items) == 1 else {},
-        'script_argv_keys': (known_argv_keys.get(script_paths[0]) if len(script_paths) == 1 else []) or (command_items[0]['script_argv_keys'] if len(command_items) == 1 else []),
-        'responsibility_bindings': responsibility_binding_context or {},
-        'declared_file_paths': scripts,
-        'commands': command_items,
-        'failure_facts': _markdown_failure_facts_for_compare({'commands': command_items}),
-    }
-
 def _build_markdown_format_full_rewrite_prompt(
     *,
     file_path: str,
@@ -11420,19 +11337,7 @@ def _build_markdown_format_full_rewrite_prompt(
     blueprint_text: str,
     deterministic_error: str,
     current_content: str,
-    previous_failure_facts: list[dict[str, Any]] | None = None,
-    responsibility_binding_context: dict[str, list[dict[str, str]]] | None = None,
-    script_argv_context: Any = None,
 ) -> list[dict[str, str]]:
-    rewrite_facts = _markdown_rewrite_structured_facts(
-        current_content=current_content,
-        blueprint_text=blueprint_text,
-        responsibility_binding_context=responsibility_binding_context,
-        script_argv_context=script_argv_context,
-    )
-    current_failure_facts = _markdown_failure_facts_for_compare(rewrite_facts)
-    no_progress = bool(previous_failure_facts and previous_failure_facts == current_failure_facts)
-    no_progress_text = "上一轮未改变失败的命令参数结构。\n" if no_progress else ""
     return [
         {
             "role": "system",
@@ -11459,13 +11364,7 @@ def _build_markdown_format_full_rewrite_prompt(
                 "5. frontmatter 必须完整闭合。\n"
                 "6. 所有 fenced block 必须成对闭合。\n"
                 "7. 不要把 repair proposal JSON 嵌进 Markdown。\n"
-                "8. 只修报告的格式失败；不得重新设计 script path、argv key、placeholder root、literal/default、ResponsibilityEdge、scripts/references/assets 文件集合或工作流顺序。\n"
-                "9. 保持 argv key 集合不变；保持 placeholder root 不变；保持 literal/default 不变；保持 scripts/references/assets 路径集合不变。\n"
-                "10. 不得自行添加 CLI flag；不得新增计划外资源。\n\n"
-                f"{no_progress_text}"
-                f"{_CREATOR_JSON_ARGV_COMMAND_PROTOCOL}\n\n"
-                "当前文件结构化事实（全部来自当前 Skill）：\n"
-                f"{json.dumps(rewrite_facts, ensure_ascii=False, indent=2, default=str)[:12000]}\n\n"
+                "8. 不要混入 command argv / 字段对齐 / workflow dataflow 的局部修复；格式合法后由后续校验处理。\n\n"
                 "蓝图上下文：\n"
                 f"{(blueprint_text or '')[:8000]}\n\n"
                 "当前文件内容：\n"
@@ -11997,14 +11896,6 @@ async def generate_file(request: GenerateFileRequest):
             skill_md_binding_context = responsibility_binding_context_from_graph(
                 {"responsibility_edges": request.responsibility_edges} if request.responsibility_edges else request.requirement_graph
             )
-            skill_md_script_argv_context = (
-                _existing_script_argv_context_for_skill_md(
-                    skill_name=skill_name,
-                    declared_paths=_declared_skill_paths_from_blueprint(request.blueprint_text),
-                )
-                if request.file_path == "SKILL.md"
-                else ""
-            )
 
             prompt_messages = (
                 _build_generate_file_prompt(
@@ -12040,7 +11931,6 @@ async def generate_file(request: GenerateFileRequest):
         repair_counts_by_layer: dict[str, int] = {}
         format_retry_count = 0
         markdown_format_retry_count = 0
-        previous_markdown_failure_facts: list[dict[str, Any]] | None = None
         business_repair_count = 0
         repair_failure_signatures: dict[str, tuple[int, str]] = {}
         # Track how many tool re-explorations have been triggered for this file
@@ -12634,23 +12524,13 @@ async def generate_file(request: GenerateFileRequest):
                         },
                     })
 
-                    current_rewrite_facts = _markdown_rewrite_structured_facts(
-                        current_content=candidate or "",
-                        blueprint_text=request.blueprint_text,
-                        responsibility_binding_context=skill_md_binding_context,
-                        script_argv_context=skill_md_script_argv_context,
-                    )
                     rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                         file_path=request.file_path,
                         skill_name=skill_name,
                         blueprint_text=request.blueprint_text,
                         deterministic_error=deterministic_error,
                         current_content=candidate or "",
-                        previous_failure_facts=previous_markdown_failure_facts,
-                        responsibility_binding_context=skill_md_binding_context,
-                        script_argv_context=skill_md_script_argv_context,
                     )
-                    previous_markdown_failure_facts = _markdown_failure_facts_for_compare(current_rewrite_facts)
 
                     candidate = await _complete_creator_file_generation(
                         messages=rewrite_messages,
@@ -13005,23 +12885,13 @@ async def generate_file(request: GenerateFileRequest):
                                 "error": deterministic_error,
                             },
                         })
-                        current_rewrite_facts = _markdown_rewrite_structured_facts(
-                            current_content=candidate or "",
-                            blueprint_text=request.blueprint_text,
-                            responsibility_binding_context=skill_md_binding_context,
-                            script_argv_context=skill_md_script_argv_context,
-                        )
                         rewrite_messages = _build_markdown_format_full_rewrite_prompt(
                             file_path=request.file_path,
                             skill_name=skill_name,
                             blueprint_text=request.blueprint_text,
                             deterministic_error=deterministic_error,
                             current_content=candidate or "",
-                            previous_failure_facts=previous_markdown_failure_facts,
-                            responsibility_binding_context=skill_md_binding_context,
-                            script_argv_context=skill_md_script_argv_context,
                         )
-                        previous_markdown_failure_facts = _markdown_failure_facts_for_compare(current_rewrite_facts)
                         candidate = await _complete_creator_file_generation(
                             messages=rewrite_messages,
                             model=route.model,

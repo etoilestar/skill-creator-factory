@@ -426,6 +426,91 @@ async def test_ready_does_not_add_summary_hallucinated_file_to_execution_plan(mo
     assert any(w.get("code") == "summary_files_not_in_skill_plan" and "scripts/extra.py" in w.get("files", []) for w in resp.warnings)
 
 
+def test_summary_hallucinated_asset_is_not_projected_to_uploads():
+    summary = api.PreparePlanReviewSummary(
+        files_to_create_or_update=["SKILL.md"],
+        assets_to_upload=["assets/hallucinated.png"],
+    )
+
+    warnings = api._sync_prepare_summary_files_from_skill_plan(
+        summary,
+        [_file("SKILL.md")],
+    )
+
+    assert summary.assets_to_upload == []
+    assert any(w.get("code") == "summary_asset_not_in_file_plan" and "assets/hallucinated.png" in w.get("files", []) for w in warnings)
+
+
+def test_required_user_upload_asset_missing_is_detectable_before_ready():
+    missing = api._required_file_plan_user_upload_asset_paths(
+        [_file("SKILL.md"), _file("assets/template.png", asset_source="user_upload")]
+    )
+
+    assert missing == ["assets/template.png"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_plan_blocks_ready_when_required_user_upload_asset_missing(monkeypatch):
+    blueprint = _ready_blueprint(_skill_plan_block(""))
+
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": blueprint,
+            "skill_name": "demo-skill",
+            "review_summary": {
+                "files_to_create_or_update": ["SKILL.md"],
+                "assets_to_upload": ["assets/template.png", "assets/hallucinated.png"],
+            },
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[
+                _file("SKILL.md"),
+                _file("assets/template.png", asset_source="user_upload"),
+            ],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=blueprint,
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(
+        _request(
+            prepare_action="confirm",
+            previous_blueprint_text=blueprint,
+            human_feedback="A. 没有，按上面的选择继续",
+            uploaded_files=[],
+            function_items=[],
+            responsibility_edges=[],
+        )
+    )
+
+    assert resp.status != "ready"
+    assert resp.prepare_stage == "asset_upload_required"
+    assert resp.review_summary.assets_to_upload == ["assets/template.png"]
+    assert any(
+        isinstance(blocker, dict)
+        and blocker.get("code") == "required_asset_not_uploaded"
+        for blocker in resp.creation_blockers
+    )
+
+
+def test_no_user_upload_asset_keeps_assets_to_upload_empty():
+    summary = api.PreparePlanReviewSummary(assets_to_upload=["assets/bundled.png"])
+
+    api._sync_prepare_summary_files_from_skill_plan(
+        summary,
+        [_file("SKILL.md"), _file("assets/bundled.png", asset_source="bundled")],
+    )
+
+    assert summary.assets_to_upload == []
+
+
 def test_sync_prepare_summary_files_filters_directories_and_dynamic_paths():
     summary = api.PreparePlanReviewSummary(files_to_create_or_update=["SKILL.md"])
     warnings = api._sync_prepare_summary_files_from_skill_plan(summary, [

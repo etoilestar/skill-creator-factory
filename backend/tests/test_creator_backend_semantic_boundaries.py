@@ -318,7 +318,7 @@ def test_responsibility_graph_rejects_function_item_outside_file_plan_scripts():
     graph = _graph(requirements=[_req()])
     with pytest.raises(Exception) as exc:
         validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")])
-    assert getattr(exc.value, "code", "") == "responsibility_graph_file_plan_conflict"
+    assert getattr(exc.value, "code", "") == "validator_incomplete"
 
 
 def test_scriptless_responsibility_graph_still_valid():
@@ -378,7 +378,7 @@ def test_responsibility_graph_rejects_non_execution_resource_nodes(target):
     )
     with pytest.raises(Exception) as exc:
         validate_responsibility_graph_schema(graph, [SimpleNamespace(path=target, purpose="not executable")])
-    assert getattr(exc.value, "code", "") == "responsibility_graph_file_plan_conflict"
+    assert getattr(exc.value, "code", "") == "validator_incomplete"
 
 
 def test_e2e_source_does_not_call_semantic_judge_or_toolpool_planning():

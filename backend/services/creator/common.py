@@ -975,14 +975,14 @@ def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list
         if not is_python_function_item_target(path):
             raise ResponsibilityGraphValidationError(
                 "ResponsibilityGraph FunctionItems must reference executable FilePlan scripts only.",
-                code="responsibility_graph_file_plan_conflict",
+                code="validator_incomplete",
                 details={"target_file": path},
             )
         if path not in script_targets:
             raise ResponsibilityGraphValidationError(
                 "FunctionItem target_file must reference "
                 "an existing script FileSpec.",
-                code="responsibility_graph_file_plan_conflict",
+                code="validator_incomplete",
                 details={"target_file": path},
             )
         target_counts[path] = target_counts.get(path, 0) + 1

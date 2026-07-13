@@ -449,6 +449,57 @@ def test_required_user_upload_asset_missing_is_detectable_before_ready():
     assert missing == ["assets/template.png"]
 
 
+@pytest.mark.asyncio
+async def test_prepare_plan_blocks_ready_when_required_user_upload_asset_missing(monkeypatch):
+    blueprint = _ready_blueprint(_skill_plan_block(""))
+
+    async def fake_generate(_request):
+        return {
+            "status": "ready",
+            "internal_blueprint_text": blueprint,
+            "skill_name": "demo-skill",
+            "review_summary": {
+                "files_to_create_or_update": ["SKILL.md"],
+                "assets_to_upload": ["assets/template.png", "assets/hallucinated.png"],
+            },
+        }
+
+    async def fake_analyze(_request):
+        return AnalyzeBlueprintResponse(
+            skill_name="demo-skill",
+            files=[
+                _file("SKILL.md"),
+                _file("assets/template.png", asset_source="user_upload"),
+            ],
+            warnings=[],
+            asset_requirements=[],
+            blueprint_text=blueprint,
+        )
+
+    monkeypatch.setattr(api, "_generate_internal_blueprint_or_questions", fake_generate)
+    monkeypatch.setattr(api, "analyze_blueprint", fake_analyze)
+
+    resp = await api.prepare_plan(
+        _request(
+            prepare_action="confirm",
+            previous_blueprint_text=blueprint,
+            human_feedback="A. 没有，按上面的选择继续",
+            uploaded_files=[],
+            function_items=[],
+            responsibility_edges=[],
+        )
+    )
+
+    assert resp.status != "ready"
+    assert resp.prepare_stage == "asset_upload_required"
+    assert resp.review_summary.assets_to_upload == ["assets/template.png"]
+    assert any(
+        isinstance(blocker, dict)
+        and blocker.get("code") == "required_asset_not_uploaded"
+        for blocker in resp.creation_blockers
+    )
+
+
 def test_no_user_upload_asset_keeps_assets_to_upload_empty():
     summary = api.PreparePlanReviewSummary(assets_to_upload=["assets/bundled.png"])
 

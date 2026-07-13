@@ -2328,3 +2328,38 @@ async def test_markdown_full_rewrite_prompt_is_not_patch(monkeypatch, tmp_path):
     assert "frontmatter 必须完整闭合" in prompt_text
     assert "所有 fenced block 必须成对闭合" in prompt_text
     assert "不要把 repair proposal JSON 嵌进 Markdown" in prompt_text
+
+
+def test_asset_paths_requiring_skill_md_mentions_ignore_blueprint_prose_only_paths():
+    from backend.services.creator.common import _paths_requiring_skill_md_mentions
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: asset-prose-only
+- path: `SKILL.md`
+  role: skill_overview
+- path: `scripts/run.py`
+  role: generic_script
+
+说明：不要把历史示例 `assets/template.docx` 或目录 `assets/icons/` 当作本次要创建的资源。
+"""
+
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="assets/") == []
+
+
+def test_asset_paths_requiring_skill_md_mentions_returns_formal_file_plan_assets():
+    from backend.services.creator.common import _paths_requiring_skill_md_mentions
+
+    blueprint = """
+📋 Skill 架构蓝图
+- **Skill 名称**: asset-formal-plan
+- path: `SKILL.md`
+  role: skill_overview
+- path: `assets/logo.png`
+  role: asset
+  source: bundled
+
+说明：这里也提到 `assets/not-planned.png`，但它不是正式文件计划。
+"""
+
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="assets/") == ["assets/logo.png"]

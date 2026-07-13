@@ -610,3 +610,27 @@ def test_argv_schema_failure_targets_skill_md_for_command_key_error_and_script_f
     )
     assert details["primary_target"] == "scripts/main.py"
     assert details["script_guard_run_mismatch"] is True
+
+
+def test_final_step_json_without_platform_terminal_fields_still_passes(tmp_path, monkeypatch):
+    skill_dir = _make_skill(tmp_path)
+    _patch_fast_e2e(monkeypatch)
+    monkeypatch.setattr(
+        e2e,
+        "_validate_final_platform_output_contract",
+        lambda **kwargs: pytest.fail("final platform output contract should not be called by E2E closure"),
+    )
+    monkeypatch.setattr(
+        e2e,
+        "_execute_e2e_python_command",
+        lambda command, **kwargs: subprocess.CompletedProcess([], 0, stdout='{"ok": true}', stderr=""),
+    )
+    monkeypatch.setattr(
+        e2e,
+        "_parse_e2e_stdout_json",
+        lambda command, **kwargs: ({"one": "ok"} if command.ordinal == 1 else {"custom_business_result": {"ok": True}}),
+    )
+
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+
+    assert e2e._run_skill_workflow_e2e_once("demo", source_skill_dir=skill_dir, e2e_session=session) == []

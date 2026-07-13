@@ -1663,7 +1663,27 @@ def _extract_declared_skill_paths(text: str) -> list[str]:
 
 
 def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> list[str]:
-    return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
+    if prefix != "assets/":
+        return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
+
+    seen: set[str] = set()
+    paths: list[str] = []
+    try:
+        parsed = parse_blueprint(
+            [{"role": "assistant", "content": blueprint_text or ""}],
+            strict=True,
+        )
+    except Exception:
+        return []
+
+    planned_files = getattr(getattr(parsed, "skill_plan", None), "files", None) or getattr(parsed, "files", []) or []
+    for item in planned_files:
+        path = str(getattr(item, "path", "") or "").replace("\\", "/").strip().strip("`")
+        if not path.startswith("assets/") or path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
 
 
 def _reject_creator_flow_leak(content: str) -> None:

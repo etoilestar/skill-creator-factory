@@ -1586,7 +1586,7 @@ async def _review_skill_md_blueprint_intent_with_model(
 
     data["required_script_paths"] = _normalize_paths(data["required_script_paths"], "scripts/")
     data["required_reference_paths"] = _normalize_paths(data["required_reference_paths"], "references/")
-    data["required_asset_paths"] = _normalize_paths(data["required_asset_paths"], "assets/")
+    data["required_asset_paths"] = _paths_requiring_skill_md_mentions(blueprint_text, prefix="assets/")
 
     return data
 

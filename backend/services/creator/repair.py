@@ -4885,9 +4885,27 @@ async def _run_script_responsibility_review(
     provided_function_execution_context = review_context.get("function_execution_context")
     if isinstance(provided_function_execution_context, dict):
         function_execution_context = dict(provided_function_execution_context)
-        function_execution_context["authorized_tool_contracts"] = tool_contracts_from_binding(
-            current_file_tool_binding or {}
+        authorized_tool_contracts = list(
+            function_execution_context.get(
+                "authorized_tool_contracts"
+            )
+            or []
         )
+        seen_tool_ids = {
+            str(contract.get("tool_id") or "").strip()
+            for contract in authorized_tool_contracts
+            if isinstance(contract, dict)
+        }
+        for contract in tool_contracts_from_binding(
+            current_file_tool_binding or {}
+        ):
+            tool_id = str(contract.get("tool_id") or "").strip()
+            if tool_id and tool_id in seen_tool_ids:
+                continue
+            if tool_id:
+                seen_tool_ids.add(tool_id)
+            authorized_tool_contracts.append(contract)
+        function_execution_context["authorized_tool_contracts"] = authorized_tool_contracts
     else:
         function_execution_context = build_function_execution_context(
             graph=review_context.get("requirement_graph"),

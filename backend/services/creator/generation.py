@@ -1554,10 +1554,15 @@ def _build_script_generate_file_prompt_variant(
         )
     ):
         raw_binding = (
-            skill_plan_entry.get(
-                "tool_binding_summary"
+            _ensure_python_script_core_binding(
+                dict(
+                    skill_plan_entry.get(
+                        "tool_binding_summary"
+                    )
+                    or {}
+                ),
+                plan_entry,
             )
-            or {}
         )
 
         local_contract[

@@ -1663,7 +1663,7 @@ def _extract_declared_skill_paths(text: str) -> list[str]:
 
 
 def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> list[str]:
-    if prefix != "assets/":
+    if prefix not in {"assets/", "references/"}:
         return [path for path in _extract_declared_skill_paths(blueprint_text) if path.startswith(prefix)]
 
     seen: set[str] = set()
@@ -1679,7 +1679,7 @@ def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> l
     planned_files = getattr(getattr(parsed, "skill_plan", None), "files", None) or getattr(parsed, "files", []) or []
     for item in planned_files:
         path = str(getattr(item, "path", "") or "").replace("\\", "/").strip().strip("`")
-        if not path.startswith("assets/") or path in seen:
+        if not path.startswith(prefix) or path in seen:
             continue
         seen.add(path)
         paths.append(path)

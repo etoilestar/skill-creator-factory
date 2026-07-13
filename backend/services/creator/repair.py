@@ -1236,9 +1236,33 @@ def _resolve_patch_span(
 
     approx = _find_approximate_substring_span(content, old)
     if approx.get("accepted"):
+        start = int(approx["start"])
+        end = int(approx["end"])
+
+        if _strip_diff_path_prefix(target_file).lower() == "skill.md":
+            starts_at_line_boundary = start == 0 or content[start - 1] == "\n"
+            ends_at_line_boundary = end == len(content) or content[end] == "\n"
+
+            if _span_crosses_markdown_boundary(content, start, end):
+                raise ValueError(
+                    f"edits[{edit_index}] 的 fuzzy 匹配"
+                    "跨越了 Markdown 结构边界，"
+                    "请提供更准确的 OLD。"
+                )
+
+            if "\n" in old and not (
+                starts_at_line_boundary
+                and ends_at_line_boundary
+            ):
+                raise ValueError(
+                    f"edits[{edit_index}] 的多行 fuzzy 匹配"
+                    "没有覆盖完整行，"
+                    "请提供更准确的 OLD。"
+                )
+
         return {
-            "start": int(approx["start"]),
-            "end": int(approx["end"]),
+            "start": start,
+            "end": end,
             "fallback_type": "fuzzy_window",
             "similarity": float(approx["similarity"]),
             "matched_excerpt": str(approx.get("matched_excerpt") or ""),
@@ -1577,6 +1601,14 @@ def _apply_exact_replace_patch(
                 "reason": "匹配到的原文 span 与 new 完全相同，已跳过该 no-op edit。",
             })
             continue
+
+        if expected_target_file == "SKILL.md" and fallback_type == "fuzzy_window":
+            if original_span.startswith("\n") and not new.startswith("\n"):
+                raise ValueError("SKILL.md fuzzy replacement 丢失了开头换行")
+
+            if original_span.endswith("\n") and not new.endswith("\n"):
+                raise ValueError("SKILL.md fuzzy replacement 丢失了结尾换行")
+
         candidate = candidate[:replace_start] + new + candidate[replace_end:]
         applied.append({
             "index": index,
@@ -4803,9 +4835,77 @@ async def _run_script_responsibility_review(
     ):
         current_file_tool_binding = {}
 
+    if (
+        str(
+            getattr(
+                skill_plan_entry,
+                "runtime",
+                "",
+            )
+            or ""
+        ).strip().lower()
+        == "python"
+    ):
+        current_file_tool_binding = dict(
+            current_file_tool_binding
+        )
+
+        for key, value in (
+            (
+                "allowed_tool_ids",
+                "script_argv_guard",
+            ),
+            (
+                "primary_tool_ids",
+                "script_argv_guard",
+            ),
+            (
+                "allowed_helper_imports",
+                "strict_json_argv_guard",
+            ),
+        ):
+            values = [
+                str(item).strip()
+                for item in (
+                    current_file_tool_binding.get(
+                        key
+                    )
+                    or []
+                )
+                if str(item or "").strip()
+            ]
+
+            if value not in values:
+                values.append(value)
+
+            current_file_tool_binding[
+                key
+            ] = values
+
     provided_function_execution_context = review_context.get("function_execution_context")
     if isinstance(provided_function_execution_context, dict):
         function_execution_context = dict(provided_function_execution_context)
+        authorized_tool_contracts = list(
+            function_execution_context.get(
+                "authorized_tool_contracts"
+            )
+            or []
+        )
+        seen_tool_ids = {
+            str(contract.get("tool_id") or "").strip()
+            for contract in authorized_tool_contracts
+            if isinstance(contract, dict)
+        }
+        for contract in tool_contracts_from_binding(
+            current_file_tool_binding or {}
+        ):
+            tool_id = str(contract.get("tool_id") or "").strip()
+            if tool_id and tool_id in seen_tool_ids:
+                continue
+            if tool_id:
+                seen_tool_ids.add(tool_id)
+            authorized_tool_contracts.append(contract)
+        function_execution_context["authorized_tool_contracts"] = authorized_tool_contracts
     else:
         function_execution_context = build_function_execution_context(
             graph=review_context.get("requirement_graph"),

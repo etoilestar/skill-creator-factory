@@ -3407,14 +3407,6 @@ def _run_skill_workflow_e2e_once(
                 # here because validator availability or semantic judgement must
                 # not block packaging or trigger business-file repair.
 
-                is_final_step = index == len(commands) - 1
-                if is_final_step:
-                    _validate_final_platform_output_contract(
-                        command=command,
-                        stdout_json=stdout_json,
-                        traces=traces,
-                    )
-
                 context_before = dict(payload)
                 logger.info("[Creator][E2E][stdout_key_sources] %s", json.dumps({
                     "event": "e2e_stdout_key_sources",

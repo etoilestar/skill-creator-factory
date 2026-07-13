@@ -2328,3 +2328,125 @@ async def test_markdown_full_rewrite_prompt_is_not_patch(monkeypatch, tmp_path):
     assert "frontmatter 必须完整闭合" in prompt_text
     assert "所有 fenced block 必须成对闭合" in prompt_text
     assert "不要把 repair proposal JSON 嵌进 Markdown" in prompt_text
+
+
+def test_asset_paths_requiring_skill_md_mentions_ignore_blueprint_prose_only_paths():
+    from backend.services.creator.common import _paths_requiring_skill_md_mentions
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: asset-prose-only
+
+### 目录结构
+- SKILL.md
+- scripts/: `scripts/run.py`
+- references/: 无需创建
+- assets/: 无需创建
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `scripts/run.py`
+  role: generic_script
+  inputs: [payload]
+  outputs: [result]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+
+### 宿主执行方式
+```bash
+python scripts/run.py '{"payload":"{{payload}}"}'
+```
+
+说明：不要把历史示例 `assets/template.docx` 或目录 `assets/icons/` 当作本次要创建的资源。
+"""
+
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="assets/") == []
+
+
+def test_asset_paths_requiring_skill_md_mentions_returns_formal_file_plan_assets():
+    from backend.services.creator.common import _paths_requiring_skill_md_mentions
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: asset-formal-plan
+
+### 目录结构
+- SKILL.md
+- references/: 无需创建
+- assets/: `assets/logo.png`
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `assets/logo.png`
+  role: asset
+  inputs: []
+  outputs: []
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+  source: bundled
+
+### 宿主执行方式
+直接回答或按 SKILL.md 说明使用静态资源。
+
+说明：这里也提到 `assets/not-planned.png`，但它不是正式文件计划。
+"""
+
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="assets/") == ["assets/logo.png"]
+
+
+def test_asset_paths_requiring_skill_md_mentions_uses_strict_formal_asset_section_path_only():
+    from backend.services.creator.common import _paths_requiring_skill_md_mentions
+
+    blueprint = """
+## 📋 Skill 架构蓝图
+- **Skill 名称**: asset-section-plan
+
+### 目录结构
+- SKILL.md
+- references/: 无需创建
+- assets/: `assets/official.png`
+
+### SkillPlan / 文件职责计划
+- path: `SKILL.md`
+  role: skill_overview
+  inputs: [user_request]
+  outputs: [workflow]
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+- path: `assets/official.png`
+  role: asset
+  inputs: []
+  outputs: []
+  dependencies: []
+  required_capabilities: []
+  business_forbidden_capabilities: []
+  references: []
+  source: bundled
+
+### 宿主执行方式
+直接回答或按 SKILL.md 说明使用静态资源。
+
+正文说明：历史示例 `assets/unplanned.png` 不属于正式文件计划。
+"""
+
+    assert _paths_requiring_skill_md_mentions(blueprint, prefix="assets/") == ["assets/official.png"]

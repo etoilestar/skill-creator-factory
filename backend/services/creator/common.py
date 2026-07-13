@@ -1669,7 +1669,10 @@ def _paths_requiring_skill_md_mentions(blueprint_text: str, *, prefix: str) -> l
     seen: set[str] = set()
     paths: list[str] = []
     try:
-        parsed = parse_blueprint([{"role": "assistant", "content": blueprint_text or ""}])
+        parsed = parse_blueprint(
+            [{"role": "assistant", "content": blueprint_text or ""}],
+            strict=True,
+        )
     except Exception:
         return []
 

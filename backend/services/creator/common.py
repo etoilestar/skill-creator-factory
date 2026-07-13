@@ -452,6 +452,7 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
         for item in graph.requirements
         if is_python_function_item_target(str(item.target_file or ""))
     }
+    has_function_items = bool(graph.function_items)
     incoming_by_node: dict[str, set[str]] = {}
     outgoing_by_node: dict[str, set[str]] = {}
     for edge in graph.dataflow_edges or []:
@@ -461,16 +462,14 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
             outgoing_by_node.setdefault(from_node, set()).add(to_node)
             incoming_by_node.setdefault(to_node, set()).add(from_node)
 
-    if not platform_input:
-        raise ResponsibilityGraphValidationError(
-            "ResponsibilityGraph must include platform_input_node.",
-            code="responsibility_graph_platform_io_conflict",
-        )
-    if not platform_output:
-        raise ResponsibilityGraphValidationError(
-            "ResponsibilityGraph must include platform_output_node.",
-            code="responsibility_graph_platform_io_conflict",
-        )
+    if not has_function_items:
+        if graph.dataflow_edges:
+            raise ResponsibilityGraphValidationError(
+                "ResponsibilityGraph without FunctionItems must not contain execution edges.",
+                code="responsibility_graph_platform_io_conflict",
+            )
+        return
+
     if incoming_by_node.get(platform_input_id):
         raise ResponsibilityGraphValidationError(
             "platform_input_node must not have incoming edges.",
@@ -559,14 +558,14 @@ def _validate_responsibility_graph_edges(graph: ResponsibilityGraph, files: list
         if from_node in {platform_output_id} or to_node in {platform_input_id}:
             raise ResponsibilityGraphValidationError(
                 "Dataflow edge uses a platform boundary node in an invalid direction.",
-                code="responsibility_graph_platform_io_conflict",
+                code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
 
         if from_node not in script_nodes or to_node not in script_nodes:
             raise ResponsibilityGraphValidationError(
                 "Script-to-script dataflow edge references a missing script node.",
-                code="responsibility_graph_file_plan_conflict",
+                code="dataflow_edge_invalid",
                 details={"index": idx, "from_node": from_node, "to_node": to_node},
             )
         if not all(isinstance(c, dict) for c in (edge.get("constraints") or [])):
@@ -962,13 +961,7 @@ def normalize_responsibility_graph(data: dict[str, Any] | ResponsibilityGraph) -
 
 
 def validate_responsibility_graph_schema(graph: ResponsibilityGraph, files: list[Any]) -> ResponsibilityGraph:
-    original_graph = graph
     graph = normalize_responsibility_graph(graph)
-    if isinstance(original_graph, ResponsibilityGraph):
-        graph = graph.model_copy(update={
-            "platform_input_node": original_graph.platform_input_node,
-            "platform_output_node": original_graph.platform_output_node,
-        })
     script_targets = {
         str(getattr(file_spec, "path", "") or "").strip()
         for file_spec in files or []

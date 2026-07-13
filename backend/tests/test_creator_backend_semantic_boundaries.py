@@ -201,7 +201,7 @@ def _graph(requirements=None, edges=None, *, include_input=True, include_output=
         requirements=requirements or [],
         platform_input_node=platform_input if include_input else {},
         platform_output_node=platform_output if include_output else {},
-        dataflow_edges=edges or [
+        dataflow_edges=edges if edges is not None else [
             {
                 "from_node": "platform_input_node",
                 "from_output": "text",
@@ -321,15 +321,50 @@ def test_responsibility_graph_rejects_function_item_outside_file_plan_scripts():
     assert getattr(exc.value, "code", "") == "responsibility_graph_file_plan_conflict"
 
 
-def test_responsibility_graph_rejects_missing_platform_input_node():
-    graph = _graph(requirements=[_req()], include_input=False)
+def test_scriptless_responsibility_graph_still_valid():
+    graph = ResponsibilityGraph(requirements=[])
+    assert validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")]).function_items == []
+
+
+def test_scriptless_responsibility_graph_rejects_execution_edges():
+    graph = _graph(requirements=[], edges=[
+        {
+            "from_node": "platform_input_node",
+            "from_output": "text",
+            "to_node": "scripts/main.py",
+            "to_input": "payload",
+        }
+    ])
+    with pytest.raises(Exception) as exc:
+        validate_responsibility_graph_schema(graph, [SimpleNamespace(path="SKILL.md", purpose="docs")])
+    assert getattr(exc.value, "code", "") == "responsibility_graph_platform_io_conflict"
+
+
+def test_responsibility_graph_rejects_script_not_connected_to_platform_input():
+    graph = _graph(requirements=[_req()], edges=[
+        {
+            "from_node": "scripts/main.py",
+            "from_output": "result",
+            "to_node": "platform_output_node",
+            "to_input": "text",
+            "constraints": [],
+        }
+    ])
     with pytest.raises(Exception) as exc:
         validate_responsibility_graph_schema(graph, [SimpleNamespace(path="scripts/main.py", purpose="do x")])
     assert getattr(exc.value, "code", "") == "responsibility_graph_platform_io_conflict"
 
 
-def test_responsibility_graph_rejects_missing_platform_output_node():
-    graph = _graph(requirements=[_req()], include_output=False)
+def test_responsibility_graph_rejects_script_not_connected_to_platform_output():
+    graph = _graph(requirements=[_req()], edges=[
+        {
+            "from_node": "platform_input_node",
+            "from_output": "text",
+            "to_node": "scripts/main.py",
+            "to_input": "payload",
+            "constraints": [],
+        }
+    ])
     with pytest.raises(Exception) as exc:
         validate_responsibility_graph_schema(graph, [SimpleNamespace(path="scripts/main.py", purpose="do x")])
     assert getattr(exc.value, "code", "") == "responsibility_graph_platform_io_conflict"

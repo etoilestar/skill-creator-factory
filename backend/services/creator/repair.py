@@ -1601,6 +1601,14 @@ def _apply_exact_replace_patch(
                 "reason": "匹配到的原文 span 与 new 完全相同，已跳过该 no-op edit。",
             })
             continue
+
+        if expected_target_file == "SKILL.md" and fallback_type == "fuzzy_window":
+            if original_span.startswith("\n") and not new.startswith("\n"):
+                raise ValueError("SKILL.md fuzzy replacement 丢失了开头换行")
+
+            if original_span.endswith("\n") and not new.endswith("\n"):
+                raise ValueError("SKILL.md fuzzy replacement 丢失了结尾换行")
+
         candidate = candidate[:replace_start] + new + candidate[replace_end:]
         applied.append({
             "index": index,
@@ -4877,6 +4885,9 @@ async def _run_script_responsibility_review(
     provided_function_execution_context = review_context.get("function_execution_context")
     if isinstance(provided_function_execution_context, dict):
         function_execution_context = dict(provided_function_execution_context)
+        function_execution_context["authorized_tool_contracts"] = tool_contracts_from_binding(
+            current_file_tool_binding or {}
+        )
     else:
         function_execution_context = build_function_execution_context(
             graph=review_context.get("requirement_graph"),

@@ -67,6 +67,8 @@ def declared_artifact_paths(payload: dict[str, Any]) -> list[tuple[str, str]]:
     declared: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for key, value in payload.items():
+        if key == "artifact_metadata":
+            continue
         for field, raw_path in _walk_artifact_values(value, field=str(key)):
             marker = (field, raw_path)
             if marker in seen:
@@ -109,10 +111,6 @@ def resolve_declared_artifact_path(raw_path: str, *, skill_dir: Path, cwd: Path 
             candidate = ((cwd or skill_dir).resolve() / path).resolve()
     if not _is_within(candidate, skill_dir.resolve()):
         raise FileOutputValidationError(f"file_output_missing: 输出路径越界或不在安全目录内: {raw_path}")
-    outputs_root = (skill_dir.resolve() / "outputs").resolve()
-    assets_generated_root = (skill_dir.resolve() / "assets" / "generated").resolve()
-    if not _is_within(candidate, outputs_root) and not _is_within(candidate, assets_generated_root):
-        raise FileOutputValidationError(f"file_output_missing: 输出路径必须位于当前 Skill 工作目录的 outputs/；OUTPUT_DIR 已经指向 outputs，不要再拼 outputs；或 assets/generated/ 下，不能使用其他目录: {raw_path}")
     return candidate
 
 

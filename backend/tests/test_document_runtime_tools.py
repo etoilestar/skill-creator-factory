@@ -91,3 +91,48 @@ def test_document_helper_output_path_must_stay_under_output_dir(tmp_path):
     result = create_pptx(["ok"], output_dir=output_dir, output_path="nested/safe.pptx")
     assert result["pptx_path"] == str(output_dir / "nested" / "safe.pptx")
     assert (output_dir / "nested" / "safe.pptx").is_file()
+
+
+def _write_minimal_pdf(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+
+
+def test_artifact_validator_ignores_artifact_metadata_filenames(tmp_path):
+    skill_dir = tmp_path / "skill"
+    pdf_path = skill_dir / "outputs" / "real.pdf"
+    _write_minimal_pdf(pdf_path)
+
+    stdout = json.dumps({
+        "pdf_path": str(pdf_path),
+        "artifact_metadata": {"options": {"filename": "output.pdf"}},
+    })
+
+    assert validate_stdout_file_outputs(stdout, skill_dir=skill_dir, cwd=skill_dir / "scripts") == [
+        {"path": "outputs/real.pdf"}
+    ]
+
+
+def test_artifact_validator_allows_other_skill_workspace_subdirectories(tmp_path):
+    skill_dir = tmp_path / "skill"
+    pdf_path = skill_dir / "reports" / "real.pdf"
+    _write_minimal_pdf(pdf_path)
+
+    stdout = json.dumps({"pdf_path": str(pdf_path)})
+
+    assert validate_stdout_file_outputs(stdout, skill_dir=skill_dir, cwd=skill_dir / "scripts") == [
+        {"path": "reports/real.pdf"}
+    ]
+
+
+def test_artifact_validator_still_rejects_paths_outside_skill_workspace(tmp_path):
+    from backend.services.artifact_validator import FileOutputValidationError
+
+    skill_dir = tmp_path / "skill"
+    outside_pdf = tmp_path / "outside.pdf"
+    _write_minimal_pdf(outside_pdf)
+
+    stdout = json.dumps({"pdf_path": str(outside_pdf)})
+
+    with pytest.raises(FileOutputValidationError, match="输出路径越界"):
+        validate_stdout_file_outputs(stdout, skill_dir=skill_dir, cwd=skill_dir / "scripts")

@@ -8021,6 +8021,9 @@ def _platform_io_graph_refine_feedback(exc: RequirementGraphValidationError, gra
     details = getattr(exc, "details", {}) or {}
     node = str(details.get("node") or "")
     targets = [str(item) for item in (details.get("targets") or []) if str(item)]
+    script_nodes = [str(item.target_file) for item in (getattr(graph, "function_items", []) or []) if str(getattr(item, "target_file", "") or "")]
+    if not targets and node in {"platform_input_node", "platform_output_node"} and len(script_nodes) == 1:
+        targets = script_nodes
     directions: list[str] = []
     if node == "platform_input_node":
         directions.append("connect platform_input_node outputs to the actual first executable responsibility when runtime input is required")
@@ -8043,20 +8046,63 @@ def _platform_io_graph_refine_feedback(exc: RequirementGraphValidationError, gra
     }
 
 
-def _graph_scope_signature(graph: RequirementGraph) -> tuple[dict[str, dict[str, Any]], set[tuple[str, str, str, str]]]:
+def _stable_graph_scope_value(value: Any) -> Any:
+    """Normalize graph scope values for deterministic equality checks.
+
+    This is intentionally local to refine scope validation: it does not change
+    ResponsibilityGraph/FunctionItem/ResponsibilityEdge wire schema.
+    """
+    if hasattr(value, "model_dump"):
+        try:
+            value = value.model_dump(mode="json")
+        except Exception:
+            value = str(value)
+    if isinstance(value, dict):
+        return {str(key): _stable_graph_scope_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        normalized = [_stable_graph_scope_value(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
+    return value
+
+
+def _function_item_scope_signature(item: Any) -> dict[str, Any]:
+    # function_item_prompt_payload explicitly includes fields excluded from the
+    # normal Pydantic dump, notably constraints/evidence_policy-like responsibility
+    # metadata when available. Keep this as a comparison-only signature.
+    if isinstance(item, FunctionItem):
+        data = function_item_prompt_payload(item)
+        data["id"] = getattr(item, "id", "")
+        data["evidence_policy"] = _stable_graph_scope_value(getattr(item, "evidence_policy", {}) or {})
+    elif isinstance(item, dict):
+        data = dict(item)
+    else:
+        data = item.model_dump(mode="json") if hasattr(item, "model_dump") else {"value": str(item)}
+    return _stable_graph_scope_value(data)
+
+
+def _edge_scope_signature(edge: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    semantic = {
+        "purpose": edge.get("purpose", ""),
+        "constraints": edge.get("constraints", []),
+    }
+    return (
+        str(edge.get("from_node") or ""),
+        str(edge.get("from_output") or ""),
+        str(edge.get("to_node") or ""),
+        str(edge.get("to_input") or ""),
+        json.dumps(_stable_graph_scope_value(semantic), ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _graph_scope_signature(graph: RequirementGraph) -> tuple[dict[str, dict[str, Any]], set[tuple[str, str, str, str, str]]]:
     items: dict[str, dict[str, Any]] = {}
     for item in getattr(graph, "function_items", []) or []:
-        data = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
-        target = str(data.get("target_file") or "")
+        data = _function_item_scope_signature(item)
+        target = str(data.get("target_file") or "") if isinstance(data, dict) else ""
         if target:
             items[target] = data
     edges = {
-        (
-            str(edge.get("from_node") or ""),
-            str(edge.get("from_output") or ""),
-            str(edge.get("to_node") or ""),
-            str(edge.get("to_input") or ""),
-        )
+        _edge_scope_signature(edge)
         for edge in (getattr(graph, "dataflow_edges", []) or [])
         if isinstance(edge, dict)
     }
@@ -8079,12 +8125,11 @@ def _validate_refined_graph_scope(
         if target in related:
             continue
         after_item = after_items.get(target) or {}
-        for field in ("role", "purpose", "inputs", "outputs", "required_capabilities", "constraints"):
-            if before_item.get(field) != after_item.get(field):
-                raise ValueError(f"graph refine changed unrelated FunctionItem field: {target}.{field}")
+        if before_item != after_item:
+            raise ValueError(f"graph refine changed unrelated FunctionItem responsibility fields: {target}")
     changed_edges = before_edges.symmetric_difference(after_edges)
     for edge in changed_edges:
-        from_node, _from_output, to_node, _to_input = edge
+        from_node, _from_output, to_node, _to_input, _edge_semantics = edge
         if from_node not in related and to_node not in related:
             raise ValueError("graph refine changed unrelated responsibility edge")
 

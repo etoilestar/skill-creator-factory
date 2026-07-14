@@ -2869,19 +2869,26 @@ async def _repair_generated_file_with_feedback(
     block_repair_constraint_note = ""
     if file_path == "SKILL.md" and "skill_md.command_block." in str(failed_checks_text or ""):
         match = re.search(r"details: (\{[^\n]*\})", failed_checks_text or "")
-        if match:
-            try:
-                details = json.loads(match.group(1))
-                if isinstance(details, dict) and details.get("block_text") and details.get("script_path"):
-                    block_repair_constraint_note = "skill_md_block_repair_constraint:" + json.dumps({
-                        "script_path": details.get("script_path"),
-                        "block_text": details.get("block_text"),
-                        "block_start": details.get("block_start"),
-                        "block_end": details.get("block_end"),
-                        "block_ordinal": details.get("block_ordinal"),
-                    }, ensure_ascii=False, sort_keys=True)
-            except Exception:
-                block_repair_constraint_note = ""
+        if not match:
+            raise ValueError("SKILL.md command block repair missing structured block constraint details; refusing file-level fallback repair.")
+        try:
+            details = json.loads(match.group(1))
+        except Exception as exc:
+            raise ValueError("SKILL.md command block repair constraint details are not valid JSON; refusing file-level fallback repair.") from exc
+        if not isinstance(details, dict):
+            raise ValueError("SKILL.md command block repair constraint details must be an object; refusing file-level fallback repair.")
+        block_text = str(details.get("block_text") or details.get("current_block") or "")
+        script_path = str(details.get("script_path") or "")
+        if not block_text or not script_path:
+            raise ValueError("SKILL.md command block repair constraint missing script_path/block_text; refusing file-level fallback repair.")
+        block_repair_constraint_note = "skill_md_block_repair_constraint:" + json.dumps({
+            "script_path": script_path,
+            "block_text": block_text,
+            "block_start": details.get("block_start"),
+            "block_end": details.get("block_end"),
+            "block_ordinal": details.get("block_ordinal"),
+        }, ensure_ascii=False, sort_keys=True)
+
 
     scope_notes = [
         "第一轮只修当前文件。",

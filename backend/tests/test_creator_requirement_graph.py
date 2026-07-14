@@ -2157,3 +2157,107 @@ def test_responsibility_graph_uses_structured_function_items_directly():
     assert item.inputs == ['semantic_input']
     assert item.outputs == ['semantic_result']
     assert item.required_tools == ['semantic_capability']
+
+
+def test_graph_scope_signature_includes_excluded_function_item_fields():
+    from backend.services.creator import api
+
+    original = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py"), _script_spec(path="scripts/b.py")],
+        responsibility_edges=[],
+        function_items=[
+            {"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["mid"], "constraints": []},
+            {"target_file": "scripts/b.py", "purpose": "B", "inputs": ["mid"], "outputs": ["out"], "constraints": [{"name": "keep", "kind": "constraint", "value": "v1", "comparator": "describes"}]},
+        ],
+    )
+    refined = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py"), _script_spec(path="scripts/b.py")],
+        responsibility_edges=[],
+        function_items=[
+            {"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["mid"], "constraints": []},
+            {"target_file": "scripts/b.py", "purpose": "B", "inputs": ["mid"], "outputs": ["out"], "constraints": [{"name": "keep", "kind": "constraint", "value": "changed", "comparator": "describes"}]},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unrelated FunctionItem"):
+        api._validate_refined_graph_scope(before=original, after=refined, feedback={"related_nodes": ["scripts/a.py"]})
+
+
+def test_graph_refine_rejects_unrelated_edge_semantics_change():
+    from backend.services.creator import api
+
+    edge = {"from_node": "scripts/a.py", "from_output": "mid", "to_node": "scripts/b.py", "to_input": "mid", "purpose": "handoff", "constraints": [{"name": "c", "value": "v"}]}
+    original = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py"), _script_spec(path="scripts/b.py")],
+        responsibility_edges=[edge],
+        function_items=[
+            {"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["mid"], "constraints": []},
+            {"target_file": "scripts/b.py", "purpose": "B", "inputs": ["mid"], "outputs": ["out"], "constraints": []},
+        ],
+    )
+    changed = dict(edge, purpose="changed", constraints=[{"name": "c", "value": "changed"}])
+    refined = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py"), _script_spec(path="scripts/b.py")],
+        responsibility_edges=[changed],
+        function_items=[
+            {"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["mid"], "constraints": []},
+            {"target_file": "scripts/b.py", "purpose": "B", "inputs": ["mid"], "outputs": ["out"], "constraints": []},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unrelated responsibility edge"):
+        api._validate_refined_graph_scope(before=original, after=refined, feedback={"related_nodes": ["platform_input_node"]})
+
+
+def test_graph_refine_allows_related_platform_io_edge_change():
+    from backend.services.creator import api
+    from backend.services.platform_io_contract import build_platform_io_contract
+
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+    original = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py")],
+        responsibility_edges=[],
+        function_items=[{"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["out"], "constraints": []}],
+    )
+    refined = build_default_requirement_graph(
+        [_script_spec(path="scripts/a.py")],
+        responsibility_edges=[{"from_node": "platform_input_node", "from_output": boundary["input_envelope_fields"][0], "to_node": "scripts/a.py", "to_input": "in", "purpose": "provide input", "constraints": []}],
+        function_items=[{"target_file": "scripts/a.py", "purpose": "A", "inputs": ["in"], "outputs": ["out"], "constraints": []}],
+    )
+
+    api._validate_refined_graph_scope(before=original, after=refined, feedback={"related_nodes": ["platform_input_node", "scripts/a.py"]})
+
+
+def test_graph_refine_scope_failure_retries_then_succeeds(monkeypatch):
+    import asyncio
+    from backend.services.creator import api
+    from backend.services.platform_io_contract import build_platform_io_contract
+
+    boundary = build_platform_io_contract()["platform_skill_boundary"]
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({
+                "function_items": [{"target_file": "scripts/generic.py", "purpose": "unrelated semantic rewrite", "inputs": ["semantic source"], "outputs": ["semantic artifact"], "constraints": []}],
+                "responsibility_edges": [],
+            })
+        return json.dumps({
+            "function_items": [{"target_file": "scripts/generic.py", "purpose": "Transform input.", "inputs": ["semantic source"], "outputs": ["semantic artifact"], "constraints": []}],
+            "responsibility_edges": [
+                {"from_node": "platform_input_node", "from_output": boundary["input_envelope_fields"][0], "to_node": "scripts/generic.py", "to_input": "semantic source", "purpose": "provide input", "constraints": []},
+                {"from_node": "scripts/generic.py", "from_output": "semantic artifact", "to_node": "platform_output_node", "to_input": boundary["final_output_fields"][0], "purpose": "deliver output", "constraints": []},
+            ],
+        })
+
+    monkeypatch.setattr(api, "complete_chat_once", fake_complete)
+    graph = asyncio.run(api._extract_requirement_graph_with_validator(
+        blueprint_text="blueprint",
+        files_out=[_script_spec()],
+        responsibility_edges=[],
+        function_items=[{"target_file": "scripts/generic.py", "purpose": "Transform input.", "inputs": ["semantic source"], "outputs": ["semantic artifact"], "constraints": []}],
+    ))
+
+    assert len(calls) == 2
+    assert graph.dataflow_edges

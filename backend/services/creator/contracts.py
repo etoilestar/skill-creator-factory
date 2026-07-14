@@ -1854,25 +1854,55 @@ async def _review_skill_md_command_block_with_model(
         "返回格式固定为：{\"passed\": true, \"target_script_path\": \"scripts/x.py\", \"key_checks\": [], \"value_checks\": [], \"type_checks\": [], \"issues\": [], \"repair_suggestions\": \"\"}\n"
         "每个 key_checks/value_checks/type_checks item 必须包含 object、passed、evidence；失败项可包含 message/expected/minimal_edit/blocking。\n"
     )
-    raw = await complete_chat_once([
+    base_messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
-    ], route.model)
-    try:
-        data = _json_loads_loose_object(raw)
-    except Exception as exc:
-        raise CreatorValidatorReviewError(
-            f"SKILL.md block reviewer returned invalid JSON for {script_path}: {exc}",
-            raw_excerpt=str(raw)[:1000],
-        ) from exc
-    if isinstance(data, dict):
-        data.setdefault("target_script_path", script_path)
-    schema_error = _skill_md_block_review_schema_error(data)
-    if schema_error:
-        raise CreatorValidatorReviewError(f"SKILL.md block reviewer schema invalid for {script_path}: {schema_error}", raw_excerpt=str(raw)[:1000])
-    data["target_script_path"] = script_path
-    data["command_block_ordinal"] = ordinal
-    return data
+    ]
+    raw = ""
+    last_schema_error = ""
+    for review_attempt in range(3):
+        active_messages = base_messages if review_attempt == 0 else [
+            *base_messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一轮输出只做 JSON 格式/schema 重写，不重新审查 command block，不改变上一轮语义结论。\n"
+                    "请保留上一轮对 key_checks/value_checks/type_checks/issues/repair_suggestions 的语义判断，仅修正为固定 JSON object schema："
+                    "passed, target_script_path, key_checks, value_checks, type_checks, issues, repair_suggestions。\n"
+                    "不要输出 Markdown 或解释。\n"
+                    f"上一轮 schema_error：{last_schema_error}\n"
+                    f"上一轮 raw output excerpt：{str(raw or '')[:1200]}"
+                ),
+            },
+        ]
+        raw = await complete_chat_once(active_messages, route.model)
+        try:
+            data = _json_loads_loose_object(raw)
+        except Exception as exc:
+            data = {}
+            last_schema_error = f"invalid JSON: {exc}"
+        else:
+            if isinstance(data, dict):
+                data.setdefault("target_script_path", script_path)
+            last_schema_error = _skill_md_block_review_schema_error(data)
+            if not last_schema_error:
+                data["target_script_path"] = script_path
+                data["command_block_ordinal"] = ordinal
+                return data
+        if review_attempt < 2:
+            logger.info(
+                "[Creator][skill_md][block_review][schema_retry] skill=%s script=%s ordinal=%d attempt=%d error=%s",
+                skill_name,
+                script_path,
+                ordinal,
+                review_attempt + 1,
+                last_schema_error[:300],
+            )
+            continue
+    raise CreatorValidatorReviewError(
+        f"SKILL.md block reviewer schema invalid for {script_path} after 3 attempts: {last_schema_error}",
+        raw_excerpt=str(raw)[:1000],
+    )
 
 
 def _skill_md_block_review_to_contract_results(

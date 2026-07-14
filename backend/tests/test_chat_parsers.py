@@ -3847,3 +3847,161 @@ def test_creator_trial_stdout_accepts_arbitrary_real_file_field(tmp_path):
         skill_dir=skill_dir,
         skill_plan_entry={"role": "pdf_builder", "outputs": ["pdf_path"], "required_capabilities": ["pdf_generation"]},
     )
+
+
+def test_skill_md_block_repair_accepts_valid_exact_replace_constraint():
+    from backend.services.creator.repair import CreatorDiffProposal, CreatorRepairScope, _validate_repair_diff_scope
+
+    old_block = "python scripts/current.py '{\"x\":\"{{input}}\"}'"
+    new_block = "python scripts/current.py '{\"x\":\"{{text}}\"}'"
+    content = f"# Skill\n```bash\n{old_block}\n```\n"
+    scope = CreatorRepairScope(
+        phase="module_functional_smoke",
+        repair_type="localized_patch",
+        target_file="SKILL.md",
+        notes=("skill_md_block_repair_constraint:" + json.dumps({"script_path": "scripts/current.py", "block_text": old_block}, ensure_ascii=False),),
+    )
+
+    candidate, stats = _validate_repair_diff_scope(
+        proposal=CreatorDiffProposal(
+            target_file="SKILL.md",
+            reason="fix current block",
+            edits=[{"old": old_block, "new": new_block}],
+            mode="exact_replace",
+        ),
+        current_content=content,
+        scope=scope,
+    )
+
+    assert new_block in candidate
+    assert stats["mode"] == "exact_replace"
+    assert stats["edit_count"] == 1
+
+
+def test_skill_md_command_block_repair_missing_constraint_fails_closed():
+    import asyncio
+    from backend.services.creator.repair import _repair_generated_file_with_feedback
+
+    with pytest.raises(ValueError, match="missing structured block constraint"):
+        asyncio.run(_repair_generated_file_with_feedback(
+            prompt_messages=[],
+            model="unit-test",
+            file_path="SKILL.md",
+            previous_content="---\nname: demo\ndescription: demo\n---\n```bash\npython scripts/a.py '{}'\n```\n",
+            validation_error="block failed",
+            failed_checks_text="- skill_md.command_block.interface.key.1: missing details",
+        ))
+
+
+def test_skill_md_command_block_repair_incomplete_constraint_fails_closed():
+    import asyncio
+    from backend.services.creator.repair import _repair_generated_file_with_feedback
+
+    failed = 'skill_md.command_block.interface.key.1 details: {"script_path":"scripts/a.py","block_text":""}'
+    with pytest.raises(ValueError, match="missing script_path/block_text"):
+        asyncio.run(_repair_generated_file_with_feedback(
+            prompt_messages=[],
+            model="unit-test",
+            file_path="SKILL.md",
+            previous_content="---\nname: demo\ndescription: demo\n---\n```bash\npython scripts/a.py '{}'\n```\n",
+            validation_error="block failed",
+            failed_checks_text=failed,
+        ))
+
+
+def test_skill_md_block_reviewer_invalid_json_schema_retry_succeeds(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return "not json"
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [{"object": "x", "passed": True, "evidence": "argv key exists"}],
+            "value_checks": [{"object": "x", "passed": True, "evidence": "value source is available"}],
+            "type_checks": [{"object": "x", "passed": True, "evidence": "string serialization is compatible"}],
+            "issues": [],
+            "repair_suggestions": "",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert review["passed"] is True
+    assert len(calls) == 2
+    assert "不重新审查 command block" in calls[1][-1]["content"]
+
+
+def test_skill_md_block_reviewer_missing_checks_schema_retry_succeeds(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({"passed": True, "target_script_path": "scripts/current.py", "issues": []})
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert review["passed"] is True
+    assert len(calls) == 2
+
+
+def test_skill_md_block_reviewer_schema_retry_limit_raises_validator_failure(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return "not json"
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    with pytest.raises(contracts.CreatorValidatorReviewError, match="schema invalid"):
+        asyncio.run(contracts._review_skill_md_command_block_with_model(
+            skill_name="demo",
+            script_path="scripts/current.py",
+            command_block="python scripts/current.py '{}'",
+            ordinal=1,
+            prior_stdout=[],
+            requirement_graph=build_default_requirement_graph([]),
+            model="unit-test",
+        ))
+    assert len(calls) == 3

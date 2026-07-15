@@ -635,6 +635,21 @@ def _ensure_python_script_core_binding(binding: dict[str, Any], plan_entry: Skil
         return binding
     merged = dict(binding)
     merged["primary_tool_ids"] = _stable_unique([*(merged.get("primary_tool_ids") or []), "script_argv_guard"])
+    available_tools = list(merged.get("available_tools") or [])
+    if not any(
+        isinstance(tool, dict)
+        and tool.get("function_name") == "strict_json_argv_guard"
+        and tool.get("import_path") == "backend.services.runtime_tools"
+        for tool in available_tools
+    ):
+        available_tools.append({
+            "tool_id": "script_argv_guard",
+            "function_name": "strict_json_argv_guard",
+            "import_path": "backend.services.runtime_tools",
+            "input_schema": {},
+            "output_schema": {},
+        })
+    merged["available_tools"] = available_tools
     merged["allowed_helper_imports"] = _stable_unique([*(merged.get("allowed_helper_imports") or []), "strict_json_argv_guard"])
     return merged
 
@@ -756,6 +771,37 @@ def _available_tool_cards_from_binding(
     tool_function_cards: list[str] = []
 
     selected_tool_names: list[str] = []
+
+    bound_available_tools = (
+        binding.get("available_tools")
+        if isinstance(binding, dict)
+        else []
+    )
+    if isinstance(bound_available_tools, list) and bound_available_tools:
+        for item in bound_available_tools:
+            if not isinstance(item, dict):
+                continue
+            function_name = str(item.get("function_name") or "").strip()
+            import_path = str(item.get("import_path") or "").strip()
+            tool_id = str(item.get("tool_id") or "").strip()
+            if not tool_id or not function_name or not import_path:
+                continue
+            capability_name = str(item.get("capability_name") or tool_id.split(".", 1)[0]).strip()
+            selected_tool_names.append(capability_name)
+            capability = get_tool_capability(capability_name)
+            if capability is not None:
+                tool_function_cards.extend(function_cards_for_tool(capability))
+            available_tools.append({
+                **item,
+                "tool_id": tool_id,
+                "capability_name": capability_name,
+                "function_name": function_name,
+                "import_path": import_path,
+                "input_schema": item.get("input_schema") or {},
+                "output_schema": item.get("output_schema") or {},
+                "call_template": item.get("call_template") or f"from {import_path} import {function_name}\nresult = {function_name}(...)",
+            })
+        return (available_tools, tool_function_cards, selected_tool_names)
 
     contracts = tool_contracts_from_binding(
         binding
@@ -1031,6 +1077,35 @@ def _script_local_contract_payload(
         )
     )
 
+    if isinstance(tool_binding_summary, dict):
+        available_tools_for_binding = (
+            tool_binding_summary.get("available_tools")
+            if isinstance(tool_binding_summary.get("available_tools"), list)
+            else []
+        )
+        tool_binding_summary["available_tools"] = available_tools_for_binding
+        tool_binding_summary["allowed_function_imports"] = _stable_unique([
+            item
+            for tool in available_tools_for_binding
+            if isinstance(tool, dict)
+            for item in (
+                tool.get("function_name"),
+                f"{tool.get('import_path')}.{tool.get('function_name')}"
+                if tool.get("import_path") and tool.get("function_name")
+                else "",
+            )
+        ])
+        tool_binding_summary["allowed_import_paths"] = _stable_unique([
+            tool.get("import_path")
+            for tool in available_tools_for_binding
+            if isinstance(tool, dict)
+        ])
+        tool_binding_summary["allowed_helper_imports"] = _stable_unique([
+            tool.get("function_name")
+            for tool in available_tools_for_binding
+            if isinstance(tool, dict)
+        ])
+
     if function_execution_context is None:
         function_execution_context = build_function_execution_context(
             graph=responsibility_graph,
@@ -1208,16 +1283,10 @@ def _script_local_contract_payload(
                 "the call."
             ),
             (
-                "Imports from "
-                "backend.services.runtime_tools "
-                "must come from current_file_tool_"
-                "binding.allowed_helper_imports."
-            ),
-            (
-                "Custom or non-runtime_tools imports "
-                "must follow current_file_tool_"
-                "binding.allowed_import_paths and "
-                "allowed_function_imports."
+                "Only use tools from current_file_tool_binding.available_tools. "
+                "Use the function_name, import_path, input_schema and output_schema "
+                "provided by that tool pool; do not use tools, imports, functions, "
+                "parameters, or output fields outside that pool."
             ),
             (
                 "Treat available tools as candidates only after responsibility_requirements are understood."

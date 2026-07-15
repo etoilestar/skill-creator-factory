@@ -4373,3 +4373,186 @@ def test_skill_md_block_reviewer_core_schema_error_still_retries(monkeypatch):
 
     assert len(calls) == 2
     assert review["passed"] is True
+
+
+def test_creator_json_argv_unquoted_whole_value_placeholder_auto_normalizes():
+    from backend.services.creator import contracts
+
+    text = '{"slot": {{item}}}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == '{"slot": "{{item}}"}'
+    assert fixes and fixes[0]["source"] == "item"
+    assert json.loads(normalized) == {"slot": "{{item}}"}
+
+    sig = contracts._command_signature("python scripts/current.py '{\"slot\": {{item}}}'", "scripts/current.py")
+    assert sig["auto_normalized"] is True
+    assert sig["normalized_json_arg"] == normalized
+    assert sig["json_payload"]["slot"] == "{{item}}"
+    assert sig["json_payload"]["slot"] is not None
+    assert sig["placeholders"]["slot"] == "item"
+
+
+def test_creator_json_argv_quoted_placeholder_not_modified():
+    from backend.services.creator import contracts
+
+    text = '{"slot": "{{item}}"}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+
+    sig = contracts._command_signature("python scripts/current.py '{\"slot\": \"{{item}}\"}'", "scripts/current.py")
+    assert sig["auto_normalized"] is False
+    assert sig["json_payload"] == {"slot": "{{item}}"}
+    assert sig["placeholders"]["slot"] == "item"
+
+
+def test_creator_json_argv_literals_unchanged_by_placeholder_normalizer():
+    from backend.services.creator import contracts
+
+    payload = {
+        "string": "text",
+        "list": [1, "two"],
+        "object": {"nested": True},
+        "number": 3.5,
+        "boolean": False,
+        "null": None,
+    }
+    text = json.dumps(payload, sort_keys=True)
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    assert json.loads(normalized) == payload
+
+
+def test_creator_json_argv_embedded_placeholder_string_unchanged():
+    from backend.services.creator import contracts
+
+    text = '{"slot": "prefix-{{item}}-suffix"}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    assert json.loads(normalized)["slot"] == "prefix-{{item}}-suffix"
+
+
+def test_creator_json_argv_placeholder_key_not_auto_fixed():
+    from backend.services.creator import contracts
+
+    text = '{"safe": 1, {{item}}: "value"}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(normalized)
+
+
+def test_creator_json_argv_outside_string_concatenation_not_auto_fixed():
+    from backend.services.creator import contracts
+
+    text = '{"slot": prefix{{item}}}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(normalized)
+
+
+def test_creator_json_argv_incomplete_placeholder_not_auto_fixed():
+    from backend.services.creator import contracts
+
+    text = '{"slot": {{item}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(normalized)
+
+
+def test_creator_json_argv_multiple_safe_placeholders_auto_normalize_independently():
+    from backend.services.creator import contracts
+
+    text = '{"first": {{one}}, "second": [{{two}}]}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == '{"first": "{{one}}", "second": ["{{two}}"]}'
+    assert [fix["source"] for fix in fixes] == ["one", "two"]
+    assert len(fixes) == 2
+    assert json.loads(normalized) == {"first": "{{one}}", "second": ["{{two}}"]}
+
+
+def test_skill_md_block_reconcile_unquoted_placeholder_auto_normalization_closes_loop():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": False,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [{"object": "slot", "passed": False, "category": "literal_type_conflict"}],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"slot": {{item}}}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+
+    assert reconciled["passed"] is True
+    assert not any(check.get("category") == "literal_type_conflict" and not check.get("passed") for check in reconciled["type_checks"])
+    assert not any(check.get("category") == "unknown_source" for check in reconciled["value_checks"])
+
+
+def test_skill_md_block_reconcile_auto_normalization_keeps_real_errors_failing():
+    from backend.services.creator import contracts
+
+    base_review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    unknown = contracts._reconcile_block_review_with_runtime_contract(
+        dict(base_review),
+        command_block='python scripts/current.py \'{"slot": {{missing}}}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+    assert unknown["passed"] is False
+    assert any(check.get("category") == "unknown_source" for check in unknown["value_checks"])
+
+    conflict = contracts._reconcile_block_review_with_runtime_contract(
+        dict(base_review),
+        command_block='python scripts/current.py \'{"slot": {{item}}}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "object"}},
+        available_source_fields=["item"],
+        available_source_types={"item": "array"},
+    )
+    assert conflict["passed"] is False
+    assert any(check.get("category") == "structured_source_type_conflict" for check in conflict["type_checks"])
+
+    extra = contracts._reconcile_block_review_with_runtime_contract(
+        dict(base_review),
+        command_block='python scripts/current.py \'{"slot": {{item}}, "extra": 1}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+    assert extra["passed"] is False
+    assert any(check.get("category") == "extra_key" for check in extra["key_checks"])
+
+    missing = contracts._reconcile_block_review_with_runtime_contract(
+        dict(base_review),
+        command_block='python scripts/current.py \'{"other": {{item}}}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["other", "slot"], "required_keys": ["slot"], "expected_types": {"other": "array"}},
+        available_source_fields=["item"],
+    )
+    assert missing["passed"] is False
+    assert any(check.get("category") == "missing_required_key" for check in missing["key_checks"])

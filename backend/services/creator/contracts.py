@@ -126,15 +126,28 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
 
     json_payload: dict[str, Any] | None = None
     arg_mode = "no_args"
+    normalized_arg0: str | None = None
+    auto_fixes: list[dict[str, Any]] = []
 
     if len(args) == 1:
         arg0 = args[0].strip()
         if arg0.startswith("{") and arg0.endswith("}"):
+            normalized_arg0, auto_fixes = _canonicalize_unquoted_json_template_placeholders(arg0)
             try:
-                parsed = _loads_templated_json_argv_object(arg0)
+                parsed = _loads_templated_json_argv_object(normalized_arg0)
                 if isinstance(parsed, dict):
                     json_payload = parsed
                     arg_mode = "json_arg"
+                    if auto_fixes:
+                        logger.info(
+                            "[Creator][skill_md][command_block][placeholder_auto_normalized] skill=%s script=%s ordinal=%s fix_count=%d sources=%s parse_ok=%s",
+                            "",
+                            expected_script,
+                            "",
+                            len(auto_fixes),
+                            sorted({str(fix.get("source") or "") for fix in auto_fixes}),
+                            True,
+                        )
                 else:
                     arg_mode = "invalid_json_arg"
             except json.JSONDecodeError:
@@ -167,16 +180,100 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         "json_payload": json_payload,
         "keys": keys,
         "placeholders": placeholders,
+        "normalized_json_arg": normalized_arg0,
+        "auto_fixes": auto_fixes,
+        "auto_normalized": bool(auto_fixes),
     }
 
 
 _UNQUOTED_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}")
 
 
+def _canonicalize_unquoted_json_template_placeholders(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Quote safe whole-value unquoted JSON template placeholders.
+
+    Only placeholders outside JSON strings that fully occupy a JSON value are
+    normalized. The original text is returned unchanged if the candidate edit
+    would not produce parseable JSON.
+    """
+    source = str(text or "")
+    result: list[str] = []
+    fixes: list[dict[str, Any]] = []
+    idx = 0
+    in_string = False
+    escape = False
+
+    def previous_non_ws(pos: int) -> str:
+        j = pos - 1
+        while j >= 0 and source[j].isspace():
+            j -= 1
+        return source[j] if j >= 0 else ""
+
+    def next_non_ws(pos: int) -> str:
+        j = pos
+        while j < len(source) and source[j].isspace():
+            j += 1
+        return source[j] if j < len(source) else ""
+
+    while idx < len(source):
+        ch = source[idx]
+        if in_string:
+            result.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            idx += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            idx += 1
+            continue
+
+        if source.startswith("{{", idx):
+            end = source.find("}}", idx + 2)
+            if end >= 0:
+                token = source[idx:end + 2]
+                match = _UNQUOTED_TEMPLATE_PLACEHOLDER_RE.fullmatch(token)
+                prev_ch = previous_non_ws(idx)
+                next_ch = next_non_ws(end + 2)
+                if match and prev_ch in {":", "[", ","} and next_ch in {",", "]", "}"}:
+                    result.append(json.dumps(token))
+                    fixes.append(
+                        {
+                            "source": match.group(1),
+                            "start": idx,
+                            "end": end + 2,
+                            "replacement": json.dumps(token),
+                        }
+                    )
+                    idx = end + 2
+                    continue
+
+        result.append(ch)
+        idx += 1
+
+    if not fixes:
+        return source, []
+
+    normalized = "".join(result)
+    try:
+        json.loads(normalized)
+    except json.JSONDecodeError:
+        return source, []
+    return normalized, fixes
+
+
 def _replace_unquoted_json_template_placeholders(text: str) -> str:
     """Replace unquoted {{placeholder}} JSON-template values with null.
 
-    Quoted placeholders are ordinary JSON strings and are preserved.
+    Quoted placeholders are ordinary JSON strings and are preserved. Do not use
+    this helper in Creator SKILL.md command signature paths that must preserve
+    placeholder identity; use _canonicalize_unquoted_json_template_placeholders.
     """
     source = str(text or "")
     result: list[str] = []
@@ -219,8 +316,9 @@ def _replace_unquoted_json_template_placeholders(text: str) -> str:
 
 
 def _loads_templated_json_argv_object(text: str) -> Any:
-    """Load a JSON argv template, allowing unquoted placeholders as values."""
-    return json.loads(_replace_unquoted_json_template_placeholders(text))
+    """Load a JSON argv template after command-signature placeholder canonicalization."""
+    return json.loads(text)
+
 
 def _explicit_field_names(value: Iterable[str] | Mapping[str, Any] | None) -> set[str]:
     """Collect only field names that are explicit placeholder roots/paths."""

@@ -474,6 +474,98 @@ async def test_skill_md_reviewer_invalid_json_retries_and_keeps_candidate(monkey
 
 
 @pytest.mark.asyncio
+async def test_skill_md_single_command_block_repair_only_replaces_failed_block(monkeypatch):
+    from backend.services.creator import api
+
+    first_block = "```bash\npython scripts/one.py '{\"a\":\"{{user_request}}\"}'\n```\n"
+    bad_block = "```bash\npython scripts/two.py '{\"bad\":\"literal\"}'\n```\n"
+    third_block = "```bash\npython scripts/three.py '{\"c\":\"{{two}}\"}'\n```\n"
+    frontmatter = "---\nname: demo\ndescription: demo\n---\n"
+    body_before = "# Demo\n\nRun one:\n"
+    middle = "\nRun two:\n"
+    body_after = "\nRun three:\n"
+    tail = "\nDone.\n"
+    candidate = frontmatter + body_before + first_block + middle + bad_block + body_after + third_block + tail
+    start = candidate.index(bad_block)
+    end = start + len(bad_block)
+    locator = {
+        "block_text": bad_block,
+        "script_path": "scripts/two.py",
+        "block_start": start,
+        "block_end": end,
+        "block_sha256": api.hashlib.sha256(bad_block.encode("utf-8")).hexdigest(),
+        "structured_checks": {"value_checks": [{"passed": False}]},
+        "failure_reasons": [{"message": "literal value has no source"}],
+    }
+    repaired_block = "```bash\npython scripts/two.py '{\"text\":\"{{one}}\"}'\n```\n"
+    seen_prompts = []
+
+    async def fake_complete(**kwargs):
+        seen_prompts.extend(kwargs["messages"])
+        return repaired_block
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete)
+    block = await api._repair_skill_md_command_block(
+        model="unit-test",
+        skill_name="demo",
+        block_text=bad_block,
+        script_path="scripts/two.py",
+        structured_checks=locator["structured_checks"],
+        failure_reasons=locator["failure_reasons"],
+    )
+    repaired = api._replace_skill_md_command_block_exact(candidate, locator, block)
+
+    assert repaired[start:start + len(repaired_block)] == repaired_block
+    assert repaired[:start] == candidate[:start]
+    assert repaired[start + len(repaired_block):] == candidate[end:]
+    assert first_block in repaired
+    assert third_block in repaired
+    assert frontmatter in repaired
+    assert body_before in repaired and middle in repaired and body_after in repaired and tail in repaired
+    assert all(candidate not in message["content"] for message in seen_prompts)
+
+
+@pytest.mark.asyncio
+async def test_skill_md_single_command_block_repair_rejects_full_document(monkeypatch):
+    from backend.services.creator import api
+
+    bad_block = "```bash\npython scripts/two.py '{\"bad\":\"literal\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n" + bad_block
+    locator = {
+        "block_text": bad_block,
+        "script_path": "scripts/two.py",
+        "block_start": candidate.index(bad_block),
+        "block_end": candidate.index(bad_block) + len(bad_block),
+        "block_sha256": api.hashlib.sha256(bad_block.encode("utf-8")).hexdigest(),
+        "structured_checks": {},
+        "failure_reasons": [{"message": "bad block"}],
+    }
+    full_document = "---\nname: demo\ndescription: demo\n---\n# Demo\n```bash\npython scripts/two.py '{}'\n```\n"
+
+    async def fake_complete(**kwargs):
+        return full_document
+
+    async def forbidden_whole_file_repair(**kwargs):
+        raise AssertionError("whole-file repair must not be called")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", forbidden_whole_file_repair)
+
+    with pytest.raises(ValueError):
+        block = await api._repair_skill_md_command_block(
+            model="unit-test",
+            skill_name="demo",
+            block_text=bad_block,
+            script_path="scripts/two.py",
+            structured_checks=locator["structured_checks"],
+            failure_reasons=locator["failure_reasons"],
+        )
+        api._replace_skill_md_command_block_exact(candidate, locator, block)
+
+    assert candidate == "---\nname: demo\ndescription: demo\n---\n# Demo\n" + bad_block
+
+
+@pytest.mark.asyncio
 async def test_skill_md_reviewer_invalid_json_then_passed_false_enters_semantic_failure(monkeypatch):
     from backend.services.creator import contracts
 

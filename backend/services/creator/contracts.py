@@ -1944,38 +1944,111 @@ def _available_source_fields_for_block_review(
     return fields
 
 
-def _argv_schema_properties(argv_schema: Any) -> dict[str, Any]:
+def _available_source_types_for_block_review(
+    *,
+    prior_stdout: list[Any] | None,
+    incoming_edges: Any,
+    function_context: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    types: dict[str, str] = {}
+
+    def add(source: Any, source_type: Any) -> None:
+        source_text = _placeholder_root(str(source or "").strip())
+        type_text = str(source_type or "").strip().lower()
+        if source_text and type_text and source_text not in types:
+            types[source_text] = type_text
+
+    for edge in incoming_edges or []:
+        if not isinstance(edge, Mapping):
+            continue
+        source = edge.get("from_output") or edge.get("source") or edge.get("source_field")
+        add(source, edge.get("from_output_type") or edge.get("source_type") or edge.get("output_type") or edge.get("type"))
+    ctx = function_context or {}
+    function_item = ctx.get("function_item") if isinstance(ctx.get("function_item"), Mapping) else {}
+    outputs = function_item.get("outputs") if isinstance(function_item, Mapping) else []
+    if isinstance(outputs, Mapping):
+        for source, source_type in outputs.items():
+            add(source, source_type)
+    elif isinstance(outputs, list):
+        for output in outputs:
+            if isinstance(output, Mapping):
+                add(output.get("name") or output.get("field") or output.get("key") or output.get("source"), output.get("type") or output.get("json_type"))
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        source = binding.get("source") or binding.get("source_field") or binding.get("from_output")
+        add(source, binding.get("source_type") or binding.get("type") or binding.get("json_type"))
+    for item in prior_stdout or []:
+        if isinstance(item, Mapping):
+            add(item.get("name") or item.get("field") or item.get("key") or item.get("source"), item.get("type") or item.get("json_type"))
+    return types
+
+
+def _normalize_block_review_argv_schema(argv_schema: Any) -> dict[str, Any]:
+    allowed_keys: set[str] = set()
+    required_keys: set[str] = set()
+    expected_types: dict[str, str] = {}
+
     if not isinstance(argv_schema, Mapping):
-        return {}
-    props = argv_schema.get("properties")
-    if isinstance(props, Mapping):
-        return {str(key): value for key, value in props.items()}
-    args = argv_schema.get("args") or argv_schema.get("argv") or argv_schema.get("fields")
-    if isinstance(args, Mapping):
-        return {str(key): value for key, value in args.items()}
-    return {}
+        return {"allowed_keys": allowed_keys, "required_keys": required_keys, "expected_types": expected_types}
 
+    def as_key_set(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            return {value} if value.strip() else set()
+        if isinstance(value, Mapping):
+            return {str(key).strip() for key in value.keys() if str(key or "").strip()}
+        if isinstance(value, Iterable):
+            return {str(item).strip() for item in value if str(item or "").strip()}
+        text = str(value or "").strip()
+        return {text} if text else set()
 
-def _argv_schema_required_keys(argv_schema: Any) -> set[str]:
-    if not isinstance(argv_schema, Mapping):
-        return set()
-    required = argv_schema.get("required") or argv_schema.get("required_keys") or []
-    if isinstance(required, str):
-        return {required}
-    if isinstance(required, Iterable):
-        return {str(item) for item in required if str(item or "").strip()}
-    return set()
+    def type_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip().lower()
+        if isinstance(value, list):
+            return "|".join(str(item).strip().lower() for item in value if str(item or "").strip())
+        if isinstance(value, Mapping):
+            raw = value.get("type") or value.get("expected_type") or value.get("json_type")
+            return type_text(raw)
+        return str(value or "").strip().lower()
 
+    allowed_keys = as_key_set(argv_schema.get("allowed_keys"))
+    properties = argv_schema.get("properties")
+    if not allowed_keys and isinstance(properties, Mapping):
+        allowed_keys = as_key_set(properties)
+    structural_args: Mapping[str, Any] = {}
+    for source_key in ("args", "argv", "fields"):
+        raw = argv_schema.get(source_key)
+        if isinstance(raw, Mapping):
+            structural_args = raw
+            if not allowed_keys:
+                allowed_keys = as_key_set(raw)
+            break
 
-def _argv_expected_type(schema_item: Any) -> str:
-    if isinstance(schema_item, str):
-        return schema_item.strip().lower()
-    if not isinstance(schema_item, Mapping):
-        return ""
-    raw = schema_item.get("type") or schema_item.get("expected_type") or schema_item.get("json_type")
-    if isinstance(raw, list):
-        return "|".join(str(item).strip().lower() for item in raw if str(item or "").strip())
-    return str(raw or "").strip().lower()
+    required_keys = as_key_set(argv_schema.get("required_keys"))
+    if not required_keys:
+        required_keys = as_key_set(argv_schema.get("required"))
+
+    raw_expected = argv_schema.get("expected_types")
+    if isinstance(raw_expected, Mapping):
+        expected_types.update({str(key): type_text(value) for key, value in raw_expected.items() if str(key or "").strip() and type_text(value)})
+    if isinstance(properties, Mapping):
+        for key, value in properties.items():
+            key_text = str(key)
+            if key_text not in expected_types:
+                parsed = type_text(value)
+                if parsed:
+                    expected_types[key_text] = parsed
+    for key, value in structural_args.items():
+        key_text = str(key)
+        if key_text not in expected_types:
+            parsed = type_text(value)
+            if parsed:
+                expected_types[key_text] = parsed
+
+    return {"allowed_keys": allowed_keys, "required_keys": required_keys, "expected_types": expected_types}
 
 
 def _json_type_matches(value: Any, expected_type: str) -> bool:
@@ -2008,6 +2081,34 @@ def _json_type_matches(value: Any, expected_type: str) -> bool:
     return bool(aliases.get(actual, {actual}) & expected)
 
 
+def _json_type_compatible(source_type: str, expected_type: str) -> bool | None:
+    source = str(source_type or "").strip().lower()
+    expected = str(expected_type or "").strip().lower()
+    if not source or not expected:
+        return None
+    sample_by_type = {
+        "string": "",
+        "str": "",
+        "array": [],
+        "list": [],
+        "object": {},
+        "dict": {},
+        "mapping": {},
+        "number": 1,
+        "integer": 1,
+        "int": 1,
+        "float": 1.0,
+        "boolean": True,
+        "bool": True,
+        "null": None,
+        "none": None,
+    }
+    sample = sample_by_type.get(source)
+    if source not in sample_by_type:
+        return None
+    return _json_type_matches(sample, expected)
+
+
 def _check_object_name(check: Mapping[str, Any]) -> str:
     for key in ("object", "check_object", "target", "field", "key", "value_path", "subject", "path"):
         text = str(check.get(key) or "").strip()
@@ -2016,10 +2117,12 @@ def _check_object_name(check: Mapping[str, Any]) -> str:
     return ""
 
 
-def _append_check(checks: list[Any], *, obj: str, passed: bool, evidence: str, message: str = "") -> None:
+def _append_check(checks: list[Any], *, obj: str, passed: bool, evidence: str, message: str = "", category: str = "") -> None:
     item = {"object": obj, "passed": passed, "evidence": evidence}
     if message:
         item["message"] = message
+    if category:
+        item["category"] = category
     checks.append(item)
 
 
@@ -2038,6 +2141,19 @@ def _recompute_block_review_passed(review: dict[str, Any]) -> None:
     review["passed"] = not failed_checks and not blocking_issues
 
 
+def _review_item_matches_key(item: Any, key: str) -> bool:
+    return isinstance(item, Mapping) and _check_object_name(item) == str(key)
+
+
+def _is_serialization_issue_for_key(issue: Any, key: str) -> bool:
+    if not isinstance(issue, Mapping):
+        return False
+    if _check_object_name(issue) != str(key):
+        return False
+    category = str(issue.get("category") or issue.get("check_type") or "").strip().lower()
+    return category in {"placeholder_serialization", "whole_value_placeholder_serialization", "template_serialization"}
+
+
 def _reconcile_block_review_with_runtime_contract(
     review: dict[str, Any],
     *,
@@ -2045,49 +2161,62 @@ def _reconcile_block_review_with_runtime_contract(
     script_path: str,
     argv_schema: Any,
     available_source_fields: list[str],
+    available_source_types: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     signature = _command_signature(command_block, script_path) or {}
     argv = signature.get("json_payload") if isinstance(signature.get("json_payload"), dict) else {}
     available_roots = {_placeholder_root(field) for field in available_source_fields if str(field or "").strip()}
-    props = _argv_schema_properties(argv_schema)
-    required = _argv_schema_required_keys(argv_schema)
-    accepted_keys = set(props.keys())
-    key_checks = list(review.get("key_checks") or [])
-    value_checks = list(review.get("value_checks") or [])
-    type_checks = list(review.get("type_checks") or [])
+    normalized_schema = _normalize_block_review_argv_schema(argv_schema)
+    required = set(normalized_schema["required_keys"])
+    accepted_keys = set(normalized_schema["allowed_keys"])
+    expected_types = dict(normalized_schema["expected_types"])
+    source_types = {str(key): str(value) for key, value in (available_source_types or {}).items() if str(key or "").strip() and str(value or "").strip()}
+
+    original_key_checks = list(review.get("key_checks") or [])
+    original_value_checks = list(review.get("value_checks") or [])
+    original_type_checks = list(review.get("type_checks") or [])
     issues = list(review.get("issues") or [])
+    key_checks = [check for check in original_key_checks if isinstance(check, dict)]
+    value_checks = [check for check in original_value_checks if isinstance(check, dict)]
+    type_checks = [check for check in original_type_checks if isinstance(check, dict)]
+    serialization_corrected_keys: set[str] = set()
 
     for key in sorted(required - set(argv.keys())):
-        _append_check(key_checks, obj=key, passed=False, evidence="required argv key is missing", message="required argv key is missing")
+        _append_check(key_checks, obj=key, passed=False, evidence="required argv key is missing", message="required argv key is missing", category="missing_required_key")
     for key in argv.keys():
         if accepted_keys and key not in accepted_keys:
-            _append_check(key_checks, obj=str(key), passed=False, evidence="argv key is not accepted by target schema", message="argv key is not accepted by target schema")
+            _append_check(key_checks, obj=str(key), passed=False, evidence="argv key is not accepted by target schema", message="argv key is not accepted by target schema", category="extra_key")
 
     for key, value in argv.items():
-        expected_type = _argv_expected_type(props.get(str(key)))
+        key_text = str(key)
+        expected_type = str(expected_types.get(key_text) or "")
         source = _whole_value_placeholder_source(value)
         if source:
             root = _placeholder_root(source)
-            if root in available_roots:
-                evidence = "whole-value placeholder source is available; runtime preserves native JSON type"
-                for checks in (value_checks, type_checks):
-                    for check in checks:
-                        if isinstance(check, dict) and _check_object_name(check) == str(key):
-                            check["passed"] = True
-                            check["evidence"] = f"{check.get('evidence') or ''}; {evidence}".strip("; ")
-                if not any(isinstance(check, dict) and _check_object_name(check) == str(key) for check in value_checks):
-                    _append_check(value_checks, obj=str(key), passed=True, evidence=evidence)
-                if not any(isinstance(check, dict) and _check_object_name(check) == str(key) for check in type_checks):
-                    _append_check(type_checks, obj=str(key), passed=True, evidence=evidence)
+            value_checks = [check for check in value_checks if not _review_item_matches_key(check, key_text)]
+            type_checks = [check for check in type_checks if not (_review_item_matches_key(check, key_text) and str(check.get("category") or "").strip().lower() in {"placeholder_serialization", "whole_value_placeholder_serialization", "template_serialization"})]
+            if root not in available_roots:
+                _append_check(value_checks, obj=key_text, passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available", category="unknown_source")
+                continue
+            _append_check(value_checks, obj=key_text, passed=True, evidence="whole-value placeholder source root exists in available_source_fields", category="source_available")
+            compatibility = _json_type_compatible(source_types.get(root, ""), expected_type)
+            if compatibility is True:
+                _append_check(type_checks, obj=key_text, passed=True, evidence="structured source type is compatible with target argv type", category="structured_source_type")
+            elif compatibility is False:
+                _append_check(type_checks, obj=key_text, passed=False, evidence="structured source type conflicts with target argv type", message="source type conflicts with target argv type", category="structured_source_type_conflict")
             else:
-                _append_check(value_checks, obj=str(key), passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available")
+                _append_check(type_checks, obj=key_text, passed=True, evidence="whole-value placeholder preserves native type; source type is unknown and runtime value is verified by E2E", category="placeholder_serialization")
+            serialization_corrected_keys.add(key_text)
             continue
         if _contains_placeholder_syntax(value):
             if expected_type and not _json_type_matches("", expected_type):
-                _append_check(type_checks, obj=str(key), passed=False, evidence="embedded placeholder serializes to string and is incompatible with expected JSON type", message="embedded placeholder is string interpolation")
+                _append_check(type_checks, obj=key_text, passed=False, evidence="embedded placeholder serializes to string and is incompatible with expected JSON type", message="embedded placeholder is string interpolation", category="embedded_placeholder_type")
             continue
         if expected_type and not _json_type_matches(value, expected_type):
-            _append_check(type_checks, obj=str(key), passed=False, evidence="literal JSON value conflicts with expected argv type", message="literal value type mismatch")
+            _append_check(type_checks, obj=key_text, passed=False, evidence="literal JSON value conflicts with expected argv type", message="literal value type mismatch", category="literal_type_conflict")
+
+    if serialization_corrected_keys:
+        issues = [issue for issue in issues if not any(_is_serialization_issue_for_key(issue, key) for key in serialization_corrected_keys)]
 
     review["key_checks"] = key_checks
     review["value_checks"] = value_checks
@@ -2095,6 +2224,7 @@ def _reconcile_block_review_with_runtime_contract(
     review["issues"] = issues
     _recompute_block_review_passed(review)
     return review
+
 
 def _skill_md_block_check_schema_error(check: Any, *, check_type: str, index: int) -> str:
     if not isinstance(check, dict):
@@ -2193,6 +2323,11 @@ async def _review_skill_md_command_block_with_model(
         incoming_edges=incoming_edges,
         function_context=function_context if isinstance(function_context, Mapping) else {},
     )
+    available_source_types = _available_source_types_for_block_review(
+        prior_stdout=prior_stdout,
+        incoming_edges=incoming_edges,
+        function_context=function_context if isinstance(function_context, Mapping) else {},
+    )
     payload = {
         "script_path": script_path,
         "command_block": command_block,
@@ -2206,6 +2341,7 @@ async def _review_skill_md_command_block_with_model(
         "incoming_edges": incoming_edges or [],
         "prior_available_stdout": prior_stdout,
         "available_source_fields": available_source_fields,
+        "available_source_types": available_source_types,
         "placeholder_runtime_contract": {
             "syntax": "{{source}}",
             "whole_value_preserves_native_type": True,
@@ -2287,6 +2423,7 @@ async def _review_skill_md_command_block_with_model(
                     script_path=script_path,
                     argv_schema=local.get("strict_json_argv_schema") or {},
                     available_source_fields=available_source_fields,
+                    available_source_types=available_source_types,
                 )
         if review_attempt < 2:
             logger.info(

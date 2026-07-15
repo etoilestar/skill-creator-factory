@@ -4006,18 +4006,9 @@ def test_skill_md_block_reviewer_schema_retry_limit_raises_validator_failure(mon
         ))
     assert len(calls) == 3
 
-@pytest.mark.parametrize(
-    ("expected_type", "source_value"),
-    [
-        ("string", "alpha"),
-        ("array", ["a"]),
-        ("object", {"a": 1}),
-        ("number", 3),
-        ("boolean", True),
-        ("null", None),
-    ],
-)
-def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(expected_type, source_value):
+
+@pytest.mark.parametrize("expected_type", ["string", "array", "object", "number", "boolean", "null"])
+def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(expected_type):
     from backend.services.creator import contracts
 
     review = {
@@ -4025,7 +4016,7 @@ def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(
         "target_script_path": "scripts/current.py",
         "key_checks": [{"object": "slot", "passed": True, "evidence": "accepted"}],
         "value_checks": [{"object": "slot", "passed": False, "evidence": "model treated quoted placeholder as literal"}],
-        "type_checks": [{"object": "slot", "passed": False, "evidence": "model expected a different literal type"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "model expected a different literal type", "category": "placeholder_serialization"}],
         "issues": [],
         "repair_suggestions": "",
     }
@@ -4038,12 +4029,115 @@ def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(
         available_source_fields=["item"],
     )
 
-    assert source_value or source_value is None or source_value is False or source_value == 3
     assert reconciled["passed"] is True
     assert all(check["passed"] for check in reconciled["value_checks"])
     assert all(check["passed"] for check in reconciled["type_checks"])
-    assert "runtime preserves native JSON type" in reconciled["type_checks"][-1]["evidence"]
+    assert "source type is unknown" in reconciled["type_checks"][-1]["evidence"]
 
+
+def test_skill_md_block_reconcile_supports_production_argv_schema_shape():
+    from backend.services.creator import contracts
+
+    extra_result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}","extra":1}\'',
+        script_path="scripts/current.py",
+        argv_schema={
+            "allowed_keys": ["slot", "optional"],
+            "required_keys": ["slot", "needed"],
+            "optional_keys": ["optional"],
+            "expected_types": {"slot": "array", "needed": "string"},
+        },
+        available_source_fields=["item"],
+    )
+
+    assert extra_result["passed"] is False
+    assert any(check.get("category") == "missing_required_key" and check.get("object") == "needed" for check in extra_result["key_checks"])
+    assert any(check.get("category") == "extra_key" and check.get("object") == "extra" for check in extra_result["key_checks"])
+    assert any(check.get("category") == "placeholder_serialization" and check.get("object") == "slot" for check in extra_result["type_checks"])
+
+
+def test_skill_md_block_reconcile_structured_source_type_compatible_passes():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": False,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [{"object": "slot", "passed": False, "evidence": "model treated template as string", "category": "placeholder_serialization"}],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+        available_source_types={"item": "array"},
+    )
+
+    assert result["passed"] is True
+    assert any(check.get("category") == "structured_source_type" and check.get("passed") is True for check in result["type_checks"])
+
+
+def test_skill_md_block_reconcile_structured_source_type_conflict_fails():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "object"}},
+        available_source_fields=["item"],
+        available_source_types={"item": "array"},
+    )
+
+    assert result["passed"] is False
+    assert any(check.get("category") == "structured_source_type_conflict" and check.get("passed") is False for check in result["type_checks"])
+
+
+def test_skill_md_block_reconcile_clears_only_structured_serialization_issue():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": False,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [{"object": "slot", "passed": False, "evidence": "template string", "category": "placeholder_serialization"}],
+            "issues": [
+                {"object": "slot", "category": "placeholder_serialization", "blocking": True, "message": "template serialization mismatch"},
+                {"object": "other", "category": "unknown_source", "blocking": True, "message": "unavailable"},
+            ],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+
+    assert result["passed"] is False
+    assert all(issue.get("category") != "placeholder_serialization" for issue in result["issues"])
+    assert any(issue.get("category") == "unknown_source" for issue in result["issues"])
 
 def test_skill_md_block_reconcile_embedded_placeholder_is_string_interpolation_only():
     from backend.services.creator import contracts
@@ -4144,7 +4238,7 @@ def test_skill_md_block_reconcile_does_not_require_extra_placeholder_wrapping():
         "target_script_path": "scripts/current.py",
         "key_checks": [],
         "value_checks": [{"object": "slot", "passed": True, "evidence": "available"}],
-        "type_checks": [{"object": "slot", "passed": False, "evidence": "suggested wrapping placeholder in an extra container"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "suggested wrapping placeholder in an extra container", "category": "placeholder_serialization"}],
         "issues": [],
         "repair_suggestions": "",
     }

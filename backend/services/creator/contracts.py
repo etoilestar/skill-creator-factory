@@ -134,19 +134,23 @@ def _command_signature(command: str, script_path: str) -> dict[str, Any] | None:
         if arg0.startswith("{") and arg0.endswith("}"):
             normalized_arg0, auto_fixes = _canonicalize_unquoted_json_template_placeholders(arg0)
             try:
-                parsed = _loads_templated_json_argv_object(normalized_arg0)
+                parsed = json.loads(normalized_arg0)
                 if isinstance(parsed, dict):
                     json_payload = parsed
                     arg_mode = "json_arg"
                     if auto_fixes:
                         logger.info(
-                            "[Creator][skill_md][command_block][placeholder_auto_normalized] skill=%s script=%s ordinal=%s fix_count=%d sources=%s parse_ok=%s",
-                            "",
+                            "[Creator][skill_md][command_block][placeholder_auto_normalized] "
+                            "script=%s fix_count=%d sources=%s parse_ok=true",
                             expected_script,
-                            "",
                             len(auto_fixes),
-                            sorted({str(fix.get("source") or "") for fix in auto_fixes}),
-                            True,
+                            sorted(
+                                {
+                                    str(fix.get("source") or "")
+                                    for fix in auto_fixes
+                                    if str(fix.get("source") or "")
+                                }
+                            ),
                         )
                 else:
                     arg_mode = "invalid_json_arg"
@@ -190,11 +194,11 @@ _UNQUOTED_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][\w.-]*)\s*\}\
 
 
 def _canonicalize_unquoted_json_template_placeholders(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Quote safe whole-value unquoted JSON template placeholders.
+    """Quote safe top-level JSON argv placeholder values.
 
-    Only placeholders outside JSON strings that fully occupy a JSON value are
-    normalized. The original text is returned unchanged if the candidate edit
-    would not produce parseable JSON.
+    Only placeholders outside JSON strings that directly occupy a top-level
+    object key's value are normalized. The original text is returned unchanged
+    if the candidate edit would not produce parseable JSON.
     """
     source = str(text or "")
     result: list[str] = []
@@ -202,12 +206,8 @@ def _canonicalize_unquoted_json_template_placeholders(text: str) -> tuple[str, l
     idx = 0
     in_string = False
     escape = False
-
-    def previous_non_ws(pos: int) -> str:
-        j = pos - 1
-        while j >= 0 and source[j].isspace():
-            j -= 1
-        return source[j] if j >= 0 else ""
+    container_stack: list[str] = []
+    top_level_object_state = "expect_start"
 
     def next_non_ws(pos: int) -> str:
         j = pos
@@ -225,6 +225,16 @@ def _canonicalize_unquoted_json_template_placeholders(text: str) -> tuple[str, l
                 escape = True
             elif ch == '"':
                 in_string = False
+                if container_stack == ["object"]:
+                    if top_level_object_state == "expect_key":
+                        top_level_object_state = "expect_colon"
+                    elif top_level_object_state == "expect_value":
+                        top_level_object_state = "expect_comma_or_end"
+            idx += 1
+            continue
+
+        if ch.isspace():
+            result.append(ch)
             idx += 1
             continue
 
@@ -239,20 +249,72 @@ def _canonicalize_unquoted_json_template_placeholders(text: str) -> tuple[str, l
             if end >= 0:
                 token = source[idx:end + 2]
                 match = _UNQUOTED_TEMPLATE_PLACEHOLDER_RE.fullmatch(token)
-                prev_ch = previous_non_ws(idx)
                 next_ch = next_non_ws(end + 2)
-                if match and prev_ch in {":", "[", ","} and next_ch in {",", "]", "}"}:
-                    result.append(json.dumps(token))
+                if (
+                    match
+                    and container_stack == ["object"]
+                    and top_level_object_state == "expect_value"
+                    and next_ch in {",", "}"}
+                ):
+                    replacement = json.dumps(token)
+                    result.append(replacement)
                     fixes.append(
                         {
                             "source": match.group(1),
                             "start": idx,
                             "end": end + 2,
-                            "replacement": json.dumps(token),
+                            "replacement": replacement,
                         }
                     )
+                    top_level_object_state = "expect_comma_or_end"
                     idx = end + 2
                     continue
+
+
+        if ch == "{":
+            container_stack.append("object")
+            if len(container_stack) == 1:
+                top_level_object_state = "expect_key"
+            result.append(ch)
+            idx += 1
+            continue
+
+        if ch == "[":
+            container_stack.append("array")
+            result.append(ch)
+            idx += 1
+            continue
+
+        if ch == "}":
+            if container_stack:
+                container_stack.pop()
+                if container_stack == ["object"] and top_level_object_state == "expect_value":
+                    top_level_object_state = "expect_comma_or_end"
+            result.append(ch)
+            idx += 1
+            continue
+
+        if ch == "]":
+            if container_stack:
+                container_stack.pop()
+                if container_stack == ["object"] and top_level_object_state == "expect_value":
+                    top_level_object_state = "expect_comma_or_end"
+            result.append(ch)
+            idx += 1
+            continue
+
+        if container_stack == ["object"] and ch == ":" and top_level_object_state == "expect_colon":
+            top_level_object_state = "expect_value"
+            result.append(ch)
+            idx += 1
+            continue
+
+        if container_stack == ["object"] and ch == ",":
+            top_level_object_state = "expect_key"
+            result.append(ch)
+            idx += 1
+            continue
+
 
         result.append(ch)
         idx += 1
@@ -316,8 +378,8 @@ def _replace_unquoted_json_template_placeholders(text: str) -> str:
 
 
 def _loads_templated_json_argv_object(text: str) -> Any:
-    """Load a JSON argv template after command-signature placeholder canonicalization."""
-    return json.loads(text)
+    """Load a JSON argv template, allowing unquoted placeholders as null values."""
+    return json.loads(_replace_unquoted_json_template_placeholders(text))
 
 
 def _explicit_field_names(value: Iterable[str] | Mapping[str, Any] | None) -> set[str]:

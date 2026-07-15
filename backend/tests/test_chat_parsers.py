@@ -4470,12 +4470,116 @@ def test_creator_json_argv_incomplete_placeholder_not_auto_fixed():
 def test_creator_json_argv_multiple_safe_placeholders_auto_normalize_independently():
     from backend.services.creator import contracts
 
-    text = '{"first": {{one}}, "second": [{{two}}]}'
+    text = '{"first": {{one}}, "second": {{two}}}'
     normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
-    assert normalized == '{"first": "{{one}}", "second": ["{{two}}"]}'
+    assert normalized == '{"first": "{{one}}", "second": "{{two}}"}'
     assert [fix["source"] for fix in fixes] == ["one", "two"]
     assert len(fixes) == 2
-    assert json.loads(normalized) == {"first": "{{one}}", "second": ["{{two}}"]}
+    assert json.loads(normalized) == {"first": "{{one}}", "second": "{{two}}"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"slot": [{{item}}]}',
+        '{"slot": [1, {{item}}, 2]}',
+        '{"slot": {"child": {{item}}}}',
+        '{"slot": [{"child": {{item}}}]}',
+    ],
+)
+def test_creator_json_argv_nested_or_array_placeholders_not_auto_normalized(text):
+    from backend.services.creator import contracts
+
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(normalized)
+
+    sig = contracts._command_signature(f"python scripts/current.py '{text}'", "scripts/current.py")
+    assert sig["auto_normalized"] is False
+    assert sig["arg_mode"] == "invalid_json_arg"
+    assert sig["json_payload"] is None
+
+
+def test_creator_json_argv_top_level_array_placeholder_not_auto_normalized():
+    from backend.services.creator import contracts
+
+    text = '[{{item}}]'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(normalized)
+
+
+def test_creator_json_argv_array_unknown_source_not_wrongly_allowed():
+    from backend.services.creator import contracts
+
+    text = '{"slot": [{{missing}}]}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    sig = contracts._command_signature(f"python scripts/current.py '{text}'", "scripts/current.py")
+    assert sig["auto_normalized"] is False
+    assert sig["arg_mode"] == "invalid_json_arg"
+    assert sig["json_payload"] is None
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block=f"python scripts/current.py '{text}'",
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+    assert reconciled["passed"] is False
+    assert any(check.get("category") == "missing_required_key" for check in reconciled["key_checks"])
+
+
+def test_creator_json_argv_nested_unknown_source_not_wrongly_allowed():
+    from backend.services.creator import contracts
+
+    text = '{"slot": {"child": {{missing}}}}'
+    normalized, fixes = contracts._canonicalize_unquoted_json_template_placeholders(text)
+    assert normalized == text
+    assert fixes == []
+    sig = contracts._command_signature(f"python scripts/current.py '{text}'", "scripts/current.py")
+    assert sig["auto_normalized"] is False
+    assert sig["arg_mode"] == "invalid_json_arg"
+    assert sig["json_payload"] is None
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block=f"python scripts/current.py '{text}'",
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "object"}},
+        available_source_fields=["item"],
+    )
+    assert reconciled["passed"] is False
+    assert any(check.get("category") == "missing_required_key" for check in reconciled["key_checks"])
+
+
+def test_loads_templated_json_argv_object_preserves_legacy_null_compatibility():
+    from backend.services.creator import contracts
+
+    assert contracts._loads_templated_json_argv_object('{"slot": {{item}}}') == {"slot": None}
+    assert contracts._loads_templated_json_argv_object('{"slot": "{{item}}"}') == {"slot": "{{item}}"}
 
 
 def test_skill_md_block_reconcile_unquoted_placeholder_auto_normalization_closes_loop():

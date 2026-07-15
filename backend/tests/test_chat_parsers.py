@@ -4005,3 +4005,371 @@ def test_skill_md_block_reviewer_schema_retry_limit_raises_validator_failure(mon
             model="unit-test",
         ))
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("expected_type", ["string", "array", "object", "number", "boolean", "null"])
+def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(expected_type):
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": False,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [{"object": "slot", "passed": True, "evidence": "accepted"}],
+        "value_checks": [{"object": "slot", "passed": False, "evidence": "model treated quoted placeholder as literal"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "model expected a different literal type"}],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": expected_type}}, "required": ["slot"]},
+        available_source_fields=["item"],
+    )
+
+    assert reconciled["passed"] is True
+    assert all(check["passed"] for check in reconciled["value_checks"])
+    assert all(check["passed"] for check in reconciled["type_checks"])
+    assert "source type is unknown" in reconciled["type_checks"][-1]["evidence"]
+
+
+def test_skill_md_block_reconcile_supports_production_argv_schema_shape():
+    from backend.services.creator import contracts
+
+    extra_result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}","extra":1}\'',
+        script_path="scripts/current.py",
+        argv_schema={
+            "allowed_keys": ["slot", "optional"],
+            "required_keys": ["slot", "needed"],
+            "optional_keys": ["optional"],
+            "expected_types": {"slot": "array", "needed": "string"},
+        },
+        available_source_fields=["item"],
+    )
+
+    assert extra_result["passed"] is False
+    assert any(check.get("category") == "missing_required_key" and check.get("object") == "needed" for check in extra_result["key_checks"])
+    assert any(check.get("category") == "extra_key" and check.get("object") == "extra" for check in extra_result["key_checks"])
+    assert any(check.get("category") == "placeholder_serialization" and check.get("object") == "slot" for check in extra_result["type_checks"])
+
+
+def test_skill_md_block_reconcile_structured_source_type_compatible_passes():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": False,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [{"object": "slot", "passed": False, "evidence": "model treated template as string", "category": "placeholder_serialization"}],
+            "issues": [],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+        available_source_types={"item": "array"},
+    )
+
+    assert result["passed"] is True
+    assert any(check.get("category") == "structured_source_type" and check.get("passed") is True for check in result["type_checks"])
+
+
+def test_skill_md_block_reconcile_structured_source_type_conflict_fails():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [{"object": "slot", "blocking": True, "message": "structured conflict"}],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "required_keys": ["slot"], "expected_types": {"slot": "object"}},
+        available_source_fields=["item"],
+        available_source_types={"item": "array"},
+    )
+
+    assert result["passed"] is False
+    assert any(check.get("category") == "structured_source_type_conflict" and check.get("passed") is False for check in result["type_checks"])
+    assert any(issue.get("object") == "slot" for issue in result["issues"])
+
+
+def test_skill_md_block_reconcile_clears_only_structured_serialization_issue():
+    from backend.services.creator import contracts
+
+    result = contracts._reconcile_block_review_with_runtime_contract(
+        {
+            "passed": False,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [{"object": "slot", "passed": False, "evidence": "template string", "category": "placeholder_serialization"}],
+            "issues": [
+                {"object": "slot", "blocking": True, "message": "template serialization mismatch"},
+                {"object": "other", "category": "unknown_source", "blocking": True, "message": "unavailable"},
+            ],
+            "repair_suggestions": "",
+        },
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"allowed_keys": ["slot"], "expected_types": {"slot": "array"}},
+        available_source_fields=["item"],
+    )
+
+    assert result["passed"] is False
+    assert not any(issue.get("object") == "slot" for issue in result["issues"])
+    assert any(issue.get("category") == "unknown_source" for issue in result["issues"])
+
+
+def test_skill_md_block_reconcile_embedded_placeholder_is_string_interpolation_only():
+    from backend.services.creator import contracts
+
+    string_review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+    string_result = contracts._reconcile_block_review_with_runtime_contract(
+        string_review,
+        command_block='python scripts/current.py \'{"slot":"prefix-{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": "string"}}},
+        available_source_fields=["item"],
+    )
+    assert string_result["passed"] is True
+
+    collection_review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+    collection_result = contracts._reconcile_block_review_with_runtime_contract(
+        collection_review,
+        command_block='python scripts/current.py \'{"slot":"prefix-{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": "array"}}},
+        available_source_fields=["item"],
+    )
+    assert collection_result["passed"] is False
+    assert any(not check["passed"] for check in collection_result["type_checks"])
+
+
+def test_skill_md_block_reconcile_unknown_placeholder_source_still_fails():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"slot":"{{missing}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": "object"}}},
+        available_source_fields=["item"],
+    )
+
+    assert reconciled["passed"] is False
+    assert any(not check["passed"] for check in reconciled["value_checks"])
+
+
+def test_skill_md_block_reconcile_literal_type_conflict_still_fails():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": True,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [],
+        "type_checks": [],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"slot":"literal"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": "array"}}},
+        available_source_fields=["item"],
+    )
+
+    assert reconciled["passed"] is False
+    assert any(not check["passed"] for check in reconciled["type_checks"])
+
+
+def test_skill_md_block_reconcile_does_not_require_extra_placeholder_wrapping():
+    from backend.services.creator import contracts
+
+    review = {
+        "passed": False,
+        "target_script_path": "scripts/current.py",
+        "key_checks": [],
+        "value_checks": [{"object": "slot", "passed": True, "evidence": "available"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "suggested wrapping placeholder in an extra container"}],
+        "issues": [],
+        "repair_suggestions": "",
+    }
+
+    reconciled = contracts._reconcile_block_review_with_runtime_contract(
+        review,
+        command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
+        script_path="scripts/current.py",
+        argv_schema={"properties": {"slot": {"type": "array"}}},
+        available_source_fields=["item"],
+    )
+
+    assert reconciled["passed"] is True
+    assert all(check["passed"] for check in reconciled["type_checks"])
+
+
+@pytest.mark.parametrize(
+    "repair_value",
+    [None, "keep text", ["first", "second"], {"edit": "current block"}],
+)
+def test_skill_md_block_reviewer_normalizes_repair_suggestions_without_retry(monkeypatch, repair_value):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        data = {
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+        }
+        if repair_value != "__missing__":
+            data["repair_suggestions"] = repair_value
+        return json.dumps(data, ensure_ascii=False)
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert len(calls) == 1
+    assert review["passed"] is True
+    assert isinstance(review["repair_suggestions"], str)
+
+
+def test_skill_md_block_reviewer_missing_repair_suggestions_normalizes_without_retry(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert len(calls) == 1
+    assert review["repair_suggestions"] == ""
+
+
+def test_skill_md_block_reviewer_core_schema_error_still_retries(monkeypatch):
+    import asyncio
+    from backend.services.creator import contracts
+    from backend.services.creator.common import build_default_requirement_graph
+
+    calls = []
+
+    async def fake_complete(messages, model):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({
+                "passed": "true",
+                "target_script_path": "scripts/current.py",
+                "key_checks": [],
+                "value_checks": [],
+                "type_checks": [],
+                "issues": [],
+                "repair_suggestions": ["display only"],
+            })
+        return json.dumps({
+            "passed": True,
+            "target_script_path": "scripts/current.py",
+            "key_checks": [],
+            "value_checks": [],
+            "type_checks": [],
+            "issues": [],
+            "repair_suggestions": "display only",
+        })
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    review = asyncio.run(contracts._review_skill_md_command_block_with_model(
+        skill_name="demo",
+        script_path="scripts/current.py",
+        command_block="python scripts/current.py '{}'",
+        ordinal=1,
+        prior_stdout=[],
+        requirement_graph=build_default_requirement_graph([]),
+        model="unit-test",
+    ))
+
+    assert len(calls) == 2
+    assert review["passed"] is True

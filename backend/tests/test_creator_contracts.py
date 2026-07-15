@@ -1,3 +1,5 @@
+import hashlib
+import inspect
 import json
 
 import pytest
@@ -930,13 +932,36 @@ def test_skill_md_review_ignores_explicit_command_mapping_evidence():
 
 
 def _skill_md_block_stage_error(api, contracts, candidate: str, block: str):
-    start = candidate.index(block)
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    parsed_block = next(item for item in parse_skill_md_bash_command_blocks(candidate) if candidate[item.start:item.end] == block)
+    full_block_text = candidate[parsed_block.start:parsed_block.end]
+    command_text = parsed_block.content
+    full_block_sha256 = api.hashlib.sha256(full_block_text.encode("utf-8")).hexdigest()
     locator_details = {
-        "block_text": block,
-        "script_path": "scripts/two.py",
-        "block_start": start,
-        "block_end": start + len(block),
-        "block_sha256": api.hashlib.sha256(block.encode("utf-8")).hexdigest(),
+        "block_start": parsed_block.start,
+        "block_end": parsed_block.end,
+        "block_text": full_block_text,
+        "block_sha256": full_block_sha256,
+        "command_text": command_text,
+        "current_block": command_text,
+        "script_path": parsed_block.script_path or "scripts/two.py",
+        "block_ordinal": 2,
+        "block_locator": {
+            "start": parsed_block.start,
+            "end": parsed_block.end,
+            "content_sha256": full_block_sha256,
+            "content_excerpt": full_block_text[:1000],
+        },
+        "skill_md_block_repair_scope": {
+            "block_start": parsed_block.start,
+            "block_end": parsed_block.end,
+            "block_text": full_block_text,
+            "block_sha256": full_block_sha256,
+            "command_text": command_text,
+            "script_path": parsed_block.script_path or "scripts/two.py",
+            "block_ordinal": 2,
+        },
         "structured_checks": {"key_checks": [{"passed": False, "message": "missing required key"}]},
     }
     result = contracts.ContractCheckResult(
@@ -955,6 +980,95 @@ def _skill_md_block_stage_error(api, contracts, candidate: str, block: str):
         detail="command_block json_argv key type issue",
         original=contracts.ContractValidationError("command block failed", [result]),
     )
+
+
+
+def test_skill_md_block_repair_scope_uses_full_block_locator_from_real_parser():
+    from backend.services.creator import contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    command = "python scripts/story_generator.py '{\"story_prompt\": \"{{user_request}}\", \"image_context\": \"\"}'"
+    candidate = "# Demo\n\nIntro\n```bash\n" + command + "\n```\n\nDone\n"
+    block = parse_skill_md_bash_command_blocks(candidate)[0]
+    full_block = candidate[block.start:block.end]
+    review = {
+        "target_script_path": "scripts/story_generator.py",
+        "passed": False,
+        "command_block": block.content,
+        "command_block_ordinal": 1,
+        "issues": [{"message": "bad key", "field": "story_prompt"}],
+    }
+
+    results = contracts._skill_md_block_review_to_contract_results(
+        review,
+        block_text=full_block,
+        command_text=block.content,
+        block_locator=contracts._skill_md_block_locator(block, candidate),
+    )
+    locator = results[0].details["skill_md_block_repair_scope"]
+
+    assert candidate[locator["block_start"]:locator["block_end"]] == locator["block_text"]
+    assert hashlib.sha256(locator["block_text"].encode("utf-8")).hexdigest() == locator["block_sha256"]
+    assert locator["command_text"] == command
+    assert locator["block_text"] == full_block
+
+
+def test_skill_md_exact_replacement_real_failure_replaces_only_current_block():
+    from backend.services.creator import api
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    first = "```bash\npython scripts/other.py '{\"topic\": \"{{user_request}}\"}'\n```\n"
+    bad = "```bash\npython scripts/story_generator.py '{\"story_prompt\": \"{{user_request}}\", \"image_context\": \"\"}'\n```\n"
+    fixed = "```bash\npython scripts/story_generator.py '{\"topic\": \"{{user_request}}\", \"image_context\": \"\"}'\n```\n"
+    third = "```bash\npython scripts/final.py '{\"story\": \"{{story}}\"}'\n```\n"
+    candidate = "# Demo\nBefore\n" + first + "Middle\n" + bad + "After\n" + third + "Done\n"
+    block = next(item for item in parse_skill_md_bash_command_blocks(candidate) if item.script_path == "scripts/story_generator.py")
+    locator = {
+        "block_start": block.start,
+        "block_end": block.end,
+        "block_text": candidate[block.start:block.end],
+        "block_sha256": hashlib.sha256(candidate[block.start:block.end].encode("utf-8")).hexdigest(),
+    }
+
+    repaired = api._replace_skill_md_command_block_exact(candidate, locator, fixed)
+
+    assert repaired[block.start:block.start + len(fixed)] == fixed
+    assert repaired[:block.start] == candidate[:block.start]
+    assert repaired[block.start + len(fixed):] == candidate[block.end:]
+    assert first in repaired
+    assert third in repaired
+    assert bad not in repaired
+
+
+def test_skill_md_exact_replacement_does_not_rematch():
+    from backend.services.creator import api
+
+    source = inspect.getsource(api._replace_skill_md_command_block_exact)
+    assert ".find(" not in source
+    assert ".index(" not in source
+    assert "re.search" not in source
+    assert "fuzzy" not in source.lower()
+
+
+def test_skill_md_exact_replacement_rejects_real_stale_locator():
+    from backend.services.creator import api
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    bad = "```bash\npython scripts/story_generator.py '{\"story_prompt\": \"{{user_request}}\", \"image_context\": \"\"}'\n```\n"
+    fixed = "```bash\npython scripts/story_generator.py '{\"topic\": \"{{user_request}}\", \"image_context\": \"\"}'\n```\n"
+    candidate = "# Demo\n" + bad + "Done\n"
+    block = parse_skill_md_bash_command_blocks(candidate)[0]
+    locator = {
+        "block_start": block.start,
+        "block_end": block.end,
+        "block_text": candidate[block.start:block.end],
+        "block_sha256": hashlib.sha256(candidate[block.start:block.end].encode("utf-8")).hexdigest(),
+    }
+    stale_candidate = candidate[:block.start] + bad.replace("story_prompt", "storyPrompt") + candidate[block.end:]
+
+    with pytest.raises(ValueError, match="locator is stale"):
+        api._replace_skill_md_command_block_exact(stale_candidate, locator, fixed)
+    assert candidate[block.start:block.end] == locator["block_text"]
 
 
 def test_skill_md_repair_scope_command_block_beats_full_format_words():

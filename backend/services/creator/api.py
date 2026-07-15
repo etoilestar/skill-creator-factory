@@ -11649,6 +11649,151 @@ def _stage_error_has_full_format_rewrite_contract(stage_error: FileGenerationSta
     return any(_result_requires_full_format_rewrite(item) for item in items)
 
 
+def _single_skill_md_command_block_failure(original: Exception | None) -> dict[str, Any] | None:
+    """Return the shared command-block locator when a validation error targets one block."""
+    if not isinstance(original, ContractValidationError):
+        return None
+    failures = [result for result in original.results if not result.passed]
+    if not failures:
+        return None
+    locators: list[dict[str, Any]] = []
+    for result in failures:
+        if str(getattr(result, "layer", "") or "") != "skill_md_command_block_interface":
+            return None
+        details = result.details if isinstance(result.details, dict) else {}
+        scope = details.get("skill_md_block_repair_scope")
+        if not isinstance(scope, dict):
+            scope = {}
+        block_text = str(details.get("block_text") or details.get("current_block") or scope.get("block_text") or "")
+        script_path = str(details.get("script_path") or scope.get("script_path") or "").strip()
+        block_start = details.get("block_start")
+        block_end = details.get("block_end")
+        if block_start is None and isinstance(details.get("block_locator"), dict):
+            block_start = details["block_locator"].get("start")
+        if block_end is None and isinstance(details.get("block_locator"), dict):
+            block_end = details["block_locator"].get("end")
+        block_sha256 = str(details.get("block_sha256") or scope.get("block_sha256") or "").strip()
+        try:
+            block_start = int(block_start)
+            block_end = int(block_end)
+        except Exception:
+            return None
+        if not block_text or not script_path or block_start < 0 or block_end <= block_start or not block_sha256:
+            return None
+        locators.append({
+            "block_text": block_text,
+            "script_path": script_path,
+            "block_start": block_start,
+            "block_end": block_end,
+            "block_sha256": block_sha256,
+            "block_ordinal": details.get("block_ordinal") or scope.get("block_ordinal"),
+            "structured_checks": details.get("structured_checks") or {},
+        })
+    first = locators[0]
+    if any(
+        item["block_start"] != first["block_start"]
+        or item["block_end"] != first["block_end"]
+        or item["block_sha256"] != first["block_sha256"]
+        for item in locators
+    ):
+        return None
+    first["failure_reasons"] = [
+        {
+            "id": result.id,
+            "message": result.message,
+            "expected": result.expected,
+            "minimal_edit": result.minimal_edit,
+            "details": result.details,
+        }
+        for result in failures
+    ]
+    return first
+
+
+def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_path: str) -> None:
+    text = str(repaired_block or "")
+    if text.lstrip().startswith("---") or re.search(r"(?m)^\s{0,3}#{1,6}\s", text):
+        raise ValueError("repaired command block must not contain frontmatter or Markdown headings")
+    fence_matches = list(re.finditer(r"(?m)^\s*(`{3,}|~{3,})([^`\n]*)\s*$", text))
+    if len(fence_matches) != 2:
+        raise ValueError("repaired command block must contain exactly one fenced block")
+    if text[:fence_matches[0].start()].strip() or text[fence_matches[1].end():].strip():
+        raise ValueError("repaired command block must not contain prose outside the fence")
+    if fence_matches[0].group(1)[0] != "`" or len(fence_matches[0].group(1)) != 3:
+        raise ValueError("repaired command block must use a ```bash fence")
+    if (fence_matches[0].group(2) or "").strip().lower() != "bash":
+        raise ValueError("repaired command block fence type must be bash")
+    body = text[fence_matches[0].end():fence_matches[1].start()]
+    command_lines = [line for line in body.splitlines() if line.strip()]
+    if len(command_lines) != 1:
+        raise ValueError("repaired command block must contain exactly one command line")
+    if script_path not in command_lines[0]:
+        raise ValueError("repaired command block must invoke the same script_path")
+
+
+async def _repair_skill_md_command_block(
+    *,
+    model: str,
+    skill_name: str,
+    block_text: str,
+    script_path: str,
+    structured_checks: Any,
+    failure_reasons: Any,
+    retry_index: int = 0,
+) -> str:
+    """Repair exactly one SKILL.md bash command block without sending full SKILL.md."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 SKILL.md 单个 bash command block 修复器。"
+                "只返回修复后的一个完整 ```bash fenced block。"
+                "不要返回完整 SKILL.md。不要返回 frontmatter、标题、正文、解释或其他 block。"
+                "仍然调用原 script_path。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"script_path:\n{script_path}\n\n"
+                "当前失败 block:\n"
+                f"{block_text}\n\n"
+                "structured_checks:\n"
+                f"{json.dumps(structured_checks, ensure_ascii=False, indent=2, default=str)}\n\n"
+                "失败原因:\n"
+                f"{json.dumps(failure_reasons, ensure_ascii=False, indent=2, default=str)}\n\n"
+                "硬性要求：只返回一个完整 ```bash fenced block；block 内只包含一条有效命令；"
+                "命令仍然调用同一个 script_path；不要输出任何其它 Markdown。"
+            ),
+        },
+    ]
+    repaired_block = await _complete_creator_file_generation(
+        messages=messages,
+        model=model,
+        skill_name=skill_name,
+        file_path="SKILL.md",
+        prompt_variant="repair_skill_md_command_block",
+        retry_index=retry_index,
+    )
+    _validate_repaired_skill_md_command_block(repaired_block, script_path=script_path)
+    return repaired_block
+
+
+def _replace_skill_md_command_block_exact(candidate: str, locator: dict[str, Any], repaired_block: str) -> str:
+    block_start = int(locator["block_start"])
+    block_end = int(locator["block_end"])
+    block_text = str(locator["block_text"])
+    block_sha256 = str(locator["block_sha256"])
+    if candidate[block_start:block_end] != block_text:
+        raise ValueError("SKILL.md command block locator is stale; rerun validation for a fresh locator")
+    if hashlib.sha256(block_text.encode("utf-8")).hexdigest() != block_sha256:
+        raise ValueError("SKILL.md command block hash mismatch; rerun validation for a fresh locator")
+    repaired_candidate = candidate[:block_start] + repaired_block + candidate[block_end:]
+    assert repaired_candidate[:block_start] == candidate[:block_start]
+    assert repaired_candidate[block_start + len(repaired_block):] == candidate[block_end:]
+    return repaired_candidate
+
+
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
         return True
@@ -13024,8 +13169,39 @@ async def generate_file(request: GenerateFileRequest):
                         file_path=request.file_path,
                         attempt=attempt,
                     )
+                    single_block_locator = (
+                        _single_skill_md_command_block_failure(stage_error.original)
+                        if request.file_path == "SKILL.md"
+                        else None
+                    )
 
-                    if error_source == "basic_format" or stage_error.layer in {"python_compile_error", "markdown_basic_format_error"}:
+                    if single_block_locator is not None:
+                        last_block_repair_error: Exception | None = None
+                        for block_retry_index in range(3):
+                            try:
+                                repaired_block = await _repair_skill_md_command_block(
+                                    model=route.model,
+                                    skill_name=skill_name,
+                                    block_text=single_block_locator["block_text"],
+                                    script_path=single_block_locator["script_path"],
+                                    structured_checks=single_block_locator.get("structured_checks") or {},
+                                    failure_reasons=single_block_locator.get("failure_reasons") or deterministic_error,
+                                    retry_index=block_retry_index,
+                                )
+                                repaired_candidate = _replace_skill_md_command_block_exact(
+                                    candidate or "",
+                                    single_block_locator,
+                                    repaired_block,
+                                )
+                                break
+                            except Exception as block_repair_exc:
+                                last_block_repair_error = block_repair_exc
+                        else:
+                            raise ValueError(
+                                "SKILL.md command block repair failed without whole-file fallback: "
+                                f"{last_block_repair_error}"
+                            )
+                    elif error_source == "basic_format" or stage_error.layer in {"python_compile_error", "markdown_basic_format_error"}:
                         feedback = _basic_format_repair_feedback(stage_error)
                         passed_checks_text = ""
                         failed_checks_text = feedback
@@ -13184,23 +13360,24 @@ async def generate_file(request: GenerateFileRequest):
                             repair_tool_pool_summary = {}
                             repair_current_file_binding = {}
 
-                    repaired_candidate = await _repair_generated_file_with_feedback(
-                        prompt_messages=prompt_messages,
-                        model=route.model,
-                        file_path=request.file_path,
-                        previous_content=candidate,
-                        validation_error=feedback,
-                        targeted_repair=targeted_repair,
-                        contract_text=contract_text,
-                        passed_checks_text=passed_checks_text,
-                        failed_checks_text=failed_checks_text,
-                        repair_mode=repair_mode,
-                        skill_plan_entry=effective_skill_plan_entry,
-                        import_guard_result=repair_import_guard_result,
-                        current_file_binding=repair_current_file_binding,
-                        tool_pool_summary=repair_tool_pool_summary,
-                        function_execution_context=function_execution_context,
-                    )
+                    if single_block_locator is None:
+                        repaired_candidate = await _repair_generated_file_with_feedback(
+                            prompt_messages=prompt_messages,
+                            model=route.model,
+                            file_path=request.file_path,
+                            previous_content=candidate,
+                            validation_error=feedback,
+                            targeted_repair=targeted_repair,
+                            contract_text=contract_text,
+                            passed_checks_text=passed_checks_text,
+                            failed_checks_text=failed_checks_text,
+                            repair_mode=repair_mode,
+                            skill_plan_entry=effective_skill_plan_entry,
+                            import_guard_result=repair_import_guard_result,
+                            current_file_binding=repair_current_file_binding,
+                            tool_pool_summary=repair_tool_pool_summary,
+                            function_execution_context=function_execution_context,
+                        )
                     repaired_candidate = _canonicalize_generated_candidate(
                         file_path=request.file_path,
                         content=repaired_candidate,

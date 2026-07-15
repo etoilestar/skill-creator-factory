@@ -4016,7 +4016,7 @@ def test_skill_md_block_reconcile_whole_value_placeholder_preserves_native_type(
         "target_script_path": "scripts/current.py",
         "key_checks": [{"object": "slot", "passed": True, "evidence": "accepted"}],
         "value_checks": [{"object": "slot", "passed": False, "evidence": "model treated quoted placeholder as literal"}],
-        "type_checks": [{"object": "slot", "passed": False, "evidence": "model expected a different literal type", "category": "placeholder_serialization"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "model expected a different literal type"}],
         "issues": [],
         "repair_suggestions": "",
     }
@@ -4238,7 +4238,7 @@ def test_skill_md_block_reconcile_does_not_require_extra_placeholder_wrapping():
         "target_script_path": "scripts/current.py",
         "key_checks": [],
         "value_checks": [{"object": "slot", "passed": True, "evidence": "available"}],
-        "type_checks": [{"object": "slot", "passed": False, "evidence": "suggested wrapping placeholder in an extra container", "category": "placeholder_serialization"}],
+        "type_checks": [{"object": "slot", "passed": False, "evidence": "suggested wrapping placeholder in an extra container"}],
         "issues": [],
         "repair_suggestions": "",
     }

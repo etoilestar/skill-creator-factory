@@ -1964,15 +1964,6 @@ def _available_source_types_for_block_review(
         source = edge.get("from_output") or edge.get("source") or edge.get("source_field")
         add(source, edge.get("from_output_type") or edge.get("source_type") or edge.get("output_type") or edge.get("type"))
     ctx = function_context or {}
-    function_item = ctx.get("function_item") if isinstance(ctx.get("function_item"), Mapping) else {}
-    outputs = function_item.get("outputs") if isinstance(function_item, Mapping) else []
-    if isinstance(outputs, Mapping):
-        for source, source_type in outputs.items():
-            add(source, source_type)
-    elif isinstance(outputs, list):
-        for output in outputs:
-            if isinstance(output, Mapping):
-                add(output.get("name") or output.get("field") or output.get("key") or output.get("source"), output.get("type") or output.get("json_type"))
     for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
         if not isinstance(binding, Mapping):
             continue
@@ -2194,7 +2185,7 @@ def _reconcile_block_review_with_runtime_contract(
         if source:
             root = _placeholder_root(source)
             value_checks = [check for check in value_checks if not _review_item_matches_key(check, key_text)]
-            type_checks = [check for check in type_checks if not (_review_item_matches_key(check, key_text) and str(check.get("category") or "").strip().lower() in {"placeholder_serialization", "whole_value_placeholder_serialization", "template_serialization"})]
+            type_checks = [check for check in type_checks if not _review_item_matches_key(check, key_text)]
             if root not in available_roots:
                 _append_check(value_checks, obj=key_text, passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available", category="unknown_source")
                 continue

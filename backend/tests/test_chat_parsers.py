@@ -4099,7 +4099,7 @@ def test_skill_md_block_reconcile_structured_source_type_conflict_fails():
             "key_checks": [],
             "value_checks": [],
             "type_checks": [],
-            "issues": [],
+            "issues": [{"object": "slot", "blocking": True, "message": "structured conflict"}],
             "repair_suggestions": "",
         },
         command_block='python scripts/current.py \'{"slot":"{{item}}"}\'',
@@ -4111,6 +4111,7 @@ def test_skill_md_block_reconcile_structured_source_type_conflict_fails():
 
     assert result["passed"] is False
     assert any(check.get("category") == "structured_source_type_conflict" and check.get("passed") is False for check in result["type_checks"])
+    assert any(issue.get("object") == "slot" for issue in result["issues"])
 
 
 def test_skill_md_block_reconcile_clears_only_structured_serialization_issue():
@@ -4124,7 +4125,7 @@ def test_skill_md_block_reconcile_clears_only_structured_serialization_issue():
             "value_checks": [],
             "type_checks": [{"object": "slot", "passed": False, "evidence": "template string", "category": "placeholder_serialization"}],
             "issues": [
-                {"object": "slot", "category": "placeholder_serialization", "blocking": True, "message": "template serialization mismatch"},
+                {"object": "slot", "blocking": True, "message": "template serialization mismatch"},
                 {"object": "other", "category": "unknown_source", "blocking": True, "message": "unavailable"},
             ],
             "repair_suggestions": "",
@@ -4136,8 +4137,9 @@ def test_skill_md_block_reconcile_clears_only_structured_serialization_issue():
     )
 
     assert result["passed"] is False
-    assert all(issue.get("category") != "placeholder_serialization" for issue in result["issues"])
+    assert not any(issue.get("object") == "slot" for issue in result["issues"])
     assert any(issue.get("category") == "unknown_source" for issue in result["issues"])
+
 
 def test_skill_md_block_reconcile_embedded_placeholder_is_string_interpolation_only():
     from backend.services.creator import contracts

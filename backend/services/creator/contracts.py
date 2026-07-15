@@ -2136,15 +2136,6 @@ def _review_item_matches_key(item: Any, key: str) -> bool:
     return isinstance(item, Mapping) and _check_object_name(item) == str(key)
 
 
-def _is_serialization_issue_for_key(issue: Any, key: str) -> bool:
-    if not isinstance(issue, Mapping):
-        return False
-    if _check_object_name(issue) != str(key):
-        return False
-    category = str(issue.get("category") or issue.get("check_type") or "").strip().lower()
-    return category in {"placeholder_serialization", "whole_value_placeholder_serialization", "template_serialization"}
-
-
 def _reconcile_block_review_with_runtime_contract(
     review: dict[str, Any],
     *,
@@ -2207,7 +2198,20 @@ def _reconcile_block_review_with_runtime_contract(
             _append_check(type_checks, obj=key_text, passed=False, evidence="literal JSON value conflicts with expected argv type", message="literal value type mismatch", category="literal_type_conflict")
 
     if serialization_corrected_keys:
-        issues = [issue for issue in issues if not any(_is_serialization_issue_for_key(issue, key) for key in serialization_corrected_keys)]
+        failed_keys = {
+            _check_object_name(check)
+            for checks in (key_checks, value_checks, type_checks)
+            for check in checks
+            if isinstance(check, Mapping) and _skill_md_block_check_failed(check)
+        }
+        issues = [
+            issue
+            for issue in issues
+            if not (
+                any(_review_item_matches_key(issue, key) for key in serialization_corrected_keys)
+                and _check_object_name(issue) not in failed_keys
+            )
+        ]
 
     review["key_checks"] = key_checks
     review["value_checks"] = value_checks

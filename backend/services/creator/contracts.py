@@ -1711,6 +1711,7 @@ async def _review_skill_md_blueprint_intent_with_model(
         "审查目标：只回答 SKILL.md 整体语义是否符合用户需求和蓝图责任。\n"
         "第一轮整体语义只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、文件计划是否完整、脚本职责和执行顺序是否合理、references/assets 职责是否正确、最终产物是什么、是否引入蓝图外能力或文件。\n"
         "不得审查 command JSON key、placeholder、argv schema、stdout 字段、incoming/outgoing edge 字段映射、类型序列化、静态值或动态值来源。\n"
+        "不要检查或裁决单个 bash command block 的 argv key、placeholder、字段来源、字段类型、JSON quoting 或 shell quoting；这些问题由后续单 command block Reviewer 单独处理。即使发现 block 字段问题，也不得将整体语义审查判定为格式失败。\n"
         "不要审查证明是否足够细；不要审查第二轮 E2E 才能通过真实执行发现的问题。\n\n"
 
         "输出 error 必须满足以下任一条件：\n"

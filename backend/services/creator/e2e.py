@@ -3417,28 +3417,10 @@ def _validate_e2e_command_static(
             )
         )
 
-    content = source_path.read_text(
-        encoding="utf-8"
-    )
-
-    try:
-        _validate_e2e_script_static_preflight(
-            file_path=command.script_path,
-            content=content,
-            skill_md=skill_md,
-        )
-    except ValueError as exc:
-        raise ValueError(
-            _e2e_error(
-                target=command.script_path,
-                layer="script_static_contract",
-                message=(
-                    f"第 {command.ordinal} 步 "
-                    f"{command.script_path} "
-                    f"无法进入真实 E2E 执行：{exc}"
-                ),
-            )
-        ) from exc
+    # Do not inspect script source shape here. Creator second-round E2E must
+    # prove script validity by launching the real subprocess, then classify
+    # failures from return_code/stdout/stderr evidence. First-round generation
+    # checks still own source-format, responsibility, and guard-shape review.
 
     return entry
 

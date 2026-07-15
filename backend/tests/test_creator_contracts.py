@@ -770,7 +770,7 @@ def test_command_template_source_proof_blocks_only_platform_io():
             "contract_impact": {"execution_closure": True, "platform_io": True},
         }],
     }
-    assert _skill_md_blueprint_review_to_contract_results(platform_review)
+    assert _skill_md_blueprint_review_to_contract_results(platform_review) == []
 
 
 @pytest.mark.parametrize("payload", [
@@ -894,16 +894,14 @@ python scripts/main.py '{"source_text":"${user_text}","style":"plain"}'
 
     assert result["passed"] is True
     prompt = captured["prompt"]
-    assert '"strict_json_argv_schema"' in prompt
-    assert '"required_keys"' in prompt
-    assert '"source_text"' in prompt
-    assert '"run_args_analysis"' in prompt
-    assert '"required_read_keys"' in prompt
-    assert '"incoming_edges"' in prompt
-    assert '"from_output": "user_text"' in prompt
+    assert "不要检查或裁决单个 bash command block" in prompt
+    assert "argv key、placeholder、字段来源、字段类型、JSON quoting 或 shell quoting" in prompt
+    assert "不得将整体语义审查判定为格式失败" in prompt
+    assert "scripts/main.py" in prompt
+    assert "user_text" in prompt
 
 
-def test_skill_md_review_blocks_explicit_command_mapping_evidence():
+def test_skill_md_review_ignores_explicit_command_mapping_evidence():
     from backend.services.creator.contracts import _skill_md_blueprint_review_to_contract_results
 
     review = {
@@ -928,5 +926,162 @@ def test_skill_md_review_blocks_explicit_command_mapping_evidence():
     }
 
     results = _skill_md_blueprint_review_to_contract_results(review)
-    assert len(results) == 1
-    assert results[0].id.startswith("skill_md.blueprint_alignment.workflow")
+    assert results == []
+
+
+def _skill_md_block_stage_error(api, contracts, candidate: str, block: str):
+    start = candidate.index(block)
+    locator_details = {
+        "block_text": block,
+        "script_path": "scripts/two.py",
+        "block_start": start,
+        "block_end": start + len(block),
+        "block_sha256": api.hashlib.sha256(block.encode("utf-8")).hexdigest(),
+        "structured_checks": {"key_checks": [{"passed": False, "message": "missing required key"}]},
+    }
+    result = contracts.ContractCheckResult(
+        id="skill_md.command_block.interface.missing_required_key.1",
+        passed=False,
+        target="SKILL.md:scripts/two.py:command_block",
+        message="JSON argv missing required key; command_block json_argv key type issue",
+        expected="required argv key exists",
+        minimal_edit="repair only current command block",
+        details=locator_details,
+        layer="skill_md_command_block_interface",
+    )
+    return api.FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_command_block_interface",
+        detail="command_block json_argv key type issue",
+        original=contracts.ContractValidationError("command block failed", [result]),
+    )
+
+
+def test_skill_md_repair_scope_command_block_beats_full_format_words():
+    from backend.services.creator import api, contracts
+
+    first = "```bash\npython scripts/one.py '{\"a\":\"{{user_request}}\"}'\n```\n"
+    bad = "```bash\npython scripts/two.py '{\"bad\":\"literal\"}'\n```\n"
+    third = "```bash\npython scripts/three.py '{\"c\":\"{{two}}\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n" + first + "\n" + bad + "\n" + third
+    stage_error = _skill_md_block_stage_error(api, contracts, candidate, bad)
+
+    assert api._classify_skill_md_repair_scope(stage_error) == "command_block"
+
+
+def test_skill_md_repair_scope_semantic_alignment_not_full_format():
+    from backend.services.creator import api, contracts
+
+    result = contracts.ContractCheckResult(
+        id="skill_md.blueprint_alignment.missing_required_capability",
+        passed=False,
+        target="SKILL.md:workflow",
+        message="遗漏蓝图要求的资源说明和功能项",
+        expected="SKILL.md covers planned scripts and resources",
+        minimal_edit="补充工作流职责说明，不修改 command block",
+        details={"category": "blueprint_alignment"},
+        layer="skill_md_blueprint_alignment",
+    )
+    stage_error = api.FileGenerationStageError(
+        source="content_review",
+        layer="skill_md_blueprint_alignment",
+        detail="semantic alignment failed",
+        original=contracts.ContractValidationError("semantic", [result]),
+    )
+
+    assert api._classify_skill_md_repair_scope(stage_error) == "semantic"
+
+
+@pytest.mark.parametrize(
+    "result_id,message,details,layer",
+    [
+        ("skill_md.frontmatter.unclosed", "frontmatter 未闭合", {}, "markdown_contract"),
+        ("skill_md.markdown_body_structure.missing_body", "缺少正文", {}, "markdown_contract"),
+        ("skill_md.markdown_body_structure.unclosed_fence", "全局 fence 未闭合", {}, "markdown_contract"),
+        ("skill_md.any", "hard format", {"repair_strategy": "full_rewrite"}, "markdown_contract"),
+        ("skill_md.any", "hard format layer", {}, "hard_format"),
+    ],
+)
+
+def test_skill_md_repair_scope_full_format_for_global_structure(result_id, message, details, layer):
+    from backend.services.creator import api, contracts
+
+    result = contracts.ContractCheckResult(
+        id=result_id,
+        passed=False,
+        target="SKILL.md",
+        message=message,
+        expected="valid markdown structure",
+        minimal_edit="rewrite full markdown format",
+        details=details,
+        layer=layer,
+    )
+    stage_error = api.FileGenerationStageError(
+        source="content_review",
+        layer=layer,
+        detail=message,
+        original=contracts.ContractValidationError("format", [result]),
+    )
+
+    assert api._classify_skill_md_repair_scope(stage_error) == "full_format"
+
+
+@pytest.mark.asyncio
+async def test_generate_file_routes_skill_md_command_block_to_block_repair(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api, contracts
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+
+    first = "```bash\npython scripts/one.py '{\"a\":\"{{user_request}}\"}'\n```\n"
+    bad = "```bash\npython scripts/two.py '{\"bad\":\"literal\"}'\n```\n"
+    fixed = "```bash\npython scripts/two.py '{\"required\":\"{{a}}\"}'\n```\n"
+    third = "```bash\npython scripts/three.py '{\"c\":\"{{required}}\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\nBefore\n" + first + "Middle\n" + bad + "After\n" + third + "Done\n"
+    stage_error = _skill_md_block_stage_error(api, contracts, candidate, bad)
+    variants = []
+    alignment_calls = 0
+
+    async def fake_complete_creator_file_generation(**kwargs):
+        variants.append(kwargs.get("prompt_variant"))
+        if kwargs.get("prompt_variant") == "repair_skill_md_command_block":
+            return fixed
+        return candidate
+
+    async def fake_alignment(**_kwargs):
+        nonlocal alignment_calls
+        alignment_calls += 1
+        if alignment_calls == 1:
+            raise stage_error
+        return None
+
+    async def forbidden_whole_file_repair(**_kwargs):
+        raise AssertionError("whole-file repair must not be called for command_block scope")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete_creator_file_generation)
+    monkeypatch.setattr(api, "validate_file_contract", lambda **_kwargs: [])
+    monkeypatch.setattr(api, "_validate_skill_md_against_existing_files", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", forbidden_whole_file_repair)
+
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill",
+        file_path="SKILL.md",
+        purpose="demo",
+        blueprint_text="use scripts/one.py scripts/two.py scripts/three.py",
+        conversation_history=[],
+        role="skill_md",
+        skill_plan_entry={},
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert "repair_skill_md_command_block" in variants
+    assert "rewrite_markdown_full_format" not in variants
+    assert "required" in body and "{{a}}" in body
+    assert "scripts/one.py" in body and "scripts/three.py" in body
+    assert "Before" in body and "Middle" in body and "After" in body and "Done" in body

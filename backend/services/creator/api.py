@@ -11794,6 +11794,68 @@ def _replace_skill_md_command_block_exact(candidate: str, locator: dict[str, Any
     return repaired_candidate
 
 
+
+def _classify_skill_md_repair_scope(
+    stage_error: FileGenerationStageError,
+) -> str:
+    """Classify first-round SKILL.md repair routing before any full rewrite checks."""
+    if _single_skill_md_command_block_failure(getattr(stage_error, "original", None)) is not None:
+        return "command_block"
+
+    original = getattr(stage_error, "original", None)
+    results: list[Any] = []
+    if isinstance(original, ContractValidationError):
+        results = [result for result in original.results if not getattr(result, "passed", False)]
+
+    def _result_text(result: Any) -> str:
+        parts = [
+            str(getattr(result, "id", "") or ""),
+            str(getattr(result, "target", "") or ""),
+            str(getattr(result, "message", "") or ""),
+            str(getattr(result, "expected", "") or ""),
+            str(getattr(result, "minimal_edit", "") or ""),
+        ]
+        details = getattr(result, "details", None)
+        if isinstance(details, dict):
+            parts.append(json.dumps(details, ensure_ascii=False, default=str))
+        return "\n".join(parts).lower()
+
+    def _is_full_format_result(result: Any) -> bool:
+        layer = str(getattr(result, "layer", "") or "").strip()
+        if layer == "hard_format":
+            return True
+        details = getattr(result, "details", None)
+        if isinstance(details, dict) and str(details.get("repair_strategy") or "").strip() == "full_rewrite":
+            return True
+        result_id = str(getattr(result, "id", "") or "").strip().lower()
+        if result_id.startswith("skill_md.frontmatter") or result_id.startswith("skill_md.markdown_body_structure"):
+            return True
+        text = _result_text(result)
+        deterministic_markers = (
+            "unclosed fence",
+            "outer markdown fence",
+            "empty body",
+            "missing body",
+            "frontmatter 未闭合",
+            "缺少正文",
+            "正文为空",
+            "整体包裹",
+            "fenced block 未闭合",
+            "全局 fence",
+        )
+        return any(marker in text for marker in deterministic_markers)
+
+    if results and any(_is_full_format_result(result) for result in results):
+        return "full_format"
+
+    if (
+        getattr(stage_error, "source", "") == "hard_format"
+        or getattr(stage_error, "layer", "") in {"hard_format", "markdown_format"}
+    ):
+        return "full_format"
+
+    return "semantic"
+
 def is_markdown_hard_format_error(stage_error: FileGenerationStageError) -> bool:
     if getattr(stage_error, "source", "") == "hard_format" or getattr(stage_error, "layer", "") == "hard_format":
         return True
@@ -12810,13 +12872,25 @@ async def generate_file(request: GenerateFileRequest):
                         recoverable=True,
                     )
                     return
+                skill_md_repair_scope = (
+                    _classify_skill_md_repair_scope(stage_error)
+                    if request.file_path == "SKILL.md"
+                    else ""
+                )
                 if (
                     is_generation_format_error(stage_error)
                     or stage_error.source == "python_compile"
                     or stage_error.layer in {"python_compile_error", "post_patch_python_compile_error"}
                 ) and request.file_path.startswith("scripts/"):
                     format_retry_count += 1
-                elif is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
+                elif (
+                    skill_md_repair_scope == "full_format"
+                    or (
+                        request.file_path != "SKILL.md"
+                        and is_markdown_hard_format_error(stage_error)
+                        and _is_markdown_creator_file(request.file_path)
+                    )
+                ):
                     markdown_format_retry_count += 1
                 else:
                     business_repair_count += 1
@@ -13017,7 +13091,45 @@ async def generate_file(request: GenerateFileRequest):
                     )
                     return
 
-                if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
+                if skill_md_repair_scope == "command_block":
+                    single_block_locator = _single_skill_md_command_block_failure(stage_error.original)
+                    if single_block_locator is None:
+                        raise ValueError("SKILL.md command block repair scope lost locator")
+                    last_block_repair_error: Exception | None = None
+                    for block_retry_index in range(3):
+                        try:
+                            repaired_block = await _repair_skill_md_command_block(
+                                model=route.model,
+                                skill_name=skill_name,
+                                block_text=single_block_locator["block_text"],
+                                script_path=single_block_locator["script_path"],
+                                structured_checks=single_block_locator.get("structured_checks") or {},
+                                failure_reasons=single_block_locator.get("failure_reasons") or deterministic_error,
+                                retry_index=block_retry_index,
+                            )
+                            candidate = _replace_skill_md_command_block_exact(
+                                candidate or "",
+                                single_block_locator,
+                                repaired_block,
+                            )
+                            break
+                        except Exception as block_repair_exc:
+                            last_block_repair_error = block_repair_exc
+                    else:
+                        raise ValueError(
+                            "SKILL.md command block repair failed without whole-file fallback: "
+                            f"{last_block_repair_error}"
+                        )
+                    continue
+
+                if (
+                    skill_md_repair_scope == "full_format"
+                    or (
+                        request.file_path != "SKILL.md"
+                        and is_markdown_hard_format_error(stage_error)
+                        and _is_markdown_creator_file(request.file_path)
+                    )
+                ):
                     layer_limit = _first_round_repair_limit(error_source)
 
                     if markdown_format_retry_count > layer_limit:

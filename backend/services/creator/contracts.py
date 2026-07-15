@@ -1495,15 +1495,17 @@ def _skill_md_command_block_repair_scope(script_path: str) -> str:
     )
 
 
-def _skill_md_block_locator(block: Any) -> dict[str, Any]:
+def _skill_md_block_locator(block: Any, skill_md_content: str = "") -> dict[str, Any]:
     start = int(getattr(block, "start", -1))
     end = int(getattr(block, "end", -1))
-    content = str(getattr(block, "content", "") or "")
+    full_block_text = str(skill_md_content or "")[start:end] if start >= 0 and end >= start else ""
+    if not full_block_text:
+        full_block_text = str(getattr(block, "content", "") or "")
     return {
         "start": start,
         "end": end,
-        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "content_excerpt": content[:1000],
+        "content_sha256": hashlib.sha256(full_block_text.encode("utf-8")).hexdigest(),
+        "content_excerpt": full_block_text[:1000],
     }
 
 
@@ -2601,13 +2603,16 @@ def _skill_md_block_review_to_contract_results(
     review: dict[str, Any],
     *,
     block_text: str = "",
+    command_text: str = "",
     block_locator: dict[str, Any] | None = None,
 ) -> list[ContractCheckResult]:
     script_path = str(review.get("target_script_path") or "unknown")
     if review.get("passed") is True:
         return []
+    if not command_text:
+        command_text = str(review.get("command_block") or "")
     if not block_text:
-        block_text = str(review.get("command_block") or "")
+        block_text = command_text
     if block_locator is None:
         block_locator = {
             "start": review.get("block_start"),
@@ -2641,10 +2646,12 @@ def _skill_md_block_review_to_contract_results(
                 "issue": issue,
                 "check_type": failure_type,
                 "script_path": script_path,
-                "current_block": block_text,
+                "current_block": command_text,
+                "command_text": command_text,
                 "block_text": block_text,
                 "block_start": locator.get("start"),
                 "block_end": locator.get("end"),
+                "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
                 "block_locator": locator,
                 "block_ordinal": review.get("command_block_ordinal"),
                 "structured_checks": {
@@ -2653,11 +2660,14 @@ def _skill_md_block_review_to_contract_results(
                     "type_checks": review.get("type_checks") or [],
                 },
                 "skill_md_block_repair_scope": {
-                    "script_path": script_path,
+                    "block_start": locator.get("start"),
+                    "block_end": locator.get("end"),
                     "block_text": block_text,
-                    "block_locator": locator,
-                    "block_ordinal": review.get("command_block_ordinal"),
                     "block_sha256": hashlib.sha256(str(block_text or "").encode("utf-8")).hexdigest(),
+                    "command_text": command_text,
+                    "block_ordinal": review.get("command_block_ordinal"),
+                    "script_path": script_path,
+                    "block_locator": locator,
                 },
             },
             layer="skill_md_command_block_interface",
@@ -3093,8 +3103,9 @@ async def _validate_skill_md_blueprint_alignment(
         })
         block_results = _skill_md_block_review_to_contract_results(
             block_review,
-            block_text=block.content,
-            block_locator=_skill_md_block_locator(block),
+            block_text=content[block.start:block.end],
+            command_text=block.content,
+            block_locator=_skill_md_block_locator(block, content),
         )
         if block_results:
             logger.info(

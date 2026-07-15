@@ -11664,15 +11664,26 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
         scope = details.get("skill_md_block_repair_scope")
         if not isinstance(scope, dict):
             scope = {}
-        block_text = str(details.get("block_text") or details.get("current_block") or scope.get("block_text") or "")
-        script_path = str(details.get("script_path") or scope.get("script_path") or "").strip()
-        block_start = details.get("block_start")
-        block_end = details.get("block_end")
-        if block_start is None and isinstance(details.get("block_locator"), dict):
-            block_start = details["block_locator"].get("start")
-        if block_end is None and isinstance(details.get("block_locator"), dict):
-            block_end = details["block_locator"].get("end")
-        block_sha256 = str(details.get("block_sha256") or scope.get("block_sha256") or "").strip()
+        block_text = str(scope.get("block_text") or details.get("block_text") or "")
+        command_text = str(
+            scope.get("command_text")
+            or details.get("command_text")
+            or details.get("current_block")
+            or ""
+        )
+        script_path = str(scope.get("script_path") or details.get("script_path") or "").strip()
+        block_start = scope.get("block_start")
+        block_end = scope.get("block_end")
+        block_locator = scope.get("block_locator") if isinstance(scope.get("block_locator"), dict) else details.get("block_locator")
+        if block_start is None:
+            block_start = details.get("block_start")
+        if block_end is None:
+            block_end = details.get("block_end")
+        if block_start is None and isinstance(block_locator, dict):
+            block_start = block_locator.get("start")
+        if block_end is None and isinstance(block_locator, dict):
+            block_end = block_locator.get("end")
+        block_sha256 = str(scope.get("block_sha256") or details.get("block_sha256") or "").strip()
         try:
             block_start = int(block_start)
             block_end = int(block_end)
@@ -11682,6 +11693,7 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
             return None
         locators.append({
             "block_text": block_text,
+            "command_text": command_text,
             "script_path": script_path,
             "block_start": block_start,
             "block_end": block_end,
@@ -13101,7 +13113,10 @@ async def generate_file(request: GenerateFileRequest):
                             repaired_block = await _repair_skill_md_command_block(
                                 model=route.model,
                                 skill_name=skill_name,
-                                block_text=single_block_locator["block_text"],
+                                block_text=(
+                                    single_block_locator.get("command_text")
+                                    or single_block_locator["block_text"]
+                                ),
                                 script_path=single_block_locator["script_path"],
                                 structured_checks=single_block_locator.get("structured_checks") or {},
                                 failure_reasons=single_block_locator.get("failure_reasons") or deterministic_error,
@@ -13294,7 +13309,10 @@ async def generate_file(request: GenerateFileRequest):
                                 repaired_block = await _repair_skill_md_command_block(
                                     model=route.model,
                                     skill_name=skill_name,
-                                    block_text=single_block_locator["block_text"],
+                                    block_text=(
+                                        single_block_locator.get("command_text")
+                                        or single_block_locator["block_text"]
+                                    ),
                                     script_path=single_block_locator["script_path"],
                                     structured_checks=single_block_locator.get("structured_checks") or {},
                                     failure_reasons=single_block_locator.get("failure_reasons") or deterministic_error,

@@ -1877,6 +1877,225 @@ def _skill_md_block_check_failed(check: Any) -> bool:
     return result in {"fail", "failed", "error", "blocking", "invalid", "missing"}
 
 
+
+_WHOLE_VALUE_PLACEHOLDER_RE = re.compile(r"^\{\{\s*([A-Za-z_][\w.-]*)\s*\}\}$")
+
+
+def _placeholder_root(value: str) -> str:
+    return str(value or "").split(".", 1)[0].strip()
+
+
+def _whole_value_placeholder_source(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    match = _WHOLE_VALUE_PLACEHOLDER_RE.fullmatch(value.strip())
+    return match.group(1).strip() if match else ""
+
+
+def _contains_placeholder_syntax(value: Any) -> bool:
+    return isinstance(value, str) and "{{" in value and "}}" in value
+
+
+def _normalize_repair_suggestions_field(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    if data.get("repair_suggestions") is None:
+        data["repair_suggestions"] = ""
+        return data
+    value = data.get("repair_suggestions")
+    if isinstance(value, str):
+        return data
+    if isinstance(value, list):
+        data["repair_suggestions"] = "\n".join(str(item) for item in value if str(item or "").strip())
+        return data
+    if isinstance(value, dict):
+        data["repair_suggestions"] = json.dumps(value, ensure_ascii=False, default=str)
+        return data
+    data["repair_suggestions"] = str(value)
+    return data
+
+
+def _available_source_fields_for_block_review(
+    *,
+    prior_stdout: list[str] | None,
+    incoming_edges: Any,
+    function_context: Mapping[str, Any] | None,
+) -> list[str]:
+    fields: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in fields:
+            fields.append(text)
+
+    for field in ("user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"):
+        add(field)
+    for field in prior_stdout or []:
+        add(field)
+    for edge in incoming_edges or []:
+        if not isinstance(edge, Mapping):
+            continue
+        add(edge.get("from_output") or edge.get("source") or edge.get("source_field"))
+    ctx = function_context or {}
+    for binding in ctx.get("input_bindings") or ctx.get("explicit_input_bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        add(binding.get("source") or binding.get("source_field") or binding.get("from_output"))
+    return fields
+
+
+def _argv_schema_properties(argv_schema: Any) -> dict[str, Any]:
+    if not isinstance(argv_schema, Mapping):
+        return {}
+    props = argv_schema.get("properties")
+    if isinstance(props, Mapping):
+        return {str(key): value for key, value in props.items()}
+    args = argv_schema.get("args") or argv_schema.get("argv") or argv_schema.get("fields")
+    if isinstance(args, Mapping):
+        return {str(key): value for key, value in args.items()}
+    return {}
+
+
+def _argv_schema_required_keys(argv_schema: Any) -> set[str]:
+    if not isinstance(argv_schema, Mapping):
+        return set()
+    required = argv_schema.get("required") or argv_schema.get("required_keys") or []
+    if isinstance(required, str):
+        return {required}
+    if isinstance(required, Iterable):
+        return {str(item) for item in required if str(item or "").strip()}
+    return set()
+
+
+def _argv_expected_type(schema_item: Any) -> str:
+    if isinstance(schema_item, str):
+        return schema_item.strip().lower()
+    if not isinstance(schema_item, Mapping):
+        return ""
+    raw = schema_item.get("type") or schema_item.get("expected_type") or schema_item.get("json_type")
+    if isinstance(raw, list):
+        return "|".join(str(item).strip().lower() for item in raw if str(item or "").strip())
+    return str(raw or "").strip().lower()
+
+
+def _json_type_matches(value: Any, expected_type: str) -> bool:
+    expected = {part for part in re.split(r"[|,]", str(expected_type or "")) if part}
+    if not expected:
+        return True
+    if "any" in expected or "unknown" in expected:
+        return True
+    if value is None:
+        return "null" in expected or "none" in expected
+    if isinstance(value, bool):
+        actual = "boolean"
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        actual = "number"
+    elif isinstance(value, str):
+        actual = "string"
+    elif isinstance(value, list):
+        actual = "array"
+    elif isinstance(value, dict):
+        actual = "object"
+    else:
+        actual = "unknown"
+    aliases = {
+        "array": {"array", "list"},
+        "object": {"object", "dict", "mapping"},
+        "boolean": {"boolean", "bool"},
+        "number": {"number", "int", "integer", "float"},
+        "string": {"string", "str"},
+    }
+    return bool(aliases.get(actual, {actual}) & expected)
+
+
+def _check_object_name(check: Mapping[str, Any]) -> str:
+    for key in ("object", "check_object", "target", "field", "key", "value_path", "subject", "path"):
+        text = str(check.get(key) or "").strip()
+        if text:
+            return text.split(".", 1)[0]
+    return ""
+
+
+def _append_check(checks: list[Any], *, obj: str, passed: bool, evidence: str, message: str = "") -> None:
+    item = {"object": obj, "passed": passed, "evidence": evidence}
+    if message:
+        item["message"] = message
+    checks.append(item)
+
+
+def _recompute_block_review_passed(review: dict[str, Any]) -> None:
+    failed_checks = [
+        check
+        for key in ("key_checks", "value_checks", "type_checks")
+        for check in (review.get(key) or [])
+        if _skill_md_block_check_failed(check)
+    ]
+    blocking_issues = [
+        issue
+        for issue in (review.get("issues") or [])
+        if _skill_md_reviewer_issue_contradicts_passed_true(issue)
+    ]
+    review["passed"] = not failed_checks and not blocking_issues
+
+
+def _reconcile_block_review_with_runtime_contract(
+    review: dict[str, Any],
+    *,
+    command_block: str,
+    script_path: str,
+    argv_schema: Any,
+    available_source_fields: list[str],
+) -> dict[str, Any]:
+    signature = _command_signature(command_block, script_path) or {}
+    argv = signature.get("json_payload") if isinstance(signature.get("json_payload"), dict) else {}
+    available_roots = {_placeholder_root(field) for field in available_source_fields if str(field or "").strip()}
+    props = _argv_schema_properties(argv_schema)
+    required = _argv_schema_required_keys(argv_schema)
+    accepted_keys = set(props.keys())
+    key_checks = list(review.get("key_checks") or [])
+    value_checks = list(review.get("value_checks") or [])
+    type_checks = list(review.get("type_checks") or [])
+    issues = list(review.get("issues") or [])
+
+    for key in sorted(required - set(argv.keys())):
+        _append_check(key_checks, obj=key, passed=False, evidence="required argv key is missing", message="required argv key is missing")
+    for key in argv.keys():
+        if accepted_keys and key not in accepted_keys:
+            _append_check(key_checks, obj=str(key), passed=False, evidence="argv key is not accepted by target schema", message="argv key is not accepted by target schema")
+
+    for key, value in argv.items():
+        expected_type = _argv_expected_type(props.get(str(key)))
+        source = _whole_value_placeholder_source(value)
+        if source:
+            root = _placeholder_root(source)
+            if root in available_roots:
+                evidence = "whole-value placeholder source is available; runtime preserves native JSON type"
+                for checks in (value_checks, type_checks):
+                    for check in checks:
+                        if isinstance(check, dict) and _check_object_name(check) == str(key):
+                            check["passed"] = True
+                            check["evidence"] = f"{check.get('evidence') or ''}; {evidence}".strip("; ")
+                if not any(isinstance(check, dict) and _check_object_name(check) == str(key) for check in value_checks):
+                    _append_check(value_checks, obj=str(key), passed=True, evidence=evidence)
+                if not any(isinstance(check, dict) and _check_object_name(check) == str(key) for check in type_checks):
+                    _append_check(type_checks, obj=str(key), passed=True, evidence=evidence)
+            else:
+                _append_check(value_checks, obj=str(key), passed=False, evidence="whole-value placeholder root is not in available_source_fields", message="placeholder source is not available")
+            continue
+        if _contains_placeholder_syntax(value):
+            if expected_type and not _json_type_matches("", expected_type):
+                _append_check(type_checks, obj=str(key), passed=False, evidence="embedded placeholder serializes to string and is incompatible with expected JSON type", message="embedded placeholder is string interpolation")
+            continue
+        if expected_type and not _json_type_matches(value, expected_type):
+            _append_check(type_checks, obj=str(key), passed=False, evidence="literal JSON value conflicts with expected argv type", message="literal value type mismatch")
+
+    review["key_checks"] = key_checks
+    review["value_checks"] = value_checks
+    review["type_checks"] = type_checks
+    review["issues"] = issues
+    _recompute_block_review_passed(review)
+    return review
+
 def _skill_md_block_check_schema_error(check: Any, *, check_type: str, index: int) -> str:
     if not isinstance(check, dict):
         return f"{check_type}_checks[{index}] must be object."
@@ -1969,6 +2188,11 @@ async def _review_skill_md_command_block_with_model(
     }
     function_context = local.get("function_execution_context") or {}
     incoming_edges = function_context.get("incoming_edges") if isinstance(function_context, dict) else []
+    available_source_fields = _available_source_fields_for_block_review(
+        prior_stdout=prior_stdout,
+        incoming_edges=incoming_edges,
+        function_context=function_context if isinstance(function_context, Mapping) else {},
+    )
     payload = {
         "script_path": script_path,
         "command_block": command_block,
@@ -1981,6 +2205,13 @@ async def _review_skill_md_command_block_with_model(
         },
         "incoming_edges": incoming_edges or [],
         "prior_available_stdout": prior_stdout,
+        "available_source_fields": available_source_fields,
+        "placeholder_runtime_contract": {
+            "syntax": "{{source}}",
+            "whole_value_preserves_native_type": True,
+            "embedded_value_serializes_to_string": True,
+            "canonical_json_representation": "quoted_whole_value",
+        },
         "available_sources": {
             "platform_input_envelope": ["user_request", "input", "text", "payload", "fields", "options", "input_files", "files", "resources"],
             "incoming_edges": incoming_edges or [],
@@ -2004,8 +2235,13 @@ async def _review_skill_md_command_block_with_model(
     prompt = (
         "你是 Creator 第一轮 SKILL.md 单 command block 接口审查器，只输出严格 JSON object。\n"
         "你一次只审查当前 script_path 的当前 command_block；不得审查完整 SKILL.md 或其他脚本。\n"
-        "分别判断：1) JSON key 是否符合目标脚本接口；2) JSON value 是否来自当前局部可用来源；3) value 类型和序列化是否兼容。\n"
+        "只判断：1) command block 是否调用目标脚本；2) JSON argv 是否为可解析 object；3) argv key 是否被目标脚本接口接受；4) 整值占位符根来源是否存在于 available_source_fields；5) literal value 是否与目标类型明显冲突；6) 占位符形式是否符合平台既有语法。\n"
+        "判断占位符来源是否合法时，只检查占位符根字段是否存在于 available_source_fields；incoming_edges、prior_available_stdout 和 input bindings 仅作为构造 available_source_fields 的结构化证据。\n"
+        "SKILL.md 统一使用平台现有 {{source}} 占位符语法，不要求将来源容器名写入占位符，不得发明其他占位符语法。\n"
+        "当 JSON value 完全由一个占位符构成时，它是运行时引用，不是普通字符串常量；运行时在 JSON object 解析完成后解析该引用，并保持来源值的原生 JSON 类型。不得仅依据模板中的引号判断最终运行时类型。\n"
+        "当占位符只是较长字符串中的组成部分时，结果才按字符串插值处理。不得要求集合类型额外套一层数组、对象类型额外套一层对象，也不得要求把来源容器名拼入占位符。\n"
         "不得因为图谱字段名与脚本 argv key 名不同就要求修改 argv key；不得把 optional key 判断为不存在；不得要求所有 value 都必须使用 placeholder；不得自行创造平台输入字段、图谱字段或 runtime sentinel。\n"
+        "不得根据字段名称猜测数据类型，不得根据某个具体案例生成修复方案，不得在第一轮重新设计脚本间 dataflow。\n"
         "失败时 repair_scope 必须是只修改当前 command block；不得修改其他 block、说明区域、scripts、references、assets 或图谱。\n"
         "返回格式固定为：{\"passed\": true, \"target_script_path\": \"scripts/x.py\", \"key_checks\": [], \"value_checks\": [], \"type_checks\": [], \"issues\": [], \"repair_suggestions\": \"\"}\n"
         "每个 key_checks/value_checks/type_checks item 必须包含 object、passed、evidence；失败项可包含 message/expected/minimal_edit/blocking。\n"
@@ -2040,11 +2276,18 @@ async def _review_skill_md_command_block_with_model(
         else:
             if isinstance(data, dict):
                 data.setdefault("target_script_path", script_path)
+                _normalize_repair_suggestions_field(data)
             last_schema_error = _skill_md_block_review_schema_error(data)
             if not last_schema_error:
                 data["target_script_path"] = script_path
                 data["command_block_ordinal"] = ordinal
-                return data
+                return _reconcile_block_review_with_runtime_contract(
+                    data,
+                    command_block=command_block,
+                    script_path=script_path,
+                    argv_schema=local.get("strict_json_argv_schema") or {},
+                    available_source_fields=available_source_fields,
+                )
         if review_attempt < 2:
             logger.info(
                 "[Creator][skill_md][block_review][schema_retry] skill=%s script=%s ordinal=%d attempt=%d error=%s",

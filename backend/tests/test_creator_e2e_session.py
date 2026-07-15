@@ -554,6 +554,96 @@ async def test_e2e_repair_stays_localized_after_repeated_attempts(tmp_path, monk
     assert any(event.get("repair_mode") == "localized_patch" and event.get("rerun_status") == "passed" for event in events)
 
 
+def _write_trial_script(tmp_path: Path, script: str, command_payload: dict | None = None):
+    skill_dir = tmp_path / "trial-skill"
+    (skill_dir / "scripts").mkdir(parents=True)
+    script_path = skill_dir / "scripts" / "run.py"
+    script_path.write_text(script, encoding="utf-8")
+    payload = command_payload if command_payload is not None else {"user_request": "hello"}
+    raw_payload = json.dumps(payload, ensure_ascii=False)
+    skill_md = f"# Demo\n```bash\npython scripts/run.py '{raw_payload}'\n```\n"
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    command = E2EWorkflowCommand(1, "SKILL.md", "scripts/run.py", f"python scripts/run.py '{raw_payload}'", "python", payload)
+    return skill_dir, command, skill_md, payload
+
+
+def _generic_python_entry(**kwargs):
+    return SimpleNamespace(runtime="python", language="python", role="generic_script", path=kwargs.get("file_path", "scripts/run.py"), inputs=["user_request"], outputs=["text"], required_capabilities=[], runtime_contract={"stdout": ["text"]}, artifact_contract={}, artifacts=[])
+
+
+def _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc):
+    return e2e._parse_e2e_stdout_json(command=command, proc=proc, trial_skill_dir=skill_dir, trial_skill_md=skill_md, content=script, entry=entry, rendered_payload=payload)
+
+
+def test_inline_dunder_main_enters_real_subprocess_and_parses_stdout(tmp_path, monkeypatch):
+    script = 'import json\nimport sys\n\nif __name__ == "__main__":\n    payload = json.loads(sys.argv[1])\n    print(json.dumps({"text": payload["user_request"]}))\n'
+    skill_dir, command, skill_md, payload = _write_trial_script(tmp_path, script)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    proc = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload=payload, venv_python=Path(sys.executable))
+    assert proc.returncode == 0
+    assert _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc) == {"text": "hello"}
+
+
+def test_top_level_script_without_dunder_main_runs_successfully(tmp_path, monkeypatch):
+    script = 'import json\nimport sys\n\npayload = json.loads(sys.argv[1])\nprint(json.dumps({"text": payload["user_request"]}))\n'
+    skill_dir, command, skill_md, payload = _write_trial_script(tmp_path, script)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    proc = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload=payload, venv_python=Path(sys.executable))
+    assert proc.returncode == 0
+    assert _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc) == {"text": "hello"}
+
+
+def test_script_with_no_stdout_fails_after_real_execution_not_static_preflight(tmp_path, monkeypatch):
+    script = 'import json\nimport sys\n\npayload = json.loads(sys.argv[1])\n_ = payload["user_request"]\n'
+    skill_dir, command, skill_md, payload = _write_trial_script(tmp_path, script)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    proc = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload=payload, venv_python=Path(sys.executable))
+    assert proc.returncode == 0
+    with pytest.raises(ValueError) as excinfo:
+        _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc)
+    failure = str(excinfo.value)
+    assert "script_static_contract" not in failure
+    assert "\"return_code\": 0" in failure
+    assert "stdout" in failure
+
+
+def test_python_syntax_error_is_real_subprocess_failure_not_static_preflight(tmp_path, monkeypatch):
+    script = "if True print('bad')\n"
+    skill_dir, command, skill_md, payload = _write_trial_script(tmp_path, script)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    proc = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload=payload, venv_python=Path(sys.executable))
+    assert proc.returncode != 0
+    assert "SyntaxError" in proc.stderr
+    with pytest.raises(ValueError) as excinfo:
+        _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc)
+    failure = str(excinfo.value)
+    assert "script_exit" in failure
+    assert "script_static_contract" not in failure
+    assert "\"failed_command\": \"python scripts/run.py" in failure
+    assert "SyntaxError" in failure
+
+
+def test_argv_guard_type_error_comes_from_real_subprocess(tmp_path, monkeypatch):
+    script = 'import json\nimport sys\nfrom backend.services.runtime_tools import strict_json_argv_guard\n\npayload = json.loads(sys.argv[1])\nargs = strict_json_argv_guard(payload, {"user_request": {"type": str, "required": True}})\nprint(json.dumps({"text": args["user_request"]}))\n'
+    payload = {"user_request": ["not", "a", "string"]}
+    skill_dir, command, skill_md, _ = _write_trial_script(tmp_path, script, payload)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+    entry = e2e._validate_e2e_command_static(command=command, trial_skill_dir=skill_dir, skill_md=skill_md)
+    proc = e2e._execute_e2e_python_command(command=command, trial_skill_dir=skill_dir, rendered_payload=payload, venv_python=Path(sys.executable))
+    assert proc.returncode != 0
+    assert "user_request" in proc.stderr
+    with pytest.raises(ValueError) as excinfo:
+        _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc)
+    failure = str(excinfo.value)
+    assert "script_static_contract" not in failure
+    assert "E2E_REPAIR_TARGET=" in failure
+    assert "return_code" in failure
+    assert "user_request" in failure
+
 def test_input_text_list_guard_preflight_reaches_subprocess(tmp_path, monkeypatch):
     skill_dir = tmp_path / "input-text-list"
     (skill_dir / "scripts").mkdir(parents=True)

@@ -107,6 +107,7 @@ class ToolPoolFileBinding(BaseModel):
     allowed_helper_imports: list[str] = Field(default_factory=list)
     allowed_import_paths: list[str] = Field(default_factory=list)
     allowed_function_imports: list[str] = Field(default_factory=list)
+    available_tools: list[dict[str, Any]] = Field(default_factory=list)
     scored_tools: list[dict[str, Any]] = Field(default_factory=list)
     matched_features_by_tool: dict[str, list[str]] = Field(default_factory=dict)
     required_env: list[str] = Field(default_factory=list)

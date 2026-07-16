@@ -1,7 +1,8 @@
 from __future__ import annotations
 import json, os, tempfile
 from pathlib import Path
-from .tool_pool_models import ToolPoolModel, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, utc_now_iso
+from .tool_pool_models import ToolPoolModel, ToolPoolFileBinding, ToolPoolGateEvent, ToolPoolDeniedRequest, ToolPoolMissingRequest, ToolPoolTool, utc_now_iso
+from ..creator_tool_registry import get_tool_capability
 
 TOOL_POOL_RELATIVE_PATH = Path('.creator') / 'tool_pool.json'
 
@@ -41,6 +42,63 @@ def _stable_unique(values):
         if value not in out:
             out.append(value)
     return out
+
+
+def _tool_callable_contracts(tool: ToolPoolTool) -> list[dict]:
+    """Return backend-validated callable contracts for one allowed tool."""
+    capability = get_tool_capability(str(tool.tool_id or "").strip())
+    if capability is None:
+        return []
+
+    contracts: list[dict] = []
+    allowed_import_paths = set(tool.allowed_import_paths or [])
+    allowed_function_imports = set(tool.allowed_function_imports or [])
+    helper_imports = set(tool.allowed_helper_imports or [])
+
+    for helper in sorted(helper_imports):
+        contracts.append({
+            "tool_id": tool.tool_id,
+            "function_name": helper,
+            "import_path": "backend.services.runtime_tools",
+            "input_schema": dict(tool.input_schema or {}),
+            "output_schema": dict(tool.output_schema or {}),
+        })
+
+    for function in list(getattr(capability, "functions", []) or []):
+        function_name = str(getattr(function, "function_name", "") or "").strip()
+        import_path = str(getattr(function, "import_path", "") or "").strip()
+        if not function_name or not import_path:
+            continue
+        if import_path not in allowed_import_paths:
+            continue
+        if (
+            function_name not in allowed_function_imports
+            and f"{import_path}.{function_name}" not in allowed_function_imports
+        ):
+            continue
+        contracts.append({
+            "tool_id": tool.tool_id,
+            "function_name": function_name,
+            "import_path": import_path,
+            "input_schema": dict(getattr(function, "input_schema", None) or tool.input_schema or {}),
+            "output_schema": dict(getattr(function, "output_schema", None) or tool.output_schema or {}),
+        })
+
+    return contracts
+
+def _derive_legacy_fields_from_available_tools(available_tools: list[dict]) -> tuple[list[str], list[str], list[str]]:
+    function_names = _stable_unique([tool.get("function_name") for tool in available_tools])
+    import_paths = _stable_unique([tool.get("import_path") for tool in available_tools])
+    helper_imports = list(function_names)
+    function_imports = _stable_unique([
+        item
+        for tool in available_tools
+        for item in (
+            tool.get("function_name"),
+            f"{tool.get('import_path')}.{tool.get('function_name')}" if tool.get("import_path") and tool.get("function_name") else "",
+        )
+    ])
+    return helper_imports, import_paths, function_imports
 
 def get_skill_tool_binding(
     pool: ToolPoolModel,
@@ -90,35 +148,28 @@ def get_skill_tool_binding(
         *shared_tool_ids,
     ])
 
-    allowed_helper_imports = _stable_unique([
-        *core_helpers,
-        *[
-            helper
-            for tool in allowed_tools
-            for helper in (
-                tool.allowed_helper_imports
-                or []
-            )
-        ],
-    ])
-
-    allowed_import_paths = _stable_unique([
-        import_path
+    available_tools = [
+        contract
         for tool in allowed_tools
-        for import_path in (
-            tool.allowed_import_paths
-            or []
-        )
-    ])
+        for contract in _tool_callable_contracts(tool)
+    ]
 
-    allowed_function_imports = _stable_unique([
-        function_name
-        for tool in allowed_tools
-        for function_name in (
-            tool.allowed_function_imports
-            or []
-        )
-    ])
+    if include_script_core:
+        available_tools.append({
+            "tool_id": "script_argv_guard",
+            "function_name": "strict_json_argv_guard",
+            "import_path": "backend.services.runtime_tools",
+            "input_schema": {},
+            "output_schema": {},
+        })
+
+    (
+        allowed_helper_imports,
+        allowed_import_paths,
+        allowed_function_imports,
+    ) = _derive_legacy_fields_from_available_tools(
+        available_tools
+    )
 
     required_env = _stable_unique([
         env_name
@@ -184,6 +235,7 @@ def get_skill_tool_binding(
         allowed_function_imports=(
             allowed_function_imports
         ),
+        available_tools=available_tools,
         scored_tools=scored_tools,
         matched_features_by_tool=(
             matched_features_by_tool

@@ -1,4 +1,6 @@
-from backend.services.creator.generation import _script_local_contract_payload
+import copy
+
+from backend.services.creator.generation import _script_local_contract_payload, build_available_tool_context
 from backend.services.creator_tool_registry import (
     ToolCapability,
     ToolFunctionManifest,
@@ -73,9 +75,7 @@ def test_script_local_contract_merges_structured_tool_binding_with_explicit_valu
         assert binding["allowed_import_paths"] == ["backend.services.runtime_tools.custom_tools.lookup", "backend.services.runtime_tools"]
         assert binding["allowed_function_imports"] == [
             "lookup_value",
-            "backend.services.runtime_tools.custom_tools.lookup.lookup_value",
             "strict_json_argv_guard",
-            "backend.services.runtime_tools.strict_json_argv_guard",
         ]
         assert binding["dependencies"] == ["explicit_dep"]
         assert payload["allowed_helper_imports"] == ["lookup_value", "strict_json_argv_guard"]
@@ -130,11 +130,203 @@ def test_script_local_contract_autofills_runtime_helper_and_argv_guard_when_bind
         assert binding["allowed_import_paths"] == ["backend.services.runtime_tools"]
         assert binding["allowed_function_imports"] == [
             "lookup_value",
-            "backend.services.runtime_tools.lookup_value",
             "strict_json_argv_guard",
-            "backend.services.runtime_tools.strict_json_argv_guard",
         ]
         assert "runtime_lookup" in binding["primary_tool_ids"]
         assert "script_argv_guard" in binding["primary_tool_ids"]
     finally:
         clear_registered_tool_capabilities()
+
+
+def test_script_local_contract_uses_binding_available_tools_as_only_index():
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="bound_lookup",
+        display_name="Bound Lookup",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools.custom_tools.lookup",
+            short_description="Lookup a value.",
+            when_to_use="Use for lookup.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object"},
+            required_capabilities=["bound_lookup"],
+        )],
+    ))
+    entry = _entry(
+        required_capabilities=["unbound_capability"],
+        runtime_contract={
+            "implementation_resolution": {"selected_tools": ["extra_tool"]},
+            "tool_binding_summary": {
+                "available_tools": [{
+                    "tool_id": "bound_lookup.lookup_value",
+                    "capability_name": "bound_lookup",
+                    "function_name": "lookup_value",
+                    "import_path": "backend.services.runtime_tools.custom_tools.lookup",
+                    "signature": "lookup_value(query: str) -> dict",
+                    "input_schema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                    "output_schema": {"type": "object"},
+                }],
+                "allowed_import_paths": ["backend.services.runtime_tools.custom_tools.extra"],
+                "allowed_function_imports": ["extra_tool"],
+                "allowed_helper_imports": ["extra_tool"],
+            },
+        },
+    )
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}},
+    )
+
+    tool_ids = [tool["tool_id"] for tool in payload["available_tools"]]
+    assert tool_ids == ["bound_lookup.lookup_value", "script_argv_guard"]
+    assert payload["current_file_tool_binding"]["available_tools"] == payload["available_tools"]
+    assert payload["current_file_tool_binding"]["allowed_function_imports"] == ["lookup_value", "strict_json_argv_guard"]
+    assert "extra_tool" not in payload["current_file_tool_binding"]["allowed_function_imports"]
+
+
+def test_available_tool_context_resolves_registry_facts_and_ignores_stale_index_schema():
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="multi_lookup",
+        display_name="Multi Lookup",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[
+            ToolFunctionManifest(
+                function_name="lookup_value",
+                import_path="backend.services.runtime_tools.custom_tools.lookup",
+                short_description="Lookup a value.",
+                when_to_use="Use for lookup.",
+                signature="lookup_value(query: str) -> dict",
+                input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                output_schema={"type": "object", "required": ["source_value"], "properties": {"source_value": {"type": "string"}}},
+                example_call="lookup_value(query='x')",
+                required_capabilities=["multi_lookup"],
+            ),
+            ToolFunctionManifest(
+                function_name="other_lookup",
+                import_path="backend.services.runtime_tools.custom_tools.lookup",
+                short_description="Other lookup.",
+                when_to_use="Use for other lookup.",
+                signature="other_lookup(value: str) -> dict",
+                input_schema={"type": "object", "required": ["value"]},
+                output_schema={"type": "object"},
+                required_capabilities=["multi_lookup"],
+            ),
+        ],
+    ))
+
+    context = build_available_tool_context({
+        "available_tools": [{
+            "tool_id": "multi_lookup.lookup_value",
+            "function_name": "lookup_value",
+            "input_schema": {"type": "object", "required": ["stale"]},
+        }]
+    }, role="generic_script", file_path="scripts/main.py")
+
+    assert set(context["available_tools"][0]) == {"tool_id", "capability_name", "function_name"}
+    assert "input_schema" not in context["available_tools"][0]
+    assert "signature" not in context["available_tools"][0]
+    assert "call_template" not in context["available_tools"][0]
+    assert context["resolved_tools"][0]["signature"] == "lookup_value(query: str) -> dict"
+    assert context["resolved_tools"][0]["input_schema"]["required"] == ["query"]
+    assert context["resolved_tools"][0]["output_schema"]["required"] == ["source_value"]
+    assert all("other_lookup" not in card for card in context["tool_function_cards"])
+    assert context["allowed_function_imports"] == ["lookup_value"]
+    assert "lookup_value" in context["tool_snippet_prompt"]
+
+
+def test_available_tool_context_fails_when_registry_index_cannot_resolve():
+    clear_registered_tool_capabilities()
+    try:
+        build_available_tool_context({
+            "available_tools": [{
+                "tool_id": "missing_capability.missing_function",
+                "function_name": "missing_function",
+            }]
+        })
+    except ValueError as exc:
+        assert "BOUND_AVAILABLE_TOOL_REGISTRY_RESOLUTION_FAILED" in str(exc)
+        assert "missing_capability.missing_function" in str(exc)
+    else:
+        raise AssertionError("Expected unresolved available_tools index to fail")
+
+
+def test_python_script_core_probe_is_visible_as_pure_index_and_resolved_from_registry():
+    clear_registered_tool_capabilities()
+    entry = _entry(runtime_contract={"tool_binding_summary": {"available_tools": []}})
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}},
+    )
+
+    assert {
+        "tool_id": "script_argv_guard",
+        "capability_name": "script_argv_guard",
+        "function_name": "strict_json_argv_guard",
+    } in payload["available_tools"]
+    probe = next(tool for tool in payload["resolved_tools"] if tool["function_name"] == "strict_json_argv_guard")
+    assert probe["import_path"] == "backend.services.runtime_tools"
+    assert "strict_json_argv_guard" in probe["signature"]
+
+
+def test_script_local_contract_runtime_contract_available_tools_uses_prompt_index_without_mutating_original():
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="lookup",
+        display_name="Lookup",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools.custom_tools.lookup",
+            short_description="Lookup a value.",
+            when_to_use="Use for lookup.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object"},
+            required_capabilities=["lookup"],
+        )],
+    ))
+    runtime_contract = {
+        "tool_binding_summary": {
+            "available_tools": [{
+                "tool_id": "lookup.lookup_value",
+                "capability_name": "lookup",
+                "function_name": "lookup_value",
+                "input_schema": {"required": ["stale"]},
+                "signature": "stale_signature()",
+            }],
+            "primary_tool_ids": ["lookup"],
+            "dependencies": ["kept-for-compat"],
+        }
+    }
+    original_runtime_contract = copy.deepcopy(runtime_contract)
+    entry = _entry(runtime_contract=runtime_contract)
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}},
+    )
+
+    assert (
+        payload["available_tools"]
+        == payload["current_file_tool_binding"]["available_tools"]
+        == payload["runtime_contract"]["tool_binding_summary"]["available_tools"]
+    )
+    for tool in payload["available_tools"]:
+        assert set(tool) == {"tool_id", "capability_name", "function_name"}
+    assert payload["resolved_tools"][0]["input_schema"]["required"] == ["query"]
+    assert entry.runtime_contract == original_runtime_contract

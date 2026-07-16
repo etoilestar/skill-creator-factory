@@ -229,10 +229,50 @@ def test_available_tool_context_resolves_registry_facts_and_ignores_stale_index_
         }]
     }, role="generic_script", file_path="scripts/main.py")
 
-    assert context["available_tools"][0]["input_schema"]["required"] == ["stale"]
+    assert set(context["available_tools"][0]) == {"tool_id", "capability_name", "function_name"}
+    assert "input_schema" not in context["available_tools"][0]
+    assert "signature" not in context["available_tools"][0]
+    assert "call_template" not in context["available_tools"][0]
     assert context["resolved_tools"][0]["signature"] == "lookup_value(query: str) -> dict"
     assert context["resolved_tools"][0]["input_schema"]["required"] == ["query"]
     assert context["resolved_tools"][0]["output_schema"]["required"] == ["source_value"]
     assert all("other_lookup" not in card for card in context["tool_function_cards"])
     assert context["allowed_function_imports"] == ["lookup_value"]
     assert "lookup_value" in context["tool_snippet_prompt"]
+
+
+def test_available_tool_context_fails_when_registry_index_cannot_resolve():
+    clear_registered_tool_capabilities()
+    try:
+        build_available_tool_context({
+            "available_tools": [{
+                "tool_id": "missing_capability.missing_function",
+                "function_name": "missing_function",
+            }]
+        })
+    except ValueError as exc:
+        assert "BOUND_AVAILABLE_TOOL_REGISTRY_RESOLUTION_FAILED" in str(exc)
+        assert "missing_capability.missing_function" in str(exc)
+    else:
+        raise AssertionError("Expected unresolved available_tools index to fail")
+
+
+def test_python_script_core_probe_is_visible_as_pure_index_and_resolved_from_registry():
+    clear_registered_tool_capabilities()
+    entry = _entry(runtime_contract={"tool_binding_summary": {"available_tools": []}})
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}},
+    )
+
+    assert {
+        "tool_id": "script_argv_guard",
+        "capability_name": "script_argv_guard",
+        "function_name": "strict_json_argv_guard",
+    } in payload["available_tools"]
+    probe = next(tool for tool in payload["resolved_tools"] if tool["function_name"] == "strict_json_argv_guard")
+    assert probe["import_path"] == "backend.services.runtime_tools"
+    assert "strict_json_argv_guard" in probe["signature"]

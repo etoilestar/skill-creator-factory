@@ -638,12 +638,16 @@ def _ensure_python_script_core_binding(binding: dict[str, Any], plan_entry: Skil
     available_tools = list(merged.get("available_tools") or [])
     if not any(
         isinstance(tool, dict)
-        and tool.get("function_name") == "strict_json_argv_guard"
-        and tool.get("import_path") == "backend.services.runtime_tools"
+        and (
+            tool.get("function_name") == "strict_json_argv_guard"
+            or tool.get("tool_id") == "script_argv_guard"
+            or tool.get("capability_name") == "script_argv_guard"
+        )
         for tool in available_tools
     ):
         available_tools.append({
             "tool_id": "script_argv_guard",
+            "capability_name": "script_argv_guard",
             "function_name": "strict_json_argv_guard",
             "import_path": "backend.services.runtime_tools",
             "input_schema": {},
@@ -795,6 +799,32 @@ def _filter_snippets_to_available_callables(
             out.append(snippet)
     return out
 
+
+def _available_tool_index_for_prompt(
+    available_tools: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Return the model-visible tool index without stale tool details."""
+
+    result: list[dict[str, str]] = []
+    for tool in available_tools or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_id = str(tool.get("tool_id") or "").strip()
+        capability_name = str(tool.get("capability_name") or "").strip()
+        function_name = str(tool.get("function_name") or "").strip()
+        if not capability_name and "." in tool_id:
+            capability_name = tool_id.split(".", 1)[0].strip()
+        if not function_name and "." in tool_id:
+            function_name = tool_id.rsplit(".", 1)[-1].strip()
+        if not tool_id or not function_name:
+            continue
+        result.append({
+            "tool_id": tool_id,
+            "capability_name": capability_name,
+            "function_name": function_name,
+        })
+    return result
+
 def _registry_tool_from_available_index(item: dict[str, Any]) -> dict[str, Any] | None:
     """Resolve one available_tools index row to a Registry function fact."""
 
@@ -898,11 +928,23 @@ def build_available_tool_context(
         if isinstance(binding.get("available_tools"), list)
         else []
     )
-    binding["available_tools"] = [
+    prompt_tool_index = _available_tool_index_for_prompt([
         dict(tool)
         for tool in raw_available_tools
         if isinstance(tool, dict)
+    ])
+    binding["available_tools"] = prompt_tool_index
+
+    unresolved_indexes = [
+        item
+        for item in prompt_tool_index
+        if _registry_tool_from_available_index(item) is None
     ]
+    if unresolved_indexes:
+        raise ValueError(
+            "BOUND_AVAILABLE_TOOL_REGISTRY_RESOLUTION_FAILED: "
+            + json.dumps(unresolved_indexes, ensure_ascii=False, default=str)
+        )
 
     (
         available_tools,
@@ -1071,9 +1113,11 @@ def _script_local_contract_payload(
     resolved_tools = tool_context["resolved_tools"]
     tool_function_cards = tool_context["tool_function_cards"]
     tool_snippets = tool_context["tool_snippets"]
-    tool_binding_summary["allowed_import_paths"] = tool_context["allowed_import_paths"]
-    tool_binding_summary["allowed_function_imports"] = tool_context["allowed_function_imports"]
-    tool_binding_summary["allowed_helper_imports"] = tool_context["allowed_helper_imports"]
+    prompt_tool_binding_summary = dict(tool_binding_summary)
+    prompt_tool_binding_summary["available_tools"] = available_tools
+    prompt_tool_binding_summary["allowed_import_paths"] = tool_context["allowed_import_paths"]
+    prompt_tool_binding_summary["allowed_function_imports"] = tool_context["allowed_function_imports"]
+    prompt_tool_binding_summary["allowed_helper_imports"] = tool_context["allowed_helper_imports"]
 
     return {
         "file_path": file_path,
@@ -1099,10 +1143,10 @@ def _script_local_contract_payload(
             )
         ),
         "current_file_tool_binding": (
-            tool_binding_summary
+            prompt_tool_binding_summary
         ),
         "allowed_helper_imports": (
-            tool_binding_summary.get(
+            prompt_tool_binding_summary.get(
                 "allowed_helper_imports",
                 [],
             )
@@ -1178,19 +1222,14 @@ def _script_local_contract_payload(
                 "current Skill."
             ),
             (
-                "For every available_tools item, "
-                "read description, signature, "
-                "input_schema, output_schema, "
-                "return_contract, artifact_outputs, "
-                "side_effects, examples and "
-                "common_mistakes before composing "
-                "the call."
+                "available_tools is only the current allowed tool index. "
+                "Read import_path, signature, input_schema, output_schema, "
+                "return_contract, examples, and common_mistakes from resolved_tools, "
+                "tool_function_cards, and tool_snippets before composing a call."
             ),
             (
-                "Only use tools from current_file_tool_binding.available_tools. "
-                "Use the function_name, import_path, input_schema and output_schema "
-                "provided by that tool pool; do not use tools, imports, functions, "
-                "parameters, or output fields outside that pool."
+                "Do not use tools outside the available_tools index. Do not use "
+                "parameters or return fields that are not declared in resolved_tools."
             ),
             (
                 "Treat available tools as candidates only after responsibility_requirements are understood."
@@ -1398,93 +1437,23 @@ def _existing_script_argv_context_for_skill_md(
 def _bound_callable_tool_contract_projection_gaps(
     binding: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Detect authorized callable tools whose contracts are not prompt-visible."""
+    """Detect available_tools indexes that cannot resolve to Registry facts."""
 
     gaps: list[dict[str, Any]] = []
-
-    for tool_id in (
-        _tool_ids_from_binding_summary(
-            binding
-        )
-    ):
-        capability = get_tool_capability(
-            tool_id
-        )
-
-        if capability is None:
+    raw_available_tools = (
+        binding.get("available_tools")
+        if isinstance(binding, dict) and isinstance(binding.get("available_tools"), list)
+        else []
+    )
+    for item in _available_tool_index_for_prompt([
+        tool for tool in raw_available_tools if isinstance(tool, dict)
+    ]):
+        if _registry_tool_from_available_index(item) is None:
             gaps.append({
-                "tool_id": tool_id,
-                "reason": (
-                    "bound tool_id is missing "
-                    "from Tool Registry"
-                ),
-            })
-
-            continue
-
-        callable_functions = [
-            function
-            for function in (
-                getattr(
-                    capability,
-                    "functions",
-                    [],
-                )
-                or []
-            )
-            if str(
-                getattr(
-                    function,
-                    "import_path",
-                    "",
-                )
-                or ""
-            ).strip()
-            and str(
-                getattr(
-                    function,
-                    "function_name",
-                    "",
-                )
-                or ""
-            ).strip()
-        ]
-
-        # Capability-only metadata may legitimately
-        # expose no callable function.
-        if not callable_functions:
-            continue
-
-        cards = function_cards_for_tool(
-            capability
-        )
-
-        if (
-            len(cards)
-            < len(callable_functions)
-        ):
-            gaps.append({
-                "tool_id": tool_id,
-                "reason": (
-                    "authorized callable tool has "
-                    "functions but not every callable "
-                    "function produced a Tool Function Card"
-                ),
-                "callable_functions": [
-                    str(
-                        getattr(
-                            function,
-                            "function_name",
-                            "",
-                        )
-                        or ""
-                    )
-                    for function
-                    in callable_functions
-                ],
-                "function_card_count": len(
-                    cards
-                ),
+                "tool_id": item.get("tool_id"),
+                "capability_name": item.get("capability_name"),
+                "function_name": item.get("function_name"),
+                "reason": "available_tools index cannot be resolved from Tool Registry",
             })
 
     return gaps

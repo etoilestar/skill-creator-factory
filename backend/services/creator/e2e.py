@@ -3757,6 +3757,36 @@ def _run_skill_workflow_e2e_once(
                     if venv_python is None:
                         raise ValueError("python venv 未初始化。")
 
+                    try:
+                        pool = load_tool_pool(trial_skill_dir)
+                        binding_model = get_file_binding(pool, command.script_path)
+                        file_binding = (
+                            binding_model.model_dump(mode="json")
+                            if binding_model is not None
+                            else {}
+                        )
+                        import_guard = guard_runtime_imports(content, command.script_path, file_binding)
+                        import_guard_payload = (
+                            import_guard.model_dump(mode="json")
+                            if hasattr(import_guard, "model_dump")
+                            else import_guard
+                        )
+                        if isinstance(import_guard_payload, dict) and import_guard_payload.get("success") is False:
+                            raise ValueError(
+                                _e2e_error(
+                                    target=command.script_path,
+                                    layer="runtime_import_guard_failed",
+                                    message=json.dumps(import_guard_payload, ensure_ascii=False, default=str),
+                                    details={
+                                        "failed_command": command.command,
+                                        "rendered_payload": rendered_payload,
+                                        "runtime_binding_trace": runtime_binding_trace,
+                                    },
+                                )
+                            )
+                    except FileNotFoundError:
+                        pass
+
                     proc = _execute_e2e_python_command(
                         command=command,
                         trial_skill_dir=trial_skill_dir,
@@ -4012,6 +4042,7 @@ async def _repair_existing_file_for_e2e_failure(
     external_context: dict[str, Any] | None = None,
     repair_events: list[dict[str, Any]] | None = None,
     e2e_session: CreatorE2ESession | None = None,
+    read_only_callable_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Repair one real second-round E2E workflow failure.
 
@@ -4304,12 +4335,14 @@ async def _repair_existing_file_for_e2e_failure(
             "basic format 错误只修格式；sandbox E2E 错误才修 workflow / argv / stdout / artifact 链路。",
             "第二轮只修 workflow / argv / placeholder / stdout / artifact / final sandbox output。",
             "平台 IO 不在 repair 层用词表判断，直接由 sandbox/E2E 试运行判断。",
-            "不得重新检查脚本职责、RequirementGraph coverage、required_capabilities、"
-            "ToolPool、allowed_helper_imports、tool binding 或 helper permission。",
+            "不得重新检查脚本职责、RequirementGraph coverage 或 required_capabilities。",
+            "不得重新选择、扩展、删除或重排 ToolPool；不得重新判断工具是否应该承担当前职责；"
+            "不得请求工具探索或 tool_pool_patch。",
             "E2E 阶段禁止工具库探索：不得请求 tool_pool_patch.add_tool_requests，"
             "不得探索或扩展工具池。",
-            "ImportError/ModuleNotFoundError 只依据真实 stderr traceback 修直接相关 import；"
-            "不得根据 ToolPool 或 allowed_helper_imports 判断导入是否合法。",
+            "当且仅当真实 traceback 是 import/name/signature 错误时，可以读取 "
+            "read_only_callable_context 中已经授权的 Registry callable facts，修正当前报错调用的 "
+            "import_path、function_name、signature、参数名或返回字段读取；该 context 不是新的工具选择建议。",
             "若 E2E 发现缺少第三方依赖，交给 dependency/environment 链路处理，"
             "不得通过重新选工具或改业务职责绕过。",
             "优先输出 edits old_lines/new_lines exact_replace patch，不要输出完整文件。",
@@ -4444,8 +4477,17 @@ async def _repair_existing_file_for_e2e_failure(
             "如果是 artifact/final output 失败，"
             "只修改当前产物创建、路径返回或最终 stdout 映射。\n"
             "不得重新判断当前脚本职责是否完整，"
-            "不得检查 required_capabilities、coverage_requirements、"
-            "ToolPool、allowed_helper_imports、tool binding 或 helper permission。\n"
+            "不得检查 required_capabilities 或 coverage_requirements。\n"
+            "不得重新选择、扩展、删除或重排 ToolPool；不得重新判断工具是否应该承担当前职责；"
+            "不得请求工具探索或 tool_pool_patch。\n"
+            "当且仅当真实 traceback 是 import/name/signature 错误时，可以读取 read_only_callable_context "
+            "中已经授权的 Registry callable facts（含 binding_digest、resolved_tools、import_path、signature），"
+            "修正当前报错调用的 import_path、function_name、signature、参数名或返回字段读取。\n"
+            "该 context 不是新的工具选择建议。\n"
+            "如果当前脚本的核心动作依赖一个已经授权的 callable，不得通过删除 import 但保留未定义调用、"
+            "fixed text、返回示例文本、fake path、写入空文件、注释掉核心调用、mock / placeholder / simulated 实现来绕过 ImportError 或调用错误。\n"
+            "应优先依据 read_only_callable_context 修正准确 import path、函数名、参数和返回字段。\n"
+            "若只读合同中没有可完成该核心动作的 callable，不要伪造实现；保留阻塞状态，让上层重新进入第一轮工具规划或人工修复。\n"
             "不得改其它文件或已通过步骤。\n"
             "优先输出 edits old_lines/new_lines exact_replace patch。"
             "不要输出完整源码。"
@@ -4515,9 +4557,22 @@ async def _repair_existing_file_for_e2e_failure(
         ),
         "",
         "第二轮硬性边界：只根据真实 E2E 运行失败申错改错；"
-        "不得重新判断脚本职责、ToolPool、allowed_helper_imports、tool binding、"
-        "required_capabilities、coverage_requirements、工具选择或 helper permission。",
+        "不得重新判断脚本职责、required_capabilities、coverage_requirements 或 helper permission；"
+        "不得重新选择、扩展、删除或重排 ToolPool，不得请求工具探索或 tool_pool_patch。",
     ])
+
+
+    if target_path.startswith("scripts/") and read_only_callable_context:
+        base_task_context += (
+            "\n\n只读 callable facts（read_only=true，仅用于修正真实 import/name/signature 错误；不是工具选择建议）：\n"
+            + json.dumps(
+                read_only_callable_context,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+        )
 
     repair_feedback = "\n\n".join(
         repair_state.get(

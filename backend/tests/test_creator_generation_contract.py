@@ -330,3 +330,58 @@ def test_script_local_contract_runtime_contract_available_tools_uses_prompt_inde
         assert set(tool) == {"tool_id", "capability_name", "function_name"}
     assert payload["resolved_tools"][0]["input_schema"]["required"] == ["query"]
     assert entry.runtime_contract == original_runtime_contract
+
+
+def test_current_skill_binding_overrides_stale_guard_only_runtime_contract_with_registry_projection():
+    from backend.services.creator import api
+
+    catalog = api._creator_tool_catalog_for_planner()
+    callable_tools = [
+        tool for tool in catalog
+        if tool.get("tool_id") != "script_argv_guard" and tool.get("functions")
+    ]
+    assert len(callable_tools) >= 2
+    selected = callable_tools[:2]
+    binding_tools = []
+    for tool in selected:
+        fn = tool["functions"][0]
+        binding_tools.append({
+            "tool_id": f"{tool['tool_id']}.{fn['function_name']}",
+            "capability_name": tool["tool_id"],
+            "function_name": fn["function_name"],
+        })
+    binding = {"available_tools": binding_tools}
+    stale_entry = {
+        "path": "scripts/main.py",
+        "runtime_contract": {
+            "tool_binding_summary": {
+                "available_tools": [{
+                    "tool_id": "script_argv_guard",
+                    "capability_name": "script_argv_guard",
+                    "function_name": "strict_json_argv_guard",
+                }]
+            }
+        },
+    }
+    synced = api._with_current_skill_tool_binding(stale_entry, binding)
+    entry = _entry(runtime_contract=synced["runtime_contract"])
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object"},
+    )
+
+    assert [tool["tool_id"] for tool in payload["available_tools"]] == [
+        *[tool["tool_id"] for tool in binding_tools],
+        "script_argv_guard",
+    ]
+    assert len(payload["resolved_tools"]) == len(payload["available_tools"])
+    assert len(payload["tool_function_cards"]) > 1
+    for tool in payload["resolved_tools"]:
+        assert tool.get("import_path")
+        assert tool.get("function_name")
+        assert tool.get("signature")
+    assert set(payload["current_file_tool_binding"]["allowed_import_paths"]) == {tool["import_path"] for tool in payload["resolved_tools"]}
+    assert stale_entry["runtime_contract"]["tool_binding_summary"]["available_tools"][0]["tool_id"] == "script_argv_guard"

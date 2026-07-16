@@ -317,3 +317,27 @@ def test_tool_readiness_blockers_are_judge_observations_not_producer_failures():
     assert '_file_done_error_sse' not in observation_block
     assert 'error_type="tool_not_ready"' not in observation_block
     assert '"tool_readiness_observations": list(tool_readiness_observations)' in judge_block
+
+
+def test_initial_skill_binding_syncs_before_generate_prompt_build():
+    source = inspect.getsource(api.generate_file)
+    binding_created = source.index('current_skill_binding_payload = current_skill_binding.model_dump(mode="json")')
+    entry_sync = source.index('effective_skill_plan_entry = _with_current_skill_tool_binding', binding_created)
+    prompt_build = source.index('_build_generate_file_prompt(', entry_sync)
+    assert binding_created < entry_sync < prompt_build
+
+
+def test_refreshed_binding_syncs_entry_before_context_guard_and_repair():
+    source = inspect.getsource(api.generate_file)
+    refresh_start = source.index('refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)')
+    refresh_end = source.index('except Exception as planning_exc', refresh_start)
+    refresh_block = source[refresh_start:refresh_end]
+    binding_refresh = 'current_skill_binding_payload = refreshed_binding.model_dump(mode="json")'
+    entry_sync = 'effective_skill_plan_entry = _with_current_skill_tool_binding'
+    context_refresh = 'function_execution_context = _build_current_function_execution_context()'
+    guard_refresh = 'last_import_guard_result = guard_runtime_imports('
+    repair_start = source.index('repair_tool_pool_summary = {}', refresh_end)
+    assert refresh_block.index(binding_refresh) < refresh_block.index(entry_sync)
+    assert refresh_block.index(entry_sync) < refresh_block.index(context_refresh)
+    assert refresh_block.index(context_refresh) < refresh_block.index(guard_refresh)
+    assert refresh_end < repair_start

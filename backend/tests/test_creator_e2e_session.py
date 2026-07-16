@@ -1,4 +1,5 @@
 from pathlib import Path
+import inspect
 import json
 from types import SimpleNamespace
 import subprocess
@@ -724,3 +725,53 @@ def test_final_step_json_without_platform_terminal_fields_still_passes(tmp_path,
     session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
 
     assert e2e._run_skill_workflow_e2e_once("demo", source_skill_dir=skill_dir, e2e_session=session) == []
+
+
+def test_e2e_repair_source_allows_read_only_callable_facts_only_for_import_failures():
+    source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
+    assert "read_only_callable_context" in source
+    assert "read_only=true" in source
+    assert "binding_digest" in source
+    assert "resolved_tools" in source
+    assert "import_path" in source
+    assert "signature" in source
+    assert "不是新的工具选择建议" in source
+
+
+def test_e2e_repair_source_keeps_argv_failures_without_callable_context_gate():
+    from backend.services.creator import api
+    assert api._is_callable_runtime_failure({"stderr": "ImportError: cannot import name X from Y"}) is True
+    assert api._is_callable_runtime_failure({"actual": "TypeError: f() got an unexpected keyword"}) is True
+    assert api._is_callable_runtime_failure({"actual": "argv_schema_error"}) is False
+    assert api._is_callable_runtime_failure({"actual": "stdout_contract"}) is False
+
+
+def test_e2e_repair_source_forbids_tool_exploration_and_pool_patch():
+    source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
+    assert "allow_tool_explore=False" in source
+    assert "不得请求工具探索或 tool_pool_patch" in source
+    assert "_recall_creator_tool_candidates" not in source
+    assert "_plan_tool_pool_patch_from_responsibility_feedback" not in source
+    assert "gate_tool_request" not in source
+    assert "build_tool_pool" not in source
+    assert "save_tool_pool" not in source
+
+
+def test_e2e_repair_source_forbids_mock_placeholder_fixed_text_and_fake_path():
+    source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
+    assert "mock" in source
+    assert "placeholder" in source
+    assert "fixed text" in source
+    assert "fake path" in source
+    assert "不要伪造实现" in source
+
+
+def test_e2e_callable_context_builder_is_read_only_and_does_not_save_tool_pool():
+    from backend.services.creator import api
+    source = inspect.getsource(api._build_e2e_callable_repair_context)
+    assert "load_tool_pool" in source
+    assert "get_skill_tool_binding" in source
+    assert "build_available_tool_context" in source
+    assert '"read_only": True' in source
+    assert "save_tool_pool" not in source
+    assert "tool_pool_patch" not in source

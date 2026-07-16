@@ -49,10 +49,14 @@ def test_script_local_contract_merges_structured_tool_binding_with_explicit_valu
             raw_capability_hints=["custom_lookup"],
             runtime_contract={
                 "tool_binding_summary": {
-                    "primary_tool_ids": ["explicit.primary"],
-                    "allowed_import_paths": ["explicit.path"],
-                    "allowed_function_imports": ["explicit_fn"],
-                    "allowed_helper_imports": ["explicit_helper"],
+                    "primary_tool_ids": ["custom_lookup"],
+                    "available_tools": [{
+                        "tool_id": "custom_lookup",
+                        "function_name": "lookup_value",
+                        "import_path": "backend.services.runtime_tools.custom_tools.lookup",
+                        "input_schema": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+                        "output_schema": {"type": "object", "required": ["source_value"], "properties": {"source_value": {"type": "string"}}},
+                    }],
                     "dependencies": ["explicit_dep"],
                 }
             },
@@ -65,17 +69,17 @@ def test_script_local_contract_merges_structured_tool_binding_with_explicit_valu
         )
 
         binding = payload["current_file_tool_binding"]
-        assert binding["primary_tool_ids"] == ["explicit.primary", "custom_lookup.lookup_value", "script_argv_guard"]
-        assert binding["allowed_import_paths"] == ["explicit.path", "backend.services.runtime_tools.custom_tools.lookup"]
+        assert binding["primary_tool_ids"] == ["custom_lookup", "script_argv_guard"]
+        assert binding["allowed_import_paths"] == ["backend.services.runtime_tools.custom_tools.lookup", "backend.services.runtime_tools"]
         assert binding["allowed_function_imports"] == [
-            "explicit_fn",
             "lookup_value",
             "backend.services.runtime_tools.custom_tools.lookup.lookup_value",
+            "strict_json_argv_guard",
+            "backend.services.runtime_tools.strict_json_argv_guard",
         ]
-        assert binding["dependencies"] == ["explicit_dep", "rich"]
-        assert payload["allowed_helper_imports"] == ["explicit_helper", "strict_json_argv_guard"]
-        assert payload["available_tools"] == payload["implementation_resolution"]["available_tools"]
-        assert "backend.services.runtime_tools.custom_tools.lookup.lookup_value" in payload["implementation_resolution"]["allowed_imports"]
+        assert binding["dependencies"] == ["explicit_dep"]
+        assert payload["allowed_helper_imports"] == ["lookup_value", "strict_json_argv_guard"]
+        assert payload["available_tools"] == binding["available_tools"]
     finally:
         clear_registered_tool_capabilities()
 
@@ -101,7 +105,18 @@ def test_script_local_contract_autofills_runtime_helper_and_argv_guard_when_bind
     try:
         entry = _entry(
             raw_capability_hints=["runtime_lookup"],
-            runtime_contract={"tool_binding_summary": {"allowed_helper_imports": []}},
+            runtime_contract={
+                "tool_binding_summary": {
+                    "primary_tool_ids": ["runtime_lookup"],
+                    "available_tools": [{
+                        "tool_id": "runtime_lookup",
+                        "function_name": "lookup_value",
+                        "import_path": "backend.services.runtime_tools",
+                        "input_schema": {"type": "object"},
+                        "output_schema": {"type": "object"},
+                    }]
+                }
+            },
         )
         payload = _script_local_contract_payload(
             file_path="scripts/main.py",
@@ -113,8 +128,13 @@ def test_script_local_contract_autofills_runtime_helper_and_argv_guard_when_bind
         binding = payload["current_file_tool_binding"]
         assert binding["allowed_helper_imports"] == ["lookup_value", "strict_json_argv_guard"]
         assert binding["allowed_import_paths"] == ["backend.services.runtime_tools"]
-        assert binding["allowed_function_imports"] == ["lookup_value", "backend.services.runtime_tools.lookup_value"]
-        assert "runtime_lookup.lookup_value" in binding["primary_tool_ids"]
+        assert binding["allowed_function_imports"] == [
+            "lookup_value",
+            "backend.services.runtime_tools.lookup_value",
+            "strict_json_argv_guard",
+            "backend.services.runtime_tools.strict_json_argv_guard",
+        ]
+        assert "runtime_lookup" in binding["primary_tool_ids"]
         assert "script_argv_guard" in binding["primary_tool_ids"]
     finally:
         clear_registered_tool_capabilities()

@@ -47,7 +47,7 @@ def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolF
                         missing.append(name)
                     elif (module, name) not in allowed_imports:
                         observed_unbound.append(f'{module}.{name}')
-            elif module.startswith(_CUSTOM_PREFIX) or module in allowed_modules:
+            elif module.startswith(_CUSTOM_PREFIX) or module.startswith('backend.services.') or module in allowed_modules:
                 for alias in node.names:
                     if alias.name == '*':
                         custom_wildcard.append(module)
@@ -58,7 +58,7 @@ def guard_runtime_imports(source: str, target_file: str, file_binding: ToolPoolF
                 name = alias.name
                 if name == _RUNTIME_PREFIX:
                     runtime_aliases.add(alias.asname or name.split('.')[-1])
-                if name.startswith(_CUSTOM_PREFIX) and name not in allowed_modules:
+                if (name.startswith(_CUSTOM_PREFIX) or name.startswith('backend.services.')) and name not in allowed_modules:
                     observed_unbound.append(name)
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == '__import__':

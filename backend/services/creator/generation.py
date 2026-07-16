@@ -748,6 +748,53 @@ def _script_responsibility_requirements_payload(
 
     return payload
 
+
+
+def _tool_function_card_from_available_tool(tool: dict[str, Any]) -> str:
+    function_name = str(tool.get("function_name") or "").strip()
+    import_path = str(tool.get("import_path") or "").strip()
+    tool_id = str(tool.get("tool_id") or "").strip()
+    return "\n".join([
+        f"Tool: {tool_id}",
+        f"Function: {function_name}",
+        f"Import: from {import_path} import {function_name}",
+        "Input schema:",
+        json.dumps(tool.get("input_schema") or {}, ensure_ascii=False, sort_keys=True),
+        "Output schema:",
+        json.dumps(tool.get("output_schema") or {}, ensure_ascii=False, sort_keys=True),
+        "Return contract:",
+        str(tool.get("return_contract") or "Returns a JSON-serializable value matching output_schema."),
+        "Example call:",
+        str(tool.get("call_template") or f"from {import_path} import {function_name}\nresult = {function_name}(...)").strip(),
+        "Runtime: python_script",
+    ])
+
+
+def _filter_snippets_to_available_callables(
+    snippets: list[dict[str, Any]],
+    available_tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    callable_names = {
+        str(tool.get("function_name") or "").strip()
+        for tool in available_tools
+        if isinstance(tool, dict) and str(tool.get("function_name") or "").strip()
+    }
+    if not callable_names:
+        return []
+    out: list[dict[str, Any]] = []
+    for snippet in snippets or []:
+        if not isinstance(snippet, dict):
+            continue
+        searchable = "\n".join(
+            str(snippet.get(key) or "")
+            for key in ("formatted", "code", "description", "title", "return_rule")
+        )
+        searchable += "\n" + json.dumps(snippet.get("applies_to") or {}, ensure_ascii=False, sort_keys=True)
+        searchable += "\n" + json.dumps(snippet.get("requires") or [], ensure_ascii=False, sort_keys=True)
+        if any(name in searchable for name in callable_names):
+            out.append(snippet)
+    return out
+
 def _available_tool_cards_from_binding(
     binding: dict[str, Any],
 ) -> tuple[
@@ -788,10 +835,7 @@ def _available_tool_cards_from_binding(
                 continue
             capability_name = str(item.get("capability_name") or tool_id.split(".", 1)[0]).strip()
             selected_tool_names.append(capability_name)
-            capability = get_tool_capability(capability_name)
-            if capability is not None:
-                tool_function_cards.extend(function_cards_for_tool(capability))
-            available_tools.append({
+            normalized_tool = {
                 **item,
                 "tool_id": tool_id,
                 "capability_name": capability_name,
@@ -800,7 +844,13 @@ def _available_tool_cards_from_binding(
                 "input_schema": item.get("input_schema") or {},
                 "output_schema": item.get("output_schema") or {},
                 "call_template": item.get("call_template") or f"from {import_path} import {function_name}\nresult = {function_name}(...)",
-            })
+            }
+            available_tools.append(normalized_tool)
+            tool_function_cards.append(
+                _tool_function_card_from_available_tool(
+                    normalized_tool
+                )
+            )
         return (available_tools, tool_function_cards, selected_tool_names)
 
     contracts = tool_contracts_from_binding(
@@ -1154,7 +1204,7 @@ def _script_local_contract_payload(
         is not None
     ]
 
-    tool_snippets = (
+    tool_snippets = _filter_snippets_to_available_callables(
         resolve_tool_snippets_for_context(
             role=plan_entry.role or "",
             capabilities=list(
@@ -1169,8 +1219,11 @@ def _script_local_contract_payload(
             ),
             file_path=file_path,
             max_snippets=8,
-        )
+        ),
+        available_tools,
     )
+
+    tool_binding_summary["available_tools"] = available_tools
 
     return {
         "file_path": file_path,

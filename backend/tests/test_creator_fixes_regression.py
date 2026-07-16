@@ -92,17 +92,18 @@ def test_extract_missing_stdlib_third_party_still_surfaced():
 
 
 # ---------------------------------------------------------------------------
-# Fix 5: runtime_import_guard diagnostic mode (no binding → report unbound helpers)
+# Fix 5: runtime_import_guard uses available_tools as the import authority
 # ---------------------------------------------------------------------------
 
 def test_import_guard_no_binding_reports_runtime_helper():
-    """With file_binding=None, importing a runtime_tools helper is diagnostic, not hard-denied."""
+    """With file_binding=None, importing a runtime_tools helper is rejected as outside available_tools."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import read_file_text\n"
     result = guard_runtime_imports(src, "scripts/a.py", None)
-    assert result.success
-    assert "read_file_text" in result.forbidden_imports
+    assert not result.success
+    assert result.error_type == "generated_tool_import_not_in_available_tools"
+    assert "backend.services.runtime_tools.read_file_text" in result.forbidden_imports
 
 
 def test_import_guard_no_binding_allows_stdlib_only():
@@ -114,14 +115,15 @@ def test_import_guard_no_binding_allows_stdlib_only():
     assert result.success
 
 
-def test_import_guard_empty_binding_reports_unbound_helper():
-    """An explicit empty binding reports unbound helpers without hard-failing business semantics."""
+def test_import_guard_empty_available_tools_rejects_unbound_helper():
+    """An explicit empty available_tools pool rejects unbound helpers."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import extract_pdf_text\n"
-    result = guard_runtime_imports(src, "scripts/a.py", {"allowed_helper_imports": []})
-    assert result.success
-    assert "extract_pdf_text" in result.forbidden_imports
+    result = guard_runtime_imports(src, "scripts/a.py", {"available_tools": []})
+    assert not result.success
+    assert result.error_type == "generated_tool_import_not_in_available_tools"
+    assert "backend.services.runtime_tools.extract_pdf_text" in result.forbidden_imports
 
 
 # ---------------------------------------------------------------------------
@@ -298,22 +300,31 @@ def test_build_tool_pool_gate_is_file_role_independent():
 
 
 # ---------------------------------------------------------------------------
-# Fix 6b: Script importing unbound helper is diagnosed by import guard
+# Fix 6b: Script importing a helper outside available_tools is rejected by import guard
 # ---------------------------------------------------------------------------
 
-def test_import_guard_reports_unregistered_runtime_helper():
-    """A script importing a helper not in allowed_helper_imports is reported for the semantic judge."""
+def test_import_guard_rejects_helper_outside_available_tools():
+    """A script importing a helper not in available_tools is rejected deterministically."""
     from backend.services.creator.runtime_import_guard import guard_runtime_imports
 
     src = "from backend.services.runtime_tools import extract_pdf_text\n"
-    # allowed list does NOT include extract_pdf_text
+    # available_tools does NOT include extract_pdf_text
     result = guard_runtime_imports(
         src,
         "scripts/test.py",
-        {"allowed_helper_imports": ["read_file_text"]},
+        {
+            "available_tools": [{
+                "tool_id": "file_reader",
+                "function_name": "read_file_text",
+                "import_path": "backend.services.runtime_tools",
+                "input_schema": {},
+                "output_schema": {},
+            }]
+        },
     )
-    assert result.success
-    assert "extract_pdf_text" in result.forbidden_imports
+    assert not result.success
+    assert result.error_type == "generated_tool_import_not_in_available_tools"
+    assert "backend.services.runtime_tools.extract_pdf_text" in result.forbidden_imports
 
 
 # ---------------------------------------------------------------------------

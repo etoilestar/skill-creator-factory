@@ -1,6 +1,7 @@
 """Creator FastAPI endpoint handlers and response assembly."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -63,6 +64,117 @@ def _tool_binding_digest(binding: dict[str, Any]) -> str:
         json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()[:12]
 
+
+
+
+def _with_current_skill_tool_binding(
+    entry: dict[str, Any] | None,
+    binding: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = copy.deepcopy(entry if isinstance(entry, dict) else {})
+    binding_payload = copy.deepcopy(binding if isinstance(binding, dict) else {})
+    runtime_contract = (
+        result.get("runtime_contract")
+        if isinstance(result.get("runtime_contract"), dict)
+        else {}
+    )
+    runtime_contract = copy.deepcopy(runtime_contract)
+    runtime_contract["tool_binding_summary"] = binding_payload
+    result["runtime_contract"] = runtime_contract
+    result["tool_binding_summary"] = copy.deepcopy(binding_payload)
+    return result
+
+
+def _build_e2e_callable_repair_context(
+    *,
+    skill_name: str,
+    target_file: str,
+) -> dict[str, Any]:
+    pool = load_tool_pool(settings.skills_path / skill_name)
+    binding = get_skill_tool_binding(
+        pool,
+        target_file=target_file,
+        include_script_core=True,
+    ).model_dump(mode="json")
+    context = build_available_tool_context(
+        binding,
+        file_path=target_file,
+        max_snippets=0,
+    )
+    if not context.get("resolved_tools"):
+        return {}
+
+    compact_tools = []
+    for tool in context.get("resolved_tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        compact_tools.append({
+            "tool_id": tool.get("tool_id"),
+            "capability_name": tool.get("capability_name"),
+            "function_name": tool.get("function_name"),
+            "import_path": tool.get("import_path"),
+            "signature": tool.get("signature"),
+            "input_schema": tool.get("input_schema"),
+            "output_schema": tool.get("output_schema"),
+            "return_contract": tool.get("return_contract"),
+            "example_call": tool.get("call_template"),
+            "common_mistakes": tool.get("common_mistakes"),
+        })
+    return {
+        "authorization_scope": "skill",
+        "read_only": True,
+        "binding_digest": _tool_binding_digest(binding),
+        "available_tools": context.get("available_tools") or [],
+        "resolved_tools": compact_tools,
+    }
+
+
+def _is_callable_runtime_failure(
+    structured_failure: dict[str, Any],
+    callable_context: dict[str, Any] | None = None,
+) -> bool:
+    stderr = str(structured_failure.get("stderr") or "")
+    actual = str(structured_failure.get("actual") or "")
+    text = f"{stderr}\n{actual}"
+
+    if re.search(
+        (
+            r"\bImportError\b|"
+            r"\bModuleNotFoundError\b|"
+            r"cannot import name"
+        ),
+        text,
+    ):
+        return True
+
+    if not re.search(r"\bNameError\b|\bTypeError\b", text):
+        return False
+
+    resolved_tools = (
+        callable_context.get("resolved_tools")
+        if isinstance(callable_context, dict)
+        else []
+    ) or []
+
+    callable_tokens: set[str] = set()
+    for tool in resolved_tools:
+        if not isinstance(tool, dict):
+            continue
+
+        function_name = str(tool.get("function_name") or "").strip()
+        import_path = str(tool.get("import_path") or "").strip()
+
+        if function_name:
+            callable_tokens.add(function_name)
+
+        if import_path:
+            callable_tokens.add(import_path)
+            callable_tokens.add(import_path.rsplit(".", 1)[-1])
+
+    return any(
+        token and re.search(rf"\b{re.escape(token)}\b", text)
+        for token in callable_tokens
+    )
 
 def _tool_binding_log_summary(binding: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -12548,6 +12660,10 @@ async def generate_file(request: GenerateFileRequest):
 
                 effective_skill_plan_entry.setdefault("path", request.file_path)
                 effective_skill_plan_entry.setdefault("purpose", request.purpose)
+                effective_skill_plan_entry = _with_current_skill_tool_binding(
+                    effective_skill_plan_entry,
+                    current_skill_binding_payload,
+                )
                 _, tool_blockers = _creator_tool_readiness_blockers(
                     effective_skill_plan_entry
                 )
@@ -13485,6 +13601,10 @@ async def generate_file(request: GenerateFileRequest):
                                     )
                                     current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")
                                     current_skill_binding_payload = refreshed_binding.model_dump(mode="json")
+                                    effective_skill_plan_entry = _with_current_skill_tool_binding(
+                                        effective_skill_plan_entry,
+                                        current_skill_binding_payload,
+                                    )
                                     function_execution_context = _build_current_function_execution_context()
                                     try:
                                         last_import_guard_result = guard_runtime_imports(
@@ -14050,6 +14170,29 @@ async def validate_skill(request: SkillActionRequest):
             )
         try:
             attempts_by_target[target_path] = attempts_by_target.get(target_path, 0) + 1
+            e2e_callable_repair_context: dict[str, Any] | None = None
+            if target_path.startswith("scripts/"):
+                try:
+                    structured_e2e_failure = _structured_failure_from_errors(blocking_errors)
+                    candidate_callable_context = _build_e2e_callable_repair_context(
+                        skill_name=skill_name,
+                        target_file=target_path,
+                    )
+                    if (
+                        candidate_callable_context
+                        and _is_callable_runtime_failure(
+                            structured_e2e_failure,
+                            candidate_callable_context,
+                        )
+                    ):
+                        e2e_callable_repair_context = candidate_callable_context
+                except Exception as callable_context_exc:
+                    logger.warning(
+                        "[Creator][E2E] callable repair context unavailable skill=%s file=%s error=%s",
+                        skill_name,
+                        target_path,
+                        callable_context_exc,
+                    )
             repair_result = await _repair_existing_file_for_e2e_failure(
                 skill_name=skill_name,
                 target_path=target_path,
@@ -14058,6 +14201,7 @@ async def validate_skill(request: SkillActionRequest):
                 external_context=external_context,
                 repair_events=repair_events,
                 e2e_session=e2e_session,
+                read_only_callable_context=e2e_callable_repair_context,
             )
             attempt += 1
             status = repair_result.get("status")

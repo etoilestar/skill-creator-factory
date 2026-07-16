@@ -242,9 +242,12 @@ def test_markdown_format_failures_use_full_rewrite_not_region_rewrite_in_main_pa
     import inspect
     source = inspect.getsource(generate_file)
     marker = 'prompt_variant="rewrite_markdown_full_format"'
-    start = source.rindex("if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):", 0, source.index(marker))
-    end = source.index("continue", source.index(marker))
+    marker_pos = source.index(marker)
+    start = source.rindex('request.file_path != "SKILL.md"', 0, marker_pos)
+    end = source.index("continue", marker_pos)
     block = source[start:end]
+    assert 'request.file_path != "SKILL.md"' in block
+    assert "_is_markdown_creator_file(request.file_path)" in block
     assert "format_full_rewrite" in block
     assert "_build_markdown_format_full_rewrite_prompt" in block
     assert "format_region_rewrite" not in block
@@ -520,16 +523,16 @@ def test_is_python_function_item_target_single_implementation_source():
     assert inspect.getsourcefile(common_module.is_python_function_item_target) == inspect.getsourcefile(skill_plan_module.is_python_function_item_target)
 
 
-def test_initial_function_execution_context_prefers_real_toolpool_binding():
+def test_initial_function_execution_context_uses_current_skill_binding_payload():
     import inspect
     source = inspect.getsource(generate_file)
     helper_start = source.index("def _build_current_function_execution_context")
     helper_end = source.index("function_execution_context: dict[str, Any] | None = _build_current_function_execution_context()", helper_start)
     helper_source = source[helper_start:helper_end]
-    assert "load_tool_pool(settings.skills_path / skill_name)" in helper_source
-    assert "get_file_binding(context_tool_pool, request.file_path)" in helper_source
-    assert helper_source.index("load_tool_pool(settings.skills_path / skill_name)") < helper_source.index("runtime_contract")
-    assert helper_source.index("get_file_binding(context_tool_pool, request.file_path)") < helper_source.index("effective_skill_plan_entry.get(\"tool_binding_summary\")")
+    assert "context_binding: dict[str, Any] = dict(current_skill_binding_payload)" in helper_source
+    assert "current_file_tool_binding=context_binding" in helper_source
+    assert "load_tool_pool(settings.skills_path / skill_name)" not in helper_source
+    assert "get_file_binding(context_tool_pool, request.file_path)" not in helper_source
 
 
 def test_toolpool_augmentation_rebuilds_function_execution_context_immediately():

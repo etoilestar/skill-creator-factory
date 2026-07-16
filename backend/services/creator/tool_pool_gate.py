@@ -34,6 +34,10 @@ def _check_function_imports(cap: Any) -> tuple[list[str], list[str], list[str], 
         import_path=str(getattr(fn,'import_path','') or '').strip()
         function_name=str(getattr(fn,'function_name','') or '').strip()
         if not import_path or not function_name:
+            messages.append(
+                'tool function manifest requires both '
+                'import_path and function_name'
+            )
             continue
         checked_paths.append(import_path); checked_functions.append(function_name)
         if import_path == 'backend.services.runtime_tools':
@@ -159,8 +163,11 @@ def gate_tool_request(
     )
 
     if (
-        has_manifest_functions
-        and not allowed_function_imports
+        import_messages
+        or (
+            has_manifest_functions
+            and not allowed_function_imports
+        )
     ):
         return ToolPoolGateEvent(
             decision="deny",

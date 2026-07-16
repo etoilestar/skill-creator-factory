@@ -87,7 +87,11 @@ def test_generation_prompt_includes_available_tool_import_path_and_function_name
     }
     messages = _build_script_generate_file_prompt_variant(file_path='scripts/a.py', skill_name='x', purpose='把 PDF 转成 Markdown，保留结构', blueprint_text='', role='generic_script', skill_plan_entry=entry, variant='standard')
     text = '\n'.join(str(m.get('content') or '') for m in messages)
-    assert 'available_tools' in text
+    assert (
+        '"available_tools"' in text
+        and '"function_name"' in text
+        and '"import_path"' in text
+    )
     assert 'backend.services.runtime_tools.custom_tools.pdf_to_md_mineru' in text
     assert 'pdf_to_md_mineru' in text
 
@@ -231,6 +235,109 @@ def test_custom_registry_function_manifest_still_gates_stores_and_resolves():
             item.get("capability_name") == "custom_pdf_to_md"
             and item.get("function_name") == "pdf_to_md_mineru"
             for item in context.get("resolved_tools", [])
+        )
+    finally:
+        clear_registered_tool_capabilities()
+
+
+def test_gate_rejects_capability_with_partially_invalid_manifests():
+    from backend.services.creator.tool_pool_gate import gate_tool_request
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        ToolFunctionManifest,
+        clear_registered_tool_capabilities,
+        register_tool_capability,
+    )
+
+    clear_registered_tool_capabilities()
+    try:
+        register_tool_capability(
+            ToolCapability(
+                name="mixed_manifest_tool",
+                display_name="Mixed Manifest Tool",
+                category="registered",
+                functions=[
+                    ToolFunctionManifest(
+                        function_name="pdf_to_md_mineru",
+                        import_path=(
+                            "backend.services.runtime_tools."
+                            "custom_tools.pdf_to_md_mineru"
+                        ),
+                        short_description="Valid function.",
+                        when_to_use="Use for testing.",
+                        signature=(
+                            "pdf_to_md_mineru("
+                            "input_path: str"
+                            ") -> dict"
+                        ),
+                    ),
+                    ToolFunctionManifest(
+                        function_name="missing_function",
+                        import_path=(
+                            "backend.services.runtime_tools."
+                            "custom_tools.pdf_to_md_mineru"
+                        ),
+                        short_description="Invalid function.",
+                        when_to_use="Use for testing.",
+                        signature="missing_function() -> dict",
+                    ),
+                ],
+            )
+        )
+
+        event = gate_tool_request({
+            "candidate_tool_id": "mixed_manifest_tool",
+        })
+
+        assert event.decision == "deny"
+        assert any(
+            "function not found in import_path" in message
+            for message in event.messages
+        )
+    finally:
+        clear_registered_tool_capabilities()
+
+
+def test_gate_rejects_manifest_missing_required_function_fields():
+    from backend.services.creator.tool_pool_gate import gate_tool_request
+    from backend.services.creator_tool_registry import (
+        ToolCapability,
+        ToolFunctionManifest,
+        clear_registered_tool_capabilities,
+        register_tool_capability,
+    )
+
+    clear_registered_tool_capabilities()
+    try:
+        register_tool_capability(
+            ToolCapability(
+                name="missing_manifest_fields_tool",
+                display_name="Missing Manifest Fields Tool",
+                category="registered",
+                functions=[
+                    ToolFunctionManifest(
+                        function_name="",
+                        import_path=(
+                            "backend.services.runtime_tools."
+                            "custom_tools.pdf_to_md_mineru"
+                        ),
+                        short_description="Invalid function.",
+                        when_to_use="Use for testing.",
+                        signature="missing() -> dict",
+                    )
+                ],
+            )
+        )
+
+        event = gate_tool_request({
+            "candidate_tool_id": "missing_manifest_fields_tool",
+        })
+
+        assert event.decision == "deny"
+        assert any(
+            "tool function manifest requires both import_path and function_name"
+            in message
+            for message in event.messages
         )
     finally:
         clear_registered_tool_capabilities()

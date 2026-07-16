@@ -258,25 +258,49 @@ def test_first_round_semantic_judge_tool_augmentation_flow_is_unchanged():
     assert "candidate_tool_catalog" in source
 
 
-def test_responsibility_tool_expansion_refreshes_binding_before_repair_and_guard_digest():
+def test_responsibility_tool_expansion_refreshes_binding_and_import_observation_before_repair():
     source = inspect.getsource(api.generate_file)
-    refresh_marker = '"[Creator][responsibility_tool_pool_refreshed] skill=%s file=%s summary=%s"'
-    repair_marker = '"[Creator][localized_repair_tool_pool] skill=%s file=%s summary=%s"'
+
     refresh_start = source.index('refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)')
     refresh_end = source.index('except Exception as planning_exc', refresh_start)
     refresh_block = source[refresh_start:refresh_end]
+
     repair_start = source.index('repair_tool_pool_summary = {}', refresh_end)
     repair_end = source.index('if single_block_locator is None:', repair_start)
     repair_block = source[repair_start:repair_end]
 
-    assert 'current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")' in refresh_block
-    assert 'current_skill_binding_payload = refreshed_binding.model_dump(mode="json")' in refresh_block
-    assert 'function_execution_context = _build_current_function_execution_context()' in refresh_block
-    assert refresh_marker in refresh_block
-    assert 'guard_runtime_imports(\n                            content,\n                            request.file_path,\n                            current_skill_binding_payload,' in source
+    binding_refresh = 'current_skill_binding_payload = refreshed_binding.model_dump(mode="json")'
+    context_refresh = 'function_execution_context = _build_current_function_execution_context()'
+    guard_refresh = 'last_import_guard_result = guard_runtime_imports('
+
+    assert binding_refresh in refresh_block
+    assert context_refresh in refresh_block
+    assert guard_refresh in refresh_block
+    assert 'candidate or ""' in refresh_block
+    assert 'current_skill_binding_payload' in refresh_block
+    assert refresh_block.index(binding_refresh) < refresh_block.index(guard_refresh)
+    assert refresh_block.index(context_refresh) < refresh_block.index(guard_refresh)
+    assert 'responsibility_import_observation_refreshed' in refresh_block
+
     assert 'repair_current_file_binding = dict(current_skill_binding_payload)' in repair_block
     assert 'repair_tool_pool_summary = dict(current_tool_pool_summary)' in repair_block
-    assert repair_marker in repair_block
+    assert 'repair_import_guard_result' in repair_block
+    assert 'load_tool_pool(' not in repair_block
+    assert 'guard_runtime_imports(' not in repair_block
+
+
+def test_refreshed_import_observation_failure_is_non_blocking():
+    source = inspect.getsource(api.generate_file)
+
+    refresh_start = source.index('refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)')
+    refresh_end = source.index('except Exception as planning_exc', refresh_start)
+    refresh_block = source[refresh_start:refresh_end]
+
+    assert 'except Exception as guard_exc' in refresh_block
+    assert '"success": None' in refresh_block
+    assert '"observation_error"' in refresh_block
+    assert 'raise FileGenerationStageError' not in refresh_block
+    assert '_file_done_error_sse' not in refresh_block
 
 
 def test_tool_readiness_blockers_are_judge_observations_not_producer_failures():

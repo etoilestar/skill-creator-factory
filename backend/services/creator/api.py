@@ -13486,10 +13486,42 @@ async def generate_file(request: GenerateFileRequest):
                                     current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")
                                     current_skill_binding_payload = refreshed_binding.model_dump(mode="json")
                                     function_execution_context = _build_current_function_execution_context()
+                                    try:
+                                        last_import_guard_result = guard_runtime_imports(
+                                            candidate or "",
+                                            request.file_path,
+                                            current_skill_binding_payload,
+                                        )
+                                    except Exception as guard_exc:
+                                        logger.warning(
+                                            "[Creator][responsibility_tool_observation_refresh_error] skill=%s file=%s error=%s: %s",
+                                            skill_name,
+                                            request.file_path,
+                                            type(guard_exc).__name__,
+                                            guard_exc,
+                                        )
+                                        last_import_guard_result = {
+                                            "success": None,
+                                            "observation_error": f"{type(guard_exc).__name__}: {guard_exc}",
+                                            "target_file": request.file_path,
+                                        }
+                                    normalized_refreshed_guard = (
+                                        last_import_guard_result.model_dump(mode="json")
+                                        if hasattr(last_import_guard_result, "model_dump")
+                                        else (last_import_guard_result if isinstance(last_import_guard_result, dict) else {})
+                                    )
                                     logger.info(
                                         "[Creator][responsibility_tool_pool_refreshed] skill=%s file=%s summary=%s",
                                         skill_name,
                                         request.file_path,
+                                        json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                                    )
+                                    logger.info(
+                                        "[Creator][responsibility_import_observation_refreshed] skill=%s file=%s success=%s error_type=%s summary=%s",
+                                        skill_name,
+                                        request.file_path,
+                                        normalized_refreshed_guard.get("success"),
+                                        normalized_refreshed_guard.get("error_type"),
                                         json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
                                     )
 

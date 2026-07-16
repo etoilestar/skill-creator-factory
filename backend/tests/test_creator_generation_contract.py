@@ -1,3 +1,5 @@
+import copy
+
 from backend.services.creator.generation import _script_local_contract_payload, build_available_tool_context
 from backend.services.creator_tool_registry import (
     ToolCapability,
@@ -276,3 +278,55 @@ def test_python_script_core_probe_is_visible_as_pure_index_and_resolved_from_reg
     probe = next(tool for tool in payload["resolved_tools"] if tool["function_name"] == "strict_json_argv_guard")
     assert probe["import_path"] == "backend.services.runtime_tools"
     assert "strict_json_argv_guard" in probe["signature"]
+
+
+def test_script_local_contract_runtime_contract_available_tools_uses_prompt_index_without_mutating_original():
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="lookup",
+        display_name="Lookup",
+        category="retrieval",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="lookup_value",
+            import_path="backend.services.runtime_tools.custom_tools.lookup",
+            short_description="Lookup a value.",
+            when_to_use="Use for lookup.",
+            signature="lookup_value(query: str) -> dict",
+            input_schema={"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}}},
+            output_schema={"type": "object"},
+            required_capabilities=["lookup"],
+        )],
+    ))
+    runtime_contract = {
+        "tool_binding_summary": {
+            "available_tools": [{
+                "tool_id": "lookup.lookup_value",
+                "capability_name": "lookup",
+                "function_name": "lookup_value",
+                "input_schema": {"required": ["stale"]},
+                "signature": "stale_signature()",
+            }],
+            "primary_tool_ids": ["lookup"],
+            "dependencies": ["kept-for-compat"],
+        }
+    }
+    original_runtime_contract = copy.deepcopy(runtime_contract)
+    entry = _entry(runtime_contract=runtime_contract)
+
+    payload = _script_local_contract_payload(
+        file_path="scripts/main.py",
+        purpose="test",
+        plan_entry=entry,
+        stdout_schema={"type": "object", "required": ["result"], "properties": {"result": {"type": "string"}}},
+    )
+
+    assert (
+        payload["available_tools"]
+        == payload["current_file_tool_binding"]["available_tools"]
+        == payload["runtime_contract"]["tool_binding_summary"]["available_tools"]
+    )
+    for tool in payload["available_tools"]:
+        assert set(tool) == {"tool_id", "capability_name", "function_name"}
+    assert payload["resolved_tools"][0]["input_schema"]["required"] == ["query"]
+    assert entry.runtime_contract == original_runtime_contract

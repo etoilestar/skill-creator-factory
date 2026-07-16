@@ -1118,6 +1118,8 @@ def _script_local_contract_payload(
     prompt_tool_binding_summary["allowed_import_paths"] = tool_context["allowed_import_paths"]
     prompt_tool_binding_summary["allowed_function_imports"] = tool_context["allowed_function_imports"]
     prompt_tool_binding_summary["allowed_helper_imports"] = tool_context["allowed_helper_imports"]
+    prompt_runtime_contract = dict(plan_entry.runtime_contract or {})
+    prompt_runtime_contract["tool_binding_summary"] = dict(prompt_tool_binding_summary)
 
     return {
         "file_path": file_path,
@@ -1175,8 +1177,7 @@ def _script_local_contract_payload(
             {},
         ),
         "runtime_contract": (
-            plan_entry.runtime_contract
-            or {}
+            prompt_runtime_contract
         ),
         "command_argv_contract": (
             command_argv_contract

@@ -10905,7 +10905,7 @@ async def upload_context_file(
 
 @router.post("/init-skill", response_model=InitSkillResponse)
 async def init_skill(request: InitSkillRequest):
-    """Initialise a Skill directory structure without touching ToolPool state."""
+    """Initialise a new Skill directory structure and preserve ToolPool observability."""
     skill_name = _validate_skill_name(request.skill_name)
     skill_dir = settings.skills_path / skill_name
 
@@ -10926,41 +10926,32 @@ async def init_skill(request: InitSkillRequest):
         before_digest,
     )
 
+    result = run_action({"action": "init", "name": skill_name})
+    if result.get("success"):
+        _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
+
+    after_allowed: list[str] = []
+    after_digest = ""
     try:
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        for folder in ("scripts", "references", "assets", ".creator"):
-            (skill_dir / folder).mkdir(parents=True, exist_ok=True)
-        copied_assets = _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
+        after_pool = load_tool_pool(skill_dir)
+        after_binding = get_skill_tool_binding(after_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
+        after_allowed = sorted(after_binding.get("allowed_tool_ids") or [])
+        after_digest = _tool_binding_digest(after_binding)
+    except Exception:
+        after_allowed = []
+        after_digest = "tool_pool_missing"
+    logger.info(
+        "[Creator][init_skill_after] skill=%s allowed_tool_ids=%s binding_digest=%s",
+        skill_name,
+        after_allowed,
+        after_digest,
+    )
 
-        after_allowed: list[str] = []
-        after_digest = ""
-        try:
-            after_pool = load_tool_pool(skill_dir)
-            after_binding = get_skill_tool_binding(after_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
-            after_allowed = sorted(after_binding.get("allowed_tool_ids") or [])
-            after_digest = _tool_binding_digest(after_binding)
-        except Exception:
-            after_allowed = []
-            after_digest = "tool_pool_missing"
-        logger.info(
-            "[Creator][init_skill_after] skill=%s allowed_tool_ids=%s binding_digest=%s",
-            skill_name,
-            after_allowed,
-            after_digest,
-        )
-
-        return InitSkillResponse(
-            success=True,
-            path=str(skill_dir),
-            message=f"已初始化 Skill 目录结构，复制已确认 assets {len(copied_assets)} 个；未重建或覆盖 ToolPool。",
-        )
-    except Exception as exc:
-        logger.exception("init-skill error")
-        return InitSkillResponse(
-            success=False,
-            path=None,
-            message=f"初始化失败：{exc}",
-        )
+    return InitSkillResponse(
+        success=result["success"],
+        path=result.get("path"),
+        message=result["message"],
+    )
 
 @router.post("/upload-asset", response_model=UploadAssetResponse)
 async def upload_asset(
@@ -12560,13 +12551,12 @@ async def generate_file(request: GenerateFileRequest):
                     effective_skill_plan_entry
                 )
                 if tool_blockers:
-                    yield _file_done_error_sse(
-                        file_path=request.file_path,
-                        role=request.role,
-                        error="required tools are not ready; Creator cannot hallucinate tools",
-                        error_type="tool_not_ready",
+                    logger.info(
+                        "[Creator][producer_tool_readiness_observation] skill=%s file=%s blockers=%s",
+                        skill_name,
+                        request.file_path,
+                        json.dumps(tool_blockers, ensure_ascii=False, default=str),
                     )
-                    return
             def _build_current_function_execution_context() -> dict[str, Any] | None:
                 if not request.file_path.startswith("scripts/"):
                     return None
@@ -13031,20 +13021,7 @@ async def generate_file(request: GenerateFileRequest):
 
                     rewrite_prompt_variant = "strict_compile_rewrite" if is_compile_rewrite_error else "strict_source_only_regeneration"
                     if is_compile_rewrite_error:
-                        try:
-                            rewrite_tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                            rewrite_binding_obj = get_file_binding(rewrite_tool_pool, request.file_path)
-                            rewrite_current_file_binding = (
-                                rewrite_binding_obj.model_dump(mode="json")
-                                if hasattr(rewrite_binding_obj, "model_dump")
-                                else (rewrite_binding_obj or {})
-                            )
-                            if not rewrite_current_file_binding and isinstance(effective_skill_plan_entry, dict):
-                                rewrite_current_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
-                        except Exception:
-                            rewrite_current_file_binding = (
-                                effective_skill_plan_entry.get("tool_binding_summary") if isinstance(effective_skill_plan_entry, dict) else {}
-                            ) or {}
+                        rewrite_current_file_binding = dict(current_skill_binding_payload)
                         try:
                             compile_detail = json.loads(str(stage_error.detail or "{}"))
                         except Exception:
@@ -13493,7 +13470,25 @@ async def generate_file(request: GenerateFileRequest):
                                 )
 
                                 tool_re_explore_count += 1
-                                function_execution_context = _build_current_function_execution_context()
+                                if (
+                                    int(expansion_result.get("allowed_new") or 0) > 0
+                                    or int(expansion_result.get("attached_existing") or 0) > 0
+                                ):
+                                    refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)
+                                    refreshed_binding = get_skill_tool_binding(
+                                        refreshed_tool_pool,
+                                        target_file=request.file_path,
+                                        include_script_core=True,
+                                    )
+                                    current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")
+                                    current_skill_binding_payload = refreshed_binding.model_dump(mode="json")
+                                    function_execution_context = _build_current_function_execution_context()
+                                    logger.info(
+                                        "[Creator][responsibility_tool_pool_refreshed] skill=%s file=%s summary=%s",
+                                        skill_name,
+                                        request.file_path,
+                                        json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                                    )
 
                             except Exception as planning_exc:
                                 logger.warning(

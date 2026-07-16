@@ -562,14 +562,14 @@ def _write_trial_script(tmp_path: Path, script: str, command_payload: dict | Non
     script_path.write_text(script, encoding="utf-8")
     payload = command_payload if command_payload is not None else {"user_request": "hello"}
     raw_payload = json.dumps(payload, ensure_ascii=False)
-    skill_md = f"# Demo\n```bash\npython scripts/run.py '{raw_payload}'\n```\n"
+    skill_md = f"---\nname: demo\ndescription: Demo skill\n---\n# Demo\n```bash\npython scripts/run.py '{raw_payload}'\n```\n"
     (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
     command = E2EWorkflowCommand(1, "SKILL.md", "scripts/run.py", f"python scripts/run.py '{raw_payload}'", "python", payload)
     return skill_dir, command, skill_md, payload
 
 
 def _generic_python_entry(**kwargs):
-    return SimpleNamespace(runtime="python", language="python", role="generic_script", path=kwargs.get("file_path", "scripts/run.py"), inputs=["user_request"], outputs=["text"], required_capabilities=[], runtime_contract={"stdout": ["text"]}, artifact_contract={}, artifacts=[])
+    return SimpleNamespace(runtime="python", language="python", role="generic_script", file_type="script", file_kind="script", path=kwargs.get("file_path", "scripts/run.py"), inputs=["user_request"], outputs=["text"], dependencies=[], required_capabilities=[], runtime_contract={"stdout": ["text"]}, artifact_contract={}, artifacts=[])
 
 
 def _parse_trial_stdout(command, skill_dir, skill_md, script, entry, payload, proc):
@@ -727,26 +727,119 @@ def test_final_step_json_without_platform_terminal_fields_still_passes(tmp_path,
     assert e2e._run_skill_workflow_e2e_once("demo", source_skill_dir=skill_dir, e2e_session=session) == []
 
 
-def test_e2e_repair_source_allows_read_only_callable_facts_only_for_import_failures():
-    source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
-    assert "read_only_callable_context" in source
-    assert "read_only=true" in source
-    assert "binding_digest" in source
-    assert "resolved_tools" in source
-    assert "import_path" in source
-    assert "signature" in source
-    assert "不是新的工具选择建议" in source
+
+def _callable_context(function_name: str = "real_callable_name"):
+    return {
+        "authorization_scope": "skill",
+        "read_only": True,
+        "binding_digest": "digest123",
+        "available_tools": [{
+            "tool_id": f"fixture_tool.{function_name}",
+            "capability_name": "fixture_tool",
+            "function_name": function_name,
+        }],
+        "resolved_tools": [{
+            "tool_id": f"fixture_tool.{function_name}",
+            "capability_name": "fixture_tool",
+            "function_name": function_name,
+            "import_path": "tests.fixtures.creator_tools",
+            "signature": f"{function_name}(text: str) -> dict",
+            "return_contract": {"type": "object"},
+        }],
+    }
 
 
-def test_e2e_repair_source_keeps_argv_failures_without_callable_context_gate():
+def test_e2e_missing_import_runs_real_subprocess_without_import_guard_failure(tmp_path, monkeypatch):
+    script = "from definitely_missing_creator_package import run\nrun()\n"
+    skill_dir, _command, _skill_md, _payload = _write_trial_script(tmp_path, script)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+
+    errors = e2e._run_skill_workflow_e2e_once("trial-skill", source_skill_dir=skill_dir)
+
+    joined = "\n".join(errors)
+    assert "ModuleNotFoundError" in joined
+    assert "script_exit" in joined or "return_code" in joined
+    assert "runtime_import_guard_failed" not in joined
+
+
+@pytest.mark.asyncio
+async def test_import_error_repair_prompt_receives_read_only_callable_context(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text("print('before')\n", encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", _generic_python_entry)
+
+    captured = {}
+
+    async def fake_patch(**kwargs):
+        captured["task_context"] = kwargs["task_context"]
+        return None, "print('after')\n", {"changed_line_count": 1, "applied": [{"fallback_type": "test"}]}
+
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", fake_patch)
+    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", lambda **kwargs: {"accepted": True, "errors": []})
+
+    context = _callable_context()
+    failure = {"stderr": "ImportError: cannot import name X from Y"}
     from backend.services.creator import api
-    assert api._is_callable_runtime_failure({"stderr": "ImportError: cannot import name X from Y"}) is True
-    assert api._is_callable_runtime_failure({"actual": "TypeError: f() got an unexpected keyword"}) is True
-    assert api._is_callable_runtime_failure({"actual": "argv_schema_error"}) is False
-    assert api._is_callable_runtime_failure({"actual": "stdout_contract"}) is False
+    assert api._is_callable_runtime_failure(failure, context) is True
+
+    result = await e2e._repair_existing_file_for_e2e_failure(
+        skill_name="demo",
+        target_path="scripts/one.py",
+        e2e_errors=["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\nImportError: cannot import name X from Y"],
+        read_only_callable_context=context,
+    )
+
+    assert result["status"] == "repaired"
+    prompt = captured["task_context"]
+    assert "read_only=true" in prompt
+    assert "binding_digest" in prompt
+    assert "resolved_tools" in prompt
+    assert "tests.fixtures.creator_tools" in prompt
+    assert "real_callable_name(text: str) -> dict" in prompt
 
 
-def test_e2e_repair_source_forbids_tool_exploration_and_pool_patch():
+def test_callable_runtime_failure_filters_business_type_errors_and_tool_type_errors():
+    from backend.services.creator import api
+    context = _callable_context()
+
+    assert api._is_callable_runtime_failure(
+        {"stderr": "TypeError: unsupported operand type(s) for +: 'int' and 'str'"},
+        context,
+    ) is False
+    assert api._is_callable_runtime_failure(
+        {"stderr": "TypeError: real_callable_name() got an unexpected keyword argument 'bad'"},
+        context,
+    ) is True
+
+
+def test_callable_runtime_failure_filters_local_name_errors_and_tool_name_errors():
+    from backend.services.creator import api
+    context = _callable_context()
+
+    assert api._is_callable_runtime_failure(
+        {"stderr": "NameError: name 'local_result' is not defined"},
+        context,
+    ) is False
+    assert api._is_callable_runtime_failure(
+        {"stderr": "NameError: name 'real_callable_name' is not defined"},
+        context,
+    ) is True
+
+
+def test_e2e_callable_context_builder_is_read_only_and_empty_context_is_not_callable_failure():
+    from backend.services.creator import api
+
+    assert api._is_callable_runtime_failure(
+        {"stderr": "TypeError: whatever() got an unexpected keyword argument"},
+        {"resolved_tools": []},
+    ) is False
+
+
+def test_e2e_repair_source_forbids_tool_exploration_and_mock_fallbacks():
     source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
     assert "allow_tool_explore=False" in source
     assert "不得请求工具探索或 tool_pool_patch" in source
@@ -755,23 +848,37 @@ def test_e2e_repair_source_forbids_tool_exploration_and_pool_patch():
     assert "gate_tool_request" not in source
     assert "build_tool_pool" not in source
     assert "save_tool_pool" not in source
-
-
-def test_e2e_repair_source_forbids_mock_placeholder_fixed_text_and_fake_path():
-    source = inspect.getsource(e2e._repair_existing_file_for_e2e_failure)
     assert "mock" in source
     assert "placeholder" in source
     assert "fixed text" in source
     assert "fake path" in source
-    assert "不要伪造实现" in source
 
 
-def test_e2e_callable_context_builder_is_read_only_and_does_not_save_tool_pool():
+def test_e2e_repair_does_not_mutate_toolpool_digest(tmp_path, monkeypatch):
     from backend.services.creator import api
-    source = inspect.getsource(api._build_e2e_callable_repair_context)
-    assert "load_tool_pool" in source
-    assert "get_skill_tool_binding" in source
-    assert "build_available_tool_context" in source
-    assert '"read_only": True' in source
-    assert "save_tool_pool" not in source
-    assert "tool_pool_patch" not in source
+    from backend.services.creator.tool_pool_models import ToolPoolModel, ToolPoolTool
+    from backend.services.creator.tool_pool_store import get_skill_tool_binding, load_tool_pool, save_tool_pool
+
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    (skill_dir / "scripts" / "one.py").write_text("print('before')\n", encoding="utf-8")
+    pool = ToolPoolModel(
+        skill_name="demo",
+        tools=[ToolPoolTool(tool_id="system_text_generation", status="allowed", source="system_required")],
+    )
+    save_tool_pool(skill_dir, pool)
+    monkeypatch.setattr(api.settings, "skills_path", root)
+
+    before_pool = load_tool_pool(skill_dir)
+    before_binding = get_skill_tool_binding(before_pool, target_file="scripts/one.py", include_script_core=True).model_dump(mode="json")
+    before_digest = api._tool_binding_digest(before_binding)
+
+    context = api._build_e2e_callable_repair_context(skill_name="demo", target_file="scripts/one.py")
+
+    after_pool = load_tool_pool(skill_dir)
+    after_binding = get_skill_tool_binding(after_pool, target_file="scripts/one.py", include_script_core=True).model_dump(mode="json")
+    assert [tool.tool_id for tool in after_pool.tools] == [tool.tool_id for tool in before_pool.tools]
+    assert api._tool_binding_digest(after_binding) == before_digest
+    assert context.get("read_only") is True or context == {}

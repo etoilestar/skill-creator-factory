@@ -6,8 +6,6 @@ import uuid
 from .common import *  # noqa: F403
 from .contracts import *  # noqa: F403
 from .command_normalizer import canonicalize_skill_md_runtime_commands
-from .tool_pool_store import load_tool_pool, get_file_binding
-from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
 
 
@@ -3756,36 +3754,6 @@ def _run_skill_workflow_e2e_once(
                 if entry.runtime == "python":
                     if venv_python is None:
                         raise ValueError("python venv 未初始化。")
-
-                    try:
-                        pool = load_tool_pool(trial_skill_dir)
-                        binding_model = get_file_binding(pool, command.script_path)
-                        file_binding = (
-                            binding_model.model_dump(mode="json")
-                            if binding_model is not None
-                            else {}
-                        )
-                        import_guard = guard_runtime_imports(content, command.script_path, file_binding)
-                        import_guard_payload = (
-                            import_guard.model_dump(mode="json")
-                            if hasattr(import_guard, "model_dump")
-                            else import_guard
-                        )
-                        if isinstance(import_guard_payload, dict) and import_guard_payload.get("success") is False:
-                            raise ValueError(
-                                _e2e_error(
-                                    target=command.script_path,
-                                    layer="runtime_import_guard_failed",
-                                    message=json.dumps(import_guard_payload, ensure_ascii=False, default=str),
-                                    details={
-                                        "failed_command": command.command,
-                                        "rendered_payload": rendered_payload,
-                                        "runtime_binding_trace": runtime_binding_trace,
-                                    },
-                                )
-                            )
-                    except FileNotFoundError:
-                        pass
 
                     proc = _execute_e2e_python_command(
                         command=command,

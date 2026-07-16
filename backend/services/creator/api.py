@@ -101,6 +101,9 @@ def _build_e2e_callable_repair_context(
         file_path=target_file,
         max_snippets=0,
     )
+    if not context.get("resolved_tools"):
+        return {}
+
     compact_tools = []
     for tool in context.get("resolved_tools") or []:
         if not isinstance(tool, dict):
@@ -128,21 +131,49 @@ def _build_e2e_callable_repair_context(
 
 def _is_callable_runtime_failure(
     structured_failure: dict[str, Any],
+    callable_context: dict[str, Any] | None = None,
 ) -> bool:
     stderr = str(structured_failure.get("stderr") or "")
     actual = str(structured_failure.get("actual") or "")
     text = f"{stderr}\n{actual}"
-    return bool(
-        re.search(
-            (
-                r"ImportError|"
-                r"ModuleNotFoundError|"
-                r"cannot import name|"
-                r"NameError|"
-                r"TypeError"
-            ),
-            text,
-        )
+
+    if re.search(
+        (
+            r"\bImportError\b|"
+            r"\bModuleNotFoundError\b|"
+            r"cannot import name"
+        ),
+        text,
+    ):
+        return True
+
+    if not re.search(r"\bNameError\b|\bTypeError\b", text):
+        return False
+
+    resolved_tools = (
+        callable_context.get("resolved_tools")
+        if isinstance(callable_context, dict)
+        else []
+    ) or []
+
+    callable_tokens: set[str] = set()
+    for tool in resolved_tools:
+        if not isinstance(tool, dict):
+            continue
+
+        function_name = str(tool.get("function_name") or "").strip()
+        import_path = str(tool.get("import_path") or "").strip()
+
+        if function_name:
+            callable_tokens.add(function_name)
+
+        if import_path:
+            callable_tokens.add(import_path)
+            callable_tokens.add(import_path.rsplit(".", 1)[-1])
+
+    return any(
+        token and re.search(rf"\b{re.escape(token)}\b", text)
+        for token in callable_tokens
     )
 
 def _tool_binding_log_summary(binding: dict[str, Any]) -> dict[str, Any]:
@@ -12645,9 +12676,6 @@ async def generate_file(request: GenerateFileRequest):
                         json.dumps(tool_readiness_observations, ensure_ascii=False, default=str),
                     )
             def _build_current_function_execution_context() -> dict[str, Any] | None:
-                # Source-order compatibility: load_tool_pool(settings.skills_path / skill_name)
-                # Source-order compatibility: get_file_binding(context_tool_pool, request.file_path)
-                # Source-order compatibility before runtime_contract and effective_skill_plan_entry.get("tool_binding_summary").
                 if not request.file_path.startswith("scripts/"):
                     return None
                 context_entry = _skill_plan_entry_for_file(
@@ -13053,8 +13081,8 @@ async def generate_file(request: GenerateFileRequest):
                     skill_md_repair_scope == "full_format"
                     or (
                         request.file_path != "SKILL.md"
-                        # if is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path):
-                        and (is_markdown_hard_format_error(stage_error) and _is_markdown_creator_file(request.file_path))
+                        and is_markdown_hard_format_error(stage_error)
+                        and _is_markdown_creator_file(request.file_path)
                     )
                 ):
                     markdown_format_retry_count += 1
@@ -14146,11 +14174,18 @@ async def validate_skill(request: SkillActionRequest):
             if target_path.startswith("scripts/"):
                 try:
                     structured_e2e_failure = _structured_failure_from_errors(blocking_errors)
-                    if _is_callable_runtime_failure(structured_e2e_failure):
-                        e2e_callable_repair_context = _build_e2e_callable_repair_context(
-                            skill_name=skill_name,
-                            target_file=target_path,
+                    candidate_callable_context = _build_e2e_callable_repair_context(
+                        skill_name=skill_name,
+                        target_file=target_path,
+                    )
+                    if (
+                        candidate_callable_context
+                        and _is_callable_runtime_failure(
+                            structured_e2e_failure,
+                            candidate_callable_context,
                         )
+                    ):
+                        e2e_callable_repair_context = candidate_callable_context
                 except Exception as callable_context_exc:
                     logger.warning(
                         "[Creator][E2E] callable repair context unavailable skill=%s file=%s error=%s",

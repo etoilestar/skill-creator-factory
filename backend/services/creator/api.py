@@ -29,6 +29,7 @@ from .tool_pool_store import (
     save_tool_pool,
     load_tool_pool,
     get_file_binding,
+    get_skill_tool_binding,
     tool_pool_snapshot,
 )
 from .tool_pool_builder import build_tool_pool
@@ -43,6 +44,32 @@ from .tool_pool_models import (
 from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
+
+
+def _tool_binding_digest(binding: dict[str, Any]) -> str:
+    normalized = {
+        "allowed_tool_ids": sorted(binding.get("allowed_tool_ids") or []),
+        "available_tools": sorted(
+            (
+                str(item.get("tool_id") or ""),
+                str(item.get("function_name") or ""),
+                str(item.get("import_path") or ""),
+            )
+            for item in (binding.get("available_tools") or [])
+            if isinstance(item, dict)
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def _tool_binding_log_summary(binding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "allowed_tool_ids": sorted(binding.get("allowed_tool_ids") or []),
+        "available_tool_count": len(binding.get("available_tools") or []),
+        "binding_digest": _tool_binding_digest(binding),
+    }
 
 
 class PreparePlanProtocolError(ValueError):
@@ -10061,6 +10088,15 @@ async def _prepare_plan_impl(
         skill_dir_for_tool_pool,
         tool_pool,
     )
+    try:
+        final_binding = get_skill_tool_binding(tool_pool, target_file="scripts/__final_selection_probe__.py", include_script_core=True).model_dump(mode="json")
+        logger.info(
+            "[Creator][final_tool_selection] skill=%s summary=%s",
+            plan.skill_name,
+            json.dumps(_tool_binding_log_summary(final_binding), ensure_ascii=False),
+        )
+    except Exception:
+        logger.exception("[Creator][final_tool_selection] failed to summarize ToolPool")
 
     for file_spec in (
         plan.files or []
@@ -10869,16 +10905,62 @@ async def upload_context_file(
 
 @router.post("/init-skill", response_model=InitSkillResponse)
 async def init_skill(request: InitSkillRequest):
-    """Initialise a new Skill directory structure."""
+    """Initialise a Skill directory structure without touching ToolPool state."""
     skill_name = _validate_skill_name(request.skill_name)
-    result = run_action({"action": "init", "name": skill_name})
-    if result.get("success"):
-        _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
-    return InitSkillResponse(
-        success=result["success"],
-        path=result.get("path"),
-        message=result["message"],
+    skill_dir = settings.skills_path / skill_name
+
+    before_allowed: list[str] = []
+    before_digest = ""
+    try:
+        before_pool = load_tool_pool(skill_dir)
+        before_binding = get_skill_tool_binding(before_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
+        before_allowed = sorted(before_binding.get("allowed_tool_ids") or [])
+        before_digest = _tool_binding_digest(before_binding)
+    except Exception:
+        before_allowed = []
+        before_digest = "tool_pool_missing"
+    logger.info(
+        "[Creator][init_skill_before] skill=%s allowed_tool_ids=%s binding_digest=%s",
+        skill_name,
+        before_allowed,
+        before_digest,
     )
+
+    try:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        for folder in ("scripts", "references", "assets", ".creator"):
+            (skill_dir / folder).mkdir(parents=True, exist_ok=True)
+        copied_assets = _copy_confirmed_uploaded_assets_to_skill(skill_name, request.confirmed_uploaded_assets)
+
+        after_allowed: list[str] = []
+        after_digest = ""
+        try:
+            after_pool = load_tool_pool(skill_dir)
+            after_binding = get_skill_tool_binding(after_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
+            after_allowed = sorted(after_binding.get("allowed_tool_ids") or [])
+            after_digest = _tool_binding_digest(after_binding)
+        except Exception:
+            after_allowed = []
+            after_digest = "tool_pool_missing"
+        logger.info(
+            "[Creator][init_skill_after] skill=%s allowed_tool_ids=%s binding_digest=%s",
+            skill_name,
+            after_allowed,
+            after_digest,
+        )
+
+        return InitSkillResponse(
+            success=True,
+            path=str(skill_dir),
+            message=f"已初始化 Skill 目录结构，复制已确认 assets {len(copied_assets)} 个；未重建或覆盖 ToolPool。",
+        )
+    except Exception as exc:
+        logger.exception("init-skill error")
+        return InitSkillResponse(
+            success=False,
+            path=None,
+            message=f"初始化失败：{exc}",
+        )
 
 @router.post("/upload-asset", response_model=UploadAssetResponse)
 async def upload_asset(
@@ -12426,6 +12508,25 @@ async def generate_file(request: GenerateFileRequest):
                 else None
             )
             entry_requirements: list[RequirementItem] = []
+            current_skill_binding_payload: dict[str, Any] = {}
+            current_tool_pool_summary: dict[str, Any] = {}
+
+            if request.file_path.startswith("scripts/"):
+                skill_dir = settings.skills_path / skill_name
+                current_tool_pool = load_tool_pool(skill_dir)
+                current_skill_binding = get_skill_tool_binding(
+                    current_tool_pool,
+                    target_file=request.file_path,
+                    include_script_core=True,
+                )
+                current_skill_binding_payload = current_skill_binding.model_dump(mode="json")
+                current_tool_pool_summary = current_tool_pool.model_dump(mode="json")
+                logger.info(
+                    "[Creator][generate_file][producer_tool_pool] skill=%s file=%s summary=%s",
+                    skill_name,
+                    request.file_path,
+                    json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                )
 
             if request.file_path.startswith("scripts/"):
                 # 后端生成阶段重新构建 canonical entry，避免依赖前端传来的不完整 entry。
@@ -12476,23 +12577,7 @@ async def generate_file(request: GenerateFileRequest):
                     role=request.role,
                     skill_plan_entry=effective_skill_plan_entry,
                 )
-                context_binding: Any = None
-                try:
-                    context_tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                    context_binding = get_file_binding(context_tool_pool, request.file_path)
-                    if hasattr(context_binding, "model_dump"):
-                        context_binding = context_binding.model_dump(mode="json")
-                except Exception:
-                    context_binding = None
-                if not isinstance(context_binding, dict):
-                    context_binding = {}
-                    if isinstance(getattr(context_entry, "runtime_contract", None), dict):
-                        raw_context_binding = context_entry.runtime_contract.get("tool_binding_summary")
-                        if isinstance(raw_context_binding, dict):
-                            context_binding = dict(raw_context_binding)
-                    if isinstance(effective_skill_plan_entry, dict) and isinstance(effective_skill_plan_entry.get("tool_binding_summary"), dict):
-                        context_binding = dict(effective_skill_plan_entry.get("tool_binding_summary") or {})
-                context_binding = _ensure_python_script_core_binding(context_binding, context_entry)
+                context_binding: dict[str, Any] = dict(current_skill_binding_payload)
                 return build_function_execution_context(
                     graph=request.requirement_graph,
                     target_file=request.file_path,
@@ -12593,7 +12678,8 @@ async def generate_file(request: GenerateFileRequest):
                 content = candidate
 
                 last_import_guard_result: Any = None
-                last_file_binding: Any = None
+                last_file_binding: Any = current_skill_binding_payload if request.file_path.startswith("scripts/") else None
+                boundary_violations: list[Any] = []
 
                 if request.file_path.startswith("scripts/"):
                     unsupported_issue = _not_supported_declared_input_issue(
@@ -12605,36 +12691,23 @@ async def generate_file(request: GenerateFileRequest):
                     if unsupported_issue:
                         raise ScriptFunctionalValidationError([unsupported_issue], layer="script_declared_input_not_supported")
 
-                    boundary_file_binding: Any = None
-                    try:
-                        boundary_tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                        boundary_file_binding = get_file_binding(boundary_tool_pool, request.file_path)
-                    except Exception:
-                        boundary_file_binding = None
-
-                    if boundary_file_binding is None and isinstance(effective_skill_plan_entry, dict):
-                        runtime_contract = effective_skill_plan_entry.get("runtime_contract")
-                        if isinstance(runtime_contract, dict):
-                            boundary_file_binding = runtime_contract.get("tool_binding_summary") or {}
-                        if not boundary_file_binding:
-                            boundary_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
-
-                    allowed_tools = list(
-                        resolve_tools_for_skill_plan_entry(effective_skill_plan_entry or {}).allowed_tools or [])
-                    boundary_violations = _script_tool_boundary_violations(
-                        content,
-                        allowed_tools,
-                        file_binding=boundary_file_binding,
-                        skill_plan_entry=effective_skill_plan_entry if isinstance(effective_skill_plan_entry,
-                                                                                  dict) else None,
-                    )
-                    if boundary_violations:
-                        first_violation = boundary_violations[0]
-                        raise FileGenerationStageError(
-                            source=first_violation["id"],
-                            layer=first_violation["layer"],
-                            detail=json.dumps(first_violation, ensure_ascii=False, default=str),
+                    allowed_tools = list(current_skill_binding_payload.get("allowed_tool_ids") or [])
+                    boundary_violations = (
+                        _script_tool_boundary_violations(
+                            content,
+                            allowed_tools,
+                            file_binding=current_skill_binding_payload,
+                            skill_plan_entry=effective_skill_plan_entry if isinstance(effective_skill_plan_entry, dict) else None,
                         )
+                        or []
+                    )
+                    logger.info(
+                        "[Creator][first_round_tool_observations] skill=%s file=%s count=%d summary=%s",
+                        skill_name,
+                        request.file_path,
+                        len(boundary_violations),
+                        json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                    )
 
                 format_stage_error = _first_round_format_stage_error(
                     file_path=request.file_path,
@@ -12650,34 +12723,31 @@ async def generate_file(request: GenerateFileRequest):
 
                 if request.file_path.startswith("scripts/"):
                     try:
-                        tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                        file_binding = get_file_binding(tool_pool, request.file_path)
-                        if file_binding is None and isinstance(effective_skill_plan_entry, dict):
-                            file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
-                        last_file_binding = file_binding
-                        import_guard_result = guard_runtime_imports(content, request.file_path, file_binding)
+                        import_guard_result = guard_runtime_imports(
+                            content,
+                            request.file_path,
+                            current_skill_binding_payload,
+                        )
                         last_import_guard_result = import_guard_result
                     except Exception as guard_exc:
-                        raise FileGenerationStageError(
-                            source="runtime_import_guard",
-                            layer="runtime_import_guard_error",
-                            detail=f"runtime_import_guard crashed: {type(guard_exc).__name__}: {guard_exc}",
-                        ) from guard_exc
-                    if not import_guard_result.success:
-                        raise FileGenerationStageError(
-                            source="runtime_import_guard",
-                            layer=(
-                                    import_guard_result.error_type
-                                    or "runtime_import_guard_failed"
-                            ),
-                            detail=json.dumps(
-                                import_guard_result.model_dump(
-                                    mode="json"
-                                ),
-                                ensure_ascii=False,
-                                default=str,
-                            ),
+                        logger.warning(
+                            "[Creator][first_round_tool_observation_error] skill=%s file=%s error=%s: %s",
+                            skill_name,
+                            request.file_path,
+                            type(guard_exc).__name__,
+                            guard_exc,
                         )
+                        last_import_guard_result = {
+                            "success": None,
+                            "observation_error": f"{type(guard_exc).__name__}: {guard_exc}",
+                            "target_file": request.file_path,
+                        }
+                    logger.info(
+                        "[Creator][runtime_import_observation] skill=%s file=%s summary=%s",
+                        skill_name,
+                        request.file_path,
+                        json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                    )
 
                 try:
 
@@ -12764,16 +12834,22 @@ async def generate_file(request: GenerateFileRequest):
                         )
 
                         workflow_allocation_summary = _load_workflow_allocation_summary(skill_name)
+                        logger.info(
+                            "[Creator][responsibility_judge_tool_pool] skill=%s file=%s summary=%s",
+                            skill_name,
+                            request.file_path,
+                            json.dumps(_tool_binding_log_summary(current_skill_binding_payload), ensure_ascii=False),
+                        )
                         responsibility_review = await _run_script_responsibility_review(
                             file_path=request.file_path,
                             script_content=content,
                             skill_plan_entry=entry,
                             requirements=entry_requirements,
-                            deterministic_issues=[],
+                            deterministic_issues=list(boundary_violations),
                             requested_model=request.model or route.model,
                             review_context={
                                 "phase": "RESPONSIBILITY_STAGE",
-                                "policy": "只判断当前文件职责是否完成。",
+                                "policy": "只判断当前文件职责是否完成。Skill ToolPool 是允许使用的能力上界，不表示当前脚本必须使用；不得仅因零业务工具调用、未使用某个授权工具、使用标准库完成职责、池中存在更高级工具或 required_capabilities 可映射但脚本未选择而判失败。只有确认调用池外平台工具、不存在的 Registry 函数、实现无法完成职责、工具调用/返回处理真实错误或声称产物但未实现时才判失败。",
                                 "blueprint_text": request.blueprint_text,
                                 "purpose_short_contract": getattr(entry, "purpose", request.purpose),
                                 "workflow_allocation_summary": workflow_allocation_summary,
@@ -12784,11 +12860,9 @@ async def generate_file(request: GenerateFileRequest):
                                     if hasattr(last_import_guard_result, "model_dump")
                                     else last_import_guard_result
                                 ),
-                                "current_file_tool_binding": (
-                                    last_file_binding.model_dump(mode="json")
-                                    if hasattr(last_file_binding, "model_dump")
-                                    else last_file_binding
-                                ),
+                                "current_skill_tool_binding": current_skill_binding_payload,
+                                "current_file_tool_binding": current_skill_binding_payload,
+                                "deterministic_issues": list(boundary_violations),
                                 "requirement_graph": request.requirement_graph,
                                 "function_execution_context": function_execution_context,
                             },
@@ -13465,29 +13539,20 @@ async def generate_file(request: GenerateFileRequest):
                     repair_current_file_binding = {}
                     repair_import_guard_result = {}
                     if request.file_path.startswith("scripts/"):
-                        try:
-                            repair_tool_pool = load_tool_pool(settings.skills_path / skill_name)
-                            repair_tool_pool_summary = repair_tool_pool.model_dump(mode="json")
-                            repair_binding_obj = get_file_binding(repair_tool_pool, request.file_path)
-                            if repair_binding_obj is not None:
-                                repair_current_file_binding = repair_binding_obj.model_dump(mode="json")
-                            elif isinstance(effective_skill_plan_entry, dict):
-                                repair_current_file_binding = effective_skill_plan_entry.get("tool_binding_summary") or {}
-                            try:
-                                parsed_guard = json.loads(str(stage_error.detail or ""))
-                                if isinstance(parsed_guard, dict) and str(parsed_guard.get("error_type") or "").startswith("generated_"):
-                                    repair_import_guard_result = parsed_guard
-                            except Exception:
-                                repair_import_guard_result = {}
-                            if not repair_import_guard_result:
-                                try:
-                                    repair_guard_obj = guard_runtime_imports(candidate or "", request.file_path, repair_current_file_binding)
-                                    repair_import_guard_result = repair_guard_obj.model_dump(mode="json")
-                                except Exception:
-                                    repair_import_guard_result = {}
-                        except Exception:
-                            repair_tool_pool_summary = {}
-                            repair_current_file_binding = {}
+                        repair_tool_pool_summary = dict(current_tool_pool_summary)
+                        repair_current_file_binding = dict(current_skill_binding_payload)
+                        if 'last_import_guard_result' in locals():
+                            repair_import_guard_result = (
+                                last_import_guard_result.model_dump(mode="json")
+                                if hasattr(last_import_guard_result, "model_dump")
+                                else (last_import_guard_result if isinstance(last_import_guard_result, dict) else {})
+                            )
+                        logger.info(
+                            "[Creator][localized_repair_tool_pool] skill=%s file=%s summary=%s",
+                            skill_name,
+                            request.file_path,
+                            json.dumps(_tool_binding_log_summary(repair_current_file_binding), ensure_ascii=False),
+                        )
 
                     if single_block_locator is None:
                         repaired_candidate = await _repair_generated_file_with_feedback(
@@ -14114,8 +14179,27 @@ async def init_from_blueprint(request: InitFromBlueprintRequest):
     skill_name = _validate_skill_name(request.skill_name)
     skill_root = getattr(settings, "skill_public_dir", settings.skills_path) / skill_name
 
+    before_allowed: list[str] = []
+    before_digest = ""
+    try:
+        before_pool = load_tool_pool(settings.skills_path / skill_name)
+        before_binding = get_skill_tool_binding(before_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
+        before_allowed = sorted(before_binding.get("allowed_tool_ids") or [])
+        before_digest = _tool_binding_digest(before_binding)
+    except Exception:
+        before_allowed = []
+        before_digest = "tool_pool_missing"
+    logger.info(
+        "[Creator][init_from_blueprint_before] skill=%s allowed_tool_ids=%s binding_digest=%s",
+        skill_name,
+        before_allowed,
+        before_digest,
+    )
+
     try:
         skill_root.mkdir(parents=True, exist_ok=True)
+        for folder in ("scripts", "references", "assets", ".creator"):
+            (skill_root / folder).mkdir(parents=True, exist_ok=True)
 
         dirs_created = 0
         seen_dirs: set[Path] = set()
@@ -14144,13 +14228,30 @@ async def init_from_blueprint(request: InitFromBlueprintRequest):
             if not existed:
                 dirs_created += 1
 
+        after_allowed: list[str] = []
+        after_digest = ""
+        try:
+            after_pool = load_tool_pool(settings.skills_path / skill_name)
+            after_binding = get_skill_tool_binding(after_pool, target_file="scripts/__init_probe__.py", include_script_core=True).model_dump(mode="json")
+            after_allowed = sorted(after_binding.get("allowed_tool_ids") or [])
+            after_digest = _tool_binding_digest(after_binding)
+        except Exception:
+            after_allowed = []
+            after_digest = "tool_pool_missing"
+        logger.info(
+            "[Creator][init_from_blueprint_after] skill=%s allowed_tool_ids=%s binding_digest=%s",
+            skill_name,
+            after_allowed,
+            after_digest,
+        )
+
         return InitFromBlueprintResponse(
             success=True,
             path=str(skill_root),
             files_created=0,
             message=(
                 f"已初始化 Skill 目录结构，创建目录 {dirs_created} 个，复制已确认 assets {len(copied_assets)} 个。"
-                "文件将在 generate-file 成功返回非空内容后写入，不再预创建 0 B 空文件。"
+                "文件将在 generate-file 成功返回非空内容后写入，不再预创建 0 B 空文件；未重建或覆盖 ToolPool。"
             ),
         )
 

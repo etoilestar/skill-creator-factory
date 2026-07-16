@@ -2303,9 +2303,14 @@ def _creator_tool_context_for_script(
 
     parts.append(
         "工具规则：\n"
-        "- 只能使用 Current Shared Skill ToolPool Projection 中 allowed_tool_ids 对应工具。\n"
-        "- primary_tool_ids / secondary_tool_ids 只表示推荐顺序，不形成不同工具池。\n"
-        "- required_capabilities / optional_capabilities 不是工具授权来源。\n"
+        "- Current Skill ToolPool 是本 Skill 可使用的平台工具集合，不是当前脚本必须逐项调用的任务清单。\n"
+        "- 你可以根据当前职责使用其中零个、一个或多个工具。\n"
+        "- 你可以使用 Python 标准库完成普通确定性处理。\n"
+        "- 在无需平台工具时，可以完全不导入任何业务工具。\n"
+        "- 只能使用 Current Shared Skill ToolPool Projection 中 allowed_tool_ids 对应工具；不得使用 ToolPool 之外的平台工具。\n"
+        "- 不得虚构 Registry 函数；不得因为某个工具已授权就强行加入无关调用。\n"
+        "- primary_tool_ids / secondary_tool_ids 只表示历史推荐顺序，不形成不同工具池。\n"
+        "- required_capabilities / optional_capabilities 不是工具授权来源，也不代表当前脚本必须调用工具。\n"
         "- 不得根据 Registry、文件职责或错误文本自行发现新工具。\n"
         "- 不得请求 tool_pool_patch。\n"
         "- 如果当前池缺能力，只能由责任判决反馈后交给规划模型重新探索并提案。\n"

@@ -2,6 +2,14 @@ from __future__ import annotations
 import importlib, importlib.util, os
 from pathlib import Path
 from typing import Any
+
+
+def _uniq(values: list[str]) -> list[str]:
+    out: list[str] = []
+    for value in values or []:
+        if value not in out:
+            out.append(value)
+    return out
 from backend.services.creator_tool_registry import get_tool_capability
 from backend.services.runtime_tools import __all__ as RUNTIME_TOOLS_ALL
 from .tool_pool_models import ToolPoolAddToolRequest, ToolPoolGateEvent
@@ -21,12 +29,19 @@ def _missing_deps(deps: list[Any]) -> list[str]:
 
 def _check_function_imports(cap: Any) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
     allowed_paths=[]; allowed_functions=[]; checked_paths=[]; checked_functions=[]; messages=[]
+    runtime_tools_all = set(RUNTIME_TOOLS_ALL)
     for fn in cap.functions or []:
         import_path=str(getattr(fn,'import_path','') or '').strip()
         function_name=str(getattr(fn,'function_name','') or '').strip()
-        if not import_path or import_path == 'backend.services.runtime_tools':
+        if not import_path or not function_name:
             continue
         checked_paths.append(import_path); checked_functions.append(function_name)
+        if import_path == 'backend.services.runtime_tools':
+            if function_name not in runtime_tools_all:
+                messages.append(f'function not exported by backend.services.runtime_tools: {function_name}')
+                continue
+            allowed_paths.append(import_path); allowed_functions.append(function_name)
+            continue
         adapter_path=str(getattr(cap,'adapter_path','') or '')
         if '.bak' in adapter_path or 'custom_tools.bak' in adapter_path:
             messages.append('custom tool adapter is only present in a .bak path')
@@ -36,11 +51,11 @@ def _check_function_imports(cap: Any) -> tuple[list[str], list[str], list[str], 
         except Exception as exc:
             messages.append(f'import_path not importable: {import_path}: {type(exc).__name__}: {exc}')
             continue
-        if not function_name or not hasattr(module, function_name):
+        if not hasattr(module, function_name):
             messages.append(f'function not found in import_path: {import_path}.{function_name}')
             continue
         allowed_paths.append(import_path); allowed_functions.append(function_name)
-    return allowed_paths, allowed_functions, checked_paths, checked_functions, messages
+    return _uniq(allowed_paths), _uniq(allowed_functions), _uniq(checked_paths), _uniq(checked_functions), messages
 
 def gate_tool_request(
     request: ToolPoolAddToolRequest | dict[str, Any],
@@ -129,40 +144,6 @@ def gate_tool_request(
             ),
         )
 
-    helper_imports = list(
-        capability.helper_imports
-        or []
-    )
-
-    denied_helpers = [
-        helper
-        for helper in helper_imports
-        if helper not in set(
-            RUNTIME_TOOLS_ALL
-        )
-    ]
-
-    if denied_helpers:
-        return ToolPoolGateEvent(
-            decision="deny",
-            tool_id=capability.name,
-            target_file="",
-            denied_helper_imports=(
-                denied_helpers
-            ),
-            messages=[
-                (
-                    "helper_imports are not exported "
-                    "by backend.services.runtime_tools.__all__"
-                )
-            ],
-            suggested_replacements=[],
-            score=req.score,
-            matched_features=list(
-                req.matched_features or []
-            ),
-        )
-
     (
         allowed_import_paths,
         allowed_function_imports,
@@ -173,13 +154,13 @@ def gate_tool_request(
         capability
     )
 
-    has_custom_functions = bool(
+    has_manifest_functions = bool(
         checked_import_paths
     )
 
     if (
-        has_custom_functions
-        and not allowed_import_paths
+        has_manifest_functions
+        and not allowed_function_imports
     ):
         return ToolPoolGateEvent(
             decision="deny",
@@ -205,6 +186,19 @@ def gate_tool_request(
                 req.matched_features or []
             ),
         )
+
+
+    manifest_runtime_helpers = []
+    for function in capability.functions or []:
+        function_name = str(getattr(function, 'function_name', '') or '').strip()
+        import_path = str(getattr(function, 'import_path', '') or '').strip()
+        if (
+            import_path == 'backend.services.runtime_tools'
+            and import_path in allowed_import_paths
+            and function_name in allowed_function_imports
+        ):
+            manifest_runtime_helpers.append(function_name)
+    manifest_runtime_helpers = _uniq(manifest_runtime_helpers)
 
     missing_env = [
         str(name)
@@ -256,7 +250,7 @@ def gate_tool_request(
         tool_id=capability.name,
         target_file="",
         allowed_helper_imports=(
-            helper_imports
+            manifest_runtime_helpers
         ),
         allowed_import_paths=(
             allowed_import_paths

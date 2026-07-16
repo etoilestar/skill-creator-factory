@@ -45,43 +45,28 @@ def _stable_unique(values):
 
 
 def _tool_callable_contracts(tool: ToolPoolTool) -> list[dict]:
-    """Return backend-validated callable contracts for one allowed tool."""
+    """Return Registry-backed callable contracts.
+
+    ToolFunctionManifest is the only source of callable tool functions.
+    Legacy helper/import fields must not create callable contracts.
+    """
     capability = get_tool_capability(str(tool.tool_id or "").strip())
     if capability is None:
         return []
 
     contracts: list[dict] = []
-    allowed_import_paths = set(tool.allowed_import_paths or [])
-    allowed_function_imports = set(tool.allowed_function_imports or [])
-    helper_imports = set(tool.allowed_helper_imports or [])
-
-    for helper in sorted(helper_imports):
-        contracts.append({
-            "tool_id": tool.tool_id,
-            "function_name": helper,
-            "import_path": "backend.services.runtime_tools",
-            "input_schema": dict(tool.input_schema or {}),
-            "output_schema": dict(tool.output_schema or {}),
-        })
 
     for function in list(getattr(capability, "functions", []) or []):
         function_name = str(getattr(function, "function_name", "") or "").strip()
         import_path = str(getattr(function, "import_path", "") or "").strip()
         if not function_name or not import_path:
             continue
-        if import_path not in allowed_import_paths:
-            continue
-        if (
-            function_name not in allowed_function_imports
-            and f"{import_path}.{function_name}" not in allowed_function_imports
-        ):
-            continue
         contracts.append({
-            "tool_id": tool.tool_id,
+            "tool_id": str(tool.tool_id or "").strip(),
             "function_name": function_name,
             "import_path": import_path,
-            "input_schema": dict(getattr(function, "input_schema", None) or tool.input_schema or {}),
-            "output_schema": dict(getattr(function, "output_schema", None) or tool.output_schema or {}),
+            "input_schema": dict(getattr(function, "input_schema", None) or {}),
+            "output_schema": dict(getattr(function, "output_schema", None) or {}),
         })
 
     return contracts

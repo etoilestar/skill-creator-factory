@@ -12501,6 +12501,7 @@ async def generate_file(request: GenerateFileRequest):
             entry_requirements: list[RequirementItem] = []
             current_skill_binding_payload: dict[str, Any] = {}
             current_tool_pool_summary: dict[str, Any] = {}
+            tool_readiness_observations: list[dict[str, Any]] = []
 
             if request.file_path.startswith("scripts/"):
                 skill_dir = settings.skills_path / skill_name
@@ -12551,11 +12552,12 @@ async def generate_file(request: GenerateFileRequest):
                     effective_skill_plan_entry
                 )
                 if tool_blockers:
+                    tool_readiness_observations = list(tool_blockers)
                     logger.info(
                         "[Creator][producer_tool_readiness_observation] skill=%s file=%s blockers=%s",
                         skill_name,
                         request.file_path,
-                        json.dumps(tool_blockers, ensure_ascii=False, default=str),
+                        json.dumps(tool_readiness_observations, ensure_ascii=False, default=str),
                     )
             def _build_current_function_execution_context() -> dict[str, Any] | None:
                 if not request.file_path.startswith("scripts/"):
@@ -12853,6 +12855,7 @@ async def generate_file(request: GenerateFileRequest):
                                 "current_skill_tool_binding": current_skill_binding_payload,
                                 "current_file_tool_binding": current_skill_binding_payload,
                                 "deterministic_issues": list(boundary_violations),
+                                "tool_readiness_observations": list(tool_readiness_observations),
                                 "requirement_graph": request.requirement_graph,
                                 "function_execution_context": function_execution_context,
                             },

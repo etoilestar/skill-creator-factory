@@ -256,3 +256,40 @@ def test_first_round_semantic_judge_tool_augmentation_flow_is_unchanged():
     assert "_recall_creator_tool_candidates" in source
     assert "responsibility_feedback" in source
     assert "candidate_tool_catalog" in source
+
+
+def test_responsibility_tool_expansion_refreshes_binding_before_repair_and_guard_digest():
+    source = inspect.getsource(api.generate_file)
+    refresh_marker = '"[Creator][responsibility_tool_pool_refreshed] skill=%s file=%s summary=%s"'
+    repair_marker = '"[Creator][localized_repair_tool_pool] skill=%s file=%s summary=%s"'
+    refresh_start = source.index('refreshed_tool_pool = load_tool_pool(settings.skills_path / skill_name)')
+    refresh_end = source.index('except Exception as planning_exc', refresh_start)
+    refresh_block = source[refresh_start:refresh_end]
+    repair_start = source.index('repair_tool_pool_summary = {}', refresh_end)
+    repair_end = source.index('if single_block_locator is None:', repair_start)
+    repair_block = source[repair_start:repair_end]
+
+    assert 'current_tool_pool_summary = refreshed_tool_pool.model_dump(mode="json")' in refresh_block
+    assert 'current_skill_binding_payload = refreshed_binding.model_dump(mode="json")' in refresh_block
+    assert 'function_execution_context = _build_current_function_execution_context()' in refresh_block
+    assert refresh_marker in refresh_block
+    assert 'guard_runtime_imports(\n                            content,\n                            request.file_path,\n                            current_skill_binding_payload,' in source
+    assert 'repair_current_file_binding = dict(current_skill_binding_payload)' in repair_block
+    assert 'repair_tool_pool_summary = dict(current_tool_pool_summary)' in repair_block
+    assert repair_marker in repair_block
+
+
+def test_tool_readiness_blockers_are_judge_observations_not_producer_failures():
+    source = inspect.getsource(api.generate_file)
+    observation_start = source.index('_, tool_blockers = _creator_tool_readiness_blockers')
+    helper_start = source.index('def _build_current_function_execution_context', observation_start)
+    observation_block = source[observation_start:helper_start]
+    judge_start = source.index('responsibility_review = await _run_script_responsibility_review')
+    judge_end = source.index('if not responsibility_review.get("passed"):', judge_start)
+    judge_block = source[judge_start:judge_end]
+
+    assert 'tool_readiness_observations = list(tool_blockers)' in observation_block
+    assert 'producer_tool_readiness_observation' in observation_block
+    assert '_file_done_error_sse' not in observation_block
+    assert 'error_type="tool_not_ready"' not in observation_block
+    assert '"tool_readiness_observations": list(tool_readiness_observations)' in judge_block

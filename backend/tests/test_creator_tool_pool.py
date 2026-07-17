@@ -341,3 +341,95 @@ def test_gate_rejects_manifest_missing_required_function_fields():
         )
     finally:
         clear_registered_tool_capabilities()
+
+
+def test_all_scripts_share_skill_wide_allowed_tools():
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(tool_id="text_tool", status="allowed"),
+            ToolPoolTool(tool_id="image_tool", status="allowed"),
+        ]
+    )
+
+    write_binding = get_file_binding(pool, "scripts/write.py")
+    draw_binding = get_file_binding(pool, "scripts/draw.py")
+
+    assert write_binding.allowed_tool_ids == draw_binding.allowed_tool_ids
+    assert set(write_binding.allowed_tool_ids) == {
+        "script_argv_guard",
+        "text_tool",
+        "image_tool",
+    }
+
+
+def test_skill_wide_projection_filters_non_allowed_tools():
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(
+                tool_id="active_tool",
+                status="allowed",
+                allowed_helper_imports=["active_helper"],
+                allowed_import_paths=["pkg.active"],
+                allowed_function_imports=["pkg.active.run"],
+                required_env=["ACTIVE_ENV"],
+                dependencies=["active-dep"],
+            ),
+            ToolPoolTool(
+                tool_id="denied_tool",
+                status="denied",
+                allowed_helper_imports=["denied_helper"],
+                allowed_import_paths=["pkg.denied"],
+                allowed_function_imports=["pkg.denied.run"],
+                required_env=["DENIED_ENV"],
+                dependencies=["denied-dep"],
+            ),
+            ToolPoolTool(
+                tool_id="removed_tool",
+                status="removed",
+                allowed_helper_imports=["removed_helper"],
+                allowed_import_paths=["pkg.removed"],
+                allowed_function_imports=["pkg.removed.run"],
+                required_env=["REMOVED_ENV"],
+                dependencies=["removed-dep"],
+            ),
+        ]
+    )
+
+    binding = get_file_binding(pool, "scripts/a.py")
+
+    assert set(binding.allowed_tool_ids) == {"script_argv_guard", "active_tool"}
+    assert {tool.get("tool_id") for tool in binding.available_tools} <= {"script_argv_guard", "active_tool"}
+    assert "denied_helper" not in binding.allowed_helper_imports
+    assert "removed_helper" not in binding.allowed_helper_imports
+    assert "pkg.denied" not in binding.allowed_import_paths
+    assert "pkg.removed" not in binding.allowed_import_paths
+    assert "pkg.denied.run" not in binding.allowed_function_imports
+    assert "pkg.removed.run" not in binding.allowed_function_imports
+    assert "DENIED_ENV" not in binding.required_env
+    assert "REMOVED_ENV" not in binding.required_env
+    assert "denied-dep" not in binding.dependencies
+    assert "removed-dep" not in binding.dependencies
+
+
+def test_historical_file_bindings_do_not_limit_script_visibility():
+    from backend.services.creator.tool_pool_models import ToolPoolFileBinding
+
+    pool = ToolPoolModel(
+        tools=[
+            ToolPoolTool(tool_id="text_tool", status="allowed"),
+            ToolPoolTool(tool_id="image_tool", status="allowed"),
+        ],
+        file_bindings=[
+            ToolPoolFileBinding(
+                target_file="scripts/a.py",
+                allowed_tool_ids=["text_tool"],
+            ),
+        ],
+    )
+
+    binding = get_file_binding(pool, "scripts/a.py")
+    raw_binding = get_file_binding(pool, "scripts/a.py", raw=True)
+
+    assert "text_tool" in binding.allowed_tool_ids
+    assert "image_tool" in binding.allowed_tool_ids
+    assert raw_binding.allowed_tool_ids == binding.allowed_tool_ids

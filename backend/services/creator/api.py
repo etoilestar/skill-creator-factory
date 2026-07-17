@@ -40,7 +40,6 @@ from .tool_pool_models import (
     ToolPoolAddToolRequest,
     ToolPoolDeniedRequest,
     ToolPoolMissingRequest,
-    ToolPoolFileBinding,
     ToolPoolModel,
     ToolPoolTool,
 )
@@ -3292,82 +3291,22 @@ async def _plan_final_tool_pool(
     )
     unavailable_tool_ids = sorted(recalled_candidate_set - set(available_optional_tool_ids))
 
-    file_capabilities: dict[str, set[str]] = {}
-    for spec in file_specs or []:
-        if not isinstance(spec, dict):
-            continue
-        path = _normalize_skill_path(str(spec.get("path") or spec.get("target_file") or ""))
-        if not path.startswith("scripts/") or spec.get("required") is False:
-            continue
-        caps = {str(cap or "").strip() for cap in (spec.get("required_capabilities") or []) if str(cap or "").strip()}
-        file_capabilities[path] = caps
-
-    planned_tool_bindings_by_file: dict[str, list[str]] = {path: [] for path in file_capabilities}
-    for tool_id in available_optional_tool_ids:
-        card = candidate_by_tool_id.get(tool_id, {})
-        owners = [
-            _normalize_skill_path(str(owner or ""))
-            for owner in (card.get("owner_files") or card.get("target_files") or [])
-            if str(owner or "").strip()
-        ]
-        if not owners:
-            recalled_caps = {str(cap or "").strip() for cap in (card.get("recalled_for_capabilities") or []) if str(cap or "").strip()}
-            owners = [path for path, caps in file_capabilities.items() if recalled_caps and caps.intersection(recalled_caps)]
-        for owner in owners:
-            if owner in planned_tool_bindings_by_file and tool_id not in planned_tool_bindings_by_file[owner]:
-                planned_tool_bindings_by_file[owner].append(tool_id)
-
-    existing_bindings_by_file = {
-        _normalize_skill_path(str(binding.target_file or "")): binding
-        for binding in (updated_pool.file_bindings or [])
-        if _normalize_skill_path(str(binding.target_file or "")).startswith("scripts/")
-    }
-    auto_recall_sources = {"blueprint_preselect", "registry_exploration"}
-    allowed_pool_tools_by_id = {
-        str(tool.tool_id or "").strip(): tool
-        for tool in (updated_pool.tools or [])
-        if tool.status == "allowed" and str(tool.tool_id or "").strip()
-    }
-    tool_bindings_by_file: dict[str, list[str]] = {}
-    for path in file_capabilities:
-        existing_binding = existing_bindings_by_file.get(path)
-        preserved_existing_ids: list[str] = []
-        if existing_binding is not None:
-            for raw_tool_id in existing_binding.allowed_tool_ids or []:
-                tool_id = str(raw_tool_id or "").strip()
-                tool = allowed_pool_tools_by_id.get(tool_id)
-                if tool is None:
-                    continue
-                if str(tool.source or "") not in auto_recall_sources and tool_id not in preserved_existing_ids:
-                    preserved_existing_ids.append(tool_id)
-        merged_tool_ids = list(preserved_existing_ids)
-        for tool_id in planned_tool_bindings_by_file.get(path, []):
-            if tool_id not in merged_tool_ids:
-                merged_tool_ids.append(tool_id)
-        if merged_tool_ids:
-            tool_bindings_by_file[path] = merged_tool_ids
-
-    updated_pool.file_bindings = [
-        _creator_file_binding_from_optional_tool_ids(
-            pool=updated_pool,
-            target_file=path,
-            allowed_tool_ids=tool_ids,
-        )
-        for path, tool_ids in tool_bindings_by_file.items()
-    ]
+    updated_pool.file_bindings = []
     save_tool_pool(skill_dir, updated_pool)
     updated_pool = load_tool_pool(skill_dir)
+
+    tool_bindings_by_file: dict[str, list[str]] = {}
 
     normalized_selector_output = {
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": tool_bindings_by_file,
+        "tool_bindings_by_file": {},
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "candidate_tool_ids": recalled_candidate_tool_ids,
         "recall_source": recall_source,
-        "selection_mode": "function_item_owned_optional_recall_no_llm",
+        "selection_mode": "skill_wide_optional_recall_no_llm",
     }
 
     logger.info(
@@ -3377,11 +3316,11 @@ async def _plan_final_tool_pool(
                 "event": "final_skill_tool_optional_availability_result",
                 "skill_name": skill_name,
                 "recall_source": recall_source,
-                "selection_mode": "function_item_owned_optional_recall_no_llm",
+                "selection_mode": "skill_wide_optional_recall_no_llm",
                 "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
                 "available_optional_tool_ids": available_optional_tool_ids,
                 "unavailable_tool_ids": unavailable_tool_ids,
-                "tool_bindings_by_file": tool_bindings_by_file,
+                "tool_bindings_by_file": {},
                 "add_tool_ids": add_tool_ids,
                 "remove_tool_ids": remove_tool_ids,
                 "llm_selector_used": False,
@@ -3398,122 +3337,13 @@ async def _plan_final_tool_pool(
         "recalled_candidate_tool_ids": recalled_candidate_tool_ids,
         "available_optional_tool_ids": available_optional_tool_ids,
         "unavailable_tool_ids": unavailable_tool_ids,
-        "tool_bindings_by_file": tool_bindings_by_file,
+        "tool_bindings_by_file": {},
         "desired_tool_ids": recalled_candidate_tool_ids,
         "authorized_tool_ids": available_optional_tool_ids,
         "tool_pool": updated_pool,
     }
 
 
-
-def _creator_file_binding_from_optional_tool_ids(
-    *,
-    pool: ToolPoolModel,
-    target_file: str,
-    allowed_tool_ids: list[str],
-) -> ToolPoolFileBinding:
-    """Persist a per-file optional tool view without making tools mandatory."""
-    current_allowed_ids = {
-        str(tool.tool_id or "").strip()
-        for tool in (pool.tools or [])
-        if tool.status == "allowed"
-        and str(tool.tool_id or "").strip()
-    }
-    canonical_tool_ids: list[str] = []
-    for raw_tool_id in allowed_tool_ids or []:
-        tool_id = str(raw_tool_id or "").strip()
-        if tool_id and tool_id in current_allowed_ids and tool_id not in canonical_tool_ids:
-            canonical_tool_ids.append(tool_id)
-
-    skill_binding = get_skill_tool_binding(
-        pool,
-        target_file=target_file,
-        include_script_core=False,
-    )
-    allowed_set = set(canonical_tool_ids)
-    available_tools = [
-        tool
-        for tool in (skill_binding.available_tools or [])
-        if str(tool.get("tool_id") or "").strip() in allowed_set
-    ]
-    scored_tools = [
-        tool
-        for tool in (skill_binding.scored_tools or [])
-        if str(tool.get("tool_id") or "").strip() in allowed_set
-    ]
-    matched_features_by_tool = {
-        tool_id: features
-        for tool_id, features in (skill_binding.matched_features_by_tool or {}).items()
-        if str(tool_id or "").strip() in allowed_set
-    }
-    selected_pool_tools = [
-        tool
-        for tool in (pool.tools or [])
-        if str(tool.tool_id or "").strip() in allowed_set
-        and tool.status == "allowed"
-    ]
-    required_env = sorted({
-        str(env_name or "")
-        for tool in selected_pool_tools
-        for env_name in (tool.required_env or [])
-        if str(env_name or "")
-    })
-    dependencies = []
-    for tool in selected_pool_tools:
-        for dependency in (tool.dependencies or []):
-            if dependency not in dependencies:
-                dependencies.append(dependency)
-    return ToolPoolFileBinding(
-        target_file=target_file,
-        allowed_tool_ids=list(canonical_tool_ids),
-        primary_tool_ids=list(canonical_tool_ids),
-        secondary_tool_ids=[],
-        available_tools=available_tools,
-        scored_tools=scored_tools,
-        matched_features_by_tool=matched_features_by_tool,
-        allowed_helper_imports=sorted({
-            *[
-                str(helper or "")
-                for tool in selected_pool_tools
-                for helper in (tool.allowed_helper_imports or [])
-                if str(helper or "")
-            ],
-            *[
-                str(item.get("function_name") or "")
-                for item in available_tools
-                if str(item.get("function_name") or "")
-            ],
-        }),
-        allowed_import_paths=sorted({
-            *[
-                str(import_path or "")
-                for tool in selected_pool_tools
-                for import_path in (tool.allowed_import_paths or [])
-                if str(import_path or "")
-            ],
-            *[
-                str(item.get("import_path") or "")
-                for item in available_tools
-                if str(item.get("import_path") or "")
-            ],
-        }),
-        allowed_function_imports=sorted({
-            *[
-                str(function_import or "")
-                for tool in selected_pool_tools
-                for function_import in (tool.allowed_function_imports or [])
-                if str(function_import or "")
-            ],
-            *[
-                f'{item.get("import_path")}.{item.get("function_name")}'
-                for item in available_tools
-                if item.get("import_path") and item.get("function_name")
-            ],
-        }),
-        required_env=required_env,
-        dependencies=dependencies,
-        snippets=[],
-    )
 
 def _apply_planner_tool_pool_patch(
     *,
@@ -3530,8 +3360,7 @@ def _apply_planner_tool_pool_patch(
 
     ToolPool.tools remains Skill-wide factual availability.
 
-    file_bindings stores per-file optional prompt/runtime views and does not
-    require tool usage.
+    file_bindings is a retired compatibility field and is cleared before save.
 
     Code model, responsibility judge, repair model, and E2E must never call this
     function to expand ToolPool.
@@ -4085,59 +3914,15 @@ def _apply_planner_tool_pool_patch(
             "denied_new"
         ] += 1
 
-    feedback_target_file = ""
-    if source_phase == "responsibility_feedback":
-        affected_files = [
-            _normalize_skill_path(str(item or ""))
-            for item in (patch.affected_files or [])
-            if str(item or "").strip()
-        ]
-        request_targets = [
-            _normalize_skill_path(str(request.target_file or ""))
-            for request in add_requests
-            if str(request.target_file or "").strip()
-        ]
-        candidate_targets = [*affected_files, *request_targets]
-        legal_targets = [
-            target
-            for target in candidate_targets
-            if target.startswith("scripts/")
-        ]
-        unique_legal_targets: list[str] = []
-        for target in legal_targets:
-            if target and target not in unique_legal_targets:
-                unique_legal_targets.append(target)
-        if len(unique_legal_targets) == 1:
-            feedback_target_file = unique_legal_targets[0]
+    affected_files = [
+        _normalize_skill_path(str(item or ""))
+        for item in (patch.affected_files or [])
+        if str(item or "").strip()
+    ]
+    if affected_files:
+        total["affected_files"] = affected_files
 
-    if feedback_target_file and current_patch_allowed_tool_ids:
-        existing_binding = next(
-            (
-                binding
-                for binding in (pool.file_bindings or [])
-                if _normalize_skill_path(str(binding.target_file or "")) == feedback_target_file
-            ),
-            None,
-        )
-        if existing_binding is None:
-            current_patch_allowed_tool_ids = []
-
-    if feedback_target_file and current_patch_allowed_tool_ids:
-        merged_tool_ids = merge_unique(
-            list(existing_binding.allowed_tool_ids or []),
-            current_patch_allowed_tool_ids,
-        )
-        rebuilt_binding = _creator_file_binding_from_optional_tool_ids(
-            pool=pool,
-            target_file=feedback_target_file,
-            allowed_tool_ids=merged_tool_ids,
-        )
-        pool.file_bindings = [
-            binding
-            for binding in (pool.file_bindings or [])
-            if _normalize_skill_path(str(binding.target_file or "")) != feedback_target_file
-        ]
-        pool.file_bindings.append(rebuilt_binding)
+    pool.file_bindings = []
 
     save_tool_pool(
         skill_dir,

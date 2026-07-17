@@ -240,47 +240,19 @@ def get_file_binding(
     *,
     raw: bool = False,
 ) -> ToolPoolFileBinding | None:
-    """Return the persisted per-file optional tool view when present."""
+    """Return the Skill-wide tool projection for a script.
+
+    Per-file tool authorization is retired. Every script sees the same
+    Skill-wide allowed tool set. target_file is contextual metadata only.
+    raw is retained only for call compatibility and has no semantic effect.
+    """
 
     normalized_target = str(target_file or "").replace("\\", "/").strip()
 
     if not normalized_target.startswith("scripts/"):
         return None
 
-    for binding in pool.file_bindings or []:
-        if str(binding.target_file or "").replace("\\", "/").strip() != normalized_target:
-            continue
-        if raw:
-            return binding
-        projected = binding.model_copy(deep=True)
-        guard_contract = {
-            "tool_id": "script_argv_guard",
-            "function_name": "strict_json_argv_guard",
-            "import_path": "backend.services.runtime_tools",
-            "input_schema": {},
-            "output_schema": {},
-        }
-        available_tools = [
-            item
-            for item in (projected.available_tools or [])
-            if not (
-                isinstance(item, dict)
-                and item.get("tool_id") == "script_argv_guard"
-                and item.get("function_name") == "strict_json_argv_guard"
-                and item.get("import_path") == "backend.services.runtime_tools"
-            )
-        ]
-        projected.available_tools = [guard_contract, *available_tools]
-        helper_imports, import_paths, function_imports = _derive_legacy_fields_from_available_tools(projected.available_tools)
-        projected.allowed_tool_ids = _stable_unique(["script_argv_guard", *list(projected.allowed_tool_ids or [])])
-        projected.primary_tool_ids = _stable_unique(["script_argv_guard", *list(projected.primary_tool_ids or [])])
-        projected.allowed_helper_imports = _stable_unique([*list(projected.allowed_helper_imports or []), *helper_imports])
-        projected.allowed_import_paths = _stable_unique([*list(projected.allowed_import_paths or []), *import_paths])
-        projected.allowed_function_imports = _stable_unique([*list(projected.allowed_function_imports or []), *function_imports])
-        return projected
-
-    if raw:
-        return None
+    _ = raw
 
     return get_skill_tool_binding(
         pool,

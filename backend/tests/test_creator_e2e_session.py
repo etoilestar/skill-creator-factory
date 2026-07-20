@@ -956,3 +956,23 @@ async def test_patch_failed_history_is_not_a_rejected_hypothesis(monkeypatch, tm
     monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({"repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis}))
     diagnosis = await e2e._diagnose_e2e_failure_for_repair(skill_name="demo", skill_dir=skill_dir, e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session)
     assert diagnosis["repair_target"] == "scripts/one.py"
+
+@pytest.mark.asyncio
+async def test_validate_skill_bounds_patch_proposal_exhaustion_cycles(monkeypatch, tmp_path):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+    skill_dir = tmp_path / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_a, **_k: SimpleNamespace(events=[]))
+    monkeypatch.setattr(api, "validate_workflow_e2e", lambda *_a, **_k: ["E2E_SYMPTOM_FILE=scripts/a.py\nE2E_LAYER=script_exit"])
+    calls = []
+    async def exhausted(**_kwargs):
+        calls.append(1)
+        return {"status": "patch_proposal_exhausted", "repaired_target": "scripts/a.py"}
+    monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", exhausted)
+    response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=1))
+    assert response.success is False
+    assert "orchestration cycle" in response.message
+    assert len(calls) == 3

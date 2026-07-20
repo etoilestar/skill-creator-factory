@@ -14236,6 +14236,8 @@ async def validate_skill(request: SkillActionRequest):
 
     max_attempts = max(0, min(int(request.max_e2e_repair_attempts or 0), 10))
     attempt = 0
+    orchestration_cycle_count = 0
+    max_orchestration_cycles = max_attempts * 3
     attempts_by_target: dict[str, int] = {}
     completed_targets: set[str] = set()
     repair_logs: list[str] = []
@@ -14322,6 +14324,16 @@ async def validate_skill(request: SkillActionRequest):
                 warnings=advisory_warnings,
             )
 
+        if orchestration_cycle_count >= max_orchestration_cycles:
+            return SkillActionResponse(
+                success=False, path=None,
+                message=("严格端到端工作流校验未能在受控 Debug Loop 范围内收敛。已达到最大 Debug orchestration cycle 上限。\n"
+                         + "\n\n".join(blocking_errors)
+                         + ("\n\n端到端自动修复记录：\n" + "\n".join(repair_logs) if repair_logs else "")),
+                repair_events=repair_events or e2e_session.events,
+                missing_stdlib_requests=missing_stdlib_reqs,
+            )
+
         if attempt >= max_attempts:
             return SkillActionResponse(
                 success=False,
@@ -14339,6 +14351,7 @@ async def validate_skill(request: SkillActionRequest):
                 repair_events=repair_events or e2e_session.events,
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
+        orchestration_cycle_count += 1
         try:
             attempts_by_target[target_path] = attempts_by_target.get(target_path, 0) + 1
             e2e_callable_repair_context: dict[str, Any] | None = None
@@ -14374,8 +14387,9 @@ async def validate_skill(request: SkillActionRequest):
                 e2e_session=e2e_session,
                 read_only_callable_context=e2e_callable_repair_context,
             )
-            attempt += 1
             status = repair_result.get("status")
+            if status in {"repaired", "debug_progress", "debug_hypothesis_rejected", "target_changed"}:
+                attempt += 1
             repaired_target = repair_result.get("repaired_target") or target_path
             if status == "target_changed":
                 completed_targets.add(repaired_target)
@@ -14398,7 +14412,6 @@ async def validate_skill(request: SkillActionRequest):
                 continue
             if status == "patch_proposal_exhausted":
                 repair_logs.append(f"第 {attempt} 轮：当前 diagnosis 未能生成合法局部补丁，尚未经过真实 E2E 实验证伪，进入下一轮根因诊断")
-                attempt -= 1
                 continue
             if status == "diagnosis_exhausted":
                 return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验失败，且根因诊断无法提出新的合法假设：\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)

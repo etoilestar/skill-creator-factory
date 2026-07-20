@@ -14396,6 +14396,10 @@ async def validate_skill(request: SkillActionRequest):
             if status == "debug_hypothesis_rejected":
                 repair_logs.append(f"第 {attempt} 轮：当前 hypothesis 经真实 E2E 实验未产生改善，已回滚并进入下一轮根因诊断")
                 continue
+            if status == "patch_proposal_exhausted":
+                repair_logs.append(f"第 {attempt} 轮：当前 diagnosis 未能生成合法局部补丁，尚未经过真实 E2E 实验证伪，进入下一轮根因诊断")
+                attempt -= 1
+                continue
             if status == "diagnosis_exhausted":
                 return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验失败，且根因诊断无法提出新的合法假设：\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)
             if status == "still_failed_same_target":

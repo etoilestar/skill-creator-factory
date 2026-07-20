@@ -907,7 +907,7 @@ async def test_e2e_debug_diagnosis_rejects_repeated_failed_hypothesis(monkeypatc
     session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
     hypothesis = "Upstream script emits an invalid payload."
     key = f"scripts/one.py|{e2e._normalized_debug_hypothesis(hypothesis)}"
-    session.debug_attempts.append({"hypothesis_key": key, "improved": False})
+    session.debug_attempts.append({"hypothesis_key": key, "improved": False, "result": "no_progress"})
     monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({
         "repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis,
     }))
@@ -946,3 +946,13 @@ async def test_e2e_diagnosis_reads_session_workspace_and_retries_rejected_propos
     assert diagnosis["repair_target"] == "scripts/two.py"
     assert len(calls) == 2
     assert "session-accepted-patch" in prompts[0]
+
+@pytest.mark.asyncio
+async def test_patch_failed_history_is_not_a_rejected_hypothesis(monkeypatch, tmp_path):
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    hypothesis = "patch formatting failed before execution"
+    session.debug_attempts.append({"hypothesis_key": f"scripts/one.py|{e2e._normalized_debug_hypothesis(hypothesis)}", "improved": None, "result": "patch_failed"})
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({"repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis}))
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(skill_name="demo", skill_dir=skill_dir, e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session)
+    assert diagnosis["repair_target"] == "scripts/one.py"

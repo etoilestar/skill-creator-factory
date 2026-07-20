@@ -4039,7 +4039,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
             rel = path.relative_to(workspace).as_posix()
             related[rel] = path.read_text(encoding="utf-8", errors="replace")[-(12000 if rel == symptom else 4000):]
     route = route_creator_file_model(file_path=symptom, purpose="E2E failure debug diagnosis only; select one repair target", requested_model=requested_model)
-    rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress" or not a.get("improved")]
+    rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress"]
     prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "previous_debug_attempts": rejected, "retry_reason": retry_reason}
     messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes."}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. The rejected combinations were tested by real sandbox E2E without improvement. Do not repeat them; select a different hypothesis and/or target."}]
     for proposal_attempt in range(3):
@@ -4052,7 +4052,7 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         target, hypothesis = str(data.get("repair_target") or "").strip(), str(data.get("root_cause_hypothesis") or "").strip()
         key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
         valid = _is_skill_repair_target(workspace, target) and bool(hypothesis)
-        repeated = any(a.get("hypothesis_key") == key and (a.get("result") == "no_progress" or not a.get("improved")) for a in e2e_session.debug_attempts)
+        repeated = any(a.get("hypothesis_key") == key and a.get("result") == "no_progress" for a in e2e_session.debug_attempts)
         if valid and not repeated:
             return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
         messages.append({"role": "user", "content": "Your proposal was invalid or was already rejected by a real sandbox experiment. Do not patch or run E2E; return a different valid target+hypothesis JSON proposal."})
@@ -4629,7 +4629,8 @@ async def _repair_existing_file_for_e2e_failure(
     last_failure = ""
     # The production API owns the overall (<=10) debug-experiment loop. Keep
     # legacy direct callers usable while they migrate to the session loop.
-    max_candidate_attempts = 10 if standalone_repair else 1
+    max_candidate_attempts = 10 if standalone_repair else 2
+    sandbox_executed = False
 
     working_content = (
         e2e_session.workspace_dir
@@ -5035,6 +5036,7 @@ async def _repair_existing_file_for_e2e_failure(
                 )
             ]
 
+            sandbox_executed = True
             sandbox_gate = (
                 _run_e2e_sandbox_acceptance_gate(
                     skill_name=skill_name,
@@ -5813,17 +5815,21 @@ async def _repair_existing_file_for_e2e_failure(
             e2e_session.events
         )
 
+    if not standalone_repair and not sandbox_executed:
+        e2e_session.debug_attempts.append({
+            "symptom_file": diagnosis["symptom_file"], "repair_target": target_path,
+            "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"],
+            "patch_digest": "", "before_failure_signature": _e2e_behavior_fingerprint((baseline_errors or [""])[0], target_file=target_path),
+            "after_failure_signature": "", "improved": None, "result": "patch_failed",
+        })
+        return {"status": "patch_proposal_exhausted", "repaired_target": target_path, "next_target": None,
+                "next_failure": repair_feedback.split("\n\n")[:8], "hypothesis_key": diagnosis["hypothesis_key"], "attempt": max_candidate_attempts}
     return {
         "status": "still_failed_same_target",
         "repaired_target": target_path,
         "next_target": None,
-        "next_failure": (
-            repair_feedback.split(
-                "\n\n"
-            )[:8]
-        ),
-        "last_failure": last_failure[:12000],
-        "attempt": max_candidate_attempts,
+        "next_failure": repair_feedback.split("\n\n")[:8],
+        "last_failure": last_failure[:12000], "attempt": max_candidate_attempts,
     }
 
 def validate_workflow_e2e(

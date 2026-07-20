@@ -14390,6 +14390,14 @@ async def validate_skill(request: SkillActionRequest):
                     f"第 {attempt} 轮：根据端到端失败反馈修复 {repaired_target}"
                 )
                 continue
+            if status == "debug_progress":
+                repair_logs.append(f"第 {attempt} 轮：{repaired_target} 已推动 E2E 断点，保留补丁并重新诊断新失败")
+                continue
+            if status == "debug_hypothesis_rejected":
+                repair_logs.append(f"第 {attempt} 轮：当前 hypothesis 经真实 E2E 实验未产生改善，已回滚并进入下一轮根因诊断")
+                continue
+            if status == "diagnosis_exhausted":
+                return SkillActionResponse(success=False, path=None, message="严格端到端工作流校验失败，且根因诊断无法提出新的合法假设：\n" + "\n\n".join(blocking_errors), repair_events=repair_events or e2e_session.events, missing_stdlib_requests=missing_stdlib_reqs)
             if status == "still_failed_same_target":
                 repair_logs.append(
                     f"第 {attempt} 轮：{repaired_target} 仍报同目标错误，未完成修复"

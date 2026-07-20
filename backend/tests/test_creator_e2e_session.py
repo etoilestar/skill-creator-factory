@@ -548,11 +548,12 @@ async def test_e2e_repair_stays_localized_after_repeated_attempts(tmp_path, monk
         repair_events=events,
     )
 
-    assert result["status"] == "repaired"
-    assert len(patch_calls) == 3
+    assert result["status"] == "debug_hypothesis_rejected"
+    assert len(patch_calls) == 1
     assert full_calls == []
-    assert len(gate_calls) == 3
-    assert any(event.get("repair_mode") == "localized_patch" and event.get("rerun_status") == "passed" for event in events)
+    assert len(gate_calls) == 1
+    assert result["hypothesis_key"]
+    assert events[-1]["writeback_status"] == "candidate_only"
 
 
 def _write_trial_script(tmp_path: Path, script: str, command_payload: dict | None = None):
@@ -910,8 +911,38 @@ async def test_e2e_debug_diagnosis_rejects_repeated_failed_hypothesis(monkeypatc
     monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({
         "repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis,
     }))
-    with pytest.raises(ValueError, match="repeated_rejected_hypothesis"):
-        await e2e._diagnose_e2e_failure_for_repair(
-            skill_name="demo", skill_dir=skill_dir,
-            e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
-        )
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir,
+        e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
+    )
+    assert diagnosis["status"] == "diagnosis_exhausted"
+
+@pytest.mark.asyncio
+async def test_e2e_diagnosis_reads_session_workspace_and_retries_rejected_proposal(monkeypatch, tmp_path):
+    skill_dir = _make_skill(tmp_path)
+    (skill_dir / "scripts" / "one.py").write_text("official-old\n", encoding="utf-8")
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    (session.workspace_dir / "scripts" / "one.py").write_text("session-accepted-patch\n", encoding="utf-8")
+    hypothesis_a = "already tested"
+    session.debug_attempts.append({
+        "hypothesis_key": f"scripts/one.py|{e2e._normalized_debug_hypothesis(hypothesis_a)}",
+        "improved": False,
+        "result": "no_progress",
+    })
+    calls, prompts = [], []
+    proposals = iter([
+        {"repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis_a},
+        {"repair_target": "scripts/two.py", "root_cause_hypothesis": "different upstream cause"},
+    ])
+    def fake_complete(messages, *_args):
+        calls.append(1)
+        prompts.append(messages[1]["content"])
+        return json.dumps(next(proposals))
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", fake_complete)
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir,
+        e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
+    )
+    assert diagnosis["repair_target"] == "scripts/two.py"
+    assert len(calls) == 2
+    assert "session-accepted-patch" in prompts[0]

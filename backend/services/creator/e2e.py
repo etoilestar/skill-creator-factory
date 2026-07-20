@@ -4026,46 +4026,37 @@ def _is_skill_repair_target(skill_dir: Path, target: str) -> bool:
 
 
 async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, e2e_errors: list[str], e2e_session: CreatorE2ESession, requested_model: str | None = None, retry_reason: str = "") -> dict[str, Any]:
-    """Select exactly one in-skill repair target from an E2E breakpoint snapshot."""
+    """Select one new in-skill repair target from the current E2E breakpoint."""
     failure = _structured_failure_from_errors(e2e_errors)
     symptom = str(failure.get("target_file") or _e2e_symptom_file_from_errors(e2e_errors) or "SKILL.md")
     details = failure.get("details") if isinstance(failure.get("details"), dict) else {}
+    workspace = e2e_session.workspace_dir
     traces = [event for event in e2e_session.events if event.get("event") in {"step_passed", "checkpoint_saved"}][-8:]
-    related = {"SKILL.md": (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")[-9000:]}
-    # Keep the context inside this Skill while exposing directly related scripts,
-    # so an upstream producer remains a viable diagnosis target.
-    scripts_dir = skill_dir / "scripts"
+    related = {"SKILL.md": (workspace / "SKILL.md").read_text(encoding="utf-8", errors="replace")[-9000:]}
+    scripts_dir = workspace / "scripts"
     if scripts_dir.is_dir():
         for path in sorted(scripts_dir.glob("*.py")):
-            rel = path.relative_to(skill_dir).as_posix()
-            limit = 12000 if rel == symptom else 4000
-            related[rel] = path.read_text(encoding="utf-8", errors="replace")[-limit:]
+            rel = path.relative_to(workspace).as_posix()
+            related[rel] = path.read_text(encoding="utf-8", errors="replace")[-(12000 if rel == symptom else 4000):]
     route = route_creator_file_model(file_path=symptom, purpose="E2E failure debug diagnosis only; select one repair target", requested_model=requested_model)
-    rejected = [a for a in e2e_session.debug_attempts if not a.get("improved")]
-    prompt = {
-        "structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"),
-        "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}),
-        "previous_step_traces": traces, "skill_files": related,
-        "platform_io_facts": _platform_io_repair_summary(), "previous_debug_attempts": rejected,
-        "retry_reason": retry_reason,
-    }
-    messages=[{"role":"system","content":"You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes."},{"role":"user","content":json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. A previously rejected target+hypothesis must not be repeated."}]
-    try:
-        text = _complete_chat_once_sync_for_e2e(messages, route.model)
-        data = _parse_validator_json_object(str(text or "")) or {}
-    except Exception as exc:
-        # A model outage must not turn a real E2E failure into an arbitrary
-        # cross-file repair; retain the symptom as a conservative fallback.
-        logger.warning("[Creator][E2E][diagnosis_unavailable] symptom=%s error=%s", symptom, exc)
-        data = {"repair_target": symptom, "root_cause_hypothesis": "Diagnosis model unavailable; verify the runtime symptom with one minimal localized patch.", "evidence": [str(exc)[:300]], "repair_instruction": "Make only the minimum patch supported by the runtime failure.", "confidence": "low"}
-    target = str(data.get("repair_target") or "").strip()
-    hypothesis = str(data.get("root_cause_hypothesis") or "").strip()
-    if not _is_skill_repair_target(skill_dir, target) or not hypothesis:
-        raise ValueError("e2e_debug_diagnosis_invalid_target_or_hypothesis")
-    key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
-    if any(a.get("hypothesis_key") == key and not a.get("improved") for a in e2e_session.debug_attempts):
-        raise ValueError("e2e_debug_diagnosis_repeated_rejected_hypothesis")
-    return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
+    rejected = [a for a in e2e_session.debug_attempts if a.get("result") == "no_progress" or not a.get("improved")]
+    prompt = {"structured_failure": failure, "symptom_file": symptom, "layer": failure.get("layer"), "filesystem_trace": details.get("filesystem_trace", {}), "runtime_binding_trace": details.get("runtime_binding_trace", {}), "previous_step_traces": traces, "skill_files": related, "platform_io_facts": _platform_io_repair_summary(), "previous_debug_attempts": rejected, "retry_reason": retry_reason}
+    messages = [{"role": "system", "content": "You diagnose a Creator E2E breakpoint. Output only JSON. Select exactly one primary repair_target. It must be SKILL.md or an existing scripts/*.py in this Skill. Do not propose edits or backend/runtime/tool changes."}, {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, default=str) + "\nReturn {repair_target, root_cause_hypothesis, evidence, repair_instruction, confidence}. The rejected combinations were tested by real sandbox E2E without improvement. Do not repeat them; select a different hypothesis and/or target."}]
+    for proposal_attempt in range(3):
+        try:
+            text = _complete_chat_once_sync_for_e2e(messages, route.model)
+            data = _parse_validator_json_object(str(text or "")) or {}
+        except Exception as exc:
+            logger.warning("[Creator][E2E][diagnosis_unavailable] symptom=%s error=%s", symptom, exc)
+            data = {"repair_target": symptom, "root_cause_hypothesis": "Diagnosis model unavailable; verify the runtime symptom with one minimal localized patch.", "evidence": [str(exc)[:300]], "repair_instruction": "Make only the minimum patch supported by the runtime failure.", "confidence": "low"}
+        target, hypothesis = str(data.get("repair_target") or "").strip(), str(data.get("root_cause_hypothesis") or "").strip()
+        key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
+        valid = _is_skill_repair_target(workspace, target) and bool(hypothesis)
+        repeated = any(a.get("hypothesis_key") == key and (a.get("result") == "no_progress" or not a.get("improved")) for a in e2e_session.debug_attempts)
+        if valid and not repeated:
+            return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
+        messages.append({"role": "user", "content": "Your proposal was invalid or was already rejected by a real sandbox experiment. Do not patch or run E2E; return a different valid target+hypothesis JSON proposal."})
+    return {"status": "diagnosis_exhausted", "symptom_file": symptom}
 
 
 async def _repair_existing_file_for_e2e_failure(
@@ -4104,6 +4095,8 @@ async def _repair_existing_file_for_e2e_failure(
         e2e_session=e2e_session,
         requested_model=requested_model,
     )
+    if diagnosis.get("status") == "diagnosis_exhausted":
+        return {"status": "diagnosis_exhausted", "repaired_target": None, "next_target": None, "next_failure": e2e_errors}
     target_path = diagnosis["repair_target"]
     _validate_file_path(target_path)
 
@@ -5182,7 +5175,10 @@ async def _repair_existing_file_for_e2e_failure(
                     e2e_session.current_revision += 1
                     if earliest_step:
                         _invalidate_checkpoints_from(e2e_session, earliest_step)
-                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": False})
+                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": False, "result": "no_progress"})
+                    if repair_events is not None:
+                        repair_events.extend(e2e_session.events)
+                    return {"status": "debug_hypothesis_rejected", "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"], "attempt": candidate_attempt}
                     no_progress_key = f"{target_path}:{baseline_fingerprint}:{failure_signature}"
                     baseline_no_progress_counts[no_progress_key] = baseline_no_progress_counts.get(no_progress_key, 0) + 1
                     baseline_no_progress_count = baseline_no_progress_counts[no_progress_key]
@@ -5379,9 +5375,9 @@ async def _repair_existing_file_for_e2e_failure(
 
                 if improved:
                     target_file.write_text(sanitized, encoding="utf-8")
-                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": True})
+                    e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": True, "result": "progressed"})
                     if repair_events is not None: repair_events.extend(e2e_session.events)
-                    return {"status": "repaired", "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "attempt": candidate_attempt}
+                    return {"status": "debug_progress", "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "attempt": candidate_attempt}
                     working_content = sanitized
                     baseline_errors = list(gate_errors)
                     baseline_no_progress_count = 0
@@ -5474,6 +5470,13 @@ async def _repair_existing_file_for_e2e_failure(
                     })
                 )
 
+            e2e_session.debug_attempts.append({
+                "symptom_file": diagnosis["symptom_file"], "repair_target": target_path,
+                "root_cause_hypothesis": diagnosis["root_cause_hypothesis"],
+                "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized),
+                "before_failure_signature": _e2e_behavior_fingerprint((baseline_errors or [""])[0], target_file=target_path),
+                "after_failure_signature": "", "improved": True, "result": "passed",
+            })
             target_file.parent.mkdir(
                 parents=True,
                 exist_ok=True,

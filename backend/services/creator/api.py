@@ -14307,7 +14307,9 @@ async def validate_skill(request: SkillActionRequest):
                 missing_stdlib_requests=missing_stdlib_reqs,
             )
 
-        target_path = _e2e_repair_target_from_errors(blocking_errors)
+        # This is the runtime symptom location, not a confirmed repair target.
+        # _repair_existing_file_for_e2e_failure performs the diagnosis phase.
+        target_path = _e2e_symptom_file_from_errors(blocking_errors)
         if target_path == "__validator__":
             return SkillActionResponse(
                 success=True,
@@ -14320,22 +14322,7 @@ async def validate_skill(request: SkillActionRequest):
                 warnings=advisory_warnings,
             )
 
-        if target_path in completed_targets:
-            return SkillActionResponse(
-                success=False,
-                path=None,
-                message=(
-                    "严格端到端工作流校验失败：已修复目标出现同目标回归，停止重复修复：\n"
-                    + "\n\n".join(blocking_errors)
-                    + f"\n\n回归目标：{target_path}"
-                    + (
-                        "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
-                        if repair_logs else ""
-                    )
-                ),
-                repair_events=repair_events or e2e_session.events,
-            )
-        if attempts_by_target.get(target_path, 0) >= max_attempts:
+        if attempt >= max_attempts:
             return SkillActionResponse(
                 success=False,
                 path=None,
@@ -14343,7 +14330,7 @@ async def validate_skill(request: SkillActionRequest):
                     "严格端到端工作流校验失败，且自动修复达到当前目标最大次数：\n"
                     + "\n\n".join(blocking_errors)
                     + f"\n\n自动修复目标：{target_path}"
-                    + f"\n当前目标尝试次数：{attempts_by_target.get(target_path, 0)}/{max_attempts}"
+                    + f"\nDebug experiments：{attempt}/{max_attempts}"
                     + (
                         "\n\n端到端自动修复记录：\n" + "\n".join(repair_logs)
                         if repair_logs else ""

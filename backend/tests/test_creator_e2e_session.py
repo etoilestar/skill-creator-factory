@@ -216,7 +216,7 @@ async def test_validate_skill_e2e_repair_handoff_continues_to_next_target(monkey
     monkeypatch.setattr(api, "validate_workflow_e2e", fake_validate_workflow_e2e)
     monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", fake_repair_existing_file_for_e2e_failure)
 
-    response = await api.validate_skill(SkillActionRequest(skill_name=skill_name, auto_repair=True, max_e2e_repair_attempts=1))
+    response = await api.validate_skill(SkillActionRequest(skill_name=skill_name, auto_repair=True, max_e2e_repair_attempts=2))
 
     assert response.success is True
     assert repaired_targets == ["scripts/step1.py", "scripts/step2.py"]
@@ -882,3 +882,36 @@ def test_e2e_repair_does_not_mutate_toolpool_digest(tmp_path, monkeypatch):
     assert [tool.tool_id for tool in after_pool.tools] == [tool.tool_id for tool in before_pool.tools]
     assert api._tool_binding_digest(after_binding) == before_digest
     assert context.get("read_only") is True or context == {}
+
+@pytest.mark.asyncio
+async def test_e2e_debug_diagnosis_can_choose_skill_md_not_symptom(monkeypatch, tmp_path):
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({
+        "repair_target": "SKILL.md", "root_cause_hypothesis": "The command passes an invalid upstream argument.",
+        "evidence": ["step 2 payload"], "repair_instruction": "Fix the command", "confidence": "high",
+    }))
+    diagnosis = await e2e._diagnose_e2e_failure_for_repair(
+        skill_name="demo", skill_dir=skill_dir,
+        e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py\nE2E_LAYER=script_exit\nE2E_STRUCTURED_FAILURE={\"target_file\": \"scripts/two.py\"}"],
+        e2e_session=session,
+    )
+    assert diagnosis["symptom_file"] == "scripts/two.py"
+    assert diagnosis["repair_target"] == "SKILL.md"
+
+
+@pytest.mark.asyncio
+async def test_e2e_debug_diagnosis_rejects_repeated_failed_hypothesis(monkeypatch, tmp_path):
+    skill_dir = _make_skill(tmp_path)
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    hypothesis = "Upstream script emits an invalid payload."
+    key = f"scripts/one.py|{e2e._normalized_debug_hypothesis(hypothesis)}"
+    session.debug_attempts.append({"hypothesis_key": key, "improved": False})
+    monkeypatch.setattr(e2e, "_complete_chat_once_sync_for_e2e", lambda *_args: json.dumps({
+        "repair_target": "scripts/one.py", "root_cause_hypothesis": hypothesis,
+    }))
+    with pytest.raises(ValueError, match="repeated_rejected_hypothesis"):
+        await e2e._diagnose_e2e_failure_for_repair(
+            skill_name="demo", skill_dir=skill_dir,
+            e2e_errors=["E2E_SYMPTOM_FILE=scripts/two.py"], e2e_session=session,
+        )

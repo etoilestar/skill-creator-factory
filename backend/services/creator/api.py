@@ -12263,6 +12263,48 @@ def _build_markdown_format_full_rewrite_prompt(
     deterministic_error: str,
     current_content: str,
 ) -> list[dict[str, str]]:
+    if file_path.startswith("references/"):
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是 references/*.md Markdown hard-format 全量重写器。"
+                    "只输出当前 Reference 文件的完整 Markdown 文件内容。"
+                    "这是格式重写，不是业务语义 repair。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"文件路径：{file_path}\n"
+                    f"Skill 名称：{skill_name}\n\n"
+                    "后台 Markdown hard format 校验失败项如下：\n"
+                    f"{deterministic_error}\n\n"
+                    "要求：\n"
+                    "1. 保留当前 Reference 已有有效语义和职责。\n"
+                    "2. 重新输出完整 Reference 文件，不输出 patch。\n"
+                    "3. 所有 Markdown fenced code blocks 必须完整成对闭合。\n"
+                    "4. 不要使用 outer ```markdown / ```md wrapper 包住整个输出文件。\n"
+                    "5. Reference 正文内部允许正常的 text/json/python 等示例 fenced block，但必须闭合。\n"
+                    "6. 不要输出 JSON patch。\n"
+                    "7. 不要输出 diff。\n"
+                    "8. 不要输出 old_lines/new_lines。\n"
+                    "9. 不要输出解释、日志、分析或 repair proposal。\n"
+                    "10. 不要新增或修改 scripts 的执行接口。\n"
+                    "11. 不要重新设计 Skill workflow。\n"
+                    "12. 不要重新设计 ResponsibilityGraph。\n"
+                    "13. 只修复当前 Reference 文件的 Markdown hard-format 问题。\n"
+                    "14. 输出必须是完整的当前 Reference Markdown 文件。\n\n"
+                    "蓝图上下文：\n"
+                    f"{(blueprint_text or '')[:8000]}\n\n"
+                    "当前文件内容：\n"
+                    "<<<CURRENT_FILE\n"
+                    f"{current_content or ''}\n"
+                    "CURRENT_FILE\n"
+                ),
+            },
+        ]
+
     return [
         {
             "role": "system",

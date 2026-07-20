@@ -277,6 +277,9 @@ def _normalize_generated_file_content(file_path: str, content: str) -> str:
     if file_path == "SKILL.md":
         return _strip_outer_markdown_fence_for_skill_md(candidate).strip()
 
+    if file_path.startswith("references/"):
+        return _strip_outer_markdown_fence_for_reference_md(candidate).strip()
+
     return _strip_code_fence(candidate)
 
 
@@ -419,6 +422,42 @@ def _strip_outer_markdown_fence_for_skill_md(content: str) -> str:
 
     body = "\n".join(lines[1:-1]).strip()
     return body + "\n"
+
+
+def _strip_outer_markdown_fence_for_reference_md(content: str) -> str:
+    """Strip a provably complete markdown wrapper around a reference file.
+
+    Unlike the generic fence stripper, this deliberately leaves incomplete
+    wrappers untouched.  Reference bodies may legitimately contain fenced
+    examples, so normalization must not guess which fence closes the wrapper.
+    """
+    text = (content or "").strip().lstrip("\ufeff")
+    lines = text.splitlines()
+    if len(lines) < 3:
+        return content
+
+    opening = re.fullmatch(r"(?P<fence>`{3,}|~{3,})(?:markdown|md)\s*", lines[0].strip(), flags=re.I)
+    if not opening:
+        return content
+
+    outer_fence = opening.group("fence")
+    stack: list[tuple[str, int]] = [(outer_fence[0], len(outer_fence))]
+    for line in lines[1:]:
+        fence_match = re.fullmatch(r"(?P<fence>`{3,}|~{3,})(?P<info>[^`]*)", line.strip())
+        if not fence_match:
+            continue
+        fence = fence_match.group("fence")
+        info = fence_match.group("info").strip()
+        if not info and stack and fence[0] == stack[-1][0] and len(fence) >= stack[-1][1]:
+            stack.pop()
+        else:
+            stack.append((fence[0], len(fence)))
+
+    closing = lines[-1].strip()
+    if stack or not re.fullmatch(rf"{re.escape(outer_fence[0])}{{{len(outer_fence)},}}\s*", closing):
+        return content
+
+    return "\n".join(lines[1:-1]).strip() + "\n"
 
 def _strip_code_fence(content: str) -> str:
     """Strip wrapping code-fence markers that a model may output despite instructions.

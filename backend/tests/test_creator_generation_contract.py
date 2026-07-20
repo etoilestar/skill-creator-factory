@@ -1,6 +1,11 @@
 import copy
 
-from backend.services.creator.generation import _script_local_contract_payload, build_available_tool_context
+from backend.services.creator.generation import (
+    _normalize_generated_file_content,
+    _script_local_contract_payload,
+    build_available_tool_context,
+)
+from backend.services.creator.contracts import detect_markdown_hard_format_failures
 from backend.services.creator_tool_registry import (
     ToolCapability,
     ToolFunctionManifest,
@@ -25,6 +30,33 @@ def _entry(**kw):
     )
     data.update(kw)
     return SkillPlanEntry(**data)
+
+
+def test_reference_normalization_strips_only_complete_outer_markdown_wrapper():
+    content = "```markdown\n# Title\n\n正文\n```\n"
+
+    assert _normalize_generated_file_content("references/guide.md", content) == "# Title\n\n正文"
+
+
+def test_reference_normalization_preserves_internal_fenced_code_block():
+    content = "# Title\n\n```python\nprint('hello')\n```\n"
+
+    assert _normalize_generated_file_content("references/guide.md", content) == content.strip()
+
+
+def test_reference_normalization_leaves_incomplete_outer_wrapper_for_validator():
+    content = "```markdown\n# Title\n\n```python\nprint('hello')\n```\n"
+
+    normalized = _normalize_generated_file_content("references/guide.md", content)
+
+    assert normalized == content.strip()
+    failures = detect_markdown_hard_format_failures("references/guide.md", normalized, False)
+    assert any(failure["id"] == "markdown.fences.unclosed" for failure in failures)
+
+
+def test_script_and_skill_normalization_behaviors_remain_path_specific():
+    assert _normalize_generated_file_content("scripts/a.py", "```python\nprint('ok')\n```") == "print('ok')"
+    assert _normalize_generated_file_content("SKILL.md", "```markdown\n# Skill\n```") == "# Skill"
 
 
 def test_script_local_contract_merges_structured_tool_binding_with_explicit_values():

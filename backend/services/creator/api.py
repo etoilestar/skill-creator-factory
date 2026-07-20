@@ -6114,6 +6114,11 @@ For every required business action or transformation:
 The final plan is ready only when every required computation has an executable
 owner under the real host execution model.
 
+Replay the complete graph from platform input boundary, through executable
+responsibility owners, to platform output boundary. Verify that required runtime
+inputs and required final results are not disconnected from their immutable
+platform boundary slots.
+
 Every function_items item must be a JSON object with exactly:
 target_file, role, purpose, inputs, outputs, required_capabilities, constraints.
 target_file must exactly equal one item from allowed_function_item_targets.
@@ -6388,6 +6393,10 @@ Check only these three principles:
 3. Executability: every required computation has a real execution owner and
    the graph does not depend on implicit host execution behavior.
 
+Graph alignment includes end-to-end platform boundary closure. A graph is not
+fully aligned when required runtime inputs or required final results exist in
+FunctionItems but are disconnected from immutable platform boundary slots.
+
 For each issue, localize the affected target_files and affected_edge_indexes,
 state the current alignment fact as evidence, and give only localized repair
 guidance. Do not propose FilePlan changes.
@@ -6500,6 +6509,32 @@ Return only strict JSON:
     return {"function_items": data["function_items"], "responsibility_edges": data["responsibility_edges"]}
 
 
+def _validate_responsibility_graph_boundary_presence(
+    responsibility_edges: list[dict[str, Any]],
+    allowed_function_item_targets: list[str],
+) -> None:
+    """Require platform transport endpoints at both ends of the graph."""
+
+    function_item_targets = set(allowed_function_item_targets)
+    has_platform_input = any(
+        edge.get("from_node") == "platform_input_node"
+        and edge.get("to_node") in function_item_targets
+        for edge in responsibility_edges
+    )
+    has_platform_output = any(
+        edge.get("to_node") == "platform_output_node"
+        and edge.get("from_node") in function_item_targets
+        for edge in responsibility_edges
+    )
+    missing = []
+    if not has_platform_input:
+        missing.append("missing platform input boundary edge")
+    if not has_platform_output:
+        missing.append("missing platform output boundary edge")
+    if missing:
+        raise ValueError("; ".join(missing))
+
+
 def _resolve_allowed_function_item_targets_from_blueprint(
     internal_blueprint_text: str,
 ) -> list[str]:
@@ -6600,6 +6635,13 @@ each FunctionItem script is invoked according to the generated workflow;
 every required computation must have a real executable owner; and every
 ResponsibilityEdge must be satisfiable as data transport without assuming an
 undeclared workflow execution engine.
+
+Platform boundary nodes are immutable transport endpoints, not executable
+FunctionItems. Preserve complete end-to-end platform boundary closure: required
+runtime inputs enter the executable responsibility graph through valid platform
+input boundary slots, and required final results leave it through valid platform
+output boundary slots. ResponsibilityEdges may connect platform boundary to
+FunctionItem, FunctionItem to FunctionItem, or FunctionItem to platform boundary.
 
 Every target_file must be copied exactly from allowed_function_item_targets.
 Do not invent a target path.
@@ -7638,14 +7680,32 @@ Blueprint Planner 只规划业务责任。
                 responsibility_edges=list(data.get("responsibility_edges") or []),
                 planner_model=route.model,
             )
-            if not alignment_review["passed"]:
+            boundary_error = ""
+            try:
+                _validate_responsibility_graph_boundary_presence(
+                    list(data.get("responsibility_edges") or []),
+                    allowed_function_item_targets,
+                )
+            except ValueError as exc:
+                boundary_error = str(exc)
+            if not alignment_review["passed"] or boundary_error:
+                repair_issues = list(alignment_review["issues"])
+                if boundary_error:
+                    repair_issues.append({
+                        "id": "platform_boundary_presence",
+                        "target_files": [],
+                        "affected_edge_indexes": [],
+                        "reason": boundary_error,
+                        "evidence": "The current responsibility graph lacks a required platform boundary edge.",
+                        "repair_guidance": "Restore platform boundary closure without changing the frozen FilePlan.",
+                    })
                 repaired_graph = await _repair_responsibility_graph_alignment(
                     request=request,
                     frozen_blueprint_text=frozen_blueprint_text,
                     allowed_function_item_targets=allowed_function_item_targets,
                     function_items=list(data.get("function_items") or []),
                     responsibility_edges=list(data.get("responsibility_edges") or []),
-                    review_issues=alignment_review["issues"],
+                    review_issues=repair_issues,
                     planner_model=route.model,
                 )
                 repaired_function_items = normalize_structured_function_items(
@@ -7673,6 +7733,10 @@ Blueprint Planner 只规划业务责任。
                         "one localized same-Planner repair; "
                         f"issues={final_alignment_review['issues']}"
                     )
+                _validate_responsibility_graph_boundary_presence(
+                    repaired_edges,
+                    allowed_function_item_targets,
+                )
                 data["function_items"] = repaired_function_items
                 data["responsibility_edges"] = repaired_edges
                 data["internal_blueprint_text"] = _render_structured_responsibility_view(

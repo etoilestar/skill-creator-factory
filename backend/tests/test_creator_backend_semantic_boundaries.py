@@ -613,6 +613,33 @@ def test_skill_md_and_markdown_rewrite_prompts_use_input_json_position_arg_wordi
         assert "sys.argv[1]" in prompt
 
 
+def test_reference_markdown_full_rewrite_prompt_is_reference_format_specific():
+    rewrite_messages = creator_api._build_markdown_format_full_rewrite_prompt(
+        file_path="references/guide.md",
+        skill_name="demo",
+        blueprint_text="目录结构:\n- references/guide.md\n",
+        deterministic_error="reference.markdown.fences_balanced",
+        current_content="```markdown\n# Guide\n",
+    )
+    prompt = "\n".join(str(message.get("content") or "") for message in rewrite_messages)
+
+    for expected in (
+        "references/*.md",
+        "fenced code blocks 必须完整成对闭合",
+        "完整 Markdown 文件",
+        "outer ```markdown / ```md wrapper",
+    ):
+        assert expected in prompt
+    for forbidden in (
+        "sys.argv[1]",
+        "脚本路径后的第一个位置参数",
+        "JSON argv",
+        "保持现有脚本调用形式",
+        "workflow dataflow",
+    ):
+        assert forbidden not in prompt
+
+
 @pytest.mark.asyncio
 async def test_reference_semantic_review_normalizes_string_issues(monkeypatch):
     class Route:

@@ -14388,7 +14388,7 @@ async def validate_skill(request: SkillActionRequest):
                 read_only_callable_context=e2e_callable_repair_context,
             )
             status = repair_result.get("status")
-            if status in {"repaired", "debug_progress", "debug_hypothesis_rejected", "target_changed"}:
+            if repair_result.get("sandbox_executed") is True:
                 attempt += 1
             repaired_target = repair_result.get("repaired_target") or target_path
             if status == "target_changed":

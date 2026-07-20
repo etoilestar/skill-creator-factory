@@ -976,3 +976,22 @@ async def test_validate_skill_bounds_patch_proposal_exhaustion_cycles(monkeypatc
     assert response.success is False
     assert "orchestration cycle" in response.message
     assert len(calls) == 3
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_status", ["debug_hypothesis_rejected", "debug_progress"])
+async def test_validate_skill_continues_after_sandbox_debug_outcome(monkeypatch, tmp_path, first_status):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+    skill_dir = tmp_path / "demo"; (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_a, **_k: SimpleNamespace(events=[]))
+    failures = iter([["E2E_SYMPTOM_FILE=scripts/b.py\nE2E_LAYER=script_exit"], ["E2E_SYMPTOM_FILE=scripts/a.py\nE2E_LAYER=script_exit"], []])
+    monkeypatch.setattr(api, "validate_workflow_e2e", lambda *_a, **_k: next(failures))
+    results = iter([{"status": first_status, "repaired_target": "scripts/b.py", "sandbox_executed": True}, {"status": "repaired", "repaired_target": "scripts/a.py", "sandbox_executed": True}])
+    calls = []
+    async def repair(**kwargs): calls.append(kwargs["target_path"]); return next(results)
+    monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", repair)
+    response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=2))
+    assert response.success is True
+    assert calls == ["scripts/b.py", "scripts/a.py"]

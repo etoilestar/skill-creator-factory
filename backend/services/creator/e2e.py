@@ -4187,6 +4187,7 @@ async def _repair_existing_file_for_e2e_failure(
 
             return {
                 "status": "repaired",
+                "sandbox_executed": False,
                 "repaired_target": "SKILL.md",
                 "patch_status": (
                     "deterministic_command_normalized"
@@ -5515,6 +5516,7 @@ async def _repair_existing_file_for_e2e_failure(
 
             return {
                 "status": "repaired",
+                "sandbox_executed": True,
                 "repaired_target": target_path,
                 "next_target": None,
                 "next_failure": [],

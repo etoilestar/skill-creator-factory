@@ -2273,6 +2273,9 @@ def _normalize_e2e_failure_text(value: str) -> str:
     text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<UUID>", text, flags=re.I)
     text = re.sub(r"0x[0-9a-f]+", "<ADDRESS>", text, flags=re.I)
     text = re.sub(r"\b(?:port|PORT)[ =:]\d{2,5}\b", "port=<PORT>", text)
+    text = re.sub(r"\b(elapsed|duration)=[0-9]+(?:\.[0-9]+)?\b", r"\1=<DURATION>", text, flags=re.I)
+    text = re.sub(r"\bpid=\d+\b", "pid=<PID>", text, flags=re.I)
+    text = re.sub(r"\brequest_id=[A-Za-z0-9_-]+\b", "request_id=<REQUEST_ID>", text, flags=re.I)
     text = re.sub(r"^\s*\d{4}-\d\d-\d\d[T ][0-2]\d:[0-5]\d:[0-5]\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d)?\s*", "", text, flags=re.M)
     return " ".join(text.split())
 
@@ -2311,10 +2314,13 @@ def _e2e_failure_identity(error: str, *, target_file: str = "") -> dict[str, Any
 
 def _e2e_breakpoint_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
     """Return whether evidence shows a material new breakpoint, not noise."""
-    for key in ("exception_type", "traceback_function", "traceback_source_line", "error_code", "target_region"):
+    structural_fields = ("exception_type", "traceback_function", "traceback_source_line", "error_code", "target_region")
+    for key in structural_fields:
         if before.get(key) and after.get(key) and before[key] != after[key]:
             return True
-    # For structured non-traceback failures, the stable actual is the blocker.
+    # Actual text is a fallback only when there is no stable structural evidence.
+    if any(before.get(key) or after.get(key) for key in structural_fields):
+        return False
     return bool(before.get("normalized_actual") and after.get("normalized_actual") and before["normalized_actual"] != after["normalized_actual"])
 
 
@@ -4098,17 +4104,11 @@ async def _diagnose_e2e_failure_for_repair(*, skill_name: str, skill_dir: Path, 
         target, hypothesis = str(data.get("repair_target") or "").strip(), str(data.get("root_cause_hypothesis") or "").strip()
         key = f"{target}|{_normalized_debug_hypothesis(hypothesis)}"
         valid = _is_skill_repair_target(workspace, target) and bool(hypothesis)
-        failure_identity = _e2e_failure_identity((e2e_errors or [""])[0], target_file=symptom)
-        family_no_progress = _count_matching_no_progress_attempts(
-            e2e_session, repair_target=target, before_failure_identity=failure_identity,
-        )
         # Hypothesis wording is explanatory only. Actual experiment deduplication
-        # happens after a patch digest exists, before Sandbox is invoked. After
-        # two distinct no-progress experiments, force a new target (the model
-        # does not supply a separately enforceable repair-region field).
-        if valid and family_no_progress < 2:
+        # happens after a patch digest exists, before Sandbox is invoked.
+        if valid:
             return {"repair_target": target, "symptom_file": symptom, "root_cause_hypothesis": hypothesis, "evidence": data.get("evidence") or [], "repair_instruction": str(data.get("repair_instruction") or ""), "confidence": data.get("confidence") or "", "hypothesis_key": key}
-        messages.append({"role": "user", "content": "Your proposal was invalid, or this breakpoint already has two no-progress experiments for that target. Do not merely rewrite the hypothesis: return a different valid repair target JSON proposal."})
+        messages.append({"role": "user", "content": "Your proposal was invalid. Return a different valid repair target JSON proposal."})
     return {"status": "diagnosis_exhausted", "symptom_file": symptom}
 
 
@@ -5005,11 +5005,14 @@ async def _repair_existing_file_for_e2e_failure(
                          "status": "duplicate_experiment_rejected", "progress_reason": "duplicate_experiment",
                          "candidate_retained": False, "candidate_rolled_back": False,
                          "before_failure_identity": before_identity, "experiment_key": experiment_key,
-                         "diagnosis_family_key": diagnosis_family_key, "rerun_status": "skipped"}
+                         "diagnosis_family_key": diagnosis_family_key, "rerun_status": "skipped",
+                         "writeback_status": "not_written"}
                 e2e_session.events.append(event)
                 if repair_events is not None:
                     repair_events.extend(e2e_session.events)
-                return {"status": "duplicate_experiment_rejected", "sandbox_executed": False, "repaired_target": target_path,
+                return {"status": "debug_hypothesis_rejected", "rejection_reason": "duplicate_experiment",
+                        "progress_reason": "duplicate_experiment", "sandbox_executed": False,
+                        "candidate_retained": False, "candidate_rolled_back": False, "repaired_target": target_path,
                         "next_target": None, "next_failure": baseline_errors, "experiment_key": experiment_key, "attempt": candidate_attempt}
 
             old_command_signature = (
@@ -5264,7 +5267,9 @@ async def _repair_existing_file_for_e2e_failure(
                         e2e_session.events[-1].update({"status": "debug_hypothesis_rejected", "no_progress_count": no_progress_count, "writeback_status": "rolled_back"})
                     if repair_events is not None:
                         repair_events.extend(e2e_session.events)
-                    return {"status": "debug_hypothesis_rejected", "sandbox_executed": True, "repaired_target": target_path,
+                    return {"status": "debug_hypothesis_rejected", "rejection_reason": "same_breakpoint_repeated",
+                            "progress_reason": "same_breakpoint_repeated", "sandbox_executed": True,
+                            "candidate_retained": False, "candidate_rolled_back": True, "repaired_target": target_path,
                             "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"],
                             "experiment_key": experiment_key, "no_progress_count": no_progress_count, "attempt": candidate_attempt}
                 e2e_session.debug_attempts.append(attempt_record)
@@ -5465,7 +5470,9 @@ async def _repair_existing_file_for_e2e_failure(
                     if e2e_session.events:
                         e2e_session.events[-1].update({"status": "debug_progress", "writeback_status": "written"})
                     if repair_events is not None: repair_events.extend(e2e_session.events)
-                    return {"status": "debug_progress", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "experiment_key": experiment_key, "attempt": candidate_attempt}
+                    return {"status": "debug_progress", "progress_reason": progress_reason, "sandbox_executed": True,
+                            "candidate_retained": True, "candidate_rolled_back": False, "repaired_target": target_path,
+                            "next_target": None, "next_failure": gate_errors, "experiment_key": experiment_key, "attempt": candidate_attempt}
 
             for error in e2e_errors:
                 (

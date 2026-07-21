@@ -1063,3 +1063,117 @@ def test_experiment_key_deduplicates_wording_but_allows_different_patch(tmp_path
         {"result": "no_progress", "repair_target": "scripts/generate_images.py", "before_failure_identity": identity},
     ])
     assert e2e._count_matching_no_progress_attempts(session, repair_target="scripts/generate_images.py", before_failure_identity=identity) == 2
+
+
+def test_same_structural_breakpoint_with_dynamic_actual_is_not_progress():
+    before = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]',
+    )
+    after = _structured_runtime_error(
+        workspace="/tmp/creator-e2e-session-b", exception="TypeError", source='response["text"]',
+    )
+    before_data = json.loads(before.removeprefix("E2E_STRUCTURED_FAILURE="))
+    after_data = json.loads(after.removeprefix("E2E_STRUCTURED_FAILURE="))
+    before_data["actual"] = "request failed after 1.24 seconds; elapsed=1.24 pid=10001"
+    after_data["actual"] = "request failed after 1.87 seconds; elapsed=1.87 pid=10002"
+    before = "E2E_STRUCTURED_FAILURE=" + json.dumps(before_data)
+    after = "E2E_STRUCTURED_FAILURE=" + json.dumps(after_data)
+
+    assert e2e._e2e_breakpoint_changed(e2e._e2e_failure_identity(before), e2e._e2e_failure_identity(after)) is False
+    assert e2e._e2e_candidate_improved([before], [after], target_file="scripts/generate_images.py") is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_experiment_skips_sandbox_with_compatible_status(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    original = "print('original')\n"
+    (skill_dir / "scripts" / "one.py").write_text(original, encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", lambda **kwargs: SimpleNamespace(role="generic_script", runtime="python", runtime_contract={"stdout": ["ok"]}, coverage_requirements=[], selected_tools=[]))
+    monkeypatch.setattr(e2e, "_validate_e2e_script_static_preflight", lambda **kwargs: None)
+    async def diagnose(**kwargs):
+        return {"repair_target": "scripts/one.py", "symptom_file": "scripts/one.py", "root_cause_hypothesis": "same", "hypothesis_key": "same"}
+    monkeypatch.setattr(e2e, "_diagnose_e2e_failure_for_repair", diagnose)
+    candidate = "print('candidate')\n"
+    async def patch(**kwargs):
+        return None, candidate, {"changed_line_count": 1, "applied": [{"fallback_type": "test"}]}
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", patch)
+    sandbox_calls = []
+    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", lambda **kwargs: sandbox_calls.append(kwargs))
+
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+    baseline = ["E2E_REPAIR_TARGET=scripts/one.py\nE2E_LAYER=script_exit\nTypeError: same"]
+    identity = e2e._e2e_failure_identity(baseline[0], target_file="scripts/one.py")
+    digest = e2e._stable_json_hash(e2e._normalize_e2e_failure_text(candidate))
+    key = e2e._e2e_experiment_key(repair_target="scripts/one.py", before_failure_identity=identity, patch_digest=digest)
+    session.debug_attempts.append({"experiment_key": key})
+
+    result = await e2e._repair_existing_file_for_e2e_failure(skill_name="demo", target_path="scripts/one.py", e2e_errors=baseline, e2e_session=session)
+    assert sandbox_calls == []
+    assert result["status"] == "debug_hypothesis_rejected"
+    assert result["rejection_reason"] == "duplicate_experiment"
+    assert result["sandbox_executed"] is False
+    assert (session.workspace_dir / "scripts" / "one.py").read_text(encoding="utf-8") == original
+    assert (skill_dir / "scripts" / "one.py").read_text(encoding="utf-8") == original
+    assert session.events[-1]["status"] == "duplicate_experiment_rejected"
+    assert session.events[-1]["writeback_status"] == "not_written"
+
+@pytest.mark.asyncio
+async def test_same_step_new_breakpoint_retains_candidate_for_next_diagnosis(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    skill_dir = root / "demo"
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    old = 'response["text"]\n'
+    candidate = 'response_text = response if isinstance(response, str) else response.get("text", "")\n'
+    target = skill_dir / "scripts" / "one.py"
+    target.write_text(old, encoding="utf-8")
+    monkeypatch.setattr(e2e.settings, "skills_path", root)
+    monkeypatch.setattr(e2e, "_skill_plan_entry_for_file", lambda **kwargs: SimpleNamespace(role="generic_script", runtime="python", runtime_contract={"stdout": ["ok"]}, coverage_requirements=[], selected_tools=[]))
+    monkeypatch.setattr(e2e, "_validate_e2e_script_static_preflight", lambda **kwargs: None)
+    async def diagnose(**kwargs):
+        return {"repair_target": "scripts/one.py", "symptom_file": "scripts/one.py", "root_cause_hypothesis": "fix response", "hypothesis_key": "fix"}
+    monkeypatch.setattr(e2e, "_diagnose_e2e_failure_for_repair", diagnose)
+    async def patch(**kwargs):
+        return None, candidate, {"changed_line_count": 1, "applied": [{"fallback_type": "test"}]}
+    monkeypatch.setattr(e2e, "_request_and_apply_repair_patch", patch)
+    command = E2EWorkflowCommand(2, "SKILL.md", "scripts/one.py", "python scripts/one.py '{}'", "python", {})
+    monkeypatch.setattr(e2e, "_extract_e2e_workflow_commands", lambda *args, **kwargs: [command])
+    monkeypatch.setattr(e2e, "_command_plan_signature", lambda commands: "sig")
+    monkeypatch.setattr(e2e, "_earliest_invalid_step", lambda **kwargs: 2)
+    monkeypatch.setattr(e2e, "_invalidate_checkpoints_from", lambda *args, **kwargs: [])
+    monkeypatch.setattr(e2e, "_load_valid_checkpoint", lambda *args, **kwargs: None)
+    before = _structured_runtime_error(workspace="/tmp/creator-e2e-session-a", exception="TypeError", source='response["text"]')
+    after = _structured_runtime_error(workspace="/tmp/creator-e2e-session-a", exception="NameError", source="file_outputs")
+    monkeypatch.setattr(e2e, "_run_e2e_sandbox_acceptance_gate", lambda **kwargs: {"accepted": False, "errors": [after]})
+    session = e2e._create_e2e_session("demo", source_skill_dir=skill_dir)
+
+    result = await e2e._repair_existing_file_for_e2e_failure(skill_name="demo", target_path="scripts/one.py", e2e_errors=[before], e2e_session=session)
+    assert result["status"] == "debug_progress"
+    assert result["progress_reason"] == "same_step_new_breakpoint"
+    assert result["candidate_retained"] is True
+    assert result["candidate_rolled_back"] is False
+    assert target.read_text(encoding="utf-8") == candidate.strip()
+    assert (session.workspace_dir / "scripts" / "one.py").read_text(encoding="utf-8") == candidate.strip()
+
+@pytest.mark.asyncio
+async def test_validate_skill_continues_after_duplicate_without_spending_attempt(monkeypatch, tmp_path):
+    from backend.services.creator import api
+    from backend.services.creator.common import SkillActionRequest
+    skill_dir = tmp_path / "demo"; (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    monkeypatch.setattr(api.settings, "skills_path", tmp_path)
+    monkeypatch.setattr(api, "_create_e2e_session", lambda *_a, **_k: SimpleNamespace(events=[]))
+    failures = iter([["E2E_SYMPTOM_FILE=scripts/a.py\nE2E_LAYER=script_exit"], ["E2E_SYMPTOM_FILE=scripts/a.py\nE2E_LAYER=script_exit"], []])
+    monkeypatch.setattr(api, "validate_workflow_e2e", lambda *_a, **_k: next(failures))
+    results = iter([
+        {"status": "debug_hypothesis_rejected", "rejection_reason": "duplicate_experiment", "sandbox_executed": False, "repaired_target": "scripts/a.py"},
+        {"status": "repaired", "sandbox_executed": True, "repaired_target": "scripts/a.py"},
+    ])
+    async def repair(**kwargs): return next(results)
+    monkeypatch.setattr(api, "_repair_existing_file_for_e2e_failure", repair)
+    response = await api.validate_skill(SkillActionRequest(skill_name="demo", auto_repair=True, max_e2e_repair_attempts=1))
+    assert response.success is True

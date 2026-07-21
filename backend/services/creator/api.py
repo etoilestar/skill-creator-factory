@@ -47,6 +47,8 @@ from ..creator_tool_registry import get_tool_capability
 from .runtime_import_guard import guard_runtime_imports
 from .basic_format import check_patch_candidate_basic_format
 from .command_normalizer import _effective_command_lines
+from .command_normalizer import parse_skill_md_bash_command_blocks
+from . import contracts as creator_contracts
 
 
 def _tool_binding_digest(binding: dict[str, Any]) -> str:
@@ -12036,7 +12038,33 @@ def _single_skill_md_command_block_failure(original: Exception | None) -> dict[s
     first.pop("result", None)
     return first
 
-def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_path: str) -> None:
+def _command_block_arg_protocol(structured_checks: Any, failure_reasons: Any) -> dict[str, Any]:
+    """Extract already-established argv facts without guessing business fields."""
+    facts: dict[str, Any] = {}
+    stack = [structured_checks, failure_reasons]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key in ("expected_arg_mode", "requires_json_argv", "argv_schema", "required_keys"):
+                if key in value and key not in facts:
+                    facts[key] = value[key]
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    schema = facts.get("argv_schema") if isinstance(facts.get("argv_schema"), dict) else {}
+    required = facts.get("required_keys")
+    if not isinstance(required, list):
+        required = schema.get("required_keys", schema.get("required", [])) if isinstance(schema, dict) else []
+    facts["argv_schema"] = schema
+    facts["required_keys"] = [str(key) for key in required if isinstance(key, str)] if isinstance(required, (list, tuple, set)) else []
+    facts["expected_arg_mode"] = str(facts.get("expected_arg_mode") or "")
+    facts["requires_json_argv"] = facts.get("requires_json_argv") is True
+    return facts
+
+
+def _validate_repaired_skill_md_command_block(
+    repaired_block: str, *, script_path: str, arg_protocol: dict[str, Any] | None = None,
+) -> None:
     text = str(repaired_block or "")
     if text.lstrip().startswith("---"):
         raise ValueError("repaired command block must not contain frontmatter or Markdown headings")
@@ -12058,6 +12086,22 @@ def _validate_repaired_skill_md_command_block(repaired_block: str, *, script_pat
         raise ValueError("repaired command block must contain exactly one command line")
     if script_path not in command_lines[0]:
         raise ValueError("repaired command block must invoke the same script_path")
+    protocol = arg_protocol or {}
+    json_required = protocol.get("expected_arg_mode") == "json_object" or protocol.get("requires_json_argv") is True
+    if not json_required:
+        return
+    blocks = parse_skill_md_bash_command_blocks(text)
+    if len(blocks) != 1:
+        raise ValueError("repaired command block must contain exactly one parseable bash block")
+    signature = creator_contracts._command_signature(command_lines[0], script_path)
+    if not signature or signature.get("arg_mode") != "json_arg":
+        raise ValueError("repaired command block must use one shell-quoted JSON object argv")
+    payload = signature.get("json_payload")
+    if not isinstance(payload, dict):
+        raise ValueError("repaired command block JSON argv must decode to an object")
+    missing = set(protocol.get("required_keys") or []) - set(payload)
+    if missing:
+        raise ValueError(f"repaired command block JSON argv missing required keys: {', '.join(sorted(missing))}")
 
 
 async def _repair_skill_md_command_block(
@@ -12071,6 +12115,7 @@ async def _repair_skill_md_command_block(
     retry_index: int = 0,
 ) -> str:
     """Repair exactly one SKILL.md bash command block without sending full SKILL.md."""
+    arg_protocol = _command_block_arg_protocol(structured_checks, failure_reasons)
     messages = [
         {
             "role": "system",
@@ -12079,6 +12124,11 @@ async def _repair_skill_md_command_block(
                 "只返回修复后的一个完整 ```bash fenced block。"
                 "不要返回完整 SKILL.md。不要返回 frontmatter、标题、正文、解释或其他 block。"
                 "仍然调用原 script_path。"
+                "命令协议约束：只修复当前传入的一个 bash fenced block，不得修改其它 SKILL.md 内容。"
+                "如果 expected_arg_mode=json_object：script_path 后必须只有一个业务参数；该参数必须是可由 json.loads() 解析的 JSON object；"
+                "外层必须使用 shell 引号，JSON 内部必须使用标准双引号。严禁改为 --topic、--input、--prompt 等 argparse flags，"
+                "除非当前脚本合同明确声明 argparse_flags。JSON key 必须来自真实 argv_schema，不得自行发明或替换字段名。"
+                "格式示例 python scripts/example.py '{\"field\":\"{{source}}\"}' 中 field 仅是格式示例，真实字段必须来自 argv_schema。"
             ),
         },
         {
@@ -12091,6 +12141,8 @@ async def _repair_skill_md_command_block(
                 f"{json.dumps(structured_checks, ensure_ascii=False, indent=2, default=str)}\n\n"
                 "失败原因:\n"
                 f"{json.dumps(failure_reasons, ensure_ascii=False, indent=2, default=str)}\n\n"
+                "脚本参数协议事实:\n"
+                f"{json.dumps(arg_protocol, ensure_ascii=False, indent=2, default=str)}\n\n"
                 "硬性要求：只返回一个完整 ```bash fenced block；block 内只包含一条有效命令；"
                 "命令仍然调用同一个 script_path；不要输出任何其它 Markdown。"
             ),
@@ -12104,7 +12156,7 @@ async def _repair_skill_md_command_block(
         prompt_variant="repair_skill_md_command_block",
         retry_index=retry_index,
     )
-    _validate_repaired_skill_md_command_block(repaired_block, script_path=script_path)
+    _validate_repaired_skill_md_command_block(repaired_block, script_path=script_path, arg_protocol=arg_protocol)
     return repaired_block
 
 

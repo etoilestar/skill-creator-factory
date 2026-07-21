@@ -1499,3 +1499,73 @@ def test_repaired_block_effective_command_lines_ignore_comments_but_reject_two_c
             "```bash\npython scripts/a.py '{}'\npython scripts/b.py '{}'\n```",
             script_path="scripts/a.py",
         )
+
+
+def test_deterministic_json_argv_failures_include_command_block_locator():
+    from backend.services.creator import api, contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+
+    content = "```bash\npython scripts/generate_story.py {\"topic\":\"{{user_request}}\"}\n```\n"
+    block = parse_skill_md_bash_command_blocks(content)[0]
+    entry = contracts.SkillPlanEntry(
+        path="scripts/generate_story.py", role="script", file_type="python", purpose="test",
+        runtime="python", inputs=[], outputs=[], dependencies=[],
+    )
+    results = contracts._validate_command_is_single_shell_json_invocation(
+        command=block.content, script_path="scripts/generate_story.py", entry=entry,
+        block=block, skill_md_content=content, block_ordinal=1,
+    )
+    failure = next(item for item in results if item.id == "skill_md.command_block.args_parseable")
+
+    assert not failure.passed
+    assert failure.details["script_path"] == "scripts/generate_story.py"
+    assert failure.details["block_text"] and failure.details["command_text"]
+    assert failure.details["block_start"] >= 0
+    assert failure.details["block_end"] > failure.details["block_start"]
+    assert failure.details["block_sha256"]
+    assert failure.details["skill_md_block_repair_scope"]
+
+    flags = "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```\n"
+    flag_block = parse_skill_md_bash_command_blocks(flags)[0]
+    flag_results = contracts._validate_command_is_single_shell_json_invocation(
+        command=flag_block.content, script_path="scripts/generate_story.py", entry=entry,
+        block=flag_block, skill_md_content=flags, block_ordinal=1,
+    )
+    flag_failure = next(item for item in flag_results if item.id == "skill_md.command_block.args_parseable")
+    assert flag_failure.details["arg_mode"] == "argparse_flags"
+    assert api._single_skill_md_command_block_failure(
+        contracts.ContractValidationError("failed", [flag_failure])
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_command_block_repair_retries_after_json_argv_protocol_rejection(monkeypatch):
+    from backend.services.creator import api
+
+    replies = iter([
+        "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```",
+        "```bash\npython scripts/generate_story.py '{\"story_prompt\":\"{{user_request}}\"}'\n```",
+    ])
+    calls = []
+
+    async def fake_complete(**kwargs):
+        calls.append(kwargs)
+        return next(replies)
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete)
+    protocol = {
+        "expected_arg_mode": "json_object",
+        "requires_json_argv": True,
+        "argv_schema": {"required": ["story_prompt"], "properties": {"story_prompt": {"type": "string"}}},
+    }
+    with pytest.raises(ValueError, match="JSON object argv"):
+        await api._repair_skill_md_command_block(
+            model="unit-test", skill_name="demo", block_text="```bash\npython scripts/generate_story.py --topic 'x'\n```",
+            script_path="scripts/generate_story.py", structured_checks=protocol, failure_reasons=[], retry_index=0,
+        )
+    repaired = await api._repair_skill_md_command_block(
+        model="unit-test", skill_name="demo", block_text="```bash\npython scripts/generate_story.py --topic 'x'\n```",
+        script_path="scripts/generate_story.py", structured_checks=protocol, failure_reasons=[], retry_index=1,
+    )
+    assert "story_prompt" in repaired and "--topic" not in repaired
+    assert len(calls) == 2

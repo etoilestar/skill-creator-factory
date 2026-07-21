@@ -1569,3 +1569,160 @@ async def test_command_block_repair_retries_after_json_argv_protocol_rejection(m
     )
     assert "story_prompt" in repaired and "--topic" not in repaired
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_file_retries_command_block_repair_after_invalid_json_argv(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api, contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+    first = "```bash\npython scripts/one.py '{\"one\":\"{{user_request}}\"}'\n```\n"
+    bad = "```bash\npython scripts/generate_story.py {\"story_prompt\":\"{{user_request}}\"}\n```\n"
+    third = "```bash\npython scripts/three.py '{\"three\":\"{{user_request}}\"}'\n```\n"
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n" + first + "Middle\n" + bad + "Tail\n" + third
+    fixed = "```bash\npython scripts/generate_story.py '{\"story_prompt\":\"{{user_request}}\"}'\n```\n"
+    block = next(item for item in parse_skill_md_bash_command_blocks(candidate) if item.script_path == "scripts/generate_story.py")
+    full_block = candidate[block.start:block.end]
+    failure = contracts.ContractCheckResult(
+        id="skill_md.command_block.args_parseable", passed=False, target="scripts/generate_story.py",
+        message="JSON argv required", expected="JSON object argv", minimal_edit="quote JSON",
+        details={
+            "script_path": "scripts/generate_story.py", "block_text": full_block, "full_block_text": full_block,
+            "command_text": block.content, "command_body_text": block.content, "block_start": block.start,
+            "block_end": block.end, "body_start": block.body_start, "body_end": block.body_end,
+            "block_sha256": hashlib.sha256(full_block.encode()).hexdigest(), "expected_arg_mode": "json_object",
+            "requires_json_argv": True, "argv_schema": {}, "required_keys": [],
+            "skill_md_block_repair_scope": {
+                "script_path": "scripts/generate_story.py", "block_text": full_block, "full_block_text": full_block,
+                "command_text": block.content, "command_body_text": block.content, "block_start": block.start,
+                "block_end": block.end, "body_start": block.body_start, "body_end": block.body_end,
+                "block_sha256": hashlib.sha256(full_block.encode()).hexdigest(),
+            },
+        }, layer="skill_md_command_block_interface",
+    )
+    stage_error = api.FileGenerationStageError(
+        source="content_review", layer="skill_md_command_block_interface", detail="bad argv",
+        original=contracts.ContractValidationError("bad argv", [failure]),
+    )
+    repair_replies = iter([
+        "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```",
+        fixed,
+    ])
+    repair_calls = []
+    validated_contents = []
+
+    async def fake_complete(**kwargs):
+        if kwargs["prompt_variant"] == "repair_skill_md_command_block":
+            repair_calls.append(kwargs)
+            return next(repair_replies)
+        assert kwargs["prompt_variant"] != "rewrite_markdown_full_format"
+        return candidate
+
+    async def fake_alignment(**kwargs):
+        validated_contents.append(kwargs["content"])
+        if len(validated_contents) == 1:
+            raise stage_error
+
+    async def forbidden_file_repair(**_kwargs):
+        raise AssertionError("whole-file repair must not be called")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete)
+    monkeypatch.setattr(api, "validate_file_contract", lambda **_kwargs: [])
+    monkeypatch.setattr(api, "_validate_skill_md_against_existing_files", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", forbidden_file_repair)
+    response = await api.generate_file(GenerateFileRequest(
+        skill_name="demo-skill", file_path="SKILL.md", purpose="demo", blueprint_text="use scripts/generate_story.py",
+        conversation_history=[], role="skill_md", skill_plan_entry={},
+    ))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    expected = validated_contents[0].replace(bad, fixed)
+    assert len(repair_calls) == 2
+    assert validated_contents == [validated_contents[0], expected]
+    assert "repair_failed" not in body
+    assert first.rstrip() in expected and third.rstrip() in expected
+    assert expected[:candidate.index(bad)] == candidate[:candidate.index(bad)]
+    assert expected[expected.index(fixed) + len(fixed):].rstrip() == candidate[candidate.index(bad) + len(bad):].rstrip()
+
+
+@pytest.mark.asyncio
+async def test_generate_file_bounds_three_failed_command_block_repairs(monkeypatch, tmp_path):
+    from backend.config import settings
+    from backend.services.creator import api, contracts
+    from backend.services.creator.command_normalizer import parse_skill_md_bash_command_blocks
+    from backend.services.creator.common import GenerateFileRequest
+
+    monkeypatch.setattr(settings, "skills_path", tmp_path)
+    (tmp_path / "demo-skill").mkdir()
+    candidate = "---\nname: demo\ndescription: demo\n---\n# Demo\n```bash\npython scripts/generate_story.py {\"story_prompt\":\"{{user_request}}\"}\n```\n"
+    block = parse_skill_md_bash_command_blocks(candidate)[0]
+    full_block = candidate[block.start:block.end]
+    details = {"script_path": "scripts/generate_story.py", "block_text": full_block, "full_block_text": full_block,
+        "command_text": block.content, "command_body_text": block.content, "block_start": block.start, "block_end": block.end,
+        "body_start": block.body_start, "body_end": block.body_end, "block_sha256": hashlib.sha256(full_block.encode()).hexdigest(),
+        "expected_arg_mode": "json_object", "requires_json_argv": True, "argv_schema": {}, "required_keys": []}
+    details["skill_md_block_repair_scope"] = dict(details)
+    failure = contracts.ContractCheckResult(id="skill_md.command_block.args_parseable", passed=False,
+        target="scripts/generate_story.py", message="JSON argv required", expected="JSON object argv", minimal_edit="quote JSON",
+        details=details, layer="skill_md_command_block_interface")
+    stage_error = api.FileGenerationStageError(source="content_review", layer="skill_md_command_block_interface", detail="bad argv",
+        original=contracts.ContractValidationError("bad argv", [failure]))
+    repair_calls = []
+    validated_contents = []
+
+    async def fake_complete(**kwargs):
+        if kwargs["prompt_variant"] == "repair_skill_md_command_block":
+            repair_calls.append(kwargs)
+            return "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```"
+        return candidate
+
+    async def fake_alignment(**kwargs):
+        validated_contents.append(kwargs["content"])
+        raise stage_error
+
+    async def forbidden_file_repair(**_kwargs):
+        raise AssertionError("whole-file repair must not be called")
+
+    monkeypatch.setattr(api, "_complete_creator_file_generation", fake_complete)
+    monkeypatch.setattr(api, "validate_file_contract", lambda **_kwargs: [])
+    monkeypatch.setattr(api, "_validate_skill_md_against_existing_files", lambda *a, **k: None)
+    monkeypatch.setattr(api, "_validate_skill_md_blueprint_alignment", fake_alignment)
+    monkeypatch.setattr(api, "_repair_generated_file_with_feedback", forbidden_file_repair)
+    response = await api.generate_file(GenerateFileRequest(skill_name="demo-skill", file_path="SKILL.md", purpose="demo",
+        blueprint_text="use scripts/generate_story.py", conversation_history=[], role="skill_md", skill_plan_entry={}))
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else str(chunk))
+    body = "".join(chunks)
+
+    assert len(repair_calls) == 3
+    assert "skill_md_command_block_repair_failed" in body
+    assert len(validated_contents) == 1
+
+
+def test_command_block_json_protocol_empty_schema_preserves_existing_keys_and_allows_flags_protocol():
+    from backend.services.creator import api
+
+    empty_schema = {"expected_arg_mode": "json_object", "requires_json_argv": True, "argv_schema": {}, "required_keys": []}
+    api._validate_repaired_skill_md_command_block(
+        "```bash\npython scripts/generate_story.py '{\"story_prompt\":\"{{user_request}}\"}'\n```",
+        script_path="scripts/generate_story.py", arg_protocol=empty_schema,
+    )
+    with pytest.raises(ValueError, match="JSON object argv"):
+        api._validate_repaired_skill_md_command_block(
+            "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```",
+            script_path="scripts/generate_story.py", arg_protocol=empty_schema,
+        )
+    api._validate_repaired_skill_md_command_block(
+        "```bash\npython scripts/generate_story.py --topic '{{user_request}}'\n```",
+        script_path="scripts/generate_story.py",
+        arg_protocol={"expected_arg_mode": "argparse_flags", "requires_json_argv": False},
+    )

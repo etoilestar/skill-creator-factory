@@ -12128,6 +12128,8 @@ async def _repair_skill_md_command_block(
                 "如果 expected_arg_mode=json_object：script_path 后必须只有一个业务参数；该参数必须是可由 json.loads() 解析的 JSON object；"
                 "外层必须使用 shell 引号，JSON 内部必须使用标准双引号。严禁改为 --topic、--input、--prompt 等 argparse flags，"
                 "除非当前脚本合同明确声明 argparse_flags。JSON key 必须来自真实 argv_schema，不得自行发明或替换字段名。"
+                "如果 argv_schema 或 required_keys 为空，只修复 shell quoting 和 JSON object argv 形态；"
+                "优先保留当前命令中已有的 JSON key，不得自行猜测、重命名或新增业务字段。"
                 "格式示例 python scripts/example.py '{\"field\":\"{{source}}\"}' 中 field 仅是格式示例，真实字段必须来自 argv_schema。"
             ),
         },
@@ -13531,10 +13533,18 @@ async def generate_file(request: GenerateFileRequest):
                         except Exception as block_repair_exc:
                             last_block_repair_error = block_repair_exc
                     else:
-                        raise ValueError(
-                            "SKILL.md command block repair failed without whole-file fallback: "
-                            f"{last_block_repair_error}"
+                        yield _file_done_error_sse(
+                            file_path=request.file_path,
+                            role=request.role,
+                            error=(
+                                "SKILL.md command block repair failed without whole-file fallback: "
+                                f"{last_block_repair_error}"
+                            ),
+                            error_type="skill_md_command_block_repair_failed",
+                            content=candidate or "",
+                            recoverable=True,
                         )
+                        return
                     continue
 
                 if (

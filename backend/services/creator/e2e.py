@@ -5181,7 +5181,7 @@ async def _repair_existing_file_for_e2e_failure(
                     e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": False, "result": "no_progress"})
                     if repair_events is not None:
                         repair_events.extend(e2e_session.events)
-                    return {"status": "debug_hypothesis_rejected", "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"], "attempt": candidate_attempt}
+                    return {"status": "debug_hypothesis_rejected", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "hypothesis_key": diagnosis["hypothesis_key"], "attempt": candidate_attempt}
                     no_progress_key = f"{target_path}:{baseline_fingerprint}:{failure_signature}"
                     baseline_no_progress_counts[no_progress_key] = baseline_no_progress_counts.get(no_progress_key, 0) + 1
                     baseline_no_progress_count = baseline_no_progress_counts[no_progress_key]
@@ -5370,6 +5370,7 @@ async def _repair_existing_file_for_e2e_failure(
 
                     return {
                         "status": "target_changed",
+                        "sandbox_executed": True,
                         "repaired_target": target_path,
                         "next_target": next_target,
                         "next_failure": gate_errors,
@@ -5380,7 +5381,7 @@ async def _repair_existing_file_for_e2e_failure(
                     target_file.write_text(sanitized, encoding="utf-8")
                     e2e_session.debug_attempts.append({"symptom_file": diagnosis["symptom_file"], "repair_target": target_path, "root_cause_hypothesis": diagnosis["root_cause_hypothesis"], "hypothesis_key": diagnosis["hypothesis_key"], "patch_digest": _stable_json_hash(sanitized), "before_failure_signature": baseline_fingerprint, "after_failure_signature": failure_signature, "improved": True, "result": "progressed"})
                     if repair_events is not None: repair_events.extend(e2e_session.events)
-                    return {"status": "debug_progress", "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "attempt": candidate_attempt}
+                    return {"status": "debug_progress", "sandbox_executed": True, "repaired_target": target_path, "next_target": None, "next_failure": gate_errors, "attempt": candidate_attempt}
                     working_content = sanitized
                     baseline_errors = list(gate_errors)
                     baseline_no_progress_count = 0

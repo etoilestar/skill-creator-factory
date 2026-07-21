@@ -549,6 +549,7 @@ async def test_e2e_repair_stays_localized_after_repeated_attempts(tmp_path, monk
     )
 
     assert result["status"] == "debug_hypothesis_rejected"
+    assert result["sandbox_executed"] is True
     assert len(patch_calls) == 1
     assert full_calls == []
     assert len(gate_calls) == 1

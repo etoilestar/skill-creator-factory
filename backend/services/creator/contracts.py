@@ -1522,6 +1522,38 @@ def _skill_md_block_locator(block: Any, skill_md_content: str = "") -> dict[str,
     }
 
 
+def _command_block_failure_details(
+    *,
+    block: Any,
+    skill_md_content: str,
+    script_path: str,
+    block_ordinal: int | None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the established command-block repair locator for deterministic checks."""
+    locator = _skill_md_block_locator(block, skill_md_content)
+    full_block_text = str(locator.get("full_block_text") or "")
+    command_text = str(locator.get("command_body_text") or getattr(block, "content", "") or "")
+    details = {
+        "script_path": script_path,
+        "block_text": full_block_text,
+        "full_block_text": full_block_text,
+        "command_text": command_text,
+        "command_body_text": command_text,
+        "block_start": locator.get("block_start"),
+        "block_end": locator.get("block_end"),
+        "body_start": locator.get("body_start"),
+        "body_end": locator.get("body_end"),
+        "block_sha256": locator.get("block_sha256"),
+        "block_ordinal": block_ordinal,
+        "block_locator": locator,
+    }
+    details["skill_md_block_repair_scope"] = dict(details)
+    if extra:
+        details.update(extra)
+    return details
+
+
 def _skill_md_reviewer_issue_contradicts_passed_true(issue: Any) -> bool:
     if not isinstance(issue, dict):
         return False
@@ -5122,6 +5154,9 @@ def _validate_command_is_single_shell_json_invocation(
     script_path: str,
     entry: SkillPlanEntry,
     upstream_available_outputs: set[str] | None = None,
+    block: Any | None = None,
+    skill_md_content: str = "",
+    block_ordinal: int | None = None,
 ) -> list[ContractCheckResult]:
     """Validate one shell fenced command under Creator JSON argv protocol.
 
@@ -5136,6 +5171,13 @@ def _validate_command_is_single_shell_json_invocation(
     lines = [line.strip() for line in raw_command.strip().splitlines() if line.strip()]
     one_line = len(lines) == 1
 
+    locator_details = (
+        _command_block_failure_details(
+            block=block, skill_md_content=skill_md_content, script_path=script_path,
+            block_ordinal=block_ordinal,
+        )
+        if block is not None else {}
+    )
     results.append(ContractCheckResult(
         id="skill_md.command_block.single_command",
         passed=one_line,
@@ -5147,6 +5189,8 @@ def _validate_command_is_single_shell_json_invocation(
         ),
         expected="每个 ```bash fenced block 内只放一条真实 shell 命令。",
         minimal_edit="把解释移出 fenced block；一个 block 只保留一条调用 scripts/*.py 的 shell 命令。",
+        details=locator_details,
+        layer="skill_md_command_block_interface",
     ))
 
     if not one_line:
@@ -5182,6 +5226,8 @@ def _validate_command_is_single_shell_json_invocation(
         minimal_edit=(
             f"改为调用真实脚本的 shell 命令，例如：python {script_path} '<JSON object>'。"
         ),
+        details=locator_details,
+        layer="skill_md_command_block_interface",
     ))
 
     if not command_sig:
@@ -5207,10 +5253,19 @@ def _validate_command_is_single_shell_json_invocation(
         minimal_edit=(
             "只修当前命令参数。不要固定套用 payload/user_request/fields/options/input_files。"
         ),
-        details={
-            "arg_mode": arg_mode,
-            "args": args,
-        },
+        details=_command_block_failure_details(
+            block=block, skill_md_content=skill_md_content, script_path=script_path,
+            block_ordinal=block_ordinal,
+            extra={
+                "arg_mode": arg_mode,
+                "args": args,
+                "expected_arg_mode": "json_object",
+                "requires_json_argv": True,
+                "argv_schema": {},
+                "required_keys": [],
+            },
+        ) if block is not None else {"arg_mode": arg_mode, "args": args},
+        layer="skill_md_command_block_interface",
     ))
 
     try:
@@ -5285,6 +5340,7 @@ def _check_skill_md_fenced_command_contracts(
         scripts_to_check = [entry.path for entry in entries_by_path.values() if entry.path in scripts_to_check]
 
     prior_outputs: set[str] = set()
+    parsed_command_blocks = parse_skill_md_bash_command_blocks(content)
 
     for script_path in scripts_to_check:
         try:
@@ -5366,13 +5422,24 @@ def _check_skill_md_fenced_command_contracts(
                 dependencies=[],
             )
 
-        for command in commands:
+        matching_blocks = [
+            block for block in parsed_command_blocks
+            if str(getattr(block, "script_path", "") or "") == script_path
+        ]
+        for command_index, command in enumerate(commands):
+            block = next(
+                (item for item in matching_blocks if str(getattr(item, "content", "") or "") == command),
+                matching_blocks[command_index] if command_index < len(matching_blocks) else None,
+            )
             try:
                 results.extend(_validate_command_is_single_shell_json_invocation(
                     command=command,
                     script_path=script_path,
                     entry=entry,
                     upstream_available_outputs=prior_outputs,
+                    block=block,
+                    skill_md_content=content,
+                    block_ordinal=(parsed_command_blocks.index(block) + 1) if block in parsed_command_blocks else None,
                 ))
             except Exception as exc:
                 logger.exception(

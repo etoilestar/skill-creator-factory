@@ -1756,6 +1756,12 @@ async def _review_skill_md_blueprint_intent_with_model(
         "你是 superskills Creator 的第一轮 SKILL.md 语义覆盖审查器，只输出严格 JSON object。\n\n"
 
         "审查目标：只回答 SKILL.md 整体语义是否符合用户需求和蓝图责任。\n"
+        "【审查边界（最高优先级）】本轮审查的唯一基准是已确认 Blueprint。你只能判断 SKILL.md 是否忠实、完整地表达 Blueprint 已明确声明的内容。\n"
+        "不得根据常见做法、经验、行业习惯或你认为“更合理”的实现，新增、推断、扩展或重新定义 Blueprint 中不存在的文件、资源、assets、references、输入、输出、目录、依赖、文件角色、数据流、业务约束、格式、数量或路径要求。\n"
+        "若 Blueprint 未声明某项要求，不得因为 SKILL.md 未描述该项而判定失败；不得把“Blueprint 未声明”解释为“SKILL.md 遗漏”。不得因为某类任务通常采用某种实现方式，就要求 SKILL.md 增加该实现方式。\n"
+        "若 Blueprint 已明确某个文件、目录、字段或产物的角色或数据流，只能检查 SKILL.md 是否与其一致，不得自行重新分类或重新设计。\n"
+        "repair_suggestions 和 repair_ops 也必须遵守上述边界：只能修复 SKILL.md 与 Blueprint 已有事实之间的差异，不得通过 append 或 replace 注入 Blueprint 未声明的路径、资源角色、业务规则或输出约束。\n"
+        "审查目标是“与 Blueprint 一致且足够执行”，不是“尽可能完整”；只要 SKILL.md 已正确表达 Blueprint 要求，不得因为还能增加更多说明而判定失败。\n"
         "第一轮整体语义只看：这个 skill 是做什么的、用户输入是什么、大致执行哪些脚本、文件计划是否完整、脚本职责和执行顺序是否合理、references/assets 职责是否正确、最终产物是什么、是否引入蓝图外能力或文件。\n"
         "不得审查 command JSON key、placeholder、argv schema、stdout 字段、incoming/outgoing edge 字段映射、类型序列化、静态值或动态值来源。\n"
         "不要检查或裁决单个 bash command block 的 argv key、placeholder、字段来源、字段类型、JSON quoting 或 shell quoting；这些问题由后续单 command block Reviewer 单独处理。即使发现 block 字段问题，也不得将整体语义审查判定为格式失败。\n"

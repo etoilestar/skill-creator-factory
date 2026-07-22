@@ -899,8 +899,45 @@ python scripts/main.py '{"source_text":"${user_text}","style":"plain"}'
     assert "不要检查或裁决单个 bash command block" in prompt
     assert "argv key、placeholder、字段来源、字段类型、JSON quoting 或 shell quoting" in prompt
     assert "不得将整体语义审查判定为格式失败" in prompt
+    assert "审查边界（最高优先级）" in prompt
+    assert "不得把“Blueprint 未声明”解释为“SKILL.md 遗漏”" in prompt
+    assert "不得自行重新分类或重新设计" in prompt
+    assert "repair_suggestions 和 repair_ops 也必须遵守上述边界" in prompt
+    assert "与 Blueprint 一致且足够执行”" in prompt
     assert "scripts/main.py" in prompt
     assert "user_text" in prompt
+
+
+@pytest.mark.asyncio
+async def test_skill_md_reviewer_prompt_forbids_inventing_runtime_images_as_assets(monkeypatch):
+    from backend.services.creator import contracts
+
+    class Route:
+        model = "unit-test-model"
+
+    captured = {}
+    monkeypatch.setattr(contracts, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        captured["prompt"] = messages[1]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(contracts, "complete_chat_once", fake_complete)
+    result = await contracts._review_skill_md_blueprint_intent_with_model(
+        skill_name="image-story",
+        content="image_paths 来自 scripts/generate_images.py 输出。",
+        blueprint_text=(
+            "scripts/generate_images.py outputs: [image_paths]。"
+            "运行时生成产物不属于 Creator 静态 assets。"
+        ),
+        skill_plan_entry={"files": [{"path": "scripts/generate_images.py", "file_type": "script"}]},
+    )
+
+    assert result["passed"] is True
+    prompt = captured["prompt"]
+    assert "不得根据常见做法、经验、行业习惯" in prompt
+    assert "资源角色" in prompt
+    assert "不得把“Blueprint 未声明”解释为“SKILL.md 遗漏”" in prompt
 
 
 def test_skill_md_review_ignores_explicit_command_mapping_evidence():

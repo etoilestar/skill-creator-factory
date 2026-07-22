@@ -236,6 +236,10 @@ def test_reference_semantic_review_helper_exists_and_uses_validator_task():
     assert "VALIDATOR_TASK" in source
     assert "token overlap" in source
     assert "passed" in source and "issues" in source and "repair_instructions" in source
+    assert "Reference 审查边界（最高优先级）" in source
+    assert "不得基于常见实现、经验、行业习惯" in source
+    assert "固定尺寸、固定数量、固定文件名、固定页面布局" in source
+    assert "不得因为 Reference 未包含该规则而判定失败" in source
 
 
 def test_markdown_format_failures_use_full_rewrite_not_region_rewrite_in_main_path():
@@ -670,6 +674,32 @@ async def test_reference_semantic_review_normalizes_string_issues(monkeypatch):
     assert all(isinstance(issue, dict) for issue in result["issues"])
     assert result["issues"][0]["failed_file"] == "references/example.md"
     assert result["issues"][0]["reason"] == "reference 内容与自身职责不一致"
+
+
+@pytest.mark.asyncio
+async def test_reference_semantic_review_prompt_forbids_inventing_default_rules(monkeypatch):
+    class Route:
+        model = "unit-test-model"
+
+    captured = {}
+    monkeypatch.setattr(repair, "route_model", lambda *a, **k: Route())
+
+    async def fake_complete(messages, model):
+        captured["prompt"] = messages[0]["content"]
+        return json.dumps({"passed": True, "issues": []})
+
+    monkeypatch.setattr(repair, "complete_chat_once", fake_complete)
+    result = await repair._run_reference_semantic_review(
+        file_path="references/story.md",
+        content="# Story guidance\n\nExplain the declared PNG output.",
+        purpose="Explain the PNG output.",
+        blueprint_context="输出必须是 PNG。",
+    )
+
+    assert result["passed"] is True
+    prompt = captured["prompt"]
+    assert "固定尺寸、固定数量、固定文件名、固定页面布局" in prompt
+    assert "不得因为 Reference 未包含该规则而判定失败" in prompt
 
 
 @pytest.mark.asyncio

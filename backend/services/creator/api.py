@@ -9750,9 +9750,12 @@ async def _prepare_plan_impl(
         protocol_errors = _preflight_prepare_blueprint_text(blueprint_text)
 
     if protocol_errors:
-        raise PreparePlanProtocolError(
-            "Confirmed Blueprint failed strict preflight after localized repairs; "
-            f"repair_index={repair_index}; errors={protocol_errors}; blueprint={blueprint_text}"
+        summary = await project_summary(blueprint_text, prepared)
+        return PreparePlanResponse(
+            status="blocked", prepare_stage="blueprint_protocol_failed",
+            clarifying_questions=[], review_summary=_strip_prepare_summary_risks(summary),
+            blueprint_text=blueprint_text, skill_name=skill_name,
+            creation_blockers=protocol_errors,
         )
 
     try:
@@ -9903,9 +9906,15 @@ async def _prepare_plan_impl(
                 continue
 
     if plan is None:
-        raise PreparePlanProtocolError(
-            "Confirmed Blueprint strict analyze failed after available retries; "
-            f"errors={analyze_errors}; blueprint={blueprint_text}"
+        summary = await project_summary(blueprint_text, prepared)
+        return PreparePlanResponse(
+            status="blocked", prepare_stage="blueprint_analyze_failed",
+            clarifying_questions=[], review_summary=_strip_prepare_summary_risks(summary),
+            blueprint_text=blueprint_text, skill_name=skill_name,
+            creation_blockers=analyze_errors or [_prepare_protocol_issue(
+                "strict_analyze_failed", "已确认 full blueprint 无法解析为创建计划。",
+                field="analyze_blueprint",
+            )],
         )
 
     (

@@ -7742,6 +7742,9 @@ Blueprint Planner 只规划业务责任。
                     _validate_function_item_targets_in_allowed_domain(current_function_items, allowed_function_item_targets)
                     current_edges = validate_structured_responsibility_edge_transport(
                         repaired_graph["responsibility_edges"], function_items=current_function_items, source="planner")
+                    # This is a fresh candidate: the first candidate's
+                    # deterministic error is repair feedback, not a final error.
+                    last_error = ""
                     alignment_review = await _review_responsibility_graph_alignment(
                         request=request, frozen_blueprint_text=frozen_blueprint_text,
                         allowed_function_item_targets=allowed_function_item_targets,
@@ -9329,10 +9332,19 @@ async def _prepare_plan_impl(
                 )
             )
 
-        except PreparePlanProtocolError:
-            # Planner protocol failures are internal repair failures, not user
-            # clarification blockers.
-            raise
+        except PreparePlanProtocolError as exc:
+            return PreparePlanResponse(
+                status="blocked",
+                prepare_stage="blueprint_protocol_failed",
+                clarifying_questions=[],
+                review_summary=PreparePlanReviewSummary(),
+                blueprint_text=previous_blueprint_text,
+                skill_name=skill_name,
+                creation_blockers=[_prepare_protocol_issue(
+                    "planner_structured_graph_protocol_failed", str(exc),
+                    field="responsibility_edges",
+                )],
+            )
 
         except Exception as exc:
             raise HTTPException(

@@ -9903,10 +9903,26 @@ async def _prepare_plan_impl(
             )
 
             if protocol_errors:
-                # Continue with the latest repaired Blueprint and the errors it
-                # actually produced; the next same-Planner repair receives both.
                 analyze_errors = protocol_errors
-                continue
+                try:
+                    # Repair the latest candidate and its latest preflight
+                    # error before another analyze attempt is permitted.
+                    blueprint_text = await _repair_prepare_blueprint_protocol(
+                        request=request,
+                        blueprint_text=blueprint_text,
+                        protocol_errors=protocol_errors,
+                    )
+                    blueprint_text = _normalize_prepare_blueprint_references(
+                        blueprint_text
+                    )
+                    protocol_errors = _preflight_prepare_blueprint_text(
+                        blueprint_text
+                    )
+                    analyze_errors = protocol_errors
+                except Exception:
+                    break
+                if protocol_errors:
+                    break
 
     if plan is None:
         summary = await project_summary(blueprint_text, prepared)

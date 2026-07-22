@@ -9758,45 +9758,48 @@ async def _prepare_plan_impl(
             creation_blockers=protocol_errors,
         )
 
-    try:
-        if isinstance(prepared, dict) and prepared.get("responsibility_edges") is not None:
-            normalized_function_items = normalize_structured_function_items(
-                prepared.get("function_items"),
-                source="planner",
-            )
-            prepared["function_items"] = normalized_function_items
-            prepared["responsibility_edges"] = validate_structured_responsibility_edge_transport(
-                prepared.get("responsibility_edges"),
-                function_items=normalized_function_items,
-                source="planner",
-            )
-    except Exception as exc:
-        summary = await project_summary(
-            blueprint_text,
-            prepared,
-        )
-        return PreparePlanResponse(
-            status="blocked",
-            prepare_stage="blueprint_protocol_failed",
-            clarifying_questions=[],
-            review_summary=(
-                _strip_prepare_summary_risks(
-                    summary
+    graph_error: Exception | None = None
+    if isinstance(prepared, dict) and prepared.get("responsibility_edges") is not None:
+        current_function_items = prepared.get("function_items")
+        current_edges = prepared.get("responsibility_edges")
+        for repair_count in range(3):
+            try:
+                normalized_function_items = normalize_structured_function_items(current_function_items, source="planner")
+                normalized_edges = validate_structured_responsibility_edge_transport(
+                    current_edges, function_items=normalized_function_items, source="planner")
+                prepared["function_items"] = normalized_function_items
+                prepared["responsibility_edges"] = normalized_edges
+                graph_error = None
+                break
+            except Exception as exc:
+                graph_error = exc
+                if repair_count >= 2:
+                    break
+                issue = {
+                    "id": "responsibility_graph_candidate_validation", "target_files": [],
+                    "affected_edge_indexes": [], "reason": str(exc),
+                    "evidence": "The current structured responsibility graph failed the existing deterministic validator.",
+                    "repair_guidance": "Repair only the invalid FunctionItem or ResponsibilityEdge. Preserve the confirmed Blueprint and FilePlan.",
+                }
+                repaired = await _repair_responsibility_graph_alignment(
+                    request=request, frozen_blueprint_text=blueprint_text,
+                    allowed_function_item_targets=_resolve_allowed_function_item_targets_from_blueprint(blueprint_text),
+                    function_items=current_function_items or [], responsibility_edges=current_edges or [],
+                    review_issues=[issue], planner_model=route_model(
+                        "creator_prepare_plan", requested_model=request.model,
+                        reason="confirmed responsibility graph repair",
+                    ).model,
                 )
-            ),
-            blueprint_text=blueprint_text,
-            skill_name=skill_name,
-            creation_blockers=[
-                _prepare_protocol_issue(
-                    "planner_structured_graph_protocol_failed",
-                    (
-                        "已确认 structured ResponsibilityEdges "
-                        f"违反 endpoint topology protocol：{exc}"
-                    ),
-                    field="responsibility_edges",
-                )
-            ],
-        )
+                current_function_items = repaired["function_items"]
+                current_edges = repaired["responsibility_edges"]
+    if graph_error is not None:
+        summary = await project_summary(blueprint_text, prepared)
+        return PreparePlanResponse(status="blocked", prepare_stage="blueprint_protocol_failed",
+            clarifying_questions=[], review_summary=_strip_prepare_summary_risks(summary),
+            blueprint_text=blueprint_text, skill_name=skill_name,
+            creation_blockers=[_prepare_protocol_issue("planner_structured_graph_protocol_failed",
+                f"已确认 structured ResponsibilityEdges 违反 endpoint topology protocol：{graph_error}",
+                field="responsibility_edges")])
 
     plan = None
 

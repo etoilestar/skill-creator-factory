@@ -15,7 +15,6 @@ from pydantic import BaseModel, field_validator
 
 from ..config import settings
 from .llm_proxy import complete_chat_once
-from .model_router import PLANNER_TASK, VALIDATOR_TASK, route_model
 
 ROLES = ("planner", "reviewer")
 _lock = RLock()
@@ -72,12 +71,12 @@ class CreatorModelProfile:
     max_tokens: int | None
 
 
-def resolve_creator_model_profile(role: Literal["planner", "reviewer"]) -> CreatorModelProfile:
+def resolve_creator_model_profile(
+    role: Literal["planner", "reviewer"], *, fallback_model: str,
+) -> CreatorModelProfile:
     if role not in ROLES:
         raise ValueError(f"Unknown Creator model profile: {role}")
     saved = _load()[role]
-    fallback_task = PLANNER_TASK if role == "planner" else VALIDATOR_TASK
-    fallback_model = route_model(fallback_task, reason=f"creator {role} profile fallback").model
     return CreatorModelProfile(
         base_url=str(saved.get("base_url") or settings.llm_base_url),
         api_key=str(saved["api_key"]) if saved.get("api_key") else None,
@@ -86,8 +85,10 @@ def resolve_creator_model_profile(role: Literal["planner", "reviewer"]) -> Creat
     )
 
 
-async def complete_creator_role_once(messages: list[dict], role: Literal["planner", "reviewer"]) -> str:
-    profile = resolve_creator_model_profile(role)
+async def complete_creator_role_once(
+    messages: list[dict], role: Literal["planner", "reviewer"], *, fallback_model: str,
+) -> str:
+    profile = resolve_creator_model_profile(role, fallback_model=fallback_model)
     logger.info("[Creator][model] task=%s model=%s provider_base_url=%s", role, profile.model, profile.base_url)
     return await complete_chat_once(messages, profile.model, base_url=profile.base_url, api_key=profile.api_key, max_tokens=profile.max_tokens)
 
@@ -103,13 +104,17 @@ class ProfileUpdate(BaseModel):
     @field_validator("base_url")
     @classmethod
     def valid_url(cls, value: str | None) -> str | None:
-        if value is not None and value and not value.startswith(("http://", "https://")):
+        if value == "":
+            return ""
+        if value is not None and not value.startswith(("http://", "https://")):
             raise ValueError("base_url must start with http:// or https://")
         return value
 
     @field_validator("model")
     @classmethod
     def valid_model(cls, value: str | None) -> str | None:
+        if value == "":
+            return ""
         if value is not None and not value.strip():
             raise ValueError("model must be a non-empty string")
         return value

@@ -2,32 +2,66 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 
-def test_profile_resolution_falls_back_per_field(tmp_path, monkeypatch):
+def _empty_profiles():
+    return {
+        "planner": {"base_url": "", "api_key": "", "model": "", "max_tokens": None},
+        "reviewer": {"base_url": "", "api_key": "", "model": "", "max_tokens": None},
+    }
+
+
+def test_empty_profile_uses_each_callsite_fallback_model(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    profiles._save(_empty_profiles())
+    with patch.object(profiles, "complete_chat_once", new=AsyncMock(return_value="ok")) as call:
+        asyncio.run(profiles.complete_creator_role_once([], "planner", fallback_model="route-original"))
+        asyncio.run(profiles.complete_creator_role_once([], "reviewer", fallback_model="planner-original"))
+    assert call.await_args_list[0].args[1] == "route-original"
+    assert call.await_args_list[1].args[1] == "planner-original"
+
+
+def test_profile_model_override_wins_and_provider_fields_remain_isolated(tmp_path, monkeypatch):
+    from backend.config import settings
+    from backend.services import creator_model_profiles as profiles
+
+    monkeypatch.setattr(settings, "governance_path", tmp_path)
+    profiles._save({
+        "planner": {"base_url": "https://a.test", "api_key": "key-A", "model": "model-A", "max_tokens": 1234},
+        "reviewer": {"base_url": "https://b.test", "api_key": "key-B", "model": "model-B", "max_tokens": 2345},
+    })
+    with patch.object(profiles, "complete_chat_once", new=AsyncMock(return_value="ok")) as call:
+        asyncio.run(profiles.complete_creator_role_once([], "planner", fallback_model="planner-original"))
+        asyncio.run(profiles.complete_creator_role_once([], "reviewer", fallback_model="reviewer-original"))
+    assert call.await_args_list[0].args[1] == "model-A"
+    assert call.await_args_list[0].kwargs == {"base_url": "https://a.test", "api_key": "key-A", "max_tokens": 1234}
+    assert call.await_args_list[1].args[1] == "model-B"
+    assert call.await_args_list[1].kwargs == {"base_url": "https://b.test", "api_key": "key-B", "max_tokens": 2345}
+
+
+def test_empty_fields_clear_overrides_and_keep_api_key(tmp_path, monkeypatch):
     from backend.config import settings
     from backend.services import creator_model_profiles as profiles
 
     monkeypatch.setattr(settings, "governance_path", tmp_path)
     monkeypatch.setattr(settings, "llm_base_url", "http://global.test")
     monkeypatch.setattr(settings, "max_tokens", 321)
-    monkeypatch.setattr(profiles, "route_model", lambda *args, **kwargs: type("Route", (), {"model": "global-planner"})())
-    profiles._save({"planner": {"base_url": "https://planner.test/v1", "api_key": "secret-A", "model": "planner-A", "max_tokens": None}, "reviewer": {"base_url": "", "api_key": "", "model": "", "max_tokens": None}})
-    resolved = profiles.resolve_creator_model_profile("planner")
-    assert (resolved.base_url, resolved.api_key, resolved.model, resolved.max_tokens) == ("https://planner.test/v1", "secret-A", "planner-A", 321)
+    profiles._save({"planner": {"base_url": "https://remote.test", "api_key": "key-A", "model": "model-A", "max_tokens": 12}, "reviewer": _empty_profiles()["reviewer"]})
+
+    response = profiles.put_profile("planner", profiles.ProfileUpdate(base_url="", model="", max_tokens=None))
+    assert response["profile"] == {"role": "planner", "base_url": "", "model": "", "max_tokens": None, "api_key_configured": True}
+    resolved = profiles.resolve_creator_model_profile("planner", fallback_model="original-model")
+    assert (resolved.base_url, resolved.api_key, resolved.model, resolved.max_tokens) == ("http://global.test", "key-A", "original-model", 321)
 
 
-def test_role_calls_do_not_leak_provider_overrides(tmp_path, monkeypatch):
-    from backend.config import settings
+def test_profile_update_empty_fields_is_accepted():
     from backend.services import creator_model_profiles as profiles
 
-    monkeypatch.setattr(settings, "governance_path", tmp_path)
-    monkeypatch.setattr(profiles, "route_model", lambda task, **kwargs: type("Route", (), {"model": f"global-{task}"})())
-    profiles._save({"planner": {"base_url": "https://a.test", "api_key": "key-A", "model": "model-A", "max_tokens": 1234}, "reviewer": {"base_url": "https://b.test", "api_key": "key-B", "model": "model-B", "max_tokens": 2345}})
-    with patch.object(profiles, "complete_chat_once", new=AsyncMock(return_value="ok")) as call:
-        asyncio.run(profiles.complete_creator_role_once([], "planner"))
-        asyncio.run(profiles.complete_creator_role_once([], "reviewer"))
-    assert call.await_args_list[0].kwargs == {"base_url": "https://a.test", "api_key": "key-A", "max_tokens": 1234}
-    assert call.await_args_list[0].args[1] == "model-A"
-    assert call.await_args_list[1].kwargs == {"base_url": "https://b.test", "api_key": "key-B", "max_tokens": 2345}
+    update = profiles.ProfileUpdate(base_url="", model="", max_tokens=None)
+    assert update.base_url == ""
+    assert update.model == ""
+    assert update.max_tokens is None
 
 
 def test_public_profile_never_contains_api_key():

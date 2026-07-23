@@ -1733,6 +1733,82 @@ def _build_script_generate_file_prompt_variant(
         or []
     )
 
+    # Keep the complete backend contract intact. This view exists only for this
+    # one model call and removes a representation only when its exact source is
+    # rendered in a dedicated prompt section below.
+    prompt_contract_view = dict(local_contract)
+    graph_context = local_contract.get("function_item_graph_context")
+    execution_context = local_contract.get("function_execution_context")
+    if json.dumps(graph_context, ensure_ascii=False, sort_keys=True, default=str) == json.dumps(
+        execution_context, ensure_ascii=False, sort_keys=True, default=str
+    ):
+        prompt_contract_view.pop("function_execution_context", None)
+
+    # The binding is rendered once in its own hard-constraint section. Its
+    # available-tools index and helper allow-lists therefore remain visible
+    # there, rather than as duplicate top-level contract fields.
+    prompt_contract_view.pop("current_file_tool_binding", None)
+    binding_available_tools = current_binding.get("available_tools")
+    if json.dumps(prompt_contract_view.get("available_tools"), ensure_ascii=False, sort_keys=True, default=str) == json.dumps(
+        binding_available_tools, ensure_ascii=False, sort_keys=True, default=str
+    ):
+        prompt_contract_view.pop("available_tools", None)
+    for key in (
+        "allowed_helper_imports",
+        "allowed_import_paths",
+        "allowed_function_imports",
+    ):
+        if key in current_binding:
+            prompt_contract_view.pop(key, None)
+
+    runtime_contract_view = prompt_contract_view.get("runtime_contract")
+    if isinstance(runtime_contract_view, dict):
+        runtime_contract_view = dict(runtime_contract_view)
+        if json.dumps(runtime_contract_view.get("tool_binding_summary"), ensure_ascii=False, sort_keys=True, default=str) == json.dumps(
+            current_binding, ensure_ascii=False, sort_keys=True, default=str
+        ):
+            runtime_contract_view.pop("tool_binding_summary", None)
+        prompt_contract_view["runtime_contract"] = runtime_contract_view
+
+    resolved_tools = local_contract.get("resolved_tools")
+    resolved_tools = resolved_tools if isinstance(resolved_tools, list) else []
+    compact_code_tools = []
+    for tool in resolved_tools:
+        if not isinstance(tool, dict):
+            continue
+        compact_tool = {
+            "tool_id": tool.get("tool_id"),
+            "capability_name": tool.get("capability_name"),
+            "function_name": tool.get("function_name"),
+            "import_path": tool.get("import_path"),
+            "purpose": (
+                tool.get("short_description")
+                or tool.get("when_to_use")
+                or tool.get("description")
+                or ""
+            ),
+            "signature": tool.get("signature"),
+            "input_schema": tool.get("input_schema") or {},
+            "output_schema": tool.get("output_schema") or {},
+            "return_contract": tool.get("return_contract"),
+            "artifact_outputs": tool.get("artifact_outputs") or [],
+            "side_effects": tool.get("side_effects") or [],
+        }
+        if tool.get("usage_policy"):
+            compact_tool["usage_policy"] = tool["usage_policy"]
+        compact_code_tools.append(compact_tool)
+
+    # Full Registry records, cards, and raw snippets remain in local_contract.
+    # The producer sees one compact callable contract and one formatted snippet
+    # representation instead.
+    for key in (
+        "resolved_tools",
+        "tool_function_cards",
+        "tool_snippets",
+        "tool_snippet_prompt",
+    ):
+        prompt_contract_view.pop(key, None)
+
     logger.info(
         "[Creator][script_generation_contract] "
         "file_path=%s "
@@ -1905,8 +1981,8 @@ def _build_script_generate_file_prompt_variant(
         (
             "只根据轻量上下文实现：script_goal、semantic inputs/outputs、"
             "responsibility_requirements、coverage_requirements、"
-            "available_tools、tool_function_cards、tool_snippets、"
-            "tool_snippet_prompt、resource_refs、output_contract、"
+            "available_tools、compact_code_tools、tool_snippet_prompt、"
+            "resource_refs、output_contract、"
             "runtime_envelope、rules。"
         ),
         (
@@ -1996,7 +2072,7 @@ def _build_script_generate_file_prompt_variant(
         f"prompt_variant: {variant}",
         "当前文件结构化合同：",
         json.dumps(
-            local_contract,
+            prompt_contract_view,
             ensure_ascii=False,
             indent=2,
         ),
@@ -2029,16 +2105,11 @@ def _build_script_generate_file_prompt_variant(
             "没有合适工具时使用标准库或已允许依赖完成本地逻辑；"
             "无法完成时返回清晰 blocker。"
         ),
-        (
-            "动态工具函数卡片（从 registry/manifest 读取，"
-            "不硬编码工具名）："
-        ),
-        (
-            "\n\n---\n\n".join(
-                tool_function_cards
-            )
-            if tool_function_cards
-            else "无"
+        "Code-callable Tool Contracts（完整授权集合的紧凑调用合同）：",
+        json.dumps(
+            compact_code_tools,
+            ensure_ascii=False,
+            indent=2,
         ),
         (
             "动态工具 Snippet 指南（从 registry/manifest 读取，"
@@ -2078,8 +2149,47 @@ def _build_script_generate_file_prompt_variant(
             "成功时打印满足 stdout_schema 的 JSON object。"
         )
 
+    prompt_text = "\n\n".join(instruction)
+    prompt_contract_text = json.dumps(prompt_contract_view, ensure_ascii=False, indent=2)
+    binding_text = json.dumps(
+        local_contract.get("current_file_tool_binding")
+        or {"allowed_helper_imports": local_contract.get("allowed_helper_imports", [])},
+        ensure_ascii=False,
+        indent=2,
+    )
+    compact_code_tools_text = json.dumps(compact_code_tools, ensure_ascii=False, indent=2)
+    formatted_snippets_text = str(local_contract.get("tool_snippet_prompt") or "当前脚本可用工具 Snippets: 无")
+    skeleton_chars = len(script_skeleton_text)
+    logger.info(
+        "[Creator][script_prompt_telemetry] file_path=%s final_prompt_chars=%d "
+        "fixed_instruction_chars=%d prompt_contract_view_chars=%d "
+        "responsibility_requirements_chars=%d function_graph_context_chars=%d coverage_requirements_chars=%d "
+        "runtime_contract_chars=%d platform_io_contract_chars=%d platform_io_rules_chars=%d runtime_envelope_chars=%d "
+        "available_tool_index_chars=%d full_resolved_tools_chars=%d compact_code_tools_chars=%d "
+        "tool_function_cards_chars=%d raw_tool_snippets_chars=%d formatted_tool_snippets_chars=%d "
+        "current_file_tool_binding_chars=%d script_skeleton_chars=%d "
+        "resolved_tool_count=%d compact_code_tool_count=%d tool_cards_count=%d snippet_count=%d",
+        file_path, len(prompt_text),
+        len(prompt_text) - len(prompt_contract_text) - len(binding_text) - len(compact_code_tools_text) - len(formatted_snippets_text) - skeleton_chars,
+        len(prompt_contract_text),
+        len(json.dumps(local_contract.get("responsibility_requirements", []), ensure_ascii=False, default=str)),
+        len(json.dumps(local_contract.get("function_item_graph_context", {}), ensure_ascii=False, default=str)),
+        len(json.dumps(local_contract.get("coverage_requirements", {}), ensure_ascii=False, default=str)),
+        len(json.dumps(prompt_contract_view.get("runtime_contract", {}), ensure_ascii=False, default=str)),
+        len(json.dumps(local_contract.get("platform_io_contract", {}), ensure_ascii=False, default=str)),
+        len(str(local_contract.get("platform_io_rules") or "")),
+        len(json.dumps(local_contract.get("runtime_envelope", {}), ensure_ascii=False, default=str)),
+        len(json.dumps(selected_tools_payload, ensure_ascii=False, default=str)),
+        len(json.dumps(resolved_tools, ensure_ascii=False, default=str)),
+        len(compact_code_tools_text),
+        len("\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无"),
+        len(json.dumps(tool_snippets, ensure_ascii=False, default=str)),
+        len(formatted_snippets_text), len(binding_text), skeleton_chars,
+        len(resolved_tools), len(compact_code_tools), len(tool_function_cards), len(tool_snippets),
+    )
+
     return _creator_file_generation_messages(
-        "\n\n".join(instruction),
+        prompt_text,
         system_rule=(
             "你是 Creator 脚本文件生成器。"
             "只输出单个目标脚本源码；"

@@ -5184,7 +5184,7 @@ Creator 协议边界：
             ),
         )
 
-        text = await complete_chat_once(
+        text = await complete_creator_role_once(
             [
                 {
                     "role": "system",
@@ -5204,7 +5204,7 @@ Creator 协议边界：
                     ),
                 },
             ],
-            route.model,
+            "planner", fallback_model=route.model,
         )
 
         data = _parse_prepare_plan_json(
@@ -5748,7 +5748,7 @@ candidate_tool_catalog 已由统一 Tool recall 层产生：
         ),
     )
 
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [
             {
                 "role": "system",
@@ -5763,7 +5763,7 @@ candidate_tool_catalog 已由统一 Tool recall 层产生：
                 ),
             },
         ],
-        route.model,
+        "planner", fallback_model=route.model,
     )
 
     data = _parse_prepare_plan_json(
@@ -6250,12 +6250,12 @@ Only output strict JSON object. Do not output Markdown or explanation.
         },
     }
 
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [
             {"role": "system", "content": prompt},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
         ],
-        planner_model,
+        "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
     data.pop("tool_pool_patch", None)
@@ -6426,10 +6426,10 @@ Do not return function_items or responsibility_edges.
             "skill_name": request.skill_name,
         },
     }
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        planner_model,
+        "reviewer", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
     if set(data) != {"passed", "issues"} or not isinstance(data.get("passed"), bool) or not isinstance(data.get("issues"), list):
@@ -6500,10 +6500,10 @@ Return only strict JSON:
             "skill_name": request.skill_name,
         },
     }
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [{"role": "system", "content": prompt},
          {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)}],
-        planner_model,
+        "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
     if set(data) != {"function_items", "responsibility_edges"} or not isinstance(data.get("function_items"), list) or not isinstance(data.get("responsibility_edges"), list):
@@ -6694,12 +6694,12 @@ Only output strict JSON object. Do not output Markdown or explanation.
         },
         "platform_io_contract": platform_io_contract_prompt_text(),
     }
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [
             {"role": "system", "content": prompt},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
         ],
-        planner_model,
+        "planner", fallback_model=planner_model,
     )
     data = _parse_prepare_plan_json(text)
     if not isinstance(data.get("function_items"), list):
@@ -7413,7 +7413,7 @@ Blueprint Planner 只规划业务责任。
         ),
     )
 
-    text = await complete_chat_once(
+    text = await complete_creator_role_once(
         [
             {
                 "role": "system",
@@ -7428,7 +7428,7 @@ Blueprint Planner 只规划业务责任。
                 ),
             },
         ],
-        route.model,
+        "planner", fallback_model=route.model,
     )
 
     data = _parse_prepare_plan_json(

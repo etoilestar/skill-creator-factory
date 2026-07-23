@@ -1877,7 +1877,7 @@ async def _review_skill_md_blueprint_intent_with_model(
                 ),
             },
         ]
-        raw = await complete_chat_once(active_messages, route.model)
+        raw = await complete_creator_role_once(active_messages, "reviewer", fallback_model=route.model)
         parsed = _json_loads_loose_object(raw)
         schema_error = _skill_md_reviewer_schema_error(parsed)
         if not schema_error:
@@ -4307,7 +4307,7 @@ async def _refine_blueprint_contract_with_model(
         ]
 
         try:
-            review_raw = await complete_chat_once(review_messages, route.model)
+            review_raw = await complete_creator_role_once(review_messages, "reviewer", fallback_model=route.model)
             review = _parse_validator_json_object(review_raw)
             if not isinstance(review, dict):
                 raise ValueError("蓝图审查模型未返回 JSON object。")

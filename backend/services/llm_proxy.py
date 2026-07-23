@@ -88,6 +88,7 @@ def _build_payload(
     messages: list[dict],
     model: str,
     stream: bool,
+    max_tokens: int | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -98,8 +99,9 @@ def _build_payload(
     if settings.temperature is not None:
         payload["temperature"] = settings.temperature
 
-    if settings.max_tokens is not None:
-        payload["max_tokens"] = settings.max_tokens
+    effective_max_tokens = max_tokens if max_tokens is not None else settings.max_tokens
+    if effective_max_tokens is not None:
+        payload["max_tokens"] = effective_max_tokens
 
     return payload
 
@@ -120,10 +122,10 @@ def _ack_response_model(*, expected_model: str, actual_model: str | None, phase:
         )
 
 
-def _build_headers() -> dict:
+def _build_headers(api_key: str | None = None) -> dict:
     return {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {_get_api_key()}",
+        "Authorization": f"Bearer {api_key or _get_api_key()}",
     }
 
 
@@ -134,14 +136,17 @@ def _build_image_headers() -> dict:
     }
 
 
-async def complete_chat_once(messages: list[dict], model: str) -> str:
+async def complete_chat_once(
+    messages: list[dict], model: str, *, base_url: str | None = None,
+    api_key: str | None = None, max_tokens: int | None = None,
+) -> str:
     """Non-streaming chat completion.
 
     用于 metadata 阶段的静默模型调用。
     """
-    url = _build_chat_completions_url(settings.llm_base_url)
-    payload = _build_payload(messages=messages, model=model, stream=False)
-    headers = _build_headers()
+    url = _build_chat_completions_url(base_url or settings.llm_base_url)
+    payload = _build_payload(messages=messages, model=model, stream=False, max_tokens=max_tokens)
+    headers = _build_headers(api_key)
     timeout = float(settings.llm_timeout_seconds)
 
     logger.info("[LLM][once] request model=%s url=%s messages=%d", model, url, len(messages))

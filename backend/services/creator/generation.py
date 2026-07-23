@@ -1770,6 +1770,45 @@ def _build_script_generate_file_prompt_variant(
             runtime_contract_view.pop("tool_binding_summary", None)
         prompt_contract_view["runtime_contract"] = runtime_contract_view
 
+    resolved_tools = local_contract.get("resolved_tools")
+    resolved_tools = resolved_tools if isinstance(resolved_tools, list) else []
+    compact_code_tools = []
+    for tool in resolved_tools:
+        if not isinstance(tool, dict):
+            continue
+        compact_tool = {
+            "tool_id": tool.get("tool_id"),
+            "capability_name": tool.get("capability_name"),
+            "function_name": tool.get("function_name"),
+            "import_path": tool.get("import_path"),
+            "purpose": (
+                tool.get("short_description")
+                or tool.get("when_to_use")
+                or tool.get("description")
+                or ""
+            ),
+            "signature": tool.get("signature"),
+            "input_schema": tool.get("input_schema") or {},
+            "output_schema": tool.get("output_schema") or {},
+            "return_contract": tool.get("return_contract"),
+            "artifact_outputs": tool.get("artifact_outputs") or [],
+            "side_effects": tool.get("side_effects") or [],
+        }
+        if tool.get("usage_policy"):
+            compact_tool["usage_policy"] = tool["usage_policy"]
+        compact_code_tools.append(compact_tool)
+
+    # Full Registry records, cards, and raw snippets remain in local_contract.
+    # The producer sees one compact callable contract and one formatted snippet
+    # representation instead.
+    for key in (
+        "resolved_tools",
+        "tool_function_cards",
+        "tool_snippets",
+        "tool_snippet_prompt",
+    ):
+        prompt_contract_view.pop(key, None)
+
     logger.info(
         "[Creator][script_generation_contract] "
         "file_path=%s "
@@ -1942,8 +1981,8 @@ def _build_script_generate_file_prompt_variant(
         (
             "只根据轻量上下文实现：script_goal、semantic inputs/outputs、"
             "responsibility_requirements、coverage_requirements、"
-            "available_tools、tool_function_cards、tool_snippets、"
-            "tool_snippet_prompt、resource_refs、output_contract、"
+            "available_tools、compact_code_tools、tool_snippet_prompt、"
+            "resource_refs、output_contract、"
             "runtime_envelope、rules。"
         ),
         (
@@ -2066,16 +2105,11 @@ def _build_script_generate_file_prompt_variant(
             "没有合适工具时使用标准库或已允许依赖完成本地逻辑；"
             "无法完成时返回清晰 blocker。"
         ),
-        (
-            "动态工具函数卡片（从 registry/manifest 读取，"
-            "不硬编码工具名）："
-        ),
-        (
-            "\n\n---\n\n".join(
-                tool_function_cards
-            )
-            if tool_function_cards
-            else "无"
+        "Code-callable Tool Contracts（完整授权集合的紧凑调用合同）：",
+        json.dumps(
+            compact_code_tools,
+            ensure_ascii=False,
+            indent=2,
         ),
         (
             "动态工具 Snippet 指南（从 registry/manifest 读取，"
@@ -2123,7 +2157,7 @@ def _build_script_generate_file_prompt_variant(
         ensure_ascii=False,
         indent=2,
     )
-    cards_text = "\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无"
+    compact_code_tools_text = json.dumps(compact_code_tools, ensure_ascii=False, indent=2)
     formatted_snippets_text = str(local_contract.get("tool_snippet_prompt") or "当前脚本可用工具 Snippets: 无")
     skeleton_chars = len(script_skeleton_text)
     logger.info(
@@ -2131,11 +2165,12 @@ def _build_script_generate_file_prompt_variant(
         "fixed_instruction_chars=%d prompt_contract_view_chars=%d "
         "responsibility_requirements_chars=%d function_graph_context_chars=%d coverage_requirements_chars=%d "
         "runtime_contract_chars=%d platform_io_contract_chars=%d platform_io_rules_chars=%d runtime_envelope_chars=%d "
-        "available_tool_index_chars=%d resolved_tools_chars=%d tool_function_cards_chars=%d "
-        "raw_tool_snippets_chars=%d formatted_tool_snippets_chars=%d current_file_tool_binding_chars=%d "
-        "script_skeleton_chars=%d tool_count=%d tool_cards_count=%d snippet_count=%d",
+        "available_tool_index_chars=%d full_resolved_tools_chars=%d compact_code_tools_chars=%d "
+        "tool_function_cards_chars=%d raw_tool_snippets_chars=%d formatted_tool_snippets_chars=%d "
+        "current_file_tool_binding_chars=%d script_skeleton_chars=%d "
+        "resolved_tool_count=%d compact_code_tool_count=%d tool_cards_count=%d snippet_count=%d",
         file_path, len(prompt_text),
-        len(prompt_text) - len(prompt_contract_text) - len(binding_text) - len(cards_text) - len(formatted_snippets_text) - skeleton_chars,
+        len(prompt_text) - len(prompt_contract_text) - len(binding_text) - len(compact_code_tools_text) - len(formatted_snippets_text) - skeleton_chars,
         len(prompt_contract_text),
         len(json.dumps(local_contract.get("responsibility_requirements", []), ensure_ascii=False, default=str)),
         len(json.dumps(local_contract.get("function_item_graph_context", {}), ensure_ascii=False, default=str)),
@@ -2143,13 +2178,14 @@ def _build_script_generate_file_prompt_variant(
         len(json.dumps(prompt_contract_view.get("runtime_contract", {}), ensure_ascii=False, default=str)),
         len(json.dumps(local_contract.get("platform_io_contract", {}), ensure_ascii=False, default=str)),
         len(str(local_contract.get("platform_io_rules") or "")),
-        len(json.dumps((local_contract.get("runtime_contract") or {}).get("runtime_envelope", {}), ensure_ascii=False, default=str)),
+        len(json.dumps(local_contract.get("runtime_envelope", {}), ensure_ascii=False, default=str)),
         len(json.dumps(selected_tools_payload, ensure_ascii=False, default=str)),
-        len(json.dumps(local_contract.get("resolved_tools", []), ensure_ascii=False, default=str)),
-        len(cards_text),
+        len(json.dumps(resolved_tools, ensure_ascii=False, default=str)),
+        len(compact_code_tools_text),
+        len("\n\n---\n\n".join(tool_function_cards) if tool_function_cards else "无"),
         len(json.dumps(tool_snippets, ensure_ascii=False, default=str)),
         len(formatted_snippets_text), len(binding_text), skeleton_chars,
-        len(selected_tools_payload), len(tool_function_cards), len(tool_snippets),
+        len(resolved_tools), len(compact_code_tools), len(tool_function_cards), len(tool_snippets),
     )
 
     return _creator_file_generation_messages(

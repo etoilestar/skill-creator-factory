@@ -437,6 +437,10 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
             input_schema={"type": "object", "required": ["input_alpha"]},
             output_schema={"type": "object", "required": ["result_gamma"]},
             return_contract="RETURN_SENTINEL_789",
+            example_return="EXAMPLE_RETURN_SENTINEL",
+            example_stdout="EXAMPLE_STDOUT_SENTINEL",
+            common_mistakes=["COMMON_MISTAKE_SENTINEL"],
+            required_secrets=["REQUIRED_SECRET_SENTINEL"],
         )],
     ))
     try:
@@ -483,6 +487,16 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
             variant="standard",
         )
         prompt = "\n".join(str(message["content"]) for message in messages)
+        local_contract = _script_local_contract_payload(
+            file_path="scripts/worker_a.py",
+            purpose="produce result_gamma",
+            plan_entry=_entry(runtime_contract={"tool_binding_summary": binding}),
+            stdout_schema={"type": "object", "required": ["result_gamma"]},
+        )
+        registry_tool = next(
+            tool for tool in local_contract["resolved_tools"]
+            if tool["tool_id"] == "capability_a.call_a"
+        )
 
         assert prompt.count("GRAPH_SENTINEL_123") == 1
         assert prompt.count("BINDING_SENTINEL_456") == 1
@@ -491,5 +505,15 @@ def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representa
         assert "RETURN_SENTINEL_789" in prompt
         assert "input_alpha" in prompt
         assert "result_gamma" in prompt
+        assert len(local_contract["resolved_tools"]) == 2
+        assert prompt.count('"tool_id"') >= len(local_contract["resolved_tools"])
+        assert registry_tool["example_return"] == "EXAMPLE_RETURN_SENTINEL"
+        assert registry_tool["example_stdout"] == "EXAMPLE_STDOUT_SENTINEL"
+        assert registry_tool["common_mistakes"] == ["COMMON_MISTAKE_SENTINEL"]
+        assert registry_tool["required_secrets"] == ["REQUIRED_SECRET_SENTINEL"]
+        assert "EXAMPLE_RETURN_SENTINEL" not in prompt
+        assert "EXAMPLE_STDOUT_SENTINEL" not in prompt
+        assert "COMMON_MISTAKE_SENTINEL" not in prompt
+        assert "REQUIRED_SECRET_SENTINEL" not in prompt
     finally:
         clear_registered_tool_capabilities()

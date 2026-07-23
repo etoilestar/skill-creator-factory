@@ -43,6 +43,7 @@ def _configure_logging() -> None:
 _configure_logging()
 
 from .routers import chat, creator, creator_chat, creator_tools, health, sandbox_chat, skills, skills_chat, publish, publish_gateway
+from .services.creator_model_profiles import router as creator_model_profiles_router
 
 
 app = FastAPI(title="Skill Creator Factory", version="0.1.0")
@@ -62,9 +63,9 @@ app.include_router(sandbox_chat.router)
 app.include_router(skills_chat.router)
 app.include_router(skills.router)
 app.include_router(creator.router)
+app.include_router(creator_model_profiles_router)
 
 app.include_router(publish.router)
 app.include_router(publish_gateway.router)
 
 app.include_router(creator_tools.router)
-

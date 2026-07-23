@@ -5052,7 +5052,7 @@ async def _run_script_responsibility_review(
                     ),
                 },
             ]
-            text = await complete_chat_once(active_messages, route.model)
+            text = await complete_creator_role_once(active_messages, "reviewer")
             last_text = str(text or "")
         except Exception as exc:
             logger.warning(
@@ -5268,7 +5268,7 @@ async def _run_reference_semantic_review(
             *messages,
             {"role": "user", "content": f"上一轮不是合法 JSON，请只返回约定 JSON object。上一轮：{last_text[:1000]}"},
         ]
-        text = await complete_chat_once(active_messages, route.model)
+        text = await complete_creator_role_once(active_messages, "reviewer")
         last_text = str(text or "")
         data = _parse_validator_json_object(last_text)
         if isinstance(data, dict) and data:

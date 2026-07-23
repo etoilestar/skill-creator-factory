@@ -78,6 +78,14 @@ def test_build_payload_with_max_tokens():
     assert payload["max_tokens"] == 512
 
 
+def test_build_payload_per_call_max_tokens_wins():
+    from backend.services import llm_proxy
+    from backend.config import settings
+    with patch.object(settings, "max_tokens", 512):
+        payload = llm_proxy._build_payload(messages=[], model="m", stream=False, max_tokens=1234)
+    assert payload["max_tokens"] == 1234
+
+
 # ---------------------------------------------------------------------------
 # _auth_headers
 # ---------------------------------------------------------------------------

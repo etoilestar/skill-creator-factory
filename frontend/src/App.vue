@@ -11,6 +11,9 @@
       <RouterLink to="/creator/tools" class="nav-item">
         <span>🧰</span> 工具管理
       </RouterLink>
+      <RouterLink to="/creator/model-profiles" class="nav-item">
+        <span>⚙️</span> Creator 模型
+      </RouterLink>
       <RouterLink to="/skills" class="nav-item">
         <span>📚</span> 技能库
       </RouterLink>

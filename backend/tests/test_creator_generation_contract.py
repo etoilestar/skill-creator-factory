@@ -417,3 +417,79 @@ def test_current_skill_binding_overrides_stale_guard_only_runtime_contract_with_
         assert tool.get("signature")
     assert set(payload["current_file_tool_binding"]["allowed_import_paths"]) == {tool["import_path"] for tool in payload["resolved_tools"]}
     assert stale_entry["runtime_contract"]["tool_binding_summary"]["available_tools"][0]["tool_id"] == "script_argv_guard"
+
+
+def test_script_prompt_deduplicates_equivalent_graph_and_tool_binding_representations():
+    from backend.services.creator.generation import _build_script_generate_file_prompt_variant
+
+    clear_registered_tool_capabilities()
+    register_tool_capability(ToolCapability(
+        name="capability_a",
+        display_name="Capability A",
+        category="test",
+        roles=["generic_script"],
+        functions=[ToolFunctionManifest(
+            function_name="call_a",
+            import_path="backend.services.runtime_tools",
+            short_description="Call A.",
+            when_to_use="Use call A.",
+            signature="call_a(input_alpha: str) -> dict",
+            input_schema={"type": "object", "required": ["input_alpha"]},
+            output_schema={"type": "object", "required": ["result_gamma"]},
+            return_contract="RETURN_SENTINEL_789",
+        )],
+    ))
+    try:
+        binding = {
+            "available_tools": [{
+                "tool_id": "capability_a.call_a",
+                "capability_name": "capability_a",
+                "function_name": "call_a",
+            }],
+            "dependencies": ["BINDING_SENTINEL_456"],
+        }
+        entry = {
+            "path": "scripts/worker_a.py",
+            "role": "generic_script",
+            "file_type": "script",
+            "purpose": "produce result_gamma",
+            "runtime": "python",
+            "language": "python",
+            "inputs": ["input_alpha", "input_beta"],
+            "outputs": ["result_gamma"],
+            "dependencies": [],
+            "required_capabilities": [],
+            "tool_binding_summary": binding,
+        }
+        graph_context = {
+            "function_item": {
+                "must_do": ["use input_alpha"],
+                "must_not_do": ["ignore input_beta"],
+                "constraints": ["GRAPH_SENTINEL_123"],
+                "inputs": ["input_alpha", "input_beta"],
+                "outputs": ["result_gamma"],
+            },
+            "incoming_edges": [{"producer": "upstream_a"}],
+            "outgoing_edges": [{"consumer": "downstream_b"}],
+        }
+        messages = _build_script_generate_file_prompt_variant(
+            file_path="scripts/worker_a.py",
+            skill_name="test_skill",
+            purpose="produce result_gamma",
+            blueprint_text="",
+            role="generic_script",
+            skill_plan_entry=entry,
+            function_execution_context=graph_context,
+            variant="standard",
+        )
+        prompt = "\n".join(str(message["content"]) for message in messages)
+
+        assert prompt.count("GRAPH_SENTINEL_123") == 1
+        assert prompt.count("BINDING_SENTINEL_456") == 1
+        assert "capability_a.call_a" in prompt
+        assert "call_a(input_alpha: str) -> dict" in prompt
+        assert "RETURN_SENTINEL_789" in prompt
+        assert "input_alpha" in prompt
+        assert "result_gamma" in prompt
+    finally:
+        clear_registered_tool_capabilities()
